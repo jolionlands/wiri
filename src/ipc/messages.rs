@@ -223,6 +223,26 @@ pub enum IpcMessage {
     /// under `result.active`.
     #[serde(rename = "toggle_resize_mode")]
     ToggleResizeMode,
+
+    /// niri parity: move the focused column to the workspace immediately
+    /// above the current one (`current_workspace_id - 1`).  Creates the
+    /// destination workspace if missing.
+    #[serde(rename = "move_column_to_workspace_up")]
+    MoveColumnToWorkspaceUp,
+    /// niri parity: move the focused column to the workspace immediately
+    /// below the current one (`current_workspace_id + 1`).
+    #[serde(rename = "move_column_to_workspace_down")]
+    MoveColumnToWorkspaceDown,
+
+    /// niri parity: swap the focused workspace with the workspace
+    /// immediately above it on the same monitor.  Focus follows the moved
+    /// workspace.  No-op when the focused workspace is the lowest.
+    #[serde(rename = "move_workspace_up")]
+    MoveWorkspaceUp,
+    /// niri parity: swap the focused workspace with the workspace
+    /// immediately below it on the same monitor.
+    #[serde(rename = "move_workspace_down")]
+    MoveWorkspaceDown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

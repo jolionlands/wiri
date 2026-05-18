@@ -530,6 +530,13 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
                 config.layout.snap_threshold_px = v;
             }
         }
+        // niri-parity `border-smart` / `smart-borders` flat-form aliases,
+        // plus the bare `smart` key inside `borders { smart true }`
+        // (handled by the same routing arm because `layout.borders` keys
+        // are folded into the same parser).
+        "smart_borders" | "smart-borders" | "border_smart" | "border-smart" | "smart" => {
+            config.layout.smart_borders = value == "true" || value == "1";
+        }
         _ => {}
     }
 }
@@ -682,6 +689,11 @@ fn apply_output_layout_property(key: &str, value: &str, lo: &mut LayoutConfigPar
         }
         "shadow_spread" | "shadow-spread" => {
             if let Ok(v) = value.parse() { lo.shadow_spread = Some(v); }
+        }
+        // Per-output `smart-borders` override; mirrors the global flat field
+        // plus the `border { smart true }` nested-block alias.
+        "smart_borders" | "smart-borders" | "border_smart" | "border-smart" | "smart" => {
+            lo.smart_borders = Some(value == "true" || value == "1");
         }
         _ => {}
     }

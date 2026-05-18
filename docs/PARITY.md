@@ -50,7 +50,7 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 | Workspace slide animation | ✅ | Engine biases tile Y by `workspace_slide_offset(oid)` |
 | Per-output `layout {}` overrides | ✅ | `TilingEngine.config_per_monitor` + `effective_config(oid)` accessor |
 | Interactive resize mode (Mod+R cycle) | ✅ | `Mod+R` toggles; `Mod+Arrow` resize while engaged; Esc exits |
-| Move column vertically between workspaces | ❌ | `Action::MoveToWorkspace { id }` exists but no "up/down by 1" shortcut |
+| Move column vertically between workspaces | ✅ | `Action::MoveColumnToWorkspaceUp/Down`, `Ctrl+Alt+Shift+Up/Down` |
 | Stack column (vertical of same width) — niri's "consume to next" inverse | ❌ | |
 
 ## Input
@@ -84,7 +84,8 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 | Focus ring (separate from border) | ✅ | `focus-ring-width` / `focus-ring-color` |
 | Wallpaper integration | 🚫 | Win32 desktop manages wallpaper |
 | Cursor theme | 🚫 | Windows handles globally |
-| Blur backdrop (niri's `blur { … }`) | ❌ | DwmEnableBlurBehindWindow exists; not wired |
+| Blur backdrop (niri's `blur { … }`) | ✅ | Wired via `DwmEnableBlurBehindWindow`; `window-rule { blur true }` |
+| Smart borders (`disable-when-only-one-window`) | ✅ | `smart-borders true` / `borders { smart true }` |
 
 ## Configuration
 
@@ -138,12 +139,12 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 
 These are concrete, scoped, and would tighten parity:
 
-- **Move-column-vertically-between-workspaces** — `Action::MoveColumnToWorkspaceAbove` / `Below`.
-- **Workspace move/swap** — `Action::MoveWorkspaceUp` / `Down` reorders the workspace stack.
-- **Smart-borders** — only draw border when more than one window is visible.
+- ✅ **Move-column-vertically-between-workspaces** — `Action::MoveColumnToWorkspaceUp` / `Down` shipped in opus pass J (default binds `Ctrl+Alt+Shift+Up/Down`).
+- ✅ **Workspace move/swap** — `Action::MoveWorkspaceUp` / `Down` shipped in opus pass J (default binds `Ctrl+Alt+Shift+Page_Up/Down`; column-to-monitor moved to `Ctrl+Alt+Shift+Comma/Period`).
+- ✅ **Smart-borders** — only draw border when more than one window is visible (`smart-borders true` or `borders { smart true }`, opus pass J).
 - **Wallpaper-aware accent** — DWM `DWMWA_CAPTION_COLOR` from system accent.
-- **Blur backdrop** for floating windows via `DwmEnableBlurBehindWindow`.
-- **Win+L lock screen passthrough** — currently captured at the WM level; should fall through.
+- ✅ **Blur backdrop** for floating windows via `DwmEnableBlurBehindWindow` (window-rule `blur true`, opus pass J).
+- ✅ **Win+L lock screen passthrough** — opus pass J introduces `SYSTEM_CRITICAL_HOTKEYS` denylist (`Win+L`, `Win+Shift+S`, `Win+D`); `register_hotkeys` skips these before calling `RegisterHotKey`.
 - **More-faithful overview rendering** — DWM thumbnail per window (via `DwmRegisterThumbnail`) instead of resizing the live HWND.
 
 PRs welcome.

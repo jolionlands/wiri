@@ -129,8 +129,22 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (shift_prefix, 0x48, Action::ShrinkColumnWidth),   // Shift+H (overrides MoveToMonitorLeft above)
         (shift_prefix, 0x4B, Action::GrowTileHeight),      // Shift+K
         (shift_prefix, 0x4A, Action::ShrinkTileHeight),    // Shift+J
-        (shift_prefix, 0x21, Action::MoveColumnToMonitorLeft),  // Shift+PageUp
-        (shift_prefix, 0x22, Action::MoveColumnToMonitorRight), // Shift+PageDown
+        // Workspace swap (reorder the workspace stack) — niri-parity
+        // `Mod+Ctrl+Page_Up/Down`.  Our default prefix is Ctrl+Alt, so the
+        // shifted variant naturally lands on `Ctrl+Alt+Shift+Page_Up/Down`,
+        // which is what we used to dedicate to move-column-to-monitor.  The
+        // column-to-monitor chords move to Ctrl+Alt+Shift+Comma/Period below.
+        (shift_prefix, 0x21, Action::MoveWorkspaceUp),    // Shift+PageUp
+        (shift_prefix, 0x22, Action::MoveWorkspaceDown),  // Shift+PageDown
+        // Niri parity: move focused column vertically between workspaces.
+        // Ctrl+Alt+Shift+Up/Down (VK_UP=0x26, VK_DOWN=0x28).
+        (shift_prefix, 0x26, Action::MoveColumnToWorkspaceUp),
+        (shift_prefix, 0x28, Action::MoveColumnToWorkspaceDown),
+        // Move column to monitor moves to Ctrl+Alt+Shift+Comma/Period
+        // (VK_OEM_COMMA=0xBC, VK_OEM_PERIOD=0xBE) to free up Page_Up/Down
+        // for workspace swap per the niri default.
+        (shift_prefix, 0xBC, Action::MoveColumnToMonitorLeft),
+        (shift_prefix, 0xBE, Action::MoveColumnToMonitorRight),
     ]
 }
 
@@ -271,6 +285,29 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
     merged
 }
 
+/// Chords that wiri must NEVER attempt to register.  These are reserved by
+/// Windows for security- or system-critical functions and stealing them at
+/// the WM layer causes very bad user-visible behaviour (e.g. binding
+/// `MOD_WIN+L` would lock out the user's lock-screen shortcut).  Even when
+/// `RegisterHotKey` would happily accept the registration, the operating
+/// system intercepts the chord before our process sees it — so the bind is
+/// at best a no-op and at worst a footgun.  Format: `(modifiers, vk, label)`.
+const SYSTEM_CRITICAL_HOTKEYS: &[(u32, u32, &str)] = &[
+    (MOD_WIN, 0x4C, "Win+L (lock screen)"),
+    (MOD_WIN | MOD_SHIFT, 0x53, "Win+Shift+S (snipping tool)"),
+    (MOD_WIN, 0x44, "Win+D (show desktop)"),
+];
+
+/// Returns Some(label) when the (mods, vk) pair is in the
+/// [`SYSTEM_CRITICAL_HOTKEYS`] denylist.  Pure helper extracted so the test
+/// suite can exercise the filter without touching `RegisterHotKey`.
+fn is_system_critical_hotkey(mods: u32, vk: u32) -> Option<&'static str> {
+    SYSTEM_CRITICAL_HOTKEYS
+        .iter()
+        .find(|(m, v, _)| *m == mods && *v == vk)
+        .map(|(_, _, label)| *label)
+}
+
 /// Register a list of hotkeys with Windows, returning the IDs, action map,
 /// and the subset of hotkey ids that must be state-gated on overview mode
 /// (i.e. bare Escape → OverviewToggle, which should only fire when overview
@@ -284,6 +321,17 @@ fn register_hotkeys(
 
     for (i, (mods, vk, action)) in hotkeys.iter().enumerate() {
         let id = base_id + i as i32;
+        // System-critical chords (Win+L, Win+Shift+S, Win+D) must never be
+        // registered — even if RegisterHotKey accepts them, the OS intercepts
+        // first and the user loses the original behaviour.  Skip silently
+        // with a WARN so the audit log reflects the intent.
+        if let Some(label) = is_system_critical_hotkey(*mods, *vk) {
+            warn!(
+                "SKIP hotkey id={} mods=0x{:X} vk=0x{:02X} {:?} — reserved by Windows ({})",
+                id, mods, vk, action, label,
+            );
+            continue;
+        }
         let result = unsafe {
             RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(*mods), *vk)
         };
@@ -994,6 +1042,22 @@ fn execute_action(
             // column / tile until the user presses Esc or Mod+R again.
             engine.write().toggle_resize_mode();
         }
+        Action::MoveColumnToWorkspaceUp => {
+            engine.write().move_focused_column_to_workspace(-1, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::MoveColumnToWorkspaceDown => {
+            engine.write().move_focused_column_to_workspace(1, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::MoveWorkspaceUp => {
+            engine.write().move_active_workspace(-1, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::MoveWorkspaceDown => {
+            engine.write().move_active_workspace(1, backend);
+            engine.write().apply_all(backend);
+        }
     }
 }
 
@@ -1144,5 +1208,39 @@ mod tests {
         let (merged, overridden) = merge_hotkeys(defaults.clone(), vec![], true);
         assert_eq!(overridden, 0);
         assert_eq!(merged, defaults);
+    }
+
+    /// System-critical chords (Win+L, Win+Shift+S, Win+D) must be flagged by
+    /// `is_system_critical_hotkey` so `register_hotkeys` skips them silently
+    /// before ever calling into `RegisterHotKey`.  Non-listed chords must
+    /// pass through unaltered.
+    #[test]
+    fn system_critical_hotkey_filter_catches_win_l_and_friends() {
+        // Win+L (lock screen) — VK_L = 0x4C, MOD_WIN = 0x0008.
+        assert!(
+            is_system_critical_hotkey(MOD_WIN, 0x4C).is_some(),
+            "Win+L must be flagged as system-critical"
+        );
+        // Win+Shift+S (snipping tool) — VK_S = 0x53.
+        assert!(
+            is_system_critical_hotkey(MOD_WIN | MOD_SHIFT, 0x53).is_some(),
+            "Win+Shift+S must be flagged as system-critical"
+        );
+        // Win+D (show desktop) — VK_D = 0x44.
+        assert!(
+            is_system_critical_hotkey(MOD_WIN, 0x44).is_some(),
+            "Win+D must be flagged as system-critical"
+        );
+
+        // Non-system chord (Ctrl+Alt+Q, our quit binding) must pass through.
+        assert!(
+            is_system_critical_hotkey(MOD_CTRL | MOD_ALT, 0x51).is_none(),
+            "Ctrl+Alt+Q is a normal binding, must NOT be filtered"
+        );
+        // Bare L (no modifiers) is not a system chord even though VK matches.
+        assert!(
+            is_system_critical_hotkey(0, 0x4C).is_none(),
+            "Bare L without Win is not a system-critical hotkey"
+        );
     }
 }

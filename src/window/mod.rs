@@ -109,6 +109,11 @@ pub struct ResolvedWindowRules {
     pub column: Option<usize>,
     pub follow_cursor: bool,
     pub border: bool,
+    /// niri-parity blur backdrop hint.  When `true`, the engine applies the
+    /// Aero-style `DwmEnableBlurBehindWindow` blur to the window's backdrop
+    /// once (tracked in `TilingEngine.blur_applied`).  Cleared from the set
+    /// when the window is removed so a re-add re-applies it.
+    pub blur: bool,
     /// Per-window opacity override (0.0..=1.0). `None` means "no rule set;
     /// the engine should leave the window at fully opaque (1.0)".  `Some(0.0)`
     /// is a legal value meaning "explicitly fully transparent".
@@ -139,6 +144,7 @@ impl Default for ResolvedWindowRules {
             column: None,
             follow_cursor: true,
             border: true,
+            blur: false,
             opacity: None,
             open_on_output: None,
             open_in_workspace: None,

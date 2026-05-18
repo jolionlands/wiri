@@ -234,6 +234,19 @@ enum Commands {
     /// `Mod+Arrow` chords resize the focused column / tile by 5% and
     /// `Esc` (or running this command again) exits the mode.
     ResizeMode,
+
+    /// niri parity: move the focused column to the workspace immediately
+    /// above the current one.  Creates the destination workspace if needed.
+    MoveColumnUp,
+    /// niri parity: move the focused column to the workspace immediately
+    /// below the current one.
+    MoveColumnDown,
+    /// niri parity: swap the focused workspace with the one above on the
+    /// same monitor.  Focus follows the moved workspace.
+    MoveWorkspaceUp,
+    /// niri parity: swap the focused workspace with the one below on the
+    /// same monitor.
+    MoveWorkspaceDown,
 }
 
 fn main() -> Result<()> {
@@ -327,6 +340,10 @@ fn main() -> Result<()> {
         Commands::ListSnapshots => IpcMessage::ListSnapshots,
         Commands::DeleteSnapshot { name } => IpcMessage::DeleteSnapshot { name },
         Commands::ResizeMode => IpcMessage::ToggleResizeMode,
+        Commands::MoveColumnUp => IpcMessage::MoveColumnToWorkspaceUp,
+        Commands::MoveColumnDown => IpcMessage::MoveColumnToWorkspaceDown,
+        Commands::MoveWorkspaceUp => IpcMessage::MoveWorkspaceUp,
+        Commands::MoveWorkspaceDown => IpcMessage::MoveWorkspaceDown,
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;

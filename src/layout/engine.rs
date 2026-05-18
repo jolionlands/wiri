@@ -128,6 +128,13 @@ pub struct LayoutConfig {
     /// `false`, reset all frame margins to 0 (the default — no shadow).  See
     /// `TilingEngine::apply_shadow_for_window` for the per-window mechanics.
     pub shadow_enable: bool,
+    /// niri-parity "smart borders" (a.k.a. `disable-when-only-one-window`).
+    /// When `true` and the active workspace contains exactly one column with
+    /// exactly one tile, the per-tile DWM border color is forced to the
+    /// "no colour" sentinel (`0xFFFFFFFF` / `DWMWA_COLOR_NONE`) so the user
+    /// gets the full tile rect without a coloured outline.  Defaults to
+    /// `false` to preserve the historic always-bordered behaviour.
+    pub smart_borders: bool,
 }
 
 impl Default for LayoutConfig {
@@ -147,6 +154,7 @@ impl Default for LayoutConfig {
             scroll_step: 200,
             strip_frame: false,
             shadow_enable: false,
+            smart_borders: false,
         }
     }
 }
@@ -188,6 +196,7 @@ impl LayoutConfig {
         };
         lc.strip_frame = config.layout.strip_frame;
         lc.shadow_enable = config.layout.shadow_enable;
+        lc.smart_borders = config.layout.smart_borders;
         lc
     }
 }
@@ -294,6 +303,12 @@ pub struct TilingEngine {
     /// until they receive a fresh paint message, so we record the desired
     /// state once and skip subsequent calls until the window is destroyed.
     shadow_applied: HashSet<WindowId>,
+    /// Windows that have had `DwmEnableBlurBehindWindow` applied at least
+    /// once.  Tracked so the engine only calls into DWM once per HWND
+    /// lifetime — re-issuing the blur on every layout pass is unnecessary
+    /// and risks the same flicker behaviour that motivated `shadow_applied`.
+    /// Entries are dropped in `remove_window` so a re-add re-applies blur.
+    blur_applied: HashSet<WindowId>,
     /// True while niri-style interactive resize mode is engaged
     /// (`Action::EnterResizeMode`).  Arrow keys with no modifier are
     /// intercepted by the WM_HOTKEY dispatcher to grow/shrink the focused
@@ -330,6 +345,7 @@ impl TilingEngine {
             auto_tile_threshold: None,
             urgent_windows: HashSet::new(),
             shadow_applied: HashSet::new(),
+            blur_applied: HashSet::new(),
             resize_mode: false,
             #[cfg(test)]
             win32_call_count: 0,
@@ -525,6 +541,10 @@ impl TilingEngine {
                     // `Some(0.0)` is honoured as fully transparent.
                     self.apply_window_opacity(window_id.as_isize(), o);
                 }
+                if rules.blur {
+                    // niri-parity: apply DWM blur backdrop once per HWND.
+                    self.apply_window_blur(hwnd, true);
+                }
             }
 
             AddWindowTarget::Output(oid) => {
@@ -551,6 +571,9 @@ impl TilingEngine {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
                     self.apply_window_opacity(window_id.as_isize(), o);
+                }
+                if rules.blur {
+                    self.apply_window_blur(hwnd, true);
                 }
             }
 
@@ -579,6 +602,9 @@ impl TilingEngine {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
                     self.apply_window_opacity(window_id.as_isize(), o);
+                }
+                if rules.blur {
+                    self.apply_window_blur(hwnd, true);
                 }
             }
 
@@ -613,6 +639,9 @@ impl TilingEngine {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
                     self.apply_window_opacity(window_id.as_isize(), o);
+                }
+                if rules.blur {
+                    self.apply_window_blur(hwnd, true);
                 }
             }
 
@@ -665,6 +694,9 @@ impl TilingEngine {
                     // `Some(0.0)` is honoured as fully transparent.
                     self.apply_window_opacity(window_id.as_isize(), o);
                 }
+                if rules.blur {
+                    self.apply_window_blur(hwnd, true);
+                }
             }
         }
 
@@ -695,6 +727,13 @@ impl TilingEngine {
         // Reset the shadow-applied flag so a re-add applies the configured
         // shadow state once more (the HWND may be reused by the OS).
         self.shadow_applied.remove(&window_id);
+        // Drop blur tracking; if the HWND is re-bound by Windows to a brand
+        // new logical window, the rule resolver will decide whether to
+        // re-apply blur on add.  We don't issue a clearing
+        // `DwmEnableBlurBehindWindow(false)` call here because the window
+        // is about to be destroyed (and on auto-float, the window will keep
+        // its blur — the user expects a floating "frosted glass" effect).
+        self.blur_applied.remove(&window_id);
 
         if self.tiled_windows.remove(&window_id).is_some() {
             let mut found_output = None;
@@ -958,6 +997,23 @@ impl TilingEngine {
         let border_color_focused_u32 = parse_color_to_u32(&eff_cfg.border_color_focused);
         let border_color_normal_u32  = parse_color_to_u32(&eff_cfg.border_color);
 
+        // niri-parity smart borders: when the active workspace has exactly
+        // one column with exactly one tile, suppress the per-tile DWM border
+        // colour (gives more usable space when there's nothing to delimit).
+        // Cached as a u32 sentinel (0xFFFFFFFE — distinct from the
+        // 0xFFFFFFFF "unset" cache marker so we don't get spurious cache
+        // hits) and resolved against the live workspace state up-front.
+        const SMART_BORDERS_SENTINEL: u32 = 0xFFFF_FFFE;
+        let smart_no_border = if eff_cfg.smart_borders && !overview_active {
+            self.monitors
+                .get(&output_id)
+                .and_then(|m| m.workspace())
+                .map(|ws| ws.columns.len() == 1 && ws.columns[0].tiles.len() == 1)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         // Pre-compute target opacity values as u8 for comparison.
         let opacity_full: u32 = 255;
         let opacity_dim: u32 = (eff_cfg.dim_unfocused * 255.0).round().clamp(0.0, 255.0) as u32;
@@ -987,8 +1043,17 @@ impl TilingEngine {
             let is_focused = focused == Some(window_id);
             let should_be_visible = true;
 
-            // Target values for this tile.
-            let new_border_color = if is_focused { border_color_focused_u32 } else { border_color_normal_u32 };
+            // Target values for this tile.  Smart-borders takes precedence:
+            // when the workspace has a lone tile and the user opted in via
+            // `smart-borders true`, paint the "no colour" sentinel instead
+            // of the focused/normal colour.
+            let new_border_color = if smart_no_border {
+                SMART_BORDERS_SENTINEL
+            } else if is_focused {
+                border_color_focused_u32
+            } else {
+                border_color_normal_u32
+            };
             let new_opacity: u32 = if eff_cfg.dim_unfocused < 1.0 {
                 if is_focused { opacity_full } else { opacity_dim }
             } else {
@@ -1037,12 +1102,19 @@ impl TilingEngine {
 
             // 2. Border color
             if prior.border_color != new_border_color {
-                let color_str = if is_focused {
-                    &eff_cfg.border_color_focused
+                if new_border_color == SMART_BORDERS_SENTINEL {
+                    // smart-borders → push the "no colour" sentinel so DWM
+                    // reverts to the system default border (effectively no
+                    // wiri-painted outline on the lone tile).
+                    self.set_dwm_border_color_none(window_id.as_isize());
                 } else {
-                    &eff_cfg.border_color
-                };
-                self.set_dwm_border_color(window_id.as_isize(), color_str);
+                    let color_str = if is_focused {
+                        &eff_cfg.border_color_focused
+                    } else {
+                        &eff_cfg.border_color
+                    };
+                    self.set_dwm_border_color(window_id.as_isize(), color_str);
+                }
                 #[cfg(test)] { self.win32_call_count += 1; }
                 self.applied_state.entry(window_id).or_insert_with(AppliedState::unset).border_color = new_border_color;
             }
@@ -1798,6 +1870,46 @@ impl TilingEngine {
             let _ = DwmExtendFrameIntoClientArea(hwnd_win, &margins);
         }
         self.shadow_applied.insert(window_id);
+    }
+
+    /// niri-parity "blur backdrop": when a matching window rule sets
+    /// `blur true`, request the Aero-style backdrop blur via
+    /// `DwmEnableBlurBehindWindow`.  Idempotent per HWND — re-issuing the
+    /// call on every layout pass is unnecessary work and matches the
+    /// once-per-HWND pattern used by `apply_shadow_for_window`.  Pass
+    /// `enabled = false` (typically on remove_window) to clear the flag and
+    /// disable the blur.
+    fn apply_window_blur(&mut self, hwnd: isize, enabled: bool) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Dwm::{
+            DwmEnableBlurBehindWindow, DWM_BB_ENABLE, DWM_BLURBEHIND,
+        };
+
+        let window_id = WindowId::new(hwnd);
+        // Idempotent: once the requested state is in the set we skip; once
+        // a window is dropped from the set, the next opt-in re-applies.
+        let already_on = self.blur_applied.contains(&window_id);
+        if enabled && already_on {
+            return;
+        }
+        if !enabled && !already_on {
+            return;
+        }
+
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        let bb = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE,
+            fEnable: enabled.into(),
+            hRgnBlur: windows::Win32::Graphics::Gdi::HRGN(std::ptr::null_mut()),
+            fTransitionOnMaximized: false.into(),
+        };
+        let _ = unsafe { DwmEnableBlurBehindWindow(hwnd_win, &bb) };
+
+        if enabled {
+            self.blur_applied.insert(window_id);
+        } else {
+            self.blur_applied.remove(&window_id);
+        }
     }
 
     /// Strip window frame decorations for tiling.
@@ -2598,6 +2710,29 @@ impl TilingEngine {
         }
     }
 
+    /// Push the "no colour" sentinel COLORREF to DWMWA_BORDER_COLOR so the
+    /// system reverts to its default chrome (no wiri-painted outline).  Used
+    /// by the `smart_borders` path when the active workspace has exactly one
+    /// column with exactly one tile.  We use `0xFFFFFFFF` per the niri-parity
+    /// brief — Windows treats this as `DWMWA_COLOR_DEFAULT`, which falls
+    /// back to the OS-chosen border colour (effectively invisible on most
+    /// theme/wallpaper combinations).  Separate function rather than an
+    /// overload of `set_dwm_border_color` so the cache compare path can
+    /// store an obviously distinct sentinel.
+    fn set_dwm_border_color_none(&self, hwnd: isize) {
+        use windows::Win32::Foundation::HWND;
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        let colorref: u32 = 0xFFFF_FFFF;
+        let _ = unsafe {
+            windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd_win,
+                windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR,
+                &colorref as *const _ as *const _,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+    }
+
         fn apply_window_opacity(&self, hwnd: isize, opacity: f32) {
         use windows::Win32::Foundation::HWND;
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
@@ -3286,6 +3421,151 @@ impl TilingEngine {
         self.maintain_empty_workspace(target_output);
         self.apply_layout_for_monitor(focused_output, backend);
         self.apply_layout_for_monitor(target_output, backend);
+    }
+
+    // -------------------------------------------------------------------------
+    // Niri-parity: move the focused column vertically between workspaces
+    // -------------------------------------------------------------------------
+
+    /// Move every tile in the focused column out of the current workspace and
+    /// append them as a single new column to `current_workspace_id + delta`.
+    /// The destination workspace is created if missing.  No-op when the focused
+    /// monitor has no focused column, or when the destination workspace id
+    /// would land on a non-positive value going up (i.e. `delta < 0` and
+    /// `current <= 0`).  Focus follows the moved column to the destination.
+    ///
+    /// Used by `Action::MoveColumnToWorkspaceUp` (delta = -1) and
+    /// `Action::MoveColumnToWorkspaceDown` (delta = +1).
+    pub fn move_focused_column_to_workspace(&mut self, delta: i32, backend: &BackendHandle) {
+        let Some(focused_output) = self.monitors.focused_id() else { return };
+
+        // Resolve focused column index + source workspace id up-front.
+        let (focus_col_idx, src_ws_id) = match self.monitors.get(&focused_output) {
+            Some(m) => match m.focus_column {
+                Some(i) => (i, m.active_workspace),
+                None => return,
+            },
+            None => return,
+        };
+        let dst_ws_id = src_ws_id + delta;
+        // Refuse to step to a negative workspace id (workspace 0 is the
+        // implicit "lowest" wiri default; user-facing labels are still
+        // 1-based via the niri convention, but the engine HashMap can carry
+        // anything).  Without this guard, "move-column-up" from workspace 0
+        // would silently create workspace -1 and strand tiles there.
+        if delta < 0 && dst_ws_id < 0 {
+            return;
+        }
+        if dst_ws_id == src_ws_id {
+            return; // delta == 0 → no-op
+        }
+
+        // Take the column from the source workspace.
+        let column_taken = {
+            let Some(monitor) = self.monitors.get_mut(&focused_output) else { return };
+            let Some(src_ws) = monitor.workspaces.get_mut(&src_ws_id) else { return };
+            if focus_col_idx >= src_ws.columns.len() {
+                return;
+            }
+            let col = src_ws.columns.remove(focus_col_idx);
+            // Clear focus on the source workspace; it will be re-anchored
+            // either to whatever is still here, or to the destination below.
+            monitor.focus_column = None;
+            monitor.focus_window = None;
+            col
+        };
+
+        let moved_wids: Vec<WindowId> = column_taken.tiles.iter().map(|t| t.window_id).collect();
+
+        // Append the column to the destination workspace (creating it if
+        // necessary).  After the append, point focus at the new column on the
+        // destination workspace and switch the monitor's active workspace to
+        // match so the user follows their tiles.
+        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+            let dst_ws = monitor
+                .workspaces
+                .entry(dst_ws_id)
+                .or_insert_with(crate::layout::Workspace::new);
+            dst_ws.columns.push(column_taken);
+            let new_col_idx = dst_ws.columns.len() - 1;
+            monitor.active_workspace = dst_ws_id;
+            monitor.focus_column = Some(new_col_idx);
+            if let Some(first) = moved_wids.first().copied() {
+                monitor.focus_window = Some(first);
+                monitor.focus_ring.push(first);
+            }
+        }
+
+        self.maintain_empty_workspace(focused_output);
+        self.apply_layout_for_monitor(focused_output, backend);
+    }
+
+    // -------------------------------------------------------------------------
+    // Niri-parity: workspace move/swap (reorder the workspace stack)
+    // -------------------------------------------------------------------------
+
+    /// Swap the focused workspace with the workspace at
+    /// `focused_workspace_id + delta` on the same monitor.  Focus follows the
+    /// moved workspace so the user stays on the original tiles.  No-op when
+    /// the swap target is the same as the source, when no monitor is focused,
+    /// or when the resulting move would clobber a workspace that does not
+    /// exist (i.e. `delta < 0` and source is the lowest workspace).
+    pub fn move_active_workspace(&mut self, delta: i32, backend: &BackendHandle) {
+        let Some(focused_output) = self.monitors.focused_id() else { return };
+
+        let src_ws_id = match self.monitors.get(&focused_output) {
+            Some(m) => m.active_workspace,
+            None => return,
+        };
+        let dst_ws_id = src_ws_id + delta;
+        if dst_ws_id == src_ws_id {
+            return;
+        }
+        // Edge guard: refuse to step to a negative workspace id (workspace 0
+        // is the implicit lowest in wiri).  Without this guard the swap
+        // would silently create a workspace at id == -1 and leave the user
+        // stranded on a negative-numbered slot.
+        if delta < 0 && dst_ws_id < 0 {
+            return;
+        }
+
+        // Perform the swap.  Either workspace may or may not exist; we
+        // materialise both before swapping so users can also swap a populated
+        // workspace into a still-empty slot.
+        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+            let src_ws = monitor
+                .workspaces
+                .remove(&src_ws_id)
+                .unwrap_or_else(crate::layout::Workspace::new);
+            let dst_ws = monitor
+                .workspaces
+                .remove(&dst_ws_id)
+                .unwrap_or_else(crate::layout::Workspace::new);
+            monitor.workspaces.insert(dst_ws_id, src_ws);
+            monitor.workspaces.insert(src_ws_id, dst_ws);
+            // Focus follows the moved workspace.
+            monitor.active_workspace = dst_ws_id;
+            // Anchor focus_column to the first column of the relocated
+            // workspace (or None when it has no columns).
+            let new_focus = monitor
+                .workspaces
+                .get(&dst_ws_id)
+                .and_then(|w| w.columns.first().and_then(|c| c.tiles.first()).map(|t| (0usize, t.window_id)));
+            match new_focus {
+                Some((col_idx, wid)) => {
+                    monitor.focus_column = Some(col_idx);
+                    monitor.focus_window = Some(wid);
+                    monitor.focus_ring.push(wid);
+                }
+                None => {
+                    monitor.focus_column = None;
+                    monitor.focus_window = None;
+                }
+            }
+        }
+
+        self.maintain_empty_workspace(focused_output);
+        self.apply_layout_for_monitor(focused_output, backend);
     }
 
     // -------------------------------------------------------------------------
@@ -6383,6 +6663,290 @@ mod tests {
             (mid_y - expected).abs() <= 1,
             "mid-slide Y={} should approx rest_y={} + offset={} (expected {})",
             mid_y, rest_y, mid_slide_offset as i32, expected,
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Niri-parity: move column vertically between workspaces
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_move_focused_column_to_workspace_down_basic() {
+        let mut engine = make_engine_fixed_1920();
+        // Two windows on workspace 0 → two columns.
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.add_window(make_window(101, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 100);
+
+        engine.move_focused_column_to_workspace(1, &BackendHandle::default_for_test());
+
+        let oid = engine.focused_output().unwrap();
+        let m = engine.monitors().get(&oid).unwrap();
+        // Focus + active workspace should now be on the destination (ws 1).
+        assert_eq!(m.active_workspace, 1, "focus follows the moved column to ws 1");
+        let dst = m.workspaces.get(&1).expect("ws 1 must exist after move");
+        assert_eq!(dst.columns.len(), 1, "destination ws should host one column");
+        assert_eq!(dst.columns[0].tiles[0].window_id, WindowId::new(100));
+        // Source workspace should still hold the second tile in its own column.
+        let src = m.workspaces.get(&0).expect("ws 0 still tracked");
+        assert_eq!(src.columns.len(), 1);
+        assert_eq!(src.columns[0].tiles[0].window_id, WindowId::new(101));
+    }
+
+    #[test]
+    fn test_move_focused_column_to_workspace_up_creates_destination() {
+        let mut engine = make_engine_fixed_1920();
+        // Start on workspace 2 with one tile; up = ws 1 which doesn't exist yet.
+        let oid = engine.focused_output().unwrap();
+        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(2);
+        engine.add_window(make_window(200, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 200);
+
+        engine.move_focused_column_to_workspace(-1, &BackendHandle::default_for_test());
+
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.active_workspace, 1, "focus relocates to ws 1");
+        let dst = m.workspaces.get(&1).expect("ws 1 was created");
+        assert_eq!(dst.columns.len(), 1);
+        assert_eq!(dst.columns[0].tiles[0].window_id, WindowId::new(200));
+        // Source ws 2 is now empty (and may have been reaped, but not before
+        // maintain_empty_workspace runs — we don't assert one way or the other
+        // beyond "destination has the tile").
+    }
+
+    #[test]
+    fn test_move_focused_column_to_workspace_up_at_floor_is_noop() {
+        // Workspace 0 is the implicit "lowest"; stepping up should be a no-op.
+        let mut engine = make_engine_fixed_1920();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 100);
+
+        let oid = engine.focused_output().unwrap();
+        let before = engine.monitors().get(&oid).unwrap().active_workspace;
+        assert_eq!(before, 0, "test setup: focused workspace is 0");
+
+        engine.move_focused_column_to_workspace(-1, &BackendHandle::default_for_test());
+
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.active_workspace, 0, "noop: still on ws 0");
+        assert_eq!(
+            m.workspaces.get(&0).unwrap().columns.len(),
+            1,
+            "the lone column should still live on ws 0"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Niri-parity: workspace move/swap (reorder the workspace stack)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_move_active_workspace_swap_down_basic() {
+        let mut engine = make_engine_fixed_1920();
+        // Workspace 0 has a window; workspace 1 also has one.  We'll swap
+        // 0 ↔ 1 and the contents should follow.
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        let oid = engine.focused_output().unwrap();
+        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(1);
+        engine.add_window(make_window(200, 0, 0), &BackendHandle::default_for_test());
+        // Back to ws 0 and swap it with ws 1.
+        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(0);
+
+        engine.move_active_workspace(1, &BackendHandle::default_for_test());
+
+        let m = engine.monitors().get(&oid).unwrap();
+        // Focus follows the moved workspace.
+        assert_eq!(m.active_workspace, 1, "focus relocates to ws 1");
+        let ws0 = m.workspaces.get(&0).expect("ws 0 still exists");
+        let ws1 = m.workspaces.get(&1).expect("ws 1 still exists");
+        // ws 1 should now host the originally-on-ws-0 window 100.
+        assert_eq!(ws1.columns[0].tiles[0].window_id, WindowId::new(100));
+        // ws 0 should now host the originally-on-ws-1 window 200.
+        assert_eq!(ws0.columns[0].tiles[0].window_id, WindowId::new(200));
+    }
+
+    #[test]
+    fn test_move_active_workspace_at_floor_is_noop() {
+        let mut engine = make_engine_fixed_1920();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        let oid = engine.focused_output().unwrap();
+        let snapshot_before: Vec<i32> = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspaces
+            .keys()
+            .copied()
+            .collect();
+
+        engine.move_active_workspace(-1, &BackendHandle::default_for_test());
+
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.active_workspace, 0, "noop: stays on ws 0");
+        // No new negative-id workspace was created.
+        assert!(
+            !m.workspaces.contains_key(&-1),
+            "must not create workspace at id -1; before: {:?}, after: {:?}",
+            snapshot_before,
+            m.workspaces.keys().copied().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_move_active_workspace_focus_follows_moved_workspace() {
+        let mut engine = make_engine_fixed_1920();
+        // Put a window on workspace 0 and remember its id.
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        let oid = engine.focused_output().unwrap();
+
+        engine.move_active_workspace(1, &BackendHandle::default_for_test());
+
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.active_workspace, 1);
+        // Focused window stays the same after the swap.
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Niri-parity: smart borders
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_smart_borders_lone_window_uses_sentinel() {
+        // smart_borders on + lone window → border cache stores the smart-borders
+        // sentinel (0xFFFFFFFE), not the focused/normal colour.
+        let mut engine = TilingEngine::new(LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            outer_gaps: (0, 0, 0, 0),
+            smart_borders: true,
+            ..LayoutConfig::default()
+        });
+        let oid = OutputId::from_name("M");
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 100);
+        engine.apply_all(&BackendHandle::default_for_test());
+
+        let cached = engine
+            .applied_state
+            .get(&WindowId::new(100))
+            .expect("lone tile should have cached state after apply_all");
+        assert_eq!(
+            cached.border_color, 0xFFFF_FFFE,
+            "lone-window smart-borders sentinel expected (0xFFFFFFFE), got 0x{:08X}",
+            cached.border_color,
+        );
+    }
+
+    #[test]
+    fn test_smart_borders_multiple_windows_keep_normal_color() {
+        // smart_borders on but 2 windows → normal focused colour applies.
+        let mut engine = TilingEngine::new(LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            outer_gaps: (0, 0, 0, 0),
+            smart_borders: true,
+            ..LayoutConfig::default()
+        });
+        let oid = OutputId::from_name("M");
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.add_window(make_window(101, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 100);
+        engine.apply_all(&BackendHandle::default_for_test());
+
+        let cached = engine
+            .applied_state
+            .get(&WindowId::new(100))
+            .expect("focused tile should have cached state");
+        // Focused colour is the engine default `#3381d9` → packed 0x003381d9.
+        let expected_focused = 0x0033_81d9u32;
+        assert_eq!(
+            cached.border_color, expected_focused,
+            "multi-window smart-borders must NOT engage; got 0x{:08X}, want 0x{:08X}",
+            cached.border_color, expected_focused,
+        );
+    }
+
+    #[test]
+    fn test_smart_borders_off_always_paints_normal_color() {
+        // smart_borders off + lone window → normal border colour applies.
+        let mut engine = TilingEngine::new(LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            outer_gaps: (0, 0, 0, 0),
+            smart_borders: false,
+            ..LayoutConfig::default()
+        });
+        let oid = OutputId::from_name("M");
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 100);
+        engine.apply_all(&BackendHandle::default_for_test());
+
+        let cached = engine
+            .applied_state
+            .get(&WindowId::new(100))
+            .expect("lone tile should have cached state after apply_all");
+        let expected_focused = 0x0033_81d9u32;
+        assert_eq!(
+            cached.border_color, expected_focused,
+            "smart-borders off: expect normal focused colour 0x{:08X}, got 0x{:08X}",
+            expected_focused, cached.border_color,
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Niri-parity: blur backdrop
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_blur_flag_round_trips_through_resolved_window_rules() {
+        // A window-rule with `blur true` must surface as
+        // ResolvedWindowRules.blur == true after rule resolution.
+        use crate::config::types::{Matcher, MatcherContext, WindowRule};
+        let rule = WindowRule {
+            matchers: vec![Matcher::ClassName("MyFloater".to_string())],
+            floating: true,
+            blur: true,
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+        let ctx = MatcherContext::from_legacy("MyFloater", "", None, None);
+        let resolved = crate::window::resolve_window_rules(&rules, &ctx);
+        assert!(
+            resolved.blur,
+            "resolved rules.blur should be true when the matching rule sets blur=true"
+        );
+        assert!(resolved.float, "floating is still honoured alongside blur");
+    }
+
+    #[test]
+    fn test_apply_window_blur_toggles_blur_applied_set() {
+        // apply_window_blur is idempotent: enabling twice does not re-call;
+        // disabling drops the HWND from the set so a re-enable applies again.
+        let mut engine = make_engine();
+        let hwnd: isize = 0xDEAD_BEEF;
+        let wid = WindowId::new(hwnd);
+
+        assert!(!engine.blur_applied.contains(&wid), "set starts empty");
+
+        engine.apply_window_blur(hwnd, true);
+        assert!(
+            engine.blur_applied.contains(&wid),
+            "enabling blur must record the HWND in blur_applied"
+        );
+
+        // Second enable is a no-op (already in the set).
+        engine.apply_window_blur(hwnd, true);
+        assert!(engine.blur_applied.contains(&wid), "set still contains HWND");
+        assert_eq!(engine.blur_applied.len(), 1, "no duplicate entries");
+
+        engine.apply_window_blur(hwnd, false);
+        assert!(
+            !engine.blur_applied.contains(&wid),
+            "disabling blur must drop the HWND from blur_applied"
         );
     }
 }

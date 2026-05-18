@@ -97,6 +97,14 @@ layout {
     // A tiny vertical line is painted at the active snap target.
     // snap-on-drag true
     // snap-threshold-px 20
+
+    // Smart borders (niri `borders { disable-when-only-one-window true }`
+    // parity): when `true`, suppress the DWM border on workspaces that
+    // contain exactly one column with exactly one tile.  Frees up usable
+    // space when there's nothing to delimit.  Default false.
+    // smart-borders true
+    // The equivalent nested form also works:
+    // borders { smart true }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -158,8 +166,21 @@ binds {
     Ctrl+Alt+Shift+H       shrink-column-width
     Ctrl+Alt+Shift+K       grow-tile-height
     Ctrl+Alt+Shift+J       shrink-tile-height
-    Ctrl+Alt+Shift+Page_Up    move-column-to-monitor-left
-    Ctrl+Alt+Shift+Page_Down  move-column-to-monitor-right
+    // Workspace + column reorder (niri parity)
+    //   Ctrl+Alt+Shift+Page_Up/Down → swap the focused workspace with the
+    //                                 one above / below on the same monitor
+    //   Ctrl+Alt+Shift+Up/Down      → move the focused column to the
+    //                                 workspace above / below (creates dst
+    //                                 workspace if missing)
+    //   Ctrl+Alt+Shift+Comma/Period → move-column-to-monitor-left/right
+    //                                 (relocated from Page_Up/Down so the
+    //                                 Page_* chords match the niri default)
+    Ctrl+Alt+Shift+Page_Up    move-workspace-up
+    Ctrl+Alt+Shift+Page_Down  move-workspace-down
+    Ctrl+Alt+Shift+Up         move-column-to-workspace-up
+    Ctrl+Alt+Shift+Down       move-column-to-workspace-down
+    Ctrl+Alt+Shift+Comma      move-column-to-monitor-left
+    Ctrl+Alt+Shift+Period     move-column-to-monitor-right
 
     // Quit
     Ctrl+Alt+Shift+Q quit
@@ -294,4 +315,14 @@ binds {
 //     // Strip Windows-Terminal native title-bar so tiles are pixel-perfect.
 //     class-name "CASCADIA_HOSTING_WINDOW_CLASS"
 //     opacity 1.0
+// }
+//
+// Blur backdrop (niri `blur { … }` parity) — request an Aero-style
+// `DwmEnableBlurBehindWindow` backdrop for any window matching the rule.
+// Best paired with `float true` so the blur sits over the desktop / lower
+// tiles instead of over the apps you're working with.
+// window-rule {
+//     class-name "MyFloater"
+//     float true
+//     blur true
 // }

@@ -248,6 +248,8 @@ pub struct LayoutConfigPartial {
     pub focus_ring_gap: Option<u32>,
     pub focus_ring_inactive_color: Option<String>,
     pub shadow_spread: Option<u32>,
+    /// Per-output override for `LayoutConfig::smart_borders`.
+    pub smart_borders: Option<bool>,
 }
 
 impl LayoutConfigPartial {
@@ -282,6 +284,7 @@ impl LayoutConfigPartial {
         if let Some(v) = self.focus_ring_gap { out.focus_ring_gap = v; }
         if let Some(ref v) = self.focus_ring_inactive_color { out.focus_ring_inactive_color = v.clone(); }
         if let Some(v) = self.shadow_spread { out.shadow_spread = v; }
+        if let Some(v) = self.smart_borders { out.smart_borders = v; }
         out
     }
 }
@@ -349,6 +352,13 @@ pub struct LayoutConfig {
     /// Defaults to 20 px.  A value of 0 disables snapping even when
     /// `snap_on_drag` is true.
     pub snap_threshold_px: u32,
+    /// niri-parity "smart borders": when `true`, suppress the DWM border on
+    /// any workspace that has exactly one column with exactly one tile (so a
+    /// single full-screen-ish window has no border to delimit it).  Multiple
+    /// columns or stacked tiles still show borders normally.  Defaults to
+    /// `false` to preserve historical behaviour — opt-in via
+    /// `border-smart true` or `border { smart true }` in `config.kdl`.
+    pub smart_borders: bool,
 }
 
 impl LayoutConfig {
@@ -382,6 +392,7 @@ impl LayoutConfig {
             shadow_spread: 0,
             snap_on_drag: true,
             snap_threshold_px: 20,
+            smart_borders: false,
         }
     }
 

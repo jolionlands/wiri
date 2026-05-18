@@ -5,6 +5,49 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — opus pass J (2026-05-18)
+- **Move column vertically between workspaces (niri parity)** — new
+  `Action::MoveColumnToWorkspaceUp` / `Action::MoveColumnToWorkspaceDown` plus
+  engine helper `move_focused_column_to_workspace(delta, backend)` lift every
+  tile in the focused column out of the current workspace and append them as
+  a single new column to `current_workspace_id + delta`.  Destination
+  workspace is created on demand; focus follows the moved column.  Default
+  binds: `Ctrl+Alt+Shift+Up` / `Ctrl+Alt+Shift+Down`.  IPC:
+  `MoveColumnToWorkspaceUp` / `MoveColumnToWorkspaceDown` +
+  `wiri-ctl move-column-up` / `move-column-down`.
+- **Workspace move/swap (niri parity)** — new
+  `Action::MoveWorkspaceUp` / `Action::MoveWorkspaceDown` plus engine helper
+  `move_active_workspace(delta, backend)` swap the focused workspace with the
+  workspace immediately above / below it on the same monitor.  Focus follows
+  the moved workspace.  Default binds: `Ctrl+Alt+Shift+Page_Up` /
+  `Ctrl+Alt+Shift+Page_Down` (relocated from `move-column-to-monitor-*`,
+  which moved to `Ctrl+Alt+Shift+Comma` / `Period` to match niri).  IPC +
+  ctl wired (`MoveWorkspaceUp` / `Down`, `move-workspace-up` /
+  `move-workspace-down`).
+- **Smart borders** — niri's `border { disable-when-only-one-window true }`
+  parity.  New `LayoutConfig.smart_borders: bool` (default `false`); when
+  enabled and the active workspace contains exactly one column with exactly
+  one tile, the per-tile DWM border colour is forced to the
+  `DWMWA_COLOR_DEFAULT` (`0xFFFFFFFF`) sentinel so the tile renders without
+  a wiri-painted outline.  KDL surface: flat `smart-borders true`, hyphen
+  variants, and nested `borders { smart true }`.  Honours per-output
+  `output { layout { smart-borders true } }` overrides.
+- **Blur backdrop for floating windows** — niri's `blur { … }` parity via
+  `DwmEnableBlurBehindWindow`.  New `ResolvedWindowRules.blur: bool` (was
+  previously misused as a "borderless proxy" — the legacy `resolved.border =
+  !rule.blur` line is replaced with a true `resolved.blur = rule.blur`
+  surface).  Engine helper `apply_window_blur(hwnd, enabled)` tracks state
+  in `blur_applied: HashSet<WindowId>` so DWM is called at most once per
+  HWND lifetime; entries are dropped in `remove_window` so HWND reuse
+  re-applies.  Wired into every `add_window_with_target` branch.
+- **System-critical hotkey passthrough guard** — new
+  `SYSTEM_CRITICAL_HOTKEYS` denylist + `is_system_critical_hotkey` helper.
+  `register_hotkeys` skips `Win+L` (lock screen), `Win+Shift+S` (snipping
+  tool), and `Win+D` (show desktop) before ever calling `RegisterHotKey`,
+  with a WARN-level log entry so the audit trail explains the skip.  Even
+  if a user binds one of these chords in `config.kdl`, the daemon refuses
+  to register it.
+
 ### Added — opus pass I (2026-05-18)
 - **Workspace-slide animation engine wiring** — `switch_workspace` now calls
   `AnimationManager::start_workspace_slide(...)` with `+work_area_height` (or

@@ -944,6 +944,62 @@ impl IpcServer {
                     }),
                 }
             }
+            IpcMessage::MoveColumnToWorkspaceUp => {
+                info!("IPC: MoveColumnToWorkspaceUp");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().move_focused_column_to_workspace(-1, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine/backend not initialized",
+                    }),
+                }
+            }
+            IpcMessage::MoveColumnToWorkspaceDown => {
+                info!("IPC: MoveColumnToWorkspaceDown");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().move_focused_column_to_workspace(1, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine/backend not initialized",
+                    }),
+                }
+            }
+            IpcMessage::MoveWorkspaceUp => {
+                info!("IPC: MoveWorkspaceUp");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().move_active_workspace(-1, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine/backend not initialized",
+                    }),
+                }
+            }
+            IpcMessage::MoveWorkspaceDown => {
+                info!("IPC: MoveWorkspaceDown");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().move_active_workspace(1, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine/backend not initialized",
+                    }),
+                }
+            }
             IpcMessage::CaptureWindow { window_hwnd, path } => {
                 info!("IPC: CaptureWindow hwnd={} path={:?}", window_hwnd, path);
                 // Validate that the HWND is one of the tracked windows so we

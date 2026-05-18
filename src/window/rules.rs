@@ -25,7 +25,14 @@ pub fn resolve_window_rules(rules: &[WindowRule], ctx: &MatcherContext<'_>) -> R
             if let Some(o) = rule.opacity {
                 resolved.opacity = Some(o.clamp(0.0, 1.0) as f32);
             }
-            resolved.border = !rule.blur; // blur is used as "borderless" proxy
+            // niri-parity blur backdrop: surface the rule's `blur` field on
+            // the resolved struct so the engine can call
+            // `DwmEnableBlurBehindWindow` once per HWND.  Last-rule-wins: any
+            // matching rule with `blur true` flips it on; matching rules
+            // that don't set blur leave the prior decision intact.
+            if rule.blur {
+                resolved.blur = true;
+            }
 
             // ── niri-parity `open-*` placement hints — last-rule-wins ──────
             // Only overwrite on Some(_) so a later rule that omits a field

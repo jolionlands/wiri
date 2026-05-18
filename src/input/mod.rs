@@ -127,6 +127,21 @@ pub enum Action {
     /// focused column / tile by 5% and Escape commits + exits.  Pressing
     /// the toggle again also exits.
     EnterResizeMode,
+    /// niri parity: move the focused column to the workspace immediately
+    /// above the current one (`current_workspace_id - 1`).  Creates the
+    /// destination workspace if it does not exist.  No-op when the focused
+    /// workspace is the lowest non-empty workspace and nothing is above it.
+    MoveColumnToWorkspaceUp,
+    /// niri parity: move the focused column to the workspace immediately
+    /// below the current one (`current_workspace_id + 1`).
+    MoveColumnToWorkspaceDown,
+    /// niri parity: swap the focused workspace with the workspace
+    /// immediately above it on the same monitor.  Focus stays on the
+    /// (now relocated) original workspace.  No-op at the edge.
+    MoveWorkspaceUp,
+    /// niri parity: swap the focused workspace with the workspace
+    /// immediately below it on the same monitor.
+    MoveWorkspaceDown,
 }
 
 /// Parse an action name string (from config/IPC) into an Action.
@@ -219,6 +234,14 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "enter-resize-mode" | "resize-mode" | "interactive-resize" => {
             Some(Action::EnterResizeMode)
         }
+        "move-column-to-workspace-up" | "move-column-up" | "move-column-to-workspace-above" => {
+            Some(Action::MoveColumnToWorkspaceUp)
+        }
+        "move-column-to-workspace-down" | "move-column-down" | "move-column-to-workspace-below" => {
+            Some(Action::MoveColumnToWorkspaceDown)
+        }
+        "move-workspace-up" | "swap-workspace-up" => Some(Action::MoveWorkspaceUp),
+        "move-workspace-down" | "swap-workspace-down" => Some(Action::MoveWorkspaceDown),
         "set-auto-tile" => {
             if args.is_empty() {
                 None
