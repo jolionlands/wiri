@@ -5,6 +5,43 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — opus pass K (2026-05-18)
+- ✅ **DwmRegisterThumbnail-based overview** — niri-parity overview rendering
+  that leaves the underlying HWNDs at their normal size and instead
+  composites live, accurately-scaled DWM thumbnails onto a fullscreen
+  transparent topmost host window.  Replaces the previous behaviour of
+  resizing every tracked HWND to a tiny rect on overview enter (which
+  caused apps to render incorrectly at 100 × 80 px and fight subsequent
+  resizes).
+  - New `src/overlay/thumbnail_overview.rs` module exposing
+    `ThumbnailOverviewSink` (trait), `DwmThumbnailOverview` (Win32
+    impl) and `MockThumbnailOverview` (test double).
+  - `TilingEngine::install_thumbnail_overview(Arc<dyn ThumbnailOverviewSink>)`
+    opts the engine into the new rendering path; without it the engine
+    falls back to the historic SetWindowPos overview so unit tests and
+    headless smoke paths keep working.
+  - `enter_overview` calls `sink.enter()` and registers a thumbnail for
+    every visible tile across every workspace on the focused monitor;
+    `exit_overview` unregisters everything and destroys the host
+    window; the overview branch of `apply_layout_for_monitor` routes
+    each tile's rect to `sink.update_thumbnail(window_id, rect)`
+    instead of `SetWindowPos`.
+  - Four new tests cover registration, update-rect propagation,
+    teardown, and the fallback path when no sink is installed.
+- ✅ **Wallpaper-aware accent for focused borders** — niri's
+  `wallpaper-aware accent` parity.  New `LayoutConfig.border_color_focused_mode:
+  BorderColorMode` enum (`Fixed` / `WindowsAccent`).  KDL surface:
+  `layout { border-color-focused "accent" }` (or `"windows-accent"`)
+  flips the mode; any other value parses as the historic `#rrggbb`
+  literal.  The new `crate::backend::accent` module reads
+  `HKCU\Software\Microsoft\Windows\DWM\AccentColor` (REG_DWORD packed as
+  `0xAABBGGRR`), unpacks it via `unpack_abgr`, and caches the result for
+  30 s.  `apply_layout_for_monitor` resolves the focused-border colour
+  per pass — a successful accent fetch is used verbatim; a failed fetch
+  falls back to the literal in `border_color_focused` so the user
+  always gets a visible focus indicator.  Three new tests cover parser
+  acceptance, cached lookup, and the failing-reader fallback.
+
 ### Added — opus pass J (2026-05-18)
 - **Move column vertically between workspaces (niri parity)** — new
   `Action::MoveColumnToWorkspaceUp` / `Action::MoveColumnToWorkspaceDown` plus

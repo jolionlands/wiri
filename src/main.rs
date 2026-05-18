@@ -276,6 +276,11 @@ async fn main() -> Result<()> {
         engine.set_full_config(config.clone());
         engine.set_layout_request_channel(layout_req_tx);
 
+        // Opt into DWM thumbnail-based overview: shrunken live previews of
+        // every window are composited by DWM instead of resizing the real
+        // HWNDs. Falls back gracefully if DWM is unavailable.
+        engine.install_thumbnail_overview(wiri::overlay::DwmThumbnailOverview::new());
+
         // Configure animations from config
         let anim_cfg = &config.animations;
         let easing = match anim_cfg.easing.as_str() {

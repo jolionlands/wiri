@@ -137,14 +137,12 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 
 ## Niri features genuinely missing (good first issues)
 
-These are concrete, scoped, and would tighten parity:
-
 - ✅ **Move-column-vertically-between-workspaces** — `Action::MoveColumnToWorkspaceUp` / `Down` shipped in opus pass J (default binds `Ctrl+Alt+Shift+Up/Down`).
 - ✅ **Workspace move/swap** — `Action::MoveWorkspaceUp` / `Down` shipped in opus pass J (default binds `Ctrl+Alt+Shift+Page_Up/Down`; column-to-monitor moved to `Ctrl+Alt+Shift+Comma/Period`).
 - ✅ **Smart-borders** — only draw border when more than one window is visible (`smart-borders true` or `borders { smart true }`, opus pass J).
-- **Wallpaper-aware accent** — DWM `DWMWA_CAPTION_COLOR` from system accent.
+- ✅ **Wallpaper-aware accent** — `layout { border-color-focused "accent" }` reads `HKCU\Software\Microsoft\Windows\DWM\AccentColor` (cached 30 s) and uses it as the focused-border colour; falls back to the configured literal when the registry lookup fails (opus pass K).
 - ✅ **Blur backdrop** for floating windows via `DwmEnableBlurBehindWindow` (window-rule `blur true`, opus pass J).
 - ✅ **Win+L lock screen passthrough** — opus pass J introduces `SYSTEM_CRITICAL_HOTKEYS` denylist (`Win+L`, `Win+Shift+S`, `Win+D`); `register_hotkeys` skips these before calling `RegisterHotKey`.
-- **More-faithful overview rendering** — DWM thumbnail per window (via `DwmRegisterThumbnail`) instead of resizing the live HWND.
+- ✅ **More-faithful overview rendering** — `DwmRegisterThumbnail`-backed overview ships in opus pass K (`crate::overlay::DwmThumbnailOverview` + `TilingEngine::install_thumbnail_overview`); the real HWNDs stay at their normal size while live thumbnails composite into a fullscreen transparent host.
 
-PRs welcome.
+All historical PARITY items have shipped. New feature requests (touch-gesture polish, tablet/stylus support, additional layer-shell-style widgets) are tracked in GitHub Issues going forward — PRs welcome.

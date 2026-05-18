@@ -1272,6 +1272,39 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_border_color_focused_accepts_hex_and_accent() {
+        // Hex literal — the parser stores the raw string verbatim; the
+        // engine's `LayoutConfig::from_config` is what interprets it.
+        let cfg = parse_kdl_config(r##"
+            layout {
+                border-color-focused "#abcdef"
+            }
+        "##)
+            .expect("hex parse");
+        assert_eq!(cfg.layout.border_color_focused, "#abcdef");
+
+        // "accent" sentinel — also accepted verbatim; engine flips the
+        // mode to WindowsAccent on `from_config`.
+        let cfg = parse_kdl_config(r#"
+            layout {
+                border-color-focused "accent"
+            }
+        "#)
+            .expect("accent parse");
+        assert_eq!(cfg.layout.border_color_focused, "accent");
+
+        // "windows-accent" alias — same code path; the engine recognises
+        // it as a sentinel too.
+        let cfg = parse_kdl_config(r#"
+            layout {
+                border-color-focused "windows-accent"
+            }
+        "#)
+            .expect("windows-accent parse");
+        assert_eq!(cfg.layout.border_color_focused, "windows-accent");
+    }
+
+    #[test]
     fn test_parse_animations() {
         let input = r#"
             animations {

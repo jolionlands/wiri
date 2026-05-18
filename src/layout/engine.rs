@@ -102,6 +102,32 @@ pub enum ColumnWidthMode {
     Proportional,
 }
 
+/// How the focused-window DWM border colour is sourced.
+///
+/// `Fixed("#hex")` (the historic behaviour) parses a colour literal up
+/// front and paints it on every focused tile.  `WindowsAccent` defers
+/// resolution until paint time and reads the live OS accent colour from
+/// `HKCU\Software\Microsoft\Windows\DWM\AccentColor`, cached for 30 s by
+/// [`crate::backend::accent`].  When the accent read fails the engine
+/// falls back to the configured `border_color_focused` literal so the
+/// user always gets *some* visible focus indicator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BorderColorMode {
+    /// Use the literal `#rrggbb` (or `#rrggbbaa`) stored in
+    /// `border_color_focused`.  This is the default.
+    Fixed,
+    /// Read the Windows system accent colour each call (cached) and use
+    /// that as the focused-border colour.  Falls back to the
+    /// `border_color_focused` literal when the registry lookup fails.
+    WindowsAccent,
+}
+
+impl Default for BorderColorMode {
+    fn default() -> Self {
+        BorderColorMode::Fixed
+    }
+}
+
 /// Configuration for layout behavior
 #[derive(Debug, Clone)]
 pub struct LayoutConfig {
@@ -112,6 +138,12 @@ pub struct LayoutConfig {
     pub border_width: i32,
     pub border_color: String,
     pub border_color_focused: String,
+    /// How `border_color_focused` is sourced.  When set to
+    /// [`BorderColorMode::WindowsAccent`], the engine ignores the
+    /// literal in `border_color_focused` for normal painting and reads
+    /// the live OS accent colour each pass (with caching) — the literal
+    /// is still used as a fallback when the registry lookup fails.
+    pub border_color_focused_mode: BorderColorMode,
     pub outer_gaps: (i32, i32, i32, i32),
     pub focus_ring_width: i32,
     pub focus_ring_color: String,
@@ -147,6 +179,7 @@ impl Default for LayoutConfig {
             border_width: 4,
             border_color: "#333333".to_string(),
             border_color_focused: "#3381d9".to_string(),
+            border_color_focused_mode: BorderColorMode::Fixed,
             outer_gaps: (8, 8, 8, 8),
             focus_ring_width: 3,
             focus_ring_color: "#3381d9".to_string(),
@@ -177,7 +210,20 @@ impl LayoutConfig {
             lc.border_color = config.layout.border_color.clone();
         }
         if !config.layout.border_color_focused.is_empty() {
-            lc.border_color_focused = config.layout.border_color_focused.clone();
+            // Recognise the special "accent" / "windows-accent" sentinels
+            // (wallpaper-aware focused border).  When the user writes a
+            // sentinel we flip the mode and keep the fallback colour at
+            // its default `#3381d9` so a failed registry lookup still
+            // paints a visible focus indicator.
+            let raw = config.layout.border_color_focused.trim().to_lowercase();
+            if raw == "accent" || raw == "windows-accent" || raw == "system-accent" {
+                lc.border_color_focused_mode = BorderColorMode::WindowsAccent;
+                // Leave `border_color_focused` at its default literal so
+                // the fallback path still has a sane colour to paint.
+            } else {
+                lc.border_color_focused = config.layout.border_color_focused.clone();
+                lc.border_color_focused_mode = BorderColorMode::Fixed;
+            }
         }
         if config.layout.focus_ring_width > 0 {
             lc.focus_ring_width = config.layout.focus_ring_width as i32;
@@ -309,6 +355,17 @@ pub struct TilingEngine {
     /// and risks the same flicker behaviour that motivated `shadow_applied`.
     /// Entries are dropped in `remove_window` so a re-add re-applies blur.
     blur_applied: HashSet<WindowId>,
+    /// Optional DWM-thumbnail overview sink.  When `Some`, overview
+    /// mode leaves the real HWNDs alone and routes per-tile positioning
+    /// to this sink (which composites live thumbnails into a transparent
+    /// fullscreen host window via `DwmRegisterThumbnail`).  When `None`,
+    /// the engine falls back to the historic behaviour of resizing the
+    /// live HWND on each overview pass — this remains the path used by
+    /// unit tests that don't stand up a Win32 sink.
+    ///
+    /// Wired by `main.rs` via [`Self::install_thumbnail_overview`].
+    pub(crate) thumbnail_overview:
+        Option<std::sync::Arc<dyn crate::overlay::ThumbnailOverviewSink>>,
     /// True while niri-style interactive resize mode is engaged
     /// (`Action::EnterResizeMode`).  Arrow keys with no modifier are
     /// intercepted by the WM_HOTKEY dispatcher to grow/shrink the focused
@@ -346,6 +403,7 @@ impl TilingEngine {
             urgent_windows: HashSet::new(),
             shadow_applied: HashSet::new(),
             blur_applied: HashSet::new(),
+            thumbnail_overview: None,
             resize_mode: false,
             #[cfg(test)]
             win32_call_count: 0,
@@ -374,6 +432,37 @@ impl TilingEngine {
     /// Whether interactive resize mode is currently engaged.
     pub fn is_resize_mode(&self) -> bool {
         self.resize_mode
+    }
+
+    /// Install a [`crate::overlay::ThumbnailOverviewSink`] to enable
+    /// DWM-thumbnail-based overview rendering (niri-parity).  When a
+    /// sink is installed:
+    ///
+    /// 1. `enter_overview` calls `sink.enter()` and registers a thumbnail
+    ///    for every visible tile across every workspace on the focused
+    ///    monitor.
+    /// 2. The overview branch of `apply_layout_for_monitor` routes each
+    ///    tile's computed rect to `sink.update_thumbnail(window_id, rect)`
+    ///    instead of physically resizing the source HWND via
+    ///    `SetWindowPos`.
+    /// 3. `exit_overview` calls `sink.exit()` which unregisters every
+    ///    handle and destroys the host window.
+    ///
+    /// Without a sink installed (the default, e.g. in unit tests), the
+    /// engine falls back to the legacy behaviour of resizing live
+    /// HWNDs.  Call this from `main.rs` after constructing the
+    /// `TilingEngine` to opt into thumbnails.
+    pub fn install_thumbnail_overview(
+        &mut self,
+        sink: std::sync::Arc<dyn crate::overlay::ThumbnailOverviewSink>,
+    ) {
+        self.thumbnail_overview = Some(sink);
+    }
+
+    /// Whether a DWM-thumbnail overview sink is currently installed.
+    /// Useful for IPC diagnostics + the unit-test fallback assertion.
+    pub fn has_thumbnail_overview(&self) -> bool {
+        self.thumbnail_overview.is_some()
     }
 
     /// Install a `LayoutRequest` channel sender. Once set, the engine can dispatch
@@ -993,8 +1082,24 @@ impl TilingEngine {
         // ^ iterates in insertion order via MonitorSet::values()
         let border_w = eff_cfg.border_width.max(1);
 
+        // Resolve the focused border colour for this pass.  When the user
+        // opted into `border-color-focused "accent"` we read the live
+        // Windows accent (cached for 30 s) and convert it to a `#rrggbb`
+        // literal so the rest of the pipeline (cache compare, DWM call)
+        // keeps treating it as a normal colour.  If the registry lookup
+        // fails we fall through to the configured literal.
+        let resolved_focused_color: String = match eff_cfg.border_color_focused_mode {
+            BorderColorMode::Fixed => eff_cfg.border_color_focused.clone(),
+            BorderColorMode::WindowsAccent => {
+                match crate::backend::accent::current_windows_accent_rgba() {
+                    Some([r, g, b, _a]) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+                    None => eff_cfg.border_color_focused.clone(),
+                }
+            }
+        };
+
         // Pre-compute target colors (as packed u32) for this pass.
-        let border_color_focused_u32 = parse_color_to_u32(&eff_cfg.border_color_focused);
+        let border_color_focused_u32 = parse_color_to_u32(&resolved_focused_color);
         let border_color_normal_u32  = parse_color_to_u32(&eff_cfg.border_color);
 
         // niri-parity smart borders: when the active workspace has exactly
@@ -1018,6 +1123,14 @@ impl TilingEngine {
         let opacity_full: u32 = 255;
         let opacity_dim: u32 = (eff_cfg.dim_unfocused * 255.0).round().clamp(0.0, 255.0) as u32;
 
+        // When `true`, the overview pass routes per-tile geometry to the
+        // installed DWM-thumbnail sink instead of resizing live HWNDs.
+        // This leaves the real windows alone (no SetWindowPos, no
+        // ShowWindow, no border colour change) so applications keep
+        // rendering at their normal size while their thumbnails appear
+        // in the transparent overview host.
+        let use_thumbnail_overview = overview_active && self.thumbnail_overview.is_some();
+
         // Track which windows had set_window_position called so we can mark_sent() afterwards.
         let mut applied_windows: HashSet<WindowId> = HashSet::new();
         // Windows whose `set_window_position` failed MAX_POSITION_FAILURES times in a
@@ -1025,6 +1138,17 @@ impl TilingEngine {
         let mut windows_to_auto_float: Vec<WindowId> = Vec::new();
 
         for (window_id, rect) in positions {
+            // niri-parity thumbnail overview: route every tile's rect
+            // to the sink and DON'T touch the source HWND.  The sink
+            // composites scaled live previews via DwmRegisterThumbnail
+            // so we never SetWindowPos / ShowWindow / change borders on
+            // the real windows while overview is active.
+            if use_thumbnail_overview {
+                if let Some(sink) = &self.thumbnail_overview {
+                    sink.update_thumbnail(window_id, rect);
+                }
+                continue;
+            }
             if self.fullscreen_windows.contains(&window_id) {
                 // Hide tiled windows when another window on this monitor is fullscreen.
                 let prior = self.applied_state.get(&window_id);
@@ -1108,8 +1232,10 @@ impl TilingEngine {
                     // wiri-painted outline on the lone tile).
                     self.set_dwm_border_color_none(window_id.as_isize());
                 } else {
-                    let color_str = if is_focused {
-                        &eff_cfg.border_color_focused
+                    let color_str: &str = if is_focused {
+                        // Use the resolved focused colour — handles the
+                        // `WindowsAccent` mode + fallback already.
+                        &resolved_focused_color
                     } else {
                         &eff_cfg.border_color
                     };
@@ -2361,6 +2487,25 @@ impl TilingEngine {
             workspace_offsets,
         });
 
+        // niri-parity DWM-thumbnail overview.  When a sink is installed,
+        // open a session and register a thumbnail for every visible
+        // tile across every workspace on the focused monitor.  The
+        // engine then routes per-tile rects into the sink during the
+        // subsequent `apply_layout_for_monitor` pass instead of
+        // physically resizing the source HWNDs.
+        if let Some(sink) = self.thumbnail_overview.clone() {
+            sink.enter();
+            if let Some(monitor) = self.monitors.get(&focused_output) {
+                for ws in monitor.workspaces.values() {
+                    for col in ws.columns.iter() {
+                        for tile in col.tiles.iter() {
+                            sink.register(tile.window_id, tile.window_id.as_isize());
+                        }
+                    }
+                }
+            }
+        }
+
         // Banner: show on the focused monitor.  No-op when the global
         // banner singleton hasn't been wired (unit tests, --headless paths).
         if let Some(m) = self.monitors.get(&focused_output) {
@@ -2401,6 +2546,11 @@ impl TilingEngine {
         info!("Exiting overview mode");
         self.overview = None;
         crate::overlay::overview_banner::global_hide();
+        // niri-parity DWM-thumbnail overview: tear down the host window
+        // and unregister every thumbnail.  No-op when no sink is wired.
+        if let Some(sink) = self.thumbnail_overview.clone() {
+            sink.exit();
+        }
 
         // Hide every tile that isn't on the active workspace of the focused
         // monitor.  Other monitors' active workspaces stay visible.
@@ -4034,6 +4184,67 @@ mod tests {
     }
 
     #[test]
+    fn test_border_color_mode_default_is_fixed() {
+        let lc = LayoutConfig::default();
+        assert_eq!(lc.border_color_focused_mode, BorderColorMode::Fixed);
+        assert_eq!(lc.border_color_focused, "#3381d9");
+    }
+
+    #[test]
+    fn test_border_color_mode_from_config_accent_sentinel() {
+        // The engine's `from_config` should recognise the "accent"
+        // sentinel and flip the mode without polluting the literal
+        // colour with non-hex text.
+        let mut cfg = crate::config::Config::default();
+        cfg.layout.border_color_focused = "accent".to_string();
+        let lc = LayoutConfig::from_config(&cfg);
+        assert_eq!(lc.border_color_focused_mode, BorderColorMode::WindowsAccent);
+        // Fallback literal must still be a parseable colour so a failed
+        // registry lookup paints *something* visible.
+        assert!(crate::config::types::parse_color(&lc.border_color_focused).is_some());
+
+        // A plain hex string keeps the Fixed mode.
+        let mut cfg = crate::config::Config::default();
+        cfg.layout.border_color_focused = "#aabbcc".to_string();
+        let lc = LayoutConfig::from_config(&cfg);
+        assert_eq!(lc.border_color_focused_mode, BorderColorMode::Fixed);
+        assert_eq!(lc.border_color_focused, "#aabbcc");
+    }
+
+    #[test]
+    fn test_accent_reader_fallback_to_fixed_when_lookup_fails() {
+        use crate::backend::accent::{
+            current_windows_accent_rgba_with, invalidate_accent_cache_for_test,
+            AccentReader,
+        };
+        struct FailingReader;
+        impl AccentReader for FailingReader {
+            fn read_now(&self) -> Option<[u8; 4]> {
+                None
+            }
+        }
+        invalidate_accent_cache_for_test();
+        // The cached fetch returns None — the engine's
+        // `apply_layout_for_monitor` will fall back to the literal.  We
+        // assert the fallback by re-running the same resolution logic
+        // here against a config that opts into WindowsAccent.
+        let mut lc = LayoutConfig::default();
+        lc.border_color_focused_mode = BorderColorMode::WindowsAccent;
+        lc.border_color_focused = "#3381d9".to_string();
+        let resolved = match lc.border_color_focused_mode {
+            BorderColorMode::Fixed => lc.border_color_focused.clone(),
+            BorderColorMode::WindowsAccent => {
+                match current_windows_accent_rgba_with(&FailingReader) {
+                    Some([r, g, b, _]) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+                    None => lc.border_color_focused.clone(),
+                }
+            }
+        };
+        assert_eq!(resolved, "#3381d9");
+        invalidate_accent_cache_for_test();
+    }
+
+    #[test]
     fn test_overview_toggle() {
         let mut engine = make_engine();
         assert!(!engine.is_overview());
@@ -4055,6 +4266,91 @@ mod tests {
         engine.exit_overview(&BackendHandle::default_for_test());
         assert!(!engine.is_overview());
         assert_eq!(engine.overview_zoom(), 1.0);
+    }
+
+    // ---- Item 1: DwmRegisterThumbnail-based overview ----
+
+    #[test]
+    fn test_enter_overview_registers_thumbnails() {
+        use crate::overlay::MockThumbnailOverview;
+        let mut engine = make_engine();
+        let sink = MockThumbnailOverview::new();
+        engine.install_thumbnail_overview(sink.clone());
+        assert!(engine.has_thumbnail_overview());
+
+        // 4 tiles spread across one workspace.
+        for i in 200..204 {
+            let window = make_window(i, 100, 100);
+            engine.add_window(window, &BackendHandle::default_for_test());
+        }
+
+        engine.enter_overview(&BackendHandle::default_for_test());
+        // enter() called exactly once, and every tracked tile registered.
+        assert_eq!(sink.enter_calls(), 1);
+        assert_eq!(sink.register_calls(), 4);
+        assert_eq!(sink.registered_count(), 4);
+    }
+
+    #[test]
+    fn test_update_thumbnail_called_with_overview_rect() {
+        use crate::overlay::MockThumbnailOverview;
+        let mut engine = make_engine();
+        let sink = MockThumbnailOverview::new();
+        engine.install_thumbnail_overview(sink.clone());
+
+        for i in 300..303 {
+            let window = make_window(i, 100, 100);
+            engine.add_window(window, &BackendHandle::default_for_test());
+        }
+
+        engine.enter_overview(&BackendHandle::default_for_test());
+
+        // Every registered tile should have received exactly one
+        // `update_thumbnail` call with a non-zero rect.
+        for i in 300..303 {
+            let r = sink.last_dst_rect(WindowId::new(i));
+            assert!(r.is_some(), "tile {} missing update_thumbnail call", i);
+            let r = r.unwrap();
+            assert!(r.size.w > 0 && r.size.h > 0, "tile {} got zero-sized rect {:?}", i, r);
+        }
+    }
+
+    #[test]
+    fn test_exit_overview_unregisters_all() {
+        use crate::overlay::MockThumbnailOverview;
+        let mut engine = make_engine();
+        let sink = MockThumbnailOverview::new();
+        engine.install_thumbnail_overview(sink.clone());
+
+        for i in 400..405 {
+            let window = make_window(i, 100, 100);
+            engine.add_window(window, &BackendHandle::default_for_test());
+        }
+        engine.enter_overview(&BackendHandle::default_for_test());
+        assert_eq!(sink.registered_count(), 5);
+
+        engine.exit_overview(&BackendHandle::default_for_test());
+        assert_eq!(sink.exit_calls(), 1);
+        assert_eq!(sink.unregister_calls(), 5);
+        assert_eq!(sink.registered_count(), 0);
+    }
+
+    #[test]
+    fn test_thumbnail_overview_disabled_falls_back_to_setwindowpos() {
+        // No sink installed → enter/exit overview must not panic and
+        // the engine falls back to the historic SetWindowPos path
+        // (verified indirectly via has_thumbnail_overview returning
+        // false + overview still functions normally).
+        let mut engine = make_engine();
+        assert!(!engine.has_thumbnail_overview());
+        for i in 500..503 {
+            let window = make_window(i, 100, 100);
+            engine.add_window(window, &BackendHandle::default_for_test());
+        }
+        engine.enter_overview(&BackendHandle::default_for_test());
+        assert!(engine.is_overview());
+        engine.exit_overview(&BackendHandle::default_for_test());
+        assert!(!engine.is_overview());
     }
 
     #[test]

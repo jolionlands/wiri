@@ -262,7 +262,16 @@ impl LayoutConfigPartial {
         if let Some(v) = self.outer_gaps { out.outer_gaps = v; }
         if let Some(v) = self.border_width { out.border_width = v; }
         if let Some(ref v) = self.border_color { out.border_color = v.clone(); }
-        if let Some(ref v) = self.border_color_focused { out.border_color_focused = v.clone(); }
+        if let Some(ref v) = self.border_color_focused {
+            // Per-output override: an "accent" / "windows-accent" sentinel
+            // is intentionally NOT stored as a literal — the engine reads
+            // the mode at apply time.  We keep this partial as a `String`
+            // so the parser surface stays uniform, but the engine
+            // (`LayoutConfig::from_config`) handles the "accent" branch
+            // by reading the same sentinel out of the partial-folded
+            // string.  Empty overrides keep the parent value.
+            out.border_color_focused = v.clone();
+        }
         if let Some(v) = self.focus_ring_width { out.focus_ring_width = v; }
         if let Some(v) = self.dim_unfocused { out.dim_unfocused = v; }
         if let Some(ref v) = self.focus_ring_color { out.focus_ring_color = v.clone(); }
