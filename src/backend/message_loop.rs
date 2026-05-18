@@ -62,6 +62,13 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (prefix, 0x4C, Action::ScrollRight),           // L
         (shift_prefix, 0x51, Action::Quit),            // Shift+Q
         (prefix, 0x20, Action::OverviewToggle),        // Space
+        // Bare Escape → OverviewToggle.  Conceptually wrong on its own
+        // (we don't want Escape to enter overview), so the WM_HOTKEY
+        // dispatcher in `run_message_loop` state-gates this binding: the
+        // action only fires when overview is already active.  Registered
+        // unconditionally so the OS knows the chord belongs to wiri while
+        // overview is on.
+        (0, 0x1B, Action::OverviewToggle),             // Escape (gated)
         (prefix, 0x4F, Action::OverviewSelect),        // O
         (prefix, 0xDC, Action::ColumnToggleTabbed),    // \
         (prefix, 0xDD, Action::TabNext),               // ]
@@ -169,11 +176,14 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
     hotkeys
 }
 
-/// Register a list of hotkeys with Windows, returning the IDs and action map
+/// Register a list of hotkeys with Windows, returning the IDs, action map,
+/// and the subset of hotkey ids that must be state-gated on overview mode
+/// (i.e. bare Escape → OverviewToggle, which should only fire when overview
+/// is already active so the user can press Esc to exit).
 fn register_hotkeys(
     hwnd: HWND,
     hotkeys: &[(u32, u32, Action)],
-) -> (Vec<i32>, HashMap<i32, Action>) {
+) -> (Vec<i32>, HashMap<i32, Action>, std::collections::HashSet<i32>) {
     let base_id = 32768i32;
     let mut registered_ids: Vec<i32> = Vec::new();
 
@@ -199,7 +209,22 @@ fn register_hotkeys(
         .map(|(i, (_, _, action))| (base_id + i as i32, action.clone()))
         .collect();
 
-    (registered_ids, action_map)
+    // Detect bare-Escape → OverviewToggle bindings (mods=0, vk=0x1B) — those
+    // must be gated on `engine.is_overview()` so Esc remains usable outside
+    // overview mode.
+    let overview_exit_only: std::collections::HashSet<i32> = hotkeys
+        .iter()
+        .enumerate()
+        .filter(|(i, (mods, vk, action))| {
+            *mods == 0
+                && *vk == 0x1B
+                && matches!(action, Action::OverviewToggle)
+                && registered_ids.contains(&(base_id + *i as i32))
+        })
+        .map(|(i, _)| base_id + i as i32)
+        .collect();
+
+    (registered_ids, action_map, overview_exit_only)
 }
 
 /// Unregister all hotkeys by ID
@@ -222,6 +247,57 @@ struct HotkeyThreadState {
 }
 
 static HOTKEY_THREAD: Mutex<Option<HotkeyThreadState>> = Mutex::new(None);
+
+/// Snapshot of the currently registered hotkey bindings, refreshed by the
+/// hotkey thread on every `register_hotkeys` call (initial + hot-reload).
+/// Exposed via `MessageLoop::current_bindings()` so the IPC `ListBindings`
+/// handler can return what the daemon really registered (vs what was in the
+/// config) — useful for diagnosing why a chord isn't firing.
+static REGISTERED_BINDINGS: Mutex<Vec<RegisteredBinding>> = Mutex::new(Vec::new());
+
+/// One registered hotkey binding, used by `MessageLoop::current_bindings`.
+#[derive(Debug, Clone)]
+pub struct RegisteredBinding {
+    /// Win32 hotkey id returned by `RegisterHotKey`.
+    pub id: i32,
+    /// Win32 MOD_* bitmask (1=Alt, 2=Ctrl, 4=Shift, 8=Win).
+    pub modifiers: u32,
+    /// Win32 VK_* virtual key code.
+    pub vk_code: u32,
+    /// Action this binding fires.  Held as a debug-formatted string so the
+    /// IPC layer (which doesn't depend on `Action`'s serde impl) can ship it.
+    pub action: String,
+}
+
+/// Refresh the global REGISTERED_BINDINGS snapshot after a (re-)registration
+/// pass.  Stores only bindings that Windows actually accepted (i.e. whose ID
+/// appears in `registered_ids`) so users get a true picture of what's live.
+fn update_current_bindings_snapshot(
+    hotkeys: &[(u32, u32, Action)],
+    registered_ids: &[i32],
+) {
+    let base_id = 32768i32;
+    let mut snap: Vec<RegisteredBinding> = Vec::with_capacity(hotkeys.len());
+    for (i, (mods, vk, action)) in hotkeys.iter().enumerate() {
+        let id = base_id + i as i32;
+        if !registered_ids.contains(&id) {
+            continue;
+        }
+        snap.push(RegisteredBinding {
+            id,
+            modifiers: *mods,
+            vk_code: *vk,
+            action: format!("{:?}", action),
+        });
+    }
+    *REGISTERED_BINDINGS.lock() = snap;
+}
+
+/// Return a clone of every hotkey currently registered with Windows.
+/// Empty when the hotkey thread hasn't started or registration failed.
+pub fn current_bindings() -> Vec<RegisteredBinding> {
+    REGISTERED_BINDINGS.lock().clone()
+}
 
 pub struct MessageLoop {
     running: Arc<Mutex<bool>>,
@@ -295,9 +371,13 @@ impl MessageLoop {
             hwnd: Some(SendHwnd(hwnd)),
         });
 
-        // Register initial hotkeys
-        let hotkeys = build_hotkey_list(&engine);
-        let (mut registered_ids, mut action_map) = register_hotkeys(hwnd, &hotkeys);
+        // Register initial hotkeys.  Keep `current_hotkeys` so the snapshot
+        // and hot-reload paths share a single source of truth.
+        let current_hotkeys = build_hotkey_list(&engine);
+        let (mut registered_ids, mut action_map, mut overview_exit_only) =
+            register_hotkeys(hwnd, &current_hotkeys);
+        // Snapshot mirror for `current_bindings()` queries from IPC.
+        update_current_bindings_snapshot(&current_hotkeys, &registered_ids);
 
         *running.lock() = true;
         info!("Hotkey message loop started on thread {:?}", std::thread::current().id());
@@ -318,15 +398,30 @@ impl MessageLoop {
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
                     let new_hotkeys = build_hotkey_list(&engine);
-                    let (new_ids, new_map) = register_hotkeys(hwnd, &new_hotkeys);
+                    let (new_ids, new_map, new_exit_only) =
+                        register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
                     action_map = new_map;
+                    overview_exit_only = new_exit_only;
+                    update_current_bindings_snapshot(&new_hotkeys, &registered_ids);
                     info!("Hotkey reload complete");
                     continue;
                 }
                 if msg.message == 0x0312 { // WM_HOTKEY
                     let hotkey_id = msg.wParam.0 as i32;
                     if let Some(action) = action_map.get(&hotkey_id) {
+                        // Esc → OverviewToggle is registered globally but only
+                        // dispatched when overview is currently active.  This
+                        // keeps Esc available to other apps in normal mode.
+                        if overview_exit_only.contains(&hotkey_id)
+                            && !engine.read().is_overview()
+                        {
+                            // Swallow the keypress silently — Windows already
+                            // routed Esc to us instead of the foreground app.
+                            // Re-posting it is unreliable, but the user expected
+                            // overview-only behaviour anyway.
+                            continue;
+                        }
                         info!("HOTKEY id={} -> {:?}", hotkey_id, action);
                         execute_action(action, &engine, &backend_handle);
                     }
@@ -404,6 +499,14 @@ impl MessageLoop {
     }
 
     pub fn is_running(&self) -> bool { *self.running.lock() }
+
+    /// Diagnostic accessor: return a clone of the currently registered hotkey
+    /// table (after the most recent `register_hotkeys` pass).  Used by the
+    /// `ListBindings` IPC handler so `wiri-ctl test-bindings` can tell users
+    /// what the daemon really registered vs what their config asked for.
+    pub fn current_bindings(&self) -> Vec<RegisteredBinding> {
+        current_bindings()
+    }
 
     pub async fn run(&mut self) -> Result<()> {
         // Set running=true synchronously so the polling loop does not return
@@ -731,6 +834,29 @@ fn execute_action(
             engine.write().move_column_to_monitor(crate::layout::ScrollDirection::Right, backend);
             engine.write().apply_all(backend);
         }
+        Action::WindowScreenshot => {
+            // Capture the foreground window via PrintWindow. Resolves the
+            // HWND through `GetForegroundWindow()` so this works for any
+            // tile the user has focused (engine MRU isn't consulted —
+            // intent matches what's on screen at hotkey time).
+            take_window_screenshot();
+        }
+    }
+}
+
+/// Capture the foreground window's bounding rect via the shared helper in
+/// `crate::hooks::capture_focused_window_to_pictures` so the hotkey path,
+/// the tray menu, and the IPC `CaptureWindow` request all obey identical
+/// destination-resolution rules.
+fn take_window_screenshot() {
+    let hwnd: isize = unsafe { GetForegroundWindow().0 as isize };
+    if hwnd == 0 {
+        warn!("WindowScreenshot: no foreground window to capture");
+        return;
+    }
+    match crate::hooks::capture_focused_window_to_pictures(hwnd) {
+        Ok(path) => info!("Window screenshot saved to {}", path),
+        Err(e) => warn!("Window screenshot failed: {}", e),
     }
 }
 

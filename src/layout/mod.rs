@@ -2,6 +2,7 @@ pub mod workspace;
 pub mod floating;
 pub mod engine;
 pub mod animation;
+pub mod snap;
 
 pub use workspace::{Workspace, Column, ColumnDisplay, Tile, compute_column_layout, compute_workspace_layout};
 pub use floating::{FloatManager, FloatWindow};

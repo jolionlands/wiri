@@ -49,4 +49,6 @@ windows = { version = "0.58", features = [
     "Win32_UI_HiDpi",
     "Win32_System_Console",
     "Win32_System_SystemInformation",
+    "Win32_System_Services",
+    "Win32_Storage_Xps",
 ] }

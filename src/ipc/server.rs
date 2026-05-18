@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::layout::TilingEngine;
-use super::messages::{IpcEvent, IpcMessage, MonitorInfo, WorkspaceInfo};
+use super::messages::{BindingInfo, IpcEvent, IpcMessage, MonitorInfo, WorkspaceInfo};
 use super::PIPE_PATH;
 
 pub struct IpcServer {
@@ -821,6 +821,24 @@ impl IpcServer {
                     _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
                 }
             }
+            IpcMessage::ListBindings => {
+                // Pull the snapshot from the message-loop module; never blocks,
+                // never touches the engine, no backend lookups.  Includes
+                // bindings that successfully registered with Windows so users
+                // see what the daemon really listens for (vs the config file).
+                let raw = crate::backend::message_loop::current_bindings();
+                let bindings: Vec<BindingInfo> = raw
+                    .into_iter()
+                    .map(|b| BindingInfo {
+                        id: b.id,
+                        modifiers: b.modifiers,
+                        vk_code: b.vk_code,
+                        action: b.action,
+                        chord: format_chord(b.modifiers, b.vk_code),
+                    })
+                    .collect();
+                serde_json::json!({"success": true, "result": { "bindings": bindings }})
+            }
             IpcMessage::MoveColumnToMonitor { direction } => {
                 info!("IPC: MoveColumnToMonitor direction={}", direction);
                 match (&self.engine, &self.backend) {
@@ -834,6 +852,47 @@ impl IpcServer {
                         serde_json::json!({"success": true})
                     }
                     _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::CaptureWindow { window_hwnd, path } => {
+                info!("IPC: CaptureWindow hwnd={} path={:?}", window_hwnd, path);
+                // Validate that the HWND is one of the tracked windows so we
+                // don't let an arbitrary process trigger captures of other
+                // apps' windows through the daemon's pipe.
+                let is_tracked = match &self.engine {
+                    Some(e) => {
+                        let eng = e.read();
+                        let wid = crate::utils::WindowId::new(window_hwnd);
+                        eng.tiled_windows().contains_key(&wid)
+                    }
+                    None => false,
+                };
+                if !is_tracked {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": format!("window {} is not tracked by wiri", window_hwnd),
+                    });
+                }
+                // Resolve output path.
+                let dest = match path.as_ref().map(std::path::PathBuf::from) {
+                    Some(p) => p,
+                    None => match crate::hooks::spawner::default_window_capture_path(window_hwnd) {
+                        Ok(p) => p,
+                        Err(e) => return serde_json::json!({
+                            "success": false,
+                            "error": format!("could not resolve default path: {}", e),
+                        }),
+                    },
+                };
+                match crate::hooks::spawner::capture_window_to_file(window_hwnd, &dest) {
+                    Ok(()) => serde_json::json!({
+                        "success": true,
+                        "result": { "path": dest.to_string_lossy() },
+                    }),
+                    Err(e) => serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
                 }
             }
         }
@@ -1009,6 +1068,61 @@ fn create_pipe_with_sa(
     };
     let _ = sa_opt; // keep alive until after the create call.
     Ok(server)
+}
+
+/// Format a Win32 modifier bitmask + VK code as a "Ctrl+Alt+Space" style
+/// chord string for human display in `wiri-ctl test-bindings`.
+///
+/// Modifier bits map to (1=Alt, 2=Ctrl, 4=Shift, 8=Win); see
+/// `MOD_ALT/MOD_CONTROL/MOD_SHIFT/MOD_WIN` in
+/// `windows::Win32::UI::Input::KeyboardAndMouse`.  Unknown VKs are rendered
+/// as a hex constant.
+pub fn format_chord(modifiers: u32, vk: u32) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if modifiers & 0x0002 != 0 { parts.push("Ctrl"); }
+    if modifiers & 0x0001 != 0 { parts.push("Alt"); }
+    if modifiers & 0x0004 != 0 { parts.push("Shift"); }
+    if modifiers & 0x0008 != 0 { parts.push("Win"); }
+    let key = match vk {
+        0x08 => "Backspace".to_string(),
+        0x09 => "Tab".to_string(),
+        0x0D => "Enter".to_string(),
+        0x13 => "Pause".to_string(),
+        0x14 => "CapsLock".to_string(),
+        0x1B => "Escape".to_string(),
+        0x20 => "Space".to_string(),
+        0x21 => "PageUp".to_string(),
+        0x22 => "PageDown".to_string(),
+        0x23 => "End".to_string(),
+        0x24 => "Home".to_string(),
+        0x25 => "Left".to_string(),
+        0x26 => "Up".to_string(),
+        0x27 => "Right".to_string(),
+        0x28 => "Down".to_string(),
+        0x2C => "PrintScreen".to_string(),
+        0x2D => "Insert".to_string(),
+        0x2E => "Delete".to_string(),
+        0x30..=0x39 => ((b'0' + (vk - 0x30) as u8) as char).to_string(),
+        0x41..=0x5A => ((b'A' + (vk - 0x41) as u8) as char).to_string(),
+        0x70..=0x7B => format!("F{}", vk - 0x70 + 1),
+        0xBA => ";".to_string(),
+        0xBB => "+".to_string(),
+        0xBC => ",".to_string(),
+        0xBD => "-".to_string(),
+        0xBE => ".".to_string(),
+        0xBF => "/".to_string(),
+        0xC0 => "`".to_string(),
+        0xDB => "[".to_string(),
+        0xDC => "\\".to_string(),
+        0xDD => "]".to_string(),
+        0xDE => "'".to_string(),
+        _ => format!("0x{:02X}", vk),
+    };
+    if parts.is_empty() {
+        key
+    } else {
+        format!("{}+{}", parts.join("+"), key)
+    }
 }
 
 /// Build a SECURITY_ATTRIBUTES that grants full access only to

@@ -339,6 +339,16 @@ pub struct LayoutConfig {
     pub focus_ring_inactive_color: String,
     /// Shadow spread (px). Default 0.
     pub shadow_spread: u32,
+    /// Snap a dragged tile to nearby column edges / mid-screen guides while
+    /// the user is holding Alt and dragging with the left mouse button
+    /// (niri parity).  When false, no snapping happens and the window
+    /// follows the cursor pixel-for-pixel.
+    pub snap_on_drag: bool,
+    /// Maximum cursor-to-candidate distance (in logical pixels) that
+    /// triggers a snap.  Smaller = the user has to land closer to a guide.
+    /// Defaults to 20 px.  A value of 0 disables snapping even when
+    /// `snap_on_drag` is true.
+    pub snap_threshold_px: u32,
 }
 
 impl LayoutConfig {
@@ -370,6 +380,8 @@ impl LayoutConfig {
             focus_ring_gap: 0,
             focus_ring_inactive_color: String::new(),
             shadow_spread: 0,
+            snap_on_drag: true,
+            snap_threshold_px: 20,
         }
     }
 

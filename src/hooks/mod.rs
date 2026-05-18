@@ -100,6 +100,40 @@ impl SystemIntegration {
                     }
                     continue;
                 }
+                TrayAction::CaptureWindow => {
+                    // Resolve the focused HWND via `GetForegroundWindow()` so
+                    // we don't need the engine here.  Matches what the user
+                    // sees focused on screen at the moment they click the
+                    // menu entry.
+                    let hwnd_isize: isize = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize
+                    };
+                    if hwnd_isize == 0 {
+                        tracing::warn!("Tray: CaptureWindow — no foreground window");
+                        let _ = self.tray.show_balloon(
+                            "wiri — capture failed",
+                            "No focused window to capture.",
+                        );
+                        continue;
+                    }
+                    match capture_focused_window_to_pictures(hwnd_isize) {
+                        Ok(path) => {
+                            tracing::info!("Tray: window capture saved to {}", path);
+                            let _ = self.tray.show_balloon(
+                                "wiri — window capture",
+                                &format!("Saved to {}", path),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Tray: window capture failed: {}", e);
+                            let _ = self.tray.show_balloon(
+                                "wiri — capture failed",
+                                &e.to_string(),
+                            );
+                        }
+                    }
+                    continue;
+                }
                 other => return Some(other),
             }
         }
@@ -156,5 +190,15 @@ pub fn capture_screenshot_to_pictures() -> anyhow::Result<String> {
         })?;
 
     Spawner::capture_screenshot_to_file(None, &dest)?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+/// Capture a single window by HWND to a BMP file under the same
+/// destination policy as `capture_screenshot_to_pictures` — Pictures
+/// folder when writable, otherwise the current working directory.
+/// Returns the full destination path (as a String) on success.
+pub fn capture_focused_window_to_pictures(hwnd: isize) -> anyhow::Result<String> {
+    let dest = spawner::default_window_capture_path(hwnd)?;
+    spawner::capture_window_to_file(hwnd, &dest)?;
     Ok(dest.to_string_lossy().into_owned())
 }

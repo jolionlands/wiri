@@ -3,6 +3,7 @@ pub mod grab;
 pub mod mouse;
 pub mod low_level_hook;
 pub mod touch;
+pub mod snap_guide;
 
 pub use hotkey::{HotkeyBinding, HotkeyId};
 pub use grab::{MoveGrab, ResizeGrab, ResizeEdge};
@@ -112,6 +113,11 @@ pub enum Action {
     MoveColumnToMonitorLeft,
     /// Move the focused column wholesale to the monitor on the right.
     MoveColumnToMonitorRight,
+    /// Capture the focused window's bounding rect to a BMP file under
+    /// `%USERPROFILE%\Pictures\wiri-window-<hwnd>-<unix>.bmp` (or the
+    /// current directory if Pictures isn't writable).  Uses
+    /// `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`.
+    WindowScreenshot,
 }
 
 /// Parse an action name string (from config/IPC) into an Action.
@@ -195,6 +201,9 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
             args.first().map(|s| Action::FocusWorkspaceNamed(s.clone()))
         }
         "screenshot" | "take-screenshot" | "capture-screen" => Some(Action::Screenshot),
+        "window-screenshot" | "capture-window" | "screenshot-window" => {
+            Some(Action::WindowScreenshot)
+        }
         "set-auto-tile" => {
             if args.is_empty() {
                 None
@@ -377,6 +386,20 @@ pub fn mouse_runtime_config() -> MouseRuntimeConfig {
     *MOUSE_RUNTIME.lock()
 }
 
+/// Apply both the mouse runtime snapshot AND the snap-on-drag runtime
+/// snapshot from a full [`crate::config::Config`].  Convenience wrapper for
+/// callers that already have a `Config` in hand (typically `main.rs` after
+/// `Config::load`).  Equivalent to calling `apply_mouse_config(&cfg.input)`
+/// plus `snap_guide::set_snap_config(...)`.
+pub fn apply_input_runtime_config(cfg: &crate::config::Config) {
+    apply_mouse_config(&cfg.input);
+    let threshold_px = cfg.layout.snap_threshold_px as i32;
+    snap_guide::set_snap_config(snap_guide::SnapRuntimeConfig {
+        enabled: cfg.layout.snap_on_drag,
+        threshold_px,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +552,21 @@ mod tests {
     #[test]
     fn test_parse_modifiers_invalid() {
         assert_eq!(parse_modifiers(&["Invalid".to_string()]), 0);
+    }
+
+    #[test]
+    fn test_parse_action_window_screenshot_aliases() {
+        assert_eq!(
+            parse_action_name("window-screenshot", &[]),
+            Some(Action::WindowScreenshot)
+        );
+        assert_eq!(
+            parse_action_name("capture-window", &[]),
+            Some(Action::WindowScreenshot)
+        );
+        assert_eq!(
+            parse_action_name("screenshot-window", &[]),
+            Some(Action::WindowScreenshot)
+        );
     }
 }

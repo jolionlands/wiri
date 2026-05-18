@@ -17,6 +17,55 @@ Get-Process wiri | Stop-Process
 
 Then start wiri again.
 
+### Known hotkey conflicts on Windows
+
+Windows reserves a handful of chords for the OS itself or its GPU/accessibility
+stack.  `RegisterHotKey` may "succeed" but the OS still intercepts the
+keystroke before wiri sees it, so the binding silently never fires.  The
+common offenders:
+
+| Chord                  | Captured by                                  |
+|------------------------|----------------------------------------------|
+| `Ctrl+Alt+Tab`         | Windows task switcher (accessibility)        |
+| `Ctrl+Alt+Arrows`      | Intel HD Graphics + AMD Radeon rotation hotkeys (driver-level — wiri can't take them back) |
+| `Win+anything`         | Windows shell reserves the Win modifier      |
+| `Win+L`                | Lock workstation (unconditional)             |
+| `Win+Shift+S`          | Snipping tool screenshot                     |
+| `Win+D`                | Show desktop                                 |
+| `Ctrl+Esc`             | Open Start menu                              |
+| `Ctrl+Shift+Esc`       | Open Task Manager                            |
+
+If a binding doesn't fire:
+
+1. Run `wiri-ctl test-bindings` to confirm the daemon actually registered it
+   (entries listed there survived `RegisterHotKey`; absent ones were rejected
+   by Windows up front).
+2. If the binding is listed but the chord still doesn't fire, suspect a system
+   capture from the table above.  Rebind to a free chord in `config.kdl`.
+3. For Ctrl+Alt+Arrows: open *Intel Graphics Control Panel → Options → Hot Keys*
+   and disable rotation hotkeys (or, for Radeon, use *Radeon Settings → Hotkeys*).
+   wiri logs a warning at startup when it detects either GPU stack on x86_64.
+
+The default config (`resources/default_config.kdl`) uses `Ctrl+Alt+Space` and
+`Escape` for the overview toggle rather than `Ctrl+Alt+Tab` for exactly this
+reason.  `Escape` is state-gated — it only fires the overview toggle when
+overview is already active, so it stays available to other apps in normal
+mode.
+
+### How to verify wiri received your keypress
+
+Two tools help isolate "didn't fire" issues:
+
+1. **`wiri-ctl test-bindings`** — prints every binding the daemon currently
+   has registered with Windows (modifier mask, VK code, action).  If a chord
+   from your config doesn't appear here, `RegisterHotKey` rejected it during
+   startup (typically because another tool already owns it).
+
+2. **Verbose log of WM_HOTKEY dispatches** — restart wiri with
+   `RUST_LOG=wiri::backend::message_loop=trace .\wiri.exe -v 2>wiri.log`.
+   Every received WM_HOTKEY prints an `HOTKEY id=…` line.  If no line shows
+   up when you press the chord, Windows is intercepting it before wiri.
+
 ### Hotkeys don't fire on ARM64
 
 You have a third-party tool holding the hotkey, or you've enabled

@@ -168,6 +168,16 @@ pub enum IpcMessage {
     #[serde(rename = "monitor_list")]
     MonitorList,
 
+    /// Enumerate every hotkey binding currently registered with Windows
+    /// (after the most recent `register_hotkeys` pass, including hot
+    /// reloads).  Returned data lets the user diagnose "which chord does
+    /// wiri really listen for?" — particularly useful when a binding is
+    /// silently dropped because RegisterHotKey rejected it (typical with
+    /// Win+anything or chords reserved by an external tool).
+    /// Used by `wiri-ctl test-bindings`.
+    #[serde(rename = "list_bindings")]
+    ListBindings,
+
     // ---- System ----
     #[serde(rename = "get_state")]
     GetState,
@@ -179,6 +189,18 @@ pub enum IpcMessage {
     ReloadConfig,
     #[serde(rename = "quit")]
     Quit,
+
+    /// Capture a single window's bounding rect to a BMP file using
+    /// `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`.  When `path` is
+    /// `None`, the server picks a default under
+    /// `%USERPROFILE%\Pictures\wiri-window-<hwnd>-<unix>.bmp`.  Server
+    /// response includes the resolved path under `result.path`.
+    #[serde(rename = "capture_window")]
+    CaptureWindow {
+        window_hwnd: isize,
+        #[serde(default)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +241,27 @@ pub struct WorkspaceInfo {
     pub window_count: usize,
 }
 
+/// Diagnostic info for one registered hotkey binding (`ListBindings`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingInfo {
+    /// Win32 hotkey id assigned by `RegisterHotKey`.
+    pub id: i32,
+    /// Win32 modifier bitmask: 1=Alt, 2=Ctrl, 4=Shift, 8=Win.
+    pub modifiers: u32,
+    /// Win32 virtual key code (e.g. 0x20 = Space, 0x1B = Escape).
+    pub vk_code: u32,
+    /// Human-readable action label (Debug-formatted `Action` enum variant).
+    pub action: String,
+    /// Pre-formatted "Ctrl+Alt+Space" style label for display.
+    pub chord: String,
+}
+
+/// Response payload for `IpcMessage::ListBindings`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListBindingsResponse {
+    pub bindings: Vec<BindingInfo>,
+}
+
 /// Per-monitor diagnostic info returned by `MonitorList`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorInfo {
@@ -247,4 +290,58 @@ pub struct StateResponse {
     pub windows: Vec<WindowInfoIpc>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_window_round_trip_with_path() {
+        let msg = IpcMessage::CaptureWindow {
+            window_hwnd: 0xDEAD_BEEF,
+            path: Some(r"C:\tmp\out.bmp".to_string()),
+        };
+        let raw = serde_json::to_string(&msg).expect("serialize");
+        assert!(raw.contains("capture_window"), "tag should be capture_window: {}", raw);
+        let parsed: IpcMessage = serde_json::from_str(&raw).expect("deserialize");
+        match parsed {
+            IpcMessage::CaptureWindow { window_hwnd, path } => {
+                assert_eq!(window_hwnd, 0xDEAD_BEEF);
+                assert_eq!(path.as_deref(), Some(r"C:\tmp\out.bmp"));
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capture_window_round_trip_default_path() {
+        let msg = IpcMessage::CaptureWindow {
+            window_hwnd: 7,
+            path: None,
+        };
+        let raw = serde_json::to_string(&msg).expect("serialize");
+        let parsed: IpcMessage = serde_json::from_str(&raw).expect("deserialize");
+        match parsed {
+            IpcMessage::CaptureWindow { window_hwnd, path } => {
+                assert_eq!(window_hwnd, 7);
+                assert!(path.is_none());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capture_window_path_missing_field_defaults_to_none() {
+        // The `#[serde(default)]` on `path` lets older clients omit the key.
+        let raw = r#"{"type":"capture_window","data":{"window_hwnd":42}}"#;
+        let parsed: IpcMessage = serde_json::from_str(raw).expect("deserialize");
+        match parsed {
+            IpcMessage::CaptureWindow { window_hwnd, path } => {
+                assert_eq!(window_hwnd, 42);
+                assert!(path.is_none());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
 }

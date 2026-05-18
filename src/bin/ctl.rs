@@ -194,6 +194,27 @@ enum Commands {
     /// niri-parity: move the focused column wholesale to the monitor in
     /// the given direction. `direction` must be `left` or `right`.
     MoveColumnToMonitor { direction: String },
+
+    /// Diagnostic: print every hotkey binding that the running wiri daemon
+    /// successfully registered with Windows.  Useful when a chord you set
+    /// in `config.kdl` isn't firing — bindings that `RegisterHotKey`
+    /// rejected (typically because another tool already owns the chord)
+    /// are silently dropped at startup; this command tells you which ones
+    /// survived.  Output columns: modifiers, virtual-key, action name.
+    TestBindings,
+
+    /// Capture a single window by HWND to a BMP file.  Uses the modern
+    /// `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` flag so UWP /
+    /// DirectComposition windows are captured correctly.  When `--path`
+    /// is omitted the file lands under
+    /// `%USERPROFILE%\Pictures\wiri-window-<hwnd>-<unix>.bmp` (falling
+    /// back to the current directory if Pictures is unavailable).
+    CaptureWindow {
+        hwnd: isize,
+        /// Output path for the BMP file. Defaults to the Pictures folder.
+        #[arg(short, long)]
+        path: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -277,6 +298,11 @@ fn main() -> Result<()> {
         Commands::MoveColumnToMonitor { direction } => {
             IpcMessage::MoveColumnToMonitor { direction }
         }
+        Commands::TestBindings => IpcMessage::ListBindings,
+        Commands::CaptureWindow { hwnd, path } => IpcMessage::CaptureWindow {
+            window_hwnd: hwnd,
+            path,
+        },
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;
@@ -429,6 +455,15 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
             println!("Moved window {} to workspace {}.", window_hwnd, workspace_id);
         }
         IpcMessage::MonitorList => print_monitor_list(resp),
+        IpcMessage::ListBindings => print_bindings(resp),
+        IpcMessage::CaptureWindow { window_hwnd, .. } => {
+            let path = resp
+                .get("result")
+                .and_then(|r| r.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            println!("Captured window {} → {}", window_hwnd, path);
+        }
         _ => {
             // Generic: report success with a hint when present.
             if let Some(note) = resp.get("note").and_then(|v| v.as_str()) {
@@ -579,6 +614,61 @@ fn print_monitor_list(resp: &serde_json::Value) {
         result.len(),
         if result.len() == 1 { "" } else { "s" }
     );
+}
+
+/// Format the response to `ListBindings` (sent by `test-bindings`) as a
+/// per-binding table.  Shows the human-readable chord, the action that
+/// fires, and the raw Win32 modifier+VK so power users can correlate with
+/// `RegisterHotKey` documentation.
+fn print_bindings(resp: &serde_json::Value) {
+    let bindings = resp
+        .pointer("/result/bindings")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if bindings.is_empty() {
+        println!("No hotkey bindings registered.");
+        println!("If the daemon just started, try again in a moment; otherwise");
+        println!("check the logs for `RegisterHotKey` failures.");
+        return;
+    }
+
+    println!(
+        "  {:<5}  {:<28}  {:<7}  {:<5}  {}",
+        "ID", "CHORD", "MODS", "VK", "ACTION"
+    );
+    println!(
+        "  {:<5}  {:<28}  {:<7}  {:<5}  {}",
+        "─".repeat(5),
+        "─".repeat(28),
+        "─".repeat(7),
+        "─".repeat(5),
+        "─".repeat(30),
+    );
+
+    for b in &bindings {
+        let id = b.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let chord = b.get("chord").and_then(|v| v.as_str()).unwrap_or("?");
+        let mods = b.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+        let vk = b.get("vk_code").and_then(|v| v.as_u64()).unwrap_or(0);
+        let action = b.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+        println!(
+            "  {:<5}  {:<28}  0x{:04X}   0x{:02X}   {}",
+            id,
+            truncate(chord, 28),
+            mods,
+            vk,
+            truncate(action, 30),
+        );
+    }
+
+    println!();
+    println!(
+        "  {} binding{} registered.  See `docs/TROUBLESHOOTING.md` for known",
+        bindings.len(),
+        if bindings.len() == 1 { "" } else { "s" }
+    );
+    println!("  Windows hotkey conflicts that may swallow your chord.");
 }
 
 // ---------------------------------------------------------------------------

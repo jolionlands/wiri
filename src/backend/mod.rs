@@ -1,6 +1,7 @@
 pub mod hooks;
 pub mod message_loop;
 pub mod cbt_hook;
+pub mod hotkey_conflicts;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;

@@ -90,6 +90,13 @@ layout {
     // changes until they receive a fresh paint.  Off by default for
     // compatibility.
     // strip-frame true
+
+    // Snap-on-drag (niri parity): while the user holds Alt and drags a
+    // tile with the left mouse button, snap the window's left edge to
+    // nearby column edges, the mid-screen guide, and the monitor edges.
+    // A tiny vertical line is painted at the active snap target.
+    // snap-on-drag true
+    // snap-threshold-px 20
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -168,14 +175,29 @@ binds {
     Ctrl+Alt+8 switch-workspace 8
     Ctrl+Alt+9 switch-workspace 9
 
-    // Overview (zoom out to see all columns)
-    Ctrl+Alt+Tab overview-toggle
-    Ctrl+Alt+O   overview-select
+    // Overview (zoom out to see all columns across every workspace).
+    //
+    // NOTE: Ctrl+Alt+Tab is reserved by Windows for the system task switcher
+    // (the accessibility cousin of Alt+Tab) — RegisterHotKey usually succeeds
+    // but the OS still intercepts the chord, so the binding silently never
+    // fires.  The default below uses Ctrl+Alt+Space and Escape instead.
+    //
+    // The bare Escape binding is state-gated: it only triggers an overview
+    // toggle WHEN overview is active.  Outside overview, Escape stays
+    // available for other applications.
+    Ctrl+Alt+Space overview-toggle
+    Escape         overview-toggle
+    Ctrl+Alt+O     overview-select
 
     // Screenshot: capture the full virtual desktop to a BMP file under
     // %USERPROFILE%\Pictures\wiri-<timestamp>.bmp (falls back to the
     // current working directory if Pictures is not writable).
     Ctrl+Alt+P   screenshot
+
+    // Window-screenshot: capture only the focused window via
+    // PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT).  Output file lands
+    // under %USERPROFILE%\Pictures\wiri-window-<hwnd>-<timestamp>.bmp.
+    Ctrl+Alt+Shift+S  window-screenshot
 }
 
 // ───────────────────────────────────────────────────────────────────────────

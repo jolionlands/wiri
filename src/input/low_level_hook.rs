@@ -17,6 +17,7 @@ use crate::input::grab::{MoveGrab, ResizeGrab};
 use crate::utils::{Point, Rect, WindowId};
 use crate::backend::BackendHandle;
 use crate::layout::TilingEngine;
+use crate::layout::snap::{build_candidates, find_snap, SnapTarget};
 
 // WM_ mouse messages
 const WM_MOUSEMOVE: u32 = 0x0200;
@@ -304,11 +305,71 @@ unsafe extern "system" fn mouse_hook_callback(
         GrabState::Move(grab) => {
             match msg {
                 WM_MOUSEMOVE => {
-                    let new_pos = grab.new_position(cursor);
+                    let mut new_pos = grab.new_position(cursor);
                     let window_id = grab.window_id;
                     // Use the window's actual size captured at grab start to avoid
                     // resizing the window on every mouse-move event.
                     let grab_size = grab.initial_size;
+
+                    // ---- Snap-on-drag (niri parity) ----
+                    // Build the snap-candidate list (column edges + mid-screen
+                    // + monitor edges) and, when the cursor's projected X is
+                    // within `snap-threshold-px`, lock onto the nearest
+                    // candidate.  Disabled with snap-on-drag false.
+                    let snap_cfg = crate::input::snap_guide::snap_config();
+                    let mut snap_overlay: Option<(i32, i32, i32)> = None;
+                    if snap_cfg.enabled {
+                        let state = HOOK_STATE.lock();
+                        if let Some(engine) = &state.engine {
+                            let eng = engine.read();
+                            if let Some(oid) = eng.focused_output() {
+                                if let Some(monitor) = eng.monitors().get(&oid) {
+                                    let mut lefts: Vec<i32> = Vec::new();
+                                    let mut rights: Vec<i32> = Vec::new();
+                                    if let Some(workspace) = monitor.workspace() {
+                                        for col in &workspace.columns {
+                                            // Exclude the dragged window's own
+                                            // column so we don't snap to the
+                                            // starting position.
+                                            let is_self = col
+                                                .tiles
+                                                .iter()
+                                                .any(|t| t.window_id == window_id);
+                                            if is_self {
+                                                continue;
+                                            }
+                                            for tile in &col.tiles {
+                                                if let Some(info) =
+                                                    eng.tiled_windows().get(&tile.window_id)
+                                                {
+                                                    lefts.push(info.bounds.loc.x);
+                                                    rights
+                                                        .push(info.bounds.right());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let wa = monitor.work_area;
+                                    let cands = build_candidates(
+                                        &lefts,
+                                        &rights,
+                                        wa.loc.x,
+                                        wa.size.w as i32,
+                                    );
+                                    if let Some(SnapTarget { x, .. }) = find_snap(
+                                        new_pos.x,
+                                        &cands,
+                                        snap_cfg.threshold_px,
+                                    ) {
+                                        new_pos.x = x;
+                                        snap_overlay =
+                                            Some((x, wa.loc.y, wa.size.h as i32));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let state = HOOK_STATE.lock();
                     if let Some(backend) = &state.backend {
                         let rect = Rect::new(new_pos.x, new_pos.y, grab_size.w, grab_size.h);
@@ -318,11 +379,29 @@ unsafe extern "system" fn mouse_hook_callback(
                                 | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
                         );
                     }
+                    drop(state);
+
+                    // Reposition or hide the snap-guide overlay.  De-dup so
+                    // we only thread-cross when the snap X changes.
+                    let new_snap_x = snap_overlay.map(|(x, _, _)| x);
+                    if crate::input::snap_guide::note_snap_x(new_snap_x) {
+                        let g = crate::input::snap_guide::guide();
+                        match snap_overlay {
+                            Some((x, top, height)) => g.show_at(x, top, height),
+                            None => g.hide(),
+                        }
+                    }
+
                     LRESULT(1)
                 }
                 WM_LBUTTONUP => {
                     let window_id = grab.window_id;
                     info!("Move grab finished: window {:?}", window_id);
+
+                    // Tear the snap guide down so it never lingers after
+                    // release.  Always force-hide — cheap if already hidden.
+                    let _ = crate::input::snap_guide::note_snap_x(None);
+                    crate::input::snap_guide::guide().hide();
 
                     let state = HOOK_STATE.lock();
                     if let Some(engine) = &state.engine {

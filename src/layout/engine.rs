@@ -50,6 +50,43 @@ fn parse_color_to_u32(color_hex: &str) -> u32 {
     }
 }
 
+/// State stored while overview mode is active.
+///
+/// Wraps the legacy `f64` zoom level with extra context — namely the precomputed
+/// vertical Y offsets at which each workspace's section is rendered (workspace 1
+/// at the top, workspace 2 below, etc.).  The vector is keyed by the same
+/// insertion order produced by iterating `monitor.workspaces` after sorting by
+/// workspace id, so callers that need to look up a specific workspace's offset
+/// must apply the same sort.  Empty workspaces are skipped during precomputation
+/// and contribute zero height to the stack.
+///
+/// `overview_zoom()` continues to return the `zoom` field for back-compat so
+/// existing consumers (and tests) keep working.
+#[derive(Debug, Clone)]
+pub struct OverviewState {
+    /// Uniform scale factor applied to every workspace's column geometry.
+    /// 1.0 = no zoom; 0.5 = everything renders half size.  Computed in
+    /// `enter_overview` to fit every workspace's columns into the work area.
+    pub zoom: f64,
+    /// Y-offset (relative to the work area's top edge) at which each visible
+    /// workspace section begins, in workspace-id ascending order.  Empty
+    /// workspaces are skipped, so the list may be shorter than the monitor's
+    /// `workspaces` map.  Pairs of `(workspace_id, y_offset)` are stored so
+    /// `calculate_positions` can map an arbitrary workspace back to its slot.
+    pub workspace_offsets: Vec<(i32, i32)>,
+}
+
+impl OverviewState {
+    /// Convenience constructor used in tests + as a fallback when no per-workspace
+    /// stacking info is available (single-workspace overview).
+    pub fn new(zoom: f64) -> Self {
+        Self {
+            zoom,
+            workspace_offsets: Vec::new(),
+        }
+    }
+}
+
 /// How column widths are determined
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnWidthMode {
@@ -205,8 +242,9 @@ pub struct TilingEngine {
     window_rules: Vec<crate::config::WindowRule>,
     full_config: Option<crate::config::Config>,
     animation: crate::layout::AnimationManager,
-    /// Overview mode: None = normal, Some(zoom_level) = zoomed out
-    overview: Option<f64>,
+    /// Overview mode: None = normal, Some(state) = zoomed out (all workspaces stacked).
+    /// See `OverviewState` for the per-workspace Y-offset layout.
+    overview: Option<OverviewState>,
     /// Counts of consecutive `set_window_position` failures per window.
     /// After `MAX_POSITION_FAILURES` attempts the window is auto-floated and
     /// removed from the tile layout so it stops thrashing the Win32 API.
@@ -706,7 +744,10 @@ impl TilingEngine {
                             "auto-tile threshold exceeded ({} > {}); engaging overview zoom {:.2}",
                             col_count, threshold, zoom
                         );
-                        self.overview = Some(zoom);
+                        // Auto-engaged overview only zooms the active workspace —
+                        // workspace_offsets stays empty so the calculate_positions
+                        // path falls back to "render current workspace only".
+                        self.overview = Some(OverviewState::new(zoom));
                     }
                 }
             }
@@ -732,12 +773,25 @@ impl TilingEngine {
             ),
         );
 
-        // Collect the window IDs on this monitor's active workspace
-        let monitor_window_ids: std::collections::HashSet<WindowId> = workspace
-            .columns
-            .iter()
-            .flat_map(|c| c.tiles.iter().map(|t| t.window_id))
-            .collect();
+        // Collect the window IDs on this monitor's active workspace.  In
+        // overview mode we also need the union across every workspace so the
+        // fullscreen-hide check (below) and the final cached_bounds write-back
+        // know which tiles to consider.
+        let overview_active = self.is_overview();
+        let monitor_window_ids: std::collections::HashSet<WindowId> = if overview_active {
+            monitor
+                .workspaces
+                .values()
+                .flat_map(|ws| ws.columns.iter())
+                .flat_map(|c| c.tiles.iter().map(|t| t.window_id))
+                .collect()
+        } else {
+            workspace
+                .columns
+                .iter()
+                .flat_map(|c| c.tiles.iter().map(|t| t.window_id))
+                .collect()
+        };
 
         for window_id in &self.fullscreen_windows {
             // Only position fullscreen windows that belong to this monitor
@@ -758,16 +812,65 @@ impl TilingEngine {
         // Snapshot the per-tile ConfigureThrottle intents before positioning.
         // We need an immutable borrow of the workspace to get tile intents, then a
         // mutable one afterwards to call mark_sent(). Collect the intents now.
+        // In overview mode we collect across ALL workspaces so every tile is
+        // throttle-aware regardless of which workspace owns it.
         let tile_intents: HashMap<WindowId, ConfigureIntent> = {
             let monitor = self.monitors.get(&output_id).unwrap();
-            let workspace = monitor.workspace().unwrap();
-            workspace.columns.iter()
-                .flat_map(|col| col.tiles.iter())
-                .map(|tile| (tile.window_id, tile.configure_throttle.intent()))
-                .collect()
+            if overview_active {
+                monitor.workspaces.values()
+                    .flat_map(|ws| ws.columns.iter())
+                    .flat_map(|col| col.tiles.iter())
+                    .map(|tile| (tile.window_id, tile.configure_throttle.intent()))
+                    .collect()
+            } else {
+                let workspace = monitor.workspace().unwrap();
+                workspace.columns.iter()
+                    .flat_map(|col| col.tiles.iter())
+                    .map(|tile| (tile.window_id, tile.configure_throttle.intent()))
+                    .collect()
+            }
         };
 
-        let positions = self.calculate_positions(workspace, work_rect);
+        // Compute positions.  In overview mode iterate every non-empty
+        // workspace in workspace-id ascending order, lay each one out inside
+        // its precomputed vertical section, and union the per-workspace
+        // position lists.  Outside overview we keep the original behaviour
+        // (active workspace only, no Y offset).
+        let positions: Vec<(WindowId, Rect)> = if overview_active {
+            let monitor = self.monitors.get(&output_id).unwrap();
+            let mut out: Vec<(WindowId, Rect)> = Vec::new();
+            // Sort by workspace id so the on-screen stack matches the
+            // numerical "Workspace 1, Workspace 2, …" labels.
+            let mut ws_ids: Vec<i32> = monitor.workspaces.keys().copied().collect();
+            ws_ids.sort();
+            // Per-workspace section height + gap come from `OverviewState`.
+            let zoom = self.overview_zoom();
+            const INTER_WORKSPACE_GAP: i32 = 50;
+            let nominal_section_height = monitor.work_area.size.h as i32;
+            let scaled_section_h = (nominal_section_height as f64 * zoom) as i32;
+            let scaled_gap = (INTER_WORKSPACE_GAP as f64 * zoom) as i32;
+            let mut section_y: i32 = 0;
+            for ws_id in ws_ids {
+                let ws = match monitor.workspaces.get(&ws_id) {
+                    Some(w) => w,
+                    None => continue,
+                };
+                if ws.columns.is_empty() {
+                    continue; // skip empty workspaces, no Y consumption
+                }
+                let mut ws_positions = self.calculate_positions_in_section(
+                    ws,
+                    work_rect,
+                    section_y,
+                    nominal_section_height,
+                );
+                out.append(&mut ws_positions);
+                section_y += scaled_section_h + scaled_gap;
+            }
+            out
+        } else {
+            self.calculate_positions(workspace, work_rect)
+        };
         // Snapshot positions for later write-back to Tile.cached_bounds so that
         // LayoutElement::bounds() returns the most recently computed rect.
         let position_map: HashMap<WindowId, Rect> = positions.iter().copied().collect();
@@ -911,9 +1014,24 @@ impl TilingEngine {
         // Mark configure_throttle as sent for every tile that had set_window_position called.
         // Populate cached_bounds while we're walking the workspace so LayoutElement::bounds()
         // returns the just-computed rect for any downstream observer (overlay rendering,
-        // hit-testing, …).
+        // hit-testing, …).  In overview mode the position_map covers every
+        // workspace's tiles, so we walk all workspaces; otherwise only the
+        // active one is touched.
         if let Some(monitor) = self.monitors.get_mut(&output_id) {
-            if let Some(workspace) = monitor.workspace_mut() {
+            if overview_active {
+                for ws in monitor.workspaces.values_mut() {
+                    for col in ws.columns.iter_mut() {
+                        for tile in col.tiles.iter_mut() {
+                            if applied_windows.contains(&tile.window_id) {
+                                tile.configure_throttle.mark_sent();
+                            }
+                            if let Some(&rect) = position_map.get(&tile.window_id) {
+                                tile.cached_bounds = rect;
+                            }
+                        }
+                    }
+                }
+            } else if let Some(workspace) = monitor.workspace_mut() {
                 for col in workspace.columns.iter_mut() {
                     for tile in col.tiles.iter_mut() {
                         if applied_windows.contains(&tile.window_id) {
@@ -964,10 +1082,33 @@ impl TilingEngine {
 
     /// Calculate window positions for a workspace.
     /// Supports per-column variable widths and overview zoom.
+    ///
+    /// Backwards-compatible single-workspace path — equivalent to
+    /// `calculate_positions_in_section(workspace, work_rect, 0, work_rect.size.h as i32)`.
     fn calculate_positions(
         &self,
         workspace: &crate::layout::workspace::Workspace,
         work_rect: Rect,
+    ) -> Vec<(WindowId, Rect)> {
+        let section_height = work_rect.size.h as i32;
+        self.calculate_positions_in_section(workspace, work_rect, 0, section_height)
+    }
+
+    /// Multi-workspace overview-aware position calculator.
+    ///
+    /// Renders one workspace's columns inside a vertical "section" that starts
+    /// at `section_y_offset` (relative to `work_rect.loc.y`) and is
+    /// `section_height` pixels tall (pre-zoom).  In normal mode the caller
+    /// passes `section_y_offset = 0` and `section_height = work_rect.size.h`,
+    /// which reproduces the original behaviour.  In overview mode the engine
+    /// stacks sections vertically; each call computes positions for one
+    /// workspace's slice.
+    fn calculate_positions_in_section(
+        &self,
+        workspace: &crate::layout::workspace::Workspace,
+        work_rect: Rect,
+        section_y_offset: i32,
+        section_height: i32,
     ) -> Vec<(WindowId, Rect)> {
         let mut positions = Vec::new();
         let column_gap = self.config.column_gap;
@@ -1008,6 +1149,15 @@ impl TilingEngine {
             0
         };
 
+        // In overview the per-workspace "section" already encodes vertical
+        // positioning; in normal mode `section_y_offset == 0` and
+        // `section_height == work_rect.size.h`, so nothing changes.
+        let scaled_section_height = if zoom < 1.0 {
+            (section_height as f64 * zoom) as i32
+        } else {
+            section_height
+        };
+
         for (col_idx, column) in workspace.columns.iter().enumerate() {
             let cw = col_widths[col_idx];
             let scaled_x = if zoom < 1.0 {
@@ -1033,16 +1183,24 @@ impl TilingEngine {
             let visible_count = visible_indices.len();
             if visible_count == 0 { continue; }
 
+            // Effective per-section work height.  In normal mode this is
+            // `work_rect.size.h`.  In overview it is the post-zoom section
+            // height (so each workspace's section is rendered at the same
+            // size, with a small inter-workspace gap drawn elsewhere).
             let work_height = if zoom < 1.0 {
-                let padding = (work_rect.size.h as f64 * 0.10) as i32;
-                work_rect.size.h as i32 - padding * 2
+                let padding = (scaled_section_height as f64 * 0.05) as i32;
+                (scaled_section_height - padding * 2).max(40)
             } else {
-                work_rect.size.h as i32
+                section_height
             };
 
-            let scaled_gap = (window_gap as f64 * zoom) as i32;
+            let scaled_gap = if zoom < 1.0 {
+                (window_gap as f64 * zoom) as i32
+            } else {
+                window_gap
+            };
             let total_gap_height = scaled_gap * (visible_count as i32 - 1).max(0);
-            let available_height = work_height - total_gap_height;
+            let available_height = (work_height - total_gap_height).max(0);
             // Per-tile heights honor `Tile.height_weight` so the keyboard
             // resize actions (`Action::GrowTileHeight` / `ShrinkTileHeight`)
             // can re-bias a column's vertical distribution. When the column
@@ -1075,24 +1233,20 @@ impl TilingEngine {
                 *last = (available_height - leading_sum).max(0);
             }
 
-            let y_offset = if zoom < 1.0 {
+            let y_centre_offset = if zoom < 1.0 {
                 let total_used: i32 = tile_heights.iter().sum::<i32>()
                     + scaled_gap * (visible_count as i32 - 1).max(0);
-                (work_rect.size.h as i32 - total_used) / 2
+                ((scaled_section_height - total_used) / 2).max(0)
             } else {
                 0
             };
 
-            let effective_gap = if zoom < 1.0 { scaled_gap } else { window_gap };
+            let effective_gap = scaled_gap;
             let mut accumulated_y: i32 = 0;
             for (slot_idx, &tile_idx) in visible_indices.iter().enumerate() {
                 if let Some(tile) = column.tiles.get(tile_idx) {
                     let window_height = tile_heights.get(slot_idx).copied().unwrap_or(0).max(0);
-                    let base_y = if zoom < 1.0 {
-                        work_rect.loc.y + y_offset + accumulated_y
-                    } else {
-                        work_rect.loc.y + accumulated_y
-                    };
+                    let base_y = work_rect.loc.y + section_y_offset + y_centre_offset + accumulated_y;
                     let rect = Rect::new(screen_x, base_y, scaled_w, window_height as u32);
                     positions.push((tile.window_id, rect));
                     accumulated_y += window_height + effective_gap;
@@ -1879,44 +2033,119 @@ impl TilingEngine {
         }
     }
 
-    /// Enter overview mode — compute a zoom level that fits all columns
+    /// Enter overview mode — niri-style "see all workspaces at once".
+    ///
+    /// Iterates ALL workspaces on the focused monitor (sorted by workspace id),
+    /// skips empties, picks the widest workspace's column-strip as the width
+    /// budget, and computes a uniform zoom that fits both the total stacked
+    /// height (one section per non-empty workspace with a 50px inter-workspace
+    /// gap) and the widest column strip into the monitor's work area.  Also
+    /// resets `scroll_offset.x` on the active workspace so the view starts at
+    /// column 0 when overview opens.
     pub fn enter_overview(&mut self, backend: &BackendHandle) {
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
         };
 
-        let (num_columns, view_width) = {
+        // Snapshot the per-workspace column count + the monitor's view dims
+        // without holding a mutable borrow.  We sort by workspace id so the
+        // stacking order is deterministic (workspace 0 on top, 1 below, …).
+        let (sorted_ws, view_width, view_height) = {
             let monitor = match self.monitors.get(&focused_output) {
                 Some(m) => m,
                 None => return,
             };
-            let workspace = match monitor.workspace() {
-                Some(w) => w,
-                None => return,
-            };
-            let num_cols = workspace.columns.len();
+            let mut entries: Vec<(i32, usize)> = monitor
+                .workspaces
+                .iter()
+                .filter_map(|(&id, ws)| {
+                    if ws.columns.is_empty() {
+                        None
+                    } else {
+                        Some((id, ws.columns.len()))
+                    }
+                })
+                .collect();
+            entries.sort_by_key(|(id, _)| *id);
             let vw = Self::view_width_for_monitor(monitor, &self.config);
-            (num_cols, vw)
+            let vh = monitor.work_area.size.h as i32;
+            (entries, vw, vh)
         };
 
-        if num_columns == 0 { return; }
+        if sorted_ws.is_empty() {
+            return;
+        }
 
-        // Compute zoom level so all columns fit within the view
-        // The total content width = num_cols * col_width + (num_cols-1) * gap
-        let col_width = Self::effective_column_width(num_columns, view_width, &self.config);
-        let total_content = num_columns as i32 * col_width + (num_columns as i32 - 1).max(0) * self.config.column_gap;
+        // -- Width budget --
+        // The widest workspace's stripe sets the horizontal content width.
+        let widest_total: i32 = sorted_ws
+            .iter()
+            .map(|(_id, n_cols)| {
+                let col_width = Self::effective_column_width(*n_cols, view_width, &self.config);
+                *n_cols as i32 * col_width
+                    + (*n_cols as i32 - 1).max(0) * self.config.column_gap
+            })
+            .max()
+            .unwrap_or(0);
 
-        let zoom = if total_content > view_width {
-            (view_width as f64 / total_content as f64).min(1.0)
+        // -- Height budget --
+        // Each workspace section gets a fixed nominal height equal to the
+        // monitor's work-area height (so each tile in overview keeps its
+        // aspect ratio with normal mode), with a 50 px inter-workspace gap.
+        const INTER_WORKSPACE_GAP: i32 = 50;
+        let n_ws = sorted_ws.len() as i32;
+        let nominal_section_height = view_height;
+        let total_content_height: i32 = n_ws * nominal_section_height
+            + (n_ws - 1).max(0) * INTER_WORKSPACE_GAP;
+
+        // Pick the smaller of the two scale factors so EVERYTHING fits.
+        let zoom_w = if widest_total > view_width && widest_total > 0 {
+            view_width as f64 / widest_total as f64
         } else {
-            1.0 // Already fits, no need to zoom out
+            1.0
         };
+        let zoom_h = if total_content_height > view_height && total_content_height > 0 {
+            view_height as f64 / total_content_height as f64
+        } else {
+            1.0
+        };
+        let zoom = zoom_w.min(zoom_h).min(1.0);
 
-        info!("Entering overview mode: zoom={:.2} ({} columns, {}px content, {}px view)",
-            zoom, num_columns, total_content, view_width);
+        // Precompute the Y offset of each workspace section.  Each section's
+        // height (post-zoom) is `nominal_section_height * zoom`; the gap is
+        // `INTER_WORKSPACE_GAP * zoom`.
+        let scaled_section_h = (nominal_section_height as f64 * zoom) as i32;
+        let scaled_gap = (INTER_WORKSPACE_GAP as f64 * zoom) as i32;
+        let mut workspace_offsets: Vec<(i32, i32)> = Vec::with_capacity(sorted_ws.len());
+        let mut y: i32 = 0;
+        for (id, _n_cols) in &sorted_ws {
+            workspace_offsets.push((*id, y));
+            y += scaled_section_h + scaled_gap;
+        }
 
-        self.overview = Some(zoom);
+        info!(
+            "Entering overview: zoom={:.2} ({} workspaces, widest={}px, total_h={}px, view {}x{})",
+            zoom, sorted_ws.len(), widest_total, total_content_height, view_width, view_height
+        );
+
+        self.overview = Some(OverviewState {
+            zoom,
+            workspace_offsets,
+        });
+
+        // Banner: show on the focused monitor.  No-op when the global
+        // banner singleton hasn't been wired (unit tests, --headless paths).
+        if let Some(m) = self.monitors.get(&focused_output) {
+            crate::overlay::overview_banner::global_show(Some(
+                crate::overlay::MonitorBounds {
+                    x: m.bounds.loc.x,
+                    y: m.bounds.loc.y,
+                    w: m.bounds.size.w as i32,
+                    h: m.bounds.size.h as i32,
+                },
+            ));
+        }
 
         // Reset scroll offset — in overview, we show everything from the start
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
@@ -1928,7 +2157,14 @@ impl TilingEngine {
         self.apply_layout_for_monitor(focused_output, backend);
     }
 
-    /// Exit overview mode — return to normal tiling
+    /// Exit overview mode — return to normal tiling.
+    ///
+    /// While overview is active we show every tile on every workspace; on
+    /// exit we must hide those that don't belong to the currently active
+    /// workspace so the user is back to a single workspace's view.  The
+    /// `applied_state` cache for those tiles is also marked invisible so
+    /// the next `apply_layout_for_monitor` pass re-issues `show_window(true)`
+    /// when the user switches workspaces back.
     pub fn exit_overview(&mut self, backend: &BackendHandle) {
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
@@ -1937,6 +2173,35 @@ impl TilingEngine {
 
         info!("Exiting overview mode");
         self.overview = None;
+        crate::overlay::overview_banner::global_hide();
+
+        // Hide every tile that isn't on the active workspace of the focused
+        // monitor.  Other monitors' active workspaces stay visible.
+        let to_hide: Vec<WindowId> = {
+            let mut acc: Vec<WindowId> = Vec::new();
+            if let Some(monitor) = self.monitors.get(&focused_output) {
+                let active_ws = monitor.active_workspace;
+                for (&ws_id, ws) in monitor.workspaces.iter() {
+                    if ws_id == active_ws {
+                        continue;
+                    }
+                    for col in &ws.columns {
+                        for tile in &col.tiles {
+                            acc.push(tile.window_id);
+                        }
+                    }
+                }
+            }
+            acc
+        };
+        for wid in to_hide {
+            let _ = backend.show_window(wid.as_isize(), false);
+            #[cfg(test)] { self.win32_call_count += 1; }
+            self.applied_state
+                .entry(wid)
+                .or_insert_with(AppliedState::unset)
+                .visible = false;
+        }
 
         // Re-scroll to the focused column
         self.scroll_to_focused_column(focused_output, backend);
@@ -1947,9 +2212,18 @@ impl TilingEngine {
         self.overview.is_some()
     }
 
-    /// Get the current overview zoom level (1.0 = normal, <1.0 = zoomed out)
+    /// Get the current overview zoom level (1.0 = normal, <1.0 = zoomed out).
+    /// Returns the inner zoom of `OverviewState` for backwards compat with
+    /// callers that only care about the scale factor.
     pub fn overview_zoom(&self) -> f64 {
-        self.overview.unwrap_or(1.0)
+        self.overview.as_ref().map(|s| s.zoom).unwrap_or(1.0)
+    }
+
+    /// Borrow the full overview state. None when overview is not active.
+    /// Currently used by the overview banner overlay to find the focused
+    /// monitor's vertical extent.
+    pub fn overview_state(&self) -> Option<&OverviewState> {
+        self.overview.as_ref()
     }
 
     /// In overview mode, focus navigation wraps around and auto-scrolls to show the column
@@ -4168,6 +4442,162 @@ mod tests {
         let wid = engine.overview_select(&BackendHandle::default_for_test());
         assert!(!engine.is_overview());
         assert!(wid.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-workspace overview tests — the niri-style "see every workspace at
+    // once" path.  `enter_overview` collects ALL non-empty workspaces of the
+    // focused monitor, stacks them vertically with a 50px gap, picks a zoom
+    // that fits both width and height, and renders every tile (not just
+    // active-workspace tiles).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_workspace_overview_state_offsets() {
+        // Three workspaces with content + one empty workspace.  The empty one
+        // must be skipped so `workspace_offsets` only carries non-empty ids.
+        let mut engine = make_engine();
+        let oid = engine.focused_output().unwrap();
+
+        // ws 0: two windows
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.add_window(make_window(101, 0, 0), &BackendHandle::default_for_test());
+
+        // ws 1: one window
+        engine.move_window_to_workspace(1, &BackendHandle::default_for_test());
+
+        // ws 2: empty (created implicitly by the move below moving a window in then back)
+        // We create ws 2 explicitly via switch_workspace so it appears in the
+        // workspaces map but stays empty.
+        if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
+            monitor.workspaces.entry(2).or_insert_with(crate::layout::Workspace::new);
+        }
+
+        // ws 3: one window
+        engine.add_window(make_window(102, 0, 0), &BackendHandle::default_for_test());
+        engine.move_window_to_workspace(3, &BackendHandle::default_for_test());
+
+        engine.enter_overview(&BackendHandle::default_for_test());
+        assert!(engine.is_overview(), "overview should be active");
+
+        let state = engine.overview_state().expect("overview state present");
+        // ws ids of non-empty workspaces: 0, 1, 3 (ws 2 is empty)
+        let ids: Vec<i32> = state.workspace_offsets.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1, 3], "empty workspaces must be skipped");
+
+        // Offsets should be monotonically increasing.
+        let ys: Vec<i32> = state.workspace_offsets.iter().map(|(_, y)| *y).collect();
+        assert_eq!(ys[0], 0, "first workspace starts at y=0");
+        assert!(ys[1] > ys[0], "second workspace below first");
+        assert!(ys[2] > ys[1], "third workspace below second");
+    }
+
+    #[test]
+    fn test_multi_workspace_overview_positions_every_window() {
+        // Add 3 workspaces with 2 + 1 + 1 windows.  In overview every tile
+        // (4 total) must appear in calculate_positions output for that
+        // workspace.  This verifies the layout pass picks up tiles outside
+        // the active workspace.
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.add_window(make_window(101, 0, 0), &BackendHandle::default_for_test());
+        engine.move_window_to_workspace(1, &BackendHandle::default_for_test());
+        engine.add_window(make_window(102, 0, 0), &BackendHandle::default_for_test());
+        engine.move_window_to_workspace(2, &BackendHandle::default_for_test());
+        engine.add_window(make_window(103, 0, 0), &BackendHandle::default_for_test());
+
+        engine.enter_overview(&BackendHandle::default_for_test());
+        assert!(engine.is_overview());
+
+        // Build the equivalent of what apply_layout_for_monitor's overview
+        // branch produces by iterating every workspace through the
+        // `calculate_positions_in_section` helper.
+        let oid = engine.focused_output().unwrap();
+        let monitor = engine.monitors().get(&oid).unwrap();
+        let work_rect = Rect::new(4, 4, 1912, 1032);
+        let mut ws_ids: Vec<i32> = monitor.workspaces.keys().copied().collect();
+        ws_ids.sort();
+        let mut total: Vec<(WindowId, Rect)> = Vec::new();
+        let nominal = monitor.work_area.size.h as i32;
+        let zoom = engine.overview_zoom();
+        let scaled_section = (nominal as f64 * zoom) as i32;
+        let gap = (50.0 * zoom) as i32;
+        let mut y = 0;
+        for ws_id in ws_ids {
+            if let Some(ws) = monitor.workspaces.get(&ws_id) {
+                if ws.columns.is_empty() { continue; }
+                let mut p = engine.calculate_positions_in_section(ws, work_rect, y, nominal);
+                total.append(&mut p);
+                y += scaled_section + gap;
+            }
+        }
+        assert_eq!(total.len(), 4, "overview must position every workspace's tiles");
+    }
+
+    #[test]
+    fn test_multi_workspace_overview_all_empty_no_op() {
+        // Engine with monitor but no windows — enter_overview must NOT
+        // engage overview mode (nothing to render).
+        let mut engine = make_engine();
+        engine.enter_overview(&BackendHandle::default_for_test());
+        assert!(!engine.is_overview());
+        assert!(engine.overview_state().is_none());
+    }
+
+    #[test]
+    fn test_multi_workspace_overview_exit_hides_inactive_tiles() {
+        // While overview is on every workspace's tiles are visible.  On
+        // exit, tiles that aren't on the active workspace must be marked
+        // hidden in the applied_state cache so subsequent passes know to
+        // re-show them (and don't leave them as zombie visible windows).
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.move_window_to_workspace(1, &BackendHandle::default_for_test());
+        engine.add_window(make_window(101, 0, 0), &BackendHandle::default_for_test());
+
+        // Active workspace is 0 (after move_window_to_workspace returns).
+        engine.enter_overview(&BackendHandle::default_for_test());
+        engine.exit_overview(&BackendHandle::default_for_test());
+
+        // Window 100 lives on workspace 1 (inactive).  Its applied_state
+        // entry must report visible=false after exit.
+        let s = engine.applied_state.get(&WindowId::new(100));
+        assert!(
+            s.map(|x| !x.visible).unwrap_or(false),
+            "inactive-workspace tile must be marked hidden after exit_overview, got {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_multi_workspace_overview_zoom_adapts_to_workspace_count() {
+        // One workspace with a small number of columns → no zoom required
+        // (zoom == 1.0).  With many workspaces stacked the height budget
+        // forces zoom < 1.0 even though each individual workspace would
+        // otherwise fit horizontally.
+        // Use fixed mode so column widths don't auto-shrink to fit.
+        let config = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            column_gap: 8,
+            ..LayoutConfig::default()
+        };
+        let mut engine = TilingEngine::new(config);
+        let oid = OutputId::from_name("Test");
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+
+        // Eight workspaces, each with one 500px column.  Stacked they need
+        // 8 * 1040 + 7 * 50 = 8670px tall vs 1040 available → zoom_h ~0.12.
+        for i in 0..8 {
+            engine.add_window(make_window(100 + i, 0, 0), &BackendHandle::default_for_test());
+            engine.move_window_to_workspace(i as i32 + 100, &BackendHandle::default_for_test());
+        }
+
+        engine.enter_overview(&BackendHandle::default_for_test());
+        assert!(engine.is_overview());
+        let zoom = engine.overview_zoom();
+        assert!(zoom < 0.5,
+            "8 stacked workspaces must force zoom < 0.5; got {}", zoom);
     }
 
     #[test]

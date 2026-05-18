@@ -16,9 +16,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, GetWindowRect,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+use windows::Win32::Foundation::RECT;
 
 #[derive(Debug, Clone)]
 pub struct Notification {
@@ -260,6 +262,174 @@ impl Spawner {
     }
 }
 
+/// Capture a single window by HWND and write a BMP file to `path`.
+///
+/// Uses `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` — the modern flag
+/// that asks the window to render its full client area including UWP /
+/// DirectComposition surfaces.  Falls back to plain `PrintWindow` flags
+/// `0` on the rare windows that don't honour PW_RENDERFULLCONTENT.
+///
+/// The output BMP is 32-bit BGRA, bottom-up, matching the desktop helper
+/// so downstream readers (web preview, share-sheet) can treat both kinds
+/// of capture identically.
+pub fn capture_window_to_file(hwnd: isize, path: &Path) -> Result<()> {
+    unsafe {
+        let hwnd_t = HWND(hwnd as *mut std::ffi::c_void);
+        if hwnd_t.is_invalid() {
+            anyhow::bail!("capture_window_to_file: invalid HWND {}", hwnd);
+        }
+
+        // --- Window rect (in screen coords) ---
+        let mut wnd_rect: RECT = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        GetWindowRect(hwnd_t, &mut wnd_rect)
+            .map_err(|e| anyhow::anyhow!("GetWindowRect failed: {:?}", e))?;
+        let width = (wnd_rect.right - wnd_rect.left).max(0);
+        let height = (wnd_rect.bottom - wnd_rect.top).max(0);
+        if width == 0 || height == 0 {
+            anyhow::bail!(
+                "capture_window_to_file: window {} has zero size ({}x{})",
+                hwnd, width, height
+            );
+        }
+
+        // --- Acquire the window's own DC + create a memory DC with a
+        //     compatible bitmap to receive the PrintWindow output ---
+        let wnd_dc = GetDC(hwnd_t);
+        if wnd_dc.is_invalid() {
+            anyhow::bail!("GetDC(hwnd) failed for window {}", hwnd);
+        }
+
+        let mem_dc = CreateCompatibleDC(wnd_dc);
+        if mem_dc.is_invalid() {
+            let _ = ReleaseDC(hwnd_t, wnd_dc);
+            anyhow::bail!("CreateCompatibleDC failed");
+        }
+
+        let bitmap = CreateCompatibleBitmap(wnd_dc, width, height);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(hwnd_t, wnd_dc);
+            anyhow::bail!("CreateCompatibleBitmap failed");
+        }
+
+        let bitmap_obj: HGDIOBJ = HGDIOBJ::from(bitmap);
+        let old_obj = SelectObject(mem_dc, bitmap_obj);
+
+        // PW_RENDERFULLCONTENT = 0x00000002 — the modern flag that handles
+        // UWP windows and DirectComposition surfaces. PW_CLIENTONLY = 0x1.
+        const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
+        let mut ok = PrintWindow(hwnd_t, mem_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT));
+        if !ok.as_bool() {
+            // Some legacy windows return 0 with PW_RENDERFULLCONTENT.
+            // Retry with the default flags = 0.
+            ok = PrintWindow(hwnd_t, mem_dc, PRINT_WINDOW_FLAGS(0));
+        }
+        if !ok.as_bool() {
+            let _ = SelectObject(mem_dc, old_obj);
+            let _ = DeleteObject(bitmap_obj);
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(hwnd_t, wnd_dc);
+            anyhow::bail!("PrintWindow failed for HWND {}", hwnd);
+        }
+
+        // --- Extract pixel bytes via GetDIBits ---
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: height,    // positive = bottom-up
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,    // BI_RGB
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [Default::default(); 1],
+        };
+
+        let row_bytes = (width as u32) * 4;
+        let pixel_data_size = (row_bytes * height as u32) as usize;
+        let mut pixels: Vec<u8> = vec![0u8; pixel_data_size];
+
+        let scan_lines = GetDIBits(
+            mem_dc,
+            bitmap,
+            0,
+            height as u32,
+            Some(pixels.as_mut_ptr() as *mut _),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+
+        // --- Cleanup GDI ---
+        let _ = SelectObject(mem_dc, old_obj);
+        let _ = DeleteObject(bitmap_obj);
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(hwnd_t, wnd_dc);
+
+        if scan_lines == 0 {
+            anyhow::bail!("GetDIBits returned 0 scan lines for window {}", hwnd);
+        }
+
+        // --- Write BMP file (BITMAPFILEHEADER + BITMAPINFOHEADER + bytes) ---
+        let file_header_size: u32 = 14;
+        let info_header_size: u32 = 40;
+        let pixel_offset: u32 = file_header_size + info_header_size;
+        let file_size: u32 = pixel_offset + pixel_data_size as u32;
+
+        let mut bmp: Vec<u8> = Vec::with_capacity(file_size as usize);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&file_size.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&pixel_offset.to_le_bytes());
+
+        bmp.extend_from_slice(&info_header_size.to_le_bytes());
+        bmp.extend_from_slice(&width.to_le_bytes());
+        bmp.extend_from_slice(&height.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&32u16.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+
+        bmp.extend_from_slice(&pixels);
+
+        std::fs::write(path, &bmp)
+            .with_context(|| format!("failed to write window BMP to {}", path.display()))?;
+
+        Ok(())
+    }
+}
+
+/// Resolve a default output path for a window capture: prefer
+/// `%USERPROFILE%\Pictures\wiri-window-<hwnd>-<unix>.bmp`; fall back to the
+/// current working directory.  Lifted into a separate helper so the IPC
+/// server, tray menu, and ctl subcommand all obey the same policy.
+pub fn default_window_capture_path(hwnd: isize) -> Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let filename = format!("wiri-window-{}-{}.bmp", hwnd, ts);
+    let dest = std::env::var("USERPROFILE")
+        .ok()
+        .map(|home| PathBuf::from(home).join("Pictures"))
+        .and_then(|dir| std::fs::create_dir_all(&dir).ok().map(|_| dir.join(&filename)))
+        .or_else(|| std::env::current_dir().ok().map(|d| d.join(&filename)))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no writable destination dir (Pictures and cwd both unavailable)")
+        })?;
+    Ok(dest)
+}
+
 /// Capture the full virtual desktop (all monitors) and write a BMP file to `path`.
 ///
 /// Uses pure GDI: `GetDC(NULL)` → `CreateCompatibleDC` → `CreateCompatibleBitmap` →
@@ -406,6 +576,56 @@ fn capture_desktop_to_bmp(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+    #[test]
+    fn test_capture_window_to_file_bmp_signature() {
+        // Use the desktop HWND as a stable target window — it always exists,
+        // has a valid window rect, and PrintWindow handles it on most boxes.
+        // In headless CI environments without a display, GetDC will fail; we
+        // skip gracefully in that case.
+        let desktop_hwnd: isize = unsafe { GetDesktopWindow().0 as isize };
+        let tmp_path = std::env::temp_dir().join("wiri_test_window_capture.bmp");
+        match capture_window_to_file(desktop_hwnd, &tmp_path) {
+            Ok(()) => {
+                let bytes = std::fs::read(&tmp_path)
+                    .expect("BMP file should be readable after window capture");
+                assert!(bytes.len() >= 2, "BMP file must be at least 2 bytes");
+                assert_eq!(&bytes[0..2], b"BM", "BMP file must start with 'BM' signature");
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("GetDC") || msg.contains("zero size") || msg.contains("PrintWindow") {
+                    eprintln!("Skipping window-capture test — no display / PrintWindow refused: {}", msg);
+                } else {
+                    panic!("capture_window_to_file failed unexpectedly: {}", e);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_capture_window_to_file_invalid_hwnd() {
+        let tmp_path = std::env::temp_dir().join("wiri_test_window_capture_bad.bmp");
+        // 0 is an explicitly-invalid HWND; the helper must reject without
+        // panicking and without leaving a partial file behind.
+        let result = capture_window_to_file(0, &tmp_path);
+        assert!(result.is_err(), "expected error for invalid HWND, got {:?}", result);
+        // No file should have been created on the failure path.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn test_default_window_capture_path_format() {
+        let p = default_window_capture_path(0xCAFE).expect("path must resolve");
+        let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert!(
+            fname.starts_with("wiri-window-51966-") && fname.ends_with(".bmp"),
+            "expected wiri-window-<hwnd>-<ts>.bmp shape, got {}",
+            fname
+        );
+    }
 
     #[test]
     fn test_capture_screenshot_to_file_bmp_signature() {

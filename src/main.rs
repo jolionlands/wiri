@@ -18,7 +18,7 @@ use wiri::hooks::{SystemIntegration, TrayAction};
 use wiri::layout::{TilingEngine, LayoutConfig};
 use wiri::input::{MouseTracker, MouseFocusConfig, start_mouse_hook, stop_mouse_hook, apply_mouse_config};
 use wiri::ipc::{IpcServer, IpcEvent, WindowInfoIpc};
-use wiri::overlay::WorkspaceIndicator;
+use wiri::overlay::{OverviewBanner, WorkspaceIndicator};
 use wiri::utils::WindowId;
 
 use parking_lot::RwLock;
@@ -85,7 +85,13 @@ async fn main() -> Result<()> {
         EnvFilter::from_default_env().add_directive(Level::INFO.into())
     };
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(
+            fmt::layer()
+                // Route logs to stderr so stdout stays clean for any future
+                // machine-consumable output (and so `wiri.exe 2>wiri.log`
+                // captures everything that matters).
+                .with_writer(std::io::stderr),
+        )
         .with(filter)
         .init();
 
@@ -93,6 +99,14 @@ async fn main() -> Result<()> {
     info!("║ wiri - Scrollable Tiling WM              ║");
     info!("║ Niri-style window manager for Windows    ║");
     info!("╚══════════════════════════════════════════╝");
+
+    // Startup probe: known GPU OEM utilities that hijack chords like
+    // Ctrl+Alt+Arrows for screen rotation.  We can't take the chord back
+    // from a kernel-mode driver, but we can tell the user why their
+    // bindings might be silently broken.  No-op on aarch64.
+    for warning in wiri::backend::hotkey_conflicts::detect() {
+        warn!("{}", warning);
+    }
 
     // Handle autostart registration flags before full startup
     if args.register_autostart || args.unregister_autostart {
@@ -467,6 +481,15 @@ info!("Mouse hook installed");
     // Spawn the Win32 message-pump thread; drop the JoinHandle (overlay lives until exit).
     let _ = overlay.clone().spawn();
 
+    // Overview-mode banner — shown while the user is in overview ("Space or
+    // Esc to exit").  Engine reaches it via the
+    // `overlay::overview_banner::global_*` helpers; we install the singleton
+    // here once so those calls actually do something.  Dropping the
+    // JoinHandle is intentional — the thread lives until process exit.
+    let overview_banner = Arc::new(OverviewBanner::new());
+    let _ = overview_banner.clone().spawn();
+    wiri::overlay::overview_banner::install_global(overview_banner.clone());
+
     print_help();
 
     // Track time for animation ticking
@@ -653,6 +676,13 @@ info!("Mouse hook installed");
                     // route in main.
                     info!("Tray: screenshot — handled inline by SystemIntegration");
                 }
+                TrayAction::CaptureWindow => {
+                    // Same pattern as Screenshot: SystemIntegration handles
+                    // window-capture inline (continues the loop, never
+                    // surfaces this variant).  Arm is here only for
+                    // exhaustive-match coverage.
+                    info!("Tray: window-capture — handled inline by SystemIntegration");
+                }
             }
         }
 
@@ -695,7 +725,8 @@ fn print_help() {
     info!("──────────────────────────────────────────");
     info!("Workspaces │ Ctrl+Alt+1-9 Switch workspace");
     info!("Overview   │ Ctrl+Alt+Space Zoom out grid");
-    info!("           │ Ctrl+Alt+O Select window");
+    info!("           │ Escape         Exit overview (overview-only)");
+    info!("           │ Ctrl+Alt+O     Select window");
     info!("──────────────────────────────────────────");
     info!("Tabs       │ Ctrl+Alt+\\  Toggle tabbed column");
     info!("           │ Ctrl+Alt+]/[ Next/prev tab");

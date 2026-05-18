@@ -6,6 +6,42 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Niri-style multi-workspace overview** — `enter_overview` now collects ALL
+  non-empty workspaces of the focused monitor, stacks them vertically with a
+  50 px gap, and picks a single zoom that fits both width and height. New
+  `OverviewState { zoom, workspace_offsets }` replaces the old `Option<f64>`;
+  `overview_zoom()` and `overview_state()` accessors retain backwards compat.
+  `exit_overview` now hides every tile that doesn't belong to the active
+  workspace so the user is back to a single-workspace view.
+- **Overview banner overlay** (`src/overlay/overview_banner.rs`) — translucent
+  "Overview — Space or Esc to exit" strip pinned at the top of the focused
+  monitor while overview is active.  Wired via a process-wide singleton so
+  `engine.rs::enter_overview` / `exit_overview` can toggle it without
+  threading state through.
+- **GPU-hotkey-conflict detector** (`src/backend/hotkey_conflicts.rs`) —
+  startup probe (x86_64 only) that logs a WARN when Intel HotKey Service or
+  AMD Radeon registry keys are present, since those drivers steal
+  `Ctrl+Alt+Arrows` for screen rotation.  No-op on aarch64.
+- **`wiri-ctl test-bindings`** — diagnostic subcommand that prints every
+  hotkey binding the running daemon successfully registered with Windows
+  (chord, modifier mask, VK code, action).  Backed by new
+  `IpcMessage::ListBindings` + `ListBindingsResponse { bindings: Vec<BindingInfo> }`
+  + `MessageLoop::current_bindings()` helper.
+- **State-gated `Escape` overview-exit binding** — registered unconditionally
+  so the OS routes Esc to wiri while overview is active, but the WM_HOTKEY
+  dispatcher swallows it (no action) when overview is off, keeping Esc
+  available to other applications in normal mode.
+- TROUBLESHOOTING.md sections: "Known hotkey conflicts on Windows" + "How to
+  verify wiri received your keypress".
+
+### Changed
+- **Default overview chord moved from `Ctrl+Alt+Tab` to `Ctrl+Alt+Space`**
+  (plus `Escape` to exit).  Windows' accessibility task switcher reserves
+  `Ctrl+Alt+Tab` system-wide — `RegisterHotKey` succeeds but the OS still
+  intercepts the keystroke, so the binding silently never fires.  Default
+  fixed in both `resources/default_config.kdl` and the in-code defaults in
+  `backend/message_loop.rs::default_hotkeys`.
+
 - `wiri-ctl validate-config <path>` — parse and validate a config file without
   needing a running daemon
 - Live `MatcherContext` flags (`is_active`, `is_floating`, `is_urgent`,

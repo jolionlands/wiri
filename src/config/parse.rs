@@ -499,6 +499,14 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
                 config.layout.shadow_spread = v;
             }
         }
+        "snap_on_drag" | "snap-on-drag" => {
+            config.layout.snap_on_drag = value == "true" || value == "1";
+        }
+        "snap_threshold_px" | "snap-threshold-px" => {
+            if let Ok(v) = value.parse() {
+                config.layout.snap_threshold_px = v;
+            }
+        }
         _ => {}
     }
 }
@@ -1685,6 +1693,58 @@ layout {
         assert_eq!(config.layout.focus_ring_gap, 6);
         assert_eq!(config.layout.focus_ring_inactive_color, "#404040");
         assert_eq!(config.layout.shadow_spread, 5);
+    }
+
+    #[test]
+    fn test_parse_snap_on_drag_enabled() {
+        let input = r#"
+layout {
+    snap-on-drag true
+    snap-threshold-px 32
+}
+"#;
+        let config = parse_kdl_config(input).unwrap();
+        assert!(config.layout.snap_on_drag);
+        assert_eq!(config.layout.snap_threshold_px, 32);
+    }
+
+    #[test]
+    fn test_parse_snap_on_drag_disabled() {
+        let input = r#"
+layout {
+    snap-on-drag false
+}
+"#;
+        let config = parse_kdl_config(input).unwrap();
+        assert!(!config.layout.snap_on_drag);
+    }
+
+    #[test]
+    fn test_parse_snap_defaults_when_omitted() {
+        // Without the keys, the layout defaults (snap_on_drag=true,
+        // snap_threshold_px=20) should hold.
+        let input = r#"
+layout {
+    inner-gaps 8
+}
+"#;
+        let config = parse_kdl_config(input).unwrap();
+        assert!(config.layout.snap_on_drag);
+        assert_eq!(config.layout.snap_threshold_px, 20);
+    }
+
+    #[test]
+    fn test_parse_snap_threshold_underscore_alias() {
+        // Both spellings (`snap-threshold-px` and `snap_threshold_px`) work.
+        let input = r#"
+layout {
+    snap_threshold_px 5
+    snap_on_drag true
+}
+"#;
+        let config = parse_kdl_config(input).unwrap();
+        assert_eq!(config.layout.snap_threshold_px, 5);
+        assert!(config.layout.snap_on_drag);
     }
 
     /// `match { }` block with multiple regex keys.

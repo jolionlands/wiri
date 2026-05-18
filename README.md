@@ -112,7 +112,10 @@ The wire format is line-delimited JSON. See `docs/DOCUMENTATION.md` § 6 for the
 
 ## Architecture
 
-See `docs/SPEC.md` for the full design, `docs/DOCUMENTATION.md` for the module reference, and `docs/PROGRESS.md` for what's implemented. A short summary:
+See `docs/SPEC.md` for the full design, `docs/DOCUMENTATION.md` for the
+module reference, `docs/PROGRESS.md` for the implementation log, and
+`docs/PARITY.md` for a feature-by-feature comparison with niri. A short
+summary:
 
 ```
 ┌────────────────────── wiri (main.rs) ─────────────────────┐
