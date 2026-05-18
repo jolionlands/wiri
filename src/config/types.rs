@@ -27,6 +27,7 @@ impl Default for Config {
                 primary: false,
                 transform: "normal".to_string(),
                 enable: true,
+                layout_override: None,
             }],
             layout: LayoutConfig::default_config(),
             workspace: Vec::new(),
@@ -203,6 +204,86 @@ pub struct OutputConfig {
     pub primary: bool,
     pub transform: String,
     pub enable: bool,
+    /// Per-output `layout { … }` block (niri parity).  Each field is `Option`
+    /// so callers can fold only the explicitly-set fields onto the global
+    /// `LayoutConfig` for the monitor backing this output.
+    ///
+    /// Engine wiring lives in `layout::engine` (owned by Agent E); this struct
+    /// is consumed by `main.rs` when it computes the effective per-monitor
+    /// layout config at engine-startup / config-reload time.
+    pub layout_override: Option<LayoutConfigPartial>,
+}
+
+/// Optional-per-field mirror of `LayoutConfig` used by per-output overrides
+/// (`output "DP-1" { layout { column-width 800 } }`).
+///
+/// Every field corresponds to a flat field on `LayoutConfig`.  `None` means
+/// "field unset on the override; fall through to the global LayoutConfig
+/// value".  `Some(x)` means "use this value on this output specifically".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LayoutConfigPartial {
+    pub inner_gaps: Option<u32>,
+    pub outer_gaps: Option<u32>,
+    pub border_width: Option<u32>,
+    pub border_color: Option<String>,
+    pub border_color_focused: Option<String>,
+    pub focus_ring_width: Option<u32>,
+    pub dim_unfocused: Option<f32>,
+    pub focus_ring_color: Option<String>,
+    pub shadow_enable: Option<bool>,
+    pub shadow_opacity: Option<f64>,
+    pub shadow_offset_x: Option<i32>,
+    pub shadow_offset_y: Option<i32>,
+    pub shadow_blur: Option<u32>,
+    pub shadow_color: Option<String>,
+    pub split_ratio: Option<f64>,
+    pub auto_balance: Option<bool>,
+    pub scroll_step: Option<u32>,
+    pub column_width: Option<u32>,
+    pub column_width_mode: Option<String>,
+    pub strip_frame: Option<bool>,
+    pub border_color_urgent: Option<String>,
+    pub border_radius: Option<u32>,
+    pub border_padding: Option<u32>,
+    pub focus_ring_gap: Option<u32>,
+    pub focus_ring_inactive_color: Option<String>,
+    pub shadow_spread: Option<u32>,
+}
+
+impl LayoutConfigPartial {
+    /// Fold the override's `Some` fields onto a clone of `base`, returning the
+    /// effective per-output `LayoutConfig`.  `None` fields fall through to the
+    /// base value (i.e. the global `layout { … }` block wins for unset keys).
+    pub fn apply_to(&self, base: &LayoutConfig) -> LayoutConfig {
+        let mut out = base.clone();
+        if let Some(v) = self.inner_gaps { out.inner_gaps = v; }
+        if let Some(v) = self.outer_gaps { out.outer_gaps = v; }
+        if let Some(v) = self.border_width { out.border_width = v; }
+        if let Some(ref v) = self.border_color { out.border_color = v.clone(); }
+        if let Some(ref v) = self.border_color_focused { out.border_color_focused = v.clone(); }
+        if let Some(v) = self.focus_ring_width { out.focus_ring_width = v; }
+        if let Some(v) = self.dim_unfocused { out.dim_unfocused = v; }
+        if let Some(ref v) = self.focus_ring_color { out.focus_ring_color = v.clone(); }
+        if let Some(v) = self.shadow_enable { out.shadow_enable = v; }
+        if let Some(v) = self.shadow_opacity { out.shadow_opacity = v; }
+        if let Some(v) = self.shadow_offset_x { out.shadow_offset_x = v; }
+        if let Some(v) = self.shadow_offset_y { out.shadow_offset_y = v; }
+        if let Some(v) = self.shadow_blur { out.shadow_blur = v; }
+        if let Some(ref v) = self.shadow_color { out.shadow_color = v.clone(); }
+        if let Some(v) = self.split_ratio { out.split_ratio = v; }
+        if let Some(v) = self.auto_balance { out.auto_balance = v; }
+        if let Some(v) = self.scroll_step { out.scroll_step = v; }
+        if let Some(v) = self.column_width { out.column_width = v; }
+        if let Some(ref v) = self.column_width_mode { out.column_width_mode = v.clone(); }
+        if let Some(v) = self.strip_frame { out.strip_frame = v; }
+        if let Some(ref v) = self.border_color_urgent { out.border_color_urgent = v.clone(); }
+        if let Some(v) = self.border_radius { out.border_radius = v; }
+        if let Some(v) = self.border_padding { out.border_padding = v; }
+        if let Some(v) = self.focus_ring_gap { out.focus_ring_gap = v; }
+        if let Some(ref v) = self.focus_ring_inactive_color { out.focus_ring_inactive_color = v.clone(); }
+        if let Some(v) = self.shadow_spread { out.shadow_spread = v; }
+        out
+    }
 }
 
 
@@ -606,6 +687,25 @@ pub struct WindowRule {
     pub scale: Option<f64>,
     pub default_width: Option<u32>,
     pub default_height: Option<u32>,
+
+    // ---- niri-parity `open-*` placement properties (applied on first map) ----
+    /// Place the window on the named monitor when it first appears.  Matches
+    /// `OutputConfig.name` (the friendly device name from Windows display
+    /// settings).
+    pub open_on_output: Option<String>,
+    /// Place the window on the workspace with this 1-based numeric id when it
+    /// first appears.
+    pub open_in_workspace: Option<i32>,
+    /// When `Some(true)`, start the window fullscreen.  `Some(false)` is
+    /// explicit-not-fullscreen; `None` leaves the engine default.
+    pub open_fullscreen: Option<bool>,
+    /// When `Some(true)`, start the window floating.  Equivalent to the
+    /// existing `floating` flag but expresses "on open" semantics for the
+    /// niri-style placement pipeline.
+    pub open_floating: Option<bool>,
+    /// Cap the initial physical size of the window to `(width_px, height_px)`.
+    /// Either dimension of `0` means "no cap on that axis".
+    pub open_max_bounds: Option<(u32, u32)>,
 }
 
 impl WindowRule {
@@ -700,6 +800,32 @@ impl HotkeyBinding {
     /// Delegates to the shared parse_key_name function.
     pub fn vk_code(&self) -> Option<u32> {
         crate::input::parse_key_name(&self.key)
+    }
+
+    /// Returns `true` when this binding's command is the niri-style
+    /// `spawn-cmd "<command>"` shorthand (Windows equivalent of
+    /// `spawn-sh`).  The dispatcher (owned by Agent E in
+    /// `backend/message_loop.rs`) consumes this to spawn the argument
+    /// through `cmd.exe /C "<command>"`.
+    pub fn is_spawn_cmd(&self) -> bool {
+        matches!(self.command.as_str(), "spawn-cmd" | "spawn_cmd" | "spawn-sh")
+    }
+
+    /// When this binding is `spawn-cmd "<command>"`, return the canonical
+    /// argv expansion the dispatcher should pass to `CreateProcessW`:
+    /// `["cmd.exe", "/C", "<command>"]`.
+    ///
+    /// Returns `None` for any other command name, or when the bind has no
+    /// argument (i.e. `Ctrl+Alt+S spawn-cmd` with no quoted command).
+    pub fn shell_command_argv(&self) -> Option<Vec<String>> {
+        if !self.is_spawn_cmd() {
+            return None;
+        }
+        let cmd = self.args.first()?;
+        if cmd.is_empty() {
+            return None;
+        }
+        Some(vec!["cmd.exe".to_string(), "/C".to_string(), cmd.clone()])
     }
 }
 
@@ -942,6 +1068,61 @@ mod tests {
         let mut b = HotkeyBinding::default();
         b.key = "Left".to_string();
         assert_eq!(b.vk_code(), Some(0x25));
+    }
+
+    /// `spawn-cmd "wt.exe"` is recognised and expands to the Windows shell argv.
+    #[test]
+    fn test_hotkey_binding_spawn_cmd_recognised() {
+        let b = HotkeyBinding {
+            command: "spawn-cmd".to_string(),
+            args: vec!["wt.exe".to_string()],
+            ..HotkeyBinding::default()
+        };
+        assert!(b.is_spawn_cmd());
+        assert_eq!(
+            b.shell_command_argv(),
+            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "wt.exe".to_string()]),
+        );
+    }
+
+    /// `spawn-sh "echo hi"` (niri-style alias) also works.
+    #[test]
+    fn test_hotkey_binding_spawn_sh_alias() {
+        let b = HotkeyBinding {
+            command: "spawn-sh".to_string(),
+            args: vec!["echo hi".to_string()],
+            ..HotkeyBinding::default()
+        };
+        assert!(b.is_spawn_cmd());
+        assert_eq!(
+            b.shell_command_argv(),
+            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "echo hi".to_string()]),
+        );
+    }
+
+    /// Non-spawn-cmd commands return None from `shell_command_argv`.
+    #[test]
+    fn test_hotkey_binding_non_spawn_cmd_returns_none() {
+        let b = HotkeyBinding {
+            command: "spawn".to_string(),
+            args: vec!["notepad.exe".to_string()],
+            ..HotkeyBinding::default()
+        };
+        assert!(!b.is_spawn_cmd());
+        assert_eq!(b.shell_command_argv(), None);
+    }
+
+    /// `spawn-cmd` with no argument yields None (parser still records the bind
+    /// so the user sees the error in logs).
+    #[test]
+    fn test_hotkey_binding_spawn_cmd_without_arg_yields_none() {
+        let b = HotkeyBinding {
+            command: "spawn-cmd".to_string(),
+            args: vec![],
+            ..HotkeyBinding::default()
+        };
+        assert!(b.is_spawn_cmd());
+        assert!(b.shell_command_argv().is_none());
     }
 
     #[test]

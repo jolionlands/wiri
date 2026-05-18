@@ -18,6 +18,13 @@ pub struct Tile {
     /// Stored here but not yet used by the layout engine — layout currently distributes
     /// height equally. Wire into calculate_positions when per-tile height is implemented.
     pub preferred_height: Option<u32>,
+    /// niri-style relative tile-height weight inside a column. When
+    /// every tile in a column carries the default weight of 1.0 the
+    /// engine distributes height equally (current behavior). Adjusting
+    /// the weight via `Action::GrowTileHeight` / `ShrinkTileHeight`
+    /// reallocates the column's vertical real estate proportionally.
+    /// Always >= 0.1 by construction in the resize helpers.
+    pub height_weight: f32,
 }
 
 impl Tile {
@@ -28,6 +35,7 @@ impl Tile {
             cached_bounds: Rect::default(),
             configure_throttle: ConfigureThrottle::default_60fps(),
             preferred_height: None,
+            height_weight: 1.0,
         }
     }
 }
@@ -73,11 +81,22 @@ pub struct Column {
     pub width: Option<u32>,
     /// Display mode: stacked (default) or tabbed.
     pub display: ColumnDisplay,
+    /// niri-style per-column maximized state — when true the column should
+    /// occupy the full work-area height (taking precedence over any per-tile
+    /// height distribution). Separate from `SizingMode::Fullscreen`, which
+    /// applies to a single window across the whole monitor including
+    /// reserved bars.
+    pub maximized: bool,
 }
 
 impl Column {
     pub fn new() -> Self {
-        Self { tiles: Vec::new(), width: None, display: ColumnDisplay::Stacked }
+        Self {
+            tiles: Vec::new(),
+            width: None,
+            display: ColumnDisplay::Stacked,
+            maximized: false,
+        }
     }
 
     pub fn add_tile(&mut self, tile: Tile) {
@@ -229,6 +248,55 @@ impl Workspace {
             }
         }
         None
+    }
+
+    /// niri-parity "consume into column": take the focused window out of its
+    /// current column and append it to the column immediately to the right.
+    /// Returns true on success, false when there is no column to the right
+    /// or the window cannot be located. Empty source columns are dropped.
+    pub fn consume_window_into_right_column(&mut self, window_id: WindowId) -> bool {
+        let Some(src_col_idx) = self.find_window_column(window_id) else { return false };
+        // Need a column to the right of the source.
+        if src_col_idx + 1 >= self.columns.len() {
+            return false;
+        }
+        // Remove the tile from its source column.
+        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else { return false };
+        let source_now_empty = self.columns[src_col_idx].tiles.is_empty();
+        // If the source becomes empty after removal it is dropped, shifting
+        // the target index left by one.
+        let target_col_idx = if source_now_empty {
+            self.columns.remove(src_col_idx);
+            src_col_idx // src+1 - 1 (shifted)
+        } else {
+            src_col_idx + 1
+        };
+        if let Some(target_col) = self.columns.get_mut(target_col_idx) {
+            target_col.add_tile(tile);
+            true
+        } else {
+            // Should not happen because we checked bounds above, but be safe.
+            false
+        }
+    }
+
+    /// niri-parity "expel from column": take the focused window out of its
+    /// current column (only meaningful when the column hosts multiple tiles)
+    /// and make it the sole tile of a brand-new column inserted immediately
+    /// to the right of the source. Returns true on success.
+    pub fn expel_window_into_new_column(&mut self, window_id: WindowId) -> bool {
+        let Some(src_col_idx) = self.find_window_column(window_id) else { return false };
+        // No-op when the source column has only one tile — there is nothing
+        // to expel (the column would just be cloned and the source removed).
+        if self.columns.get(src_col_idx).map(|c| c.tiles.len()).unwrap_or(0) <= 1 {
+            return false;
+        }
+        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else { return false };
+        let mut new_col = Column::new();
+        new_col.add_tile(tile);
+        let insert_at = src_col_idx + 1;
+        self.columns.insert(insert_at, new_col);
+        true
     }
 
     /// Move a window to a different column

@@ -162,6 +162,38 @@ enum Commands {
         /// %USERPROFILE%\.config\wiri\config.kdl.
         path: Option<String>,
     },
+
+    /// niri-parity: take the focused tile out of its column and append it
+    /// to the column on its right. No-op when already rightmost.
+    ConsumeWindow,
+
+    /// niri-parity: take the focused tile out of its column and place it
+    /// in a brand-new column to the right of its source.
+    ExpelWindow,
+
+    /// niri-parity: expand the focused column to fill the leftover
+    /// horizontal space in the work area.
+    ExpandColumn,
+
+    /// niri-parity: toggle the focused column's maximize flag (full
+    /// work-area height). Distinct from window fullscreen.
+    MaximizeColumn,
+
+    /// niri-parity: grow the focused column width by 5% of the work area.
+    GrowColumn,
+
+    /// niri-parity: shrink the focused column width by 5% of the work area.
+    ShrinkColumn,
+
+    /// niri-parity: grow the focused tile height by 5% of its column.
+    GrowTile,
+
+    /// niri-parity: shrink the focused tile height by 5% of its column.
+    ShrinkTile,
+
+    /// niri-parity: move the focused column wholesale to the monitor in
+    /// the given direction. `direction` must be `left` or `right`.
+    MoveColumnToMonitor { direction: String },
 }
 
 fn main() -> Result<()> {
@@ -234,6 +266,17 @@ fn main() -> Result<()> {
         },
         Commands::ListMonitors => IpcMessage::MonitorList,
         Commands::ValidateConfig { .. } => unreachable!("handled above"),
+        Commands::ConsumeWindow => IpcMessage::ConsumeWindow,
+        Commands::ExpelWindow => IpcMessage::ExpelWindow,
+        Commands::ExpandColumn => IpcMessage::ExpandColumn,
+        Commands::MaximizeColumn => IpcMessage::MaximizeColumn,
+        Commands::GrowColumn => IpcMessage::GrowColumn,
+        Commands::ShrinkColumn => IpcMessage::ShrinkColumn,
+        Commands::GrowTile => IpcMessage::GrowTile,
+        Commands::ShrinkTile => IpcMessage::ShrinkTile,
+        Commands::MoveColumnToMonitor { direction } => {
+            IpcMessage::MoveColumnToMonitor { direction }
+        }
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;

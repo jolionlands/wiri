@@ -46,7 +46,13 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                     primary: false,
                     transform: "normal".to_string(),
                     enable: true,
+                    layout_override: None,
                 });
+            } else if section_name == "output.layout" && depth == 0 {
+                // Defensive: top-level `output.layout` cannot happen because
+                // try_parse_section returns a single name; we get there via
+                // the section_stack push of `layout` under `output` instead.
+                // No-op kept so the table is exhaustive.
             } else if section_name == "workspace" && depth == 0 {
                 current_workspace = Some(WorkspaceConfig {
                     name: section_arg.clone().unwrap_or_default(),
@@ -153,6 +159,14 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                         apply_output_property(&key, &value, out);
                     }
                 }
+                // Per-output layout override block (niri parity).  Routes the
+                // key=value pairs into `OutputConfig.layout_override`.
+                "output.layout" => {
+                    if let Some(ref mut out) = current_output {
+                        let lo = out.layout_override.get_or_insert_with(LayoutConfigPartial::default);
+                        apply_output_layout_property(&key, &value, lo);
+                    }
+                }
                 // Bug fix #7: workspace block properties.
                 "workspace" => {
                     if let Some(ref mut ws) = current_workspace {
@@ -183,6 +197,7 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
             primary: false,
             transform: "normal".to_string(),
             enable: true,
+            layout_override: None,
         });
     }
 
@@ -529,8 +544,17 @@ fn apply_output_property(key: &str, value: &str, out: &mut OutputConfig) {
             }
         }
         "scale" => {
-            if let Ok(v) = value.parse() {
+            if let Ok(v) = value.parse::<f64>() {
+                if !(0.5..=4.0).contains(&v) {
+                    tracing::warn!(
+                        "output scale {} is outside the supported range [0.5, 4.0] — \
+                         keeping value but Windows DPI APIs may behave unexpectedly",
+                        v,
+                    );
+                }
                 out.scale = v;
+            } else {
+                tracing::warn!("output scale {:?} is not a valid number; ignoring", value);
             }
         }
         "enable" | "enabled" => {
@@ -547,6 +571,86 @@ fn apply_output_property(key: &str, value: &str, out: &mut OutputConfig) {
         }
         "primary" => {
             out.primary = value == "true" || value == "1";
+        }
+        _ => {}
+    }
+}
+
+/// Parse properties inside `output "name" { layout { … } }`.  Routes the
+/// key=value pair onto the matching `LayoutConfigPartial` field as `Some(_)`;
+/// fields the user doesn't set remain `None` and fall through to the global
+/// layout config (see `LayoutConfigPartial::apply_to`).
+fn apply_output_layout_property(key: &str, value: &str, lo: &mut LayoutConfigPartial) {
+    match key {
+        "inner_gaps" | "inner-gaps" | "inner" => {
+            if let Ok(v) = value.parse() { lo.inner_gaps = Some(v); }
+        }
+        "outer_gaps" | "outer-gaps" | "outer" => {
+            if let Ok(v) = value.parse() { lo.outer_gaps = Some(v); }
+        }
+        "border_width" | "border-width" => {
+            if let Ok(v) = value.parse() { lo.border_width = Some(v); }
+        }
+        "border_color" | "border-color" => { lo.border_color = Some(value.to_string()); }
+        "border_color_focused" | "border-color-focused" => { lo.border_color_focused = Some(value.to_string()); }
+        "focus_ring_width" | "focus-ring-width" => {
+            if let Ok(v) = value.parse() { lo.focus_ring_width = Some(v); }
+        }
+        "dim_unfocused" | "dim-unfocused" => {
+            if let Ok(v) = value.parse::<f32>() { lo.dim_unfocused = Some(v.clamp(0.1, 1.0)); }
+        }
+        "focus_ring_color" | "focus-ring-color" => { lo.focus_ring_color = Some(value.to_string()); }
+        "shadow_enable" | "shadow-enable" | "shadows-enable" => {
+            lo.shadow_enable = Some(value == "true" || value == "1");
+        }
+        "shadow_opacity" | "shadow-opacity" => {
+            if let Ok(v) = value.parse() { lo.shadow_opacity = Some(v); }
+        }
+        "shadow_offset_x" | "shadow-offset-x" => {
+            if let Ok(v) = value.parse() { lo.shadow_offset_x = Some(v); }
+        }
+        "shadow_offset_y" | "shadow-offset-y" => {
+            if let Ok(v) = value.parse() { lo.shadow_offset_y = Some(v); }
+        }
+        "shadow_blur" | "shadow-blur" => {
+            if let Ok(v) = value.parse() { lo.shadow_blur = Some(v); }
+        }
+        "shadow_color" | "shadow-color" => { lo.shadow_color = Some(value.to_string()); }
+        "scroll_step" | "scroll-step" => {
+            if let Ok(v) = value.parse() { lo.scroll_step = Some(v); }
+        }
+        "column_width" | "column-width" => {
+            if let Ok(v) = value.parse() { lo.column_width = Some(v); }
+        }
+        "column_width_mode" | "column-width-mode" => {
+            lo.column_width_mode = Some(value.to_string());
+        }
+        "split_ratio" | "split-ratio" => {
+            if let Ok(v) = value.parse() { lo.split_ratio = Some(v); }
+        }
+        "auto_balance" | "auto-balance" => {
+            lo.auto_balance = Some(value == "true" || value == "1");
+        }
+        "strip_frame" | "strip-frame" => {
+            lo.strip_frame = Some(value == "true" || value == "1");
+        }
+        "border_color_urgent" | "border-color-urgent" => {
+            lo.border_color_urgent = Some(value.to_string());
+        }
+        "border_radius" | "border-radius" => {
+            if let Ok(v) = value.parse() { lo.border_radius = Some(v); }
+        }
+        "border_padding" | "border-padding" => {
+            if let Ok(v) = value.parse() { lo.border_padding = Some(v); }
+        }
+        "focus_ring_gap" | "focus-ring-gap" => {
+            if let Ok(v) = value.parse() { lo.focus_ring_gap = Some(v); }
+        }
+        "focus_ring_inactive_color" | "focus-ring-inactive-color" => {
+            lo.focus_ring_inactive_color = Some(value.to_string());
+        }
+        "shadow_spread" | "shadow-spread" => {
+            if let Ok(v) = value.parse() { lo.shadow_spread = Some(v); }
         }
         _ => {}
     }
@@ -616,6 +720,43 @@ fn apply_window_rule_property(key: &str, value: &str, wr: &mut WindowRule) {
         }
         "sticky" => {
             wr.sticky = value == "true" || value == "1";
+        }
+        // ── niri-parity `open-*` placement properties ────────────────────────
+        "open-on-output" | "open_on_output" => {
+            wr.open_on_output = Some(value.to_string());
+        }
+        "open-in-workspace" | "open_in_workspace" => {
+            if let Ok(v) = value.parse() {
+                wr.open_in_workspace = Some(v);
+            }
+        }
+        "open-fullscreen" | "open_fullscreen" => {
+            wr.open_fullscreen = Some(value == "true" || value == "1");
+        }
+        "open-floating" | "open_floating" => {
+            wr.open_floating = Some(value == "true" || value == "1");
+        }
+        "open-max-bounds" | "open_max_bounds" => {
+            // Accept "WxH", "W H", or "W,H".  Each axis with 0 means "no cap".
+            let parts: Vec<&str> = value
+                .split(|c: char| c == 'x' || c == 'X' || c == ',' || c.is_whitespace())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() == 2 {
+                if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    wr.open_max_bounds = Some((w, h));
+                } else {
+                    tracing::warn!(
+                        "window-rule open-max-bounds {:?} could not be parsed as `<w> <h>`",
+                        value,
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "window-rule open-max-bounds {:?} must have two dimensions (got {})",
+                    value, parts.len(),
+                );
+            }
         }
         _ => {}
     }
@@ -780,6 +921,9 @@ fn known_nested_sections(parent: &str) -> &'static [&'static str] {
         "input" => &["keyboard", "mouse", "focus", "touch"],
         "layout" => &["gaps", "borders", "focus-ring", "shadows"],
         "window-rule" => &["match"],
+        // niri parity: `output "DP-1" { layout { … } }` for per-output
+        // layout overrides.  See `OutputConfig::layout_override`.
+        "output" => &["layout"],
         _ => &[],
     }
 }
@@ -1342,6 +1486,27 @@ output "HDMI-1" {
         assert!(wr.floating);
     }
 
+    /// niri-parity `spawn-cmd "<command>"` bind line round-trips through the
+    /// binds parser and is recognised by `HotkeyBinding::is_spawn_cmd`.
+    #[test]
+    fn test_parse_binds_spawn_cmd() {
+        let input = r#"binds {
+    Ctrl+Alt+S spawn-cmd "wt.exe"
+}"#;
+        let cfg = parse_kdl_config(input).unwrap();
+        assert_eq!(cfg.binds.hotkeys.len(), 1);
+        let b = &cfg.binds.hotkeys[0];
+        assert_eq!(b.modifiers, vec!["Ctrl", "Alt"]);
+        assert_eq!(b.key, "S");
+        assert_eq!(b.command, "spawn-cmd");
+        assert_eq!(b.args, vec!["wt.exe".to_string()]);
+        assert!(b.is_spawn_cmd());
+        assert_eq!(
+            b.shell_command_argv(),
+            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "wt.exe".to_string()]),
+        );
+    }
+
     #[test]
     fn test_parse_multiple_binds_with_args() {
         let input = "
@@ -1657,5 +1822,206 @@ layout {
                 && i.message.contains("unknown nested section 'joystick'")),
             "expected nested-section warning, got: {:?}", issues
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Output-relative layout overrides
+    // -----------------------------------------------------------------------
+
+    /// `output "DP-1" { layout { column-width 800 } }` populates
+    /// `OutputConfig.layout_override` with only the explicitly-set field.
+    #[test]
+    fn test_parse_output_layout_override_basic() {
+        let input = r##"output "DP-1" {
+    x 0
+    y 0
+    width 2560
+    height 1440
+    layout {
+        column-width 800
+        inner-gaps 20
+        border-color "#abcdef"
+    }
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        let out = &cfg.output[0];
+        assert_eq!(out.name, "DP-1");
+        let lo = out.layout_override.as_ref().expect("layout override populated");
+        assert_eq!(lo.column_width, Some(800));
+        assert_eq!(lo.inner_gaps, Some(20));
+        assert_eq!(lo.border_color.as_deref(), Some("#abcdef"));
+        // Fields not set in KDL must remain None.
+        assert!(lo.scroll_step.is_none());
+        assert!(lo.border_color_focused.is_none());
+    }
+
+    /// `LayoutConfigPartial::apply_to` overlays Some(_) fields on the base.
+    #[test]
+    fn test_layout_partial_apply_to_overlays_only_set_fields() {
+        let mut base = LayoutConfig::default_config();
+        base.column_width = 500;
+        base.inner_gaps = 16;
+        base.border_color = "#111111".to_string();
+
+        let partial = LayoutConfigPartial {
+            column_width: Some(900),
+            border_color: Some("#222222".to_string()),
+            ..LayoutConfigPartial::default()
+        };
+
+        let effective = partial.apply_to(&base);
+        assert_eq!(effective.column_width, 900, "Some(900) wins");
+        assert_eq!(effective.border_color, "#222222", "Some color wins");
+        assert_eq!(effective.inner_gaps, 16, "None field falls through to base");
+    }
+
+    /// Output without a nested layout block has `layout_override = None`.
+    #[test]
+    fn test_parse_output_without_layout_override() {
+        let input = r##"output "Primary" {
+    x 0
+    y 0
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        assert!(cfg.output[0].layout_override.is_none());
+    }
+
+    /// Multi-output configs keep per-output layout overrides separated.
+    #[test]
+    fn test_parse_multiple_outputs_with_distinct_layout_overrides() {
+        let input = r##"output "DP-1" {
+    layout {
+        column-width 800
+    }
+}
+output "HDMI-1" {
+    layout {
+        column-width 400
+    }
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        assert_eq!(cfg.output.len(), 2);
+        assert_eq!(cfg.output[0].layout_override.as_ref().and_then(|p| p.column_width), Some(800));
+        assert_eq!(cfg.output[1].layout_override.as_ref().and_then(|p| p.column_width), Some(400));
+    }
+
+    /// Validator recognises `output > layout` as a known nested section.
+    #[test]
+    fn test_validate_output_layout_nested_section_is_known() {
+        let input = "output \"DP-1\" {\n  layout {\n    column-width 800\n  }\n}\n";
+        let issues = validate_kdl_config(input);
+        let unknown_nested = issues.iter().filter(|i|
+            i.message.contains("unknown nested section")
+        ).count();
+        assert_eq!(unknown_nested, 0, "output > layout must be known, got: {:?}", issues);
+    }
+
+    // -----------------------------------------------------------------------
+    // Scale validation
+    // -----------------------------------------------------------------------
+
+    /// In-range scale values are accepted silently.
+    #[test]
+    fn test_parse_output_scale_in_range_is_accepted() {
+        let input = r##"output "DP-1" {
+    scale 1.5
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        assert!((cfg.output[0].scale - 1.5).abs() < 1e-9);
+
+        let input2 = r##"output "DP-1" {
+    scale 4.0
+}"##;
+        let cfg2 = parse_kdl_config(input2).unwrap();
+        assert!((cfg2.output[0].scale - 4.0).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------------------
+    // niri-parity `open-*` window-rule properties
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_window_rule_open_on_output() {
+        let input = r#"window-rule {
+    class-name "Firefox"
+    open-on-output "HDMI-1"
+}"#;
+        let cfg = parse_kdl_config(input).unwrap();
+        let wr = &cfg.window_rules[0];
+        assert_eq!(wr.open_on_output.as_deref(), Some("HDMI-1"));
+    }
+
+    #[test]
+    fn test_parse_window_rule_open_in_workspace_and_fullscreen() {
+        let input = r#"window-rule {
+    class-name "Steam"
+    open-in-workspace 4
+    open-fullscreen true
+}"#;
+        let cfg = parse_kdl_config(input).unwrap();
+        let wr = &cfg.window_rules[0];
+        assert_eq!(wr.open_in_workspace, Some(4));
+        assert_eq!(wr.open_fullscreen, Some(true));
+    }
+
+    #[test]
+    fn test_parse_window_rule_open_floating() {
+        let input = r#"window-rule {
+    class-name "Calculator"
+    open-floating true
+}"#;
+        let cfg = parse_kdl_config(input).unwrap();
+        let wr = &cfg.window_rules[0];
+        assert_eq!(wr.open_floating, Some(true));
+    }
+
+    /// `open-max-bounds` accepts `<w>x<h>`, `<w> <h>`, and `<w>,<h>` syntaxes.
+    #[test]
+    fn test_parse_window_rule_open_max_bounds_variants() {
+        for v in ["1600x900", "1600 900", "1600,900"] {
+            let input = format!(
+                "window-rule {{\n  class-name \"X\"\n  open-max-bounds \"{}\"\n}}",
+                v
+            );
+            let cfg = parse_kdl_config(&input).unwrap_or_else(|e| panic!("parse {}: {}", v, e));
+            let wr = &cfg.window_rules[0];
+            assert_eq!(
+                wr.open_max_bounds,
+                Some((1600, 900)),
+                "open-max-bounds {:?} must parse to (1600, 900)",
+                v
+            );
+        }
+    }
+
+    /// `open-max-bounds` with a single dimension is ignored (warn logged).
+    #[test]
+    fn test_parse_window_rule_open_max_bounds_invalid_is_ignored() {
+        let input = r#"window-rule {
+    class-name "X"
+    open-max-bounds "1600"
+}"#;
+        let cfg = parse_kdl_config(input).unwrap();
+        let wr = &cfg.window_rules[0];
+        assert_eq!(wr.open_max_bounds, None);
+    }
+
+    /// Out-of-range scale values still parse (warn is logged) but the value is
+    /// stored verbatim so the user can observe the effect.
+    #[test]
+    fn test_parse_output_scale_out_of_range_still_parses() {
+        let input = r##"output "DP-1" {
+    scale 8.0
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        // Value preserved; downstream Win32 APIs may reject it, but parser
+        // does not silently clamp (matches niri: warn-and-keep).
+        assert!((cfg.output[0].scale - 8.0).abs() < 1e-9);
+
+        let input_low = r##"output "DP-1" {
+    scale 0.25
+}"##;
+        let cfg_low = parse_kdl_config(input_low).unwrap();
+        assert!((cfg_low.output[0].scale - 0.25).abs() < 1e-9);
     }
 }

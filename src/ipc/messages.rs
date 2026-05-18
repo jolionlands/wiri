@@ -130,6 +130,36 @@ pub enum IpcMessage {
     #[serde(rename = "set_auto_tile_threshold")]
     SetAutoTileThreshold { threshold: Option<usize> },
 
+    // ---- Niri-parity Round 4 (rearrange / sizing) ----
+    /// Consume the focused tile into the column on its right.
+    #[serde(rename = "consume_window")]
+    ConsumeWindow,
+    /// Take the focused tile out and place it in a new column to the right.
+    #[serde(rename = "expel_window")]
+    ExpelWindow,
+    /// Expand the focused column to fill the remaining work-area width.
+    #[serde(rename = "expand_column")]
+    ExpandColumn,
+    /// Toggle the focused column's maximize state (full work-area height).
+    #[serde(rename = "maximize_column")]
+    MaximizeColumn,
+    /// Grow the focused column by 5% of the work-area width.
+    #[serde(rename = "grow_column")]
+    GrowColumn,
+    /// Shrink the focused column by 5% of the work-area width.
+    #[serde(rename = "shrink_column")]
+    ShrinkColumn,
+    /// Grow the focused tile's share of its column height by 5%.
+    #[serde(rename = "grow_tile")]
+    GrowTile,
+    /// Shrink the focused tile's share of its column height by 5%.
+    #[serde(rename = "shrink_tile")]
+    ShrinkTile,
+    /// Move the entire focused column to the monitor on the
+    /// given side (`"left"` or `"right"`).
+    #[serde(rename = "move_column_to_monitor")]
+    MoveColumnToMonitor { direction: String },
+
     // ---- Diagnostics ----
     /// Enumerate every monitor the engine currently tracks, returning
     /// per-monitor geometry (bounds, work area), DPI scale factor, the

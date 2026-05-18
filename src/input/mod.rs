@@ -85,6 +85,33 @@ pub enum Action {
     /// `%USERPROFILE%\Pictures\wiri-<timestamp>.bmp` (or the current working
     /// directory if Pictures isn't writable).
     Screenshot,
+    /// Set the focused column to 1/4 of the work-area width.
+    ColumnWidthPresetQuarter,
+    /// Set the focused column to 3/4 of the work-area width.
+    ColumnWidthPresetThreeQuarters,
+    /// Take the focused tile out of its column and append it to the column
+    /// on the right. No-op if already in the rightmost column.
+    ConsumeWindowIntoColumn,
+    /// Take the focused tile out of its column and place it in a new
+    /// column immediately to the right of the source column.
+    ExpelWindowFromColumn,
+    /// Expand the focused column so it fills the leftover work-area width.
+    ExpandColumnToAvailable,
+    /// Toggle per-column maximize (full work-area height). Distinct from
+    /// `ToggleFullscreen`, which covers the entire monitor.
+    MaximizeColumn,
+    /// Grow the focused column's width by 5% of the work area (clamped).
+    GrowColumnWidth,
+    /// Shrink the focused column's width by 5% of the work area (clamped).
+    ShrinkColumnWidth,
+    /// Grow the focused tile's height inside its column by 5% (clamped).
+    GrowTileHeight,
+    /// Shrink the focused tile's height inside its column by 5% (clamped).
+    ShrinkTileHeight,
+    /// Move the focused column wholesale to the monitor on the left.
+    MoveColumnToMonitorLeft,
+    /// Move the focused column wholesale to the monitor on the right.
+    MoveColumnToMonitorRight,
 }
 
 /// Parse an action name string (from config/IPC) into an Action.
@@ -135,6 +162,29 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "column-width-third" | "column-width-1/3" => Some(Action::ColumnWidthPresetThird),
         "column-width-two-thirds" | "column-width-2/3" => Some(Action::ColumnWidthPresetTwoThirds),
         "column-width-full" | "column-width-100" => Some(Action::ColumnWidthPresetFull),
+        "column-width-quarter" | "column-width-1/4" => Some(Action::ColumnWidthPresetQuarter),
+        "column-width-three-quarters" | "column-width-3/4" => {
+            Some(Action::ColumnWidthPresetThreeQuarters)
+        }
+        "consume-window-into-column" | "consume-window" | "consume-into-column" => {
+            Some(Action::ConsumeWindowIntoColumn)
+        }
+        "expel-window-from-column" | "expel-window" | "expel-from-column" => {
+            Some(Action::ExpelWindowFromColumn)
+        }
+        "expand-column-to-available" | "expand-column" => Some(Action::ExpandColumnToAvailable),
+        "maximize-column" | "column-maximize" | "toggle-column-maximize" => {
+            Some(Action::MaximizeColumn)
+        }
+        // Percentage-based column resize (Ctrl+Alt+Shift+L/H). Distinct from
+        // `resize-column-left/right` (pixel-based) further down — different
+        // resolution + different clamping, so we keep both spellings live.
+        "grow-column-width" | "grow-column-pct" => Some(Action::GrowColumnWidth),
+        "shrink-column-width" | "shrink-column-pct" => Some(Action::ShrinkColumnWidth),
+        "grow-tile-height" | "grow-tile" => Some(Action::GrowTileHeight),
+        "shrink-tile-height" | "shrink-tile" => Some(Action::ShrinkTileHeight),
+        "move-column-to-monitor-left" => Some(Action::MoveColumnToMonitorLeft),
+        "move-column-to-monitor-right" => Some(Action::MoveColumnToMonitorRight),
         "resize-column-left" | "shrink-column" => Some(Action::ResizeColumnLeft),
         "resize-column-right" | "grow-column" => Some(Action::ResizeColumnRight),
         "focus-workspace-next" | "workspace-next" => Some(Action::FocusWorkspaceNext),

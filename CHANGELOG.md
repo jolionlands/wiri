@@ -15,10 +15,63 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   avoid the Windows Terminal blank-paint regression)
 - Two-finger pinch gesture coalescing in `input/touch.rs` (frame-coalesced
   WM_POINTER updates emit `Gesture::Pinch { scale }` when distance changes >8 px)
+- **KDL `include "…"` directive (niri parity)** — pre-processed before parsing;
+  paths resolve relative to the including file or absolute; depth capped at 8;
+  cycles detected.  New API: `Config::load_from_str_with_base(input, base_dir)`
+  in `src/config/loader.rs`
+- **Per-output `layout { … }` override block (niri parity)** — `output "DP-1"
+  { layout { column-width 800 } }` populates `OutputConfig.layout_override:
+  Option<LayoutConfigPartial>`.  `LayoutConfigPartial::apply_to(&base)` folds
+  Some-fields onto a base `LayoutConfig` to produce the effective per-monitor
+  config
+- **niri-parity `open-*` window-rule properties** — `open-on-output`,
+  `open-in-workspace`, `open-fullscreen`, `open-floating`, `open-max-bounds`
+  (accepts `WxH`, `W H`, `W,H`).  Surfaced on `ResolvedWindowRules`; resolver
+  in `src/window/rules.rs` folds them with last-rule-wins semantics
+- **Workspace slide animation primitive** —
+  `AnimationTarget::WorkspaceX(OutputId)` plus
+  `AnimationManager::start_workspace_slide(output, from_px, to_px, duration_ms)`
+  and `workspace_slide_offset(output)` reader.  Sign convention matches niri:
+  positive = slide in from the right, negative = from the left
+- **`spawn-cmd "<command>"` bind (niri-`spawn-sh` parity)** — recognised by
+  `HotkeyBinding::is_spawn_cmd()`; `shell_command_argv()` returns
+  `["cmd.exe", "/C", "<command>"]` for the dispatcher
+- **Output `scale` validation** — values outside `0.5..=4.0` log a warning but
+  are still stored (warn-and-keep, matches niri)
+- `MAX_INCLUDE_DEPTH` constant (`8`) exposed in `src/config/loader.rs`
+- Default config (`resources/default_config.kdl`) documents the new `include`,
+  `spawn-cmd`, and per-output `layout {}` blocks with commented examples
+
+### Requests to Agent E (engine wiring not in this pass)
+- **`OutputConfig.layout_override` is parsed but not yet applied.** The
+  engine currently holds one global `LayoutConfig`.  Wire per-monitor
+  effective configs by folding `output.layout_override.as_ref().map(|p|
+  p.apply_to(&global))` onto a `HashMap<OutputId, LayoutConfig>` (or store
+  the partial on `Monitor` and merge at the layout-calculation site)
+- **`AnimationTarget::WorkspaceX` needs a reader in
+  `apply_layout_for_monitor`.** During a workspace-switch, call
+  `engine.animation.workspace_slide_offset(oid)` and add the f64 to every
+  column's X position on the active workspace.  Engine should call
+  `start_workspace_slide()` in `switch_workspace(...)` when
+  `config.animations.workspace_transition` is true
+- **`ResolvedWindowRules.open_on_output / open_in_workspace /
+  open_fullscreen / open_max_bounds` are populated but not consumed.** Wire
+  them in `engine.rs::add_window` (or the matching `add_window_with_target`
+  path): route by `open_on_output` → matching `OutputId`; pick workspace by
+  `open_in_workspace`; cap initial bounds by `open_max_bounds`; flip
+  fullscreen state when `open_fullscreen == Some(true)`
+- **`HotkeyBinding::is_spawn_cmd() / shell_command_argv()` need a
+  dispatcher arm** in `backend/message_loop.rs::WM_HOTKEY` handler.  The
+  existing `Action::Spawn(cmd)` path can be extended with a sibling
+  `Action::SpawnCmd(cmd)` variant in `input/mod.rs`; route it to
+  `CreateProcessW` with the argv from `shell_command_argv()`
 
 ### Changed
 - `build.rs` watches `.git/logs/HEAD` so `--version` git hash refreshes on
   every commit (previously stale until `cargo clean`)
+- `Config::load_sync_inner` (in `loader.rs`) now resolves the file's parent
+  as the include base directory and routes through `load_from_str_with_base`,
+  so on-disk configs gain `include` support automatically
 
 ## [0.1.0] — 2026-05-17
 

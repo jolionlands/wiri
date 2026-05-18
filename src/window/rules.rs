@@ -26,6 +26,33 @@ pub fn resolve_window_rules(rules: &[WindowRule], ctx: &MatcherContext<'_>) -> R
                 resolved.opacity = Some(o.clamp(0.0, 1.0) as f32);
             }
             resolved.border = !rule.blur; // blur is used as "borderless" proxy
+
+            // ── niri-parity `open-*` placement hints — last-rule-wins ──────
+            // Only overwrite on Some(_) so a later rule that omits a field
+            // doesn't clobber an earlier rule's explicit value.
+            if let Some(ref out) = rule.open_on_output {
+                resolved.open_on_output = Some(out.clone());
+            }
+            if let Some(ws) = rule.open_in_workspace {
+                resolved.open_in_workspace = Some(ws);
+            }
+            if let Some(fs) = rule.open_fullscreen {
+                resolved.open_fullscreen = Some(fs);
+                // Propagate explicit "open fullscreen" to fullscreen state hint
+                // via the float flag staying as-is; engine wiring will gate this.
+            }
+            if let Some(fl) = rule.open_floating {
+                resolved.open_floating = Some(fl);
+                if fl {
+                    // Be conservative: an explicit `open-floating true` also
+                    // implies `float = true` so engines that read only `.float`
+                    // still honour the user's intent.
+                    resolved.float = true;
+                }
+            }
+            if let Some(bounds) = rule.open_max_bounds {
+                resolved.open_max_bounds = Some(bounds);
+            }
         }
     }
 
@@ -494,6 +521,92 @@ mod tests {
             resolve_window_rules(&rules, &floating_only).opacity.is_none(),
             "Composite: floating without class must NOT match"
         );
+    }
+
+    // ── niri-parity `open-*` placement rule tests ────────────────────────────
+
+    /// `open-on-output` is folded into the resolved rules when the matcher
+    /// fires; left None otherwise.
+    #[test]
+    fn test_resolved_open_on_output() {
+        let rule = WindowRule {
+            class: Some("Firefox".to_string()),
+            open_on_output: Some("HDMI-1".to_string()),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+
+        let yes = resolve_window_rules(&rules, &ctx("Firefox", ""));
+        assert_eq!(yes.open_on_output.as_deref(), Some("HDMI-1"));
+
+        let no = resolve_window_rules(&rules, &ctx("Notepad", ""));
+        assert!(no.open_on_output.is_none());
+    }
+
+    /// `open-in-workspace` and `open-fullscreen` round-trip.
+    #[test]
+    fn test_resolved_open_in_workspace_and_fullscreen() {
+        let rule = WindowRule {
+            class: Some("Steam".to_string()),
+            open_in_workspace: Some(3),
+            open_fullscreen: Some(true),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+        let r = resolve_window_rules(&rules, &ctx("Steam", ""));
+        assert_eq!(r.open_in_workspace, Some(3));
+        assert_eq!(r.open_fullscreen, Some(true));
+    }
+
+    /// `open-floating true` implies `float = true` (so engines that look only
+    /// at `.float` honour the user's intent without re-reading `open_floating`).
+    #[test]
+    fn test_resolved_open_floating_implies_float() {
+        let rule = WindowRule {
+            class: Some("Calculator".to_string()),
+            open_floating: Some(true),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+        let r = resolve_window_rules(&rules, &ctx("Calculator", ""));
+        assert_eq!(r.open_floating, Some(true));
+        assert!(r.float, "open-floating true must also set the legacy .float flag");
+    }
+
+    /// `open-max-bounds` is preserved on the resolved struct (engine wiring
+    /// in `add_window` will cap the initial bounds — owned by Agent E).
+    #[test]
+    fn test_resolved_open_max_bounds() {
+        let rule = WindowRule {
+            class: Some("BigApp".to_string()),
+            open_max_bounds: Some((1600, 900)),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+        let r = resolve_window_rules(&rules, &ctx("BigApp", ""));
+        assert_eq!(r.open_max_bounds, Some((1600, 900)));
+    }
+
+    /// Later rules override earlier ones for the open-* fields (last-wins),
+    /// but rules that don't set a field do not clobber earlier explicit values.
+    #[test]
+    fn test_resolved_open_fields_last_wins_but_unset_preserves() {
+        let rule1 = WindowRule {
+            class: Some("App".to_string()),
+            open_on_output: Some("DP-1".to_string()),
+            open_in_workspace: Some(2),
+            ..WindowRule::default()
+        };
+        let rule2 = WindowRule {
+            class: Some("App".to_string()),
+            open_on_output: Some("HDMI-1".to_string()),
+            // open_in_workspace deliberately unset
+            ..WindowRule::default()
+        };
+        let rules = vec![rule1, rule2];
+        let r = resolve_window_rules(&rules, &ctx("App", ""));
+        assert_eq!(r.open_on_output.as_deref(), Some("HDMI-1"), "last-rule-wins");
+        assert_eq!(r.open_in_workspace, Some(2), "unset field on later rule preserves earlier");
     }
 
     /// An invalid regex pattern must not panic; the matcher returns `false`.

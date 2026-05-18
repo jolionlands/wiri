@@ -137,6 +137,15 @@ pub enum AnimationTarget {
     WindowH(WindowId),
     /// Opacity for a window
     Opacity(WindowId),
+    /// Per-monitor workspace X offset (workspace-transition slide).  The
+    /// engine reads the current value via `AnimationManager::get_value(...)`
+    /// while a workspace switch is in flight and adds it to the column
+    /// positions for every window on the active workspace.
+    ///
+    /// Sign convention: positive offsets push the incoming workspace's
+    /// columns from the right, negative offsets from the left, matching
+    /// niri's `workspace-switch` animation direction.
+    WorkspaceX(OutputId),
 }
 
 use crate::utils::OutputId;
@@ -224,6 +233,54 @@ impl AnimationManager {
     /// Cancel all animations
     pub fn cancel_all(&mut self) {
         self.animations.clear();
+    }
+
+    /// Start a workspace-switch slide on the given monitor.
+    ///
+    /// `from_offset_px` is the starting X offset (typically the width of the
+    /// outgoing workspace, e.g. `+work_rect.width` when sliding in from the
+    /// right or `-work_rect.width` when sliding in from the left).
+    /// `to_offset_px` is the resting offset, almost always `0.0`.
+    /// `duration_ms` overrides the manager's default duration when non-zero;
+    /// pass `0` to use the manager default.
+    ///
+    /// When animations are disabled or the manager-default duration is also 0
+    /// the animation completes instantly (no slide, layout jumps).
+    ///
+    /// Engine wiring: the consumer reads `get_value(&AnimationTarget::WorkspaceX(oid))`
+    /// during layout calculations and adds the returned f64 to every column's
+    /// X position on the active workspace.  See the "Request to Agent E" note
+    /// in CHANGELOG.md.
+    pub fn start_workspace_slide(
+        &mut self,
+        output: OutputId,
+        from_offset_px: f64,
+        to_offset_px: f64,
+        duration_ms: u32,
+    ) {
+        let target = AnimationTarget::WorkspaceX(output);
+        if !self.enabled || from_offset_px == to_offset_px {
+            self.animations.insert(target, Animation::instant(to_offset_px));
+            return;
+        }
+        let dur = if duration_ms == 0 { self.default_duration_ms } else { duration_ms };
+        if dur == 0 {
+            self.animations.insert(target, Animation::instant(to_offset_px));
+            return;
+        }
+        self.animations.insert(
+            target,
+            Animation::new(from_offset_px, to_offset_px, dur, self.default_easing),
+        );
+    }
+
+    /// Read the current workspace-slide offset for a monitor, in pixels.
+    /// Returns `0.0` when no slide is in flight (i.e. the workspace is at rest).
+    pub fn workspace_slide_offset(&self, output: OutputId) -> f64 {
+        self.animations
+            .get(&AnimationTarget::WorkspaceX(output))
+            .map(|a| a.current())
+            .unwrap_or(0.0)
     }
 
     /// Update animation settings
@@ -408,4 +465,79 @@ mod tests {
         assert_ne!(t1, t3);
     }
 
+    // ── workspace-slide animation tests ───────────────────────────────────────
+
+    #[test]
+    fn test_start_workspace_slide_moves_from_offset_to_zero() {
+        let mut mgr = AnimationManager::new(true, 200, Easing::Linear);
+        let oid = OutputId::from_name("ws-slide-1");
+        // Slide in from +1920 px (incoming workspace pushed off to the right).
+        mgr.start_workspace_slide(oid, 1920.0, 0.0, 200);
+        assert!(mgr.has_active(), "slide animation must be active immediately");
+        assert!(
+            (mgr.workspace_slide_offset(oid) - 1920.0).abs() < f64::EPSILON,
+            "offset at t=0 should be the starting offset"
+        );
+
+        // Halfway through (Linear) — should be exactly +960 px.
+        mgr.tick(100);
+        let mid = mgr.workspace_slide_offset(oid);
+        assert!(
+            (mid - 960.0).abs() < 1.0,
+            "linear at t=0.5 expected ≈960, got {}",
+            mid
+        );
+
+        // Finish out the animation.
+        mgr.tick(200);
+        assert!(!mgr.has_active(), "animation should be done");
+        assert_eq!(
+            mgr.workspace_slide_offset(oid),
+            0.0,
+            "post-animation offset returns 0 (no entry)"
+        );
+    }
+
+    #[test]
+    fn test_start_workspace_slide_negative_direction() {
+        let mut mgr = AnimationManager::new(true, 100, Easing::Linear);
+        let oid = OutputId::from_name("ws-slide-2");
+        // Slide in from -1920 px (incoming workspace pushed off to the left).
+        mgr.start_workspace_slide(oid, -1920.0, 0.0, 0); // 0 → use mgr default 100
+        mgr.tick(50);
+        let mid = mgr.workspace_slide_offset(oid);
+        assert!(
+            mid < 0.0 && mid > -1920.0,
+            "halfway through a left-slide the offset is negative and between -1920 and 0, got {}",
+            mid
+        );
+    }
+
+    #[test]
+    fn test_start_workspace_slide_when_disabled_is_instant() {
+        let mut mgr = AnimationManager::disabled();
+        let oid = OutputId::from_name("ws-slide-3");
+        mgr.start_workspace_slide(oid, 1920.0, 0.0, 200);
+        // Disabled manager → instant transition (no active animation after tick).
+        let _ = mgr.tick(0);
+        assert!(!mgr.has_active(), "disabled manager: slide is instant");
+        assert_eq!(mgr.workspace_slide_offset(oid), 0.0);
+    }
+
+    #[test]
+    fn test_workspace_slide_offset_with_no_active_returns_zero() {
+        let mgr = AnimationManager::new(true, 200, Easing::Linear);
+        let oid = OutputId::from_name("ws-slide-4");
+        assert_eq!(mgr.workspace_slide_offset(oid), 0.0);
+    }
+
+    #[test]
+    fn test_start_workspace_slide_zero_duration_is_instant() {
+        let mut mgr = AnimationManager::new(true, 0, Easing::Linear);
+        let oid = OutputId::from_name("ws-slide-5");
+        // Both override and default = 0 → instant.
+        mgr.start_workspace_slide(oid, 1000.0, 0.0, 0);
+        let _ = mgr.tick(0);
+        assert!(!mgr.has_active(), "zero-duration slide must complete instantly");
+    }
 }

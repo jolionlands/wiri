@@ -27,6 +27,8 @@ config.kdl
 
 # Misc throwaways
 test_position.rs
+empty.in
+.commit-msg.tmp
 
 # Unused local build helper (hardcodes one user's Windows SDK path)
 link.bat

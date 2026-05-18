@@ -133,6 +133,27 @@ binds {
     Ctrl+Alt+Bracket_Right set-column-width "2/3"
     Ctrl+Alt+Backslash     set-column-width "cycle"
 
+    // niri-parity: column-rearrange + size actions
+    //   Ctrl+Alt+Comma   → consume focused tile into the column on the right
+    //   Ctrl+Alt+Period  → expel focused tile into a brand-new column
+    //   Ctrl+Alt+E       → expand column to fill leftover work-area width
+    //   Ctrl+Alt+Shift+F → maximize column (full work-area height; toggle)
+    //   Ctrl+Alt+Shift+L → grow column width by 5%
+    //   Ctrl+Alt+Shift+H → shrink column width by 5%
+    //   Ctrl+Alt+Shift+K → grow tile height by 5% (multi-tile columns)
+    //   Ctrl+Alt+Shift+J → shrink tile height by 5% (multi-tile columns)
+    //   Ctrl+Alt+Shift+PageUp/PageDown → move column to monitor left/right
+    Ctrl+Alt+Comma         consume-window-into-column
+    Ctrl+Alt+Period        expel-window-from-column
+    Ctrl+Alt+E             expand-column-to-available
+    Ctrl+Alt+Shift+F       maximize-column
+    Ctrl+Alt+Shift+L       grow-column-width
+    Ctrl+Alt+Shift+H       shrink-column-width
+    Ctrl+Alt+Shift+K       grow-tile-height
+    Ctrl+Alt+Shift+J       shrink-tile-height
+    Ctrl+Alt+Shift+Page_Up    move-column-to-monitor-left
+    Ctrl+Alt+Shift+Page_Down  move-column-to-monitor-right
+
     // Quit
     Ctrl+Alt+Shift+Q quit
 
@@ -163,6 +184,24 @@ binds {
 // ───────────────────────────────────────────────────────────────────────────
 // spawn-at-startup "wt.exe"
 // spawn-at-startup "explorer.exe" "shell:startup"
+
+// ───────────────────────────────────────────────────────────────────────────
+// Include other KDL files (niri parity).  Paths are resolved relative to
+// this file (or absolute).  Cycles are detected and the nesting depth is
+// capped at 8.  `include` directives are pre-processed before KDL parsing.
+// ───────────────────────────────────────────────────────────────────────────
+// include "binds.kdl"
+// include "C:/Users/me/.config/wiri/window-rules.kdl"
+
+// ───────────────────────────────────────────────────────────────────────────
+// Shell-command shortcut (niri parity).  `spawn-cmd "<command>"` is the
+// Windows equivalent of niri's `spawn-sh`; the dispatcher runs the argument
+// through `cmd.exe /C "<command>"`.
+// ───────────────────────────────────────────────────────────────────────────
+// binds {
+//     Ctrl+Alt+S spawn-cmd "wt.exe"
+//     Ctrl+Alt+B spawn-cmd "start https://example.com"
+// }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Output configuration — uncomment and adjust for your monitors.

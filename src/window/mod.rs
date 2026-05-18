@@ -113,6 +113,22 @@ pub struct ResolvedWindowRules {
     /// the engine should leave the window at fully opaque (1.0)".  `Some(0.0)`
     /// is a legal value meaning "explicitly fully transparent".
     pub opacity: Option<f32>,
+
+    // ── niri-parity `open-*` placement hints (consumed by add_window) ──────
+    /// Place the window on the monitor with this device name on first map.
+    /// Falls through when None.
+    pub open_on_output: Option<String>,
+    /// Place the window on this 1-based workspace id on first map.
+    pub open_in_workspace: Option<i32>,
+    /// Start the window fullscreen.  None = engine default.
+    pub open_fullscreen: Option<bool>,
+    /// Start the window floating.  None = engine default (also see `float`
+    /// flag, which is the resolved `floating` property from any matching
+    /// rule; `open_floating` is the explicit `open-floating "…"` directive).
+    pub open_floating: Option<bool>,
+    /// Cap the initial physical size of the window to `(width_px, height_px)`.
+    /// Either dimension of `0` means "no cap on that axis".
+    pub open_max_bounds: Option<(u32, u32)>,
 }
 
 impl Default for ResolvedWindowRules {
@@ -124,6 +140,11 @@ impl Default for ResolvedWindowRules {
             follow_cursor: true,
             border: true,
             opacity: None,
+            open_on_output: None,
+            open_in_workspace: None,
+            open_fullscreen: None,
+            open_floating: None,
+            open_max_bounds: None,
         }
     }
 }

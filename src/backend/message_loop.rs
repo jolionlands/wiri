@@ -91,8 +91,11 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (prefix, 0x57, Action::ColumnWidthPresetCycle),   // W
         (prefix, 0xBD, Action::ResizeColumnLeft),         // VK_OEM_MINUS
         (prefix, 0xBB, Action::ResizeColumnRight),        // VK_OEM_PLUS
-        (shift_prefix, 0x48, Action::MoveToMonitorLeft),  // Shift+H
-        (shift_prefix, 0x4C, Action::MoveToMonitorRight), // Shift+L
+        // NOTE: Shift+H / Shift+L are repurposed below to Shrink/GrowColumnWidth
+        // for niri parity. MoveToMonitorLeft/Right remain available via the
+        // KDL `binds {}` block (e.g. Ctrl+Alt+Comma+Shift) or wiri-ctl.
+        // ((shift_prefix, 0x48, Action::MoveToMonitorLeft) replaced)
+        // ((shift_prefix, 0x4C, Action::MoveToMonitorRight) replaced)
         // Niri-parity round-2: FocusPrevious (alt-tab MRU) and ToggleAlwaysOnTop
         // NOTE: if prefix is Ctrl+Alt, prefix+Tab conflicts with the Windows system
         // Ctrl+Alt+Tab switcher. RegisterHotKey will fail; that's OK — the warning
@@ -100,6 +103,26 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (prefix, 0x09, Action::FocusPrevious),            // Tab
         (prefix, 0x50, Action::Screenshot),               // P (capture desktop to file)
         (prefix, 0x41, Action::ToggleAlwaysOnTop),        // A (always-on-top)
+        // niri-parity Round 4: rearrange / sizing actions.
+        //   Ctrl+Alt+Comma   → consume window into next column
+        //   Ctrl+Alt+Period  → expel window into a new column to the right
+        //   Ctrl+Alt+E       → expand column to fill leftover width
+        //   Ctrl+Alt+Shift+F → maximize column (full work-area height)
+        //   Ctrl+Alt+Shift+L → grow column width (5%)
+        //   Ctrl+Alt+Shift+H → shrink column width (5%)
+        //   Ctrl+Alt+Shift+K → grow tile height (5%)
+        //   Ctrl+Alt+Shift+J → shrink tile height (5%)
+        //   Ctrl+Alt+Shift+PgUp/PgDn → move column to monitor left/right
+        (prefix, 0xBC, Action::ConsumeWindowIntoColumn),   // VK_OEM_COMMA  ","
+        (prefix, 0xBE, Action::ExpelWindowFromColumn),     // VK_OEM_PERIOD "."
+        (prefix, 0x45, Action::ExpandColumnToAvailable),   // E
+        (shift_prefix, 0x46, Action::MaximizeColumn),      // Shift+F
+        (shift_prefix, 0x4C, Action::GrowColumnWidth),     // Shift+L (overrides MoveToMonitorRight above)
+        (shift_prefix, 0x48, Action::ShrinkColumnWidth),   // Shift+H (overrides MoveToMonitorLeft above)
+        (shift_prefix, 0x4B, Action::GrowTileHeight),      // Shift+K
+        (shift_prefix, 0x4A, Action::ShrinkTileHeight),    // Shift+J
+        (shift_prefix, 0x21, Action::MoveColumnToMonitorLeft),  // Shift+PageUp
+        (shift_prefix, 0x22, Action::MoveColumnToMonitorRight), // Shift+PageDown
     ]
 }
 
@@ -659,6 +682,54 @@ fn execute_action(
         }
         Action::Screenshot => {
             take_screenshot();
+        }
+        Action::ColumnWidthPresetQuarter => {
+            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::OneQuarter, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::ColumnWidthPresetThreeQuarters => {
+            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::ThreeQuarters, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::ConsumeWindowIntoColumn => {
+            engine.write().consume_window_into_column(backend);
+            engine.write().apply_all(backend);
+        }
+        Action::ExpelWindowFromColumn => {
+            engine.write().expel_window_from_column(backend);
+            engine.write().apply_all(backend);
+        }
+        Action::ExpandColumnToAvailable => {
+            engine.write().expand_column_to_available(backend);
+            engine.write().apply_all(backend);
+        }
+        Action::MaximizeColumn => {
+            engine.write().toggle_maximize_focused_column(backend);
+            engine.write().apply_all(backend);
+        }
+        Action::GrowColumnWidth => {
+            engine.write().resize_focused_column_by_percent(5, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::ShrinkColumnWidth => {
+            engine.write().resize_focused_column_by_percent(-5, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::GrowTileHeight => {
+            engine.write().resize_focused_tile_height_by_percent(5, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::ShrinkTileHeight => {
+            engine.write().resize_focused_tile_height_by_percent(-5, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::MoveColumnToMonitorLeft => {
+            engine.write().move_column_to_monitor(crate::layout::ScrollDirection::Left, backend);
+            engine.write().apply_all(backend);
+        }
+        Action::MoveColumnToMonitorRight => {
+            engine.write().move_column_to_monitor(crate::layout::ScrollDirection::Right, backend);
+            engine.write().apply_all(backend);
         }
     }
 }

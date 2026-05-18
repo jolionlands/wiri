@@ -585,9 +585,13 @@ impl IpcServer {
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
                         let p = match preset.to_lowercase().as_str() {
-                            "1/2" | "half" => crate::layout::ColumnWidthPreset::Half,
+                            "1/4" | "quarter" => crate::layout::ColumnWidthPreset::OneQuarter,
                             "1/3" | "third" => crate::layout::ColumnWidthPreset::OneThird,
+                            "1/2" | "half" => crate::layout::ColumnWidthPreset::Half,
                             "2/3" | "two-thirds" => crate::layout::ColumnWidthPreset::TwoThirds,
+                            "3/4" | "three-quarters" => {
+                                crate::layout::ColumnWidthPreset::ThreeQuarters
+                            }
                             "full" | "100" => crate::layout::ColumnWidthPreset::Full,
                             _ => crate::layout::ColumnWidthPreset::Cycle,
                         };
@@ -727,6 +731,109 @@ impl IpcServer {
                 match crate::hooks::Spawner::new().spawn(program, &args, true) {
                     Ok(pid) => serde_json::json!({"success": true, "pid": pid}),
                     Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
+                }
+            }
+            IpcMessage::ConsumeWindow => {
+                info!("IPC: ConsumeWindow");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().consume_window_into_column(b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::ExpelWindow => {
+                info!("IPC: ExpelWindow");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().expel_window_from_column(b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::ExpandColumn => {
+                info!("IPC: ExpandColumn");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().expand_column_to_available(b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::MaximizeColumn => {
+                info!("IPC: MaximizeColumn");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().toggle_maximize_focused_column(b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::GrowColumn => {
+                info!("IPC: GrowColumn");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().resize_focused_column_by_percent(5, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::ShrinkColumn => {
+                info!("IPC: ShrinkColumn");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().resize_focused_column_by_percent(-5, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::GrowTile => {
+                info!("IPC: GrowTile");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().resize_focused_tile_height_by_percent(5, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::ShrinkTile => {
+                info!("IPC: ShrinkTile");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().resize_focused_tile_height_by_percent(-5, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::MoveColumnToMonitor { direction } => {
+                info!("IPC: MoveColumnToMonitor direction={}", direction);
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        let dir = match direction.to_lowercase().as_str() {
+                            "right" => crate::layout::ScrollDirection::Right,
+                            _ => crate::layout::ScrollDirection::Left,
+                        };
+                        e.write().move_column_to_monitor(dir, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
                 }
             }
         }
