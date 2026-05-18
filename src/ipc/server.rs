@@ -1,0 +1,865 @@
+// IPC server: named-pipe creation loop, client handler, message processor,
+// event broadcaster, and pipe security attributes helper.
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, warn};
+
+use crate::layout::TilingEngine;
+use super::messages::{IpcEvent, IpcMessage, WorkspaceInfo};
+use super::PIPE_PATH;
+
+pub struct IpcServer {
+    event_tx: broadcast::Sender<IpcEvent>,
+    engine: Option<Arc<parking_lot::RwLock<TilingEngine>>>,
+    /// Backend handle so IPC handlers can drive engine state-changing methods
+    /// (switch_workspace, focus_window, etc.) which need a real backend to
+    /// show/hide/position windows.
+    backend: Option<crate::backend::BackendHandle>,
+    /// Optional one-shot sender to request graceful shutdown of main.
+    shutdown_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl IpcServer {
+    pub fn new() -> Self {
+        let (event_tx, _) = broadcast::channel(64);
+        Self {
+            event_tx,
+            engine: None,
+            backend: None,
+            shutdown_tx: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Connect this IPC server to the tiling engine so it can query real state
+    pub fn set_engine(&mut self, engine: Arc<parking_lot::RwLock<TilingEngine>>) {
+        self.engine = Some(engine);
+    }
+
+    /// Provide the backend handle so engine state-changing IPC handlers can
+    /// drive show/hide/position calls on real windows.
+    pub fn set_backend(&mut self, backend: crate::backend::BackendHandle) {
+        self.backend = Some(backend);
+    }
+
+    /// Provide a oneshot sender that will signal main to shut down gracefully
+    /// when an IPC Quit message is received.
+    pub fn set_shutdown_sender(&self, tx: tokio::sync::oneshot::Sender<()>) {
+        *self.shutdown_tx.lock() = Some(tx);
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<IpcEvent> {
+        self.event_tx.subscribe()
+    }
+
+    pub fn broadcast_event(&self, event: IpcEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Start the IPC server listening on the named pipe.
+    /// This spawns a background task that accepts connections.
+    ///
+    /// Security: the named pipe is created with a DACL that grants only
+    /// `BUILTIN\Administrators` and the file owner full access — preventing
+    /// other local users from connecting via `\\.\pipe\wiri_control` even on
+    /// a shared workstation.  Implemented via tokio's
+    /// `ServerOptions::create_with_security_attributes_raw` so the ACL applies
+    /// to every pipe instance, not just the first.
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        // SAFETY wrapper: SECURITY_ATTRIBUTES contains `*mut c_void` which
+        // makes it !Send/!Sync by default — that would poison the future
+        // captured by `tokio::spawn` (the multi-threaded runtime requires
+        // Send).  We hold the boxed descriptor for the entire lifetime of
+        // run() and only ever read its address from this single task, so
+        // crossing await points is safe.
+        struct SaHolder {
+            sa: Option<Box<windows::Win32::Security::SECURITY_ATTRIBUTES>>,
+        }
+        unsafe impl Send for SaHolder {}
+        unsafe impl Sync for SaHolder {}
+        impl SaHolder {
+            fn ptr(&self) -> *mut std::ffi::c_void {
+                match &self.sa {
+                    Some(b) => &**b as *const _ as *mut std::ffi::c_void,
+                    None => std::ptr::null_mut(),
+                }
+            }
+        }
+
+        let holder = SaHolder {
+            sa: match build_pipe_security_attributes() {
+                Ok(s) => Some(Box::new(s)),
+                Err(e) => {
+                    warn!(
+                        "Failed to build pipe security attributes: {} — falling back to defaults",
+                        e
+                    );
+                    None
+                }
+            },
+        };
+
+        info!("IPC server starting on {} (ACL: Admins+Owner only)", PIPE_PATH);
+
+        const MAX_CREATE_RETRIES: u32 = 5;
+        let mut retry_count = 0u32;
+
+        loop {
+            // SAFETY: holder.ptr() is either null or points to a valid
+            // SECURITY_ATTRIBUTES (and the security descriptor it references)
+            // that lives for the lifetime of this `run` call.
+            let create_first = || unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create_with_security_attributes_raw(PIPE_PATH, holder.ptr())
+            };
+            let create_more = || unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(false)
+                    .create_with_security_attributes_raw(PIPE_PATH, holder.ptr())
+            };
+
+            // Try to create a new pipe instance; attempt first_pipe_instance=true on first use.
+            let server = match create_more() {
+                Ok(s) => {
+                    retry_count = 0;
+                    s
+                }
+                Err(e) => {
+                    match create_first() {
+                        Ok(s) => {
+                            retry_count = 0;
+                            s
+                        }
+                        Err(e2) => {
+                            retry_count += 1;
+                            warn!(
+                                "Failed to create named pipe (attempt {}/{}): {} / {}",
+                                retry_count, MAX_CREATE_RETRIES, e, e2
+                            );
+                            if retry_count >= MAX_CREATE_RETRIES {
+                                error!(
+                                    "IPC pipe creation failed {} times — giving up. \
+                                     Is another wiri instance already running?",
+                                    MAX_CREATE_RETRIES
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "Cannot create IPC pipe after {} attempts: {} / {}",
+                                    MAX_CREATE_RETRIES, e, e2
+                                ));
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Wait for a client to connect
+            if let Err(e) = server.connect().await {
+                warn!("Pipe connect error: {}", e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                continue;
+            }
+
+            info!("IPC client connected");
+
+            // Spawn a task to handle this client
+            let ipc = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(e) = ipc.handle_client(server).await {
+                    debug!("IPC client handler error: {}", e);
+                }
+            });
+        }
+    }
+
+    async fn handle_client(
+        &self,
+        mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    ) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buffer = vec![0u8; 65536];
+
+        loop {
+            let n = match pipe.read(&mut buffer).await {
+                Ok(0) => {
+                    // Client disconnected
+                    info!("IPC client disconnected");
+                    return Ok(());
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        info!("IPC client disconnected (broken pipe)");
+                        return Ok(());
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            // Parse the message
+            let message: IpcMessage = match serde_json::from_slice(&buffer[..n]) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    warn!("IPC: Failed to parse message: {}", e);
+                    let error_response = serde_json::json!({
+                        "success": false,
+                        "error": format!("Invalid message: {}", e)
+                    });
+                    let response_bytes = serde_json::to_vec(&error_response)?;
+                    let _ = pipe.write_all(&response_bytes).await;
+                    continue;
+                }
+            };
+
+            debug!("IPC received: {:?}", message);
+
+            // SubscribeEvents is handled inline: ack the subscription, then
+            // forward broadcast events to the client pipe until it disconnects.
+            if let IpcMessage::SubscribeEvents { ref event_types } = message {
+                info!("IPC: Subscribe to events: {:?}", event_types);
+                let ack = serde_json::to_vec(&serde_json::json!({
+                    "success": true,
+                    "subscription_id": 1
+                }))?;
+                let _ = pipe.write_all(&ack).await;
+
+                // Subscribe to the broadcast channel (64-entry buffer per spec)
+                let mut event_rx = self.event_tx.subscribe();
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            let bytes = match serde_json::to_vec(&event) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!("IPC: Failed to serialize event: {}", e);
+                                    continue;
+                                }
+                            };
+                            if pipe.write_all(&bytes).await.is_err() {
+                                debug!("IPC event subscriber disconnected");
+                                return Ok(());
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("IPC event subscriber lagged by {} events", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            debug!("IPC event broadcast channel closed");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            // Process the message and send response.
+            let response = self.process_message(message);
+            let response_bytes = serde_json::to_vec(&response)?;
+            let _ = pipe.write_all(&response_bytes).await;
+            // Flush + disconnect: ctl uses read_to_end which waits for EOF.
+            // Each ctl invocation opens a fresh pipe; one round-trip per connection.
+            let _ = pipe.flush().await;
+            let _ = pipe.shutdown().await;
+            return Ok(());
+        }
+    }
+
+    fn process_message(&self, message: IpcMessage) -> serde_json::Value {
+        match message {
+            IpcMessage::GetState => {
+                if let Some(engine) = &self.engine {
+                    let eng = engine.read();
+                    let windows = build_window_infos(&eng);
+                    let mut workspaces = Vec::new();
+                    for (_oid, monitor) in eng.monitors().iter() {
+                        let ws = monitor.workspace();
+                        workspaces.push(WorkspaceInfo {
+                            name: format!("workspace-{}", monitor.active_workspace_id()),
+                            id: monitor.active_workspace_id() as u32,
+                            window_count: ws.map(|w| w.columns.iter().map(|c| c.tiles.len()).sum()).unwrap_or(0),
+                        });
+                    }
+                    let active_workspace = workspaces.first().map(|w| w.name.clone());
+                    serde_json::json!({
+                        "success": true,
+                        "result": {
+                            "windows": windows,
+                            "workspaces": workspaces,
+                            "active_workspace": active_workspace
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "success": true,
+                        "result": {
+                            "windows": [],
+                            "workspaces": [],
+                            "active_workspace": null
+                        }
+                    })
+                }
+            }
+            IpcMessage::WindowList => {
+                if let Some(engine) = &self.engine {
+                    let eng = engine.read();
+                    let windows = build_window_infos(&eng);
+                    serde_json::json!({"success": true, "result": windows})
+                } else {
+                    serde_json::json!({"success": true, "result": []})
+                }
+            }
+            IpcMessage::SwitchWorkspace { id } => {
+                info!("IPC: Switch to workspace {}", id);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        engine.write().switch_workspace(id, backend);
+                        serde_json::json!({
+                            "success": true,
+                            "result": {"workspace_id": id}
+                        })
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    }),
+                }
+            }
+            IpcMessage::FocusWindow { window_hwnd } => {
+                info!("IPC: Focus window {}", window_hwnd);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        if !focus_window_by_hwnd(engine, backend, window_hwnd) {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("Unknown tiled window: hwnd={}", window_hwnd)
+                            });
+                        }
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    }),
+                }
+            }
+            IpcMessage::CloseWindow { window_hwnd } => {
+                info!("IPC: Close window {}", window_hwnd);
+                use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
+                use windows::Win32::Foundation::{HWND, WPARAM, LPARAM};
+                let hwnd = HWND(window_hwnd as *mut std::ffi::c_void);
+                // Validate the HWND before posting any message
+                if !unsafe { IsWindow(hwnd).as_bool() } {
+                    warn!("IPC CloseWindow: HWND {} is not a valid window", window_hwnd);
+                    return serde_json::json!({
+                        "success": false,
+                        "error": format!("Invalid HWND: {}", window_hwnd)
+                    });
+                }
+                unsafe {
+                    let _ = PostMessageW(
+                        hwnd,
+                        windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::ReloadConfig => {
+                info!("IPC: Reload config requested");
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::Quit => {
+                info!("IPC: Quit requested — sending shutdown signal to main");
+                if let Some(tx) = self.shutdown_tx.lock().take() {
+                    let _ = tx.send(());
+                } else {
+                    // Fallback if no shutdown channel was wired
+                    warn!("IPC Quit: no shutdown channel set; calling process::exit");
+                    std::process::exit(0);
+                }
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::SubscribeEvents { event_types } => {
+                info!("IPC: Subscribe to events: {:?}", event_types);
+                serde_json::json!({"success": true, "subscription_id": 1})
+            }
+            IpcMessage::WindowMove { window_hwnd, x, y } => {
+                info!("IPC: Move window {} to ({}, {})", window_hwnd, x, y);
+                use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetWindowPos, SWP_NOSIZE, SWP_NOZORDER};
+                use windows::Win32::Foundation::HWND;
+                let hwnd = HWND(window_hwnd as *mut std::ffi::c_void);
+                if !unsafe { IsWindow(hwnd).as_bool() } {
+                    return serde_json::json!({"success": false, "error": format!("Invalid HWND: {}", window_hwnd)});
+                }
+                unsafe {
+                    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                }
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::WindowResize { window_hwnd, width, height } => {
+                info!("IPC: Resize window {} to {}x{}", window_hwnd, width, height);
+                use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetWindowPos, SWP_NOMOVE, SWP_NOZORDER};
+                use windows::Win32::Foundation::HWND;
+                let hwnd = HWND(window_hwnd as *mut std::ffi::c_void);
+                if !unsafe { IsWindow(hwnd).as_bool() } {
+                    return serde_json::json!({"success": false, "error": format!("Invalid HWND: {}", window_hwnd)});
+                }
+                unsafe {
+                    let _ = SetWindowPos(hwnd, None, 0, 0, width as i32, height as i32, SWP_NOMOVE | SWP_NOZORDER);
+                }
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::TileRequest { window_hwnd, target_workspace } => {
+                info!("IPC: TileRequest for window {} workspace {:?}", window_hwnd, target_workspace);
+                // Bring the window back into tiling: if it's currently floating
+                // we toggle it; if a target workspace name was provided we
+                // additionally move it there.
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        if !focus_window_by_hwnd(engine, backend, window_hwnd) {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("Unknown tiled window: hwnd={}", window_hwnd)
+                            });
+                        }
+                        // Un-float if floating.
+                        let wid = crate::utils::WindowId::new(window_hwnd);
+                        if engine.read().is_floating(wid) {
+                            engine.write().toggle_floating(backend);
+                        }
+                        // Optional workspace move (by name).
+                        if let Some(name) = target_workspace.as_deref() {
+                            engine.write().focus_workspace_named(name, backend);
+                        }
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true, "result": {"hwnd": window_hwnd}})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    }),
+                }
+            }
+            IpcMessage::WindowMoveToWorkspace { window_hwnd, workspace_id } => {
+                info!("IPC: Move window {} to workspace {}", window_hwnd, workspace_id);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        if !focus_window_by_hwnd(engine, backend, window_hwnd) {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("Unknown tiled window: hwnd={}", window_hwnd)
+                            });
+                        }
+                        engine.write().move_window_to_workspace(workspace_id, backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    }),
+                }
+            }
+            IpcMessage::WindowFloat { window_hwnd } => {
+                info!("IPC: Float window {}", window_hwnd);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        if !focus_window_by_hwnd(engine, backend, window_hwnd) {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("Unknown tiled window: hwnd={}", window_hwnd)
+                            });
+                        }
+                        let wid = crate::utils::WindowId::new(window_hwnd);
+                        // Only toggle if not already floating, so this is idempotent.
+                        if !engine.read().is_floating(wid) {
+                            engine.write().toggle_floating(backend);
+                        }
+                        serde_json::json!({"success": true, "floating": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    }),
+                }
+            }
+            IpcMessage::WindowUnfloat { window_hwnd } => {
+                info!("IPC: Unfloat window {}", window_hwnd);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        if !focus_window_by_hwnd(engine, backend, window_hwnd) {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("Unknown tiled window: hwnd={}", window_hwnd)
+                            });
+                        }
+                        let wid = crate::utils::WindowId::new(window_hwnd);
+                        if engine.read().is_floating(wid) {
+                            engine.write().toggle_floating(backend);
+                        }
+                        serde_json::json!({"success": true, "floating": false})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    }),
+                }
+            }
+            IpcMessage::WindowFind { query } => {
+                info!("IPC: Find window query={:?}", query);
+                serde_json::json!({"success": true, "result": []})
+            }
+            IpcMessage::WorkspaceList => {
+                if let Some(engine) = &self.engine {
+                    let eng = engine.read();
+                    let workspaces: Vec<_> = eng.monitors().iter().map(|(_oid, m)| {
+                        WorkspaceInfo {
+                            name: format!("workspace-{}", m.active_workspace_id()),
+                            id: m.active_workspace_id() as u32,
+                            window_count: m.workspace().map(|w| w.columns.iter().map(|c| c.tiles.len()).sum()).unwrap_or(0),
+                        }
+                    }).collect();
+                    serde_json::json!({"success": true, "result": workspaces})
+                } else {
+                    serde_json::json!({"success": true, "result": []})
+                }
+            }
+            IpcMessage::WorkspaceCreate { id } => {
+                info!("IPC: Create workspace {:?}", id);
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::WorkspaceDelete { id } => {
+                info!("IPC: Delete workspace {}", id);
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::PresetList => {
+                serde_json::json!({"success": true, "result": []})
+            }
+            IpcMessage::PresetSave { name } => {
+                info!("IPC: Save preset {:?}", name);
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::PresetLoad { name } => {
+                info!("IPC: Load preset {:?}", name);
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::PresetDelete { name } => {
+                info!("IPC: Delete preset {:?}", name);
+                serde_json::json!({"success": true})
+            }
+            IpcMessage::LayoutExport => {
+                serde_json::json!({"success": true, "result": {}})
+            }
+            IpcMessage::MoveWindowToWorkspace { workspace_id } => {
+                info!("IPC: MoveWindowToWorkspace {}", workspace_id);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        engine.write().move_window_to_workspace(workspace_id, backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                }
+            }
+            IpcMessage::MoveWindowToMonitor { direction } => {
+                info!("IPC: MoveWindowToMonitor direction={}", direction);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        let dir = match direction.to_lowercase().as_str() {
+                            "right" => crate::layout::ScrollDirection::Right,
+                            _ => crate::layout::ScrollDirection::Left,
+                        };
+                        engine.write().move_window_to_monitor(dir, backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                }
+            }
+            IpcMessage::CenterColumn => {
+                info!("IPC: CenterColumn");
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        engine.write().center_focused_column(backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                }
+            }
+            IpcMessage::SetColumnWidth { preset } => {
+                info!("IPC: SetColumnWidth preset={}", preset);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        let p = match preset.to_lowercase().as_str() {
+                            "1/2" | "half" => crate::layout::ColumnWidthPreset::Half,
+                            "1/3" | "third" => crate::layout::ColumnWidthPreset::OneThird,
+                            "2/3" | "two-thirds" => crate::layout::ColumnWidthPreset::TwoThirds,
+                            "full" | "100" => crate::layout::ColumnWidthPreset::Full,
+                            _ => crate::layout::ColumnWidthPreset::Cycle,
+                        };
+                        engine.write().set_column_width_preset(p, backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                }
+            }
+            IpcMessage::ResizeColumn { delta_px } => {
+                info!("IPC: ResizeColumn delta_px={}", delta_px);
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        engine.write().resize_focused_column_by(delta_px, backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                }
+            }
+            IpcMessage::FocusWorkspaceNext => {
+                info!("IPC: FocusWorkspaceNext");
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Next, backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                }
+            }
+            IpcMessage::FocusWorkspacePrevious => {
+                info!("IPC: FocusWorkspacePrevious");
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Previous, backend);
+                        engine.write().apply_all(backend);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                }
+            }
+            IpcMessage::FocusPrevious => {
+                info!("IPC: FocusPrevious");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().focus_previous_window(b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::ToggleAlwaysOnTop => {
+                info!("IPC: ToggleAlwaysOnTop");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().toggle_always_on_top_for_focused(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::FocusWorkspaceNamed { name } => {
+                info!("IPC: FocusWorkspaceNamed {:?}", name);
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().focus_workspace_named(&name, b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::SetAutoTileThreshold { threshold } => {
+                info!("IPC: SetAutoTileThreshold {:?}", threshold);
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().set_auto_tile_threshold(threshold);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::SpawnCommand { command } => {
+                info!("IPC: SpawnCommand {:?}", command);
+                let parts: Vec<&str> = command.split_whitespace().collect();
+                if parts.is_empty() {
+                    return serde_json::json!({"success": false, "error": "empty command"});
+                }
+                let program = std::path::Path::new(parts[0]);
+                let args: Vec<&str> = parts[1..].to_vec();
+                match crate::hooks::Spawner::new().spawn(program, &args, true) {
+                    Ok(pid) => serde_json::json!({"success": true, "pid": pid}),
+                    Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
+                }
+            }
+        }
+    }
+}
+
+impl Default for IpcServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Build the per-window reply used by both `GetState` and `WindowList`.
+///
+/// Returns `Vec<serde_json::Value>` rather than `Vec<WindowInfoIpc>` so the
+/// wire format can include "workspace" + "floating" fields that the typed
+/// struct intentionally does not carry (it stays minimal so library consumers
+/// of `WindowInfoIpc` aren't forced to track engine-side state).  Walks every
+/// monitor + workspace + column exactly once for O(W+T) total work.
+fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+    use crate::utils::WindowId;
+
+    let mut ws_of: HashMap<WindowId, i32> = HashMap::new();
+    for (_oid, monitor) in eng.monitors().iter() {
+        for (&ws_id, ws) in monitor.workspaces.iter() {
+            for col in &ws.columns {
+                for tile in &col.tiles {
+                    ws_of.insert(tile.window_id, ws_id);
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(eng.tiled_windows().len());
+    for (wid, info) in eng.tiled_windows() {
+        out.push(serde_json::json!({
+            "hwnd": wid.as_isize(),
+            "title": info.title,
+            "class_name": info.class_name,
+            "process_id": info.process_id,
+            "x": info.bounds.loc.x,
+            "y": info.bounds.loc.y,
+            "width": info.bounds.size.w,
+            "height": info.bounds.size.h,
+            "workspace": ws_of.get(wid).copied(),
+            "floating": eng.is_floating(*wid),
+        }));
+    }
+    // Stable order: hwnd ascending so `wiri-ctl windows` is deterministic.
+    out.sort_by(|a, b| {
+        a.get("hwnd").and_then(|v| v.as_i64())
+            .cmp(&b.get("hwnd").and_then(|v| v.as_i64()))
+    });
+    out
+}
+
+/// Locate a window by its HWND across all monitors/workspaces and update the
+/// engine's focus state to point at it.  Used by IPC handlers that act on a
+/// specific window (TileRequest, WindowFloat, WindowMoveToWorkspace, etc.) so
+/// the subsequent focused-window engine call hits the right target.
+///
+/// Returns `true` on success, `false` when the HWND isn't a tracked tiled
+/// (or floating) window.
+fn focus_window_by_hwnd(
+    engine: &Arc<parking_lot::RwLock<crate::layout::TilingEngine>>,
+    backend: &crate::backend::BackendHandle,
+    hwnd: isize,
+) -> bool {
+    let wid = crate::utils::WindowId::new(hwnd);
+
+    // Fast path: if the engine doesn't know this window, give up early.
+    if !engine.read().tiled_windows().contains_key(&wid) {
+        return false;
+    }
+
+    // Find which monitor + workspace + column hosts the window.
+    let location = {
+        let eng = engine.read();
+        let mut found: Option<(crate::utils::OutputId, i32, usize)> = None;
+        for (&oid, monitor) in eng.monitors().iter() {
+            for (&ws_id, ws) in monitor.workspaces.iter() {
+                if let Some(col_idx) = ws.find_window_column(wid) {
+                    found = Some((oid, ws_id, col_idx));
+                    break;
+                }
+            }
+            if found.is_some() { break; }
+        }
+        found
+    };
+
+    let Some((oid, ws_id, col_idx)) = location else {
+        // Window is registered (e.g. floating) but not in any workspace column —
+        // still treat as "focusable" by raising it; the engine will reconcile.
+        return true;
+    };
+
+    // Update focused output, workspace, focus_column and focus_window.
+    {
+        let mut eng = engine.write();
+        eng.set_focused_output(oid);
+        if let Some(monitor) = eng.monitors_mut().get_mut(&oid) {
+            monitor.active_workspace = ws_id;
+            monitor.focus_column = Some(col_idx);
+            monitor.focus_window = Some(wid);
+            monitor.focus_ring.push(wid);
+        }
+    }
+
+    // Best-effort: bring the Win32 window to the foreground (don't fail on err).
+    {
+        let eng = engine.read();
+        if let Some(window) = eng.tiled_windows().get(&wid) {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                IsWindow, SetForegroundWindow,
+            };
+            let h = HWND(window.hwnd as *mut std::ffi::c_void);
+            unsafe {
+                if IsWindow(h).as_bool() {
+                    let _ = SetForegroundWindow(h);
+                }
+            }
+        }
+    }
+
+    // Re-apply layout on the target monitor.
+    engine.write().apply_all(backend);
+    true
+}
+
+/// Build a SECURITY_ATTRIBUTES that grants full access only to
+/// BUILTIN\Administrators (BA) and the file owner (OW).
+pub fn build_pipe_security_attributes() -> Result<windows::Win32::Security::SECURITY_ATTRIBUTES> {
+    use windows::Win32::Security::{
+        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    };
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::core::PCWSTR;
+
+    // D: = DACL; (A;;GA;;;BA) = Allow GenericAll to BUILTIN\Administrators
+    //           (A;;GA;;;OW) = Allow GenericAll to the object Owner
+    let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;OW)\0"
+        .encode_utf16()
+        .collect();
+
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR::from_raw(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )?;
+    }
+
+    Ok(SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    })
+}

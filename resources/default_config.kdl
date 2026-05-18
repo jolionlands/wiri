@@ -1,0 +1,231 @@
+// vim: filetype=kdl
+//
+// wiri default configuration
+// ───────────────────────────────────────────────────────────────────────────
+// Copy this file to %APPDATA%\wiri\config.kdl and customise.  wiri watches
+// the file and hot-reloads on save (~100 ms debounce); no restart needed.
+//
+// Reference: https://github.com/wiri-wm/wiri/blob/main/docs/SPEC.md
+//
+
+version "1.0"
+
+// ───────────────────────────────────────────────────────────────────────────
+// Input — keyboard, mouse, touch, focus policy
+// ───────────────────────────────────────────────────────────────────────────
+input {
+    keyboard {
+        layout "us"
+        repeat-delay 250        // ms before keyrepeat kicks in
+        repeat-rate 25          // keys/sec while held
+        // numlock true         // turn NumLock on at startup
+    }
+    mouse {
+        natural-scroll false    // true = invert wheel direction (macOS-style)
+        scroll-speed 1.0        // multiplier on the system wheel delta
+        acceleration 0.0        // advisory; Windows mouse accel is system-wide
+        sensitivity 1.0
+        tap-to-click false      // tap-to-click on touchpads
+    }
+    // touch {
+    //     enable true
+    //     tap-to-click true
+    //     scroll-speed 1.0
+    // }
+    focus {
+        follows-mouse false     // focus the window under the cursor automatically
+        focus-delay-ms 150      // small delay so a fast pointer pass doesn't grab focus
+        warp-on-focus false     // warp the cursor to the centre of the newly focused window
+    }
+    // Modifier prefix for the default keybindings ("ctrl-alt", "alt",
+    // "super" = Win key, "win-alt", "ctrl-shift").  Custom `binds {}`
+    // blocks below override everything.
+    // mod-key "ctrl-alt"
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Layout — gaps, borders, focus ring, shadows, scrolling
+// ───────────────────────────────────────────────────────────────────────────
+layout {
+    gaps {
+        inner 16                // gap between tiled windows
+        outer 8                 // gap from the screen edge
+    }
+    borders {
+        width 4                 // 0 disables borders entirely
+        color "#4d4d4d"
+        color-focused "#3381d9"
+        color-urgent "#cc3344"  // colour for windows in the "urgent" state
+        // radius 8             // rounded corner radius (px). 0 = square.
+        // padding 0            // inner padding between content and border.
+    }
+    focus-ring {
+        width 3                 // 0 disables the ring
+        color "#3381d9"         // active ring colour
+        // gap 6                // gap between window edge and ring (px)
+        // inactive-color "#404040"
+    }
+    shadows {
+        enable false            // DWM drops a soft drop-shadow on tiled windows
+        // opacity 0.5
+        // offset-x 10
+        // offset-y 10
+        // blur 20
+        // spread 0
+        // color "#000000"
+    }
+
+    // Column width mode: "proportional" (fill screen) or "fixed" (exact pixels).
+    column-width-mode "proportional"
+    // Column width in pixels (used in fixed mode, or as a minimum in proportional).
+    column-width 500
+    // Pixels scrolled per scroll-left / scroll-right action.
+    scroll-step 200
+    // Dim unfocused windows (0.1-1.0, 1.0 = no dimming).
+    dim-unfocused 0.92
+
+    // Strip native frame (caption + thick border) from tiled windows for
+    // pixel-perfect tiles.  Default false — some apps (Windows Terminal,
+    // Edge, some Electron) render their content area black after style
+    // changes until they receive a fresh paint.  Off by default for
+    // compatibility.
+    // strip-frame true
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Animations
+// ───────────────────────────────────────────────────────────────────────────
+animations {
+    enable false                // off by default; performance-conscious
+    duration 200                // ms
+    easing "ease-out-cubic"     // none | linear | ease-in | ease-out | ease-in-out | cubic-out
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Keybindings (Ctrl+Alt prefix by default)
+//
+// When any binds are defined, they REPLACE the defaults entirely.  Comment
+// out a line to leave its key combo unbound.
+// ───────────────────────────────────────────────────────────────────────────
+binds {
+    // Focus navigation
+    Ctrl+Alt+Left   focus-column-left
+    Ctrl+Alt+Right  focus-column-right
+    Ctrl+Alt+Up     focus-up
+    Ctrl+Alt+Down   focus-down
+
+    // Move columns
+    Ctrl+Alt+Shift+Left  move-column-left
+    Ctrl+Alt+Shift+Right move-column-right
+
+    // Window actions
+    Ctrl+Alt+Q       close-window
+    Ctrl+Alt+Return  spawn "cmd.exe"
+    Ctrl+Alt+F       toggle-fullscreen
+    Ctrl+Alt+T       toggle-floating
+
+    // Infinite scroll (scrolls the view; focus follows)
+    Ctrl+Alt+H       scroll-left
+    Ctrl+Alt+L       scroll-right
+
+    // Column-width presets
+    Ctrl+Alt+Bracket_Left  set-column-width "1/3"
+    Ctrl+Alt+Bracket_Right set-column-width "2/3"
+    Ctrl+Alt+Backslash     set-column-width "cycle"
+
+    // Quit
+    Ctrl+Alt+Shift+Q quit
+
+    // Workspaces
+    Ctrl+Alt+1 switch-workspace 1
+    Ctrl+Alt+2 switch-workspace 2
+    Ctrl+Alt+3 switch-workspace 3
+    Ctrl+Alt+4 switch-workspace 4
+    Ctrl+Alt+5 switch-workspace 5
+    Ctrl+Alt+6 switch-workspace 6
+    Ctrl+Alt+7 switch-workspace 7
+    Ctrl+Alt+8 switch-workspace 8
+    Ctrl+Alt+9 switch-workspace 9
+
+    // Overview (zoom out to see all columns)
+    Ctrl+Alt+Tab overview-toggle
+    Ctrl+Alt+O   overview-select
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Programs to launch on wiri startup.  One entry per `spawn-at-startup` line.
+// Each argument is its own quoted token.
+// ───────────────────────────────────────────────────────────────────────────
+// spawn-at-startup "wt.exe"
+// spawn-at-startup "explorer.exe" "shell:startup"
+
+// ───────────────────────────────────────────────────────────────────────────
+// Output configuration — uncomment and adjust for your monitors.
+// `name` matches the friendly device name shown by Windows display settings.
+// ───────────────────────────────────────────────────────────────────────────
+// output "Primary" {
+//     x 0
+//     y 0
+//     width 2560
+//     height 1440
+//     scale 1.0
+//     enable true
+//     // primary true
+//     // vrr true                  // variable refresh rate
+//     // transform "normal"        // normal | 90 | 180 | 270
+// }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Workspace configuration — uncomment to give workspaces friendly names that
+// can be targeted from binds with `focus-workspace-named "Main"`.
+// ───────────────────────────────────────────────────────────────────────────
+// workspace "Main" {
+//     layout "tile"
+//     monitor "Primary"
+//     follow-on-focus true
+// }
+// workspace "Comms" {
+//     layout "tile"
+//     monitor "Primary"
+// }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Window rules — pattern-match windows on creation and apply properties.
+// Two styles are supported:
+//
+//   1. Flat fields (back-compat):
+//        window-rule {
+//            class-name "Firefox"
+//            floating true
+//        }
+//
+//   2. `match { }` block (regex + AND-combined matchers):
+//        window-rule {
+//            match {
+//                class-name-regex "^(chrome|edge|firefox)$"
+//                title-regex ".*Picture-in-Picture.*"
+//            }
+//            float true
+//            sticky true
+//        }
+// ───────────────────────────────────────────────────────────────────────────
+// window-rule {
+//     class-name "Firefox"
+//     floating true
+// }
+// window-rule {
+//     class-name "mspaint"
+//     default-width 800
+//     default-height 600
+//     opacity 1.0
+// }
+// window-rule {
+//     match { process-name-regex "(?i)^(steam|discord)\.exe$" }
+//     workspace "Comms"
+//     sticky true
+// }
+// window-rule {
+//     // Strip Windows-Terminal native title-bar so tiles are pixel-perfect.
+//     class-name "CASCADIA_HOSTING_WINDOW_CLASS"
+//     opacity 1.0
+// }

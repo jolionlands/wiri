@@ -1,0 +1,45 @@
+; wiri Windows Resource File
+;
+; Build:
+;   rc.exe /fo wiri.res resources/wiri.rc
+;   link adds the .res file at link time (see Cargo.toml / build.rs).
+;
+; The 32×32 .ico is the small/tray icon; Explorer scales the same .ico for
+; the taskbar (Windows picks the best embedded size automatically).
+
+1 ICON "wiri.ico"
+
+#define WIRI_VERSION 0,1,0
+#define WIRI_NAME "wiri"
+#define WIRI_DESCRIPTION "A scrollable-tiling window manager for Windows"
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION WIRI_VERSION
+    PRODUCTVERSION WIRI_VERSION
+    FILEFLAGSMASK 0x3f
+    FILEFLAGS 0x0
+    FILEOS 0x40004
+    FILETYPE 0x1
+    FILESUBTYPE 0x0
+    BEGIN
+        BLOCK "StringFileInfo"
+        BEGIN
+            BLOCK "040904B0"
+            BEGIN
+                VALUE "CompanyName", "wiri developers"
+                VALUE "FileDescription", WIRI_DESCRIPTION
+                VALUE "FileVersion", "0.1.0"
+                VALUE "InternalName", WIRI_NAME
+                VALUE "LegalCopyright", "Copyright (c) wiri developers"
+                VALUE "OriginalFilename", "wiri.exe"
+                VALUE "ProductName", WIRI_NAME
+                VALUE "ProductVersion", "0.1.0"
+                VALUE "Comments", "https://github.com/wiri-wm/wiri"
+            END
+        END
+        BLOCK "VarFileInfo"
+        BEGIN
+            VALUE "Translation", 0x0409, 0x04B0
+        END
+    END
+END
