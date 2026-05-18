@@ -23,10 +23,25 @@ use wiri::utils::WindowId;
 
 use parking_lot::RwLock;
 
+/// Build version string. `build.rs` sets `WIRI_GIT_HASH` to the short commit
+/// hash when available; otherwise we just render the crate version.
+fn version_static() -> &'static str {
+    use std::sync::OnceLock;
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| {
+        let pkg = env!("CARGO_PKG_VERSION");
+        match option_env!("WIRI_GIT_HASH") {
+            Some(h) if !h.is_empty() => format!("{} (commit {})", pkg, h),
+            _ => pkg.to_string(),
+        }
+    })
+    .as_str()
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "wiri",
-    version,
+    version = version_static(),
     about = "A scrollable-tiling window manager for Windows"
 )]
 struct Args {

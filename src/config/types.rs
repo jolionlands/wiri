@@ -502,12 +502,16 @@ impl Matcher {
 
 /// Context passed to `Matcher::matches` and `WindowRule::matches`.
 ///
-/// The boolean flags (`is_active`, `is_floating`, `is_urgent`, `at_startup`) default
-/// to `false` when constructed via `MatcherContext::from_legacy` or built by callers
-/// that don't yet wire real window state.
+/// The boolean flags (`is_active`, `is_floating`, `is_urgent`, `at_startup`) are
+/// populated by `layout::engine::TilingEngine::add_window_with_target` with live
+/// state pulled from `GetForegroundWindow`, the engine's `floating_windows` set,
+/// the `urgent_windows` set (driven by `backend::hooks::URGENT_WINDOWS` +
+/// `FLASHWINFO`), and the `at_startup` flag is set by
+/// `add_window_at_startup`.
 ///
-/// TODO(audit): wire is_active/is_floating/is_urgent/at_startup from real window state
-/// once the engine passes per-window flags through to the rule-resolution call site.
+/// Other call sites (IPC, the legacy shim) construct contexts with these flags
+/// defaulting to `false`; they're considered best-effort and only used for
+/// rule-resolution against external (non-engine) requests.
 pub struct MatcherContext<'a> {
     pub class_name: &'a str,
     pub title: &'a str,
@@ -522,10 +526,10 @@ pub struct MatcherContext<'a> {
 impl<'a> MatcherContext<'a> {
     /// Build a `MatcherContext` from the fields previously threaded through
     /// `resolve_window_rules` (class, title, instance, pid).  All boolean
-    /// flags are set to `false`; wire them from real window state when available.
-    ///
-    /// TODO(audit): replace call-sites with a richer constructor once engine
-    /// provides is_active / is_floating / is_urgent / at_startup.
+    /// flags are set to `false` — this constructor is only used by external
+    /// (non-engine) call sites that cannot observe live window state.  The
+    /// engine itself builds a richer context inline (see
+    /// `layout::engine::TilingEngine::add_window_with_target`).
     pub fn from_legacy(
         class_name: &'a str,
         title: &'a str,
@@ -545,10 +549,9 @@ impl<'a> MatcherContext<'a> {
     }
 
     /// Build a `MatcherContext` from a `crate::backend::WindowInfo`.
-    /// Boolean flags default to `false` until wired by callers.
-    ///
-    /// TODO(audit): wire is_active/is_floating/is_urgent/at_startup from real
-    /// window state once the engine passes them to the rule-resolution site.
+    /// Boolean flags default to `false` — callers that want live state should
+    /// construct `MatcherContext` directly (see
+    /// `layout::engine::TilingEngine::add_window_with_target`).
     pub fn from_window_info(info: &'a crate::backend::WindowInfo) -> Self {
         Self {
             class_name: &info.class_name,

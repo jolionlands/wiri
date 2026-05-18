@@ -411,8 +411,8 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
         }
         "shadow_enable" | "shadow-enable" | "shadows-enable" | "shadow" | "enable" => {
             config.layout.shadow_enable = value == "true" || value == "1";
-            // TODO(audit): apply config.layout.shadow_enable in engine.rs strip_frame_for_tiling
-            // — DwmExtendFrameIntoClientArea(0,0,0,0) restores native shadow
+            // Applied by `TilingEngine::apply_shadow_for_window` during the
+            // initial tile pass for each window.
         }
         "shadow_opacity" | "shadow-opacity" | "opacity" => {
             if let Ok(v) = value.parse() {
@@ -712,6 +712,272 @@ fn tokenize_shell_line(line: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+// ---------------------------------------------------------------------------
+// Config validation (used by `wiri-ctl validate-config`)
+// ---------------------------------------------------------------------------
+
+/// Severity of a config validation issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationSeverity {
+    /// A fatal issue — the daemon would still load (parser is lenient) but the
+    /// indicated configuration cannot take effect.  Examples: invalid colour
+    /// literal, unparseable integer, unknown section name.
+    Error,
+    /// A non-fatal issue worth surfacing — typically a recoverable typo or a
+    /// rule that will be silently ignored.  Examples: unrecognised key inside
+    /// a known section, unbalanced trailing brace, or an unmatched bind line.
+    Warning,
+}
+
+impl std::fmt::Display for ValidationSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationSeverity::Error => write!(f, "error"),
+            ValidationSeverity::Warning => write!(f, "warning"),
+        }
+    }
+}
+
+/// A single validation finding produced by [`validate_kdl_config`].
+///
+/// `line` and `column` are 1-indexed positions into the input string.
+/// `column` is best-effort and currently always points to the start of the
+/// offending token (column 1 when no specific token is known).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub severity: ValidationSeverity,
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for ValidationIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}: {}: {}",
+            self.line, self.column, self.severity, self.message
+        )
+    }
+}
+
+/// Top-level sections accepted by the KDL parser.
+const KNOWN_TOP_LEVEL_SECTIONS: &[&str] = &[
+    "input",
+    "output",
+    "layout",
+    "workspace",
+    "window-rule",
+    "binds",
+    "animations",
+];
+
+/// Sections that may appear nested inside another section. Keyed by parent.
+fn known_nested_sections(parent: &str) -> &'static [&'static str] {
+    match parent {
+        "input" => &["keyboard", "mouse", "focus", "touch"],
+        "layout" => &["gaps", "borders", "focus-ring", "shadows"],
+        "window-rule" => &["match"],
+        _ => &[],
+    }
+}
+
+/// Validate a KDL configuration string and return any structural / semantic
+/// issues without halting on the first error.
+///
+/// The check is intentionally limited to issues a user can fix from the
+/// surface syntax: brace balance, unknown sections, unparseable values, and
+/// invalid colour literals.  Deep semantic validation (e.g. workspace name
+/// references) is left to runtime.
+pub fn validate_kdl_config(input: &str) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let mut section_stack: Vec<(String, usize)> = Vec::new();
+
+    for (idx, raw_line) in input.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+
+        // Skip empty / comment lines.
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let line = strip_inline_comment(line);
+        if line.is_empty() {
+            continue;
+        }
+
+        // Section open?
+        if let Some((name, _arg)) = try_parse_section(line) {
+            let depth = section_stack.len();
+            if depth == 0 {
+                if !KNOWN_TOP_LEVEL_SECTIONS.contains(&name.as_str()) {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Error,
+                        line: line_no,
+                        column: 1,
+                        message: format!(
+                            "unknown top-level section '{}' (known: {})",
+                            name,
+                            KNOWN_TOP_LEVEL_SECTIONS.join(", ")
+                        ),
+                    });
+                }
+            } else {
+                let parent = section_stack.last().map(|(n, _)| n.as_str()).unwrap_or("");
+                let allowed = known_nested_sections(parent);
+                if !allowed.is_empty() && !allowed.contains(&name.as_str()) {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        line: line_no,
+                        column: 1,
+                        message: format!(
+                            "unknown nested section '{}' under '{}' (known: {})",
+                            name,
+                            parent,
+                            allowed.join(", ")
+                        ),
+                    });
+                }
+            }
+            section_stack.push((name, line_no));
+            continue;
+        }
+
+        // Section close?
+        if line.starts_with('}') {
+            if section_stack.pop().is_none() {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Error,
+                    line: line_no,
+                    column: 1,
+                    message: "unmatched closing brace".to_string(),
+                });
+            }
+            continue;
+        }
+
+        let section_path = section_stack
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+
+        // binds {} entries are validated separately — they're not key=value.
+        if section_path.as_str() == "binds" {
+            if parse_bind_line(line).is_none() {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    line: line_no,
+                    column: 1,
+                    message: "could not parse as a `Mod+Key action` bind line".to_string(),
+                });
+            }
+            continue;
+        }
+
+        // Inside window-rule.match a bare flag keyword is OK (is-active /
+        // is-floating / is-urgent / at-startup); otherwise we want key=value.
+        if section_path.as_str() == "window-rule.match" {
+            if parse_property(line).is_some() {
+                continue;
+            }
+            let trimmed = line.trim();
+            if matches!(trimmed, "is-active" | "is-floating" | "is-urgent" | "at-startup") {
+                continue;
+            }
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                line: line_no,
+                column: 1,
+                message: format!(
+                    "unrecognised matcher '{}' (expected key=value or one of: is-active, is-floating, is-urgent, at-startup)",
+                    trimmed
+                ),
+            });
+            continue;
+        }
+
+        // spawn-at-startup is a multi-arg top-level directive; just accept it.
+        if section_path.is_empty()
+            && (line.starts_with("spawn-at-startup") || line.starts_with("spawn_at_startup"))
+        {
+            continue;
+        }
+
+        // Standard key=value path. Pull (key, value) and run semantic checks
+        // (colour validity, integer parse) where applicable.
+        let Some((key, value)) = parse_property(line) else {
+            // Could not parse at all — flag as warning, don't choke the rest.
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                line: line_no,
+                column: 1,
+                message: format!("could not parse '{}' as a key=value property", line),
+            });
+            continue;
+        };
+
+        // Colour-typed fields. We don't reject empty strings (they're how
+        // users disable a field) but anything non-empty that doesn't parse is
+        // an error.
+        let is_color_key = key.ends_with("_color")
+            || key.ends_with("-color")
+            || key == "shadow-color"
+            || key == "shadow_color";
+        if is_color_key && !value.is_empty() && crate::config::parse_color(&value).is_none() {
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Error,
+                line: line_no,
+                column: 1,
+                message: format!(
+                    "invalid colour '{}' for '{}' (expected #rgb hex of length 6 or 8)",
+                    value, key
+                ),
+            });
+        }
+
+        // Numeric-typed fields. Look at well-known integer keys (gaps,
+        // borders, widths, etc.) and surface a parse error early.
+        let is_int_key = matches!(
+            key.as_str(),
+            "inner_gaps" | "inner-gaps"
+                | "outer_gaps" | "outer-gaps"
+                | "border_width" | "border-width"
+                | "border_radius" | "border-radius"
+                | "border_padding" | "border-padding"
+                | "focus_ring_width" | "focus-ring-width"
+                | "focus_ring_gap" | "focus-ring-gap"
+                | "shadow_blur" | "shadow-blur"
+                | "shadow_spread" | "shadow-spread"
+                | "column_width" | "column-width"
+                | "scroll_step" | "scroll-step"
+                | "repeat_delay" | "repeat-delay"
+                | "repeat_rate" | "repeat-rate"
+                | "duration"
+        );
+        if is_int_key && !value.is_empty() && value.parse::<i64>().is_err() {
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Error,
+                line: line_no,
+                column: 1,
+                message: format!("'{}' expects an integer, got '{}'", key, value),
+            });
+        }
+    }
+
+    // Anything left on the stack is an unclosed section.
+    for (name, line_no) in section_stack {
+        issues.push(ValidationIssue {
+            severity: ValidationSeverity::Error,
+            line: line_no,
+            column: 1,
+            message: format!("unclosed section '{}' — missing closing brace", name),
+        });
+    }
+
+    issues
 }
 
 /// Parse a bind line inside a binds {} block.
@@ -1275,5 +1541,121 @@ layout {
         assert!(matches!(&wr.matchers[1], Matcher::TitleRegex(s) if s == ".*Editor.*"));
         assert!(matches!(&wr.matchers[2], Matcher::InstanceRegex(s) if s == "^main$"));
         assert!(matches!(&wr.matchers[3], Matcher::ProcessNameRegex(s) if s == "(?i)firefox"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_kdl_config tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_empty_input_has_no_issues() {
+        assert!(validate_kdl_config("").is_empty());
+    }
+
+    #[test]
+    fn test_validate_clean_config_has_no_issues() {
+        let input = r##"
+            input {
+                keyboard_layout "us"
+            }
+            layout {
+                inner_gaps 8
+                border_color "#333333"
+            }
+        "##;
+        let issues = validate_kdl_config(input);
+        assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn test_validate_unknown_top_level_section() {
+        let input = "telemetry {\n  enabled true\n}\n";
+        let issues = validate_kdl_config(input);
+        assert!(
+            issues.iter().any(|i| i.severity == ValidationSeverity::Error
+                && i.message.contains("unknown top-level section")
+                && i.line == 1),
+            "expected error on line 1, got: {:?}", issues
+        );
+    }
+
+    #[test]
+    fn test_validate_unclosed_section_is_error() {
+        let input = "layout {\n  inner_gaps 8\n";
+        let issues = validate_kdl_config(input);
+        assert!(
+            issues.iter().any(|i| i.severity == ValidationSeverity::Error
+                && i.message.contains("unclosed section 'layout'")),
+            "expected unclosed-section error, got: {:?}", issues
+        );
+    }
+
+    #[test]
+    fn test_validate_unmatched_close_brace() {
+        let input = "}\n";
+        let issues = validate_kdl_config(input);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, ValidationSeverity::Error);
+        assert!(issues[0].message.contains("unmatched closing brace"));
+    }
+
+    #[test]
+    fn test_validate_invalid_color_is_error() {
+        let input = "layout {\n  border_color \"red\"\n}\n";
+        let issues = validate_kdl_config(input);
+        assert!(
+            issues.iter().any(|i| i.severity == ValidationSeverity::Error
+                && i.message.contains("invalid colour 'red'")),
+            "expected colour error, got: {:?}", issues
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_color_value_is_accepted() {
+        // Users sometimes set a colour field to "" to disable it; this should
+        // not produce an error.
+        let input = "layout {\n  focus_ring_inactive_color \"\"\n}\n";
+        let issues = validate_kdl_config(input);
+        assert!(issues.is_empty(), "empty colour string must not be flagged");
+    }
+
+    #[test]
+    fn test_validate_non_integer_for_int_field_is_error() {
+        let input = "layout {\n  inner_gaps \"eight\"\n}\n";
+        let issues = validate_kdl_config(input);
+        assert!(
+            issues.iter().any(|i| i.severity == ValidationSeverity::Error
+                && i.message.contains("'inner_gaps' expects an integer")),
+            "expected integer parse error, got: {:?}", issues
+        );
+    }
+
+    #[test]
+    fn test_validate_bind_warning() {
+        let input = "binds {\n  ____\n}\n";
+        let issues = validate_kdl_config(input);
+        assert!(
+            issues.iter().any(|i| i.severity == ValidationSeverity::Warning
+                && i.message.contains("bind line")),
+            "expected bind warning, got: {:?}", issues
+        );
+    }
+
+    #[test]
+    fn test_validate_window_rule_match_flag_keywords_accepted() {
+        let input = "window-rule {\n  match {\n    is-active\n    is-floating\n    is-urgent\n    at-startup\n  }\n}\n";
+        let issues = validate_kdl_config(input);
+        assert!(issues.is_empty(), "flag keywords must not produce issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn test_validate_unknown_nested_section_is_warning() {
+        let input = "input {\n  joystick {\n    enable true\n  }\n}\n";
+        let issues = validate_kdl_config(input);
+        assert!(
+            issues.iter().any(|i| i.severity == ValidationSeverity::Warning
+                && i.message.contains("unknown nested section 'joystick'")),
+            "expected nested-section warning, got: {:?}", issues
+        );
     }
 }

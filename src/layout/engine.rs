@@ -86,6 +86,11 @@ pub struct LayoutConfig {
     /// receive a paint message. With frames intact those apps render correctly
     /// at the cost of slightly inset client area.
     pub strip_frame: bool,
+    /// When `true`, re-enable the DWM drop shadow on each tile by extending
+    /// the frame into the client area by 1 px along the top edge.  When
+    /// `false`, reset all frame margins to 0 (the default — no shadow).  See
+    /// `TilingEngine::apply_shadow_for_window` for the per-window mechanics.
+    pub shadow_enable: bool,
 }
 
 impl Default for LayoutConfig {
@@ -104,6 +109,7 @@ impl Default for LayoutConfig {
             dim_unfocused: 1.0,
             scroll_step: 200,
             strip_frame: false,
+            shadow_enable: false,
         }
     }
 }
@@ -144,6 +150,7 @@ impl LayoutConfig {
             _ => ColumnWidthMode::Proportional,
         };
         lc.strip_frame = config.layout.strip_frame;
+        lc.shadow_enable = config.layout.shadow_enable;
         lc
     }
 }
@@ -234,6 +241,13 @@ pub struct TilingEngine {
     /// Windows marked urgent (e.g. via WM_FLASHWINDOW or external hook).
     /// Populated by mark_urgent / cleared by clear_urgent.
     urgent_windows: HashSet<WindowId>,
+    /// Windows whose DWM shadow state has already been applied this session.
+    /// `apply_shadow_for_window` is a one-shot per-HWND call: re-issuing the
+    /// `DwmExtendFrameIntoClientArea` margins on every layout pass causes some
+    /// apps (notably Windows Terminal) to render their content area black
+    /// until they receive a fresh paint message, so we record the desired
+    /// state once and skip subsequent calls until the window is destroyed.
+    shadow_applied: HashSet<WindowId>,
     /// Counter tracking how many Win32 calls were actually issued (for testing).
     #[cfg(test)]
     pub win32_call_count: u32,
@@ -263,6 +277,7 @@ impl TilingEngine {
             always_on_top: HashSet::new(),
             auto_tile_threshold: None,
             urgent_windows: HashSet::new(),
+            shadow_applied: HashSet::new(),
             #[cfg(test)]
             win32_call_count: 0,
         }
@@ -427,6 +442,7 @@ impl TilingEngine {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
+                self.apply_shadow_for_window(hwnd);
                 if let Some(o) = rules.opacity {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
@@ -453,6 +469,7 @@ impl TilingEngine {
                     }
                 }
                 self.strip_frame_for_tiling(hwnd);
+                self.apply_shadow_for_window(hwnd);
                 if let Some(o) = rules.opacity {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
@@ -480,6 +497,7 @@ impl TilingEngine {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
+                self.apply_shadow_for_window(hwnd);
                 if let Some(o) = rules.opacity {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
@@ -513,6 +531,7 @@ impl TilingEngine {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
+                self.apply_shadow_for_window(hwnd);
                 if let Some(o) = rules.opacity {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
@@ -563,6 +582,7 @@ impl TilingEngine {
                     }
                 }
                 self.strip_frame_for_tiling(hwnd);
+                self.apply_shadow_for_window(hwnd);
                 if let Some(o) = rules.opacity {
                     // Explicit opacity override from a window-rule.
                     // `Some(0.0)` is honoured as fully transparent.
@@ -595,6 +615,9 @@ impl TilingEngine {
         // Drop the applied-state cache entry so if the window is re-added its
         // state is re-applied from scratch.
         self.applied_state.remove(&window_id);
+        // Reset the shadow-applied flag so a re-add applies the configured
+        // shadow state once more (the HWND may be reused by the OS).
+        self.shadow_applied.remove(&window_id);
 
         if self.tiled_windows.remove(&window_id).is_some() {
             let mut found_output = None;
@@ -1421,6 +1444,58 @@ impl TilingEngine {
             info!("Floating window {:?}", window_id);
             self.apply_layout_for_monitor(focused_output, backend);
         }
+    }
+
+    /// Apply the configured DWM drop-shadow state to a single window.
+    ///
+    /// When `shadow_enable` is `true` we extend the DWM frame into the client
+    /// area by a single pixel along the top edge.  This is the canonical
+    /// trick for re-enabling the OS drop-shadow on borderless / styled-down
+    /// windows without affecting their visible layout — DWM only paints the
+    /// shadow when at least one frame margin is non-zero, but a 1 px top
+    /// margin is small enough to escape user notice.
+    ///
+    /// When `shadow_enable` is `false` we reset all four margins to 0, which
+    /// suppresses the shadow.
+    ///
+    /// The result is recorded in `shadow_applied` so we only call into DWM
+    /// once per window — Windows Terminal and some Electron apps render
+    /// their content area black after a fresh `DwmExtendFrameIntoClientArea`
+    /// call until they receive the next paint message, so repeating the call
+    /// on every layout pass causes visible flicker.
+    fn apply_shadow_for_window(&mut self, hwnd: isize) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+        use windows::Win32::UI::Controls::MARGINS;
+
+        let window_id = WindowId::new(hwnd);
+        if self.shadow_applied.contains(&window_id) {
+            return;
+        }
+
+        let margins = if self.config.shadow_enable {
+            // 1 px top extension — the smallest value that re-enables DWM's
+            // drop shadow without producing a visible gap inside the window.
+            MARGINS {
+                cxLeftWidth: 0,
+                cxRightWidth: 0,
+                cyTopHeight: 1,
+                cyBottomHeight: 0,
+            }
+        } else {
+            MARGINS {
+                cxLeftWidth: 0,
+                cxRightWidth: 0,
+                cyTopHeight: 0,
+                cyBottomHeight: 0,
+            }
+        };
+
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        unsafe {
+            let _ = DwmExtendFrameIntoClientArea(hwnd_win, &margins);
+        }
+        self.shadow_applied.insert(window_id);
     }
 
     /// Strip window frame decorations for tiling.

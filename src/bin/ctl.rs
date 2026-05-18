@@ -147,6 +147,21 @@ enum Commands {
     /// bounds, work area, DPI scale, active workspace, and tiled-window count.
     /// Useful for diagnosing multi-monitor / HiDPI issues.
     ListMonitors,
+
+    /// Validate a config file without sending it to the running daemon.
+    ///
+    /// Reads the file at `path` (or wiri's default config search order when
+    /// omitted), runs the same lenient parser the daemon uses, then prints any
+    /// structural errors or warnings (unknown sections, invalid colours,
+    /// unbalanced braces, etc.) one per line.  Exits with status 1 when at
+    /// least one error is found, 0 otherwise.  Does not require a running
+    /// daemon — useful for editor-side checks before reload.
+    ValidateConfig {
+        /// Path to the config file. If omitted, uses the same search order as
+        /// the daemon: $WIRI_CONFIG, %APPDATA%\wiri\config.kdl, then
+        /// %USERPROFILE%\.config\wiri\config.kdl.
+        path: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -156,6 +171,12 @@ fn main() -> Result<()> {
     // single-request/response path below.
     if let Commands::Events { types } = &cli.command {
         return stream_events(types, cli.timeout, cli.json);
+    }
+
+    // validate-config is a pure-local operation — no IPC, no running daemon
+    // required — so handle it before we try to dial the named pipe.
+    if let Commands::ValidateConfig { path } = &cli.command {
+        return validate_config_subcommand(path.as_deref(), cli.json);
     }
 
     let message = match cli.command {
@@ -212,6 +233,7 @@ fn main() -> Result<()> {
             threshold: if threshold == 0 { None } else { Some(threshold) },
         },
         Commands::ListMonitors => IpcMessage::MonitorList,
+        Commands::ValidateConfig { .. } => unreachable!("handled above"),
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;
@@ -222,6 +244,97 @@ fn main() -> Result<()> {
     }
 
     print_human_response(&message, &response);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// validate-config subcommand
+// ---------------------------------------------------------------------------
+
+/// Locate the config file to validate.
+///
+/// Resolution order:
+///   1. Caller-supplied `path` argument (verbatim — even if it doesn't exist;
+///      we surface a clean error message instead of silently falling through).
+///   2. `WIRI_CONFIG` environment variable.
+///   3. `%APPDATA%\wiri\config.kdl`.
+///   4. `%USERPROFILE%\.config\wiri\config.kdl`.
+fn resolve_config_path(supplied: Option<&str>) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(p) = supplied {
+        return Some(PathBuf::from(p));
+    }
+    wiri::config::default_config_path()
+}
+
+/// Implementation of `wiri-ctl validate-config [path]`.
+fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
+    let resolved = match resolve_config_path(path) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "error: no config file found. Set WIRI_CONFIG or create %APPDATA%\\wiri\\config.kdl"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not read {}: {}", resolved.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let issues = wiri::config::validate_kdl_config(&content);
+    let error_count = issues
+        .iter()
+        .filter(|i| i.severity == wiri::config::ValidationSeverity::Error)
+        .count();
+    let warning_count = issues
+        .iter()
+        .filter(|i| i.severity == wiri::config::ValidationSeverity::Warning)
+        .count();
+
+    if json {
+        let json_issues: Vec<serde_json::Value> = issues
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "severity": i.severity.to_string(),
+                    "line": i.line,
+                    "column": i.column,
+                    "message": i.message,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "path": resolved.display().to_string(),
+            "errors": error_count,
+            "warnings": warning_count,
+            "issues": json_issues,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let path_str = resolved.display();
+        if issues.is_empty() {
+            println!("{}: ok (no issues)", path_str);
+        } else {
+            for issue in &issues {
+                // Format mirrors common compiler output: `path:line:col: sev: msg`.
+                println!("{}:{}", path_str, issue);
+            }
+            println!(
+                "{}: {} error(s), {} warning(s)",
+                path_str, error_count, warning_count
+            );
+        }
+    }
+
+    if error_count > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

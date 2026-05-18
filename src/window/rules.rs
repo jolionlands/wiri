@@ -367,6 +367,135 @@ mod tests {
         assert!(!no_proc.float, "ProcessNameRegex should not match when process_name is None");
     }
 
+    // ── live-state matcher tests ──────────────────────────────────────────────
+    //
+    // These prove the engine-populated boolean flags (`is_active`, `is_floating`,
+    // `is_urgent`, `at_startup`) drive `Matcher` evaluation correctly when the
+    // caller passes real state instead of the placeholder default.
+
+    /// Helper that returns a `MatcherContext` with explicit live-state flags.
+    fn ctx_flags<'a>(
+        class: &'a str,
+        title: &'a str,
+        is_active: bool,
+        is_floating: bool,
+        is_urgent: bool,
+        at_startup: bool,
+    ) -> MatcherContext<'a> {
+        MatcherContext {
+            class_name: class,
+            title,
+            instance: None,
+            process_name: None,
+            is_active,
+            is_floating,
+            is_urgent,
+            at_startup,
+        }
+    }
+
+    /// `Matcher::IsFloating` fires only when `ctx.is_floating == true`.
+    #[test]
+    fn test_matcher_is_floating_fires_only_when_floating() {
+        let rule = WindowRule {
+            matchers: vec![Matcher::IsFloating],
+            opacity: Some(0.7),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+
+        let floating = ctx_flags("Any", "", false, true, false, false);
+        let tiled = ctx_flags("Any", "", false, false, false, false);
+
+        assert_eq!(
+            resolve_window_rules(&rules, &floating).opacity,
+            Some(0.7),
+            "IsFloating rule must apply when window is floating"
+        );
+        assert!(
+            resolve_window_rules(&rules, &tiled).opacity.is_none(),
+            "IsFloating rule must not apply when window is tiled"
+        );
+    }
+
+    /// `Matcher::IsUrgent` fires only when `ctx.is_urgent == true`.
+    #[test]
+    fn test_matcher_is_urgent_fires_only_when_urgent() {
+        let rule = WindowRule {
+            matchers: vec![Matcher::IsUrgent],
+            floating: true,
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+
+        let urgent = ctx_flags("Any", "", false, false, true, false);
+        let calm = ctx_flags("Any", "", false, false, false, false);
+
+        assert!(
+            resolve_window_rules(&rules, &urgent).float,
+            "IsUrgent rule must fire when window is flashing"
+        );
+        assert!(
+            !resolve_window_rules(&rules, &calm).float,
+            "IsUrgent rule must not fire on calm windows"
+        );
+    }
+
+    /// `Matcher::AtStartup` fires only on the initial startup scan.
+    #[test]
+    fn test_matcher_at_startup_distinguishes_runtime_from_startup() {
+        let rule = WindowRule {
+            matchers: vec![Matcher::AtStartup],
+            floating: true,
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+
+        let startup = ctx_flags("Any", "", false, false, false, true);
+        let runtime = ctx_flags("Any", "", false, false, false, false);
+
+        assert!(
+            resolve_window_rules(&rules, &startup).float,
+            "AtStartup rule must fire during initial scan"
+        );
+        assert!(
+            !resolve_window_rules(&rules, &runtime).float,
+            "AtStartup rule must NOT fire for windows opened after startup"
+        );
+    }
+
+    /// Composite matcher: class + is_active. Both must hold.
+    #[test]
+    fn test_matcher_composite_class_and_is_floating() {
+        let rule = WindowRule {
+            matchers: vec![
+                Matcher::ClassName("Notepad".to_string()),
+                Matcher::IsFloating,
+            ],
+            opacity: Some(0.5),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+
+        let class_and_floating = ctx_flags("Notepad", "", false, true, false, false);
+        let class_only = ctx_flags("Notepad", "", false, false, false, false);
+        let floating_only = ctx_flags("Chrome", "", false, true, false, false);
+
+        assert_eq!(
+            resolve_window_rules(&rules, &class_and_floating).opacity,
+            Some(0.5),
+            "Composite: both class and floating must hold"
+        );
+        assert!(
+            resolve_window_rules(&rules, &class_only).opacity.is_none(),
+            "Composite: class without floating must NOT match"
+        );
+        assert!(
+            resolve_window_rules(&rules, &floating_only).opacity.is_none(),
+            "Composite: floating without class must NOT match"
+        );
+    }
+
     /// An invalid regex pattern must not panic; the matcher returns `false`.
     #[test]
     fn test_matcher_invalid_regex_does_not_panic() {

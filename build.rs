@@ -10,8 +10,11 @@
 use std::process::Command;
 
 fn main() {
-    // Re-run if .git/HEAD changes (cheap heuristic — covers commit/checkout).
+    // Re-run when git state changes. .git/HEAD covers branch switches; the
+    // reflog at .git/logs/HEAD is appended on every commit/reset, so watching
+    // it catches new commits that don't change which ref HEAD points to.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/logs/HEAD");
     println!("cargo:rerun-if-changed=build.rs");
 
     // ---- WIRI_GIT_HASH --------------------------------------------------

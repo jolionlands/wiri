@@ -1,11 +1,19 @@
 //! Touch / pointer input scaffolding for wiri.
 //!
 //! Listens to WM_POINTERDOWN/WM_POINTERUP/WM_POINTERUPDATE (or WM_TOUCH) and
-//! recognizes basic gestures: tap, swipe-left, swipe-right, swipe-up, swipe-down.
-//! Two-finger gestures (pinch in/out) are not yet implemented because they
-//! require multi-pointer tracking with frame coalescing.
-//! Each completed gesture is mapped to an `Action` via TouchConfig and posted
-//! to the global action queue read by `backend::message_loop`.
+//! recognizes basic gestures: tap, swipe-left, swipe-right, swipe-up,
+//! swipe-down, and two-finger pinch-in / pinch-out.
+//!
+//! Pinch detection coalesces WM_POINTER events by pointer id: when two
+//! pointers are down simultaneously the recogniser records their initial
+//! distance and emits a `PinchIn` / `PinchOut` gesture once the distance
+//! changes by more than `pinch_threshold_px` between frames.  We deliberately
+//! do not call `RegisterTouchWindow` / handle `WM_GESTURE` — Win32's
+//! `GestureRecognizer` would re-implement the same logic at a different layer
+//! and is a much larger surface to maintain.
+//!
+//! Each completed gesture is mapped to an `Action` via `TouchConfig` and
+//! pushed to a global queue that `backend::message_loop` drains every tick.
 
 use crate::input::Action;
 use parking_lot::Mutex;
@@ -35,6 +43,10 @@ pub struct TouchConfig {
     pub swipe_threshold_px: u32,
     /// Maximum time for a swipe gesture in milliseconds.
     pub swipe_timeout_ms: u32,
+    /// Minimum pinch-distance change (px) between two pointers before a
+    /// `PinchIn` / `PinchOut` gesture fires. Smaller values feel snappier but
+    /// produce more spurious gestures on noisy hardware.
+    pub pinch_threshold_px: u32,
     /// Map of gesture → Action.
     pub gestures: std::collections::HashMap<TouchGesture, Action>,
 }
@@ -47,10 +59,16 @@ impl Default for TouchConfig {
         gestures.insert(TouchGesture::SwipeRight, Action::FocusColumnLeft);
         gestures.insert(TouchGesture::SwipeUp, Action::FocusUp);
         gestures.insert(TouchGesture::SwipeDown, Action::FocusDown);
+        // Pinch defaults: pinch-out (spread two fingers) opens the overview;
+        // pinch-in dismisses it. Both map to the same toggle so the gesture
+        // round-trips even if the user's first fingers were already spread.
+        gestures.insert(TouchGesture::PinchOut, Action::OverviewToggle);
+        gestures.insert(TouchGesture::PinchIn, Action::OverviewToggle);
         Self {
             enabled: false,
             swipe_threshold_px: 50,
             swipe_timeout_ms: 500,
+            pinch_threshold_px: 8,
             gestures,
         }
     }
@@ -72,32 +90,165 @@ pub enum TouchGesture {
 // Gesture recognizer
 // ---------------------------------------------------------------------------
 
-/// Minimal gesture recognizer. Tracks one finger only.
-#[derive(Debug, Default)]
+/// Per-pointer tracking record. We retain the original-down location for the
+/// primary pointer (used by tap / swipe recognition) and the most recent
+/// location for every active pointer (used by pinch recognition).
+#[derive(Debug, Clone, Copy)]
+struct TrackedPointer {
+    /// First location observed for this pointer (set on WM_POINTERDOWN).
+    start_pos: POINT,
+    /// Most recent location observed (updated on WM_POINTERUPDATE).
+    last_pos: POINT,
+    /// Timestamp of the down event — only meaningful for the primary pointer.
+    start_t: Instant,
+}
+
+/// Gesture recogniser with single-finger (tap / swipe) and two-finger (pinch)
+/// support.  Multi-pointer state is keyed by Win32 pointer id; pointers are
+/// tracked in insertion order (so the first finger down is the "primary"
+/// pointer that drives tap/swipe).
+#[derive(Debug)]
 pub struct GestureRecognizer {
-    start: Option<(POINT, Instant)>,
+    /// Active pointers keyed by Win32 pointer id.  We use a `Vec` rather than
+    /// a `HashMap` because real workloads see <= 2 pointers and ordering
+    /// matters (first-down is the primary tap/swipe pointer).
+    pointers: Vec<(u32, TrackedPointer)>,
+    /// Distance between the two pointers at the moment the second one went
+    /// down.  Used as the reference for pinch-direction detection.  `None`
+    /// when fewer than two pointers are active or after a pinch fires.
+    pinch_reference_distance: Option<f32>,
     swipe_threshold_px: u32,
     swipe_timeout_ms: u32,
+    pinch_threshold_px: u32,
+}
+
+impl Default for GestureRecognizer {
+    fn default() -> Self {
+        Self {
+            pointers: Vec::new(),
+            pinch_reference_distance: None,
+            swipe_threshold_px: 50,
+            swipe_timeout_ms: 500,
+            pinch_threshold_px: 8,
+        }
+    }
 }
 
 impl GestureRecognizer {
     pub fn new(config: &TouchConfig) -> Self {
         Self {
-            start: None,
+            pointers: Vec::new(),
+            pinch_reference_distance: None,
             swipe_threshold_px: config.swipe_threshold_px,
             swipe_timeout_ms: config.swipe_timeout_ms,
+            pinch_threshold_px: config.pinch_threshold_px,
         }
     }
 
+    /// Record a pointer-down event.  Single-finger callers (most of the
+    /// existing test suite) can use `pointer_down(p)` which auto-assigns
+    /// id 0; multi-pointer callers should use `pointer_down_id`.
     pub fn pointer_down(&mut self, p: POINT) {
-        self.start = Some((p, Instant::now()));
+        self.pointer_down_id(0, p);
     }
 
+    /// Record a pointer-down event keyed by an explicit pointer id.
+    pub fn pointer_down_id(&mut self, id: u32, p: POINT) {
+        // Replace any stale entry for this id (defensive — Windows occasionally
+        // re-uses pointer ids across short-lived gestures).
+        self.pointers.retain(|(pid, _)| *pid != id);
+        self.pointers.push((
+            id,
+            TrackedPointer {
+                start_pos: p,
+                last_pos: p,
+                start_t: Instant::now(),
+            },
+        ));
+        // If we just transitioned from one to two pointers, freeze the
+        // reference distance so subsequent updates can detect pinch direction.
+        if self.pointers.len() == 2 {
+            self.pinch_reference_distance = Some(self.current_pointer_distance());
+        }
+    }
+
+    /// Record a pointer-move event.  Returns a `PinchIn` / `PinchOut` gesture
+    /// when two pointers are active and the inter-pointer distance has shifted
+    /// by more than `pinch_threshold_px` from the last reference.  After
+    /// emitting a pinch the reference distance is reset to the current
+    /// distance so a continuous spread fires repeatedly (one event per
+    /// threshold-crossing).
+    pub fn pointer_update_id(&mut self, id: u32, p: POINT) -> Option<TouchGesture> {
+        // Update last_pos for this pointer; bail if the id is unknown.
+        let mut updated = false;
+        for entry in self.pointers.iter_mut() {
+            if entry.0 == id {
+                entry.1.last_pos = p;
+                updated = true;
+                break;
+            }
+        }
+        if !updated {
+            return None;
+        }
+
+        if self.pointers.len() != 2 {
+            return None;
+        }
+        let reference = self.pinch_reference_distance?;
+        let current = self.current_pointer_distance();
+        let delta = current - reference;
+        if delta.abs() < self.pinch_threshold_px as f32 {
+            return None;
+        }
+        // Reset the reference so the user can pinch continuously.
+        self.pinch_reference_distance = Some(current);
+        if delta > 0.0 {
+            Some(TouchGesture::PinchOut)
+        } else {
+            Some(TouchGesture::PinchIn)
+        }
+    }
+
+    /// Record a pointer-up event for the primary pointer (id 0 / first down).
+    /// Same signature as the legacy single-touch API.
     pub fn pointer_up(&mut self, p: POINT) -> Option<TouchGesture> {
-        let (start_p, start_t) = self.start.take()?;
+        let id = self.pointers.first().map(|(pid, _)| *pid).unwrap_or(0);
+        self.pointer_up_id(id, p)
+    }
+
+    /// Record a pointer-up event for an explicit pointer id.  When the
+    /// released pointer was the primary single-finger pointer this returns
+    /// the resolved tap / swipe gesture; when releasing the second of a pair
+    /// it returns `None` (the pinch has already fired during updates).
+    pub fn pointer_up_id(&mut self, id: u32, p: POINT) -> Option<TouchGesture> {
+        // Pop the entry — defensively handle a missing id (Windows can issue
+        // a stray UP without a matching DOWN).
+        let entry_idx = self.pointers.iter().position(|(pid, _)| *pid == id);
+        let entry = entry_idx.map(|i| self.pointers.remove(i));
+
+        // Releasing one of the two pointers ends the pinch session; drop the
+        // reference distance so a fresh second-down restarts it.
+        if self.pointers.len() < 2 {
+            self.pinch_reference_distance = None;
+        }
+
+        let TrackedPointer { start_pos, start_t, .. } = match entry {
+            Some((_, t)) => t,
+            None => return None,
+        };
+
+        // Only the primary pointer (the first one that was tracked at the
+        // time of the up event, i.e. the only remaining one if there was a
+        // pair) resolves to tap / swipe.  If there are still pointers down
+        // after this release we're mid-multi-touch and skip tap/swipe.
+        if !self.pointers.is_empty() {
+            return None;
+        }
+
         let elapsed = start_t.elapsed();
-        let dx = (p.x - start_p.x) as i64;
-        let dy = (p.y - start_p.y) as i64;
+        let dx = (p.x - start_pos.x) as i64;
+        let dy = (p.y - start_pos.y) as i64;
         let dist_sq = dx * dx + dy * dy;
         let threshold_sq = (self.swipe_threshold_px as i64).pow(2);
 
@@ -121,11 +272,30 @@ impl GestureRecognizer {
         }
     }
 
+    /// Distance between the two currently-tracked pointers.  Panics if there
+    /// are fewer than two pointers — callers guard with `pointers.len() == 2`.
+    fn current_pointer_distance(&self) -> f32 {
+        let a = self.pointers[0].1.last_pos;
+        let b = self.pointers[1].1.last_pos;
+        let dx = (b.x - a.x) as f32;
+        let dy = (b.y - a.y) as f32;
+        (dx * dx + dy * dy).sqrt()
+    }
+
     /// Test-only helper: inject a start point with an explicit timestamp so
     /// timeout scenarios can be exercised without sleeping.
     #[cfg(test)]
     pub fn start_at(&mut self, p: POINT, t: Instant) {
-        self.start = Some((p, t));
+        self.pointers.clear();
+        self.pointers.push((
+            0,
+            TrackedPointer {
+                start_pos: p,
+                last_pos: p,
+                start_t: t,
+            },
+        ));
+        self.pinch_reference_distance = None;
     }
 }
 
@@ -283,32 +453,43 @@ unsafe extern "system" fn touch_hook_callback(
     let msg = &*msg_ptr;
 
     match msg.message {
-        WM_POINTERDOWN | WM_POINTERUP => {
+        WM_POINTERDOWN | WM_POINTERUP | WM_POINTERUPDATE => {
             let pid = pointer_id_from_wparam(msg.wParam.0);
             let mut info = PointerInfo::zeroed();
             if GetPointerInfo(pid, &mut info) != 0 {
                 let pt = info.pt_pixel_location;
                 if let Some(state) = TOUCH_STATE.lock().as_mut() {
-                    if msg.message == WM_POINTERDOWN {
-                        debug!("touch: pointer_down ({}, {})", pt.x, pt.y);
-                        state.recognizer.pointer_down(pt);
-                    } else {
-                        debug!("touch: pointer_up ({}, {})", pt.x, pt.y);
-                        if let Some(gesture) = state.recognizer.pointer_up(pt) {
-                            debug!("touch: gesture detected = {:?}", gesture);
-                            if let Some(action) = state.config.gestures.get(&gesture) {
-                                info!("touch gesture {:?} -> action {:?}", gesture, action);
-                                push_pending_action(action.clone());
-                            }
+                    let gesture: Option<TouchGesture> = match msg.message {
+                        WM_POINTERDOWN => {
+                            debug!("touch: pointer_down id={} ({}, {})", pid, pt.x, pt.y);
+                            state.recognizer.pointer_down_id(pid, pt);
+                            None
+                        }
+                        WM_POINTERUPDATE => {
+                            // Only emit log lines on update if a pinch fires —
+                            // every contact frame produces an update event, so
+                            // logging unconditionally would flood the trace.
+                            state.recognizer.pointer_update_id(pid, pt)
+                        }
+                        WM_POINTERUP => {
+                            debug!("touch: pointer_up id={} ({}, {})", pid, pt.x, pt.y);
+                            state.recognizer.pointer_up_id(pid, pt)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Some(g) = gesture {
+                        debug!("touch: gesture detected = {:?}", g);
+                        if let Some(action) = state.config.gestures.get(&g) {
+                            info!("touch gesture {:?} -> action {:?}", g, action);
+                            push_pending_action(action.clone());
                         }
                     }
                 }
-            } else {
+            } else if msg.message != WM_POINTERUPDATE {
+                // Failing to resolve a pointer-up / down is worth a warning;
+                // failing on every coalesced update would spam the log.
                 warn!("touch: GetPointerInfo failed for pointer_id={}", pid);
             }
-        }
-        WM_POINTERUPDATE => {
-            // Intentionally ignored for now — single-finger tracking only.
         }
         _ => {}
     }
@@ -398,5 +579,89 @@ mod tests {
         // Distance is large enough to be a swipe, but elapsed > timeout.
         let result = r.pointer_up(make_point(200, 15));
         assert_eq!(result, None);
+    }
+
+    // ── Multi-pointer pinch tests ───────────────────────────────────────────
+
+    /// Two pointers move apart by more than the threshold -> PinchOut fires.
+    #[test]
+    fn test_recognizer_pinch_out() {
+        let mut r = default_recognizer();
+        r.pointer_down_id(1, make_point(100, 100));
+        r.pointer_down_id(2, make_point(140, 100)); // reference distance = 40
+
+        // First update inside threshold -> no gesture yet.
+        assert_eq!(r.pointer_update_id(2, make_point(145, 100)), None);
+        // Subsequent update pushes total distance past 8 px threshold.
+        let g = r.pointer_update_id(2, make_point(160, 100));
+        assert_eq!(g, Some(TouchGesture::PinchOut));
+    }
+
+    /// Two pointers move together by more than the threshold -> PinchIn fires.
+    #[test]
+    fn test_recognizer_pinch_in() {
+        let mut r = default_recognizer();
+        r.pointer_down_id(1, make_point(100, 100));
+        r.pointer_down_id(2, make_point(200, 100)); // reference distance = 100
+        let g = r.pointer_update_id(2, make_point(180, 100)); // delta = -20
+        assert_eq!(g, Some(TouchGesture::PinchIn));
+    }
+
+    /// Tiny pointer movement below the pinch threshold is ignored.
+    #[test]
+    fn test_recognizer_pinch_below_threshold_is_silent() {
+        let mut r = default_recognizer();
+        r.pointer_down_id(1, make_point(100, 100));
+        r.pointer_down_id(2, make_point(140, 100));
+        // Only 3 px of additional spread -> still under the 8 px threshold.
+        assert_eq!(r.pointer_update_id(2, make_point(143, 100)), None);
+    }
+
+    /// Single-pointer updates do not produce a pinch gesture.
+    #[test]
+    fn test_recognizer_single_pointer_update_no_pinch() {
+        let mut r = default_recognizer();
+        r.pointer_down_id(1, make_point(100, 100));
+        // Move the lone pointer a long way — must not produce a pinch.
+        assert_eq!(r.pointer_update_id(1, make_point(500, 500)), None);
+    }
+
+    /// Releasing one pointer ends the pinch session; a fresh second down
+    /// re-establishes the reference distance.
+    #[test]
+    fn test_recognizer_pinch_resets_after_release() {
+        let mut r = default_recognizer();
+        r.pointer_down_id(1, make_point(100, 100));
+        r.pointer_down_id(2, make_point(140, 100));
+        assert_eq!(
+            r.pointer_update_id(2, make_point(160, 100)),
+            Some(TouchGesture::PinchOut)
+        );
+        // Release one pointer. With only one pointer left, no pinch is possible.
+        let _ = r.pointer_up_id(2, make_point(160, 100));
+        assert_eq!(r.pointer_update_id(1, make_point(50, 100)), None);
+        // Second pointer comes back down — new reference distance applies.
+        r.pointer_down_id(2, make_point(60, 100)); // distance now ~10
+        // Tiny update -> still under threshold.
+        assert_eq!(r.pointer_update_id(2, make_point(63, 100)), None);
+        // Big spread -> PinchOut from the new reference.
+        assert_eq!(
+            r.pointer_update_id(2, make_point(80, 100)),
+            Some(TouchGesture::PinchOut)
+        );
+    }
+
+    /// Pinch gesture is mapped to the `OverviewToggle` action by default.
+    #[test]
+    fn test_default_config_maps_pinch_to_overview_toggle() {
+        let cfg = TouchConfig::default();
+        assert_eq!(
+            cfg.gestures.get(&TouchGesture::PinchOut),
+            Some(&Action::OverviewToggle)
+        );
+        assert_eq!(
+            cfg.gestures.get(&TouchGesture::PinchIn),
+            Some(&Action::OverviewToggle)
+        );
     }
 }

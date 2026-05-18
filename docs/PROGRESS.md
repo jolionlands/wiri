@@ -216,3 +216,52 @@ tray, and config.  Highlights:
 - [x] ~~Touch input fields in config~~ (DONE — input/touch.rs consumer pending)
 - [ ] Touch swipe gesture handler
 - [ ] Wallpaper/accent color integration
+
+## Refinements (2026-05)
+
+### MatcherContext live-state wiring
+- ✅ `layout/engine.rs::add_window_with_target` builds `MatcherContext` with
+      real `is_active` (`GetForegroundWindow`), `is_floating`
+      (`floating_windows` membership), `is_urgent` (`urgent_windows` +
+      `is_window_flashing`), and `at_startup` (parameter on
+      `add_window_at_startup`).
+- ✅ Stale `TODO(audit)` comments in `config/types.rs` replaced with
+      pointers to the engine call-site.
+- ✅ `window/rules.rs` adds four targeted tests proving `IsFloating`,
+      `IsUrgent`, `AtStartup`, and composite matchers fire only when the
+      flag actually holds.
+
+### DWM drop-shadow control
+- ✅ New `apply_shadow_for_window` helper on `TilingEngine` calls
+      `DwmExtendFrameIntoClientArea` once per HWND with `cyTopHeight = 1`
+      when `shadow_enable = true`, `MARGINS(0,0,0,0)` otherwise.
+- ✅ `shadow_applied: HashSet<WindowId>` ensures the call fires once
+      per window (Windows Terminal stays painted instead of flickering
+      black on every layout pass).
+- ✅ Cleared on `remove_window` so HWND reuse re-applies the desired
+      state.
+- ✅ Engine-local `LayoutConfig` now carries `shadow_enable`, mirrored
+      from `config.layout.shadow_enable` in `from_config`.
+
+### Two-finger pinch gestures
+- ✅ `input/touch.rs::GestureRecognizer` now tracks multiple pointers
+      keyed by Win32 pointer id, exposing `pointer_down_id`,
+      `pointer_update_id`, `pointer_up_id`.
+- ✅ Distance change between two pointers > `pinch_threshold_px`
+      (default 8 px) emits `TouchGesture::PinchIn` / `PinchOut`.
+- ✅ Hook callback forwards `WM_POINTERUPDATE` (previously ignored)
+      into the recogniser; default config maps both pinch directions
+      to `Action::OverviewToggle`.
+- ✅ 5 new unit tests cover pinch-in, pinch-out, sub-threshold quiet,
+      single-pointer ignore, and reset-on-release.
+
+### `wiri-ctl validate-config`
+- ✅ New zero-IPC subcommand: parses a config file with
+      `config::parse::validate_kdl_config` and prints
+      `path:line:col: severity: message` lines.
+- ✅ Detects unknown top-level sections, unknown nested sections,
+      unclosed / unmatched braces, invalid colour literals, non-integer
+      values for known integer fields, and unparseable bind lines.
+- ✅ `--json` flag emits a structured report; exit 1 on any error,
+      0 otherwise. Honors `$WIRI_CONFIG` / `%APPDATA%\wiri\config.kdl`
+      when no explicit path is given.
