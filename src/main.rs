@@ -348,14 +348,15 @@ info!("Mouse hook installed");
     // `message_loop::resolve_terminal_command` — the first `spawn` bind or
     // spawn-at-startup entry wins, with `cmd.exe` as the final fallback.
 
-    // Start IPC server — wire a shutdown channel so IPC Quit triggers graceful exit
+    // Start IPC server — wire a shutdown channel so IPC Quit triggers graceful exit.
     //
-    // We run the server on a dedicated thread with a single-threaded Tokio
-    // runtime because IpcServer::run holds Win32 `SECURITY_ATTRIBUTES`
-    // (containing a raw `*mut c_void`) across `await` points. That's not
-    // `Send`, so `tokio::spawn` on the main multi-thread runtime can't accept
-    // the future. A current-thread runtime never moves the future across
-    // threads, so the Send bound is dropped.
+    // Item 2 (Option A): the server now builds the named pipe's
+    // SECURITY_ATTRIBUTES synchronously inside `IpcServer::run` *before* any
+    // `.await`, hands off only the prebuilt `NamedPipeServer` handles to the
+    // accept loop, and never holds a `SECURITY_ATTRIBUTES` (or its
+    // `*mut c_void` ACL pointer) across await points.  The future is therefore
+    // `Send`, so plain `tokio::spawn` on the multi-thread runtime is enough —
+    // no dedicated single-thread runtime required.
     let mut ipc_server = IpcServer::new();
     ipc_server.set_engine(engine.clone());
     ipc_server.set_backend(backend.handle());
@@ -363,26 +364,11 @@ info!("Mouse hook installed");
     ipc_server.set_shutdown_sender(ipc_shutdown_tx);
     let ipc_server = Arc::new(ipc_server);
     let ipc_server_clone = ipc_server.clone();
-    std::thread::Builder::new()
-        .name("wiri-ipc".to_string())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    error!("IPC runtime build failed: {}", e);
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                if let Err(e) = ipc_server_clone.run().await {
-                    error!("IPC server error: {}", e);
-                }
-            });
-        })
-        .expect("failed to spawn IPC thread");
+    tokio::spawn(async move {
+        if let Err(e) = ipc_server_clone.run().await {
+            error!("IPC server error: {}", e);
+        }
+    });
     info!("IPC server started on {}", wiri::ipc::PIPE_PATH);
 
     // Take event receiver before spawning event handler
@@ -644,6 +630,13 @@ info!("Mouse hook installed");
                     info!("Tray: focus previous (MRU)");
                     engine.write().focus_previous_window(&handle);
                     engine.write().apply_all(&handle);
+                }
+                TrayAction::Screenshot => {
+                    // Screenshot is handled inline inside poll_tray_action so
+                    // this arm is never reached.  Kept exhaustive so the
+                    // compiler flags any new TrayAction variant we forget to
+                    // route in main.
+                    info!("Tray: screenshot — handled inline by SystemIntegration");
                 }
             }
         }

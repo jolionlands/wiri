@@ -88,12 +88,45 @@ mod tests {
             IpcMessage::WindowResize { window_hwnd: 1, width: 800, height: 600 },
             IpcMessage::TileRequest { window_hwnd: 1, target_workspace: Some("ws2".to_string()) },
             IpcMessage::SubscribeEvents { event_types: vec!["focus".to_string()] },
+            // MonitorList is a new variant — make sure it round-trips
+            // through the serde tagged-enum format unchanged.
+            IpcMessage::MonitorList,
         ];
         for msg in &messages {
             let json = serde_json::to_string(msg).unwrap();
             let parsed: IpcMessage = serde_json::from_str(&json).unwrap();
             assert_eq!(json, serde_json::to_string(&parsed).unwrap());
         }
+    }
+
+    /// `MonitorInfo` survives a JSON round-trip with every field preserved.
+    /// This is the wire payload returned by `MonitorList`.
+    #[test]
+    fn test_monitor_info_serialization() {
+        let m = crate::ipc::MonitorInfo {
+            output_id: 0xDEAD_BEEF_CAFE_F00D,
+            bounds_x: 0,
+            bounds_y: 0,
+            bounds_width: 2560,
+            bounds_height: 1440,
+            work_area_x: 0,
+            work_area_y: 0,
+            work_area_width: 2560,
+            work_area_height: 1392,
+            scale_factor: 1.5,
+            active_workspace: 3,
+            window_count: 7,
+            focused: true,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: crate::ipc::MonitorInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.output_id, m.output_id);
+        assert_eq!(parsed.bounds_width, m.bounds_width);
+        assert_eq!(parsed.work_area_height, m.work_area_height);
+        assert!((parsed.scale_factor - m.scale_factor).abs() < f64::EPSILON);
+        assert_eq!(parsed.active_workspace, m.active_workspace);
+        assert_eq!(parsed.window_count, m.window_count);
+        assert!(parsed.focused);
     }
 
     #[test]

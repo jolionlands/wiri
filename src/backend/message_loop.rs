@@ -98,7 +98,8 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         // Ctrl+Alt+Tab switcher. RegisterHotKey will fail; that's OK — the warning
         // will be logged and the action remains available via custom KDL binds.
         (prefix, 0x09, Action::FocusPrevious),            // Tab
-        (prefix, 0x50, Action::ToggleAlwaysOnTop),        // P
+        (prefix, 0x50, Action::Screenshot),               // P (capture desktop to file)
+        (prefix, 0x41, Action::ToggleAlwaysOnTop),        // A (always-on-top)
     ]
 }
 
@@ -656,6 +657,19 @@ fn execute_action(
             engine.write().set_auto_tile_threshold(*t);
             engine.write().apply_all(backend);
         }
+        Action::Screenshot => {
+            take_screenshot();
+        }
+    }
+}
+
+/// Item 3: capture the full virtual desktop to a BMP file via the shared
+/// helper in `crate::hooks::capture_screenshot_to_pictures` so the hotkey
+/// path and the tray-menu path obey identical destination-resolution rules.
+fn take_screenshot() {
+    match crate::hooks::capture_screenshot_to_pictures() {
+        Ok(path) => info!("Screenshot saved to {}", path),
+        Err(e) => warn!("Screenshot failed: {}", e),
     }
 }
 

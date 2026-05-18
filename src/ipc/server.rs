@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::layout::TilingEngine;
-use super::messages::{IpcEvent, IpcMessage, WorkspaceInfo};
+use super::messages::{IpcEvent, IpcMessage, MonitorInfo, WorkspaceInfo};
 use super::PIPE_PATH;
 
 pub struct IpcServer {
@@ -65,72 +65,39 @@ impl IpcServer {
     /// a shared workstation.  Implemented via tokio's
     /// `ServerOptions::create_with_security_attributes_raw` so the ACL applies
     /// to every pipe instance, not just the first.
+    ///
+    /// **Item 2 (Option A)** — `SECURITY_ATTRIBUTES` contains a raw
+    /// `*mut c_void` ACL pointer which is `!Send`.  We never hold one across
+    /// `.await`: every pipe instance is built by the synchronous helper
+    /// [`create_pipe_with_sa`] which builds the SA, calls
+    /// `ServerOptions::create_with_security_attributes_raw`, and drops the SA
+    /// before returning.  Each iteration of the accept loop runs the
+    /// synchronous build first, *then* awaits `connect`.  The resulting future
+    /// is `Send`, so plain `tokio::spawn` on the multi-thread runtime is fine.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
-        // SAFETY wrapper: SECURITY_ATTRIBUTES contains `*mut c_void` which
-        // makes it !Send/!Sync by default — that would poison the future
-        // captured by `tokio::spawn` (the multi-threaded runtime requires
-        // Send).  We hold the boxed descriptor for the entire lifetime of
-        // run() and only ever read its address from this single task, so
-        // crossing await points is safe.
-        struct SaHolder {
-            sa: Option<Box<windows::Win32::Security::SECURITY_ATTRIBUTES>>,
-        }
-        unsafe impl Send for SaHolder {}
-        unsafe impl Sync for SaHolder {}
-        impl SaHolder {
-            fn ptr(&self) -> *mut std::ffi::c_void {
-                match &self.sa {
-                    Some(b) => &**b as *const _ as *mut std::ffi::c_void,
-                    None => std::ptr::null_mut(),
-                }
-            }
-        }
-
-        let holder = SaHolder {
-            sa: match build_pipe_security_attributes() {
-                Ok(s) => Some(Box::new(s)),
-                Err(e) => {
-                    warn!(
-                        "Failed to build pipe security attributes: {} — falling back to defaults",
-                        e
-                    );
-                    None
-                }
-            },
-        };
-
         info!("IPC server starting on {} (ACL: Admins+Owner only)", PIPE_PATH);
 
         const MAX_CREATE_RETRIES: u32 = 5;
         let mut retry_count = 0u32;
+        let mut first_instance = true;
 
         loop {
-            // SAFETY: holder.ptr() is either null or points to a valid
-            // SECURITY_ATTRIBUTES (and the security descriptor it references)
-            // that lives for the lifetime of this `run` call.
-            let create_first = || unsafe {
-                ServerOptions::new()
-                    .first_pipe_instance(true)
-                    .create_with_security_attributes_raw(PIPE_PATH, holder.ptr())
-            };
-            let create_more = || unsafe {
-                ServerOptions::new()
-                    .first_pipe_instance(false)
-                    .create_with_security_attributes_raw(PIPE_PATH, holder.ptr())
-            };
-
-            // Try to create a new pipe instance; attempt first_pipe_instance=true on first use.
-            let server = match create_more() {
+            // Synchronous pipe creation — SECURITY_ATTRIBUTES is materialised
+            // and dropped entirely within this call, before any `.await` below.
+            let create_result = create_pipe_with_sa(first_instance);
+            let server = match create_result {
                 Ok(s) => {
                     retry_count = 0;
+                    first_instance = false; // Subsequent instances must not set first_pipe_instance.
                     s
                 }
-                Err(e) => {
-                    match create_first() {
+                Err(e) if first_instance => {
+                    // First-instance attempt failed — fall back to not requesting
+                    // first_pipe_instance in case another (stale) handle exists.
+                    match create_pipe_with_sa(false) {
                         Ok(s) => {
                             retry_count = 0;
+                            first_instance = false;
                             s
                         }
                         Err(e2) => {
@@ -155,9 +122,29 @@ impl IpcServer {
                         }
                     }
                 }
+                Err(e) => {
+                    retry_count += 1;
+                    warn!(
+                        "Failed to create named pipe (attempt {}/{}): {}",
+                        retry_count, MAX_CREATE_RETRIES, e
+                    );
+                    if retry_count >= MAX_CREATE_RETRIES {
+                        error!(
+                            "IPC pipe creation failed {} times — giving up.",
+                            MAX_CREATE_RETRIES
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Cannot create IPC pipe after {} attempts: {}",
+                            MAX_CREATE_RETRIES, e
+                        ));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue;
+                }
             };
 
-            // Wait for a client to connect
+            // Wait for a client to connect.  `server` (a NamedPipeServer) is
+            // Send-safe; SECURITY_ATTRIBUTES has already been dropped.
             if let Err(e) = server.connect().await {
                 warn!("Pipe connect error: {}", e);
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -687,6 +674,48 @@ impl IpcServer {
                     _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
                 }
             }
+            IpcMessage::MonitorList => {
+                // Enumerate every monitor with its bounds, work area, DPI
+                // scale, active workspace, and whether it is the focused
+                // output. Pure read-only — no engine mutation.
+                if let Some(engine) = &self.engine {
+                    let eng = engine.read();
+                    let focused = eng.focused_output();
+                    let mut out: Vec<MonitorInfo> = eng
+                        .monitors()
+                        .iter()
+                        .map(|(oid, m)| {
+                            let window_count: usize = m
+                                .workspaces
+                                .values()
+                                .flat_map(|ws| ws.columns.iter())
+                                .map(|c| c.tiles.len())
+                                .sum();
+                            MonitorInfo {
+                                output_id: oid.as_u64(),
+                                bounds_x: m.bounds.loc.x,
+                                bounds_y: m.bounds.loc.y,
+                                bounds_width: m.bounds.size.w,
+                                bounds_height: m.bounds.size.h,
+                                work_area_x: m.work_area.loc.x,
+                                work_area_y: m.work_area.loc.y,
+                                work_area_width: m.work_area.size.w,
+                                work_area_height: m.work_area.size.h,
+                                scale_factor: m.scale_factor,
+                                active_workspace: m.active_workspace_id(),
+                                window_count,
+                                focused: Some(*oid) == focused,
+                            }
+                        })
+                        .collect();
+                    // Stable order: sort by x-coordinate of bounds so the user
+                    // sees left-to-right monitors in left-to-right output.
+                    out.sort_by_key(|m| (m.bounds_x, m.bounds_y));
+                    serde_json::json!({"success": true, "result": out})
+                } else {
+                    serde_json::json!({"success": true, "result": []})
+                }
+            }
             IpcMessage::SpawnCommand { command } => {
                 info!("IPC: SpawnCommand {:?}", command);
                 let parts: Vec<&str> = command.split_whitespace().collect();
@@ -828,6 +857,51 @@ fn focus_window_by_hwnd(
     // Re-apply layout on the target monitor.
     engine.write().apply_all(backend);
     true
+}
+
+/// Item 2 (Option A): synchronously build a named-pipe instance with the
+/// Admins-only ACL applied, then drop the `SECURITY_ATTRIBUTES` before
+/// returning.  This guarantees the !Send `SECURITY_ATTRIBUTES` never crosses
+/// an `.await` point and the resulting `NamedPipeServer` is freely Send.
+///
+/// If `first_instance` is true, the call sets `first_pipe_instance(true)`
+/// (fails if another listener already holds the pipe — used as the
+/// single-instance probe).
+fn create_pipe_with_sa(
+    first_instance: bool,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    // Build SA inline so it lives only for this call.
+    let sa_opt = match build_pipe_security_attributes() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(
+                "Failed to build pipe security attributes: {} — falling back to defaults",
+                e
+            );
+            None
+        }
+    };
+    let sa_ptr: *mut std::ffi::c_void = match &sa_opt {
+        Some(sa) => sa as *const _ as *mut std::ffi::c_void,
+        None => std::ptr::null_mut(),
+    };
+
+    // SAFETY: sa_ptr is null (defaults) or points to the local `sa_opt`,
+    // which is on this thread's stack and alive for the duration of the
+    // create call.  After `create_with_security_attributes_raw` returns,
+    // the OS has copied/duplicated whatever security info it needed.
+    // `SECURITY_ATTRIBUTES` is `Copy`, so `sa_opt` is dropped automatically
+    // when this synchronous function returns — strictly before any `.await`
+    // in the caller.
+    let server = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first_instance)
+            .create_with_security_attributes_raw(PIPE_PATH, sa_ptr)?
+    };
+    let _ = sa_opt; // keep alive until after the create call.
+    Ok(server)
 }
 
 /// Build a SECURITY_ATTRIBUTES that grants full access only to

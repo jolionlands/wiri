@@ -587,8 +587,25 @@ fn apply_window_rule_property(key: &str, value: &str, wr: &mut WindowRule) {
             }
         }
         "opacity" => {
-            if let Ok(v) = value.parse() {
-                wr.opacity = v;
+            if let Ok(v) = value.parse::<f64>() {
+                // Validate range: clamp values outside [0.0, 1.0] and warn
+                // (rather than reject silently) so the user sees the typo.
+                let clamped = if !(0.0..=1.0).contains(&v) {
+                    let c = v.clamp(0.0, 1.0);
+                    tracing::warn!(
+                        "window-rule opacity {} is outside [0.0, 1.0]; clamped to {}",
+                        v, c,
+                    );
+                    c
+                } else {
+                    v
+                };
+                wr.opacity = Some(clamped);
+            } else {
+                tracing::warn!(
+                    "window-rule opacity {:?} is not a valid number; ignoring",
+                    value,
+                );
             }
         }
         "workspace" => {
@@ -1005,10 +1022,46 @@ output "HDMI-1" {
         let wr = &config.window_rules[0];
         assert_eq!(wr.class.as_deref(), Some("Firefox"));
         assert!(wr.floating);
-        assert!((wr.opacity - 0.9).abs() < 0.001);
+        let op = wr.opacity.expect("opacity should be Some(0.9) after parse");
+        assert!((op - 0.9).abs() < 0.001);
         assert_eq!(wr.default_width, Some(1200));
         assert_eq!(wr.default_height, Some(800));
         assert_eq!(wr.workspace.as_deref(), Some("Main"));
+    }
+
+    /// Item 1: `opacity 0` parses to `Some(0.0)`, not None / not dropped.
+    #[test]
+    fn test_parse_window_rule_opacity_zero() {
+        let input = r#"window-rule {
+    class-name "Ghost"
+    opacity 0.0
+}"#;
+        let config = parse_kdl_config(input).unwrap();
+        let wr = &config.window_rules[0];
+        assert_eq!(wr.opacity, Some(0.0));
+    }
+
+    /// Item 1: opacity outside [0,1] is clamped (and a warning is logged).
+    #[test]
+    fn test_parse_window_rule_opacity_clamped() {
+        let input = r#"window-rule {
+    class-name "Bright"
+    opacity 2.5
+}"#;
+        let config = parse_kdl_config(input).unwrap();
+        let wr = &config.window_rules[0];
+        assert_eq!(wr.opacity, Some(1.0));
+    }
+
+    /// Item 1: no opacity line → `None` on the rule (not the previous default 0.0).
+    #[test]
+    fn test_parse_window_rule_no_opacity_is_none() {
+        let input = r#"window-rule {
+    class-name "Plain"
+}"#;
+        let config = parse_kdl_config(input).unwrap();
+        let wr = &config.window_rules[0];
+        assert_eq!(wr.opacity, None);
     }
 
     #[test]

@@ -81,6 +81,10 @@ pub enum Action {
     FocusWorkspaceNamed(String),
     /// Set auto-tile threshold (None disables)
     SetAutoTileThreshold(Option<usize>),
+    /// Capture the full virtual desktop to a BMP file under
+    /// `%USERPROFILE%\Pictures\wiri-<timestamp>.bmp` (or the current working
+    /// directory if Pictures isn't writable).
+    Screenshot,
 }
 
 /// Parse an action name string (from config/IPC) into an Action.
@@ -140,6 +144,7 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "focus-workspace-named" | "focus-workspace" => {
             args.first().map(|s| Action::FocusWorkspaceNamed(s.clone()))
         }
+        "screenshot" | "take-screenshot" | "capture-screen" => Some(Action::Screenshot),
         "set-auto-tile" => {
             if args.is_empty() {
                 None

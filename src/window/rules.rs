@@ -18,15 +18,12 @@ pub fn resolve_window_rules(rules: &[WindowRule], ctx: &MatcherContext<'_>) -> R
             if let Some(ref ws) = rule.workspace {
                 resolved.workspace = Some(ws.parse().ok()).flatten();
             }
-            // `rule.opacity` is currently `f64` with default 0.0, so we cannot
-            // distinguish "field unset" from "explicit opacity 0.0". We treat
-            // 0.0 as "leave default" (most common case) and only apply when
-            // the user wrote a strictly positive value. The default config
-            // never emits opacity:0 rules so this is safe.
-            // (Request to Agent B: switch `WindowRule::opacity` to `Option<f32>`
-            //  so we can express opacity:0 explicitly.)
-            if rule.opacity > 0.0 {
-                resolved.opacity = rule.opacity as f32;
+            // `rule.opacity` is `Option<f64>`: `Some(x)` is an explicit
+            // override (including `Some(0.0)` for "fully transparent"), `None`
+            // means "field unset; fall through" so earlier matching rules
+            // (or the default `None`) win.
+            if let Some(o) = rule.opacity {
+                resolved.opacity = Some(o.clamp(0.0, 1.0) as f32);
             }
             resolved.border = !rule.blur; // blur is used as "borderless" proxy
         }
@@ -124,11 +121,58 @@ mod tests {
     fn test_opacity_rule() {
         let mut rule = WindowRule::default();
         rule.class = Some("Terminal".to_string());
-        rule.opacity = 0.9;
+        rule.opacity = Some(0.9);
 
         let rules = vec![rule];
         let resolved = resolve_window_rules(&rules, &ctx("Terminal", ""));
-        assert!((resolved.opacity - 0.9).abs() < 0.01);
+        let got = resolved.opacity.expect("opacity should be Some after matching rule");
+        assert!((got - 0.9).abs() < 0.01);
+    }
+
+    /// Item 1: explicit `Some(0.0)` produces a fully-transparent window.
+    /// Previously the `> 0.0` filter dropped this case silently.
+    #[test]
+    fn test_opacity_zero_is_applied() {
+        let mut rule = WindowRule::default();
+        rule.class = Some("Ghost".to_string());
+        rule.opacity = Some(0.0);
+
+        let rules = vec![rule];
+        let resolved = resolve_window_rules(&rules, &ctx("Ghost", ""));
+        assert_eq!(
+            resolved.opacity,
+            Some(0.0),
+            "opacity:0 must be honoured as fully transparent"
+        );
+    }
+
+    /// `None` opacity means "field unset; leave default".
+    #[test]
+    fn test_opacity_none_falls_through() {
+        let mut rule = WindowRule::default();
+        rule.class = Some("Other".to_string());
+        // opacity left as None
+        let rules = vec![rule];
+        let resolved = resolve_window_rules(&rules, &ctx("Other", ""));
+        assert!(resolved.opacity.is_none(), "unset opacity must stay None");
+    }
+
+    /// Out-of-range opacity is clamped to [0.0, 1.0] rather than rejected.
+    #[test]
+    fn test_opacity_clamped_to_range() {
+        let mut rule = WindowRule::default();
+        rule.class = Some("Bright".to_string());
+        rule.opacity = Some(2.5);
+        let rules = vec![rule];
+        let resolved = resolve_window_rules(&rules, &ctx("Bright", ""));
+        assert_eq!(resolved.opacity, Some(1.0), "opacity>1 must clamp to 1.0");
+
+        let mut rule = WindowRule::default();
+        rule.class = Some("Dark".to_string());
+        rule.opacity = Some(-0.5);
+        let rules = vec![rule];
+        let resolved = resolve_window_rules(&rules, &ctx("Dark", ""));
+        assert_eq!(resolved.opacity, Some(0.0), "opacity<0 must clamp to 0.0");
     }
 
     #[test]
@@ -136,16 +180,17 @@ mod tests {
         let mut rule1 = WindowRule::default();
         rule1.class = Some("Chrome".to_string());
         rule1.floating = true;
-        rule1.opacity = 0.8;
+        rule1.opacity = Some(0.8);
 
         let mut rule2 = WindowRule::default();
         rule2.class = Some("Chrome".to_string());
-        rule2.opacity = 0.95;
+        rule2.opacity = Some(0.95);
 
         let rules = vec![rule1, rule2];
         let resolved = resolve_window_rules(&rules, &ctx("Chrome", ""));
         assert!(resolved.float); // from rule1
-        assert!((resolved.opacity - 0.95).abs() < 0.01); // overridden by rule2
+        let got = resolved.opacity.expect("opacity should be Some after matching rule");
+        assert!((got - 0.95).abs() < 0.01); // overridden by rule2
     }
 
     // ── new tests ─────────────────────────────────────────────────────────────

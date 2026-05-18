@@ -109,7 +109,10 @@ pub struct ResolvedWindowRules {
     pub column: Option<usize>,
     pub follow_cursor: bool,
     pub border: bool,
-    pub opacity: f32,
+    /// Per-window opacity override (0.0..=1.0). `None` means "no rule set;
+    /// the engine should leave the window at fully opaque (1.0)".  `Some(0.0)`
+    /// is a legal value meaning "explicitly fully transparent".
+    pub opacity: Option<f32>,
 }
 
 impl Default for ResolvedWindowRules {
@@ -120,7 +123,7 @@ impl Default for ResolvedWindowRules {
             column: None,
             follow_cursor: true,
             border: true,
-            opacity: 1.0,
+            opacity: None,
         }
     }
 }

@@ -25,6 +25,7 @@ const ID_TRAY_QUIT: usize = 1003;
 const ID_TRAY_OPEN_CONFIG_DIR: usize = 1004;
 const ID_TRAY_ABOUT: usize = 1005;
 const ID_TRAY_FOCUS_PREV: usize = 1006;
+const ID_TRAY_SCREENSHOT: usize = 1007;
 
 /// Actions that the tray icon can trigger
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,9 @@ pub enum TrayAction {
     About,
     /// Bring focus to the most recently focused tile.
     FocusPrevious,
+    /// Capture the full virtual desktop to a file under the user's Pictures
+    /// folder (Item 3: tray-driven screenshot).
+    Screenshot,
     /// Quit wiri.
     Quit,
 }
@@ -206,6 +210,7 @@ impl TrayIcon {
                         ID_TRAY_OPEN_CONFIG_DIR => { let _ = tx.send(TrayAction::OpenConfigDir); }
                         ID_TRAY_ABOUT => { let _ = tx.send(TrayAction::About); }
                         ID_TRAY_FOCUS_PREV => { let _ = tx.send(TrayAction::FocusPrevious); }
+                        ID_TRAY_SCREENSHOT => { let _ = tx.send(TrayAction::Screenshot); }
                         ID_TRAY_QUIT => { let _ = tx.send(TrayAction::Quit); }
                         _ => {}
                     }
@@ -243,6 +248,7 @@ impl TrayIcon {
             // AppendMenuW calls.
             let focus_prev: Vec<u16> = "Focus Last Tile\0".encode_utf16().collect();
             let show_hide_text: Vec<u16> = "Show/Hide\0".encode_utf16().collect();
+            let screenshot_text: Vec<u16> = "Take screenshot\0".encode_utf16().collect();
             let reload_text: Vec<u16> = "Reload Config\0".encode_utf16().collect();
             let open_dir_text: Vec<u16> = "Open Config Folder…\0".encode_utf16().collect();
             let about_text: Vec<u16> = "About wiri…\0".encode_utf16().collect();
@@ -250,6 +256,7 @@ impl TrayIcon {
 
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_FOCUS_PREV, PCWSTR(focus_prev.as_ptr())).ok();
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_SHOW_HIDE, PCWSTR(show_hide_text.as_ptr())).ok();
+            AppendMenuW(hmenu, MF_STRING, ID_TRAY_SCREENSHOT, PCWSTR(screenshot_text.as_ptr())).ok();
             AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_RELOAD_CONFIG, PCWSTR(reload_text.as_ptr())).ok();
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_OPEN_CONFIG_DIR, PCWSTR(open_dir_text.as_ptr())).ok();

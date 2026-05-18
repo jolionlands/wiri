@@ -594,7 +594,10 @@ pub struct WindowRule {
     pub floating: bool,
     pub workspace: Option<String>,
     pub monitor: Option<String>,
-    pub opacity: f64,
+    /// Per-window opacity override (0.0 = fully transparent, 1.0 = fully opaque).
+    /// `None` means "field unset; fall through to default / earlier rules".
+    /// `Some(x)` is an explicit override — including `Some(0.0)` for fully transparent.
+    pub opacity: Option<f64>,
     pub blur: bool,
     pub sticky: bool,
     pub scale: Option<f64>,

@@ -78,6 +78,28 @@ impl SystemIntegration {
                     // TrayAction::FocusPrevious unchanged.
                     return Some(TrayAction::ShowHide);
                 }
+                TrayAction::Screenshot => {
+                    // Item 3: capture inline so the tray menu is self-contained.
+                    // The exact same destination-resolution policy used by the
+                    // hotkey path lives here (Pictures → cwd fallback).
+                    match self::capture_screenshot_to_pictures() {
+                        Ok(path) => {
+                            tracing::info!("Tray: screenshot saved to {}", path);
+                            let _ = self.tray.show_balloon(
+                                "wiri — screenshot",
+                                &format!("Saved to {}", path),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Tray: screenshot failed: {}", e);
+                            let _ = self.tray.show_balloon(
+                                "wiri — screenshot failed",
+                                &e.to_string(),
+                            );
+                        }
+                    }
+                    continue;
+                }
                 other => return Some(other),
             }
         }
@@ -103,4 +125,36 @@ impl SystemIntegration {
     pub fn tray_icon_mut(&mut self) -> &mut TrayIcon {
         &mut self.tray
     }
+}
+
+/// Item 3: capture the full virtual desktop to a BMP file under
+/// `%USERPROFILE%\Pictures\wiri-<timestamp>.bmp`.  Falls back to the current
+/// working directory if Pictures is missing / not creatable.
+///
+/// Returns the full path (as a String) on success, or a propagated error.
+/// Shared between the `screenshot` hotkey action and the tray menu entry so
+/// both paths obey the same destination-resolution policy.
+pub fn capture_screenshot_to_pictures() -> anyhow::Result<String> {
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let filename = format!("wiri-{}.bmp", stamp);
+
+    let dest = std::env::var("USERPROFILE")
+        .ok()
+        .map(|home| PathBuf::from(home).join("Pictures"))
+        .and_then(|dir| {
+            std::fs::create_dir_all(&dir).ok().map(|_| dir.join(&filename))
+        })
+        .or_else(|| std::env::current_dir().ok().map(|d| d.join(&filename)))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no writable destination dir (Pictures and cwd both unavailable)")
+        })?;
+
+    Spawner::capture_screenshot_to_file(None, &dest)?;
+    Ok(dest.to_string_lossy().into_owned())
 }

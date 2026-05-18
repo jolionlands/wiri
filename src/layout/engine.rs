@@ -427,8 +427,10 @@ impl TilingEngine {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
-                if rules.opacity < 1.0 {
-                    self.apply_window_opacity(window_id.as_isize(), rules.opacity);
+                if let Some(o) = rules.opacity {
+                    // Explicit opacity override from a window-rule.
+                    // `Some(0.0)` is honoured as fully transparent.
+                    self.apply_window_opacity(window_id.as_isize(), o);
                 }
             }
 
@@ -451,8 +453,10 @@ impl TilingEngine {
                     }
                 }
                 self.strip_frame_for_tiling(hwnd);
-                if rules.opacity < 1.0 {
-                    self.apply_window_opacity(window_id.as_isize(), rules.opacity);
+                if let Some(o) = rules.opacity {
+                    // Explicit opacity override from a window-rule.
+                    // `Some(0.0)` is honoured as fully transparent.
+                    self.apply_window_opacity(window_id.as_isize(), o);
                 }
             }
 
@@ -476,8 +480,10 @@ impl TilingEngine {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
-                if rules.opacity < 1.0 {
-                    self.apply_window_opacity(window_id.as_isize(), rules.opacity);
+                if let Some(o) = rules.opacity {
+                    // Explicit opacity override from a window-rule.
+                    // `Some(0.0)` is honoured as fully transparent.
+                    self.apply_window_opacity(window_id.as_isize(), o);
                 }
             }
 
@@ -507,8 +513,10 @@ impl TilingEngine {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
-                if rules.opacity < 1.0 {
-                    self.apply_window_opacity(window_id.as_isize(), rules.opacity);
+                if let Some(o) = rules.opacity {
+                    // Explicit opacity override from a window-rule.
+                    // `Some(0.0)` is honoured as fully transparent.
+                    self.apply_window_opacity(window_id.as_isize(), o);
                 }
             }
 
@@ -555,8 +563,10 @@ impl TilingEngine {
                     }
                 }
                 self.strip_frame_for_tiling(hwnd);
-                if rules.opacity < 1.0 {
-                    self.apply_window_opacity(window_id.as_isize(), rules.opacity);
+                if let Some(o) = rules.opacity {
+                    // Explicit opacity override from a window-rule.
+                    // `Some(0.0)` is honoured as fully transparent.
+                    self.apply_window_opacity(window_id.as_isize(), o);
                 }
             }
         }
@@ -4232,7 +4242,7 @@ mod tests {
         assert!(scroll > 0, "scroll should be positive when centering column 4; got {}", scroll);
     }
 
-    // --- Item 4: set_column_width_preset ---
+    // --- set_column_width_preset ---
 
     #[test]
     fn test_column_width_preset_half() {
@@ -4598,7 +4608,7 @@ mod tests {
         assert_eq!(engine.auto_tile_threshold(), Some(7));
     }
 
-    // --- Item 4: focus_workspace_named ---
+    // --- focus_workspace_named ---
 
     #[test]
     fn test_focus_workspace_named() {

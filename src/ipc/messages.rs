@@ -130,6 +130,14 @@ pub enum IpcMessage {
     #[serde(rename = "set_auto_tile_threshold")]
     SetAutoTileThreshold { threshold: Option<usize> },
 
+    // ---- Diagnostics ----
+    /// Enumerate every monitor the engine currently tracks, returning
+    /// per-monitor geometry (bounds, work area), DPI scale factor, the
+    /// currently active workspace id, and the active focused-output marker.
+    /// Used by `wiri-ctl list-monitors`.
+    #[serde(rename = "monitor_list")]
+    MonitorList,
+
     // ---- System ----
     #[serde(rename = "get_state")]
     GetState,
@@ -179,6 +187,29 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub id: u32,
     pub window_count: usize,
+}
+
+/// Per-monitor diagnostic info returned by `MonitorList`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    /// Engine-internal OutputId (a deterministic 64-bit name hash).
+    pub output_id: u64,
+    pub bounds_x: i32,
+    pub bounds_y: i32,
+    pub bounds_width: u32,
+    pub bounds_height: u32,
+    pub work_area_x: i32,
+    pub work_area_y: i32,
+    pub work_area_width: u32,
+    pub work_area_height: u32,
+    /// DPI scale factor (1.0 = 96 DPI, 1.5 = 144 DPI, 2.0 = 192 DPI).
+    pub scale_factor: f64,
+    /// Active workspace id on this monitor.
+    pub active_workspace: i32,
+    /// Total number of windows currently tiled on this monitor.
+    pub window_count: usize,
+    /// True for the focused output (where new window operations go).
+    pub focused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

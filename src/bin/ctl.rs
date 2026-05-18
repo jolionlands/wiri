@@ -142,6 +142,11 @@ enum Commands {
 
     /// Set auto-tile threshold (window count above which to auto-grid). 0 to disable.
     SetAutoTile { threshold: usize },
+
+    /// List every monitor the running wiri daemon has detected, with its
+    /// bounds, work area, DPI scale, active workspace, and tiled-window count.
+    /// Useful for diagnosing multi-monitor / HiDPI issues.
+    ListMonitors,
 }
 
 fn main() -> Result<()> {
@@ -206,6 +211,7 @@ fn main() -> Result<()> {
         Commands::SetAutoTile { threshold } => IpcMessage::SetAutoTileThreshold {
             threshold: if threshold == 0 { None } else { Some(threshold) },
         },
+        Commands::ListMonitors => IpcMessage::MonitorList,
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;
@@ -266,6 +272,7 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
         IpcMessage::WindowMoveToWorkspace { window_hwnd, workspace_id } => {
             println!("Moved window {} to workspace {}.", window_hwnd, workspace_id);
         }
+        IpcMessage::MonitorList => print_monitor_list(resp),
         _ => {
             // Generic: report success with a hint when present.
             if let Some(note) = resp.get("note").and_then(|v| v.as_str()) {
@@ -353,6 +360,69 @@ fn print_window_list(resp: &serde_json::Value) {
     }
     println!();
     println!("  {} window{}", result.len(), if result.len() == 1 { "" } else { "s" });
+}
+
+/// Format `MonitorList` as a human-readable table — bounds, work area, DPI
+/// scale, active workspace, and which monitor is focused.
+fn print_monitor_list(resp: &serde_json::Value) {
+    let result = resp
+        .get("result")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if result.is_empty() {
+        println!("No monitors registered with the running wiri.");
+        return;
+    }
+
+    println!(
+        "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {}",
+        "F", "BOUNDS (x,y wxh)", "DPI", "WS", "WIN", "ID", "WORK AREA (x,y wxh)"
+    );
+    println!(
+        "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {}",
+        "─".repeat(3),
+        "─".repeat(18),
+        "─".repeat(10),
+        "─".repeat(5),
+        "─".repeat(3),
+        "─".repeat(5),
+        "─".repeat(20),
+    );
+
+    for m in &result {
+        let bx = m.get("bounds_x").and_then(|v| v.as_i64()).unwrap_or(0);
+        let by = m.get("bounds_y").and_then(|v| v.as_i64()).unwrap_or(0);
+        let bw = m.get("bounds_width").and_then(|v| v.as_u64()).unwrap_or(0);
+        let bh = m.get("bounds_height").and_then(|v| v.as_u64()).unwrap_or(0);
+        let wx = m.get("work_area_x").and_then(|v| v.as_i64()).unwrap_or(0);
+        let wy = m.get("work_area_y").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ww = m.get("work_area_width").and_then(|v| v.as_u64()).unwrap_or(0);
+        let wh = m.get("work_area_height").and_then(|v| v.as_u64()).unwrap_or(0);
+        let scale = m.get("scale_factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        let ws = m.get("active_workspace").and_then(|v| v.as_i64()).unwrap_or(0);
+        let win_count = m.get("window_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let id = m.get("output_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let focused = m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        println!(
+            "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5x}  {}",
+            if focused { "*" } else { " " },
+            format!("{},{} {}x{}", bx, by, bw, bh),
+            format!("{:.0}% ({:.1})", scale * 100.0, scale),
+            ws,
+            win_count,
+            id & 0xFFFF,
+            format!("{},{} {}x{}", wx, wy, ww, wh),
+        );
+    }
+
+    println!();
+    println!(
+        "  {} monitor{}  (* = focused output)",
+        result.len(),
+        if result.len() == 1 { "" } else { "s" }
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -150,6 +150,11 @@ binds {
     // Overview (zoom out to see all columns)
     Ctrl+Alt+Tab overview-toggle
     Ctrl+Alt+O   overview-select
+
+    // Screenshot: capture the full virtual desktop to a BMP file under
+    // %USERPROFILE%\Pictures\wiri-<timestamp>.bmp (falls back to the
+    // current working directory if Pictures is not writable).
+    Ctrl+Alt+P   screenshot
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 
 ## Build Status
 - ✅ Compiles cleanly (release build, all targets)
-- ✅ 322+ unit tests across config / ipc / layout / overlay / window / utils
+- ✅ 330+ unit tests across config / ipc / layout / overlay / window / utils
 - ✅ Release build: 2.4 MB (wiri.exe), 710 KB (wiri-ctl.exe)
 - ✅ 40+ source files, ~9 000 lines of Rust
 - ✅ Runs on aarch64-pc-windows-msvc (ARM64) and x86_64-pc-windows-msvc
