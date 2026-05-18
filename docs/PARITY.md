@@ -44,12 +44,12 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 | `open-floating` rule | ✅ | |
 | `open-max-bounds` rule | ✅ | |
 | Auto-engage overview when columns exceed threshold | ✅ | `auto-tile-threshold` |
-| Tabbed columns within a column | 🟡 | Engine scaffolding present (`Column.visible_tile_indices`), no default bind to toggle yet |
+| Tabbed columns within a column | ✅ | `Ctrl+Alt+\` toggles, `Ctrl+Alt+]` / `[` next/prev tab |
 | Interactive snap-on-drag with snap guides | 🟡 | Agent H pass landing |
 | Overview mode (zoom out, see all workspaces) | 🟡 | Agent G pass landing |
-| Workspace slide animation | 🟡 | Primitive shipped; engine consumer to wire |
-| Per-output `layout {}` overrides | 🟡 | Parser + data shipped; engine consumer to wire |
-| Interactive resize mode (Mod+R cycle) | ❌ | |
+| Workspace slide animation | ✅ | Engine biases tile Y by `workspace_slide_offset(oid)` |
+| Per-output `layout {}` overrides | ✅ | `TilingEngine.config_per_monitor` + `effective_config(oid)` accessor |
+| Interactive resize mode (Mod+R cycle) | ✅ | `Mod+R` toggles; `Mod+Arrow` resize while engaged; Esc exits |
 | Move column vertically between workspaces | ❌ | `Action::MoveToWorkspace { id }` exists but no "up/down by 1" shortcut |
 | Stack column (vertical of same width) — niri's "consume to next" inverse | ❌ | |
 
@@ -96,7 +96,7 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 | Per-monitor `output { … }` config | ✅ | name + index match |
 | `output { scale }` validation (0.5–4.0) | ✅ | warns + clamps |
 | Default-config drop on first run | ✅ | `%APPDATA%\wiri\config.kdl` |
-| Merge-with-defaults for `binds {}` | ❌ | Current behaviour: replace-all when present; pending |
+| Merge-with-defaults for `binds {}` | ✅ | Default `extend-defaults true`; config wins on collision, additions are appended |
 
 ## IPC
 
@@ -109,7 +109,7 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 | Diagnostic `test-bindings` (registered hotkeys + actions) | 🟡 | Agent G pass landing |
 | Window capture (`capture-window`) | 🟡 | Agent H pass landing |
 | Screenshot capture (`screenshot`) | ✅ | Default bind `Ctrl+Alt+P` |
-| Workspace + window persistence across reloads | 🟡 | engine state survives reload, but no snapshot serialise yet |
+| Workspace + window persistence across reloads | ✅ | `wiri-ctl save-snapshot / load-snapshot / list-snapshots / delete-snapshot` → JSON under `%APPDATA%\wiri\snapshots\` |
 
 ## Robustness
 
@@ -138,13 +138,10 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 
 These are concrete, scoped, and would tighten parity:
 
-- **Interactive resize mode** — niri's `Mod+R` enters a state where arrow keys resize the focused column/tile (escape to commit). Currently wiri requires modifier-held resize.
 - **Move-column-vertically-between-workspaces** — `Action::MoveColumnToWorkspaceAbove` / `Below`.
 - **Workspace move/swap** — `Action::MoveWorkspaceUp` / `Down` reorders the workspace stack.
 - **Smart-borders** — only draw border when more than one window is visible.
 - **Wallpaper-aware accent** — DWM `DWMWA_CAPTION_COLOR` from system accent.
-- **Snapshot/restore** — `wiri-ctl save-snapshot <name>` / `restore-snapshot <name>` serialises the engine state to JSON.
-- **Merge config binds with defaults** — see Configuration table.
 - **Blur backdrop** for floating windows via `DwmEnableBlurBehindWindow`.
 - **Win+L lock screen passthrough** — currently captured at the WM level; should fall through.
 - **More-faithful overview rendering** — DWM thumbnail per window (via `DwmRegisterThumbnail`) instead of resizing the live HWND.

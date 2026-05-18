@@ -854,6 +854,96 @@ impl IpcServer {
                     _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
                 }
             }
+            IpcMessage::SaveSnapshot { name } => {
+                info!("IPC: SaveSnapshot name={}", name);
+                match &self.engine {
+                    Some(e) => {
+                        let snap = e.read().snapshot();
+                        match crate::layout::snapshot::save_to(&name, &snap) {
+                            Ok(path) => serde_json::json!({
+                                "success": true,
+                                "result": { "path": path.to_string_lossy(), "name": name },
+                            }),
+                            Err(e) => serde_json::json!({
+                                "success": false,
+                                "error": format!("save failed: {}", e),
+                            }),
+                        }
+                    }
+                    None => serde_json::json!({
+                        "success": false,
+                        "error": "engine not initialized",
+                    }),
+                }
+            }
+            IpcMessage::LoadSnapshot { name } => {
+                info!("IPC: LoadSnapshot name={}", name);
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        match crate::layout::snapshot::load_from(&name) {
+                            Ok(snap) => {
+                                let mut eng = e.write();
+                                eng.apply_snapshot(&snap);
+                                eng.apply_all(b);
+                                serde_json::json!({
+                                    "success": true,
+                                    "result": { "name": name, "monitors": snap.monitors.len() },
+                                })
+                            }
+                            Err(e) => serde_json::json!({
+                                "success": false,
+                                "error": format!("load failed: {}", e),
+                            }),
+                        }
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine/backend not initialized",
+                    }),
+                }
+            }
+            IpcMessage::ListSnapshots => {
+                info!("IPC: ListSnapshots");
+                match crate::layout::snapshot::list_names() {
+                    Ok(names) => serde_json::json!({
+                        "success": true,
+                        "result": { "snapshots": names },
+                    }),
+                    Err(e) => serde_json::json!({
+                        "success": false,
+                        "error": format!("list failed: {}", e),
+                    }),
+                }
+            }
+            IpcMessage::DeleteSnapshot { name } => {
+                info!("IPC: DeleteSnapshot name={}", name);
+                match crate::layout::snapshot::delete(&name) {
+                    Ok(path) => serde_json::json!({
+                        "success": true,
+                        "result": { "name": name, "path": path.to_string_lossy() },
+                    }),
+                    Err(e) => serde_json::json!({
+                        "success": false,
+                        "error": format!("delete failed: {}", e),
+                    }),
+                }
+            }
+            IpcMessage::ToggleResizeMode => {
+                info!("IPC: ToggleResizeMode");
+                match &self.engine {
+                    Some(e) => {
+                        let active = e.write().toggle_resize_mode();
+                        serde_json::json!({
+                            "success": true,
+                            "result": { "active": active },
+                        })
+                    }
+                    None => serde_json::json!({
+                        "success": false,
+                        "error": "engine not initialized",
+                    }),
+                }
+            }
             IpcMessage::CaptureWindow { window_hwnd, path } => {
                 info!("IPC: CaptureWindow hwnd={} path={:?}", window_hwnd, path);
                 // Validate that the HWND is one of the tracked windows so we

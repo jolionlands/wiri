@@ -98,8 +98,31 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
             .collect::<Vec<_>>()
             .join(".");
 
-        // Binds section: each line is a binding (not key=value)
+        // Binds section: each line is a binding (not key=value), with the
+        // exception of `extend-defaults <bool>` which toggles whether the
+        // user's binds extend (merge with) or replace the built-in default
+        // hotkey table.  Recognised before the per-line bind parser so the
+        // "key combo + action" parser doesn't misinterpret the directive.
         if section.as_str() == "binds" {
+            let trimmed = line.trim();
+            let mut tokens = trimmed.split_whitespace();
+            if let Some(head) = tokens.next() {
+                let head_norm = head.to_lowercase();
+                if head_norm == "extend-defaults" || head_norm == "extend_defaults" {
+                    // Accept the niri spelling (bare bool) AND the KDL
+                    // `key=value` flavour. Default to true when no value
+                    // follows the directive (mirrors niri's behaviour).
+                    let raw_val = trimmed
+                        .splitn(2, |c: char| c.is_whitespace() || c == '=')
+                        .nth(1)
+                        .map(|s| s.trim_matches(|c: char| c.is_whitespace() || c == '=' || c == '"').to_lowercase())
+                        .unwrap_or_else(|| "true".to_string());
+                    let want_extend = matches!(raw_val.as_str(),
+                        "true" | "1" | "yes" | "on" | "");
+                    config.binds.extend_defaults = want_extend;
+                    continue;
+                }
+            }
             if let Some(binding) = parse_bind_line(line) {
                 config.binds.hotkeys.push(binding);
             }

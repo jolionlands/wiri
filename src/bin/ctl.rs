@@ -215,6 +215,25 @@ enum Commands {
         #[arg(short, long)]
         path: Option<String>,
     },
+
+    /// Save the current monitor/workspace/column/tile layout to a JSON
+    /// snapshot file under `%APPDATA%\wiri\snapshots\<name>.json`.
+    SaveSnapshot { name: String },
+
+    /// Restore a previously-saved snapshot.  Windows whose HWNDs no
+    /// longer exist are skipped silently.
+    LoadSnapshot { name: String },
+
+    /// List every saved snapshot under `%APPDATA%\wiri\snapshots\`.
+    ListSnapshots,
+
+    /// Delete a saved snapshot by name.
+    DeleteSnapshot { name: String },
+
+    /// Toggle niri-style interactive resize mode.  While engaged, the
+    /// `Mod+Arrow` chords resize the focused column / tile by 5% and
+    /// `Esc` (or running this command again) exits the mode.
+    ResizeMode,
 }
 
 fn main() -> Result<()> {
@@ -303,6 +322,11 @@ fn main() -> Result<()> {
             window_hwnd: hwnd,
             path,
         },
+        Commands::SaveSnapshot { name } => IpcMessage::SaveSnapshot { name },
+        Commands::LoadSnapshot { name } => IpcMessage::LoadSnapshot { name },
+        Commands::ListSnapshots => IpcMessage::ListSnapshots,
+        Commands::DeleteSnapshot { name } => IpcMessage::DeleteSnapshot { name },
+        Commands::ResizeMode => IpcMessage::ToggleResizeMode,
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;
@@ -463,6 +487,56 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("<unknown>");
             println!("Captured window {} → {}", window_hwnd, path);
+        }
+        IpcMessage::SaveSnapshot { name } => {
+            let path = resp
+                .get("result")
+                .and_then(|r| r.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            println!("Saved snapshot '{}' → {}", name, path);
+        }
+        IpcMessage::LoadSnapshot { name } => {
+            let monitors = resp
+                .get("result")
+                .and_then(|r| r.get("monitors"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            println!("Restored snapshot '{}' ({} monitor(s)).", name, monitors);
+        }
+        IpcMessage::ListSnapshots => {
+            let names = resp
+                .get("result")
+                .and_then(|r| r.get("snapshots"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if names.is_empty() {
+                println!("No saved snapshots.");
+            } else {
+                for n in &names {
+                    if let Some(s) = n.as_str() {
+                        println!("  {}", s);
+                    }
+                }
+                println!();
+                println!("  {} snapshot(s)", names.len());
+            }
+        }
+        IpcMessage::DeleteSnapshot { name } => {
+            println!("Deleted snapshot '{}'.", name);
+        }
+        IpcMessage::ToggleResizeMode => {
+            let active = resp
+                .get("result")
+                .and_then(|r| r.get("active"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if active {
+                println!("Resize mode: ON (Mod+Arrow grows/shrinks; Esc exits)");
+            } else {
+                println!("Resize mode: OFF");
+            }
         }
         _ => {
             // Generic: report success with a hint when present.

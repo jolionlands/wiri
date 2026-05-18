@@ -233,6 +233,12 @@ pub enum AddWindowTarget {
 pub struct TilingEngine {
     monitors: MonitorSet<OutputId, Monitor>,
     config: LayoutConfig,
+    /// Per-monitor layout overrides resolved from
+    /// `output.layout_override` blocks at config-load time.  When an
+    /// `OutputId` has an entry here, `effective_config(oid)` returns a
+    /// reference to the per-monitor `LayoutConfig`; otherwise it falls
+    /// through to the global `self.config`.
+    config_per_monitor: HashMap<OutputId, LayoutConfig>,
     tiled_windows: HashMap<WindowId, WindowInfo>,
     fullscreen_windows: HashSet<WindowId>,
     floating_windows: HashSet<WindowId>,
@@ -288,6 +294,11 @@ pub struct TilingEngine {
     /// until they receive a fresh paint message, so we record the desired
     /// state once and skip subsequent calls until the window is destroyed.
     shadow_applied: HashSet<WindowId>,
+    /// True while niri-style interactive resize mode is engaged
+    /// (`Action::EnterResizeMode`).  Arrow keys with no modifier are
+    /// intercepted by the WM_HOTKEY dispatcher to grow/shrink the focused
+    /// column / tile, and Escape exits the mode.  Defaults to `false`.
+    pub resize_mode: bool,
     /// Counter tracking how many Win32 calls were actually issued (for testing).
     #[cfg(test)]
     pub win32_call_count: u32,
@@ -298,6 +309,7 @@ impl TilingEngine {
         Self {
             monitors: MonitorSet::new(),
             config,
+            config_per_monitor: HashMap::new(),
             tiled_windows: HashMap::new(),
             fullscreen_windows: HashSet::new(),
             floating_windows: HashSet::new(),
@@ -318,9 +330,34 @@ impl TilingEngine {
             auto_tile_threshold: None,
             urgent_windows: HashSet::new(),
             shadow_applied: HashSet::new(),
+            resize_mode: false,
             #[cfg(test)]
             win32_call_count: 0,
         }
+    }
+
+    /// Toggle interactive resize mode.  Returns the new state.
+    pub fn toggle_resize_mode(&mut self) -> bool {
+        self.resize_mode = !self.resize_mode;
+        if self.resize_mode {
+            info!("Resize mode ON — arrow keys grow/shrink the focused tile (Esc to exit)");
+        } else {
+            info!("Resize mode OFF");
+        }
+        self.resize_mode
+    }
+
+    /// Force exit of resize mode (used by Escape handler and shutdown).
+    pub fn exit_resize_mode(&mut self) {
+        if self.resize_mode {
+            self.resize_mode = false;
+            info!("Resize mode OFF");
+        }
+    }
+
+    /// Whether interactive resize mode is currently engaged.
+    pub fn is_resize_mode(&self) -> bool {
+        self.resize_mode
     }
 
     /// Install a `LayoutRequest` channel sender. Once set, the engine can dispatch
@@ -762,14 +799,23 @@ impl TilingEngine {
             None => return,
         };
 
+        // Per-monitor layout config (falls through to `self.config` when no
+        // `output { layout { … } }` override is present for this monitor).
+        // Cloned so the rest of this function can hold it across the
+        // interleaved `&mut self.applied_state` updates that drive selective
+        // Win32 calls without fighting the borrow checker.  `LayoutConfig`
+        // is a small struct (~20 fields, no large allocations) so the clone
+        // cost is negligible vs the Win32 calls it gates.
+        let eff_cfg: LayoutConfig = self.effective_config(output_id).clone();
+
         let work_rect = Rect::new(
-            monitor.work_area.loc.x + self.config.outer_gaps.3,
-            monitor.work_area.loc.y + self.config.outer_gaps.0,
+            monitor.work_area.loc.x + eff_cfg.outer_gaps.3,
+            monitor.work_area.loc.y + eff_cfg.outer_gaps.0,
             monitor.work_area.size.w.saturating_sub(
-                (self.config.outer_gaps.1 + self.config.outer_gaps.3) as u32,
+                (eff_cfg.outer_gaps.1 + eff_cfg.outer_gaps.3) as u32,
             ),
             monitor.work_area.size.h.saturating_sub(
-                (self.config.outer_gaps.0 + self.config.outer_gaps.2) as u32,
+                (eff_cfg.outer_gaps.0 + eff_cfg.outer_gaps.2) as u32,
             ),
         );
 
@@ -863,28 +909,58 @@ impl TilingEngine {
                     work_rect,
                     section_y,
                     nominal_section_height,
+                    &eff_cfg,
                 );
                 out.append(&mut ws_positions);
                 section_y += scaled_section_h + scaled_gap;
             }
             out
         } else {
-            self.calculate_positions(workspace, work_rect)
+            self.calculate_positions(workspace, work_rect, &eff_cfg)
         };
+
+        // Workspace-slide animation bias (niri parity).  While a workspace
+        // switch is in flight the engine reads `workspace_slide_offset(oid)`
+        // and adds it as a Y-axis bias to every tile on the active workspace
+        // so the new workspace appears to slide in from above/below.  No-op
+        // in overview mode (overview already lays out workspaces vertically)
+        // and when no slide is active (returns 0.0).
+        let slide_offset_y = if !overview_active {
+            self.animation.workspace_slide_offset(output_id) as i32
+        } else {
+            0
+        };
+        let positions: Vec<(WindowId, Rect)> = if slide_offset_y != 0 {
+            positions
+                .into_iter()
+                .map(|(wid, r)| {
+                    let shifted = Rect::new(
+                        r.loc.x,
+                        r.loc.y + slide_offset_y,
+                        r.size.w,
+                        r.size.h,
+                    );
+                    (wid, shifted)
+                })
+                .collect()
+        } else {
+            positions
+        };
+
         // Snapshot positions for later write-back to Tile.cached_bounds so that
         // LayoutElement::bounds() returns the most recently computed rect.
         let position_map: HashMap<WindowId, Rect> = positions.iter().copied().collect();
         let focused = self.monitors.values().find_map(|m| m.focus_window);
         // ^ iterates in insertion order via MonitorSet::values()
-        let border_w = self.config.border_width.max(1);
+        let border_w = eff_cfg.border_width.max(1);
 
         // Pre-compute target colors (as packed u32) for this pass.
-        let border_color_focused_u32 = parse_color_to_u32(&self.config.border_color_focused);
-        let border_color_normal_u32  = parse_color_to_u32(&self.config.border_color);
+        let border_color_focused_u32 = parse_color_to_u32(&eff_cfg.border_color_focused);
+        let border_color_normal_u32  = parse_color_to_u32(&eff_cfg.border_color);
 
         // Pre-compute target opacity values as u8 for comparison.
         let opacity_full: u32 = 255;
-        let opacity_dim: u32 = (self.config.dim_unfocused * 255.0).round().clamp(0.0, 255.0) as u32;
+        let opacity_dim: u32 = (eff_cfg.dim_unfocused * 255.0).round().clamp(0.0, 255.0) as u32;
 
         // Track which windows had set_window_position called so we can mark_sent() afterwards.
         let mut applied_windows: HashSet<WindowId> = HashSet::new();
@@ -913,7 +989,7 @@ impl TilingEngine {
 
             // Target values for this tile.
             let new_border_color = if is_focused { border_color_focused_u32 } else { border_color_normal_u32 };
-            let new_opacity: u32 = if self.config.dim_unfocused < 1.0 {
+            let new_opacity: u32 = if eff_cfg.dim_unfocused < 1.0 {
                 if is_focused { opacity_full } else { opacity_dim }
             } else {
                 // dim_unfocused == 1.0 means "no dimming"; use sentinel so we
@@ -922,7 +998,7 @@ impl TilingEngine {
             };
 
             // Focused windows get a wider border for visual emphasis.
-            let inset = if is_focused { border_w + self.config.focus_ring_width } else { border_w };
+            let inset = if is_focused { border_w + eff_cfg.focus_ring_width } else { border_w };
             let inset_rect = Rect::new(
                 rect.loc.x + inset,
                 rect.loc.y + inset,
@@ -962,9 +1038,9 @@ impl TilingEngine {
             // 2. Border color
             if prior.border_color != new_border_color {
                 let color_str = if is_focused {
-                    &self.config.border_color_focused
+                    &eff_cfg.border_color_focused
                 } else {
-                    &self.config.border_color
+                    &eff_cfg.border_color
                 };
                 self.set_dwm_border_color(window_id.as_isize(), color_str);
                 #[cfg(test)] { self.win32_call_count += 1; }
@@ -1084,14 +1160,15 @@ impl TilingEngine {
     /// Supports per-column variable widths and overview zoom.
     ///
     /// Backwards-compatible single-workspace path — equivalent to
-    /// `calculate_positions_in_section(workspace, work_rect, 0, work_rect.size.h as i32)`.
+    /// `calculate_positions_in_section(workspace, work_rect, 0, work_rect.size.h as i32, cfg)`.
     fn calculate_positions(
         &self,
         workspace: &crate::layout::workspace::Workspace,
         work_rect: Rect,
+        cfg: &LayoutConfig,
     ) -> Vec<(WindowId, Rect)> {
         let section_height = work_rect.size.h as i32;
-        self.calculate_positions_in_section(workspace, work_rect, 0, section_height)
+        self.calculate_positions_in_section(workspace, work_rect, 0, section_height, cfg)
     }
 
     /// Multi-workspace overview-aware position calculator.
@@ -1102,17 +1179,20 @@ impl TilingEngine {
     /// passes `section_y_offset = 0` and `section_height = work_rect.size.h`,
     /// which reproduces the original behaviour.  In overview mode the engine
     /// stacks sections vertically; each call computes positions for one
-    /// workspace's slice.
+    /// workspace's slice.  `cfg` is the per-monitor effective `LayoutConfig`
+    /// (see `effective_config`) so per-output overrides for gaps / widths /
+    /// modes are honoured.
     fn calculate_positions_in_section(
         &self,
         workspace: &crate::layout::workspace::Workspace,
         work_rect: Rect,
         section_y_offset: i32,
         section_height: i32,
+        cfg: &LayoutConfig,
     ) -> Vec<(WindowId, Rect)> {
         let mut positions = Vec::new();
-        let column_gap = self.config.column_gap;
-        let window_gap = self.config.window_gap;
+        let column_gap = cfg.column_gap;
+        let window_gap = cfg.window_gap;
         let num_columns = workspace.columns.len();
         if num_columns == 0 { return positions; }
 
@@ -1121,14 +1201,14 @@ impl TilingEngine {
         let proportional_width = {
             let total_gaps = column_gap * (num_columns as i32 - 1).max(0);
             let available = work_rect.size.w as i32 - total_gaps;
-            (available / num_columns as i32).max(self.config.column_width as i32 / 2)
+            (available / num_columns as i32).max(cfg.column_width as i32 / 2)
         };
 
         let col_widths: Vec<i32> = workspace.columns.iter().map(|col| {
-            match self.config.column_width_mode {
+            match cfg.column_width_mode {
                 ColumnWidthMode::Proportional => proportional_width,
                 ColumnWidthMode::Fixed => {
-                    col.width.map(|w| w as i32).unwrap_or(self.config.column_width as i32)
+                    col.width.map(|w| w as i32).unwrap_or(cfg.column_width as i32)
                 }
             }
         }).collect();
@@ -1414,6 +1494,26 @@ impl TilingEngine {
             None => return,
         };
 
+        // Resolve the slide animation direction BEFORE swapping workspaces.
+        // niri convention: going to a higher-numbered (later) workspace, the
+        // new content slides in from BELOW (start at +work_area_height,
+        // end at 0); going to a lower-numbered workspace, it slides in from
+        // ABOVE (start at -work_area_height).  When animations are disabled
+        // or this is the same workspace we skip the call (no-op).
+        let (prev_ws_id, work_area_h) = self
+            .monitors
+            .get(&focused_output)
+            .map(|m| (m.active_workspace, m.work_area.size.h as i32))
+            .unwrap_or((workspace_id, 0));
+        let want_slide = self.animation.is_enabled()
+            && self
+                .full_config
+                .as_ref()
+                .map(|c| c.animations.workspace_transition)
+                .unwrap_or(true)
+            && prev_ws_id != workspace_id
+            && work_area_h > 0;
+
         // Get current workspace windows to hide
         let current_windows: Vec<WindowId> = self.monitors.get(&focused_output)
             .map(|m| m.workspace()
@@ -1441,6 +1541,21 @@ impl TilingEngine {
                     }
                 }
             }
+        }
+
+        // Kick off the workspace-slide animation now that the engine has
+        // settled on the incoming workspace.  Layout passes consult
+        // `workspace_slide_offset(oid)` and bias every tile's Y position by
+        // the returned value, producing the slide in/out effect.
+        if want_slide {
+            let from_offset = if workspace_id > prev_ws_id {
+                work_area_h as f64
+            } else {
+                -(work_area_h as f64)
+            };
+            // duration_ms = 0 → use the AnimationManager's default duration.
+            self.animation
+                .start_workspace_slide(focused_output, from_offset, 0.0, 0);
         }
 
         self.apply_layout_for_monitor(focused_output, backend);
@@ -2317,10 +2432,107 @@ impl TilingEngine {
         self.window_rules = rules;
     }
 
-    /// Set the full configuration (for keybind access and future use)
+    /// Set the full configuration (for keybind access and future use).
+    ///
+    /// Also rebuilds the per-monitor `LayoutConfig` cache from every
+    /// `output { layout { … } }` block by folding the partial fields onto
+    /// `config.layout` and converting the result through
+    /// `LayoutConfig::from_config`.  Subsequent layout passes consult
+    /// `effective_config(oid)` to pick the right config per monitor.
     pub fn set_full_config(&mut self, config: crate::config::Config) {
         self.window_rules = config.window_rules.clone();
+
+        // Rebuild per-monitor overrides from `config.output[*].layout_override`.
+        self.config_per_monitor.clear();
+        for out in &config.output {
+            let Some(partial) = out.layout_override.as_ref() else { continue };
+            if out.name.is_empty() {
+                continue;
+            }
+            // Fold the partial onto a clone of the global layout, then
+            // produce the engine's runtime `LayoutConfig` from the merged
+            // view so colour parsing / column-width-mode mapping match the
+            // default code path verbatim.
+            let merged_config_layout = partial.apply_to(&config.layout);
+            let mut shim = config.clone();
+            shim.layout = merged_config_layout;
+            let engine_cfg = LayoutConfig::from_config(&shim);
+            let oid = OutputId::from_name(&out.name);
+            self.config_per_monitor.insert(oid, engine_cfg);
+        }
+
         self.full_config = Some(config);
+    }
+
+    /// Take a snapshot of the current monitor / workspace / column / tile
+    /// structure suitable for serialisation to disk via
+    /// [`crate::layout::snapshot::save_to`].
+    pub fn snapshot(&self) -> crate::layout::snapshot::Snapshot {
+        crate::layout::snapshot::Snapshot::from_monitors(&self.monitors)
+    }
+
+    /// Reapply a previously-loaded snapshot.  Tiles whose HWNDs are not
+    /// present in `tiled_windows` are dropped silently so old snapshots
+    /// continue to load cleanly.  Workspaces / columns are rebuilt from the
+    /// snapshot; monitors that no longer exist on this machine are skipped.
+    ///
+    /// After load, callers should run `apply_all(backend)` to repaint the
+    /// restored layout.
+    pub fn apply_snapshot(&mut self, snap: &crate::layout::snapshot::Snapshot) {
+        let surviving: std::collections::HashSet<isize> = self
+            .tiled_windows
+            .keys()
+            .map(|w| w.as_isize())
+            .collect();
+        for snap_mon in &snap.monitors {
+            // Match by OutputId u64 — survives device-name → from_name re-hash.
+            let mut found: Option<OutputId> = None;
+            for oid in self.monitors.keys() {
+                if oid.as_u64() == snap_mon.output_id {
+                    found = Some(*oid);
+                    break;
+                }
+            }
+            let Some(oid) = found else { continue };
+            let rebuilt =
+                crate::layout::snapshot::rebuild_workspaces(snap_mon, &surviving);
+            if let Some(monitor) = self.monitors.get_mut(&oid) {
+                monitor.workspaces = rebuilt;
+                monitor.active_workspace = snap_mon.active_workspace;
+                // Workspace 0 is guaranteed to exist by rebuild_workspaces.
+                // Reset focus to the first tile of the active workspace's
+                // first column when possible — the user's previous focus
+                // was a transient state we did not persist.
+                let new_focus: Option<(usize, WindowId)> = monitor
+                    .workspace()
+                    .and_then(|ws| ws.columns.first())
+                    .and_then(|col| col.tiles.first())
+                    .map(|tile| (0usize, tile.window_id));
+                match new_focus {
+                    Some((c, w)) => {
+                        monitor.focus_column = Some(c);
+                        monitor.focus_window = Some(w);
+                    }
+                    None => {
+                        monitor.focus_column = None;
+                        monitor.focus_window = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the layout configuration that applies to `output_id`.  If a
+    /// per-monitor override exists (set via `output { layout { … } }`) the
+    /// reference points into `config_per_monitor`; otherwise the global
+    /// `self.config` is returned.  Engine state-mutating methods that take an
+    /// `OutputId` should prefer this accessor over reading `self.config`
+    /// directly so per-monitor layout settings (column-width, gaps, etc.)
+    /// are honoured on multi-monitor setups.
+    pub fn effective_config(&self, output_id: OutputId) -> &LayoutConfig {
+        self.config_per_monitor
+            .get(&output_id)
+            .unwrap_or(&self.config)
     }
 
     /// Activate a window (bring to foreground).
@@ -3625,7 +3837,7 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
-        let positions = engine.calculate_positions(workspace, work_rect);
+        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         assert_eq!(positions.len(), 1);
         let (_, rect) = &positions[0];
         assert_eq!(rect.loc.x, 4);
@@ -3644,7 +3856,7 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
-        let positions = engine.calculate_positions(workspace, work_rect);
+        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         // In Fixed mode: 4 columns at 500px each. Some may extend beyond the viewport
         // (niri scrolls — that is fine). All 4 should be returned because left edges are
         // within the viewport (culling only removes columns whose left edge is past the
@@ -3679,7 +3891,7 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
-        let positions = engine.calculate_positions(workspace, work_rect);
+        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         assert_eq!(positions.len(), 2);
         assert_eq!(positions[0].1.loc.x, positions[1].1.loc.x);
         assert!(positions[1].1.loc.y > positions[0].1.loc.y);
@@ -3699,7 +3911,7 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
-        let positions = engine.calculate_positions(workspace, work_rect);
+        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         assert_eq!(positions.len(), 10);
         for (_, rect) in &positions {
             assert!(rect.loc.x >= work_rect.loc.x,
@@ -4400,7 +4612,7 @@ mod tests {
     fn test_calculate_positions_empty_workspace() {
         let engine = make_engine();
         let ws = crate::layout::Workspace::new();
-        let positions = engine.calculate_positions(&ws, Rect::new(0, 0, 1920, 1080));
+        let positions = engine.calculate_positions(&ws, Rect::new(0, 0, 1920, 1080), &engine.config);
         assert!(positions.is_empty());
     }
 
@@ -4526,7 +4738,7 @@ mod tests {
         for ws_id in ws_ids {
             if let Some(ws) = monitor.workspaces.get(&ws_id) {
                 if ws.columns.is_empty() { continue; }
-                let mut p = engine.calculate_positions_in_section(ws, work_rect, y, nominal);
+                let mut p = engine.calculate_positions_in_section(ws, work_rect, y, nominal, &engine.config);
                 total.append(&mut p);
                 y += scaled_section + gap;
             }
@@ -4743,7 +4955,7 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
-        let positions = engine.calculate_positions(workspace, work_rect);
+        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         assert_eq!(positions.len(), 10, "all 10 windows must be positioned in overview");
         let work_right = work_rect.loc.x + work_rect.size.w as i32;
         for (_, rect) in &positions {
@@ -4782,7 +4994,7 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
-        let positions = engine.calculate_positions(workspace, work_rect);
+        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         assert_eq!(positions.len(), 2, "stacked should show both tiles");
 
         // Switch to tabbed and check only 1 tile is positioned.
@@ -4795,7 +5007,7 @@ mod tests {
         }
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
-        let positions = engine.calculate_positions(workspace, work_rect);
+        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         assert_eq!(positions.len(), 1, "tabbed should show only the active tab");
         // The active tab (index 0) is w1 (WindowId 200).
         assert_eq!(positions[0].0, WindowId::new(200));
@@ -5817,5 +6029,360 @@ mod tests {
         engine.move_column_to_monitor(ScrollDirection::Right, &BackendHandle::default_for_test());
         let ws = engine.monitors().get(&oid).unwrap().workspace().unwrap();
         assert_eq!(ws.columns.len(), 1, "no neighbor → column stays put");
+    }
+
+    // -------------------------------------------------------------------------
+    // Workspace-slide animation engine wiring (Step 1)
+    // -------------------------------------------------------------------------
+
+    /// Build a config with animations enabled (workspace_transition default true)
+    /// and apply it so `switch_workspace` triggers a slide.
+    fn enable_workspace_slide_animations(engine: &mut TilingEngine) {
+        let mut cfg = crate::config::Config::default();
+        cfg.animations.enabled = true;
+        cfg.animations.duration = 200;
+        cfg.animations.workspace_transition = true;
+        engine.set_full_config(cfg);
+        engine.update_animation_settings(true, 200, crate::layout::Easing::Linear);
+    }
+
+    /// switch_workspace starts a slide animation whose initial offset equals
+    /// the work-area height when moving to a higher-numbered workspace.
+    #[test]
+    fn test_switch_workspace_starts_slide_with_positive_offset() {
+        let mut engine = make_engine_fixed_1920();
+        enable_workspace_slide_animations(&mut engine);
+        let oid = engine.focused_output().unwrap();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.switch_workspace(2, &BackendHandle::default_for_test());
+        let offset = engine.animation().workspace_slide_offset(oid);
+        assert!(
+            offset > 1.0,
+            "downward slide should start with a positive offset, got {}",
+            offset
+        );
+        assert!(
+            offset <= 1080.0 + 0.001,
+            "offset should not exceed work-area height, got {}",
+            offset
+        );
+    }
+
+    /// With animations disabled the slide is skipped and offset is 0 at rest.
+    #[test]
+    fn test_switch_workspace_disabled_snaps_no_slide() {
+        let mut engine = make_engine_fixed_1920();
+        let oid = engine.focused_output().unwrap();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.switch_workspace(3, &BackendHandle::default_for_test());
+        assert_eq!(
+            engine.animation().workspace_slide_offset(oid),
+            0.0,
+            "disabled animations: slide offset stays 0 (snap)"
+        );
+        assert!(
+            !engine.has_active_animations(),
+            "no animation should be queued when disabled"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-monitor layout overrides (Step 2)
+    // -------------------------------------------------------------------------
+
+    /// No override on an output → effective_config falls through to the global.
+    #[test]
+    fn test_effective_config_no_override_falls_through() {
+        let engine = make_engine_fixed_1920();
+        let oid = engine.focused_output().unwrap();
+        let eff = engine.effective_config(oid);
+        // No layout_override set → same column_width as the global.
+        assert_eq!(eff.column_width, engine.config.column_width);
+        // Also check identity-by-pointer when no override is present.
+        let p_eff = eff as *const LayoutConfig;
+        let p_default = &engine.config as *const LayoutConfig;
+        assert_eq!(p_eff, p_default, "fall-through must return the same &LayoutConfig");
+    }
+
+    /// A single-field override (column_width) is applied on top of the global.
+    #[test]
+    fn test_effective_config_single_field_override() {
+        let mut engine = make_engine_fixed_1920();
+        let oid_name = "M-OVR-1";
+        let oid = OutputId::from_name(oid_name);
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+
+        let mut cfg = crate::config::Config::default();
+        cfg.output.push(crate::config::OutputConfig {
+            name: oid_name.to_string(),
+            position: crate::config::types::Position::default(),
+            width: 0,
+            height: 0,
+            scale: 1.0,
+            mode: String::new(),
+            vrr: false,
+            primary: false,
+            transform: "normal".to_string(),
+            enable: true,
+            layout_override: Some(crate::config::types::LayoutConfigPartial {
+                column_width: Some(800),
+                ..Default::default()
+            }),
+        });
+        engine.set_full_config(cfg);
+
+        let eff = engine.effective_config(oid);
+        assert_eq!(eff.column_width, 800, "override field wins");
+        // Other fields fall through to the (built-from-config) base.
+        assert!(eff.border_width >= 1, "fall-through populates default border width");
+    }
+
+    /// Multi-field override populates each Some(_) field correctly.
+    #[test]
+    fn test_effective_config_multi_field_override() {
+        let mut engine = make_engine_fixed_1920();
+        let oid_name = "M-OVR-2";
+        let oid = OutputId::from_name(oid_name);
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+
+        let mut cfg = crate::config::Config::default();
+        cfg.output.push(crate::config::OutputConfig {
+            name: oid_name.to_string(),
+            position: crate::config::types::Position::default(),
+            width: 0,
+            height: 0,
+            scale: 1.0,
+            mode: String::new(),
+            vrr: false,
+            primary: false,
+            transform: "normal".to_string(),
+            enable: true,
+            layout_override: Some(crate::config::types::LayoutConfigPartial {
+                column_width: Some(600),
+                border_width: Some(12),
+                column_width_mode: Some("fixed".to_string()),
+                ..Default::default()
+            }),
+        });
+        engine.set_full_config(cfg);
+
+        let eff = engine.effective_config(oid);
+        assert_eq!(eff.column_width, 600);
+        assert_eq!(eff.border_width, 12);
+        assert_eq!(eff.column_width_mode, ColumnWidthMode::Fixed);
+    }
+
+    /// Reloading config with a different override replaces the previous one
+    /// in the per-monitor map.
+    #[test]
+    fn test_effective_config_reload_swaps_override() {
+        let mut engine = make_engine_fixed_1920();
+        let oid_name = "M-OVR-3";
+        let oid = OutputId::from_name(oid_name);
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+
+        let mk_cfg = |w: u32| {
+            let mut c = crate::config::Config::default();
+            c.output.push(crate::config::OutputConfig {
+                name: oid_name.to_string(),
+                position: crate::config::types::Position::default(),
+                width: 0, height: 0, scale: 1.0,
+                mode: String::new(), vrr: false, primary: false,
+                transform: "normal".to_string(), enable: true,
+                layout_override: Some(crate::config::types::LayoutConfigPartial {
+                    column_width: Some(w),
+                    ..Default::default()
+                }),
+            });
+            c
+        };
+
+        engine.set_full_config(mk_cfg(700));
+        assert_eq!(engine.effective_config(oid).column_width, 700);
+        engine.set_full_config(mk_cfg(1100));
+        assert_eq!(engine.effective_config(oid).column_width, 1100);
+        // Reload with no override at all → fall-through.
+        let mut bare = crate::config::Config::default();
+        bare.output.clear();
+        engine.set_full_config(bare);
+        let p_eff = engine.effective_config(oid) as *const LayoutConfig;
+        let p_default = &engine.config as *const LayoutConfig;
+        assert_eq!(p_eff, p_default, "reload without override falls back to global");
+    }
+
+    // -------------------------------------------------------------------------
+    // Snapshot / restore engine wiring (Step 6 — additional coverage)
+    // -------------------------------------------------------------------------
+
+    /// Engine.snapshot() captures the current monitor stack and
+    /// apply_snapshot rebuilds it.  Surviving HWNDs come back; missing
+    /// ones are dropped silently.
+    #[test]
+    fn test_engine_apply_snapshot_restores_layout_minus_missing_hwnds() {
+        let mut engine = make_engine_fixed_1920();
+        let oid = engine.focused_output().unwrap();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        engine.add_window(make_window(101, 0, 0), &BackendHandle::default_for_test());
+        // Two-tile column on column 0.
+        if let Some(m) = engine.monitors_mut().get_mut(&oid) {
+            if let Some(ws) = m.workspace_mut() {
+                ws.add_window_to_column(0, WindowId::new(102));
+            }
+        }
+        engine.tiled_windows.insert(WindowId::new(102), make_window(102, 0, 0));
+        let snap = engine.snapshot();
+        // Remove HWND 101 (simulate window closed).
+        engine.tiled_windows.remove(&WindowId::new(101));
+        if let Some(m) = engine.monitors_mut().get_mut(&oid) {
+            if let Some(ws) = m.workspace_mut() {
+                ws.remove_window(WindowId::new(101));
+            }
+        }
+        // Apply the snapshot — 101 is missing from tiled_windows so it
+        // must be skipped, but 100 + 102 should come back.
+        engine.apply_snapshot(&snap);
+        let ws = engine.monitors().get(&oid).unwrap().workspace().unwrap();
+        let restored: Vec<isize> = ws.columns.iter()
+            .flat_map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()))
+            .collect();
+        assert!(restored.contains(&100), "HWND 100 must be restored");
+        assert!(restored.contains(&102), "HWND 102 must be restored");
+        assert!(!restored.contains(&101), "missing HWND 101 must NOT be restored");
+    }
+
+    // -------------------------------------------------------------------------
+    // Interactive resize mode (Step 7)
+    // -------------------------------------------------------------------------
+
+    /// toggle_resize_mode flips the state and exit_resize_mode is idempotent.
+    #[test]
+    fn test_resize_mode_toggle_and_exit() {
+        let mut engine = make_engine_fixed_1920();
+        assert!(!engine.is_resize_mode());
+        assert!(engine.toggle_resize_mode());
+        assert!(engine.is_resize_mode());
+        assert!(!engine.toggle_resize_mode());
+        assert!(!engine.is_resize_mode());
+        // exit_resize_mode while off is a no-op (no panic).
+        engine.exit_resize_mode();
+        assert!(!engine.is_resize_mode());
+        // Re-enter then exit explicitly.
+        engine.toggle_resize_mode();
+        assert!(engine.is_resize_mode());
+        engine.exit_resize_mode();
+        assert!(!engine.is_resize_mode());
+    }
+
+    /// While resize_mode is on, the engine's resize methods actually
+    /// change column widths (i.e. the wiring from action to engine method
+    /// stays sane).  The dispatcher in message_loop routes Mod+Arrow to
+    /// the same resize calls when resize_mode is set.
+    #[test]
+    fn test_resize_mode_arrow_resizes_column() {
+        let mut engine = make_engine_fixed_1920();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 100);
+        let oid = engine.focused_output().unwrap();
+        let original_w = engine.monitors().get(&oid).unwrap()
+            .workspace().unwrap().columns[0].width
+            .unwrap_or(engine.config.column_width);
+        engine.toggle_resize_mode();
+        engine.resize_focused_column_by_percent(5, &BackendHandle::default_for_test());
+        let grown = engine.monitors().get(&oid).unwrap()
+            .workspace().unwrap().columns[0].width.unwrap();
+        assert!(
+            grown > original_w,
+            "+5% resize should grow the column (was {} → {})",
+            original_w, grown
+        );
+        engine.resize_focused_column_by_percent(-5, &BackendHandle::default_for_test());
+        let shrunk = engine.monitors().get(&oid).unwrap()
+            .workspace().unwrap().columns[0].width.unwrap();
+        assert!(shrunk < grown);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tabbed column engine-level dispatch (Step 5)
+    // -------------------------------------------------------------------------
+
+    /// toggle_tabbed_for_focused_column flips the column's display mode
+    /// between Stacked and Tabbed and the change persists across calls.
+    #[test]
+    fn test_toggle_tabbed_for_focused_column_persists() {
+        use crate::layout::workspace::ColumnDisplay;
+        let mut engine = make_engine_fixed_1920();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        let oid = engine.focused_output().unwrap();
+        if let Some(m) = engine.monitors_mut().get_mut(&oid) {
+            if let Some(ws) = m.workspace_mut() {
+                ws.add_window_to_column(0, WindowId::new(101));
+                ws.add_window_to_column(0, WindowId::new(102));
+            }
+        }
+        engine.tiled_windows.insert(WindowId::new(101), make_window(101, 0, 0));
+        engine.tiled_windows.insert(WindowId::new(102), make_window(102, 0, 0));
+        focus_window(&mut engine, 100);
+
+        // Start in Stacked.
+        let disp = &engine.monitors().get(&oid).unwrap()
+            .workspace().unwrap().columns[0].display;
+        assert!(matches!(disp, ColumnDisplay::Stacked));
+
+        // First toggle → Tabbed.
+        engine.toggle_tabbed_for_focused_column(&BackendHandle::default_for_test());
+        let disp = engine.monitors().get(&oid).unwrap()
+            .workspace().unwrap().columns[0].display.clone();
+        assert!(matches!(disp, ColumnDisplay::Tabbed { .. }));
+
+        // Second toggle → back to Stacked.
+        engine.toggle_tabbed_for_focused_column(&BackendHandle::default_for_test());
+        let disp = &engine.monitors().get(&oid).unwrap()
+            .workspace().unwrap().columns[0].display;
+        assert!(matches!(disp, ColumnDisplay::Stacked));
+    }
+
+    /// During an active slide, calculate-position output for the active
+    /// workspace is shifted on the Y axis by the slide offset.
+    #[test]
+    fn test_workspace_slide_offset_biases_layout_y() {
+        let mut engine = make_engine_fixed_1920();
+        enable_workspace_slide_animations(&mut engine);
+        let oid = engine.focused_output().unwrap();
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
+        focus_window(&mut engine, 100);
+        engine.apply_layout_for_monitor(oid, &BackendHandle::default_for_test());
+        let rest_y = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles[0]
+            .cached_bounds
+            .loc
+            .y;
+        // Switch to workspace 2 (downward) which arms the slide animation.
+        engine.switch_workspace(2, &BackendHandle::default_for_test());
+        engine.add_window(make_window(200, 0, 0), &BackendHandle::default_for_test());
+        engine.apply_layout_for_monitor(oid, &BackendHandle::default_for_test());
+        let mid_slide_offset = engine.animation().workspace_slide_offset(oid);
+        let mid_y = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles[0]
+            .cached_bounds
+            .loc
+            .y;
+        let expected = rest_y + mid_slide_offset as i32;
+        assert!(
+            (mid_y - expected).abs() <= 1,
+            "mid-slide Y={} should approx rest_y={} + offset={} (expected {})",
+            mid_y, rest_y, mid_slide_offset as i32, expected,
+        );
     }
 }

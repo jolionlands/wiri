@@ -1,0 +1,33 @@
+// Minimal wiri config — sane defaults for someone trying wiri for the first
+// time. Drop into %APPDATA%\wiri\config.kdl and restart wiri.
+
+version "1.0"
+
+// Modifier prefix for all default bindings. Ctrl+Alt is the niri-inspired
+// default and avoids the Win key reservations.
+input {
+    mod-key "Ctrl+Alt"
+    focus-follows-mouse false
+}
+
+layout {
+    column-width 700
+    column-width-mode "proportional"
+    inner-gaps 12
+    outer-gaps 8
+
+    border-width 3
+    border-color "#3c3836"
+    border-color-focused "#83a598"
+
+    snap-on-drag true
+    snap-threshold-px 20
+}
+
+animations {
+    enabled true
+    duration 180
+    easing "ease-out-cubic"
+    workspace-transition true
+    focus-transition true
+}

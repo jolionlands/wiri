@@ -5,6 +5,46 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — opus pass I (2026-05-18)
+- **Workspace-slide animation engine wiring** — `switch_workspace` now calls
+  `AnimationManager::start_workspace_slide(...)` with `+work_area_height` (or
+  `-work_area_height` when stepping to a lower workspace) and
+  `apply_layout_for_monitor` adds the per-monitor `workspace_slide_offset(oid)`
+  to every tile's Y position.  Honours `animations.enabled` and
+  `animations.workspace_transition` — disabled = snap, no slide.
+- **Per-output `layout {}` engine wiring** — new `TilingEngine.config_per_monitor:
+  HashMap<OutputId, LayoutConfig>` populated from every
+  `output { layout { … } }` block at `set_full_config` time, plus
+  `effective_config(output_id) -> &LayoutConfig` accessor that falls through to
+  the global default.  `apply_layout_for_monitor` + `calculate_positions_in_section`
+  read through the accessor so per-monitor column-width / border / gap / mode
+  overrides take effect on multi-monitor setups.
+- **`Action::SpawnCmd(String)`** — new dispatcher arm for `spawn-cmd "<command>"`
+  binds.  Routes through `cmd.exe /C "<command>"` so cmd-builtins, env-var
+  expansion, and PowerShell one-liners work as the user typed them.
+  `HotkeyBinding::parse_action` now returns `SpawnCmd` for the `spawn-cmd` /
+  `spawn-sh` aliases.
+- **`binds { extend-defaults true | false }` directive (niri parity)** — default
+  `true`.  When extending, config binds merge with the shipped defaults; config
+  wins on `(mods, vk)` collision, non-colliding config binds are appended.
+  Startup logs `Hotkeys: N from defaults, M from config (X overridden)`.
+  Fixes the long-standing "new shipped actions disappear after editing config".
+- **Engine-level snapshot/restore + `wiri-ctl save-snapshot/load-snapshot/list-snapshots/delete-snapshot`** —
+  new `src/layout/snapshot.rs` module serialises monitor → workspace → column →
+  tile structure to JSON at `%APPDATA%\wiri\snapshots\<name>.json` (override
+  with `WIRI_SNAPSHOT_DIR`).  On restore, HWNDs that no longer exist are
+  skipped silently so yesterday's snapshot still loads today.  Snapshot name
+  is sanitised to ASCII alphanumerics + `-_.` so `..\\..\\evil` cannot escape
+  the dir.  New IPC messages: `SaveSnapshot`, `LoadSnapshot`, `ListSnapshots`,
+  `DeleteSnapshot`.
+- **Interactive resize mode (niri-`Mod+R` parity)** — `Action::EnterResizeMode`
+  toggles `TilingEngine.resize_mode`; while engaged the WM_HOTKEY dispatcher
+  re-routes the `Mod+Arrow` chords to grow/shrink the focused column / tile by
+  5% and `Esc` exits (Esc is registered globally + state-gated on
+  `is_overview() || is_resize_mode()`).  Default chord moves: `Mod+R` becomes
+  EnterResizeMode, CenterColumn moves to `Mod+Shift+R`.  New
+  `wiri-ctl resize-mode` IPC + ctl subcommand backed by `IpcMessage::ToggleResizeMode`.
+
 ### Added
 - **Niri-style multi-workspace overview** — `enter_overview` now collects ALL
   non-empty workspaces of the focused monitor, stacks them vertically with a

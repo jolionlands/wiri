@@ -134,11 +134,24 @@ summary:
 └────────────────────────────────────────────────────────────┘
 ```
 
+## Examples
+
+See `examples/`:
+
+- `minimal.kdl` — sane defaults, three blocks, drop in and go
+- `cheatsheet.kdl` — every action bound to a memorable chord
+
+## Contributing
+
+PRs and issues welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Bug and
+feature templates live in `.github/ISSUE_TEMPLATE/`.
+
 ## Limitations
 
 - Fullscreen-exclusive games cannot be tiled (no compositor can).
 - Some UWP apps expose limited HWND control.
 - A handful of anti-cheat shims dislike `WH_MOUSE_LL` — disable the mouse hook in those games.
+- Windows reserves a handful of chords (`Ctrl+Alt+Tab`, `Ctrl+Alt+Arrows` on Intel/AMD laptops, `Win+L`, `Win+Shift+S`). See `docs/TROUBLESHOOTING.md` for the full table.
 
 ## Credits
 

@@ -94,7 +94,8 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (shift_prefix, 0x39, Action::MoveToWorkspace(9)),
         (prefix, 0x21, Action::FocusWorkspacePrevious),   // PageUp
         (prefix, 0x22, Action::FocusWorkspaceNext),       // PageDown
-        (prefix, 0x52, Action::CenterColumn),             // R
+        (prefix, 0x52, Action::EnterResizeMode),          // R — niri-style interactive resize
+        (shift_prefix, 0x52, Action::CenterColumn),       // Shift+R — center-on-screen
         (prefix, 0x57, Action::ColumnWidthPresetCycle),   // W
         (prefix, 0xBD, Action::ResizeColumnLeft),         // VK_OEM_MINUS
         (prefix, 0xBB, Action::ResizeColumnRight),        // VK_OEM_PLUS
@@ -133,21 +134,102 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
     ]
 }
 
-/// Build hotkey list from config binds, falling back to defaults.
+/// Pure helper: merge `parsed_config` with `defaults` according to
+/// `extend_defaults`.  Returns the final (mods, vk, Action) table plus the
+/// number of (default, config) collisions overridden by the config side.
+///
+/// When `extend_defaults` is true:
+///   - Start from defaults.
+///   - For every (mods, vk) collision, the config bind wins.
+///   - Non-colliding config binds are appended.
+///
+/// When `extend_defaults` is false:
+///   - Returns `parsed_config` verbatim (override count is the input length
+///     so the caller can log it; the defaults are discarded).
+///   - If `parsed_config` is empty, returns `defaults` so the daemon never
+///     ships zero hotkeys after a bad reload.
+fn merge_hotkeys(
+    defaults: Vec<(u32, u32, Action)>,
+    parsed_config: Vec<(u32, u32, Action)>,
+    extend_defaults: bool,
+) -> (Vec<(u32, u32, Action)>, usize) {
+    use std::collections::{HashMap, HashSet};
+    if !extend_defaults {
+        if parsed_config.is_empty() {
+            return (defaults, 0);
+        }
+        let n = parsed_config.len();
+        return (parsed_config, n);
+    }
+    if parsed_config.is_empty() {
+        return (defaults, 0);
+    }
+    let default_count = defaults.len();
+    let cfg_index: HashMap<(u32, u32), Action> = parsed_config
+        .iter()
+        .map(|(m, v, a)| ((*m, *v), a.clone()))
+        .collect();
+    let mut merged: Vec<(u32, u32, Action)> =
+        Vec::with_capacity(default_count + parsed_config.len());
+    let mut overridden = 0usize;
+    let mut covered_in_defaults: HashSet<(u32, u32)> = HashSet::new();
+    for (m, v, default_action) in &defaults {
+        match cfg_index.get(&(*m, *v)) {
+            Some(replacement) => {
+                merged.push((*m, *v, replacement.clone()));
+                overridden += 1;
+                covered_in_defaults.insert((*m, *v));
+            }
+            None => merged.push((*m, *v, default_action.clone())),
+        }
+    }
+    for (m, v, a) in parsed_config.into_iter() {
+        if !covered_in_defaults.contains(&(m, v)) {
+            merged.push((m, v, a));
+        }
+    }
+    (merged, overridden)
+}
+
+/// Build hotkey list from config binds, optionally extending the built-in
+/// defaults so newly-shipped actions stay available to users with stale
+/// configs.
+///
+/// Resolution order:
+///   1. Read `binds.extend_defaults` (default `true`).
+///   2. When `true`: build the default table, then walk config binds.
+///      Each successfully-parsed config bind WINS on a `(mods, vk)`
+///      collision with the defaults; otherwise the config bind is
+///      appended.  Bindings the user could not parse (unknown key /
+///      unknown action name) are logged and skipped.
+///   3. When `false`: behaviour matches the pre-2026-05-18 path —
+///      config binds replace defaults entirely (with the same skip-and-log
+///      semantics), and an empty surviving table falls back to defaults
+///      so the daemon never ships zero hotkeys after a bad reload.
 fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u32, u32, Action)> {
     let terminal_cmd = resolve_terminal_command(engine);
     let eng = engine.read();
-    let config_binds = &eng.config_binds().hotkeys;
+    let binds = eng.config_binds();
+    let config_binds = &binds.hotkeys;
+    let extend_defaults = binds.extend_defaults;
     let (prefix, shift_prefix) = eng
         .full_config()
         .map(|c| resolve_mod_prefix(&c.input.mod_key))
         .unwrap_or((MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT));
 
+    // Always materialise the defaults first so we can both A) return them
+    // verbatim when the user's binds block is missing, and B) merge with
+    // user binds when extend_defaults=true.
+    let defaults = default_hotkeys(prefix, shift_prefix, &terminal_cmd);
+    let default_count = defaults.len();
+
     if config_binds.is_empty() {
-        return default_hotkeys(prefix, shift_prefix, &terminal_cmd);
+        info!("Hotkeys: {} from defaults, 0 from config (0 overridden)", default_count);
+        return defaults;
     }
 
-    let mut hotkeys = Vec::new();
+    // Parse every config bind once.
+    let mut parsed_config: Vec<(u32, u32, Action)> = Vec::with_capacity(config_binds.len());
     for bind in config_binds {
         let mods = bind.mod_flags();
         let vk = match bind.vk_code() {
@@ -164,16 +246,29 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
                 continue;
             }
         };
-        hotkeys.push((mods, vk, action));
+        parsed_config.push((mods, vk, action));
     }
 
-    if hotkeys.is_empty() {
-        warn!("Config had binds section but none parsed successfully, using defaults");
+    let config_count = parsed_config.len();
+    let (merged, overridden) = merge_hotkeys(defaults, parsed_config, extend_defaults);
+    if extend_defaults {
+        info!(
+            "Hotkeys: {} from defaults, {} from config ({} overridden)",
+            default_count.saturating_sub(overridden),
+            config_count,
+            overridden,
+        );
+    } else {
+        info!(
+            "Hotkeys: 0 from defaults (extend-defaults=false), {} from config",
+            config_count,
+        );
+    }
+    if merged.is_empty() {
+        warn!("Hotkey table empty after merge; defaults reinstated");
         return default_hotkeys(prefix, shift_prefix, &terminal_cmd);
     }
-
-    info!("Using {} hotkeys from config", hotkeys.len());
-    hotkeys
+    merged
 }
 
 /// Register a list of hotkeys with Windows, returning the IDs, action map,
@@ -411,16 +506,18 @@ impl MessageLoop {
                     let hotkey_id = msg.wParam.0 as i32;
                     if let Some(action) = action_map.get(&hotkey_id) {
                         // Esc → OverviewToggle is registered globally but only
-                        // dispatched when overview is currently active.  This
-                        // keeps Esc available to other apps in normal mode.
-                        if overview_exit_only.contains(&hotkey_id)
-                            && !engine.read().is_overview()
-                        {
-                            // Swallow the keypress silently — Windows already
-                            // routed Esc to us instead of the foreground app.
-                            // Re-posting it is unreliable, but the user expected
-                            // overview-only behaviour anyway.
-                            continue;
+                        // dispatched when overview is currently active OR
+                        // interactive resize-mode is engaged (Esc is the
+                        // canonical "exit resize mode" key).  Outside both
+                        // states the keypress is swallowed so Esc stays
+                        // available to other apps.
+                        if overview_exit_only.contains(&hotkey_id) {
+                            let eng = engine.read();
+                            let allow = eng.is_overview() || eng.is_resize_mode();
+                            drop(eng);
+                            if !allow {
+                                continue;
+                            }
                         }
                         info!("HOTKEY id={} -> {:?}", hotkey_id, action);
                         execute_action(action, &engine, &backend_handle);
@@ -556,6 +653,49 @@ fn execute_action(
         *last = (action.clone(), std::time::Instant::now());
     }
 
+    // niri-style interactive-resize mode: while engaged, the arrow-focus
+    // chords resize the focused column / tile instead of moving focus.
+    // Escape exits the mode (Esc-handling is gated on overview elsewhere,
+    // but resize-mode also intercepts it via OverviewToggle below).
+    let resize_active = engine.read().is_resize_mode();
+    if resize_active {
+        match action {
+            Action::FocusColumnLeft => {
+                engine.write().resize_focused_column_by_percent(-5, backend);
+                engine.write().apply_all(backend);
+                return;
+            }
+            Action::FocusColumnRight => {
+                engine.write().resize_focused_column_by_percent(5, backend);
+                engine.write().apply_all(backend);
+                return;
+            }
+            Action::FocusUp => {
+                engine.write().resize_focused_tile_height_by_percent(-5, backend);
+                engine.write().apply_all(backend);
+                return;
+            }
+            Action::FocusDown => {
+                engine.write().resize_focused_tile_height_by_percent(5, backend);
+                engine.write().apply_all(backend);
+                return;
+            }
+            Action::OverviewToggle => {
+                // Bare Escape (which is registered as OverviewToggle and
+                // state-gated below) is the canonical "exit resize mode"
+                // chord.  Swallow the action so overview doesn't open.
+                engine.write().exit_resize_mode();
+                return;
+            }
+            Action::EnterResizeMode => {
+                // Pressing the toggle again exits.
+                engine.write().exit_resize_mode();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match action {
         Action::FocusColumnLeft => {
             engine.write().focus_left(backend);
@@ -580,6 +720,13 @@ fn execute_action(
         }
         Action::Spawn(cmd) => {
             spawn_process(cmd);
+        }
+        Action::SpawnCmd(cmd) => {
+            // niri-style `spawn-cmd "<command>"` — route through the
+            // Windows shell so cmd-builtins (`start`, `dir`, redirection,
+            // env-var expansion) and PowerShell one-liners work as the
+            // user typed them.  Equivalent to `cmd.exe /C "<command>"`.
+            spawn_shell_command(cmd);
         }
         Action::ToggleFullscreen => {
             engine.write().toggle_fullscreen(backend);
@@ -841,6 +988,12 @@ fn execute_action(
             // intent matches what's on screen at hotkey time).
             take_window_screenshot();
         }
+        Action::EnterResizeMode => {
+            // Enter or exit resize mode.  When entering, the dispatcher
+            // re-routes the Mod+Arrow chords to grow/shrink the focused
+            // column / tile until the user presses Esc or Mod+R again.
+            engine.write().toggle_resize_mode();
+        }
     }
 }
 
@@ -879,6 +1032,25 @@ fn spawn_process(cmd: &str) {
     }
 }
 
+/// Launch a single command line through `cmd.exe /C "<command>"`.
+///
+/// Used by `Action::SpawnCmd` and the IPC `SpawnCommand` shell path.  The
+/// shell expands env vars (`%USERPROFILE%`, etc.), recognises built-ins
+/// (`start`, redirection, `&&`), and resolves PATH lookups for callers
+/// that don't want to deal with `std::process::Command`'s argv parsing.
+fn spawn_shell_command(cmd: &str) {
+    if cmd.trim().is_empty() {
+        return;
+    }
+    match std::process::Command::new("cmd.exe")
+        .args(["/C", cmd])
+        .spawn()
+    {
+        Ok(_) => info!("SpawnCmd (cmd.exe /C): {}", cmd),
+        Err(e) => warn!("SpawnCmd failed: {}", e),
+    }
+}
+
 /// Resolve the user's preferred "terminal" command, falling back to `cmd.exe`.
 ///
 /// Looked up from the engine's full config in this order:
@@ -890,12 +1062,17 @@ fn spawn_process(cmd: &str) {
 fn resolve_terminal_command(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> String {
     let eng = engine.read();
     if let Some(cfg) = eng.full_config() {
-        // 1. Look for a Spawn bind in the config.
+        // 1. Look for a Spawn / SpawnCmd bind in the config — either flavour
+        // is treated as the user's terminal-launch preference for the
+        // Mod+Enter default.
         for bind in &cfg.binds.hotkeys {
-            if let Some(Action::Spawn(cmd)) = bind.parse_action() {
-                if !cmd.trim().is_empty() {
-                    return cmd;
+            match bind.parse_action() {
+                Some(Action::Spawn(cmd)) | Some(Action::SpawnCmd(cmd)) => {
+                    if !cmd.trim().is_empty() {
+                        return cmd;
+                    }
                 }
+                _ => {}
             }
         }
         // 2. Look at spawn-at-startup entries.
@@ -904,4 +1081,68 @@ fn resolve_terminal_command(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> 
         }
     }
     "cmd.exe".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(mods: u32, vk: u32, label: &str) -> (u32, u32, Action) {
+        (mods, vk, Action::Spawn(label.to_string()))
+    }
+
+    /// extend_defaults=true preserves every default chord AND appends the
+    /// non-colliding config chord; override count is zero.
+    #[test]
+    fn merge_extends_keeps_defaults_and_adds_new_config_chord() {
+        let defaults = vec![
+            d(0x0002, 0x25, "default-left"),
+            d(0x0002, 0x27, "default-right"),
+        ];
+        let config = vec![d(0x0001, 0x50, "config-alt-p")];
+        let (merged, overridden) = merge_hotkeys(defaults, config, true);
+        assert_eq!(overridden, 0);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].2, Action::Spawn("default-left".to_string()));
+        assert_eq!(merged[1].2, Action::Spawn("default-right".to_string()));
+        assert_eq!(merged[2].2, Action::Spawn("config-alt-p".to_string()));
+    }
+
+    /// extend_defaults=true: config wins on a (mods, vk) collision; the
+    /// override count is incremented and the original default action is
+    /// replaced in-place.
+    #[test]
+    fn merge_extends_config_wins_on_collision() {
+        let defaults = vec![d(0x0002, 0x25, "default-left")];
+        let config = vec![d(0x0002, 0x25, "config-left")];
+        let (merged, overridden) = merge_hotkeys(defaults, config, true);
+        assert_eq!(overridden, 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].2, Action::Spawn("config-left".to_string()));
+    }
+
+    /// extend_defaults=false drops every default and uses the config table
+    /// verbatim, including non-colliding chords.
+    #[test]
+    fn merge_no_extend_replaces_defaults_entirely() {
+        let defaults = vec![
+            d(0x0002, 0x25, "default-left"),
+            d(0x0002, 0x27, "default-right"),
+        ];
+        let config = vec![d(0x0001, 0x50, "config-alt-p")];
+        let (merged, _overridden) = merge_hotkeys(defaults, config, false);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].2, Action::Spawn("config-alt-p".to_string()));
+    }
+
+    /// Empty config + extend=true returns defaults untouched (a fresh user
+    /// install or a config with only `binds { }` should still get every
+    /// shipped default).
+    #[test]
+    fn merge_empty_config_returns_defaults() {
+        let defaults = vec![d(0x0002, 0x25, "default-left")];
+        let (merged, overridden) = merge_hotkeys(defaults.clone(), vec![], true);
+        assert_eq!(overridden, 0);
+        assert_eq!(merged, defaults);
+    }
 }

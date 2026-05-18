@@ -768,9 +768,25 @@ impl WindowRule {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BindsConfig {
     pub hotkeys: Vec<HotkeyBinding>,
+    /// niri-style "extend the built-in default keybindings instead of
+    /// replacing them".  Default `true` — the user's `binds { … }` block
+    /// is folded on top of the shipped defaults so newly-added actions
+    /// stay available without a config edit.  Set to `false` (via
+    /// `binds { extend-defaults false … }`) to get the pre-2026-05-18
+    /// "replace everything" behaviour.
+    pub extend_defaults: bool,
+}
+
+impl Default for BindsConfig {
+    fn default() -> Self {
+        Self {
+            hotkeys: Vec::new(),
+            extend_defaults: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -788,8 +804,19 @@ pub struct HotkeyBinding {
 
 impl HotkeyBinding {
     /// Parse the action name to an Action enum.
-    /// Delegates to the shared parse_action_name function.
+    /// Delegates to the shared parse_action_name function.  Recognises the
+    /// niri-style `spawn-cmd "<command>"` shorthand by returning
+    /// `Action::SpawnCmd(...)` so the WM_HOTKEY dispatcher routes through
+    /// the Windows shell instead of `Spawn`'s whitespace-split argv path.
     pub fn parse_action(&self) -> Option<crate::input::Action> {
+        if self.is_spawn_cmd() {
+            if let Some(cmd) = self.args.first() {
+                if !cmd.is_empty() {
+                    return Some(crate::input::Action::SpawnCmd(cmd.clone()));
+                }
+            }
+            return None;
+        }
         crate::input::parse_action_name(&self.command, &self.args)
     }
 
@@ -1135,6 +1162,21 @@ mod tests {
         };
         assert!(b.is_spawn_cmd());
         assert!(b.shell_command_argv().is_none());
+    }
+
+    /// `spawn-cmd "wt.exe"` → `Action::SpawnCmd("wt.exe")` via parse_action so
+    /// the WM_HOTKEY dispatcher can route through the Windows shell.
+    #[test]
+    fn test_hotkey_binding_spawn_cmd_parse_action_returns_spawn_cmd() {
+        let b = HotkeyBinding {
+            command: "spawn-cmd".to_string(),
+            args: vec!["wt.exe".to_string()],
+            ..HotkeyBinding::default()
+        };
+        assert_eq!(
+            b.parse_action(),
+            Some(crate::input::Action::SpawnCmd("wt.exe".to_string())),
+        );
     }
 
     #[test]

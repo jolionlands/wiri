@@ -201,6 +201,28 @@ pub enum IpcMessage {
         #[serde(default)]
         path: Option<String>,
     },
+
+    // ---- Snapshot / restore (niri-parity layout persistence) ----
+    /// Serialise the engine's current monitor → workspace → column → tile
+    /// structure to JSON at `%APPDATA%\wiri\snapshots\<name>.json`.
+    #[serde(rename = "save_snapshot")]
+    SaveSnapshot { name: String },
+    /// Deserialise a previously-saved snapshot and reapply its tile layout.
+    /// Windows whose HWNDs no longer exist are skipped silently so a
+    /// snapshot taken yesterday can still restore today's surviving tiles.
+    #[serde(rename = "load_snapshot")]
+    LoadSnapshot { name: String },
+    /// Enumerate every saved snapshot in `%APPDATA%\wiri\snapshots\`.
+    #[serde(rename = "list_snapshots")]
+    ListSnapshots,
+    /// Delete a saved snapshot by name.
+    #[serde(rename = "delete_snapshot")]
+    DeleteSnapshot { name: String },
+
+    /// Toggle niri-style interactive resize mode.  Returns the new state
+    /// under `result.active`.
+    #[serde(rename = "toggle_resize_mode")]
+    ToggleResizeMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -16,6 +16,10 @@ pub use touch::{TouchConfig, TouchGesture, GestureRecognizer, start_touch_hook, 
 pub enum Action {
     Quit,
     Spawn(String),
+    /// Spawn a shell command via `cmd.exe /C "<command>"` (niri `spawn-sh`
+    /// parity). Distinct from `Spawn(...)` which splits on whitespace and
+    /// invokes the resulting argv directly.
+    SpawnCmd(String),
     CloseWindow,
     MoveColumnLeft,
     MoveColumnRight,
@@ -118,6 +122,11 @@ pub enum Action {
     /// current directory if Pictures isn't writable).  Uses
     /// `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`.
     WindowScreenshot,
+    /// Toggle niri-style "interactive resize mode" (Mod+R).  While
+    /// active, the engine intercepts bare Arrow keys to grow/shrink the
+    /// focused column / tile by 5% and Escape commits + exits.  Pressing
+    /// the toggle again also exits.
+    EnterResizeMode,
 }
 
 /// Parse an action name string (from config/IPC) into an Action.
@@ -149,6 +158,9 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         }
         "spawn" | "exec" => {
             args.first().map(|cmd| Action::Spawn(cmd.clone()))
+        }
+        "spawn-cmd" | "spawn_cmd" | "spawn-sh" => {
+            args.first().map(|cmd| Action::SpawnCmd(cmd.clone()))
         }
         "overview" | "overview-toggle" | "zoom-out" => Some(Action::OverviewToggle),
         "overview-left" => Some(Action::OverviewLeft),
@@ -203,6 +215,9 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "screenshot" | "take-screenshot" | "capture-screen" => Some(Action::Screenshot),
         "window-screenshot" | "capture-window" | "screenshot-window" => {
             Some(Action::WindowScreenshot)
+        }
+        "enter-resize-mode" | "resize-mode" | "interactive-resize" => {
+            Some(Action::EnterResizeMode)
         }
         "set-auto-tile" => {
             if args.is_empty() {

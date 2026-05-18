@@ -1,0 +1,87 @@
+// Every wiri action bound to a memorable chord. Use this to learn the keymap;
+// strip the binds you don't want once you've internalised them.
+
+version "1.0"
+
+input {
+    mod-key "Ctrl+Alt"
+}
+
+binds {
+    // --- Navigation ---
+    Ctrl+Alt+Left           focus-column-left
+    Ctrl+Alt+Right          focus-column-right
+    Ctrl+Alt+Up             focus-up
+    Ctrl+Alt+Down           focus-down
+    Ctrl+Alt+H              scroll-left
+    Ctrl+Alt+L              scroll-right
+    Ctrl+Alt+Tab            focus-previous              // alt-tab MRU
+
+    // --- Move focused column ---
+    Ctrl+Alt+Shift+Left     move-column-left
+    Ctrl+Alt+Shift+Right    move-column-right
+    Ctrl+Alt+Shift+Page_Up  move-column-to-monitor-left
+    Ctrl+Alt+Shift+Page_Down move-column-to-monitor-right
+
+    // --- Window state ---
+    Ctrl+Alt+Q              close-window
+    Ctrl+Alt+F              toggle-fullscreen
+    Ctrl+Alt+T              toggle-floating
+    Ctrl+Alt+A              toggle-always-on-top
+
+    // --- Column rearrange (niri) ---
+    Ctrl+Alt+Comma          consume-window-into-column   // merge into right column
+    Ctrl+Alt+Period         expel-window-from-column     // pop into new column
+    Ctrl+Alt+E              expand-column-to-available   // fill remaining width
+    Ctrl+Alt+Shift+F        maximize-column              // full work-area height
+
+    // --- Keyboard resize ---
+    Ctrl+Alt+Shift+L        grow-column-width            // +5%
+    Ctrl+Alt+Shift+H        shrink-column-width          // -5%
+    Ctrl+Alt+Shift+K        grow-tile-height             // +5%
+    Ctrl+Alt+Shift+J        shrink-tile-height           // -5%
+
+    // --- Column-width presets ---
+    Ctrl+Alt+Bracket_Left   set-column-width "1/3"
+    Ctrl+Alt+Bracket_Right  set-column-width "2/3"
+    Ctrl+Alt+Backslash      set-column-width "cycle"
+
+    // --- Workspaces ---
+    Ctrl+Alt+1              switch-workspace 1
+    Ctrl+Alt+2              switch-workspace 2
+    Ctrl+Alt+3              switch-workspace 3
+    Ctrl+Alt+4              switch-workspace 4
+    Ctrl+Alt+5              switch-workspace 5
+    Ctrl+Alt+6              switch-workspace 6
+    Ctrl+Alt+7              switch-workspace 7
+    Ctrl+Alt+8              switch-workspace 8
+    Ctrl+Alt+9              switch-workspace 9
+
+    // --- Overview / multi-workspace view ---
+    Ctrl+Alt+Space          overview-toggle
+    Ctrl+Alt+O              overview-select
+    // (Escape is registered automatically and only fires when overview is on.)
+
+    // --- Capture ---
+    Ctrl+Alt+P              screenshot
+    Ctrl+Alt+Shift+S        window-screenshot
+
+    // --- Spawn ---
+    Ctrl+Alt+Return         spawn "wt.exe"                // terminal
+    Ctrl+Alt+B              spawn "msedge.exe"            // browser
+    Ctrl+Alt+S              spawn-cmd "start ."           // explorer in cwd
+
+    // --- Lifecycle ---
+    Ctrl+Alt+Shift+Q        quit
+}
+
+// --- Example window rules ---
+window-rules {
+    class "CalcFrame" {
+        float true
+    }
+    title "Picture-in-Picture" {
+        float true
+        sticky true
+    }
+}
