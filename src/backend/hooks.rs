@@ -183,11 +183,21 @@ unsafe extern "system" fn winevent_proc(
             backend.remove_window(hwnd_isize);
         }
         0x8003 => { // EVENT_OBJECT_SHOW
-            if let Some(mut info) = backend.get_window(hwnd.0 as isize) {
-                info.is_visible = true;
-                backend.update_window(hwnd.0 as isize, info.clone());
-                backend.send_event(BackendEvent::WindowShown { hwnd: hwnd.0 as isize });
-            }
+            // A SHOW event is the first reliable point at which a top-level
+            // window has its real title / class / styles set. The earlier
+            // EVENT_OBJECT_CREATE often fires before WS_VISIBLE and before
+            // WM_SETTEXT, so the cached WindowInfo there is half-populated
+            // (empty title => filtered out by `should_tile_window`).
+            //
+            // Refresh from the live HWND on every SHOW so the engine sees the
+            // current title/class/bounds. If the window was never seen before
+            // (CREATE missed it — e.g. raced with the hook install, or it was
+            // created hidden and only now made visible), insert it fresh.
+            let hwnd_isize = hwnd.0 as isize;
+            let mut info = WindowInfo::new(hwnd);
+            info.is_visible = true;
+            backend.update_window(hwnd_isize, info);
+            backend.send_event(BackendEvent::WindowShown { hwnd: hwnd_isize });
         }
         0x8004 => { // EVENT_OBJECT_HIDE
             if let Some(mut info) = backend.get_window(hwnd.0 as isize) {
@@ -282,7 +292,19 @@ unsafe extern "system" fn winevent_proc(
             }
         }
         0x800C => { // EVENT_OBJECT_NAMECHANGE
-            backend.send_event(BackendEvent::WindowTitleChanged { hwnd: hwnd.0 as isize });
+            // Refresh the cached WindowInfo's title (and class/bounds for
+            // good measure — apps occasionally update class via SetClassLongPtr
+            // mid-life). Then emit BOTH WindowTitleChanged (for listeners) and
+            // WindowShown (to retry classification): a window whose title was
+            // empty at CREATE time is rejected by should_tile_window, and
+            // NAMECHANGE is the signal that the title is now real.
+            let hwnd_isize = hwnd.0 as isize;
+            if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() } {
+                let info = WindowInfo::new(hwnd);
+                backend.update_window(hwnd_isize, info);
+                backend.send_event(BackendEvent::WindowTitleChanged { hwnd: hwnd_isize });
+                backend.send_event(BackendEvent::WindowShown { hwnd: hwnd_isize });
+            }
         }
         _ => {}
     }

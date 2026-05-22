@@ -406,24 +406,25 @@ unsafe extern "system" fn mouse_hook_callback(
         if ctrl_held {
             // Ctrl+Alt+Wheel → switch workspace.
             // Positive (forward) = previous workspace; negative (back) = next.
-            // TODO: gate on MouseFocusConfig.wheel_workspace_nav (default true).
-            let state = HOOK_STATE.lock();
-            if let (Some(engine), Some(backend)) = (&state.engine, &state.backend) {
-                let engine = engine.clone();
-                let backend = backend.clone();
-                drop(state);
-                if delta > 0 {
-                    engine.write().focus_workspace_relative(
-                        crate::layout::WorkspaceDirection::Previous,
-                        &backend,
-                    );
-                } else {
-                    engine.write().focus_workspace_relative(
-                        crate::layout::WorkspaceDirection::Next,
-                        &backend,
-                    );
-                }
-                engine.write().apply_all(&backend);
+            // Dispatch off the LL hook thread so a long apply_all on a
+            // contended write lock doesn't stall global input.  Windows
+            // unhooks slow LL callbacks; even when it doesn't, anything
+            // > ~1 ms in here is perceived as system-wide cursor lag.
+            let (maybe_engine, maybe_backend) = {
+                let state = HOOK_STATE.lock();
+                (state.engine.clone(), state.backend.clone())
+            };
+            if let (Some(engine), Some(backend)) = (maybe_engine, maybe_backend) {
+                std::thread::spawn(move || {
+                    let dir = if delta > 0 {
+                        crate::layout::WorkspaceDirection::Previous
+                    } else {
+                        crate::layout::WorkspaceDirection::Next
+                    };
+                    let mut eng = engine.write();
+                    eng.focus_workspace_relative(dir, &backend);
+                    eng.apply_all(&backend);
+                });
             }
             // Consume the event — do not forward to the app under the cursor.
             return LRESULT(1);
@@ -444,14 +445,23 @@ unsafe extern "system" fn mouse_hook_callback(
             let raw_steps = (mouse_cfg.scroll_speed.max(0.1) as f64).round() as u32;
             raw_steps.max(1).min(8)
         };
-        let state = HOOK_STATE.lock();
-        if let (Some(engine), Some(backend)) = (&state.engine, &state.backend) {
-            let engine = engine.clone();
-            let backend = backend.clone();
-            drop(state);
-            for _ in 0..steps {
-                engine.write().scroll(direction, &backend);
-            }
+        let (maybe_engine, maybe_backend) = {
+            let state = HOOK_STATE.lock();
+            (state.engine.clone(), state.backend.clone())
+        };
+        if let (Some(engine), Some(backend)) = (maybe_engine, maybe_backend) {
+            // Dispatch the scroll off the LL hook thread.  Each `scroll()` call
+            // takes the engine write lock and runs apply_layout_for_monitor
+            // (DwmSetWindowAttribute + DeferWindowPos for every tile); doing
+            // that N times synchronously on the OS input thread is the visible
+            // cursor-stutter source when Alt+Wheeling.  Off-thread the LL hook
+            // returns immediately and the layout work happens concurrently.
+            std::thread::spawn(move || {
+                let mut eng = engine.write();
+                for _ in 0..steps {
+                    eng.scroll(direction, &backend);
+                }
+            });
         }
         // Swallow the event so the app under the cursor doesn't also scroll.
         return LRESULT(1);

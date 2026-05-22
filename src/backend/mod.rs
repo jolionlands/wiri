@@ -465,6 +465,12 @@ impl BackendHandle {
 
     pub fn set_window_position(&self, hwnd: isize, rect: Rect, flags: SET_WINDOW_POS_FLAGS) -> Result<()> {
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        // Compensate for the invisible DWM shadow margin so the *visible*
+        // window edges land at `rect`, not the frame edges (which include the
+        // ~11 px shadow on Windows 10/11).  Without this, configured inner
+        // gaps between tiles get eaten by overlapping shadows.
+        let rect = expand_for_shadow_margin(hwnd_win, rect);
+
         // SWP_NOCOPYBITS forces a full repaint of the client area instead of
         // bit-blitting old content — fixes black-content rendering on
         // Windows Terminal / Edge / Electron after a tile move.
@@ -557,6 +563,8 @@ impl BackendHandle {
         let mut count = 0;
         for (hwnd, rect, flags) in positions {
             let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
+            // Same shadow-margin compensation as set_window_position above.
+            let rect = expand_for_shadow_margin(hwnd_win, *rect);
             // DeferWindowPos returns a new HDWP that incorporates this change.
             // We feed each new HDWP back in.
             let result = unsafe {
@@ -1048,6 +1056,60 @@ mod tests {
         let len = handle.self_applied.read().len();
         assert_eq!(len, 1, "only the freshly-marked hwnd should remain after prune");
     }
+}
+
+/// Adjust a target visible-bounds rect to compensate for the invisible DWM
+/// drop-shadow margin on Windows 10/11.
+///
+/// `GetWindowRect` returns the frame including the ~11 px transparent shadow
+/// on left/right/bottom (top is usually 0).  `DwmGetWindowAttribute(
+/// DWMWA_EXTENDED_FRAME_BOUNDS)` returns the *visible* edges.  We compute the
+/// per-side delta from the current window state and apply it as a margin so
+/// that after `SetWindowPos(rect.expanded)` the visible edges land at `rect`.
+///
+/// Without this, configured `inner_gaps` between tiles are eaten by the two
+/// adjacent windows' overlapping shadows, making the tiles appear flush.
+fn expand_for_shadow_margin(hwnd: HWND, rect: Rect) -> Rect {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let mut frame = RECT::default();
+    let mut visible = RECT::default();
+    unsafe {
+        if GetWindowRect(hwnd, &mut frame).is_err() {
+            return rect;
+        }
+        let hr = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut visible as *mut _ as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        );
+        if hr.is_err() {
+            return rect;
+        }
+    }
+
+    // visible is strictly inside or equal to frame on each side.
+    let left = (visible.left - frame.left).max(0);
+    let top = (visible.top - frame.top).max(0);
+    let right = (frame.right - visible.right).max(0);
+    let bottom = (frame.bottom - visible.bottom).max(0);
+
+    // Sanity cap — if any side margin exceeds 32 px the window is doing
+    // something unusual (custom non-client area) and our compensation may
+    // hurt more than help.  Bail to the uncompensated rect in that case.
+    if left > 32 || top > 32 || right > 32 || bottom > 32 {
+        return rect;
+    }
+
+    Rect::new(
+        rect.loc.x - left,
+        rect.loc.y - top,
+        rect.size.w.saturating_add((left + right) as u32),
+        rect.size.h.saturating_add((top + bottom) as u32),
+    )
 }
 
 /// Returns the default flags for batched SetWindowPos calls.

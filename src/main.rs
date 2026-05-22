@@ -580,18 +580,33 @@ info!("Mouse hook installed");
     'main: loop {
         // Tick animations if enabled.  apply_all is cheap when no state changed
         // because the applied-state cache in the engine skips all Win32 calls.
+        //
+        // Idle-tick optimisation: when no animation is in flight we do NOT
+        // need to acquire the engine write lock or walk every tile every
+        // 33 ms.  Holding the write lock blocks WinEvent callbacks, IPC
+        // requests, hotkey actions, and the mouse hook — even though the
+        // per-tile work is O(n) hash lookups, the write-lock contention
+        // itself is the visible source of input/event latency the user
+        // perceives as "lag".  Other code paths (hotkeys, WinEvents,
+        // mouse drags) call apply_all/apply_layout_for_monitor directly
+        // when they change state, so the periodic tick is only needed to
+        // drive ongoing animations.
         {
             let elapsed = last_tick.elapsed().as_millis() as u32;
             if elapsed >= ANIMATION_TICK_MS {
                 last_tick = std::time::Instant::now();
 
-                let mut eng = engine.write();
-                // Always call apply_all: when tick_animations returns false and
-                // the cache matches, the pass costs only hash lookups (O(n_tiles) μs).
-                // This ensures focus/border/opacity changes are reflected even when
-                // no animation is running.
-                eng.tick_animations(elapsed);
-                eng.apply_all(&handle);
+                // Cheap read-lock probe first — bail out fast on idle ticks.
+                let needs_tick = engine.read().has_active_animations();
+                if needs_tick {
+                    // try_write so we never block the main loop behind a
+                    // long-running write holder (e.g. a hotkey handler).
+                    // If contended, the next tick (33 ms later) picks it up.
+                    if let Some(mut eng) = engine.try_write() {
+                        eng.tick_animations(elapsed);
+                        eng.apply_all(&handle);
+                    }
+                }
             }
         }
 
@@ -828,23 +843,33 @@ fn handle_backend_event(
 ) {
     match event {
         BackendEvent::WindowCreated { hwnd } => {
+            // Most windows fail `should_tile_window` at CREATE time because the
+            // title/visibility aren't set yet — that's expected; SHOW/NAMECHANGE
+            // re-trigger this path. Guard against double-add in case both fire.
             if let Some(window) = handle.get_window(hwnd) {
                 if should_tile_window(&window) {
-                    info!("+ {} ({})", window.title, window.class_name);
-                    ipc_server.broadcast_event(IpcEvent::WindowOpened {
-                        window: WindowInfoIpc {
-                            hwnd,
-                            title: window.title.clone(),
-                            class_name: window.class_name.clone(),
-                            process_id: window.process_id,
-                            x: window.bounds.loc.x,
-                            y: window.bounds.loc.y,
-                            width: window.bounds.size.w,
-                            height: window.bounds.size.h,
-                        },
-                    });
-                    engine.write().add_window(window, handle);
-                    engine.write().apply_all(handle);
+                    let window_id = WindowId::new(hwnd);
+                    let already_tiled = engine
+                        .read()
+                        .tiled_windows()
+                        .contains_key(&window_id);
+                    if !already_tiled {
+                        info!("+ {} ({})", window.title, window.class_name);
+                        ipc_server.broadcast_event(IpcEvent::WindowOpened {
+                            window: WindowInfoIpc {
+                                hwnd,
+                                title: window.title.clone(),
+                                class_name: window.class_name.clone(),
+                                process_id: window.process_id,
+                                x: window.bounds.loc.x,
+                                y: window.bounds.loc.y,
+                                width: window.bounds.size.w,
+                                height: window.bounds.size.h,
+                            },
+                        });
+                        engine.write().add_window(window, handle);
+                        engine.write().apply_all(handle);
+                    }
                 }
             }
         }
@@ -855,22 +880,36 @@ fn handle_backend_event(
             engine.write().apply_all(handle);
         }
         BackendEvent::WindowShown { hwnd } => {
+            // Idempotent: only add+broadcast if this window is not already
+            // tracked by the tiling engine. EVENT_OBJECT_SHOW fires on every
+            // un-minimize, every workspace re-show, and on every NAMECHANGE
+            // (we re-emit Shown from there to retry classification of windows
+            // that had an empty title at CREATE time). Without this guard we
+            // would add the same HWND to a new column every time.
             if let Some(window) = handle.get_window(hwnd) {
                 if should_tile_window(&window) {
-                    ipc_server.broadcast_event(IpcEvent::WindowOpened {
-                        window: WindowInfoIpc {
-                            hwnd,
-                            title: window.title.clone(),
-                            class_name: window.class_name.clone(),
-                            process_id: window.process_id,
-                            x: window.bounds.loc.x,
-                            y: window.bounds.loc.y,
-                            width: window.bounds.size.w,
-                            height: window.bounds.size.h,
-                        },
-                    });
-                    engine.write().add_window(window, handle);
-                    engine.write().apply_all(handle);
+                    let window_id = WindowId::new(hwnd);
+                    let already_tiled = engine
+                        .read()
+                        .tiled_windows()
+                        .contains_key(&window_id);
+                    if !already_tiled {
+                        info!("+ {} ({}) [via show/namechange]", window.title, window.class_name);
+                        ipc_server.broadcast_event(IpcEvent::WindowOpened {
+                            window: WindowInfoIpc {
+                                hwnd,
+                                title: window.title.clone(),
+                                class_name: window.class_name.clone(),
+                                process_id: window.process_id,
+                                x: window.bounds.loc.x,
+                                y: window.bounds.loc.y,
+                                width: window.bounds.size.w,
+                                height: window.bounds.size.h,
+                            },
+                        });
+                        engine.write().add_window(window, handle);
+                        engine.write().apply_all(handle);
+                    }
                 }
             }
         }
