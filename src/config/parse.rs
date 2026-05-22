@@ -1194,6 +1194,48 @@ pub fn validate_kdl_config(input: &str) -> Vec<ValidationIssue> {
 /// Format: Mod+Key action-name [args]
 /// Example: Ctrl+Alt+Left focus-column-left
 ///          Ctrl+Alt+1 switch-workspace 1
+/// Split a binding action's tail into tokens, keeping anything inside double
+/// quotes as a single token (with the surrounding quotes stripped).
+///
+/// Examples:
+///   `set-column-width "1/3"`            -> ["set-column-width", "1/3"]
+///   `spawn-cmd "wt.exe -p PowerShell"`  -> ["spawn-cmd", "wt.exe -p PowerShell"]
+///   `spawn "start cmd || exit"`         -> ["spawn", "start cmd || exit"]
+///
+/// Backslash escapes (`\"`) inside a quoted string are honoured.  An unbalanced
+/// final quote is treated as if it had been closed at end-of-line.
+fn tokenize_respecting_quotes(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                // Don't include the quote char itself in the token.
+            }
+            '\\' if in_quotes => {
+                if let Some(&next) = chars.peek() {
+                    cur.push(next);
+                    chars.next();
+                }
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn parse_bind_line(line: &str) -> Option<crate::config::HotkeyBinding> {
     let line = line.trim();
     if line.is_empty() || line.starts_with("//") { return None; }
@@ -1216,15 +1258,18 @@ fn parse_bind_line(line: &str) -> Option<crate::config::HotkeyBinding> {
         (mods, key)
     };
 
-    // Parse action: could be just "action-name" or "action-name arg1 arg2"
-    let action_parts: Vec<&str> = action_rest.split_whitespace().collect();
-    if action_parts.is_empty() { return None; }
+    // Parse action: could be just "action-name" or "action-name arg1 "quoted arg"".
+    //
+    // We must respect quoted strings as a single token, otherwise
+    //   spawn-cmd "start wt.exe || start powershell.exe"
+    // gets split into 5 args, only the first of which ("start") survives the
+    // `args.first()` lookup downstream — silently turning the binding into a
+    // useless `spawn-cmd start`.
+    let action_tokens = tokenize_respecting_quotes(action_rest);
+    if action_tokens.is_empty() { return None; }
 
-    let command = action_parts[0].trim_matches('"').to_string();
-    let args: Vec<String> = action_parts[1..]
-        .iter()
-        .map(|s| s.trim_matches('"').to_string())
-        .collect();
+    let command = action_tokens[0].clone();
+    let args: Vec<String> = action_tokens[1..].to_vec();
 
     Some(crate::config::HotkeyBinding {
         modifiers,

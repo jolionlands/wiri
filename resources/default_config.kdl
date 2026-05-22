@@ -135,7 +135,11 @@ binds {
 
     // Window actions
     Ctrl+Alt+Q       close-window
-    Ctrl+Alt+Return  spawn "cmd.exe"
+    // Open a terminal — prefers Windows Terminal (`wt.exe`), falling back to
+    // PowerShell via the shell path so the user is never dropped into a bare
+    // cmd.exe prompt.  Override this line in your config if you want a
+    // different terminal (Alacritty, WezTerm, Ghostty, etc.).
+    Ctrl+Alt+Return  spawn-cmd "start wt.exe || start powershell.exe"
     Ctrl+Alt+F       toggle-fullscreen
     Ctrl+Alt+T       toggle-floating
 
