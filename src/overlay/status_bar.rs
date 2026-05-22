@@ -81,10 +81,10 @@ struct BarState {
 /// Handle to the persistent status bar overlay.
 ///
 /// # Usage
-/// ```
+/// ```ignore
 /// let bar = Arc::new(StatusBar::new());
 /// let _ = bar.clone().spawn(); // start Win32 thread; drops JoinHandle intentionally
-/// bar.update(StatusBarContent { ... });
+/// bar.update(StatusBarContent { /* fields */ });
 /// ```
 pub struct StatusBar {
     state: Arc<BarState>,

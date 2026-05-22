@@ -1162,9 +1162,17 @@ fn take_screenshot() {
 }
 
 fn spawn_process(cmd: &str) {
+    use std::os::windows::process::CommandExt;
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() { return; }
-    match std::process::Command::new(parts[0]).args(&parts[1..]).spawn() {
+    // CREATE_NO_WINDOW = 0x08000000 — prevents console-subsystem children
+    // (like wiri-ctl, or any user-defined keybind action that resolves to a
+    // console exe) from popping a visible cmd window.
+    match std::process::Command::new(parts[0])
+        .args(&parts[1..])
+        .creation_flags(0x0800_0000)
+        .spawn()
+    {
         Ok(_) => info!("Spawned: {}", cmd),
         Err(e) => warn!("Spawn failed: {}", e),
     }
@@ -1177,11 +1185,16 @@ fn spawn_process(cmd: &str) {
 /// (`start`, redirection, `&&`), and resolves PATH lookups for callers
 /// that don't want to deal with `std::process::Command`'s argv parsing.
 fn spawn_shell_command(cmd: &str) {
+    use std::os::windows::process::CommandExt;
     if cmd.trim().is_empty() {
         return;
     }
+    // CREATE_NO_WINDOW = 0x08000000 — without this, every keybinding that
+    // shells out (e.g. user `spawn-cmd` actions) flashes a console window
+    // before the actual program launches.
     match std::process::Command::new("cmd.exe")
         .args(["/C", cmd])
+        .creation_flags(0x0800_0000)
         .spawn()
     {
         Ok(_) => info!("SpawnCmd (cmd.exe /C): {}", cmd),
