@@ -381,6 +381,20 @@ pub struct LayoutConfig {
     /// local time (right).  Opt-in via `status-bar true` inside `layout { }`.
     /// Default `false`.
     pub status_bar: bool,
+
+    // ---- screen-area reservation for external bars / panels ----
+    /// Pixels to subtract from the top of each monitor's tiling work area.
+    /// Set via `reserve-top N` inside `layout { }`.  Default 0.
+    pub reserve_top: u32,
+    /// Pixels to subtract from the bottom of each monitor's tiling work area.
+    /// Set via `reserve-bottom N` inside `layout { }`.  Default 0.
+    pub reserve_bottom: u32,
+    /// Pixels to subtract from the left of each monitor's tiling work area.
+    /// Set via `reserve-left N` inside `layout { }`.  Default 0.
+    pub reserve_left: u32,
+    /// Pixels to subtract from the right of each monitor's tiling work area.
+    /// Set via `reserve-right N` inside `layout { }`.  Default 0.
+    pub reserve_right: u32,
 }
 
 impl LayoutConfig {
@@ -416,6 +430,10 @@ impl LayoutConfig {
             snap_threshold_px: 20,
             smart_borders: false,
             status_bar: false,
+            reserve_top: 0,
+            reserve_bottom: 0,
+            reserve_left: 0,
+            reserve_right: 0,
         }
     }
 

@@ -298,6 +298,23 @@ enum Commands {
     /// (after `RegisterHotKey`), including any custom binds from config.
     /// Pass --json for the raw JSON array.
     Bindings,
+
+    /// Reserve screen-edge pixels for external apps (e.g. status bars).
+    ///
+    /// Instructs wiri to subtract the given pixel count from each monitor's
+    /// tiling work area on the specified edge.  The reservation is in-memory
+    /// only — it is reset when wiri restarts.  External bars should re-issue
+    /// this command after reconnecting.  Pass `--pixels 0` to release a
+    /// previous reservation.
+    ReserveArea {
+        /// Edge to reserve: top | bottom | left | right
+        side: String,
+        /// Number of pixels to reserve on that edge (0 = release)
+        pixels: u32,
+        /// Optional monitor ID (numeric). Currently ignored (global reservation).
+        #[arg(long)]
+        monitor_id: Option<u64>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -412,6 +429,9 @@ fn main() -> Result<()> {
         Commands::GetFocus => IpcMessage::GetFocus,
         Commands::GetWorkspaceList => IpcMessage::GetWorkspaceList,
         Commands::Bindings => IpcMessage::GetBindings,
+        Commands::ReserveArea { side, pixels, monitor_id } => {
+            IpcMessage::ReserveArea { side, pixels, monitor_id }
+        }
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;
@@ -624,6 +644,13 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
             }
         }
         IpcMessage::GetBindings => print_bindings_table(resp),
+        IpcMessage::ReserveArea { side, pixels, .. } => {
+            if *pixels == 0 {
+                println!("Released {} reservation.", side);
+            } else {
+                println!("Reserved {} px on the {} edge.", pixels, side);
+            }
+        }
         _ => {
             // Generic: report success with a hint when present.
             if let Some(note) = resp.get("note").and_then(|v| v.as_str()) {

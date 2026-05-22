@@ -181,6 +181,18 @@ pub struct LayoutConfig {
     /// `"acrylic"` (3), `"tabbed"` (4).  Defaults to `"auto"` which
     /// lets Windows choose (usually no backdrop for non-UWP apps).
     pub backdrop: String,
+
+    // ---- screen-area reservation for external bars / panels ----
+    /// Pixels reserved at the top of every monitor's tiling work area.
+    /// Applied before outer_gaps.  Set statically via `layout { reserve-top N }`
+    /// or dynamically via the `reserve_area` IPC message.  Default 0.
+    pub reserve_top: u32,
+    /// Pixels reserved at the bottom of every monitor's tiling work area.
+    pub reserve_bottom: u32,
+    /// Pixels reserved at the left of every monitor's tiling work area.
+    pub reserve_left: u32,
+    /// Pixels reserved at the right of every monitor's tiling work area.
+    pub reserve_right: u32,
 }
 
 impl Default for LayoutConfig {
@@ -204,6 +216,10 @@ impl Default for LayoutConfig {
             smart_borders: false,
             border_color_urgent: "#e53935".to_string(),
             backdrop: "auto".to_string(),
+            reserve_top: 0,
+            reserve_bottom: 0,
+            reserve_left: 0,
+            reserve_right: 0,
         }
     }
 }
@@ -265,6 +281,10 @@ impl LayoutConfig {
         // `backdrop` is engine-only and has no counterpart in the flat KDL
         // LayoutConfig; callers set it directly on the LayoutConfig after
         // calling from_config() if they need a non-default value.
+        lc.reserve_top = config.layout.reserve_top;
+        lc.reserve_bottom = config.layout.reserve_bottom;
+        lc.reserve_left = config.layout.reserve_left;
+        lc.reserve_right = config.layout.reserve_right;
         lc
     }
 }
@@ -1084,15 +1104,21 @@ impl TilingEngine {
         // cost is negligible vs the Win32 calls it gates.
         let eff_cfg: LayoutConfig = self.effective_config(output_id).clone();
 
+        // Subtract reserved screen-edge pixels (for external bars / panels)
+        // before applying outer_gaps so the two insets compose correctly.
+        let rt = eff_cfg.reserve_top as i32;
+        let rb = eff_cfg.reserve_bottom as i32;
+        let rl = eff_cfg.reserve_left as i32;
+        let rr = eff_cfg.reserve_right as i32;
         let work_rect = Rect::new(
-            monitor.work_area.loc.x + eff_cfg.outer_gaps.3,
-            monitor.work_area.loc.y + eff_cfg.outer_gaps.0,
-            monitor.work_area.size.w.saturating_sub(
-                (eff_cfg.outer_gaps.1 + eff_cfg.outer_gaps.3) as u32,
-            ),
-            monitor.work_area.size.h.saturating_sub(
-                (eff_cfg.outer_gaps.0 + eff_cfg.outer_gaps.2) as u32,
-            ),
+            monitor.work_area.loc.x + rl + eff_cfg.outer_gaps.3,
+            monitor.work_area.loc.y + rt + eff_cfg.outer_gaps.0,
+            monitor.work_area.size.w
+                .saturating_sub((rl + rr) as u32)
+                .saturating_sub((eff_cfg.outer_gaps.1 + eff_cfg.outer_gaps.3) as u32),
+            monitor.work_area.size.h
+                .saturating_sub((rt + rb) as u32)
+                .saturating_sub((eff_cfg.outer_gaps.0 + eff_cfg.outer_gaps.2) as u32),
         );
 
         // Collect the window IDs on this monitor's active workspace.  In

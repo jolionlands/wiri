@@ -1037,6 +1037,55 @@ wiri-ctl events --stream --filter window_focused | ForEach-Object {
 }
 ```
 
+### `reserve_area` — Reserve screen-edge space for external bars
+
+Requests that wiri subtract the given pixel count from each monitor's tiling
+work area on the specified edge.  Useful for status bars (e.g. crest), pinned
+panels, or other persistent overlays that need dedicated space that tiles must
+not overlap.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `side` | `string` | yes | Which edge: `"top"` \| `"bottom"` \| `"left"` \| `"right"` |
+| `pixels` | `integer` | yes | Pixels to reserve on that edge. `0` = release. |
+| `monitor_id` | `integer \| null` | no | Monitor ID (currently ignored; applies to all monitors). |
+
+**Request:**
+```json
+{"type":"reserve_area","data":{"side":"top","pixels":32}}
+```
+
+**Response (success):**
+```json
+{"success":true}
+```
+
+**Response (invalid side string):**
+```json
+{"success":false,"error":"invalid side \"foo\": expected top | bottom | left | right"}
+```
+
+**Behaviour notes:**
+
+- The reservation is **in-memory only** — it is not written to `config.kdl` and
+  resets when wiri restarts.
+- External bars should re-issue `reserve_area` on every wiri reconnect (e.g.
+  subscribe to `config_loaded` to detect daemon restarts and reapply).
+- Pass `pixels: 0` to release a previous reservation.
+- The reserved area is applied **before** the `outer-gaps` inset, so the two
+  compose: a 32 px top reservation plus 8 px outer-gaps gives 40 px of clearance
+  from the monitor edge to the first tile.
+- `monitor_id` is accepted but ignored in v1 — the reservation is global across
+  all monitors.  Per-monitor reservations are planned for a future release.
+
+**`wiri-ctl` equivalent:**
+```
+wiri-ctl reserve-area top 32
+wiri-ctl reserve-area top 0     # release
+```
+
+---
+
 ### aurora / crest integration checklist
 
 1. Open `\\.\pipe\wiri_control` with `GENERIC_READ | GENERIC_WRITE`.

@@ -542,6 +542,18 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
         "status_bar" | "status-bar" => {
             config.layout.status_bar = value == "true" || value == "1";
         }
+        "reserve_top" | "reserve-top" => {
+            if let Ok(v) = value.parse() { config.layout.reserve_top = v; }
+        }
+        "reserve_bottom" | "reserve-bottom" => {
+            if let Ok(v) = value.parse() { config.layout.reserve_bottom = v; }
+        }
+        "reserve_left" | "reserve-left" => {
+            if let Ok(v) = value.parse() { config.layout.reserve_left = v; }
+        }
+        "reserve_right" | "reserve-right" => {
+            if let Ok(v) = value.parse() { config.layout.reserve_right = v; }
+        }
         _ => {}
     }
 }

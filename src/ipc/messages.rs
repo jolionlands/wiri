@@ -364,6 +364,31 @@ pub enum IpcMessage {
     /// hotkey registration.
     #[serde(rename = "get_bindings")]
     GetBindings,
+
+    /// Reserve screen-edge pixels for an external bar or panel.
+    ///
+    /// `side` must be one of `"top"`, `"bottom"`, `"left"`, `"right"`.
+    /// `pixels` is the number of logical pixels to subtract from each
+    /// monitor's tiling work area on that edge.  Pass `pixels: 0` to release
+    /// a previous reservation.
+    ///
+    /// `monitor_id` is accepted but ignored in v1 (reservation is global).
+    ///
+    /// The reservation is **in-memory only** — it is not written to
+    /// `config.kdl` and is reset when wiri restarts.  External bars should
+    /// re-issue this message on every wiri reconnect.
+    #[serde(rename = "reserve_area")]
+    ReserveArea {
+        /// Which edge to reserve: `"top"` | `"bottom"` | `"left"` | `"right"`.
+        side: String,
+        /// Number of pixels to reserve on that edge.
+        pixels: u32,
+        /// Optional monitor ID (numeric). Currently ignored — reservation
+        /// applies globally to all monitors.
+        // TODO(audit): per-monitor reservations
+        #[serde(default)]
+        monitor_id: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1146,6 +1146,30 @@ impl IpcServer {
                     .collect();
                 serde_json::json!({"success": true, "result": entries})
             }
+            IpcMessage::ReserveArea { side, pixels, monitor_id: _ } => {
+                // TODO(audit): per-monitor reservations (monitor_id ignored for v1)
+                info!("IPC: ReserveArea side={} pixels={}", side, pixels);
+                if let Some(engine) = &self.engine {
+                    let mut new_config = engine.read().config().clone();
+                    match side.as_str() {
+                        "top" => new_config.reserve_top = pixels,
+                        "bottom" => new_config.reserve_bottom = pixels,
+                        "left" => new_config.reserve_left = pixels,
+                        "right" => new_config.reserve_right = pixels,
+                        _ => return serde_json::json!({
+                            "success": false,
+                            "error": format!("invalid side {:?}: expected top | bottom | left | right", side),
+                        }),
+                    }
+                    engine.write().update_config(new_config);
+                    if let Some(backend) = &self.backend {
+                        engine.write().apply_all(backend);
+                    }
+                    serde_json::json!({"success": true})
+                } else {
+                    serde_json::json!({"success": false, "error": "engine not initialised"})
+                }
+            }
             IpcMessage::CaptureWindow { window_hwnd, path } => {
                 info!("IPC: CaptureWindow hwnd={} path={:?}", window_hwnd, path);
                 // Validate that the HWND is one of the tracked windows so we
