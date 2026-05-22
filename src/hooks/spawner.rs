@@ -11,8 +11,8 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetProcessId, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
-    STARTUPINFOW, PROCESS_INFORMATION,
+    CreateProcessW, GetProcessId, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    DETACHED_PROCESS, STARTUPINFOW, PROCESS_INFORMATION,
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -64,10 +64,16 @@ impl Spawner {
             si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
             let mut pi = PROCESS_INFORMATION::default();
 
+            // CREATE_NO_WINDOW = suppress the cmd console window that would
+            // otherwise appear for console-subsystem children (e.g. wiri-ctl,
+            // any user script that resolves to a .bat / .cmd / console exe).
+            // DETACHED_PROCESS already implies no console for the child, but
+            // some console-subsystem exes will still allocate one if launched
+            // without CREATE_NO_WINDOW, so we add both for safety.
             let creation_flags = if detached {
-                DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT
+                DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
             } else {
-                CREATE_UNICODE_ENVIRONMENT
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
             };
 
             let program_wide: Vec<u16> = OsStr::new(program)
@@ -122,10 +128,16 @@ impl Spawner {
             si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
             let mut pi = PROCESS_INFORMATION::default();
 
+            // CREATE_NO_WINDOW = suppress the cmd console window that would
+            // otherwise appear for console-subsystem children (e.g. wiri-ctl,
+            // any user script that resolves to a .bat / .cmd / console exe).
+            // DETACHED_PROCESS already implies no console for the child, but
+            // some console-subsystem exes will still allocate one if launched
+            // without CREATE_NO_WINDOW, so we add both for safety.
             let creation_flags = if detached {
-                DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT
+                DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
             } else {
-                CREATE_UNICODE_ENVIRONMENT
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
             };
 
             let program_wide: Vec<u16> = OsStr::new(program)
