@@ -22,9 +22,10 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromWindow, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos,
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
     IsWindowVisible, IsWindow, MoveWindow, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SWP_NOMOVE,
+    HDWP, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SWP_NOMOVE,
     SWP_ASYNCWINDOWPOS, SWP_NOCOPYBITS, SHOW_WINDOW_CMD, SW_MINIMIZE, SW_MAXIMIZE, SW_RESTORE, WM_CLOSE,
 };
 use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_INVALIDATE, RDW_ALLCHILDREN, RDW_UPDATENOW};
@@ -82,6 +83,17 @@ pub enum BackendEvent {
     WindowMoveResizeStart { hwnd: isize },
     /// Fires when the user finishes a manual move/resize via window chrome.
     WindowMoveResizeEnd { hwnd: isize },
+    /// Fires when a window enters the urgent / attention-demanding state.
+    /// Sourced from EVENT_SYSTEM_ALERT (FlashWindow / FlashWindowEx) and
+    /// EVENT_OBJECT_STATECHANGE (accessibility alert state).  `urgent: true`
+    /// means "now flashing"; callers should highlight the window in the
+    /// taskbar / border.  `urgent: false` is emitted when the engine focuses
+    /// the window (i.e. the user has acknowledged it).
+    WindowUrgent { hwnd: isize, urgent: bool },
+    /// Fired on EVENT_SYSTEM_FOREGROUND for a window that was previously
+    /// in the urgent set — signals that the urgent state was implicitly
+    /// cleared by the user switching to that window.
+    WindowUrgentCleared { hwnd: isize },
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +527,75 @@ impl BackendHandle {
         Err(anyhow::anyhow!("Failed to position window {}", hwnd))
     }
 
+    /// Position multiple windows atomically in a single render frame.
+    ///
+    /// Uses `BeginDeferWindowPos` / `DeferWindowPos` / `EndDeferWindowPos` under
+    /// the hood. Failures for individual windows are logged but do not abort the
+    /// whole batch. Returns the number of windows successfully deferred.
+    pub fn set_window_positions_batched(
+        &self,
+        positions: &[(isize, Rect, SET_WINDOW_POS_FLAGS)],
+    ) -> usize {
+        let n = positions.len();
+        if n == 0 { return 0; }
+
+        let hdwp_initial = unsafe { BeginDeferWindowPos(n as i32) };
+        let mut hdwp = match hdwp_initial {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
+                // Fall back to one-by-one positioning.
+                let mut applied = 0;
+                for (hwnd, rect, flags) in positions {
+                    if self.set_window_position(*hwnd, *rect, *flags).is_ok() {
+                        applied += 1;
+                    }
+                }
+                return applied;
+            }
+        };
+
+        let mut count = 0;
+        for (hwnd, rect, flags) in positions {
+            let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
+            // DeferWindowPos returns a new HDWP that incorporates this change.
+            // We feed each new HDWP back in.
+            let result = unsafe {
+                DeferWindowPos(
+                    hdwp,
+                    hwnd_win,
+                    HWND_TOP,
+                    rect.loc.x,
+                    rect.loc.y,
+                    rect.size.w as i32,
+                    rect.size.h as i32,
+                    *flags | SWP_NOCOPYBITS,
+                )
+            };
+            match result {
+                Ok(new_hdwp) if !new_hdwp.is_invalid() => {
+                    hdwp = new_hdwp;
+                    self.mark_self_applied(*hwnd);
+                    count += 1;
+                }
+                _ => {
+                    debug!("DeferWindowPos failed for hwnd={}", hwnd);
+                }
+            }
+        }
+
+        // Commit the entire batch atomically.
+        if let Err(e) = unsafe { EndDeferWindowPos(hdwp) } {
+            warn!("EndDeferWindowPos failed: {:?}", e);
+        }
+
+        // Trigger redraws AFTER commit so apps see the final size.
+        for (hwnd, _, _) in positions {
+            let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
+            request_redraw(hwnd_win);
+        }
+
+        count
+    }
 
     pub fn show_window(&self, hwnd: isize, show: bool) -> Result<()> {
         unsafe {

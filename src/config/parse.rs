@@ -47,6 +47,7 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                     transform: "normal".to_string(),
                     enable: true,
                     layout_override: None,
+                    mod_key: None,
                 });
             } else if section_name == "output.layout" && depth == 0 {
                 // Defensive: top-level `output.layout` cannot happen because
@@ -221,6 +222,7 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
             transform: "normal".to_string(),
             enable: true,
             layout_override: None,
+            mod_key: None,
         });
     }
 
@@ -537,6 +539,9 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
         "smart_borders" | "smart-borders" | "border_smart" | "border-smart" | "smart" => {
             config.layout.smart_borders = value == "true" || value == "1";
         }
+        "status_bar" | "status-bar" => {
+            config.layout.status_bar = value == "true" || value == "1";
+        }
         _ => {}
     }
 }
@@ -609,6 +614,12 @@ fn apply_output_property(key: &str, value: &str, out: &mut OutputConfig) {
         }
         "primary" => {
             out.primary = value == "true" || value == "1";
+        }
+        "mod-key" | "mod_key" => {
+            // Per-monitor modifier override (niri parity).  Stored as-is for
+            // future monitor-scoped IPC use.  Global hotkeys are not affected —
+            // Windows registers them per-thread, not per-display.
+            out.mod_key = Some(value.trim().trim_matches('"').to_string());
         }
         _ => {}
     }
@@ -2151,5 +2162,48 @@ output "HDMI-1" {
 }"##;
         let cfg_low = parse_kdl_config(input_low).unwrap();
         assert!((cfg_low.output[0].scale - 0.25).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-monitor mod-key parsing (Item 2 — niri parity)
+    // -----------------------------------------------------------------------
+
+    /// `output "DP-1" { mod-key "super" }` populates `OutputConfig.mod_key`.
+    #[test]
+    fn test_output_config_mod_key_parsing() {
+        let input = r##"output "DP-1" {
+    mod-key "super"
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        assert_eq!(cfg.output.len(), 1);
+        assert_eq!(
+            cfg.output[0].mod_key.as_deref(),
+            Some("super"),
+            "mod-key should be stored verbatim (without quotes)",
+        );
+    }
+
+    /// The underscore alias `mod_key` also parses correctly.
+    #[test]
+    fn test_output_config_mod_key_underscore_alias() {
+        let input = r##"output "HDMI-1" {
+    mod_key "ctrl-alt"
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        assert_eq!(cfg.output[0].mod_key.as_deref(), Some("ctrl-alt"));
+    }
+
+    /// An output block without `mod-key` leaves the field as `None`.
+    #[test]
+    fn test_output_config_mod_key_absent_stays_none() {
+        let input = r##"output "DP-2" {
+    x 1920
+    y 0
+}"##;
+        let cfg = parse_kdl_config(input).unwrap();
+        assert!(
+            cfg.output[0].mod_key.is_none(),
+            "mod_key should be None when not specified in output block",
+        );
     }
 }

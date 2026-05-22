@@ -185,10 +185,49 @@ impl Default for Column {
     }
 }
 
+/// Per-workspace layout algorithm (Item 5 — niri-parity).
+///
+/// `Scrolling`  — default niri-style horizontal scroll.
+/// `BStack`     — bottom-stack: first column takes 50% width, remaining
+///                columns split the right 50% stacked vertically.
+/// `Spiral`     — golden-ratio recursive bisection: alternating horizontal/vertical
+///                splits produce a spiral arrangement where each tile takes half of
+///                the remaining rectangle. Implemented in
+///                `TilingEngine::calculate_positions_spiral`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceLayout {
+    /// Default: horizontal scrollable tiling (niri-style).
+    Scrolling,
+    /// Main-on-left, rest stacked vertically on the right half.
+    BStack,
+    /// Golden-ratio recursive bisection — alternating H/V splits.
+    Spiral,
+}
+
+impl Default for WorkspaceLayout {
+    fn default() -> Self {
+        WorkspaceLayout::Scrolling
+    }
+}
+
+impl WorkspaceLayout {
+    /// Parse a layout-mode string from config (case-insensitive).
+    /// Unknown strings fall back to `Scrolling`.
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "bstack" | "bottom-stack" | "bottomstack" => WorkspaceLayout::BStack,
+            "spiral" => WorkspaceLayout::Spiral,
+            _ => WorkspaceLayout::Scrolling,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub columns: Vec<Column>,
     pub scroll_offset: Point,
+    /// Per-workspace layout algorithm; defaults to `Scrolling`.
+    pub layout_mode: WorkspaceLayout,
 }
 
 impl Workspace {
@@ -196,6 +235,16 @@ impl Workspace {
         Self {
             columns: Vec::new(),
             scroll_offset: Point::default(),
+            layout_mode: WorkspaceLayout::Scrolling,
+        }
+    }
+
+    /// Create a new workspace with an explicit layout mode.
+    pub fn with_layout(layout_mode: WorkspaceLayout) -> Self {
+        Self {
+            columns: Vec::new(),
+            scroll_offset: Point::default(),
+            layout_mode,
         }
     }
 
@@ -852,6 +901,31 @@ mod tests {
         // Fresh tile has never sent a configure, so intent = ShouldSend.
         use super::super::ConfigureIntent;
         assert_eq!(tile.configure_intent(), ConfigureIntent::ShouldSend);
+    }
+
+    // --- Item 5: WorkspaceLayout ---
+
+    #[test]
+    fn test_workspace_layout_mode_default_is_scrolling() {
+        let ws = Workspace::new();
+        assert_eq!(ws.layout_mode, WorkspaceLayout::Scrolling);
+    }
+
+    #[test]
+    fn test_workspace_layout_from_str() {
+        assert_eq!(WorkspaceLayout::from_str("bstack"), WorkspaceLayout::BStack);
+        assert_eq!(WorkspaceLayout::from_str("bottom-stack"), WorkspaceLayout::BStack);
+        assert_eq!(WorkspaceLayout::from_str("spiral"), WorkspaceLayout::Spiral);
+        assert_eq!(WorkspaceLayout::from_str("tile"), WorkspaceLayout::Scrolling);
+        assert_eq!(WorkspaceLayout::from_str(""), WorkspaceLayout::Scrolling);
+        assert_eq!(WorkspaceLayout::from_str("BSTACK"), WorkspaceLayout::BStack);
+    }
+
+    #[test]
+    fn test_workspace_with_layout() {
+        let ws = Workspace::with_layout(WorkspaceLayout::BStack);
+        assert_eq!(ws.layout_mode, WorkspaceLayout::BStack);
+        assert!(ws.columns.is_empty());
     }
 
 }

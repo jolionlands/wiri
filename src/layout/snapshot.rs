@@ -133,6 +133,56 @@ fn snapshot_column(col: &Column) -> SnapshotColumn {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Item 1 — Layout preset types (focused-workspace snapshot / restore)
+// ---------------------------------------------------------------------------
+
+/// A snapshot of one column within a [`WorkspaceSnapshot`].
+///
+/// `display` encodes the [`crate::layout::workspace::ColumnDisplay`] variant
+/// as a string: `"stacked"` or `"tabbed:<active_tab_index>"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnSnapshot {
+    /// Explicit width override in pixels; `None` means "use layout default".
+    pub width: Option<u32>,
+    /// Encoded display mode: `"stacked"` or `"tabbed:<idx>"`.
+    pub display: String,
+    /// Ordered list of HWND values for the tiles in this column.
+    pub tiles: Vec<isize>,
+}
+
+/// A snapshot of one workspace within a [`LayoutSnapshot`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    /// Workspace id (0-based integer key).
+    pub id: i32,
+    /// Columns in left-to-right order.
+    pub columns: Vec<ColumnSnapshot>,
+    /// Horizontal scroll offset at the time of the snapshot.
+    #[serde(default)]
+    pub scroll_offset_x: i32,
+}
+
+/// A lightweight IPC-facing layout snapshot that covers one or more workspaces
+/// on the *focused monitor*.
+///
+/// This is distinct from the full [`Snapshot`] type (which covers all monitors
+/// and is used for on-disk persistence).  `LayoutSnapshot` is the type
+/// returned by [`crate::layout::engine::TilingEngine::snapshot_current_workspace`]
+/// and consumed by
+/// [`crate::layout::engine::TilingEngine::restore_snapshot`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutSnapshot {
+    /// Workspaces captured in this snapshot.  Typically contains exactly one
+    /// entry (the currently active workspace) but the format allows multiple
+    /// for future multi-workspace preset support.
+    pub workspaces: Vec<WorkspaceSnapshot>,
+    /// The workspace that should be made active after restore.  `None` leaves
+    /// the current active workspace unchanged.
+    #[serde(default)]
+    pub focused_workspace: Option<i32>,
+}
+
 /// Resolve the directory that holds snapshot files.
 ///
 /// Order: `WIRI_SNAPSHOT_DIR` env var, then `%APPDATA%\wiri\snapshots`,

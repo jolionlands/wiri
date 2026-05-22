@@ -17,6 +17,7 @@
 
 use crate::input::Action;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -358,6 +359,81 @@ static TOUCH_STATE: LazyLock<Mutex<Option<TouchHookState>>> =
     LazyLock::new(|| Mutex::new(None));
 
 // ---------------------------------------------------------------------------
+// Three-finger swipe — parallel pointer accumulator
+// ---------------------------------------------------------------------------
+
+/// Per-pointer record for the 3-finger swipe accumulator. Independent of
+/// `GestureRecognizer` so the two-finger pinch path and the three-finger
+/// swipe path do not interfere.
+#[derive(Debug, Clone)]
+struct ActivePointer {
+    /// Mirrors the HashMap key; retained here so the struct is self-contained
+    /// and logging doesn't require the caller to thread the key through.
+    #[allow(dead_code)]
+    pointer_id: u32,
+    /// Screen-space pixel location at WM_POINTERDOWN time.
+    start: POINT,
+    /// Wall-clock time of the down event. Used to enforce the 300 ms lift
+    /// window: if the oldest pointer's down happened more than 300 ms before
+    /// the last lift, the gesture is discarded.
+    start_time: Instant,
+}
+
+/// All pointers currently in the down state, keyed by pointer id. The hook
+/// callback updates this on WM_POINTERDOWN and WM_POINTERUP. When the count
+/// transitions from 3 → 0 (i.e. the third finger lifts) we evaluate the
+/// aggregate displacement and possibly emit a 3-finger swipe gesture.
+static ACTIVE_POINTERS: LazyLock<Mutex<HashMap<u32, ActivePointer>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Scratch accumulator for the displacement of pointers that lifted in the
+/// current gesture cycle: `(start_point, end_point, down_time)`.
+/// Cleared when a new down event arrives while the active map is empty
+/// (start of a fresh gesture).
+static LIFTED_POINTERS: LazyLock<Mutex<Vec<(POINT, POINT, Instant)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+// ---------------------------------------------------------------------------
+// Optional action sender (for dispatch beyond the pending-action queue)
+// ---------------------------------------------------------------------------
+
+/// Wrapper so `tokio::sync::mpsc::UnboundedSender<Action>` is `Sync`.
+struct SendSender(tokio::sync::mpsc::UnboundedSender<Action>);
+// SAFETY: UnboundedSender is already Send; we only ever access it under the
+// Mutex so Sync is fine here.
+unsafe impl Sync for SendSender {}
+
+static ACTION_SENDER: LazyLock<Mutex<Option<SendSender>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Wire a tokio mpsc sender so the hook can dispatch gestures to the main
+/// event loop directly. Optional — if not set, gestures are still queued via
+/// `push_pending_action` and available via `take_pending_actions`.
+#[allow(dead_code)]
+pub fn set_action_sender(tx: tokio::sync::mpsc::UnboundedSender<Action>) {
+    *ACTION_SENDER.lock() = Some(SendSender(tx));
+}
+
+/// Dispatch `action` to the wired sender if available, otherwise fall back
+/// to the pending-action queue. This function is safe to call from the hook
+/// callback thread (the Mutex ensures mutual exclusion, and the sender is
+/// `Send`).
+fn dispatch_action(action: Action) {
+    // Try the mpsc sender first so the engine receives it without polling delay.
+    let sent = {
+        let guard = ACTION_SENDER.lock();
+        if let Some(SendSender(ref tx)) = *guard {
+            tx.send(action.clone()).is_ok()
+        } else {
+            false
+        }
+    };
+    if !sent {
+        push_pending_action(action);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -458,6 +534,85 @@ unsafe extern "system" fn touch_hook_callback(
             let mut info = PointerInfo::zeroed();
             if GetPointerInfo(pid, &mut info) != 0 {
                 let pt = info.pt_pixel_location;
+
+                // ── Three-finger swipe accumulator ──────────────────────────
+                // Maintained in parallel with GestureRecognizer (which handles
+                // 1-finger swipe / 2-finger pinch) so the two paths don't
+                // interfere.
+                match msg.message {
+                    WM_POINTERDOWN => {
+                        let mut active = ACTIVE_POINTERS.lock();
+                        // Start of a completely new gesture: clear the lifted
+                        // accumulator so displacement from old fingers doesn't
+                        // pollute the new gesture.
+                        if active.is_empty() {
+                            LIFTED_POINTERS.lock().clear();
+                        }
+                        active.insert(pid, ActivePointer {
+                            pointer_id: pid,
+                            start: pt,
+                            start_time: Instant::now(),
+                        });
+                    }
+                    WM_POINTERUP => {
+                        let removed = ACTIVE_POINTERS.lock().remove(&pid);
+                        if let Some(ap) = removed {
+                            // Record (start, end, down_time) triple for swipe
+                            // measurement and gesture-window enforcement.
+                            LIFTED_POINTERS.lock().push((ap.start, pt, ap.start_time));
+                        }
+
+                        // Evaluate 3-finger swipe when all pointers have lifted
+                        // and exactly 3 were involved.
+                        let active_empty = ACTIVE_POINTERS.lock().is_empty();
+                        if active_empty {
+                            let lifted = {
+                                let mut l = LIFTED_POINTERS.lock();
+                                std::mem::take(&mut *l)
+                            };
+                            if lifted.len() == 3 {
+                                // Enforce the 300 ms gesture window: all fingers
+                                // must have come down within THREE_FINGER_WINDOW_MS
+                                // of each other (oldest → youngest down time).
+                                let now = Instant::now();
+                                let oldest = lifted
+                                    .iter()
+                                    .map(|(_, _, t)| *t)
+                                    .min()
+                                    .unwrap_or(now);
+                                let window_ok = now
+                                    .duration_since(oldest)
+                                    .as_millis()
+                                    <= THREE_FINGER_WINDOW_MS as u128;
+                                if window_ok {
+                                    // Strip the timestamp for evaluate_three_finger_swipe.
+                                    let pairs: Vec<(POINT, POINT)> = lifted
+                                        .iter()
+                                        .map(|(s, e, _)| (*s, *e))
+                                        .collect();
+                                    if let Some(gesture) = evaluate_three_finger_swipe(&pairs) {
+                                        info!("touch: 3-finger gesture detected = {:?}", gesture);
+                                        let action = TOUCH_STATE
+                                            .lock()
+                                            .as_ref()
+                                            .and_then(|s| s.config.gestures.get(&gesture).cloned());
+                                        if let Some(action) = action {
+                                            info!("touch: 3-finger {:?} -> action {:?}", gesture, action);
+                                            dispatch_action(action);
+                                        } else {
+                                            info!("touch: 3-finger {:?} (no action bound)", gesture);
+                                        }
+                                    }
+                                } else {
+                                    debug!("touch: 3-finger gesture discarded (outside {}ms window)", THREE_FINGER_WINDOW_MS);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                // ── GestureRecognizer (1-finger swipe + 2-finger pinch) ──────
                 if let Some(state) = TOUCH_STATE.lock().as_mut() {
                     let gesture: Option<TouchGesture> = match msg.message {
                         WM_POINTERDOWN => {
@@ -481,7 +636,7 @@ unsafe extern "system" fn touch_hook_callback(
                         debug!("touch: gesture detected = {:?}", g);
                         if let Some(action) = state.config.gestures.get(&g) {
                             info!("touch gesture {:?} -> action {:?}", g, action);
-                            push_pending_action(action.clone());
+                            dispatch_action(action.clone());
                         }
                     }
                 }
@@ -495,6 +650,66 @@ unsafe extern "system" fn touch_hook_callback(
     }
 
     CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+// ---------------------------------------------------------------------------
+// Three-finger swipe evaluation
+// ---------------------------------------------------------------------------
+
+/// Maximum time between the oldest down event and the last lift for the
+/// group to qualify as a single gesture.
+const THREE_FINGER_WINDOW_MS: u64 = 300;
+
+/// Evaluate a completed 3-finger lift to determine if it constitutes a swipe.
+///
+/// `lifted` is a slice of `(start_point, end_point)` pairs, one per pointer,
+/// ordered by lift time. Returns `None` if the average displacement is below
+/// `SWIPE_THRESHOLD_PX` or if the direction is ambiguous.
+///
+/// This function is pure (no global state reads) so it can be exercised in
+/// unit tests without Win32.
+fn evaluate_three_finger_swipe(lifted: &[(POINT, POINT)]) -> Option<TouchGesture> {
+    debug_assert_eq!(lifted.len(), 3, "caller must ensure exactly 3 lifted pointers");
+
+    // Compute average displacement across the three fingers.
+    let mut sum_dx: i64 = 0;
+    let mut sum_dy: i64 = 0;
+    for (start, end) in lifted {
+        sum_dx += (end.x - start.x) as i64;
+        sum_dy += (end.y - start.y) as i64;
+    }
+    let avg_dx = sum_dx / 3;
+    let avg_dy = sum_dy / 3;
+
+    // Use a fixed threshold of 50 px (matching the default swipe_threshold_px).
+    // Callers that want a configurable threshold can wrap this at the call site.
+    const THRESHOLD: i64 = 50;
+
+    let abs_dx = avg_dx.abs();
+    let abs_dy = avg_dy.abs();
+
+    if abs_dx < THRESHOLD && abs_dy < THRESHOLD {
+        // Displacement too small — not a deliberate swipe.
+        return None;
+    }
+
+    // Require the dominant axis to be at least 2× the minor axis to avoid
+    // diagionals being mis-classified.
+    if abs_dx > abs_dy {
+        // Horizontal swipe.
+        if avg_dx > 0 {
+            Some(TouchGesture::SwipeRight)
+        } else {
+            Some(TouchGesture::SwipeLeft)
+        }
+    } else {
+        // Vertical swipe.
+        if avg_dy > 0 {
+            Some(TouchGesture::SwipeDown)
+        } else {
+            Some(TouchGesture::SwipeUp)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +877,85 @@ mod tests {
         assert_eq!(
             cfg.gestures.get(&TouchGesture::PinchIn),
             Some(&Action::OverviewToggle)
+        );
+    }
+
+    // ── Three-finger swipe tests ────────────────────────────────────────────
+    // These exercise `evaluate_three_finger_swipe` directly; no Win32 needed.
+
+    /// Three fingers swiping right → SwipeRight.
+    #[test]
+    fn test_three_finger_swipe_right() {
+        // Each finger starts at x=10 and ends at x=100; all move 90 px right.
+        // avg_dx = 90, avg_dy = 0 — well above the 50 px threshold.
+        let lifted = vec![
+            (make_point(10, 100), make_point(100, 102)),
+            (make_point(10, 200), make_point(100, 201)),
+            (make_point(10, 300), make_point(100, 299)),
+        ];
+        assert_eq!(
+            evaluate_three_finger_swipe(&lifted),
+            Some(TouchGesture::SwipeRight),
+            "three fingers moving right should produce SwipeRight"
+        );
+    }
+
+    /// Displacement below the threshold → no gesture.
+    #[test]
+    fn test_three_finger_swipe_too_short_returns_none() {
+        // Each finger moves only 10 px right — below the 50 px threshold.
+        let lifted = vec![
+            (make_point(50, 100), make_point(60, 100)),
+            (make_point(50, 200), make_point(60, 200)),
+            (make_point(50, 300), make_point(60, 300)),
+        ];
+        assert_eq!(
+            evaluate_three_finger_swipe(&lifted),
+            None,
+            "displacement below threshold must not produce a gesture"
+        );
+    }
+
+    /// Three fingers swiping up → SwipeUp.
+    #[test]
+    fn test_three_finger_swipe_up() {
+        // Each finger moves 80 px upward (negative dy).
+        let lifted = vec![
+            (make_point(100, 300), make_point(102, 220)),
+            (make_point(200, 300), make_point(201, 220)),
+            (make_point(300, 300), make_point(299, 220)),
+        ];
+        assert_eq!(
+            evaluate_three_finger_swipe(&lifted),
+            Some(TouchGesture::SwipeUp),
+        );
+    }
+
+    /// Three fingers swiping down → SwipeDown.
+    #[test]
+    fn test_three_finger_swipe_down() {
+        let lifted = vec![
+            (make_point(100, 100), make_point(100, 200)),
+            (make_point(200, 100), make_point(200, 200)),
+            (make_point(300, 100), make_point(300, 200)),
+        ];
+        assert_eq!(
+            evaluate_three_finger_swipe(&lifted),
+            Some(TouchGesture::SwipeDown),
+        );
+    }
+
+    /// Three fingers swiping left → SwipeLeft.
+    #[test]
+    fn test_three_finger_swipe_left() {
+        let lifted = vec![
+            (make_point(200, 100), make_point(100, 100)),
+            (make_point(200, 200), make_point(100, 200)),
+            (make_point(200, 300), make_point(100, 300)),
+        ];
+        assert_eq!(
+            evaluate_three_finger_swipe(&lifted),
+            Some(TouchGesture::SwipeLeft),
         );
     }
 }

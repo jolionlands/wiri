@@ -6,7 +6,9 @@ pub mod snap;
 pub mod snapshot;
 
 pub use workspace::{Workspace, Column, ColumnDisplay, Tile, compute_column_layout, compute_workspace_layout};
+pub use workspace::{WorkspaceLayout};
 pub use floating::{FloatManager, FloatWindow};
+pub use floating::FloatingCorner;
 pub use engine::TilingEngine;
 pub use engine::LayoutConfig;
 pub use engine::ColumnWidthMode;

@@ -171,6 +171,37 @@ impl ResizeGrab {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Column reorder grab (Item 3 — drag-to-reorder columns)
+// ---------------------------------------------------------------------------
+
+/// Pixels from the top of a tile that constitute the "column header" hit-zone.
+/// When a move-grab starts inside this strip AND `Ctrl` is held, we enter
+/// column-reorder mode instead of floating mode.
+pub const COLUMN_REORDER_HIT_ZONE_PX: i32 = 32;
+
+/// Grab state for column drag-reorder.
+///
+/// The user holds Ctrl+Alt and drags a tiled window near its top edge.
+/// Instead of floating the window, the grab tracks the source column index.
+/// On mouse-up, `TilingEngine::swap_columns` is called with the column that
+/// the cursor is currently over as the destination.
+#[derive(Debug, Clone)]
+pub struct ColumnReorderGrab {
+    /// Window being dragged (used for visual feedback / reference only).
+    pub window_id: WindowId,
+    /// Column index of the dragged window when the grab started.
+    pub source_col: usize,
+    /// Cursor position when the grab started (used for a drag-threshold).
+    pub initial_cursor: Point,
+}
+
+impl ColumnReorderGrab {
+    pub fn new(window_id: WindowId, source_col: usize, cursor: Point) -> Self {
+        Self { window_id, source_col, initial_cursor: cursor }
+    }
+}
+
 /// Determines the resize edge from a hit-test position relative to the window.
 ///
 /// Returns `None` if the point lies outside the window rect entirely, preventing

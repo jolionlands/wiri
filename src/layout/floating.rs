@@ -6,6 +6,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE,
 };
 
+/// PiP corner snap destinations (Item 3 — niri-parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatingCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Center,
+}
+
 #[derive(Debug, Clone)]
 pub struct FloatWindow {
     pub window_id: WindowId,
@@ -119,6 +129,48 @@ impl FloatManager {
         None
     }
 
+    /// Compute a snapped `Rect` for `window_id` at the given `corner` of `work_rect`.
+    /// The window's current size is preserved; the returned rect is clamped inside
+    /// `work_rect` with a fixed 24-pixel margin from each edge.
+    /// Returns `None` when the window is not tracked.
+    pub fn snap_to_corner(
+        &mut self,
+        window_id: WindowId,
+        corner: FloatingCorner,
+        work_rect: Rect,
+        win_size: Size,
+    ) -> Rect {
+        let margin: i32 = 24;
+        let (x, y) = match corner {
+            FloatingCorner::TopLeft => (
+                work_rect.loc.x + margin,
+                work_rect.loc.y + margin,
+            ),
+            FloatingCorner::TopRight => (
+                work_rect.loc.x + work_rect.size.w as i32 - win_size.w as i32 - margin,
+                work_rect.loc.y + margin,
+            ),
+            FloatingCorner::BottomLeft => (
+                work_rect.loc.x + margin,
+                work_rect.loc.y + work_rect.size.h as i32 - win_size.h as i32 - margin,
+            ),
+            FloatingCorner::BottomRight => (
+                work_rect.loc.x + work_rect.size.w as i32 - win_size.w as i32 - margin,
+                work_rect.loc.y + work_rect.size.h as i32 - win_size.h as i32 - margin,
+            ),
+            FloatingCorner::Center => (
+                work_rect.loc.x + (work_rect.size.w as i32 - win_size.w as i32) / 2,
+                work_rect.loc.y + (work_rect.size.h as i32 - win_size.h as i32) / 2,
+            ),
+        };
+        let snapped = Rect::new(x, y, win_size.w, win_size.h);
+        // Update the stored rect if this window is tracked.
+        if let Some(fw) = self.windows.get_mut(&window_id) {
+            fw.rect = snapped;
+        }
+        snapped
+    }
+
     pub fn adjust_to_output(&mut self, output_rect: Rect) {
         for float in self.windows.values_mut() {
             if !output_rect.intersects(float.rect) {
@@ -174,5 +226,70 @@ mod tests {
         assert_eq!(fm.find_window_at(Point::new(50, 50)), Some(WindowId::new(1)));
         assert_eq!(fm.find_window_at(Point::new(250, 250)), Some(WindowId::new(2)));
         assert_eq!(fm.find_window_at(Point::new(150, 150)), None);
+    }
+
+    // --- Item 3: PiP corner snap ---
+
+    #[test]
+    fn test_floating_snap_top_left() {
+        let mut fm = FloatManager::new();
+        let win_size = crate::utils::Size::new(320, 180);
+        // work_rect: full 1920×1080 at origin
+        let work_rect = Rect::new(0, 0, 1920, 1080);
+        let wid = WindowId::new(42);
+        fm.insert(wid, Rect::new(500, 500, win_size.w, win_size.h));
+
+        let snapped = fm.snap_to_corner(wid, FloatingCorner::TopLeft, work_rect, win_size);
+
+        // Expected: margin=24 from top-left
+        assert_eq!(snapped.loc.x, 24, "x should be 24 (left margin)");
+        assert_eq!(snapped.loc.y, 24, "y should be 24 (top margin)");
+        assert_eq!(snapped.size.w, win_size.w, "width preserved");
+        assert_eq!(snapped.size.h, win_size.h, "height preserved");
+        // Stored rect is also updated
+        assert_eq!(fm.get(wid).unwrap().rect.loc.x, 24);
+    }
+
+    #[test]
+    fn test_floating_snap_bottom_right() {
+        let mut fm = FloatManager::new();
+        let win_size = crate::utils::Size::new(400, 300);
+        let work_rect = Rect::new(0, 0, 1920, 1080);
+        let wid = WindowId::new(7);
+        fm.insert(wid, Rect::new(0, 0, win_size.w, win_size.h));
+
+        let snapped = fm.snap_to_corner(wid, FloatingCorner::BottomRight, work_rect, win_size);
+
+        // Expected: 1920 - 400 - 24 = 1496, 1080 - 300 - 24 = 756
+        assert_eq!(snapped.loc.x, 1496);
+        assert_eq!(snapped.loc.y, 756);
+    }
+
+    #[test]
+    fn test_floating_snap_center() {
+        let mut fm = FloatManager::new();
+        let win_size = crate::utils::Size::new(200, 100);
+        let work_rect = Rect::new(0, 0, 1920, 1080);
+        let wid = WindowId::new(9);
+        fm.insert(wid, Rect::new(0, 0, win_size.w, win_size.h));
+
+        let snapped = fm.snap_to_corner(wid, FloatingCorner::Center, work_rect, win_size);
+
+        // (1920 - 200) / 2 = 860, (1080 - 100) / 2 = 490
+        assert_eq!(snapped.loc.x, 860);
+        assert_eq!(snapped.loc.y, 490);
+    }
+
+    #[test]
+    fn test_floating_snap_untracked_window_returns_rect() {
+        // snap_to_corner on an untracked window_id just returns the rect without panic.
+        let mut fm = FloatManager::new();
+        let win_size = crate::utils::Size::new(100, 100);
+        let work_rect = Rect::new(0, 0, 1920, 1080);
+        let wid = WindowId::new(999);
+        // Not inserted — snap_to_corner must not panic.
+        let snapped = fm.snap_to_corner(wid, FloatingCorner::TopRight, work_rect, win_size);
+        // x = 1920 - 100 - 24 = 1796
+        assert_eq!(snapped.loc.x, 1796);
     }
 }

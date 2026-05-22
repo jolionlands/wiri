@@ -100,11 +100,29 @@ enum Commands {
     /// Request wiri to quit
     Quit,
 
-    /// Subscribe to events (stream mode)
+    /// Subscribe to events (stream mode).
+    ///
+    /// By default prints a human-readable summary line per event.
+    /// Pass --stream to emit raw newline-delimited JSON (pipe-safe, jq-friendly).
+    /// Pass --filter to receive only certain event types.
     Events {
-        /// Event types to subscribe to (comma-separated)
-        #[arg(short, long, default_value = "*")]
+        /// Event types to subscribe to (comma-separated, legacy alias for --filter).
+        /// Kept for backwards compatibility; prefer --filter.
+        #[arg(short, long, default_value = "*", hide = true)]
         types: String,
+
+        /// Emit raw newline-delimited JSON instead of the human-readable summary.
+        /// Each line is one complete JSON object. Third-party scripts should use
+        /// this flag so the output is stable and pipe-safe.
+        #[arg(long)]
+        stream: bool,
+
+        /// Comma-separated list of event types to subscribe to.
+        /// When provided, only the listed types are delivered by the daemon.
+        /// Overrides --types when both are supplied.
+        /// Example: --filter workspace_switched,window_focused
+        #[arg(long, value_name = "TYPES")]
+        filter: Option<String>,
     },
 
     /// Move the focused window to the given workspace
@@ -247,6 +265,39 @@ enum Commands {
     /// niri parity: swap the focused workspace with the one below on the
     /// same monitor.
     MoveWorkspaceDown,
+
+    // ---- Round-4 ----
+
+    /// Toggle sticky (visible on all workspaces) for the focused window.
+    ToggleSticky,
+
+    /// Set the active workspace's layout (scrolling | bstack | spiral).
+    SetWorkspaceLayout { mode: String },
+
+    /// Rename a workspace by its numeric id.
+    RenameWorkspace { workspace_id: i32, name: String },
+
+    /// Screenshot a window (or the focused window when --hwnd is omitted).
+    ScreenshotWindow {
+        /// HWND of the window to capture. Defaults to the focused window.
+        #[arg(long)]
+        hwnd: Option<i64>,
+        /// Output path for the BMP file. Defaults to the Pictures folder.
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Get the currently focused window, workspace, and monitor.
+    GetFocus,
+
+    /// List all workspaces with their names and window counts.
+    GetWorkspaceList,
+
+    /// List all live key-bindings as a human-readable chord table.
+    /// Shows what the running daemon actually registered with Windows
+    /// (after `RegisterHotKey`), including any custom binds from config.
+    /// Pass --json for the raw JSON array.
+    Bindings,
 }
 
 fn main() -> Result<()> {
@@ -254,8 +305,13 @@ fn main() -> Result<()> {
 
     // SubscribeEvents has bespoke streaming behaviour — handle it before the
     // single-request/response path below.
-    if let Commands::Events { types } = &cli.command {
-        return stream_events(types, cli.timeout, cli.json);
+    if let Commands::Events { types, stream, filter } = &cli.command {
+        // --filter takes precedence over the legacy --types flag.
+        let effective_types = filter.as_deref().unwrap_or(types.as_str());
+        // --stream or --json both select raw newline-delimited JSON output;
+        // --stream is the preferred flag for documentation purposes.
+        let raw_output = *stream || cli.json;
+        return stream_events(effective_types, cli.timeout, raw_output);
     }
 
     // validate-config is a pure-local operation — no IPC, no running daemon
@@ -298,7 +354,7 @@ fn main() -> Result<()> {
         }
         Commands::ReloadConfig => IpcMessage::ReloadConfig,
         Commands::Quit => IpcMessage::Quit,
-        Commands::Events { .. } => unreachable!("handled above"),
+        Commands::Events { .. } => unreachable!("events handled above before IPC dial"),
         Commands::MoveWindowToWorkspace { workspace_id } => {
             IpcMessage::MoveWindowToWorkspace { workspace_id }
         }
@@ -344,6 +400,18 @@ fn main() -> Result<()> {
         Commands::MoveColumnDown => IpcMessage::MoveColumnToWorkspaceDown,
         Commands::MoveWorkspaceUp => IpcMessage::MoveWorkspaceUp,
         Commands::MoveWorkspaceDown => IpcMessage::MoveWorkspaceDown,
+        Commands::ToggleSticky => IpcMessage::ToggleSticky,
+        Commands::SetWorkspaceLayout { mode } => IpcMessage::SetWorkspaceLayout { mode },
+        Commands::RenameWorkspace { workspace_id, name } => {
+            IpcMessage::RenameWorkspace { workspace_id, name }
+        }
+        Commands::ScreenshotWindow { hwnd, path } => IpcMessage::ScreenshotWindow {
+            hwnd: hwnd.map(|h| h as isize),
+            path,
+        },
+        Commands::GetFocus => IpcMessage::GetFocus,
+        Commands::GetWorkspaceList => IpcMessage::GetWorkspaceList,
+        Commands::Bindings => IpcMessage::GetBindings,
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;
@@ -555,6 +623,7 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 println!("Resize mode: OFF");
             }
         }
+        IpcMessage::GetBindings => print_bindings_table(resp),
         _ => {
             // Generic: report success with a hint when present.
             if let Some(note) = resp.get("note").and_then(|v| v.as_str()) {
@@ -762,17 +831,152 @@ fn print_bindings(resp: &serde_json::Value) {
     println!("  Windows hotkey conflicts that may swallow your chord.");
 }
 
+/// Format the response to `GetBindings` (`wiri-ctl bindings`) as a
+/// two-column chord+action table.  When the daemon returns an empty list
+/// (hotkey thread not yet started), print the hardcoded defaults instead.
+fn print_bindings_table(resp: &serde_json::Value) {
+    let entries = resp
+        .get("result")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if entries.is_empty() {
+        println!("No live bindings reported by the daemon.");
+        println!("(Hotkey thread may not have started yet — try again in a moment.)");
+        println!();
+        println!("Default bindings (Ctrl+Alt prefix):");
+        println!();
+        print_default_bindings_table();
+        return;
+    }
+
+    let chord_w = 26usize;
+    let action_w = 40usize;
+
+    println!(
+        "  {:<cw$}  {}",
+        "Chord", "Action",
+        cw = chord_w
+    );
+    println!(
+        "  {:<cw$}  {}",
+        "─".repeat(chord_w), "─".repeat(action_w),
+        cw = chord_w
+    );
+
+    for e in &entries {
+        let chord  = e.get("chord").and_then(|v| v.as_str()).unwrap_or("?");
+        let action = e.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+        println!(
+            "  {:<cw$}  {}",
+            truncate(chord, chord_w),
+            truncate(action, action_w),
+            cw = chord_w
+        );
+    }
+
+    println!();
+    println!("  {} binding{} registered.", entries.len(), if entries.len() == 1 { "" } else { "s" });
+}
+
+/// Print the hardcoded default bindings table as a fallback (no daemon needed).
+fn print_default_bindings_table() {
+    // Mirror of `default_bindings_table("Ctrl+Alt")` in overlay/bindings_cheatsheet.rs.
+    let p = "Ctrl+Alt";
+    let s = "Ctrl+Alt+Shift";
+    let defaults: &[(&str, &str)] = &[
+        ("Ctrl+Alt+Left",         "focus-column-left"),
+        ("Ctrl+Alt+Right",        "focus-column-right"),
+        ("Ctrl+Alt+Up",           "focus-up"),
+        ("Ctrl+Alt+Down",         "focus-down"),
+        (&format!("{}+Left", s),  "move-column-left"),
+        (&format!("{}+Right", s), "move-column-right"),
+        (&format!("{}+Q", p),     "close-window"),
+        (&format!("{}+Enter", p), "spawn (terminal)"),
+        (&format!("{}+F", p),     "toggle-fullscreen"),
+        (&format!("{}+T", p),     "toggle-floating"),
+        (&format!("{}+H", p),     "scroll-left"),
+        (&format!("{}+L", p),     "scroll-right"),
+        (&format!("{}+Q", s),     "quit"),
+        (&format!("{}+Space", p), "overview-toggle"),
+        ("Escape",                "exit overview / resize mode"),
+        (&format!("{}+O", p),     "overview-select"),
+        (&format!("{}+\\", p),    "column-toggle-tabbed"),
+        (&format!("{}+]", p),     "tab-next"),
+        (&format!("{}+[", p),     "tab-prev"),
+        (&format!("{}+1…9", p),   "focus-workspace-N"),
+        (&format!("{}+1…9", s),   "move-to-workspace-N"),
+        (&format!("{}+PageUp", p),    "focus-workspace-previous"),
+        (&format!("{}+PageDown", p),  "focus-workspace-next"),
+        (&format!("{}+R", p),     "enter-resize-mode"),
+        (&format!("{}+R", s),     "center-column"),
+        (&format!("{}+W", p),     "column-width-cycle"),
+        (&format!("{}+-", p),     "resize-column-left"),
+        (&format!("{}++", p),     "resize-column-right"),
+        (&format!("{}+Tab", p),   "focus-previous (alt-tab)"),
+        (&format!("{}+P", p),     "screenshot"),
+        (&format!("{}+A", p),     "toggle-always-on-top"),
+        (&format!("{}+,", p),     "consume-window-into-column"),
+        (&format!("{}+.", p),     "expel-window-from-column"),
+        (&format!("{}+E", p),     "expand-column-to-available"),
+        (&format!("{}+F", s),     "maximize-column"),
+        (&format!("{}+L", s),     "grow-column-width"),
+        (&format!("{}+H", s),     "shrink-column-width"),
+        (&format!("{}+K", s),     "grow-tile-height"),
+        (&format!("{}+J", s),     "shrink-tile-height"),
+        (&format!("{}+PageUp", s),    "move-workspace-up"),
+        (&format!("{}+PageDown", s),  "move-workspace-down"),
+        (&format!("{}+Up", s),    "move-column-to-workspace-up"),
+        (&format!("{}+Down", s),  "move-column-to-workspace-down"),
+        (&format!("{}+,", s),     "move-column-to-monitor-left"),
+        (&format!("{}+.", s),     "move-column-to-monitor-right"),
+        (&format!("{}+S", p),     "toggle-sticky"),
+        (&format!("{}+?", s),     "show-key-bindings (cheatsheet)"),
+    ];
+
+    let chord_w = 28usize;
+    let action_w = 36usize;
+    println!(
+        "  {:<cw$}  {}",
+        "Chord", "Action",
+        cw = chord_w
+    );
+    println!(
+        "  {:<cw$}  {}",
+        "─".repeat(chord_w), "─".repeat(action_w),
+        cw = chord_w
+    );
+    for (chord, action) in defaults {
+        println!("  {:<cw$}  {}", truncate(chord, chord_w), action, cw = chord_w);
+    }
+    println!();
+    println!("  {} built-in bindings.", defaults.len());
+}
+
 // ---------------------------------------------------------------------------
 // Event streaming
 // ---------------------------------------------------------------------------
 
 /// Subscribe to the daemon's event broadcast channel and print events as they
-/// arrive.  Each event is printed as a single line, prefixed with a wall-clock
-/// timestamp.  Pass `--json` to dump the raw event JSON instead.
-fn stream_events(types: &str, timeout_secs: u64, json: bool) -> Result<()> {
-    let message = IpcMessage::SubscribeEvents {
-        event_types: types.split(',').map(|s| s.trim().to_string()).collect(),
+/// arrive.
+///
+/// `raw`: when `true` (selected by `--stream` or `--json`), each event is
+/// printed as a single compact JSON object terminated by `\n` — exactly as
+/// received from the daemon, so the output is safe to pipe into `jq` or any
+/// line-oriented JSON consumer.
+///
+/// When `raw` is `false` (the default), each event is printed as a
+/// human-readable summary line prefixed with a wall-clock timestamp.
+fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
+    // Parse the effective event-types list.  Empty string or "*" means all.
+    let event_types: Vec<String> = if types.is_empty() || types == "*" {
+        vec![]
+    } else {
+        types.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
     };
+
+    let message = IpcMessage::SubscribeEvents { event_types: event_types.clone() };
 
     let pipe_wide: Vec<u16> = OsStr::new(PIPE_PATH)
         .encode_wide()
@@ -804,7 +1008,13 @@ fn stream_events(types: &str, timeout_secs: u64, json: bool) -> Result<()> {
     file.write_all(&data)?;
     file.flush()?;
 
-    eprintln!("Subscribed to events ({}). Press Ctrl+C to exit.", types);
+    let filter_desc = if event_types.is_empty() {
+        "all types".to_string()
+    } else {
+        event_types.join(",")
+    };
+    let mode_desc = if raw { "newline-delimited JSON" } else { "human-readable" };
+    eprintln!("Subscribed to events ({}) [{}]. Press Ctrl+C to exit.", filter_desc, mode_desc);
 
     // The server streams length-implicit JSON objects back-to-back; serde_json
     // tolerates concatenated values in a Deserializer stream.
@@ -816,7 +1026,10 @@ fn stream_events(types: &str, timeout_secs: u64, json: bool) -> Result<()> {
                 if value.get("subscription_id").is_some() {
                     continue;
                 }
-                if json {
+                if raw {
+                    // Emit compact JSON followed by a newline.
+                    // Do NOT pretty-print: third-party consumers (jq, etc.)
+                    // expect one object per line.
                     println!("{}", serde_json::to_string(&value)?);
                 } else {
                     println!("{}", format_event(&value));

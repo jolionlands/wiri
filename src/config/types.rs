@@ -28,6 +28,7 @@ impl Default for Config {
                 transform: "normal".to_string(),
                 enable: true,
                 layout_override: None,
+                mod_key: None,
             }],
             layout: LayoutConfig::default_config(),
             workspace: Vec::new(),
@@ -212,6 +213,13 @@ pub struct OutputConfig {
     /// is consumed by `main.rs` when it computes the effective per-monitor
     /// layout config at engine-startup / config-reload time.
     pub layout_override: Option<LayoutConfigPartial>,
+    /// Per-monitor mod-key override (niri parity).  `None` means "use the
+    /// global `input.mod-key` value".  When `Some`, this string overrides the
+    /// modifier prefix for monitor-scoped IPC actions such as
+    /// `focus-monitor-by-prefix`.  Global hotkeys are NOT affected because
+    /// Windows registers hotkeys per-thread, not per-display; see the
+    /// `build_hotkey_list` comment in `backend/message_loop.rs` for details.
+    pub mod_key: Option<String>,
 }
 
 /// Optional-per-field mirror of `LayoutConfig` used by per-output overrides
@@ -368,6 +376,11 @@ pub struct LayoutConfig {
     /// `false` to preserve historical behaviour — opt-in via
     /// `border-smart true` or `border { smart true }` in `config.kdl`.
     pub smart_borders: bool,
+    /// Show a thin status bar at the top of the primary monitor.  Displays the
+    /// current workspace label (left), focused window title (centre), and the
+    /// local time (right).  Opt-in via `status-bar true` inside `layout { }`.
+    /// Default `false`.
+    pub status_bar: bool,
 }
 
 impl LayoutConfig {
@@ -402,6 +415,7 @@ impl LayoutConfig {
             snap_on_drag: true,
             snap_threshold_px: 20,
             smart_borders: false,
+            status_bar: false,
         }
     }
 
@@ -1359,5 +1373,39 @@ mod tests {
         let wrong_proc = ctx_full("Mozilla", "About:Mozilla", Some("main"), Some("chrome.exe"));
         assert!(rule.matches(&ok));
         assert!(!rule.matches(&wrong_proc));
+    }
+
+    /// `OutputConfig.mod_key` defaults to `None` and accepts a `Some` override.
+    /// This exercises the struct field directly; the config-parser path is
+    /// exercised by `test_output_config_mod_key_parsing` in `config/parse.rs`.
+    #[test]
+    fn test_output_config_mod_key_field_defaults_none() {
+        let cfg = Config::default();
+        let out = &cfg.output[0];
+        assert!(
+            out.mod_key.is_none(),
+            "OutputConfig.mod_key should default to None (use global input.mod-key)",
+        );
+    }
+
+    #[test]
+    fn test_output_config_mod_key_field_can_be_set() {
+        let mut out = OutputConfig {
+            name: "DP-1".to_string(),
+            position: Position::default(),
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            mode: String::new(),
+            vrr: false,
+            primary: false,
+            transform: "normal".to_string(),
+            enable: true,
+            layout_override: None,
+            mod_key: None,
+        };
+        assert!(out.mod_key.is_none());
+        out.mod_key = Some("super".to_string());
+        assert_eq!(out.mod_key.as_deref(), Some("super"));
     }
 }

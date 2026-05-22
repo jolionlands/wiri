@@ -3,17 +3,30 @@
 //! Uses `SetWindowsHookExW(WH_MOUSE_LL, ...)` to intercept all mouse input
 //! globally. When a grab is active (user is dragging a window), the hook
 //! consumes mouse events and dispatches them to the grab handler.
+//!
+//! ## Double-Alt keyboard hook
+//!
+//! A companion `WH_KEYBOARD_LL` hook is installed by `start_keyboard_hook` /
+//! stopped by `stop_keyboard_hook`.  It tracks consecutive Alt key-down
+//! events: when two Alt presses arrive within `DOUBLE_TAP_WINDOW_MS` (250 ms)
+//! with no intervening non-Alt key, `Action::OverviewToggle` is fired via the
+//! action-sender channel wired by `set_keyboard_action_sender`.
+//!
+//! The hook is a **pass-through**: it calls `CallNextHookEx` for every event
+//! and only consumes the very last Alt-down that completes a double-tap
+//! (by returning `LRESULT(1)` for that single event).
 
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx,
-    WH_MOUSE_LL, MSLLHOOKSTRUCT, HHOOK,
+    WH_MOUSE_LL, WH_KEYBOARD_LL, MSLLHOOKSTRUCT, KBDLLHOOKSTRUCT, HHOOK,
 };
 
-use crate::input::grab::{MoveGrab, ResizeGrab};
+use crate::input::grab::{MoveGrab, ResizeGrab, ColumnReorderGrab, COLUMN_REORDER_HIT_ZONE_PX};
 use crate::utils::{Point, Rect, WindowId};
 use crate::backend::BackendHandle;
 use crate::layout::TilingEngine;
@@ -27,6 +40,18 @@ const WM_RBUTTONDOWN: u32 = 0x0204;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 
+// WM_ keyboard messages used by the double-Alt hook
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_KEYUP: u32 = 0x0101;
+const WM_SYSKEYUP: u32 = 0x0105;
+
+/// Virtual key code for the Alt key (either left or right Alt).
+const VK_MENU: u32 = 0x12;
+
+/// Maximum gap between two Alt key-down events that counts as a double-tap (ms).
+const DOUBLE_TAP_WINDOW_MS: u128 = 250;
+
 /// Global grab state — what kind of interactive operation is active
 #[derive(Debug, Clone)]
 pub enum GrabState {
@@ -36,6 +61,10 @@ pub enum GrabState {
     Move(MoveGrab),
     /// Resizing a window by dragging an edge
     Resize(ResizeGrab),
+    /// Dragging a column to reorder it (Ctrl+Alt+Left-click on the top strip
+    /// of a tiled window).  On mouse-up the source and destination columns are
+    /// swapped via `TilingEngine::swap_columns`.
+    ColumnReorder(ColumnReorderGrab),
 }
 
 impl Default for GrabState {
@@ -64,6 +93,30 @@ static HOOK_STATE: LazyLock<Mutex<HookState>> = LazyLock::new(|| {
 static HOOK_HANDLE: LazyLock<Mutex<Option<SendHook>>> = LazyLock::new(|| {
     Mutex::new(None)
 });
+
+// ---------------------------------------------------------------------------
+// Keyboard hook — double-Alt detection
+// ---------------------------------------------------------------------------
+
+/// Handle for the installed `WH_KEYBOARD_LL` hook.
+static KB_HOOK_HANDLE: LazyLock<Mutex<Option<SendHook>>> = LazyLock::new(|| {
+    Mutex::new(None)
+});
+
+/// Timestamp of the last Alt key-down event.  `None` means the chain was
+/// broken (another key was pressed) or no Alt has been seen yet.
+static LAST_ALT_DOWN: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| {
+    Mutex::new(None)
+});
+
+/// Whether the previous Alt-down is still being held (haven't seen an Alt-up yet).
+/// Used to distinguish a held Alt from a fresh second tap.
+static ALT_HELD: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
+
+/// Optional sender for `Action` values produced by the keyboard hook.
+/// Wired by `set_keyboard_action_sender`.
+static KB_ACTION_TX: LazyLock<Mutex<Option<std::sync::mpsc::Sender<crate::input::Action>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Start the low-level mouse hook. Must be called from a thread with a message pump.
 /// Guard against double-install: if the hook is already active, logs a warning and returns.
@@ -113,6 +166,127 @@ pub fn stop_mouse_hook() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keyboard hook — double-Alt detection
+// ---------------------------------------------------------------------------
+
+/// Wire an `Action` sender so the keyboard hook can fire `OverviewToggle`
+/// when a double-Alt is detected.  Must be called before `start_keyboard_hook`.
+pub fn set_keyboard_action_sender(tx: std::sync::mpsc::Sender<crate::input::Action>) {
+    *KB_ACTION_TX.lock() = Some(tx);
+}
+
+/// Install the low-level keyboard hook for double-Alt detection.
+///
+/// Must be called from a thread that runs a Win32 message loop (the hook
+/// callback is driven by `GetMessage` / `DispatchMessage`).  Safe to call
+/// again after `stop_keyboard_hook` — a fresh hook is installed.  Calling
+/// while already installed logs a warning and returns without re-installing.
+pub fn start_keyboard_hook() -> Result<(), String> {
+    if KB_HOOK_HANDLE.lock().is_some() {
+        warn!("keyboard hook already installed; skipping duplicate SetWindowsHookExW");
+        return Ok(());
+    }
+
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(keyboard_hook_callback),
+            windows::Win32::Foundation::HMODULE::default(),
+            0,
+        )
+    };
+
+    match hook {
+        Ok(h) => {
+            *KB_HOOK_HANDLE.lock() = Some(SendHook(h));
+            info!("Low-level keyboard hook installed (double-Alt detection)");
+            Ok(())
+        }
+        Err(e) => {
+            Err(format!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {:?}", e))
+        }
+    }
+}
+
+/// Uninstall the low-level keyboard hook.
+pub fn stop_keyboard_hook() {
+    if let Some(h) = KB_HOOK_HANDLE.lock().take() {
+        unsafe { let _ = UnhookWindowsHookEx(h.0); }
+        info!("Low-level keyboard hook removed");
+    }
+}
+
+/// Low-level keyboard hook callback.
+///
+/// Pass-through for all keys except Alt.  On Alt-down:
+/// - If `LAST_ALT_DOWN` is set, `ALT_HELD` is false, and elapsed < 250 ms →
+///   double-tap detected: fire `Action::OverviewToggle`, clear the timestamp,
+///   and consume the event (`LRESULT(1)`).
+/// - Otherwise, record the timestamp and pass through.
+///
+/// On any non-Alt key-down: clear `LAST_ALT_DOWN` (breaks the chain).
+unsafe extern "system" fn keyboard_hook_callback(
+    n_code: i32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if n_code < 0 {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
+
+    let msg = w_param.0 as u32;
+    let kb = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
+    let vk = kb.vkCode;
+
+    let is_key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    let is_key_up   = msg == WM_KEYUP   || msg == WM_SYSKEYUP;
+
+    if is_key_down {
+        if vk == VK_MENU {
+            // Alt key-down event.
+            let mut last = LAST_ALT_DOWN.lock();
+            let mut held = ALT_HELD.lock();
+
+            if let Some(prev) = *last {
+                // There was a previous Alt-down.  Check that:
+                //   1. The key was released between the two presses (!held).
+                //   2. The gap is within the double-tap window.
+                if !*held && prev.elapsed().as_millis() < DOUBLE_TAP_WINDOW_MS {
+                    // Double-tap confirmed.
+                    *last = None;
+                    *held = false;
+                    drop(last);
+                    drop(held);
+                    // Fire OverviewToggle.
+                    if let Some(tx) = KB_ACTION_TX.lock().as_ref() {
+                        let _ = tx.send(crate::input::Action::OverviewToggle);
+                    }
+                    // Consume this Alt-down so the system doesn't act on it.
+                    return LRESULT(1);
+                } else {
+                    // Chain broken or gap too large — start fresh.
+                    *last = Some(Instant::now());
+                    *held = true;
+                }
+            } else {
+                // First Alt-down.
+                *last = Some(Instant::now());
+                *held = true;
+            }
+        } else {
+            // Any non-Alt key-down breaks the double-tap chain.
+            *LAST_ALT_DOWN.lock() = None;
+            *ALT_HELD.lock() = false;
+        }
+    } else if is_key_up && vk == VK_MENU {
+        // Alt released — mark as not held so the next Alt-down can complete a double-tap.
+        *ALT_HELD.lock() = false;
+    }
+
+    CallNextHookEx(None, n_code, w_param, l_param)
+}
+
 /// Start a move grab (called when Alt+LButton is pressed on a tiled window)
 pub fn begin_move_grab(grab: MoveGrab) {
     info!("Starting move grab for window {:?}", grab.window_id);
@@ -123,6 +297,16 @@ pub fn begin_move_grab(grab: MoveGrab) {
 pub fn begin_resize_grab(grab: ResizeGrab) {
     info!("Starting resize grab for window {:?}", grab.window_id);
     HOOK_STATE.lock().grab = GrabState::Resize(grab);
+}
+
+/// Start a column-reorder grab (called when Ctrl+Alt+LButton is pressed on
+/// the top strip of a tiled window).
+pub fn begin_column_reorder_grab(grab: ColumnReorderGrab) {
+    info!(
+        "Starting column-reorder grab for window {:?} (source col {})",
+        grab.window_id, grab.source_col
+    );
+    HOOK_STATE.lock().grab = GrabState::ColumnReorder(grab);
 }
 
 /// Cancel any active grab
@@ -182,13 +366,17 @@ unsafe extern "system" fn mouse_hook_callback(
     let hook_struct = &*(l_param.0 as *const MSLLHOOKSTRUCT);
     let cursor = Point::new(hook_struct.pt.x, hook_struct.pt.y);
 
-    // --- WM_MOUSEWHEEL: scroll the workspace horizontally when the configured
-    // modifier (Alt by default) is held. We let normal wheel events through to
-    // the app under cursor by returning CallNextHookEx unmodified. The wheel
-    // delta lives in the HIWORD of mouseData (signed); a positive delta means
-    // the wheel rolled forward (away from user) which we map to scroll-right
-    // when `natural_scroll = false`. We never intercept when no grab is active
-    // AND no modifier is held to avoid breaking in-app scrolling.
+    // --- WM_MOUSEWHEEL: two modifier-gated behaviours:
+    //
+    //   Ctrl+Alt held → workspace navigation (round-4 parity).
+    //     Wheel forward (positive delta) = FocusWorkspacePrevious.
+    //     Wheel backward (negative delta) = FocusWorkspaceNext.
+    //     TODO: gate behind MouseFocusConfig.wheel_workspace_nav (default true).
+    //
+    //   Alt-only held → horizontal column scroll (existing behaviour).
+    //     Respects natural_scroll and scroll_speed from input config.
+    //
+    //   No modifier held → fall through to the app under the cursor.
     if msg == WM_MOUSEWHEEL {
         let alt_held: bool = unsafe {
             let vk: i16 = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
@@ -199,12 +387,49 @@ unsafe extern "system" fn mouse_hook_callback(
         if !alt_held {
             return CallNextHookEx(None, n_code, w_param, l_param);
         }
+
         // mouseData high-word = signed wheel delta (multiples of WHEEL_DELTA=120)
         let raw = hook_struct.mouseData as i32;
         let delta = (raw >> 16) as i16 as i32;
         if delta == 0 {
             return CallNextHookEx(None, n_code, w_param, l_param);
         }
+
+        // Check if Ctrl is ALSO held → workspace navigation.
+        let ctrl_held: bool = unsafe {
+            let vk: i16 = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+                windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32,
+            );
+            (vk as u16 & 0x8000) != 0
+        };
+
+        if ctrl_held {
+            // Ctrl+Alt+Wheel → switch workspace.
+            // Positive (forward) = previous workspace; negative (back) = next.
+            // TODO: gate on MouseFocusConfig.wheel_workspace_nav (default true).
+            let state = HOOK_STATE.lock();
+            if let (Some(engine), Some(backend)) = (&state.engine, &state.backend) {
+                let engine = engine.clone();
+                let backend = backend.clone();
+                drop(state);
+                if delta > 0 {
+                    engine.write().focus_workspace_relative(
+                        crate::layout::WorkspaceDirection::Previous,
+                        &backend,
+                    );
+                } else {
+                    engine.write().focus_workspace_relative(
+                        crate::layout::WorkspaceDirection::Next,
+                        &backend,
+                    );
+                }
+                engine.write().apply_all(&backend);
+            }
+            // Consume the event — do not forward to the app under the cursor.
+            return LRESULT(1);
+        }
+
+        // Alt-only held → horizontal column scroll (existing behaviour).
         let mouse_cfg = crate::input::mouse_runtime_config();
         // Invert direction when natural_scroll is enabled (touchpad convention).
         let effective_delta = if mouse_cfg.natural_scroll { -delta } else { delta };
@@ -249,6 +474,14 @@ unsafe extern "system" fn mouse_hook_callback(
             };
 
             if alt_held {
+                // Check whether Ctrl is also held — used for column-reorder mode.
+                let ctrl_held: bool = unsafe {
+                    let vk: i16 = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+                        windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32,
+                    );
+                    (vk as u16 & 0x8000) != 0
+                };
+
                 let hwnd_at_cursor = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(
                         POINT { x: cursor.x, y: cursor.y },
@@ -270,6 +503,21 @@ unsafe extern "system" fn mouse_hook_callback(
                                         .find_map(|m| m.workspace()
                                             .and_then(|w| w.find_window_column(wid)))
                                         .unwrap_or(0);
+
+                                    // Ctrl+Alt+LButton on the top strip of the tile →
+                                    // column-reorder mode.  The hit-zone is the top
+                                    // COLUMN_REORDER_HIT_ZONE_PX pixels of the tile.
+                                    if ctrl_held
+                                        && cursor.y >= pos.y
+                                        && cursor.y <= pos.y + COLUMN_REORDER_HIT_ZONE_PX
+                                    {
+                                        let grab = ColumnReorderGrab::new(wid, col_idx, cursor);
+                                        drop(eng);
+                                        drop(state);
+                                        begin_column_reorder_grab(grab);
+                                        return LRESULT(1);
+                                    }
+
                                     let grab = MoveGrab::new(wid, cursor, pos, size, col_idx);
                                     drop(eng);
                                     drop(state);
@@ -460,6 +708,41 @@ unsafe extern "system" fn mouse_hook_callback(
                     }
                     drop(state);
                     HOOK_STATE.lock().grab = GrabState::None;
+                    LRESULT(1)
+                }
+                _ => CallNextHookEx(None, n_code, w_param, l_param),
+            }
+        }
+        GrabState::ColumnReorder(grab) => {
+            match msg {
+                WM_MOUSEMOVE => {
+                    // No visual feedback in this minimal implementation — the
+                    // snap-guide overlay from MoveGrab covers the reorder case
+                    // adequately. Pass through so the cursor remains responsive.
+                    CallNextHookEx(None, n_code, w_param, l_param)
+                }
+                WM_LBUTTONUP => {
+                    let src = grab.source_col;
+                    info!(
+                        "Column-reorder grab finished: source col {} cursor {:?}",
+                        src, cursor
+                    );
+
+                    // Extract engine + backend references before clearing the grab
+                    // so we don't need to re-lock HOOK_STATE after the clear.
+                    let (maybe_engine, maybe_backend) = {
+                        let state = HOOK_STATE.lock();
+                        (state.engine.clone(), state.backend.clone())
+                    };
+                    HOOK_STATE.lock().grab = GrabState::None;
+
+                    // Find which column the cursor is over and swap.
+                    if let (Some(engine), Some(backend)) = (maybe_engine, maybe_backend) {
+                        let dst = engine.read().column_at_x(cursor.x);
+                        if let Some(dst_col) = dst {
+                            engine.write().swap_columns(src, dst_col, &backend);
+                        }
+                    }
                     LRESULT(1)
                 }
                 _ => CallNextHookEx(None, n_code, w_param, l_param),

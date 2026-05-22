@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Gdi::{
     EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor, HFONT,
     PAINTSTRUCT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
 };
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW,
     GetMessageW, GetSystemMetrics, KillTimer, MSG, PostQuitMessage,
@@ -140,14 +141,20 @@ impl WorkspaceIndicator {
     }
 }
 
-/// Centre an HWND of `OVERLAY_W × OVERLAY_H` at the top of either the
+/// Centre an HWND (already DPI-scaled at creation) at the top of either the
 /// supplied monitor bounds or — when `bounds` is None — the primary monitor.
+///
+/// The window was sized with `OVERLAY_W × OVERLAY_H` scaled by
+/// `primary_monitor_scale()`, so centering uses those same scaled dimensions.
+/// `SWP_NOSIZE` preserves the created size — we only move, not resize.
 fn reposition_to_monitor(hwnd: HWND, bounds: Option<MonitorBounds>) {
+    let scale = primary_monitor_scale();
+    let scaled_w = (OVERLAY_W as f64 * scale) as i32;
     let (x, y) = match bounds {
-        Some(b) => (b.x + (b.w - OVERLAY_W) / 2, b.y + 24),
+        Some(b) => (b.x + (b.w - scaled_w) / 2, b.y + 24),
         None => {
             let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-            ((screen_w - OVERLAY_W) / 2, 24)
+            ((screen_w - scaled_w) / 2, 24)
         }
     };
     unsafe {
@@ -175,6 +182,24 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Return the DPI scale factor for the primary monitor.
+///
+/// Uses `GetDpiForSystem()` (available since Windows 8.1 / DPIAWARE V1).  On
+/// older platforms where the call is unavailable the function returns 1.0 so
+/// all callers degrade gracefully to the 96-DPI baseline.
+///
+/// `96` is the "100% scale" DPI baseline defined by Windows; a 200% display
+/// therefore has system DPI = 192, giving a scale factor of 2.0.
+fn primary_monitor_scale() -> f64 {
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 {
+        // Unsupported or pre-Vista — fall back to 1.0 (96 DPI baseline).
+        1.0
+    } else {
+        dpi as f64 / 96.0
+    }
+}
+
 fn run_window_loop(state: Arc<IndicatorState>) {
     unsafe {
         // ----- Register window class ----------------------------------------
@@ -192,11 +217,19 @@ fn run_window_loop(state: Arc<IndicatorState>) {
         };
         RegisterClassExW(&wc);
 
+        // ----- Compute DPI-scaled dimensions --------------------------------
+        // On a 200% display the process receives physical coordinates
+        // (PER_MONITOR_AWARE_V2), so OVERLAY_W/H must be scaled up so the
+        // overlay looks the same physical size regardless of DPI setting.
+        let scale = primary_monitor_scale();
+        let scaled_w = (OVERLAY_W as f64 * scale) as i32;
+        let scaled_h = (OVERLAY_H as f64 * scale) as i32;
+
         // ----- Compute initial position --------------------------------------
         // We default to the primary monitor; show_at()/show_internal() will
         // reposition before each fade-in if a monitor bounds was supplied.
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let x = (screen_w - OVERLAY_W) / 2;
+        let x = (screen_w - scaled_w) / 2;
         let y = 24;
 
         // ----- Create layered, topmost, no-activate popup --------------------
@@ -218,8 +251,8 @@ fn run_window_loop(state: Arc<IndicatorState>) {
             WS_POPUP,
             x,
             y,
-            OVERLAY_W,
-            OVERLAY_H,
+            scaled_w,
+            scaled_h,
             None,
             None,
             hinstance,
@@ -300,18 +333,25 @@ unsafe extern "system" fn wnd_proc(
             // Background: dark charcoal rounded-looking rectangle.
             // Win32 GDI doesn't do GPU rounded-rects cheaply so we fill a plain
             // rect; visual rounding is done via the window alpha channel.
+            // Scale the rect to the DPI-aware window dimensions so it fills the
+            // entire client area regardless of display scale factor.
+            let scale = primary_monitor_scale();
+            let scaled_w = (OVERLAY_W as f64 * scale) as i32;
+            let scaled_h = (OVERLAY_H as f64 * scale) as i32;
             let bg_brush = CreateSolidBrush(COLORREF(0x00_1E_1E_1E)); // #1e1e1e
             let mut rc = RECT {
                 left: 0,
                 top: 0,
-                right: OVERLAY_W,
-                bottom: OVERLAY_H,
+                right: scaled_w,
+                bottom: scaled_h,
             };
             FillRect(hdc, &rc, bg_brush);
             let _ = DeleteObject(bg_brush);
 
-            // Font: 22pt bold; height negative = point size in logical units.
-            let font_height: i32 = -22;
+            // Font: 22pt bold at 96 DPI baseline; scale by the monitor DPI
+            // factor so text appears the same physical size on high-DPI displays.
+            // Negative height = point size in GDI logical units.
+            let font_height: i32 = (-22f64 * scale) as i32;
             let hfont: HFONT = CreateFontW(
                 font_height,
                 0,

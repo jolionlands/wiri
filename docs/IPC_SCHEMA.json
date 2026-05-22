@@ -1,0 +1,1078 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jolionlands/wiri/raw/main/docs/IPC_SCHEMA.json",
+  "title": "wiri IPC protocol",
+  "description": "JSON Schema for every IpcMessage request and IpcEvent variant in the wiri window manager named-pipe IPC. Both types use serde adjacent tagging: {\"type\": \"<variant>\", \"data\": {...}}.",
+  "version": "1.0",
+  "$defs": {
+
+    "WindowInfoIpc": {
+      "type": "object",
+      "description": "Per-window data returned by window_opened events and window_list responses.",
+      "required": ["hwnd", "title", "class_name", "process_id", "x", "y", "width", "height"],
+      "properties": {
+        "hwnd":        { "type": "integer", "description": "Win32 HWND (decimal)." },
+        "title":       { "type": "string",  "description": "Window title." },
+        "class_name":  { "type": "string",  "description": "Win32 window class name." },
+        "process_id":  { "type": "integer", "minimum": 0, "description": "Owning process PID." },
+        "x":           { "type": "integer", "description": "Left edge in screen pixels." },
+        "y":           { "type": "integer", "description": "Top edge in screen pixels." },
+        "width":       { "type": "integer", "minimum": 0, "description": "Width in physical pixels." },
+        "height":      { "type": "integer", "minimum": 0, "description": "Height in physical pixels." }
+      }
+    },
+
+    "WorkspaceInfo": {
+      "type": "object",
+      "description": "Summary of one workspace.",
+      "required": ["name", "id", "window_count"],
+      "properties": {
+        "name":         { "type": "string",  "description": "Human-readable workspace name." },
+        "id":           { "type": "integer", "minimum": 0, "description": "Numeric workspace id." },
+        "window_count": { "type": "integer", "minimum": 0, "description": "Number of tiled windows." }
+      }
+    },
+
+    "MonitorInfo": {
+      "type": "object",
+      "description": "Per-monitor diagnostics returned by monitor_list.",
+      "required": [
+        "output_id", "bounds_x", "bounds_y", "bounds_width", "bounds_height",
+        "work_area_x", "work_area_y", "work_area_width", "work_area_height",
+        "scale_factor", "active_workspace", "window_count", "focused"
+      ],
+      "properties": {
+        "output_id":         { "type": "integer", "description": "Deterministic 64-bit name hash (OutputId)." },
+        "bounds_x":          { "type": "integer", "description": "Left edge of physical screen rect." },
+        "bounds_y":          { "type": "integer", "description": "Top edge of physical screen rect." },
+        "bounds_width":      { "type": "integer", "minimum": 0 },
+        "bounds_height":     { "type": "integer", "minimum": 0 },
+        "work_area_x":       { "type": "integer" },
+        "work_area_y":       { "type": "integer" },
+        "work_area_width":   { "type": "integer", "minimum": 0 },
+        "work_area_height":  { "type": "integer", "minimum": 0 },
+        "scale_factor":      { "type": "number",  "description": "DPI scale (1.0 = 96 DPI, 1.5 = 144 DPI, 2.0 = 192 DPI)." },
+        "active_workspace":  { "type": "integer", "description": "Active workspace id on this monitor." },
+        "window_count":      { "type": "integer", "minimum": 0 },
+        "focused":           { "type": "boolean", "description": "True for the focused output (where new windows go)." }
+      }
+    },
+
+    "BindingInfo": {
+      "type": "object",
+      "description": "One registered hotkey binding (list_bindings / get_bindings).",
+      "required": ["id", "modifiers", "vk_code", "action", "chord"],
+      "properties": {
+        "id":        { "type": "integer", "description": "Win32 hotkey id from RegisterHotKey." },
+        "modifiers": { "type": "integer", "description": "Win32 modifier bitmask: 1=Alt, 2=Ctrl, 4=Shift, 8=Win." },
+        "vk_code":   { "type": "integer", "description": "Win32 virtual key code (e.g. 0x20 = Space)." },
+        "action":    { "type": "string",  "description": "Debug-formatted Action enum variant." },
+        "chord":     { "type": "string",  "description": "Human-readable chord, e.g. \"Ctrl+Alt+Space\"." }
+      }
+    },
+
+    "SuccessResponse": {
+      "type": "object",
+      "description": "Generic success response with no result payload.",
+      "required": ["success"],
+      "properties": {
+        "success": { "const": true },
+        "result":  {}
+      }
+    },
+
+    "ErrorResponse": {
+      "type": "object",
+      "description": "Error response returned when the daemon cannot fulfil a request.",
+      "required": ["success", "error"],
+      "properties": {
+        "success": { "const": false },
+        "error":   { "type": "string", "description": "Human-readable error description." }
+      }
+    },
+
+    "IpcResponse": {
+      "description": "Top-level response wrapper for all one-shot requests.",
+      "oneOf": [
+        { "$ref": "#/$defs/SuccessResponse" },
+        { "$ref": "#/$defs/ErrorResponse" }
+      ]
+    },
+
+    "ColumnWidthPreset": {
+      "type": "string",
+      "enum": ["1/4", "1/3", "1/2", "2/3", "3/4", "full", "cycle", "quarter", "third", "half", "two-thirds", "three-quarters", "100"],
+      "description": "Column width preset for set_column_width. Aliases: quarter=1/4, third=1/3, half=1/2, etc."
+    },
+
+    "WorkspaceLayoutMode": {
+      "type": "string",
+      "enum": ["scrolling", "bstack", "spiral"],
+      "description": "Layout algorithm for a workspace."
+    },
+
+    "MonitorDirection": {
+      "type": "string",
+      "enum": ["left", "right"],
+      "description": "Direction to an adjacent monitor."
+    },
+
+    "IpcMessage": {
+      "description": "Any request sent from a client to the wiri daemon.",
+      "oneOf": [
+
+        {
+          "description": "Force a window into the tiling layout. Un-floats it if floating. Optionally moves it to the named workspace.",
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "tile_request" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd":       { "type": "integer", "description": "Win32 HWND (decimal)." },
+                "target_workspace":  { "type": ["string", "null"], "description": "Workspace name to move to, or null." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Move a window to an absolute screen position.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_move" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd", "x", "y"],
+              "properties": {
+                "window_hwnd": { "type": "integer" },
+                "x":           { "type": "integer" },
+                "y":           { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Resize a window to explicit pixel dimensions.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_resize" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd", "width", "height"],
+              "properties": {
+                "window_hwnd": { "type": "integer" },
+                "width":       { "type": "integer", "minimum": 0 },
+                "height":      { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "List all windows currently tracked by the engine.",
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "window_list" }
+          }
+        },
+
+        {
+          "description": "Find a tracked window by title substring.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_find" },
+            "data": {
+              "type": "object",
+              "required": ["query"],
+              "properties": {
+                "query": { "type": "string" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Set keyboard focus to a specific HWND.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "focus_window" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Send WM_CLOSE to a window.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "close_window" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Float a window (remove from tiling layout).",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_float" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Return a floating window to the tiling layout.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_unfloat" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Move a specific window (by HWND) to a workspace.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_move_to_workspace" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd", "workspace_id"],
+              "properties": {
+                "window_hwnd":  { "type": "integer" },
+                "workspace_id": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "List workspaces (one per active monitor).",
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "workspace_list" }
+          }
+        },
+
+        {
+          "description": "Create a new workspace.",
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "workspace_create" },
+            "data": {
+              "type": "object",
+              "properties": {
+                "id": { "type": ["integer", "null"], "description": "Requested id; null = auto-assign." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Delete a workspace by id.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "workspace_delete" },
+            "data": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {
+                "id": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Switch the focused monitor to a workspace by id.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "switch_workspace" },
+            "data": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {
+                "id": { "type": "integer", "description": "Target workspace id (1-9 typical)." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "List saved layout presets.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "preset_list" } }
+        },
+
+        {
+          "description": "Save the current layout as a named preset.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "preset_save" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": { "name": { "type": "string" } }
+            }
+          }
+        },
+
+        {
+          "description": "Apply a saved preset.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "preset_load" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": { "name": { "type": "string" } }
+            }
+          }
+        },
+
+        {
+          "description": "Delete a saved preset.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "preset_delete" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": { "name": { "type": "string" } }
+            }
+          }
+        },
+
+        {
+          "description": "Export the current layout as JSON.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "layout_export" } }
+        },
+
+        {
+          "description": "Move the focused window to a workspace by id.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "move_window_to_workspace" },
+            "data": {
+              "type": "object",
+              "required": ["workspace_id"],
+              "properties": { "workspace_id": { "type": "integer" } }
+            }
+          }
+        },
+
+        {
+          "description": "Move the focused window to the monitor in the given direction.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "move_window_to_monitor" },
+            "data": {
+              "type": "object",
+              "required": ["direction"],
+              "properties": { "direction": { "$ref": "#/$defs/MonitorDirection" } }
+            }
+          }
+        },
+
+        {
+          "description": "Center the focused column on screen.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "center_column" } }
+        },
+
+        {
+          "description": "Set the focused column to a width preset.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "set_column_width" },
+            "data": {
+              "type": "object",
+              "required": ["preset"],
+              "properties": { "preset": { "$ref": "#/$defs/ColumnWidthPreset" } }
+            }
+          }
+        },
+
+        {
+          "description": "Resize the focused column by a pixel delta (positive = wider).",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "resize_column" },
+            "data": {
+              "type": "object",
+              "required": ["delta_px"],
+              "properties": { "delta_px": { "type": "integer" } }
+            }
+          }
+        },
+
+        {
+          "description": "Switch to the next workspace on the focused monitor (wraps).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "focus_workspace_next" } }
+        },
+
+        {
+          "description": "Switch to the previous workspace on the focused monitor (wraps).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "focus_workspace_previous" } }
+        },
+
+        {
+          "description": "Spawn an external process.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "spawn_command" },
+            "data": {
+              "type": "object",
+              "required": ["command"],
+              "properties": { "command": { "type": "string", "description": "Command line to execute." } }
+            }
+          }
+        },
+
+        {
+          "description": "Focus the previously focused window (MRU history).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "focus_previous" } }
+        },
+
+        {
+          "description": "Toggle always-on-top for the focused window.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "toggle_always_on_top" } }
+        },
+
+        {
+          "description": "Switch to a named workspace as defined in config.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "focus_workspace_named" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": { "name": { "type": "string" } }
+            }
+          }
+        },
+
+        {
+          "description": "Set the auto-tile window-count threshold. null disables auto-tile.",
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "set_auto_tile_threshold" },
+            "data": {
+              "type": "object",
+              "properties": {
+                "threshold": { "type": ["integer", "null"], "minimum": 0 }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Pull the right-adjacent tile into the focused column (niri-parity consume).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "consume_window" } }
+        },
+
+        {
+          "description": "Eject the focused tile into a new column to the right (niri-parity expel).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "expel_window" } }
+        },
+
+        {
+          "description": "Expand the focused column to fill leftover horizontal space.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "expand_column" } }
+        },
+
+        {
+          "description": "Toggle maximize (full work-area height) for the focused column.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "maximize_column" } }
+        },
+
+        {
+          "description": "Grow the focused column width by 5% of the work area.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "grow_column" } }
+        },
+
+        {
+          "description": "Shrink the focused column width by 5% of the work area.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "shrink_column" } }
+        },
+
+        {
+          "description": "Grow the focused tile height by 5% of its column.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "grow_tile" } }
+        },
+
+        {
+          "description": "Shrink the focused tile height by 5% of its column.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "shrink_tile" } }
+        },
+
+        {
+          "description": "Move the focused column wholesale to the monitor in the given direction.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "move_column_to_monitor" },
+            "data": {
+              "type": "object",
+              "required": ["direction"],
+              "properties": { "direction": { "$ref": "#/$defs/MonitorDirection" } }
+            }
+          }
+        },
+
+        {
+          "description": "Enumerate every monitor with bounds, work area, DPI scale, and workspace info.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "monitor_list" } }
+        },
+
+        {
+          "description": "List all Win32 hotkey bindings registered by the daemon (raw: id, modifiers, vk_code).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "list_bindings" } }
+        },
+
+        {
+          "description": "Return the full engine state: windows + workspaces.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "get_state" } }
+        },
+
+        {
+          "description": "Subscribe to the live event broadcast channel. Keeps the pipe open and streams events.",
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "subscribe_events" },
+            "data": {
+              "type": "object",
+              "required": ["event_types"],
+              "properties": {
+                "event_types": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Event type names to receive. Empty array or [\"*\"] = all events."
+                }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Hot-reload config.kdl without restarting the daemon.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "reload_config" } }
+        },
+
+        {
+          "description": "Gracefully shut down the wiri daemon.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "quit" } }
+        },
+
+        {
+          "description": "Capture a wiri-tracked window to a BMP file using PrintWindow(PW_RENDERFULLCONTENT).",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "capture_window" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer", "description": "Must be tracked by wiri." },
+                "path": { "type": ["string", "null"], "description": "Output BMP path; null = Pictures folder default." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Save the full monitor/workspace/column/tile layout to a named snapshot.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "save_snapshot" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": { "name": { "type": "string" } }
+            }
+          }
+        },
+
+        {
+          "description": "Restore a previously-saved snapshot. Missing HWNDs are skipped silently.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "load_snapshot" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": { "name": { "type": "string" } }
+            }
+          }
+        },
+
+        {
+          "description": "List all saved snapshot names under %APPDATA%\\wiri\\snapshots\\.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "list_snapshots" } }
+        },
+
+        {
+          "description": "Delete a saved snapshot by name.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "delete_snapshot" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": { "name": { "type": "string" } }
+            }
+          }
+        },
+
+        {
+          "description": "Toggle niri-style interactive resize mode. Returns result.active=true|false.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "toggle_resize_mode" } }
+        },
+
+        {
+          "description": "Move the focused column to the workspace above (current_workspace_id - 1). Creates the workspace if needed.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "move_column_to_workspace_up" } }
+        },
+
+        {
+          "description": "Move the focused column to the workspace below (current_workspace_id + 1).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "move_column_to_workspace_down" } }
+        },
+
+        {
+          "description": "Swap the focused workspace with the one above it on the same monitor.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "move_workspace_up" } }
+        },
+
+        {
+          "description": "Swap the focused workspace with the one below it on the same monitor.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "move_workspace_down" } }
+        },
+
+        {
+          "description": "Toggle sticky (visible on all workspaces) for the focused window.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "toggle_sticky" } }
+        },
+
+        {
+          "description": "Set the active workspace's layout mode.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "set_workspace_layout" },
+            "data": {
+              "type": "object",
+              "required": ["mode"],
+              "properties": { "mode": { "$ref": "#/$defs/WorkspaceLayoutMode" } }
+            }
+          }
+        },
+
+        {
+          "description": "Rename a workspace by its numeric id.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "rename_workspace" },
+            "data": {
+              "type": "object",
+              "required": ["workspace_id", "name"],
+              "properties": {
+                "workspace_id": { "type": "integer" },
+                "name":         { "type": "string" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Capture a window (or the focused window) to a BMP file. Less restricted than capture_window.",
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "screenshot_window" },
+            "data": {
+              "type": "object",
+              "properties": {
+                "hwnd": { "type": ["integer", "null"], "description": "null = focused window." },
+                "path": { "type": ["string", "null"], "description": "null = Pictures folder default." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Return the currently focused window, workspace, and monitor.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "get_focus" } }
+        },
+
+        {
+          "description": "List all workspaces across all monitors with names and window counts.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "get_workspace_list" } }
+        },
+
+        {
+          "description": "Return the live hotkey bindings as a chord+action table.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "get_bindings" } }
+        }
+
+      ]
+    },
+
+    "IpcEvent": {
+      "description": "Any event emitted by the wiri daemon to active subscribe_events subscribers.",
+      "oneOf": [
+
+        {
+          "description": "Emitted when the set of workspaces changes (create, delete, or rename).",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "workspaces_changed" },
+            "data": {
+              "type": "object",
+              "required": ["workspaces"],
+              "properties": {
+                "workspaces": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/WorkspaceInfo" }
+                }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when a new window is added to the tiling engine.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_opened" },
+            "data": {
+              "type": "object",
+              "required": ["window"],
+              "properties": {
+                "window": { "$ref": "#/$defs/WindowInfoIpc" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when a tiled window is destroyed or removed from the layout.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_closed" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when a named workspace becomes active on any monitor.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "workspace_activated" },
+            "data": {
+              "type": "object",
+              "required": ["workspace"],
+              "properties": {
+                "workspace": { "type": "string", "description": "Name of the activated workspace." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when the config file is loaded or hot-reloaded.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "config_loaded" },
+            "data": {
+              "type": "object",
+              "required": ["config_path"],
+              "properties": {
+                "config_path": { "type": "string", "description": "Absolute path of the loaded config file." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when keyboard focus moves to a different tracked window.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_focused" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when the focused output (monitor) changes.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "monitor_changed" },
+            "data": {
+              "type": "object",
+              "required": ["monitor_name"],
+              "properties": {
+                "monitor_name": { "type": "string", "description": "OS display name of the newly focused monitor." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when a tiled window is repositioned by the layout engine.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_moved" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd", "x", "y", "width", "height"],
+              "properties": {
+                "window_hwnd": { "type": "integer" },
+                "x":           { "type": "integer", "description": "New left edge in screen pixels." },
+                "y":           { "type": "integer", "description": "New top edge in screen pixels." },
+                "width":       { "type": "integer", "minimum": 0, "description": "New client width in physical pixels." },
+                "height":      { "type": "integer", "minimum": 0, "description": "New client height in physical pixels." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when a tiled window's size changes from the previous layout pass.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_resized" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd", "width", "height"],
+              "properties": {
+                "window_hwnd": { "type": "integer" },
+                "width":       { "type": "integer", "minimum": 0 },
+                "height":      { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when the user begins an interactive move/resize drag on a tracked window.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_move_resize_start" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when the interactive move/resize drag finishes.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_move_resize_end" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd"],
+              "properties": {
+                "window_hwnd": { "type": "integer" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when a window's urgency / attention-request state changes.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_urgent" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd", "urgent"],
+              "properties": {
+                "window_hwnd": { "type": "integer" },
+                "urgent":      { "type": "boolean", "description": "true = urgent; false = urgency cleared." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when the active workspace on a monitor changes.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "workspace_switched" },
+            "data": {
+              "type": "object",
+              "required": ["workspace_id", "monitor_id"],
+              "properties": {
+                "workspace_id": { "type": "integer", "description": "New active workspace id." },
+                "monitor_id":   { "type": "integer", "description": "Engine OutputId of the monitor that switched." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Emitted when the focused column changes within the layout (derived from ForegroundChanged).",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "column_focused" },
+            "data": {
+              "type": "object",
+              "required": ["window_hwnd", "column_index", "workspace_id"],
+              "properties": {
+                "window_hwnd":   { "type": "integer" },
+                "column_index":  { "type": "integer", "minimum": 0, "description": "Zero-based column index within the workspace." },
+                "workspace_id":  { "type": "integer" }
+              }
+            }
+          }
+        }
+
+      ]
+    }
+
+  }
+}

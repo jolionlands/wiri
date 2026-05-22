@@ -18,7 +18,7 @@ use wiri::hooks::{SystemIntegration, TrayAction};
 use wiri::layout::{TilingEngine, LayoutConfig};
 use wiri::input::{MouseTracker, MouseFocusConfig, start_mouse_hook, stop_mouse_hook, apply_mouse_config};
 use wiri::ipc::{IpcServer, IpcEvent, WindowInfoIpc};
-use wiri::overlay::{OverviewBanner, WorkspaceIndicator};
+use wiri::overlay::{BindingsCheatsheet, OverviewBanner, StatusBar, StatusBarContent, WorkspaceIndicator};
 use wiri::utils::WindowId;
 
 use parking_lot::RwLock;
@@ -495,6 +495,76 @@ info!("Mouse hook installed");
     let _ = overview_banner.clone().spawn();
     wiri::overlay::overview_banner::install_global(overview_banner.clone());
 
+    // Key-bindings cheatsheet overlay — toggled by the ShowKeyBindings action
+    // (default chord: prefix+Shift+/ = prefix+?).  Installed as a global so
+    // execute_action can reach it without extra plumbing.
+    let cheatsheet = Arc::new(BindingsCheatsheet::new());
+    let _ = cheatsheet.clone().spawn();
+    wiri::overlay::bindings_cheatsheet::set_global_cheatsheet(cheatsheet.clone());
+    info!("Key-bindings cheatsheet overlay installed");
+
+    // Status bar overlay — opt-in via `status-bar true` in `layout { }`.
+    // TODO(audit): when status_bar is enabled, reserve top 32px from each
+    // monitor's work_area so tiles don't overlap the bar.
+    if config.layout.status_bar {
+        let status_bar = Arc::new(StatusBar::new());
+        let _ = status_bar.clone().spawn();
+
+        // Updater task: runs every 1 second; pushes workspace label + focused
+        // window title + local time into the bar.
+        let sb_engine = engine.clone();
+        let sb_bar = status_bar.clone();
+        tokio::spawn(async move {
+            loop {
+                // Workspace label: look up the active workspace on the focused monitor.
+                let (workspace_label, focused_title) = {
+                    let eng = sb_engine.read();
+
+                    let ws_label = eng.monitors().focused().map(|m| {
+                        let ws_id = m.active_workspace_id();
+                        // Try configured workspace name; fall back to "Workspace N".
+                        eng.full_config()
+                            .and_then(|c| {
+                                c.workspace
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(idx, w)| {
+                                        *idx as i32 == ws_id
+                                            || w.name == ws_id.to_string()
+                                    })
+                                    .and_then(|(_, w)| {
+                                        if w.name.is_empty() { None } else { Some(w.name.clone()) }
+                                    })
+                            })
+                            .unwrap_or_else(|| format!("[{}]", ws_id + 1))
+                    }).unwrap_or_default();
+
+                    // Focused window title from the focused monitor's focus_window.
+                    let title = eng.monitors().focused()
+                        .and_then(|m| m.focus_window)
+                        .and_then(|wid| eng.tiled_windows().get(&wid).map(|info| info.title.clone()))
+                        .unwrap_or_default();
+
+                    (ws_label, title)
+                };
+
+                // Local time via GetLocalTime (windows-rs 0.58: no args, returns SYSTEMTIME).
+                let time_str = unsafe {
+                    let st = windows::Win32::System::SystemInformation::GetLocalTime();
+                    format!("{:02}:{:02}", st.wHour, st.wMinute)
+                };
+
+                sb_bar.update(StatusBarContent {
+                    workspace_label,
+                    focused_title,
+                    time_str,
+                });
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
     print_help();
 
     // Track time for animation ticking
@@ -569,6 +639,14 @@ info!("Mouse hook installed");
                     match focused_bounds {
                         Some(b) => overlay.show_at(&label, b),
                         None => overlay.show(&label),
+                    }
+                    // Broadcast workspace switch to IPC subscribers.
+                    // OutputId wraps a u64 name-hash; expose it via .as_u64().
+                    if let Some(focused_oid) = engine.read().monitors().focused_id() {
+                        ipc_server.broadcast_event(IpcEvent::WorkspaceSwitched {
+                            workspace_id: ws_id,
+                            monitor_id: focused_oid.as_u64(),
+                        });
                     }
                 }
                 *last = current;
@@ -829,6 +907,8 @@ fn handle_backend_event(
             let window_id = WindowId::new(hwnd);
             ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
             let mut eng = engine.write();
+            // Track which monitor/column gained focus and emit ColumnFocused.
+            let mut focused_col: Option<(usize, i32)> = None;
             for (_, monitor) in eng.monitors_mut().iter_mut() {
                 if monitor
                     .workspace()
@@ -840,23 +920,62 @@ fn handle_backend_event(
                         monitor.workspace().and_then(|w| w.find_window_column(window_id))
                     {
                         monitor.focus_column = Some(col_idx);
+                        let ws_id = monitor.active_workspace_id();
+                        focused_col = Some((col_idx, ws_id));
                     }
                     break;
                 }
             }
+            drop(eng);
+            if let Some((col_idx, ws_id)) = focused_col {
+                ipc_server.broadcast_event(IpcEvent::ColumnFocused {
+                    window_hwnd: hwnd,
+                    column_index: col_idx,
+                    workspace_id: ws_id,
+                });
+            }
         }
         // Window position/title changes from external sources are
-        // overridden by the tiling engine on next layout pass
-        BackendEvent::WindowMoved { .. }
-        | BackendEvent::WindowResized { .. }
-        | BackendEvent::WindowTitleChanged { .. } => {}
+        // overridden by the tiling engine on next layout pass; but we
+        // still forward them as IPC events for external listeners.
+        BackendEvent::WindowMoved { hwnd, rect } => {
+            ipc_server.broadcast_event(IpcEvent::WindowMoved {
+                window_hwnd: hwnd,
+                x: rect.loc.x,
+                y: rect.loc.y,
+                width: rect.size.w,
+                height: rect.size.h,
+            });
+        }
+        BackendEvent::WindowResized { hwnd, rect } => {
+            ipc_server.broadcast_event(IpcEvent::WindowResized {
+                window_hwnd: hwnd,
+                width: rect.size.w,
+                height: rect.size.h,
+            });
+        }
+        BackendEvent::WindowTitleChanged { .. } => {}
 
         BackendEvent::WindowMoveResizeStart { hwnd } => {
             debug!("User started manual move/resize on hwnd {}", hwnd);
+            ipc_server.broadcast_event(IpcEvent::WindowMoveResizeStart { window_hwnd: hwnd });
         }
         BackendEvent::WindowMoveResizeEnd { hwnd } => {
             debug!("User ended manual move/resize on hwnd {}", hwnd);
+            ipc_server.broadcast_event(IpcEvent::WindowMoveResizeEnd { window_hwnd: hwnd });
             engine.write().apply_all(handle);
+        }
+        BackendEvent::WindowUrgent { hwnd, urgent } => {
+            ipc_server.broadcast_event(IpcEvent::WindowUrgent {
+                window_hwnd: hwnd,
+                urgent,
+            });
+        }
+        BackendEvent::WindowUrgentCleared { hwnd } => {
+            ipc_server.broadcast_event(IpcEvent::WindowUrgent {
+                window_hwnd: hwnd,
+                urgent: false,
+            });
         }
 
         // CBT events - fire BEFORE window operations

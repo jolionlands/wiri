@@ -1000,6 +1000,152 @@ impl IpcServer {
                     }),
                 }
             }
+            IpcMessage::ToggleSticky => {
+                info!("IPC: ToggleSticky");
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        e.write().toggle_sticky(b);
+                        e.write().apply_all(b);
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                }
+            }
+            IpcMessage::SetWorkspaceLayout { mode } => {
+                info!("IPC: SetWorkspaceLayout mode={}", mode);
+                // TODO(audit): need set_workspace_layout helper on TilingEngine.
+                // Wire the call once the engine agent adds the method.
+                warn!("SetWorkspaceLayout: set_workspace_layout helper not yet available");
+                serde_json::json!({"success": false, "error": "set_workspace_layout not yet implemented"})
+            }
+            IpcMessage::RenameWorkspace { workspace_id, name } => {
+                info!("IPC: RenameWorkspace id={} name={:?}", workspace_id, name);
+                match &self.engine {
+                    Some(e) => match e.write().rename_workspace(workspace_id, &name) {
+                        Ok(()) => serde_json::json!({"success": true}),
+                        Err(err) => serde_json::json!({"success": false, "error": err}),
+                    },
+                    None => serde_json::json!({"success": false, "error": "engine not initialized"}),
+                }
+            }
+            IpcMessage::ScreenshotWindow { hwnd, path } => {
+                info!("IPC: ScreenshotWindow hwnd={:?} path={:?}", hwnd, path);
+                // Resolve target HWND: explicit arg or foreground window.
+                let target_hwnd: isize = match hwnd {
+                    Some(h) => h,
+                    None => {
+                        let fg = unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+                        };
+                        if fg.0.is_null() {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": "no foreground window to capture",
+                            });
+                        }
+                        fg.0 as isize
+                    }
+                };
+                // Resolve output path.
+                let dest = match path.as_ref().map(std::path::PathBuf::from) {
+                    Some(p) => p,
+                    None => match crate::hooks::spawner::default_window_capture_path(target_hwnd) {
+                        Ok(p) => p,
+                        Err(e) => return serde_json::json!({
+                            "success": false,
+                            "error": format!("could not resolve default path: {}", e),
+                        }),
+                    },
+                };
+                match crate::hooks::spawner::capture_window_to_file(target_hwnd, &dest) {
+                    Ok(()) => serde_json::json!({
+                        "success": true,
+                        "result": { "path": dest.to_string_lossy() },
+                    }),
+                    Err(e) => serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                }
+            }
+            IpcMessage::GetFocus => {
+                info!("IPC: GetFocus");
+                if let Some(engine) = &self.engine {
+                    let eng = engine.read();
+                    let focused_output = eng.focused_output();
+                    let (window_hwnd, workspace_id, monitor_id) = match focused_output {
+                        Some(oid) => {
+                            let monitor = eng.monitors().get(&oid);
+                            let ws_id = monitor.map(|m| m.active_workspace_id()).unwrap_or(0);
+                            let hwnd = monitor
+                                .and_then(|m| m.focus_window)
+                                .map(|wid| wid.as_isize());
+                            (hwnd, ws_id, oid.as_u64())
+                        }
+                        None => (None, 0, 0u64),
+                    };
+                    serde_json::json!({
+                        "success": true,
+                        "result": {
+                            "window_hwnd": window_hwnd,
+                            "workspace_id": workspace_id,
+                            "monitor_id": monitor_id,
+                        },
+                    })
+                } else {
+                    serde_json::json!({
+                        "success": true,
+                        "result": {
+                            "window_hwnd": null,
+                            "workspace_id": 0,
+                            "monitor_id": 0,
+                        },
+                    })
+                }
+            }
+            IpcMessage::GetWorkspaceList => {
+                info!("IPC: GetWorkspaceList");
+                if let Some(engine) = &self.engine {
+                    let eng = engine.read();
+                    let mut workspaces: Vec<serde_json::Value> = Vec::new();
+                    for (_oid, monitor) in eng.monitors().iter() {
+                        for (&ws_id, ws) in monitor.workspaces.iter() {
+                            let window_count: usize =
+                                ws.columns.iter().map(|c| c.tiles.len()).sum();
+                            let name = eng.workspace_name(ws_id)
+                                .unwrap_or_else(|| format!("workspace-{}", ws_id));
+                            workspaces.push(serde_json::json!({
+                                "id": ws_id,
+                                "name": name,
+                                "window_count": window_count,
+                            }));
+                        }
+                    }
+                    workspaces.sort_by_key(|w| w.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+                    serde_json::json!({"success": true, "result": {"workspaces": workspaces}})
+                } else {
+                    serde_json::json!({"success": true, "result": {"workspaces": []}})
+                }
+            }
+            IpcMessage::GetBindings => {
+                // Return the live registered-bindings snapshot as a
+                // chord+action table.  Never blocks; safe to call from any
+                // context.  Returns an empty array when registration hasn't
+                // completed yet so callers can fall back gracefully.
+                let raw = crate::backend::message_loop::current_bindings();
+                let entries: Vec<serde_json::Value> = raw
+                    .iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "chord": format_chord(b.modifiers, b.vk_code),
+                            "modifiers": b.modifiers,
+                            "vk_code": b.vk_code,
+                            "action": b.action,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({"success": true, "result": entries})
+            }
             IpcMessage::CaptureWindow { window_hwnd, path } => {
                 info!("IPC: CaptureWindow hwnd={} path={:?}", window_hwnd, path);
                 // Validate that the HWND is one of the tracked windows so we

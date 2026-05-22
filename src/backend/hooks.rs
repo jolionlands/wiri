@@ -20,6 +20,11 @@ const EVENT_OBJECT_CREATE: u32 = 0x8000;
 const EVENT_OBJECT_DESTROY: u32 = 0x8001;
 const EVENT_OBJECT_SHOW: u32 = 0x8003;
 const EVENT_OBJECT_HIDE: u32 = 0x8004;
+/// EVENT_OBJECT_STATECHANGE (0x800A) fires when an object's accessibility
+/// state changes — including the STATE_SYSTEM_ALERT bit that apps set when
+/// requesting urgent attention (often accompanies FlashWindow). Monitoring
+/// this gives us a second signal for urgent-window detection.
+const EVENT_OBJECT_STATECHANGE: u32 = 0x800A;
 const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 
@@ -51,6 +56,10 @@ impl WinEventHook {
             (EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE),
             (EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY),
             (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+            // EVENT_OBJECT_STATECHANGE (0x800A) — fires when accessibility state
+            // changes including STATE_SYSTEM_ALERT. Bridges apps that request
+            // attention via IAccessible::accState rather than FlashWindow.
+            (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
             (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
         ];
@@ -139,12 +148,19 @@ unsafe extern "system" fn winevent_proc(
         0x0002 => { // EVENT_SYSTEM_ALERT — record window as flashing/urgent.
             let hwnd_isize = hwnd.0 as isize;
             URGENT_WINDOWS.lock().insert(hwnd_isize);
+            // Notify the engine so it can update window rules / border colour.
+            backend.send_event(BackendEvent::WindowUrgent { hwnd: hwnd_isize, urgent: true });
         }
         0x0003 => { // EVENT_SYSTEM_FOREGROUND
             // Bringing a window to the foreground implicitly clears its urgent state
             // — the user is now looking at it, no need to keep nagging.
-            URGENT_WINDOWS.lock().remove(&(hwnd.0 as isize));
-            backend.send_event(BackendEvent::ForegroundChanged { hwnd: hwnd.0 as isize });
+            let hwnd_isize = hwnd.0 as isize;
+            let was_urgent = URGENT_WINDOWS.lock().remove(&hwnd_isize);
+            if was_urgent {
+                // Emit the cleared signal so the engine can un-highlight the border.
+                backend.send_event(BackendEvent::WindowUrgentCleared { hwnd: hwnd_isize });
+            }
+            backend.send_event(BackendEvent::ForegroundChanged { hwnd: hwnd_isize });
         }
         0x000A => { // EVENT_SYSTEM_MOVESIZESTART
             backend.send_event(BackendEvent::WindowMoveResizeStart { hwnd: hwnd.0 as isize });
@@ -178,6 +194,19 @@ unsafe extern "system" fn winevent_proc(
                 info.is_visible = false;
                 backend.update_window(hwnd.0 as isize, info.clone());
                 backend.send_event(BackendEvent::WindowHidden { hwnd: hwnd.0 as isize });
+            }
+        }
+        0x800A => { // EVENT_OBJECT_STATECHANGE — accessibility state changed.
+            // Some apps (e.g. terminals, chat clients) signal attention via the
+            // IAccessible STATE_SYSTEM_ALERT bit rather than FlashWindow. We
+            // emit WindowUrgent only for windows we are already tracking to
+            // avoid turning every control's state-change into a spurious alert.
+            let hwnd_isize = hwnd.0 as isize;
+            if backend.get_window(hwnd_isize).is_some() {
+                let newly_inserted = URGENT_WINDOWS.lock().insert(hwnd_isize);
+                if newly_inserted {
+                    backend.send_event(BackendEvent::WindowUrgent { hwnd: hwnd_isize, urgent: true });
+                }
             }
         }
         0x800B => { // EVENT_OBJECT_LOCATIONCHANGE

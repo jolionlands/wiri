@@ -30,6 +30,19 @@ const MOD_CTRL: u32 = 0x0002;
 const MOD_SHIFT: u32 = 0x0004;
 const MOD_WIN: u32 = 0x0008;
 
+// TODO(audit): per-monitor mod-key only takes effect when used in
+// monitor-scoped IPC actions (e.g. focus-monitor-by-prefix). Global hotkeys
+// remain unified across monitors because Windows registers hotkeys per-thread,
+// not per-display.  The `OutputConfig.mod_key` field is populated by the parser
+// and can be read via `engine.full_config().map(|c| &c.output[i].mod_key)` for
+// future IPC dispatch.
+
+// TODO(item3-wheel): the low-level mouse-wheel hook in `src/input/low_level_hook.rs`
+// needs to call `engine.read().is_over_gap(cursor_x, cursor_y) -> bool` to decide
+// whether a no-modifier scroll should be consumed as `Action::ScrollLeft/Right`
+// (gap zone) or passed through to the window (content zone).  The engine helper
+// `TilingEngine::is_over_gap` is implemented in `src/layout/engine.rs`.
+
 /// Resolve a `mod-key` config string to a (prefix, prefix+shift) pair of Win32 modifier flags.
 fn resolve_mod_prefix(name: &str) -> (u32, u32) {
     let prefix = match name.trim().to_lowercase().as_str() {
@@ -145,6 +158,10 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         // for workspace swap per the niri default.
         (shift_prefix, 0xBC, Action::MoveColumnToMonitorLeft),
         (shift_prefix, 0xBE, Action::MoveColumnToMonitorRight),
+        // Round-4: Mod+S → ToggleSticky (pin window to all workspaces)
+        (prefix, 0x53, Action::ToggleSticky),
+        // Cheatsheet overlay: prefix+Shift+/ = prefix+?  (VK_OEM_2 = 0xBF)
+        (shift_prefix, 0xBF, Action::ShowKeyBindings),
     ]
 }
 
@@ -1058,6 +1075,63 @@ fn execute_action(
             engine.write().move_active_workspace(1, backend);
             engine.write().apply_all(backend);
         }
+        Action::ToggleSticky => {
+            engine.write().toggle_sticky(backend);
+            engine.write().apply_all(backend);
+        }
+        Action::SetWorkspaceLayout(mode) => {
+            // TODO(audit): need set_workspace_layout helper on TilingEngine.
+            // The engine agent may add engine.set_workspace_layout(id, mode).
+            // Until then, log the intent and no-op so the action arm is wired.
+            warn!("SetWorkspaceLayout({}): not yet wired — set_workspace_layout helper missing", mode);
+        }
+        Action::RenameWorkspace(name) => {
+            // Rename the currently-focused workspace.
+            let id = {
+                let eng = engine.read();
+                eng.focused_output()
+                    .and_then(|oid| eng.monitors().get(&oid))
+                    .map(|m| m.active_workspace_id())
+                    .unwrap_or(0)
+            };
+            if let Err(e) = engine.write().rename_workspace(id, name.as_str()) {
+                warn!("rename_workspace({:?}): {}", name, e);
+            }
+        }
+        Action::ScreenshotWindow => {
+            take_window_screenshot();
+        }
+        Action::ToggleBackdrop => {
+            engine.write().toggle_backdrop_cycle(backend);
+        }
+        Action::ShowKeyBindings => {
+            // Build a binding row list from the live REGISTERED_BINDINGS snapshot
+            // (what Windows actually accepted) and toggle the cheatsheet overlay.
+            if let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet() {
+                let raw = current_bindings();
+                let rows: Vec<(String, String)> = if raw.is_empty() {
+                    // Engine not yet registered — show hardcoded defaults.
+                    let prefix_name = engine
+                        .read()
+                        .full_config()
+                        .map(|c| mod_prefix_display_name(&c.input.mod_key))
+                        .unwrap_or_else(|| "Ctrl+Alt".to_string());
+                    crate::overlay::bindings_cheatsheet::default_bindings_table(&prefix_name)
+                } else {
+                    raw.iter()
+                        .map(|b| {
+                            let chord = crate::ipc::server::format_chord(b.modifiers, b.vk_code);
+                            let action = b.action.clone();
+                            (chord, action)
+                        })
+                        .collect()
+                };
+                info!("ShowKeyBindings: toggling cheatsheet ({} rows)", rows.len());
+                cs.toggle(rows);
+            } else {
+                info!("ShowKeyBindings: cheatsheet overlay not installed (main.rs wiring missing)");
+            }
+        }
     }
 }
 
@@ -1112,6 +1186,20 @@ fn spawn_shell_command(cmd: &str) {
     {
         Ok(_) => info!("SpawnCmd (cmd.exe /C): {}", cmd),
         Err(e) => warn!("SpawnCmd failed: {}", e),
+    }
+}
+
+/// Convert a `mod-key` config string to a human-readable prefix label such as
+/// `"Ctrl+Alt"`.  Used by `ShowKeyBindings` to build the fallback default table
+/// when no live registered-bindings snapshot is available.
+fn mod_prefix_display_name(name: &str) -> String {
+    match name.trim().to_lowercase().as_str() {
+        "alt" => "Alt".to_string(),
+        "ctrl" | "control" => "Ctrl".to_string(),
+        "super" | "win" | "meta" => "Win".to_string(),
+        "win-alt" | "super-alt" | "meta-alt" => "Win+Alt".to_string(),
+        "ctrl-shift" => "Ctrl+Shift".to_string(),
+        _ => "Ctrl+Alt".to_string(),
     }
 }
 

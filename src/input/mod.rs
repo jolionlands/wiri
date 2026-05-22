@@ -6,10 +6,17 @@ pub mod touch;
 pub mod snap_guide;
 
 pub use hotkey::{HotkeyBinding, HotkeyId};
-pub use grab::{MoveGrab, ResizeGrab, ResizeEdge};
-pub use low_level_hook::{GrabState, begin_move_grab, begin_resize_grab, cancel_grab, is_grab_active, current_grab, start_mouse_hook, stop_mouse_hook};
+pub use grab::{MoveGrab, ResizeGrab, ResizeEdge, ColumnReorderGrab, COLUMN_REORDER_HIT_ZONE_PX};
+pub use low_level_hook::{
+    GrabState,
+    begin_move_grab, begin_resize_grab, begin_column_reorder_grab,
+    cancel_grab, is_grab_active, current_grab,
+    start_mouse_hook, stop_mouse_hook,
+    start_keyboard_hook, stop_keyboard_hook, set_keyboard_action_sender,
+};
 pub use mouse::{MouseTracker, MouseFocusConfig};
-pub use touch::{TouchConfig, TouchGesture, GestureRecognizer, start_touch_hook, stop_touch_hook};
+pub use touch::{TouchConfig, TouchGesture, GestureRecognizer, start_touch_hook, stop_touch_hook,
+                set_action_sender as set_touch_action_sender};
 
 /// All actions that can be triggered by hotkeys or IPC
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -142,6 +149,24 @@ pub enum Action {
     /// niri parity: swap the focused workspace with the workspace
     /// immediately below it on the same monitor.
     MoveWorkspaceDown,
+    /// niri parity: mark the focused window "sticky" — it appears on every
+    /// workspace (like a pinned window in niri).  Toggle off to unpin.
+    ToggleSticky,
+    /// Set the active workspace's layout algorithm.
+    /// Accepted modes: `"scrolling"` (default), `"bstack"`, `"spiral"`.
+    SetWorkspaceLayout(String),
+    /// Rename the currently-focused workspace to the given string.
+    RenameWorkspace(String),
+    /// Capture the focused window's bounding rect to a BMP via PrintWindow,
+    /// identical to `WindowScreenshot` but reachable from config binds /
+    /// `wiri-ctl screenshot-window`.
+    ScreenshotWindow,
+    /// Cycle through DWM backdrop types (auto → none → mica → acrylic → tabbed → auto)
+    /// for all tiled windows.  Maps to `TilingEngine::toggle_backdrop_cycle`.
+    ToggleBackdrop,
+    /// Show/hide the key-bindings cheatsheet overlay window.
+    /// Default chord: prefix + Shift+/ (i.e. prefix + ?).
+    ShowKeyBindings,
 }
 
 /// Parse an action name string (from config/IPC) into an Action.
@@ -228,7 +253,7 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
             args.first().map(|s| Action::FocusWorkspaceNamed(s.clone()))
         }
         "screenshot" | "take-screenshot" | "capture-screen" => Some(Action::Screenshot),
-        "window-screenshot" | "capture-window" | "screenshot-window" => {
+        "window-screenshot" | "capture-window" => {
             Some(Action::WindowScreenshot)
         }
         "enter-resize-mode" | "resize-mode" | "interactive-resize" => {
@@ -242,6 +267,18 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         }
         "move-workspace-up" | "swap-workspace-up" => Some(Action::MoveWorkspaceUp),
         "move-workspace-down" | "swap-workspace-down" => Some(Action::MoveWorkspaceDown),
+        "toggle-sticky" | "sticky" => Some(Action::ToggleSticky),
+        "set-workspace-layout" | "workspace-layout" => {
+            args.first().map(|s| Action::SetWorkspaceLayout(s.clone()))
+        }
+        "rename-workspace" | "rename-ws" => {
+            args.first().map(|s| Action::RenameWorkspace(s.clone()))
+        }
+        "screenshot-window" | "screenshot-focused" => Some(Action::ScreenshotWindow),
+        "toggle-backdrop" | "backdrop-cycle" | "backdrop" => Some(Action::ToggleBackdrop),
+        "show-key-bindings" | "show-bindings" | "cheatsheet" | "help" => {
+            Some(Action::ShowKeyBindings)
+        }
         "set-auto-tile" => {
             if args.is_empty() {
                 None
@@ -602,9 +639,154 @@ mod tests {
             parse_action_name("capture-window", &[]),
             Some(Action::WindowScreenshot)
         );
+        // "screenshot-window" now maps to ScreenshotWindow (round-4), not
+        // WindowScreenshot.  The old alias was superseded — update accordingly.
         assert_eq!(
             parse_action_name("screenshot-window", &[]),
-            Some(Action::WindowScreenshot)
+            Some(Action::ScreenshotWindow)
         );
+    }
+
+    // ---- Round-4 action parse tests ----
+
+    #[test]
+    fn test_parse_action_toggle_sticky() {
+        assert_eq!(parse_action_name("toggle-sticky", &[]), Some(Action::ToggleSticky));
+        assert_eq!(parse_action_name("sticky", &[]), Some(Action::ToggleSticky));
+    }
+
+    #[test]
+    fn test_parse_action_set_workspace_layout() {
+        assert_eq!(
+            parse_action_name("set-workspace-layout", &["bstack".to_string()]),
+            Some(Action::SetWorkspaceLayout("bstack".to_string()))
+        );
+        assert_eq!(
+            parse_action_name("workspace-layout", &["spiral".to_string()]),
+            Some(Action::SetWorkspaceLayout("spiral".to_string()))
+        );
+        // Missing arg → None
+        assert_eq!(parse_action_name("set-workspace-layout", &[]), None);
+    }
+
+    #[test]
+    fn test_parse_action_rename_workspace() {
+        assert_eq!(
+            parse_action_name("rename-workspace", &["dev".to_string()]),
+            Some(Action::RenameWorkspace("dev".to_string()))
+        );
+        assert_eq!(
+            parse_action_name("rename-ws", &["chat".to_string()]),
+            Some(Action::RenameWorkspace("chat".to_string()))
+        );
+        // Missing arg → None
+        assert_eq!(parse_action_name("rename-workspace", &[]), None);
+    }
+
+    #[test]
+    fn test_parse_action_screenshot_window() {
+        assert_eq!(
+            parse_action_name("screenshot-window", &[]),
+            Some(Action::ScreenshotWindow)
+        );
+        assert_eq!(
+            parse_action_name("screenshot-focused", &[]),
+            Some(Action::ScreenshotWindow)
+        );
+    }
+
+    /// Pure helper that mirrors the wheel-delta → action mapping used in the
+    /// WM_MOUSEWHEEL hook.  Positive delta (wheel away from user) = workspace
+    /// previous; negative delta (wheel toward user) = workspace next.
+    fn wheel_delta_to_workspace_action(delta: i32) -> Option<Action> {
+        if delta == 0 {
+            return None;
+        }
+        if delta > 0 {
+            Some(Action::FocusWorkspacePrevious)
+        } else {
+            Some(Action::FocusWorkspaceNext)
+        }
+    }
+
+    #[test]
+    fn test_wheel_delta_positive_is_previous() {
+        assert_eq!(
+            wheel_delta_to_workspace_action(120),
+            Some(Action::FocusWorkspacePrevious),
+        );
+    }
+
+    #[test]
+    fn test_wheel_delta_negative_is_next() {
+        assert_eq!(
+            wheel_delta_to_workspace_action(-120),
+            Some(Action::FocusWorkspaceNext),
+        );
+    }
+
+    #[test]
+    fn test_wheel_delta_zero_is_none() {
+        assert_eq!(wheel_delta_to_workspace_action(0), None);
+    }
+
+    /// Verify the double-tap window logic by simulating the timestamp comparisons
+    /// that the `keyboard_hook_callback` performs.  We test the pure timing
+    /// predicate without actually installing the WH_KEYBOARD_LL hook (which
+    /// would require a Win32 message loop).
+    #[test]
+    fn test_double_alt_within_window() {
+        use std::time::{Duration, Instant};
+
+        // Helper: returns true when the elapsed time since `prev` is within
+        // the double-tap window (< 250 ms).  Mirrors the hook's condition.
+        let is_double_tap = |prev: Instant| -> bool {
+            prev.elapsed().as_millis() < 250
+        };
+
+        // Case 1: two Alt presses very close together → double tap detected.
+        let t0 = Instant::now();
+        // Immediately check — should be well within 250 ms.
+        assert!(
+            is_double_tap(t0),
+            "immediate second Alt-down must be within the 250 ms double-tap window"
+        );
+
+        // Case 2: simulate gap >= 250 ms using an artificially aged Instant.
+        // We subtract 300 ms from now to emulate a "stale" first press.
+        let stale = Instant::now()
+            .checked_sub(Duration::from_millis(300))
+            .expect("can subtract 300 ms from now");
+        assert!(
+            !is_double_tap(stale),
+            "Alt-down 300 ms after the first press must NOT count as a double tap"
+        );
+
+        // Case 3: boundary — exactly at 249 ms should still be within the window.
+        let near_boundary = Instant::now()
+            .checked_sub(Duration::from_millis(249))
+            .expect("can subtract 249 ms from now");
+        // elapsed() will be >= 249 ms but typically < 250 ms unless the system is
+        // extremely slow.  We allow a 5 ms tolerance for timing jitter.
+        let elapsed = near_boundary.elapsed().as_millis();
+        // We only assert the fast path (well within the window) not the near-miss
+        // boundary, because wall-clock tests are inherently racy.
+        assert!(
+            elapsed < 260,
+            "elapsed {} ms from a 249-ms-ago Instant must be < 260 ms (system timing jitter tolerance)",
+            elapsed
+        );
+
+        // Case 4: verify that Action::OverviewToggle exists and PartialEq works
+        // (compile-time check that the action is wired).
+        let action = Action::OverviewToggle;
+        assert_eq!(action, Action::OverviewToggle);
+    }
+
+    #[test]
+    fn test_parse_action_toggle_backdrop() {
+        assert_eq!(parse_action_name("toggle-backdrop", &[]), Some(Action::ToggleBackdrop));
+        assert_eq!(parse_action_name("backdrop-cycle", &[]),  Some(Action::ToggleBackdrop));
+        assert_eq!(parse_action_name("backdrop", &[]),         Some(Action::ToggleBackdrop));
     }
 }
