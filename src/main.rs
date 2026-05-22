@@ -668,7 +668,13 @@ info!("Mouse hook installed");
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(33)).await;
+        // 8 ms sleep — keeps the loop tight (~125 Hz) so hotkey/IPC events
+        // are picked up with minimum perceptible lag.  The expensive
+        // apply_all path is gated by has_active_animations() above so this
+        // tight cycle is cheap when idle (~one engine.read() + a try_recv).
+        // 33 ms here previously added a baseline ~16 ms median latency to
+        // every keypress + tray click; the user noticed it as input lag.
+        tokio::time::sleep(Duration::from_millis(8)).await;
 
         // Handle file-watcher config reloads
         match config_reload_rx.try_recv() {
@@ -1051,14 +1057,19 @@ fn should_tile_window(window: &wiri::backend::WindowInfo) -> bool {
         return false;
     }
 
-    // Skip known shell/system window classes
+    // Skip known shell/system window classes.
+    //
+    // ApplicationFrameWindow is deliberately NOT in this list — in Win 11
+    // most modern apps (including File Explorer itself) run inside that
+    // wrapper, and skipping it makes wiri unable to tile any of them.  The
+    // inner Windows.UI.Core.CoreWindow is still skipped below (correct
+    // granularity — ApplicationFrameWindow is the OUTER top-level we want).
     let skip_classes = [
         "Shell_TrayWnd",          // Taskbar
         "Shell_SecondaryTrayWnd", // Secondary taskbar
         "Progman",                 // Desktop
         "WorkerW",                 // Desktop worker
-        "Windows.UI.Core.CoreWindow", // UWP shell
-        "ApplicationFrameWindow", // UWP frame
+        "Windows.UI.Core.CoreWindow", // UWP shell (inner child of ApplicationFrameWindow)
         "DV2ControlHost",         // Start menu
         "NotifyIconOverflowWindow", // Tray overflow
         "ToolbarWindow32",        // Toolbars

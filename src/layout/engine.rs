@@ -3746,6 +3746,14 @@ impl TilingEngine {
     /// Apply opacity to a window using DWMWA_EXCLUDED_FROM_PEEK + layered window
     /// Set the DWM border color for a window (Windows 11+).
     /// Falls back silently on older Windows.
+    ///
+    /// Terminal-style apps (Windows Terminal / Cascadia, mintty, ConsoleWindow,
+    /// Alacritty, WezTerm) extend their content into the non-client area via
+    /// `ExtendsContentIntoTitleBar`, which paints over the DWMWA_BORDER_COLOR
+    /// outline so the user sees no border on them.  For those classes we also
+    /// set DWMWA_CAPTION_COLOR (attr 35) so the top edge is recoloured to
+    /// match — gives the user *something* visible to indicate the tile is
+    /// wiri-managed.  See `is_border_unfriendly_class`.
     fn set_dwm_border_color(&self, hwnd: isize, color_hex: &str) {
         use windows::Win32::Foundation::HWND;
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
@@ -3762,7 +3770,78 @@ impl TilingEngine {
                     std::mem::size_of::<u32>() as u32,
                 )
             };
+
+            // Belt-and-braces for terminal-style apps that draw over the DWM
+            // border: also colour the caption (DWMWA_CAPTION_COLOR, attr 35).
+            // Caption-color is honoured even on windows with
+            // ExtendsContentIntoTitleBar so the user gets a visible focus
+            // indicator on Windows Terminal / mintty / Alacritty / WezTerm.
+            //
+            // Also flip DWMWA_USE_IMMERSIVE_DARK_MODE based on the requested
+            // colour's brightness so any system-painted accent (e.g. the
+            // 1-px chrome at window edges some apps still rely on) inherits a
+            // contrasting tone instead of always defaulting to light.
+            if self.is_border_unfriendly_window(hwnd) {
+                const DWMWA_CAPTION_COLOR: i32 = 35;
+                let caption_attr =
+                    windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_CAPTION_COLOR);
+                let _ = unsafe {
+                    windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                        hwnd_win,
+                        caption_attr,
+                        &colorref as *const _ as *const _,
+                        std::mem::size_of::<u32>() as u32,
+                    )
+                };
+
+                // brightness ≈ 0.299R + 0.587G + 0.114B (Rec. 601 luma)
+                let luma = (299 * r as u32 + 587 * g as u32 + 114 * b as u32) / 1000;
+                let use_dark: i32 = if luma < 128 { 1 } else { 0 };
+                const DWMWA_USE_IMMERSIVE_DARK_MODE: i32 = 20;
+                let dark_attr = windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                );
+                let _ = unsafe {
+                    windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                        hwnd_win,
+                        dark_attr,
+                        &use_dark as *const _ as *const _,
+                        std::mem::size_of::<i32>() as u32,
+                    )
+                };
+            }
         }
+    }
+
+    /// True for tile windows whose class is known to paint over the DWM-managed
+    /// non-client area, hiding DWMWA_BORDER_COLOR.  Currently:
+    ///
+    /// * `CASCADIA_HOSTING_WINDOW_CLASS` — Windows Terminal / wt.exe
+    /// * `mintty` — Cygwin / Git-for-Windows terminal
+    /// * `ConsoleWindowClass` — classic conhost (rarely tiled directly)
+    /// * `Alacritty` — Alacritty Windows port
+    /// * `org.wezfurlong.wezterm` — WezTerm
+    ///
+    /// Class matching is case-insensitive and uses `starts_with` so future
+    /// suffixes (e.g. CASCADIA_HOSTING_WINDOW_CLASS_v2) don't fall through.
+    fn is_border_unfriendly_window(&self, hwnd: isize) -> bool {
+        let window_id = WindowId::new(hwnd);
+        let class = self
+            .tiled_windows
+            .get(&window_id)
+            .map(|info| info.class_name.to_lowercase())
+            .unwrap_or_default();
+        if class.is_empty() {
+            return false;
+        }
+        const NEEDLES: &[&str] = &[
+            "cascadia_hosting_window_class",
+            "mintty",
+            "consolewindowclass",
+            "alacritty",
+            "org.wezfurlong.wezterm",
+        ];
+        NEEDLES.iter().any(|n| class.starts_with(n))
     }
 
     /// Push the "no colour" sentinel COLORREF to DWMWA_BORDER_COLOR so the
