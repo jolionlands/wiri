@@ -133,10 +133,12 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32
         (prefix, 0x50, Action::Screenshot),        // P (capture desktop to file)
         (prefix, 0x41, Action::ToggleAlwaysOnTop), // A (always-on-top)
         // niri-parity Round 4: rearrange / sizing actions.
-        //   Ctrl+Alt+Comma   → consume window into next column
-        //   Ctrl+Alt+Period  → expel window into a new column to the right
+        //   Ctrl+Alt+Comma   → consume-window-into-column: the first window of the
+        //                      column on the right moves under the focused one
+        //   Ctrl+Alt+Period  → expel-window-from-column: the bottom window of the
+        //                      focused column gets a column of its own on the right
         //   Ctrl+Alt+E       → expand column to fill leftover width
-        //   Ctrl+Alt+Shift+F → maximize column (full work-area height)
+        //   Ctrl+Alt+Shift+F → maximize-column: the column is as wide as the view
         //   Ctrl+Alt+Shift+L → grow column width (5%)
         //   Ctrl+Alt+Shift+H → shrink column width (5%)
         //   Ctrl+Alt+Shift+K → grow tile height (5%)
@@ -170,6 +172,16 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32
         (prefix, 0x53, Action::ToggleSticky),
         // Cheatsheet overlay: prefix+Shift+/ = prefix+?  (VK_OEM_2 = 0xBF)
         (shift_prefix, 0xBF, Action::ShowKeyBindings),
+        // niri keymap: first / last column, column moves to the ends of the strip,
+        // consume-or-expel and the window moves inside a column.
+        (prefix, 0x24, Action::FocusColumnFirst),        // Home
+        (prefix, 0x23, Action::FocusColumnLast),         // End
+        (shift_prefix, 0x24, Action::MoveColumnToFirst), // Shift+Home
+        (shift_prefix, 0x23, Action::MoveColumnToLast),  // Shift+End
+        (shift_prefix, 0xDB, Action::ConsumeOrExpelWindowLeft), // Shift+[
+        (shift_prefix, 0xDD, Action::ConsumeOrExpelWindowRight), // Shift+]
+        (prefix, 0x4B, Action::MoveWindowUp),            // K
+        (prefix, 0x4A, Action::MoveWindowDown),          // J
     ]
 }
 
@@ -1149,21 +1161,67 @@ pub(crate) fn perform_action(
             }
             engine.write().apply_all(backend);
         }
+        // The column operations belong to the strip: a floating window has no column
+        // (niri does nothing for it either).
         Action::ConsumeWindowIntoColumn => {
-            engine.write().consume_window_into_column(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().consume_window_into_column(backend);
+                engine.write().apply_all(backend);
+            }
         }
         Action::ExpelWindowFromColumn => {
-            engine.write().expel_window_from_column(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().expel_window_from_column(backend);
+                engine.write().apply_all(backend);
+            }
+        }
+        Action::ConsumeOrExpelWindowLeft => {
+            if float_of(target).is_none() {
+                engine.write().consume_or_expel_window_left(backend);
+                engine.write().apply_all(backend);
+            }
+        }
+        Action::ConsumeOrExpelWindowRight => {
+            if float_of(target).is_none() {
+                engine.write().consume_or_expel_window_right(backend);
+                engine.write().apply_all(backend);
+            }
+        }
+        Action::MoveWindowUp => match float_of(target) {
+            Some(window) => engine.write().float_move_by(window, 0, -FLOAT_STEP_PX, backend),
+            None => engine.write().move_window_in_column(-1, backend),
+        },
+        Action::MoveWindowDown => match float_of(target) {
+            Some(window) => engine.write().float_move_by(window, 0, FLOAT_STEP_PX, backend),
+            None => engine.write().move_window_in_column(1, backend),
+        },
+        Action::FocusColumnFirst => {
+            engine.write().focus_column_first(backend);
+        }
+        Action::FocusColumnLast => {
+            engine.write().focus_column_last(backend);
+        }
+        Action::MoveColumnToFirst => {
+            if float_of(target).is_none() {
+                engine.write().move_column_to_edge(false, backend);
+            }
+        }
+        Action::MoveColumnToLast => {
+            if float_of(target).is_none() {
+                engine.write().move_column_to_edge(true, backend);
+            }
         }
         Action::ExpandColumnToAvailable => {
-            engine.write().expand_column_to_available(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().expand_column_to_available(backend);
+                engine.write().apply_all(backend);
+            }
         }
         Action::MaximizeColumn => {
-            engine.write().toggle_maximize_focused_column(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().toggle_maximize_focused_column(backend);
+                engine.write().apply_all(backend);
+            }
         }
         Action::GrowColumnWidth => {
             match float_of(target) {

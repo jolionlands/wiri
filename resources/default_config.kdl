@@ -163,10 +163,13 @@ binds {
     Ctrl+Alt+Backslash     set-column-width "cycle"
 
     // niri-parity: column-rearrange + size actions
-    //   Ctrl+Alt+Comma   → consume focused tile into the column on the right
-    //   Ctrl+Alt+Period  → expel focused tile into a brand-new column
+    //   Ctrl+Alt+Comma   → consume-window-into-column: the first window of the
+    //                      column on the right moves under the focused window
+    //   Ctrl+Alt+Period  → expel-window-from-column: the bottom window of the
+    //                      focused column gets a column of its own on the right
     //   Ctrl+Alt+E       → expand column to fill leftover work-area width
-    //   Ctrl+Alt+Shift+F → maximize column (full work-area height; toggle)
+    //   Ctrl+Alt+Shift+F → maximize-column: the column is as wide as the view
+    //                      (toggle; also for a column of one window)
     //   Ctrl+Alt+Shift+L → grow column width by 5%
     //   Ctrl+Alt+Shift+H → shrink column width by 5%
     //   Ctrl+Alt+Shift+K → grow tile height by 5% (multi-tile columns)
@@ -180,6 +183,23 @@ binds {
     Ctrl+Alt+Shift+H       shrink-column-width
     Ctrl+Alt+Shift+K       grow-tile-height
     Ctrl+Alt+Shift+J       shrink-tile-height
+
+    // niri keymap: columns and windows
+    //   Ctrl+Alt+Home / End               → focus the first / last column
+    //   Ctrl+Alt+Shift+Home / End         → move the column to the start / end of the strip
+    //   Ctrl+Alt+Shift+Bracket_Left/Right → consume-or-expel-window-left / right: a lone
+    //                                       window joins the column on that side, one of
+    //                                       several leaves its column on that side
+    //   Ctrl+Alt+K / J                    → move-window-up / down inside the column
+    Ctrl+Alt+Home                focus-column-first
+    Ctrl+Alt+End                 focus-column-last
+    Ctrl+Alt+Shift+Home          move-column-to-first
+    Ctrl+Alt+Shift+End           move-column-to-last
+    Ctrl+Alt+Shift+Bracket_Left  consume-or-expel-window-left
+    Ctrl+Alt+Shift+Bracket_Right consume-or-expel-window-right
+    Ctrl+Alt+K                   move-window-up
+    Ctrl+Alt+J                   move-window-down
+
     // Workspace + column reorder (niri parity)
     //   Ctrl+Alt+Shift+Page_Up/Down → swap the focused workspace with the
     //                                 one above / below on the same monitor

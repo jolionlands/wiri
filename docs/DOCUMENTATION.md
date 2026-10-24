@@ -370,7 +370,8 @@ binds {
 }
 ```
 
-If a `binds {}` section exists, the defaults are **replaced entirely** (not merged).
+A `binds {}` section is merged with the built-in defaults: a bind in the config wins when it uses the
+same chord as a default, the other defaults stay.  `binds { extend-defaults false }` drops the defaults.
 
 ### Config `output {}` Blocks
 
@@ -404,6 +405,12 @@ All default bindings use the `Ctrl+Alt` prefix:
 | O | `overview-select` | Select window and exit overview |
 | Shift+Q | `quit` | Exit wiri |
 | 1–9 | `switch-workspace 1`–`9` | Switch to workspace |
+| , / . | `consume-window-into-column` / `expel-window-from-column` | niri: the first window of the column on the right moves under the focused window / the bottom window of the focused column gets a column of its own on the right |
+| Shift+[ / Shift+] | `consume-or-expel-window-left` / `consume-or-expel-window-right` | niri: a window alone in its column joins the column on that side (at the bottom); one of several leaves its column on that side |
+| K / J | `move-window-up` / `move-window-down` | niri: swap the window with the one above / below in its column |
+| Home / End | `focus-column-first` / `focus-column-last` | Focus the first / last column |
+| Shift+Home / Shift+End | `move-column-to-first` / `move-column-to-last` | Move the focused column to the start / end of the strip |
+| Shift+F | `maximize-column` | niri: the column is as wide as the view (toggle, also for a column of one window) |
 
 ### Mouse Bindings
 
@@ -436,10 +443,21 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 |---|---|---|---|
 | `focus-column-left` | `focus-left` | — | Focus column left |
 | `focus-column-right` | `focus-right` | — | Focus column right |
-| `focus-up` | — | — | Focus tile above |
-| `focus-down` | — | — | Focus tile below |
+| `focus-up` | `focus-window-up` | — | Focus tile above |
+| `focus-down` | `focus-window-down` | — | Focus tile below |
+| `focus-column-first` | — | — | Focus the first column |
+| `focus-column-last` | — | — | Focus the last column |
 | `move-column-left` | `move-left` | — | Move column left |
 | `move-column-right` | `move-right` | — | Move column right |
+| `move-column-to-first` | — | — | Move the column to the start of the strip |
+| `move-column-to-last` | — | — | Move the column to the end of the strip |
+| `move-window-up` | — | — | Swap the window with the one above it in its column (a floating window moves by 50 px) |
+| `move-window-down` | — | — | Swap the window with the one below it in its column |
+| `consume-window-into-column` | `consume-window`, `consume-into-column` | — | The first window of the column on the right moves to the bottom of the focused column |
+| `expel-window-from-column` | `expel-window`, `expel-from-column` | — | The bottom window of the focused column becomes a column of its own on its right |
+| `consume-or-expel-window-left` | — | — | A window alone in its column joins the column on its left; one of several leaves its column to the left |
+| `consume-or-expel-window-right` | — | — | The same to the right |
+| `maximize-column` | `column-maximize`, `toggle-column-maximize` | — | Toggle: the column is as wide as the view (also for a column of one window); toggling again restores its width |
 | `close-window` | `close` | — | Close focused window |
 | `toggle-fullscreen` | `fullscreen` | — | Toggle fullscreen |
 | `toggle-floating` | `float` | — | Toggle floating |

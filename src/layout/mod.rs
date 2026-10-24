@@ -670,6 +670,34 @@ impl Monitor {
         }
     }
 
+    /// niri `focus-column-first`: the first tile of the first column.
+    pub fn focus_column_first(&mut self) {
+        self.focus_column_at(0);
+    }
+
+    /// niri `focus-column-last`: the first tile of the last column.
+    pub fn focus_column_last(&mut self) {
+        let last = self
+            .workspace()
+            .map(|w| w.columns.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.focus_column_at(last);
+    }
+
+    /// Focus the first tile of column `col` (nothing when there is no such column).
+    fn focus_column_at(&mut self, col: usize) {
+        let target = self
+            .workspace()
+            .and_then(|w| w.columns.get(col))
+            .and_then(|c| c.tiles.first())
+            .map(|t| t.window_id);
+        if let Some(wid) = target {
+            self.focus_column = Some(col);
+            self.focus_window = Some(wid);
+            self.focus_ring.push(wid);
+        }
+    }
+
     pub fn focus_up(&mut self) {
         let new_wid = if let Some(workspace) = self.workspace() {
             if let Some(col_idx) = self.focus_column {

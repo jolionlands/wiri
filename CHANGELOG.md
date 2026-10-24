@@ -59,6 +59,19 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   workspace is entered (a tile that was just clicked used to cover the float), and a workspace that
   holds only floating windows is no longer pruned as empty.  A window floats where it floated last
   time.
+- **niri's column keymap.**  `consume-or-expel-window-left` / `-right` (a window alone in its column
+  joins the column on that side at the bottom, one of several leaves its column to that side),
+  `consume-window-into-column` (pulls the first window of the column on the right under the focused
+  one: it used to push the focused window into the right neighbour) and `expel-window-from-column`
+  (the bottom window leaves, it used to be the focused one), `move-window-up` / `move-window-down`
+  (swap inside the column, the window keeps the focus), `focus-column-first` / `focus-column-last`,
+  `move-column-to-first` / `move-column-to-last`, and the niri names `focus-window-up` /
+  `focus-window-down`.  `maximize-column` now makes the column as wide as the view, also for a
+  column of one window, and toggling gives the old width back; an explicit width ends it, a maximized
+  column follows the view, and a window expelled from it stays maximized.  The new chords:
+  `Ctrl+Alt+Home` / `End`, `Ctrl+Alt+Shift+Home` / `End`, `Ctrl+Alt+Shift+[` / `]`, `Ctrl+Alt+K` /
+  `J`.  A floating window has no column: the column actions leave it alone and `move-window-up` /
+  `down` nudge it by 50 px.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal

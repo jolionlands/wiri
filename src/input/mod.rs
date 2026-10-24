@@ -106,12 +106,30 @@ pub enum Action {
     ColumnWidthPresetQuarter,
     /// Set the focused column to 3/4 of the work-area width.
     ColumnWidthPresetThreeQuarters,
-    /// Take the focused tile out of its column and append it to the column
-    /// on the right. No-op if already in the rightmost column.
+    /// niri `consume-window-into-column`: the first window of the column on the
+    /// right moves to the bottom of the focused column.  No-op in the last column.
     ConsumeWindowIntoColumn,
-    /// Take the focused tile out of its column and place it in a new
-    /// column immediately to the right of the source column.
+    /// niri `expel-window-from-column`: the bottom window of the focused column
+    /// becomes a column of its own on its right.  No-op for a single window.
     ExpelWindowFromColumn,
+    /// niri `consume-or-expel-window-left`: a lone window joins the column on its
+    /// left, one of several leaves its column to the left.
+    ConsumeOrExpelWindowLeft,
+    /// niri `consume-or-expel-window-right`.
+    ConsumeOrExpelWindowRight,
+    /// niri `move-window-up`: swap the focused window with the one above it in its
+    /// column (a floating window moves up by 50 px).
+    MoveWindowUp,
+    /// niri `move-window-down`.
+    MoveWindowDown,
+    /// niri `focus-column-first`.
+    FocusColumnFirst,
+    /// niri `focus-column-last`.
+    FocusColumnLast,
+    /// niri `move-column-to-first`.
+    MoveColumnToFirst,
+    /// niri `move-column-to-last`.
+    MoveColumnToLast,
     /// Expand the focused column so it fills the leftover work-area width.
     ExpandColumnToAvailable,
     /// Toggle per-column maximize (full work-area height). Distinct from
@@ -180,8 +198,16 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
     match name {
         "focus-column-left" | "focus-left" => Some(Action::FocusColumnLeft),
         "focus-column-right" | "focus-right" => Some(Action::FocusColumnRight),
-        "focus-up" => Some(Action::FocusUp),
-        "focus-down" => Some(Action::FocusDown),
+        "focus-up" | "focus-window-up" => Some(Action::FocusUp),
+        "focus-down" | "focus-window-down" => Some(Action::FocusDown),
+        "focus-column-first" => Some(Action::FocusColumnFirst),
+        "focus-column-last" => Some(Action::FocusColumnLast),
+        "move-column-to-first" => Some(Action::MoveColumnToFirst),
+        "move-column-to-last" => Some(Action::MoveColumnToLast),
+        "move-window-up" => Some(Action::MoveWindowUp),
+        "move-window-down" => Some(Action::MoveWindowDown),
+        "consume-or-expel-window-left" => Some(Action::ConsumeOrExpelWindowLeft),
+        "consume-or-expel-window-right" => Some(Action::ConsumeOrExpelWindowRight),
         "move-column-left" | "move-left" => Some(Action::MoveColumnLeft),
         "move-column-right" | "move-right" => Some(Action::MoveColumnRight),
         "close-window" | "close" => Some(Action::CloseWindow),
@@ -744,6 +770,27 @@ mod tests {
             parse_action_name("move-right", &[]),
             Some(Action::MoveColumnRight)
         );
+    }
+
+    #[test]
+    fn test_parse_niri_column_keymap_names() {
+        for (name, action) in [
+            ("focus-window-up", Action::FocusUp),
+            ("focus-window-down", Action::FocusDown),
+            ("focus-column-first", Action::FocusColumnFirst),
+            ("focus-column-last", Action::FocusColumnLast),
+            ("move-column-to-first", Action::MoveColumnToFirst),
+            ("move-column-to-last", Action::MoveColumnToLast),
+            ("move-window-up", Action::MoveWindowUp),
+            ("move-window-down", Action::MoveWindowDown),
+            ("consume-or-expel-window-left", Action::ConsumeOrExpelWindowLeft),
+            ("consume-or-expel-window-right", Action::ConsumeOrExpelWindowRight),
+            ("consume-window-into-column", Action::ConsumeWindowIntoColumn),
+            ("expel-window-from-column", Action::ExpelWindowFromColumn),
+            ("maximize-column", Action::MaximizeColumn),
+        ] {
+            assert_eq!(parse_action_name(name, &[]), Some(action), "{name}");
+        }
     }
 
     #[test]

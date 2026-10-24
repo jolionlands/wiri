@@ -10,7 +10,9 @@
 #          Ctrl+Alt+2 / Ctrl+Alt+1 hide and show the windows.
 # Phase H  Phase 1 scenarios, each under a config of its own (wiri is restarted for every one):
 #          H1 modifiers, H2 spawn, H3 actions follow the real foreground window (floats, dialogs),
-#          H4 minimized windows leave no gap, H5 floating windows belong to their workspace.
+#          H4 minimized windows leave no gap, H5 floating windows belong to their workspace,
+#          H6 the niri column keymap (consume/expel, move-window, first/last, maximize-column), pressed
+#          with the shipped default binds.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -437,8 +439,9 @@ Start-Sleep -Seconds 1
 # ---- Phase G: real key presses (RegisterHotKey + the keyboard hook) --------------------------------
 $vk = @{
     ctrl = 0x11; alt = 0x12; shift = 0x10; esc = 0x1B; space = 0x20; 'return' = 0x0D
-    '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; a = 0x41; f = 0x46; q = 0x51; t = 0x54
-    left = 0x25; right = 0x27
+    '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; a = 0x41; f = 0x46; j = 0x4A; k = 0x4B; q = 0x51; t = 0x54
+    left = 0x25; right = 0x27; home = 0x24; end = 0x23
+    comma = 0xBC; period = 0xBE; lbracket = 0xDB; rbracket = 0xDD
     f6 = 0x75; f7 = 0x76; f8 = 0x77; f9 = 0x78
 }
 function Chord([string]$spec) {
@@ -850,6 +853,139 @@ Start-Sleep -Milliseconds 1200
 Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 1800
 $h5Closed = -not [LT]::IsWindow($ff)
 
+# ---- H6: the niri column keymap behaves like niri, driven by the shipped default binds --------------------------
+$log6 = Join-Path $D 'wiri.stderr6.log'
+$h6Config = @"
+input {
+    mod-key "ctrl-alt"
+}
+"@
+Stop-WiriGracefully $w 'h6'
+$w6 = Start-WiriWithConfig $h6Config $log6
+$w = $w6
+# The binds of the niri keymap are registered (a chord that another program owns would be missing here).
+$h6BindsRaw = Ctl 'h6-bindings' @('--json', 'bindings')
+$h6Binds = @()
+try { $h6Binds = @(($h6BindsRaw | ConvertFrom-Json).result) } catch { }
+function HasBind([int]$vkCode, [int]$mods, [string]$action) {
+    return (@($h6Binds | Where-Object { $_.vk_code -eq $vkCode -and $_.modifiers -eq $mods -and $_.action -eq $action }).Count -eq 1)
+}
+$h6BindsRegistered = (HasBind 0xBC 3 'ConsumeWindowIntoColumn') -and (HasBind 0xBE 3 'ExpelWindowFromColumn') -and
+    (HasBind 0xDB 7 'ConsumeOrExpelWindowLeft') -and (HasBind 0xDD 7 'ConsumeOrExpelWindowRight') -and
+    (HasBind 0x4B 3 'MoveWindowUp') -and (HasBind 0x4A 3 'MoveWindowDown') -and
+    (HasBind 0x24 3 'FocusColumnFirst') -and (HasBind 0x23 3 'FocusColumnLast') -and
+    (HasBind 0x24 7 'MoveColumnToFirst') -and (HasBind 0x23 7 'MoveColumnToLast') -and (HasBind 0x46 7 'MaximizeColumn')
+function TileOf($list, $hwnd) { $e = WinOf $list $hwnd; if ($null -eq $e -or $null -eq $e.tile) { return -1 } else { return [int]$e.tile } }
+function Press([string]$chord) { Chord $chord; Start-Sleep -Milliseconds 1400 }
+function FocusForm($h) { $null = Ctl 'h6-focus-window' @('focus-window', [string][int64]$h); Start-Sleep -Milliseconds 1300 }
+# Three windows, one column each, the last three columns of the strip: s1 | s2 | s3
+$sf = @()
+foreach ($i in 1..3) { $sf += [TestForms]::Open("wiri-h6-$i", (50 * $i), 130, 200); Start-Sleep -Milliseconds 1500 }
+Start-Sleep -Seconds 1
+$l0 = WinList 'h6-windows-start'
+$h6ThreeColumns = ((ColOf $l0 $sf[0]) -ge 0) -and ((ColOf $l0 $sf[1]) -eq ((ColOf $l0 $sf[0]) + 1)) -and ((ColOf $l0 $sf[2]) -eq ((ColOf $l0 $sf[1]) + 1))
+Shot 'h6-01-three-columns'
+
+# consume-or-expel-window-left (Ctrl+Alt+Shift+[): a lone window joins the column on its left (at the bottom)
+FocusForm $sf[1]
+Press 'ctrl+alt+shift+lbracket'
+$l = WinList 'h6-after-consume-left'
+$h6ConsumeLeft = ((ColOf $l $sf[1]) -eq (ColOf $l $sf[0])) -and ((TileOf $l $sf[1]) -eq ((TileOf $l $sf[0]) + 1))
+$h6EmptiedColumnVanished = ((ColOf $l $sf[2]) -eq ((ColOf $l $sf[0]) + 1))
+$h6FocusStaysOnMovedWindow = ([LT]::GetForegroundWindow() -eq $sf[1])
+Shot 'h6-02-consumed-left'
+# ... a window that shares its column leaves it, to the left
+Press 'ctrl+alt+shift+lbracket'
+$l = WinList 'h6-after-expel-left'
+$h6ExpelLeft = (((ColOf $l $sf[1]) + 1) -eq (ColOf $l $sf[0])) -and (((ColOf $l $sf[0]) + 1) -eq (ColOf $l $sf[2]))
+Shot 'h6-03-expelled-left'
+
+# consume-or-expel-window-right (Ctrl+Alt+Shift+]): s2 | s1 | s3 -> s2 goes to the bottom of s1's column, then leaves to the right
+FocusForm $sf[1]
+Press 'ctrl+alt+shift+rbracket'
+$l = WinList 'h6-after-consume-right'
+$h6ConsumeRight = ((ColOf $l $sf[1]) -eq (ColOf $l $sf[0])) -and ((TileOf $l $sf[1]) -eq ((TileOf $l $sf[0]) + 1))
+Press 'ctrl+alt+shift+rbracket'
+$l = WinList 'h6-after-expel-right'
+$h6ExpelRight = ((ColOf $l $sf[1]) -eq ((ColOf $l $sf[0]) + 1)) -and ((ColOf $l $sf[2]) -eq ((ColOf $l $sf[1]) + 1))
+Shot 'h6-04-expelled-right'
+
+# consume-window-into-column (Ctrl+Alt+Comma): the first window of the column on the RIGHT goes under the focused one
+FocusForm $sf[0]
+Press 'ctrl+alt+comma'
+$l = WinList 'h6-after-consume-into'
+$h6ConsumeInto = ((ColOf $l $sf[1]) -eq (ColOf $l $sf[0])) -and ((TileOf $l $sf[1]) -eq ((TileOf $l $sf[0]) + 1))
+$h6ConsumeIntoFocusStays = ([LT]::GetForegroundWindow() -eq $sf[0])
+# expel-window-from-column (Ctrl+Alt+Period): the BOTTOM window leaves to the right; the focus stays on the one above
+Press 'ctrl+alt+period'
+$l = WinList 'h6-after-expel-from'
+$h6ExpelFrom = ((ColOf $l $sf[1]) -eq ((ColOf $l $sf[0]) + 1)) -and ((TileOf $l $sf[0]) -eq 0)
+$h6ExpelFromFocusStays = ([LT]::GetForegroundWindow() -eq $sf[0])
+Shot 'h6-05-consume-and-expel'
+
+# move-window-up / move-window-down (Ctrl+Alt+K / J) inside a column, and the niri focus-window-up / down names
+FocusForm $sf[0]
+Press 'ctrl+alt+comma'       # s1 over s2 again
+FocusForm $sf[1]
+Press 'ctrl+alt+k'
+$l = WinList 'h6-after-move-up'
+$h6MoveUp = ((TileOf $l $sf[1]) -lt (TileOf $l $sf[0])) -and ((ColOf $l $sf[1]) -eq (ColOf $l $sf[0]))
+$h6MoveKeepsFocus = ([LT]::GetForegroundWindow() -eq $sf[1])
+Press 'ctrl+alt+j'
+$l = WinList 'h6-after-move-down'
+$h6MoveDown = ((TileOf $l $sf[1]) -gt (TileOf $l $sf[0]))
+$null = Ctl 'h6-action-focus-window-up' @('action', 'focus-window-up'); Start-Sleep -Milliseconds 1300
+$h6FocusWindowUp = ([LT]::GetForegroundWindow() -eq $sf[0])
+$null = Ctl 'h6-action-focus-window-down' @('action', 'focus-window-down'); Start-Sleep -Milliseconds 1300
+$h6FocusWindowDown = ([LT]::GetForegroundWindow() -eq $sf[1])
+FocusForm $sf[0]
+Press 'ctrl+alt+period'      # back to s1 | s2 | s3
+
+# move-column-right / move-column-left (Ctrl+Alt+Shift+Right / Left) swap two columns (they used to merge the windows)
+FocusForm $sf[0]
+Press 'ctrl+alt+shift+right'
+$l = WinList 'h6-after-move-column-right'
+$h6MoveColumnRight = ((ColOf $l $sf[0]) -eq ((ColOf $l $sf[1]) + 1)) -and ((TileOf $l $sf[0]) -eq 0) -and ((TileOf $l $sf[1]) -eq 0) -and ([LT]::GetForegroundWindow() -eq $sf[0])
+Press 'ctrl+alt+shift+left'
+$l = WinList 'h6-after-move-column-left'
+$h6MoveColumnLeft = ((ColOf $l $sf[1]) -eq ((ColOf $l $sf[0]) + 1)) -and ((TileOf $l $sf[0]) -eq 0) -and ((TileOf $l $sf[1]) -eq 0) -and ([LT]::GetForegroundWindow() -eq $sf[0])
+
+# focus-column-first / focus-column-last (Ctrl+Alt+Home / End)
+Press 'ctrl+alt+home'
+$l = WinList 'h6-after-focus-first'
+$fg = [int64][LT]::GetForegroundWindow()
+$first = @($l | Where-Object { $_.column -eq 0 -and $_.tile -eq 0 }) | Select-Object -First 1
+$h6FocusFirst = ($null -ne $first) -and ([int64]$first.hwnd -eq $fg)
+Press 'ctrl+alt+end'
+$maxCol = ($l | Where-Object { $null -ne $_.column } | Measure-Object -Property column -Maximum).Maximum
+$last = @($l | Where-Object { $_.column -eq $maxCol -and $_.tile -eq 0 }) | Select-Object -First 1
+$h6FocusLast = ($null -ne $last) -and ([int64]$last.hwnd -eq [int64][LT]::GetForegroundWindow())
+
+# move-column-to-last / move-column-to-first (Ctrl+Alt+Shift+End / Home): the column goes to the end / start of the strip and keeps the focus
+FocusForm $sf[1]
+Press 'ctrl+alt+shift+end'
+$l = WinList 'h6-after-column-to-last'
+$maxCol = ($l | Where-Object { $null -ne $_.column } | Measure-Object -Property column -Maximum).Maximum
+$h6ColumnToLast = ((ColOf $l $sf[1]) -eq $maxCol) -and ([LT]::GetForegroundWindow() -eq $sf[1])
+Press 'ctrl+alt+shift+home'
+$l = WinList 'h6-after-column-to-first'
+$h6ColumnToFirst = ((ColOf $l $sf[1]) -eq 0) -and ([LT]::GetForegroundWindow() -eq $sf[1])
+Shot 'h6-06-column-moved-to-first'
+
+# maximize-column (Ctrl+Alt+Shift+F): a column with ONE window becomes as wide as the screen, and back
+FocusForm $sf[2]
+$m0 = Rc $sf[2]
+Press 'ctrl+alt+shift+f'
+$m1 = Rc $sf[2]
+$h6MaximizeFull = ($m1.W -ge ($sb.Width - 60)) -and ($m1.L -le 60)
+Shot 'h6-07-maximized'
+Press 'ctrl+alt+shift+f'
+$m2 = Rc $sf[2]
+$h6MaximizeRestores = (Near $m2.W $m0.W 8)
+Shot 'h6-08-maximize-restored'
+foreach ($h in $sf) { [TestForms]::CloseForm($h) }
+Start-Sleep -Milliseconds 1500
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -1003,6 +1139,32 @@ $summary = [ordered]@{
     h5_float_hidden_again_on_workspace_1 = $h5HiddenAgainOnWs1
     h5_focus_window_switches_to_the_float_workspace = $h5FocusSwitchesWorkspace
     h5_float_closed = $h5Closed
+    # --- Phase 1 / H6: niri column keymap
+    h6_niri_keymap_binds_registered = $h6BindsRegistered
+    h6_three_single_window_columns = $h6ThreeColumns
+    h6_consume_or_expel_left_joins_the_left_column = $h6ConsumeLeft
+    h6_emptied_column_vanishes = $h6EmptiedColumnVanished
+    h6_focus_stays_on_the_moved_window = $h6FocusStaysOnMovedWindow
+    h6_consume_or_expel_left_expels_to_the_left = $h6ExpelLeft
+    h6_consume_or_expel_right_joins_the_right_column = $h6ConsumeRight
+    h6_consume_or_expel_right_expels_to_the_right = $h6ExpelRight
+    h6_consume_window_into_column_takes_the_right_neighbour = $h6ConsumeInto
+    h6_consume_keeps_the_focus = $h6ConsumeIntoFocusStays
+    h6_expel_takes_the_bottom_window = $h6ExpelFrom
+    h6_expel_keeps_the_focus = $h6ExpelFromFocusStays
+    h6_move_window_up = $h6MoveUp
+    h6_move_window_keeps_the_focus = $h6MoveKeepsFocus
+    h6_move_window_down = $h6MoveDown
+    h6_focus_window_up_name = $h6FocusWindowUp
+    h6_focus_window_down_name = $h6FocusWindowDown
+    h6_focus_column_first = $h6FocusFirst
+    h6_focus_column_last = $h6FocusLast
+    h6_move_column_right_swaps_the_columns = $h6MoveColumnRight
+    h6_move_column_left_swaps_them_back = $h6MoveColumnLeft
+    h6_move_column_to_last = $h6ColumnToLast
+    h6_move_column_to_first = $h6ColumnToFirst
+    h6_maximize_column_full_width_for_a_one_window_column = $h6MaximizeFull
+    h6_maximize_column_restores_the_width = $h6MaximizeRestores
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

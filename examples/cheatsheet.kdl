@@ -30,10 +30,18 @@ binds {
     Ctrl+Alt+A              toggle-always-on-top
 
     // --- Column rearrange (niri) ---
-    Ctrl+Alt+Comma          consume-window-into-column   // merge into right column
-    Ctrl+Alt+Period         expel-window-from-column     // pop into new column
+    Ctrl+Alt+Comma          consume-window-into-column   // pull the right column's first window under this one
+    Ctrl+Alt+Period         expel-window-from-column     // bottom window gets a column of its own
+    Ctrl+Alt+Shift+Bracket_Left  consume-or-expel-window-left   // lone window joins the left column / one of several leaves to the left
+    Ctrl+Alt+Shift+Bracket_Right consume-or-expel-window-right
+    Ctrl+Alt+K              move-window-up               // swap with the window above
+    Ctrl+Alt+J              move-window-down
+    Ctrl+Alt+Home           focus-column-first
+    Ctrl+Alt+End            focus-column-last
+    Ctrl+Alt+Shift+Home     move-column-to-first
+    Ctrl+Alt+Shift+End      move-column-to-last
     Ctrl+Alt+E              expand-column-to-available   // fill remaining width
-    Ctrl+Alt+Shift+F        maximize-column              // full work-area height
+    Ctrl+Alt+Shift+F        maximize-column              // column as wide as the view (toggle)
 
     // --- Keyboard resize ---
     Ctrl+Alt+Shift+L        grow-column-width            // +5%

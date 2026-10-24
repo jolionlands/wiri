@@ -1185,6 +1185,14 @@ fn print_default_bindings_table() {
         (&format!("{}+.", s), "move-column-to-monitor-right"),
         (&format!("{}+S", p), "toggle-sticky"),
         (&format!("{}+?", s), "show-key-bindings (cheatsheet)"),
+        (&format!("{}+Home", p), "focus-column-first"),
+        (&format!("{}+End", p), "focus-column-last"),
+        (&format!("{}+Home", s), "move-column-to-first"),
+        (&format!("{}+End", s), "move-column-to-last"),
+        (&format!("{}+[", s), "consume-or-expel-window-left"),
+        (&format!("{}+]", s), "consume-or-expel-window-right"),
+        (&format!("{}+K", p), "move-window-up"),
+        (&format!("{}+J", p), "move-window-down"),
     ];
 
     let chord_w = 28usize;

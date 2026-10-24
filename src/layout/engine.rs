@@ -1787,6 +1787,7 @@ impl TilingEngine {
             self.hide_inactive_workspace_windows_for_monitor(output_id, backend);
             self.reconcile_floats(output_id, backend);
         }
+        self.refresh_maximized_widths(output_id);
 
         let monitor = match self.monitors.get(&output_id) {
             Some(m) => m,
@@ -2835,10 +2836,8 @@ impl TilingEngine {
             let available_height = (work_height - total_gap_height).max(0);
             // Per-tile heights honor `Tile.height_weight` so the keyboard
             // resize actions (`Action::GrowTileHeight` / `ShrinkTileHeight`)
-            // can re-bias a column's vertical distribution. When the column
-            // is `maximized`, weights are ignored and the tiles share the
-            // full work-area height equally (treating maximize as a reset).
-            let force_equal = column.maximized || visible_count == 1;
+            // can re-bias a column's vertical distribution.
+            let force_equal = visible_count == 1;
             let weights: Vec<f32> = visible_indices
                 .iter()
                 .map(|&i| {
@@ -5976,7 +5975,7 @@ impl TilingEngine {
             if let Some(focus_col) = monitor.focus_column {
                 if let Some(workspace) = monitor.workspace_mut() {
                     if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        column.width = Some(target_w);
+                        column.set_width(Some(target_w));
                     }
                 }
             }
@@ -6016,7 +6015,7 @@ impl TilingEngine {
                     if let Some(column) = workspace.columns.get_mut(focus_col) {
                         let current = column.width.map(|w| w as i32).unwrap_or(default_col_w);
                         let new_w = (current + delta_px).max(50) as u32;
-                        column.width = Some(new_w);
+                        column.set_width(Some(new_w));
                     }
                 }
             }
@@ -6029,83 +6028,183 @@ impl TilingEngine {
     // niri-parity Round 4: column / tile rearrangement
     // -------------------------------------------------------------------------
 
-    /// Take the focused tile out of its column and append it to the column
-    /// immediately to the right. No-op when there is no column to the right
-    /// or no focused window. The moved tile is re-focused after the op.
-    pub fn consume_window_into_column(&mut self, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else {
+    /// The focused monitor and the tile the column operations act on (the engine
+    /// focus, which the action dispatcher has just synced with the OS foreground).
+    fn column_op_target(&self) -> Option<(OutputId, WindowId)> {
+        let output = self.monitors.focused_id()?;
+        let window = self.monitors.get(&output)?.focus_window?;
+        Some((output, window))
+    }
+
+    /// After a column operation: the focus window stays where it is wherever its
+    /// column went, so re-anchor the focus column, keep it in view and lay out.
+    fn finish_column_op(&mut self, output: OutputId, backend: &BackendHandle) {
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            let col = monitor
+                .focus_window
+                .and_then(|wid| monitor.workspace().and_then(|w| w.find_window_column(wid)));
+            if col.is_some() {
+                monitor.focus_column = col;
+            }
+        }
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// niri `consume-or-expel-window-left`: a window that is alone in its column
+    /// joins the column on its left (at the bottom); one that shares its column
+    /// leaves it as a column of its own on the left.  The window keeps the focus.
+    pub fn consume_or_expel_window_left(&mut self, backend: &BackendHandle) {
+        self.consume_or_expel_window(false, backend);
+    }
+
+    /// niri `consume-or-expel-window-right`.
+    pub fn consume_or_expel_window_right(&mut self, backend: &BackendHandle) {
+        self.consume_or_expel_window(true, backend);
+    }
+
+    fn consume_or_expel_window(&mut self, right: bool, backend: &BackendHandle) {
+        let Some((output, window)) = self.column_op_target() else {
             return;
         };
-
-        let window_id = match self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.focus_window)
-        {
-            Some(id) => id,
-            None => return,
-        };
-
         let moved = {
-            let Some(monitor) = self.monitors.get_mut(&focused_output) else {
+            let Some(workspace) = self
+                .monitors
+                .get_mut(&output)
+                .and_then(|m| m.workspace_mut())
+            else {
                 return;
             };
-            let Some(workspace) = monitor.workspace_mut() else {
-                return;
-            };
-            workspace.consume_window_into_right_column(window_id)
-        };
-
-        if moved {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                if let Some(workspace) = monitor.workspace() {
-                    if let Some(new_col) = workspace.find_window_column(window_id) {
-                        monitor.focus_column = Some(new_col);
-                        monitor.focus_window = Some(window_id);
-                    }
-                }
+            if right {
+                workspace.consume_or_expel_right(window)
+            } else {
+                workspace.consume_or_expel_left(window)
             }
-            self.apply_layout_for_monitor(focused_output, backend);
+        };
+        if moved.is_some() {
+            self.finish_column_op(output, backend);
         }
     }
 
-    /// Take the focused tile out of its column and place it in a brand-new
-    /// column immediately to the right of the source. No-op when the column
-    /// only hosts a single tile (nothing to expel) or there is no focus.
-    pub fn expel_window_from_column(&mut self, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else {
+    /// niri `consume-window-into-column`: the first window of the column on the
+    /// right of the focused one moves to the bottom of the focused column.  The
+    /// focus stays on the window that had it.  Nothing happens in the last column.
+    pub fn consume_window_into_column(&mut self, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
             return;
         };
-
-        let window_id = match self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.focus_window)
-        {
-            Some(id) => id,
-            None => return,
-        };
-
         let moved = {
-            let Some(monitor) = self.monitors.get_mut(&focused_output) else {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let Some(col) = monitor.focus_column else {
                 return;
             };
             let Some(workspace) = monitor.workspace_mut() else {
                 return;
             };
-            workspace.expel_window_into_new_column(window_id)
+            workspace.consume_into_column(col)
         };
+        if moved.is_some() {
+            self.finish_column_op(output, backend);
+        }
+    }
 
-        if moved {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                if let Some(workspace) = monitor.workspace() {
-                    if let Some(new_col) = workspace.find_window_column(window_id) {
-                        monitor.focus_column = Some(new_col);
-                        monitor.focus_window = Some(window_id);
-                    }
+    /// niri `expel-window-from-column`: the BOTTOM window of the focused column
+    /// becomes a column of its own on its right.  The focus stays in the column it
+    /// was in (on the window above when the bottom window had it).  Nothing happens
+    /// in a column with a single window.
+    pub fn expel_window_from_column(&mut self, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let Some(col) = monitor.focus_column else {
+                return;
+            };
+            let Some(workspace) = monitor.workspace_mut() else {
+                return;
+            };
+            let Some(expelled) = workspace.expel_from_column(col) else {
+                return;
+            };
+            if monitor.focus_window == Some(expelled) {
+                let above = monitor
+                    .workspace()
+                    .and_then(|w| w.columns.get(col))
+                    .and_then(|c| c.tiles.last())
+                    .map(|t| t.window_id);
+                if let Some(wid) = above {
+                    monitor.focus_window = Some(wid);
+                    monitor.focus_ring.push(wid);
                 }
             }
-            self.apply_layout_for_monitor(focused_output, backend);
+        }
+        self.finish_column_op(output, backend);
+    }
+
+    /// niri `move-window-up` / `move-window-down`: the focused window changes
+    /// places with its neighbour in the column and keeps the focus.
+    pub fn move_window_in_column(&mut self, delta: i32, backend: &BackendHandle) {
+        let Some((output, window)) = self.column_op_target() else {
+            return;
+        };
+        let moved = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+            .map_or(false, |w| w.move_tile_within_column(window, delta));
+        if moved {
+            self.finish_column_op(output, backend);
+        }
+    }
+
+    /// niri `focus-column-first`.
+    pub fn focus_column_first(&mut self, backend: &BackendHandle) -> Option<WindowId> {
+        let output = self.monitors.focused_id()?;
+        self.monitors.get_mut(&output)?.focus_column_first();
+        self.scroll_to_focused_column(output, backend)
+    }
+
+    /// niri `focus-column-last`.
+    pub fn focus_column_last(&mut self, backend: &BackendHandle) -> Option<WindowId> {
+        let output = self.monitors.focused_id()?;
+        self.monitors.get_mut(&output)?.focus_column_last();
+        self.scroll_to_focused_column(output, backend)
+    }
+
+    /// niri `move-column-to-first` / `move-column-to-last`: the focused column
+    /// (all its windows) goes to the start / end of the strip and keeps the focus.
+    pub fn move_column_to_edge(&mut self, last: bool, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let moved = {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let Some(col) = monitor.focus_column else {
+                return;
+            };
+            let Some(workspace) = monitor.workspace_mut() else {
+                return;
+            };
+            let target = if last {
+                workspace.columns.len().saturating_sub(1)
+            } else {
+                0
+            };
+            workspace.move_column_to(col, target)
+        };
+        if let Some(new_col) = moved {
+            if let Some(monitor) = self.monitors.get_mut(&output) {
+                monitor.focus_column = Some(new_col);
+            }
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
         }
     }
 
@@ -6148,7 +6247,7 @@ impl TilingEngine {
                 let total_gaps = gap * other_count;
                 let target_w = (view_width - other_columns_sum - total_gaps).max(50) as u32;
                 if let Some(column) = workspace.columns.get_mut(focus_col_idx) {
-                    column.width = Some(target_w);
+                    column.set_width(Some(target_w));
                 }
             }
         }
@@ -6156,24 +6255,51 @@ impl TilingEngine {
         self.apply_layout_for_monitor(focused_output, backend);
     }
 
-    /// Toggle the per-column maximize flag on the focused column.
-    /// Maximized columns visually occupy the full work-area height (any
-    /// per-tile `height_weight` adjustments are ignored while maximized).
-    /// Distinct from window-fullscreen, which covers the whole monitor.
+    /// niri `maximize-column`: the focused column becomes as wide as the view
+    /// (whatever its width and however many windows it has, one included); toggling
+    /// it again gives the column the width it had.  Distinct from window-fullscreen,
+    /// which covers the whole monitor.
     pub fn toggle_maximize_focused_column(&mut self, backend: &BackendHandle) {
         let Some(focused_output) = self.monitors.focused_id() else {
             return;
+        };
+        let view_width = match self.monitors.get(&focused_output) {
+            Some(monitor) => Self::view_width_for_monitor(monitor, self.effective_config(focused_output))
+                .max(50) as u32,
+            None => return,
         };
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             if let Some(focus_col_idx) = monitor.focus_column {
                 if let Some(workspace) = monitor.workspace_mut() {
                     if let Some(column) = workspace.columns.get_mut(focus_col_idx) {
-                        column.maximized = !column.maximized;
+                        column.toggle_maximized(view_width);
                     }
                 }
             }
         }
+        self.reveal_focused_column(focused_output);
         self.apply_layout_for_monitor(focused_output, backend);
+    }
+
+    /// A maximized column is as wide as the view, and the view can change (another
+    /// monitor, other gaps or reserved edges): follow it.
+    fn refresh_maximized_widths(&mut self, output_id: OutputId) {
+        let Some(view_width) = self
+            .monitors
+            .get(&output_id)
+            .map(|m| Self::view_width_for_monitor(m, self.effective_config(output_id)).max(50) as u32)
+        else {
+            return;
+        };
+        if let Some(monitor) = self.monitors.get_mut(&output_id) {
+            for workspace in monitor.workspaces.values_mut() {
+                for column in workspace.columns.iter_mut().filter(|c| c.maximized) {
+                    if column.width != Some(view_width) {
+                        column.width = Some(view_width);
+                    }
+                }
+            }
+        }
     }
 
     /// Resize the focused column by a percentage of the work-area width.
@@ -6211,7 +6337,7 @@ impl TilingEngine {
                     if let Some(column) = workspace.columns.get_mut(focus_col) {
                         let current = column.width.map(|w| w as i32).unwrap_or(default_col_w);
                         let new_w = (current + delta_px).clamp(min_w, max_w) as u32;
-                        column.width = Some(new_w);
+                        column.set_width(Some(new_w));
                     }
                 }
             }
@@ -7963,16 +8089,16 @@ mod tests {
             engine.add_window(window, &BackendHandle::default_for_test());
         }
         let oid = engine.focused_output().unwrap();
-        // Stack 101 into the column of 102 (consume-into-column); focus stays on 101.
+        // 101 pulls 102 (the first window of the column on its right) under itself; focus stays on 101.
         engine.focus_left(&BackendHandle::default_for_test());
         engine.consume_window_into_column(&BackendHandle::default_for_test());
-        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102, 101]]);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101, 102]]);
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_column, Some(1));
         assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
 
         engine.move_column(ScrollDirection::Left, &BackendHandle::default_for_test());
-        assert_eq!(column_windows(&engine, oid), vec![vec![102, 101], vec![100]]);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101, 102], vec![100]]);
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_column, Some(0));
         assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
@@ -10693,17 +10819,11 @@ mod tests {
 
         let oid = engine.focused_output().unwrap();
         let m = engine.monitors().get(&oid).unwrap();
-        let ws = m.workspace().unwrap();
-        // Original col0 (100) merged into col1: now col0 should host [101, 100], col1 = [102]
-        assert_eq!(ws.columns.len(), 2);
-        assert_eq!(ws.columns[0].tiles.len(), 2);
-        assert!(ws.columns[0]
-            .tiles
-            .iter()
-            .any(|t| t.window_id == WindowId::new(100)));
-        assert_eq!(ws.columns[1].tiles.len(), 1);
-        // Focus follows the moved window.
+        // niri: the first window of the column on the RIGHT (101) goes under the focused one.
+        assert_eq!(column_windows(&engine, oid), vec![vec![100, 101], vec![102]]);
+        // The focus stays where it was.
         assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
     }
 
     #[test]
@@ -10743,15 +10863,40 @@ mod tests {
         focus_window(&mut engine, 101);
         engine.expel_window_from_column(&BackendHandle::default_for_test());
 
+        // The BOTTOM window (101) leaves for a column of its own on the right.
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![102]]
+        );
+        // It had the focus, which stays in the column it was in: on the window above.
         let m = engine.monitors().get(&oid).unwrap();
-        let ws = m.workspace().unwrap();
-        // After expel, col0 = [100], col1 = [101] (new), col2 = [102]
-        assert_eq!(ws.columns.len(), 3);
-        assert_eq!(ws.columns[0].tiles.len(), 1);
-        assert_eq!(ws.columns[0].tiles[0].window_id, WindowId::new(100));
-        assert_eq!(ws.columns[1].tiles.len(), 1);
-        assert_eq!(ws.columns[1].tiles[0].window_id, WindowId::new(101));
-        assert_eq!(m.focus_window, Some(WindowId::new(101)));
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
+    }
+
+    #[test]
+    fn test_expel_takes_the_bottom_window_not_the_focused_one() {
+        let mut engine = make_engine_fixed_1920();
+        for i in 100..103 {
+            engine.add_window(make_window(i, 0, 0), &BackendHandle::default_for_test());
+        }
+        let oid = engine.focused_output().unwrap();
+        // One column of three: [100, 101, 102]
+        {
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(101), 0, 1));
+            assert!(ws.move_window(WindowId::new(102), 0, 2));
+        }
+        focus_window(&mut engine, 100);
+        engine.expel_window_from_column(&BackendHandle::default_for_test());
+        assert_eq!(column_windows(&engine, oid), vec![vec![100, 101], vec![102]]);
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.focus_window, Some(WindowId::new(100)), "the focus did not move");
     }
 
     #[test]
@@ -10766,6 +10911,125 @@ mod tests {
         let ws = engine.monitors().get(&oid).unwrap().workspace().unwrap();
         // Each column already had one tile — no new column should appear.
         assert_eq!(ws.columns.len(), 2);
+    }
+
+    // ---- niri column keymap: consume-or-expel, move-window, first / last ----
+
+    /// An engine (1920 px wide, fixed 500 px columns) with one single-window column per id.
+    fn engine_with_columns(ids: &[isize]) -> TilingEngine {
+        let mut engine = make_engine_fixed_1920();
+        for id in ids {
+            engine.add_window(make_window(*id, 0, 0), &BackendHandle::default_for_test());
+        }
+        engine
+    }
+
+    #[test]
+    fn test_consume_or_expel_window_left_and_right_keep_the_focus_on_the_window() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 101);
+
+        engine.consume_or_expel_window_left(&be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100, 101], vec![102]]);
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!((m.focus_column, m.focus_window), (Some(0), Some(WindowId::new(101))));
+
+        // Now it shares a column: it is expelled again, to the right this time.
+        engine.consume_or_expel_window_right(&be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![102]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!((m.focus_column, m.focus_window), (Some(1), Some(WindowId::new(101))));
+
+        // Right into the last column, and no further.
+        focus_window(&mut engine, 101);
+        engine.consume_or_expel_window_right(&be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102, 101]]);
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!((m.focus_column, m.focus_window), (Some(1), Some(WindowId::new(101))));
+        engine.consume_or_expel_window_right(&be); // shares a column: expelled to the right
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102], vec![101]]);
+        engine.consume_or_expel_window_right(&be); // alone in the last column: nothing
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102], vec![101]]);
+    }
+
+    #[test]
+    fn test_consume_or_expel_window_left_in_the_first_column_does_nothing() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 100);
+        engine.consume_or_expel_window_left(&be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+    }
+
+    #[test]
+    fn test_move_window_up_and_down_swap_inside_the_column_and_keep_the_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102]);
+        let oid = engine.focused_output().unwrap();
+        {
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(101), 0, 1));
+            assert!(ws.move_window(WindowId::new(102), 0, 2));
+        }
+        focus_window(&mut engine, 101);
+        engine.move_window_in_column(-1, &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101, 100, 102]]);
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.focus_window, Some(WindowId::new(101)), "the moved window keeps the focus");
+        engine.move_window_in_column(-1, &be); // at the top already
+        assert_eq!(column_windows(&engine, oid), vec![vec![101, 100, 102]]);
+        engine.move_window_in_column(1, &be);
+        engine.move_window_in_column(1, &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100, 102, 101]]);
+        engine.move_window_in_column(1, &be); // at the bottom already
+        assert_eq!(column_windows(&engine, oid), vec![vec![100, 102, 101]]);
+    }
+
+    #[test]
+    fn test_focus_column_first_and_last_and_move_column_to_the_edges() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102, 103]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 101);
+
+        assert_eq!(engine.focus_column_first(&be), Some(WindowId::new(100)));
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!((m.focus_column, m.focus_window), (Some(0), Some(WindowId::new(100))));
+        assert_eq!(engine.focus_column_last(&be), Some(WindowId::new(103)));
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!((m.focus_column, m.focus_window), (Some(3), Some(WindowId::new(103))));
+
+        focus_window(&mut engine, 101);
+        engine.move_column_to_edge(true, &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![103], vec![101]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!((m.focus_column, m.focus_window), (Some(3), Some(WindowId::new(101))));
+        engine.move_column_to_edge(false, &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101], vec![100], vec![102], vec![103]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!((m.focus_column, m.focus_window), (Some(0), Some(WindowId::new(101))));
+        engine.move_column_to_edge(false, &be); // already first
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101], vec![100], vec![102], vec![103]]
+        );
     }
 
     // ---- Expand column ----
@@ -10830,6 +11094,87 @@ mod tests {
                 .columns[0]
                 .maximized
         );
+    }
+
+    #[test]
+    fn test_maximize_column_makes_even_a_one_window_column_as_wide_as_the_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 101);
+        let width_of = |engine: &TilingEngine, col: usize| {
+            engine
+                .monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[col]
+                .width
+        };
+        let before = width_of(&engine, 1);
+        let other_before = width_of(&engine, 0);
+
+        // The configure throttle (16 ms) would hide a layout pass that follows the
+        // previous one too closely.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.toggle_maximize_focused_column(&be);
+        assert_eq!(width_of(&engine, 1), Some(1920), "as wide as the view (1920 px, no gaps)");
+        assert_eq!(width_of(&engine, 0), other_before, "the other column is untouched");
+        let rect = engine.applied_state.get(&WindowId::new(101)).unwrap().rect;
+        assert!(rect.size.w >= 1900, "the window got the width: {:?}", rect);
+
+        // The configure throttle (16 ms) would hide the second layout pass.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.toggle_maximize_focused_column(&be);
+        assert_eq!(width_of(&engine, 1), before, "toggling again restores the width");
+        let rect = engine.applied_state.get(&WindowId::new(101)).unwrap().rect;
+        assert!(rect.size.w < 600, "{:?}", rect);
+    }
+
+    #[test]
+    fn test_a_width_change_ends_the_maximized_state_of_a_column() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 100);
+        engine.toggle_maximize_focused_column(&be);
+        engine.resize_focused_column_by(-100, &be);
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
+        assert!(!col.maximized);
+        assert_eq!(col.width, Some(1820));
+    }
+
+    #[test]
+    fn test_a_maximized_column_follows_the_view_width() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 100);
+        engine.toggle_maximize_focused_column(&be);
+        // Gaps appear at both sides: the maximized column shrinks with the view.
+        engine.update_config(LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            outer_gaps: (0, 100, 0, 100),
+            ..LayoutConfig::default()
+        });
+        engine.apply_all(&be);
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
+        assert!(col.maximized);
+        assert_eq!(col.width, Some(1720));
     }
 
     // ---- Resize column / tile by percentage ----

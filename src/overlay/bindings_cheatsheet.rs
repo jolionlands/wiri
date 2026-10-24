@@ -587,5 +587,13 @@ pub fn default_bindings_table(prefix_name: &str) -> Vec<BindingRow> {
             format!("{}+?", s),
             "show-key-bindings (this overlay)".into(),
         ),
+        (format!("{}+Home", p), "focus-column-first".into()),
+        (format!("{}+End", p), "focus-column-last".into()),
+        (format!("{}+Home", s), "move-column-to-first".into()),
+        (format!("{}+End", s), "move-column-to-last".into()),
+        (format!("{}+[", s), "consume-or-expel-window-left".into()),
+        (format!("{}+]", s), "consume-or-expel-window-right".into()),
+        (format!("{}+K", p), "move-window-up".into()),
+        (format!("{}+J", p), "move-window-down".into()),
     ]
 }

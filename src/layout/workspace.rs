@@ -81,12 +81,14 @@ pub struct Column {
     pub width: Option<u32>,
     /// Display mode: stacked (default) or tabbed.
     pub display: ColumnDisplay,
-    /// niri-style per-column maximized state — when true the column should
-    /// occupy the full work-area height (taking precedence over any per-tile
-    /// height distribution). Separate from `SizingMode::Fullscreen`, which
-    /// applies to a single window across the whole monitor including
-    /// reserved bars.
+    /// niri `maximize-column`: the column is as wide as the view (`width` holds
+    /// that width) until it is toggled back or given a width of its own.
+    /// Separate from `SizingMode::Fullscreen`, which applies to a single window
+    /// across the whole monitor including reserved bars.
     pub maximized: bool,
+    /// The width the column had when it was maximized (`Some(None)`: the
+    /// layout default), to restore when it is toggled back.
+    pub pre_max_width: Option<Option<u32>>,
 }
 
 impl Column {
@@ -96,6 +98,37 @@ impl Column {
             width: None,
             display: ColumnDisplay::Stacked,
             maximized: false,
+            pre_max_width: None,
+        }
+    }
+
+    /// Give the column an explicit width.  This ends a maximized state: a column
+    /// that has a width of its own is not "as wide as the view" any more.
+    pub fn set_width(&mut self, width: Option<u32>) {
+        self.maximized = false;
+        self.pre_max_width = None;
+        self.width = width;
+    }
+
+    /// niri `toggle_full_width` (`maximize-column`): make the column `view_width`
+    /// wide, remembering the width it had; toggling again gives that width back.
+    /// Works for a column of any number of tiles.
+    pub fn toggle_maximized(&mut self, view_width: u32) {
+        if self.maximized {
+            self.maximized = false;
+            self.width = self.pre_max_width.take().unwrap_or(None);
+        } else {
+            self.pre_max_width = Some(self.width);
+            self.maximized = true;
+            self.width = Some(view_width);
+        }
+    }
+
+    /// Keep the active tab of a tabbed column on a tile that exists.
+    pub fn clamp_active_tab(&mut self) {
+        let last = self.tiles.len().saturating_sub(1);
+        if let ColumnDisplay::Tabbed { active_tab } = &mut self.display {
+            *active_tab = (*active_tab).min(last);
         }
     }
 
@@ -243,6 +276,8 @@ pub struct WindowSlot {
     pub column_width: Option<u32>,
     pub column_display: ColumnDisplay,
     pub column_maximized: bool,
+    /// The width the column had before it was maximized (see [`Column::pre_max_width`]).
+    pub column_pre_max_width: Option<Option<u32>>,
     /// Windows above it in its column, nearest first.
     pub above: Vec<WindowId>,
     /// Windows below it in its column, nearest first.
@@ -373,6 +408,7 @@ impl Workspace {
             column_width: col.width,
             column_display: col.display.clone(),
             column_maximized: col.maximized,
+            column_pre_max_width: col.pre_max_width,
             above: col.tiles[..index].iter().rev().map(|t| t.window_id).collect(),
             below: col.tiles[index + 1..].iter().map(|t| t.window_id).collect(),
             left_of: self.columns[..column].iter().rev().flat_map(ids_of).collect(),
@@ -393,6 +429,7 @@ impl Workspace {
             column_width,
             column_display,
             column_maximized,
+            column_pre_max_width,
             above,
             below,
             left_of,
@@ -432,6 +469,7 @@ impl Workspace {
         let mut col = Column::new();
         col.width = column_width;
         col.maximized = column_maximized;
+        col.pre_max_width = column_pre_max_width;
         col.display = match column_display {
             // One tile left: its tab is the first.
             ColumnDisplay::Tabbed { .. } => ColumnDisplay::Tabbed { active_tab: 0 },
@@ -452,66 +490,121 @@ impl Workspace {
         None
     }
 
-    /// niri-parity "consume into column": take the focused window out of its
-    /// current column and append it to the column immediately to the right.
-    /// Returns true on success, false when there is no column to the right
-    /// or the window cannot be located. Empty source columns are dropped.
-    pub fn consume_window_into_right_column(&mut self, window_id: WindowId) -> bool {
-        let Some(src_col_idx) = self.find_window_column(window_id) else {
-            return false;
-        };
-        // Need a column to the right of the source.
-        if src_col_idx + 1 >= self.columns.len() {
-            return false;
+    /// Take `window_id` out of the column `col` (which must have another tile) and
+    /// wrap it in a new column that has the width of the one it came from.
+    fn take_tile_into_new_column(&mut self, col: usize, window_id: WindowId) -> Option<Column> {
+        let source = self.columns.get_mut(col)?;
+        if source.tiles.len() < 2 {
+            return None;
         }
-        // Remove the tile from its source column.
-        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else {
-            return false;
-        };
-        let source_now_empty = self.columns[src_col_idx].tiles.is_empty();
-        // If the source becomes empty after removal it is dropped, shifting
-        // the target index left by one.
-        let target_col_idx = if source_now_empty {
-            self.columns.remove(src_col_idx);
-            src_col_idx // src+1 - 1 (shifted)
+        let tile = source.remove_tile(window_id)?;
+        source.clamp_active_tab();
+        let mut new_col = Column::new();
+        new_col.width = source.width;
+        new_col.maximized = source.maximized;
+        new_col.pre_max_width = source.pre_max_width;
+        new_col.add_tile(tile);
+        Some(new_col)
+    }
+
+    /// niri `consume-or-expel-window-left`.  A window that is alone in its column
+    /// moves to the bottom of the column on its left (and the column it leaves
+    /// vanishes); a window in a column of several leaves it as a column of its own
+    /// on the left of the one it left.  Returns the index of the column the window
+    /// is in now, or `None` when nothing moved (a lone window in the first column).
+    pub fn consume_or_expel_left(&mut self, window_id: WindowId) -> Option<usize> {
+        let col = self.find_window_column(window_id)?;
+        if self.columns[col].tiles.len() == 1 {
+            if col == 0 {
+                return None;
+            }
+            let lone = self.columns.remove(col);
+            let tile = lone.tiles.into_iter().next()?;
+            let target = col - 1;
+            self.columns[target].add_tile(tile);
+            Some(target)
         } else {
-            src_col_idx + 1
-        };
-        if let Some(target_col) = self.columns.get_mut(target_col_idx) {
-            target_col.add_tile(tile);
-            true
-        } else {
-            // Should not happen because we checked bounds above, but be safe.
-            false
+            let expelled = self.take_tile_into_new_column(col, window_id)?;
+            self.columns.insert(col, expelled);
+            Some(col)
         }
     }
 
-    /// niri-parity "expel from column": take the focused window out of its
-    /// current column (only meaningful when the column hosts multiple tiles)
-    /// and make it the sole tile of a brand-new column inserted immediately
-    /// to the right of the source. Returns true on success.
-    pub fn expel_window_into_new_column(&mut self, window_id: WindowId) -> bool {
-        let Some(src_col_idx) = self.find_window_column(window_id) else {
+    /// niri `consume-or-expel-window-right`: the mirror image of
+    /// [`Self::consume_or_expel_left`] (a lone window goes to the bottom of the
+    /// column on its right; one of several leaves as a column on the right).
+    pub fn consume_or_expel_right(&mut self, window_id: WindowId) -> Option<usize> {
+        let col = self.find_window_column(window_id)?;
+        if self.columns[col].tiles.len() == 1 {
+            if col + 1 >= self.columns.len() {
+                return None;
+            }
+            let lone = self.columns.remove(col);
+            let tile = lone.tiles.into_iter().next()?;
+            // The column that was on the right has taken the lone window's index.
+            self.columns[col].add_tile(tile);
+            Some(col)
+        } else {
+            let expelled = self.take_tile_into_new_column(col, window_id)?;
+            self.columns.insert(col + 1, expelled);
+            Some(col + 1)
+        }
+    }
+
+    /// niri `consume-window-into-column`: the FIRST window of the column on the
+    /// right of `col` moves to the bottom of `col` (the column it leaves vanishes
+    /// when it was its only window).  Returns the window that moved.
+    pub fn consume_into_column(&mut self, col: usize) -> Option<WindowId> {
+        if col + 1 >= self.columns.len() {
+            return None;
+        }
+        let neighbour = &mut self.columns[col + 1];
+        let window_id = neighbour.tiles.first()?.window_id;
+        let tile = neighbour.tiles.remove(0);
+        if neighbour.tiles.is_empty() {
+            self.columns.remove(col + 1);
+        } else {
+            neighbour.clamp_active_tab();
+        }
+        self.columns[col].add_tile(tile);
+        Some(window_id)
+    }
+
+    /// niri `expel-window-from-column`: the BOTTOM window of `col` becomes a column
+    /// of its own on the right of it.  Returns the window that moved, or `None`
+    /// when the column has a single window.
+    pub fn expel_from_column(&mut self, col: usize) -> Option<WindowId> {
+        let window_id = self.columns.get(col)?.tiles.last()?.window_id;
+        let expelled = self.take_tile_into_new_column(col, window_id)?;
+        self.columns.insert(col + 1, expelled);
+        Some(window_id)
+    }
+
+    /// niri `move-window-up` / `move-window-down`: `window_id` changes places with
+    /// the tile above (`delta` -1) or below (`delta` 1) it in its column.  `false`
+    /// at the top / bottom of the column.
+    pub fn move_tile_within_column(&mut self, window_id: WindowId, delta: i32) -> bool {
+        let Some(col) = self.find_window_column(window_id) else {
             return false;
         };
-        // No-op when the source column has only one tile — there is nothing
-        // to expel (the column would just be cloned and the source removed).
-        if self
-            .columns
-            .get(src_col_idx)
-            .map(|c| c.tiles.len())
-            .unwrap_or(0)
-            <= 1
-        {
+        let column = &mut self.columns[col];
+        let Some(from) = column.index_of(window_id) else {
+            return false;
+        };
+        let to = from as i64 + delta as i64;
+        if to < 0 || to >= column.tiles.len() as i64 {
             return false;
         }
-        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else {
-            return false;
-        };
-        let mut new_col = Column::new();
-        new_col.add_tile(tile);
-        let insert_at = src_col_idx + 1;
-        self.columns.insert(insert_at, new_col);
+        let to = to as usize;
+        column.tiles.swap(from, to);
+        // A tabbed column keeps showing the same window.
+        if let ColumnDisplay::Tabbed { active_tab } = &mut column.display {
+            if *active_tab == from {
+                *active_tab = to;
+            } else if *active_tab == to {
+                *active_tab = from;
+            }
+        }
         true
     }
 
@@ -568,6 +661,18 @@ impl Workspace {
             return None;
         }
         let target = target as usize;
+        let column = self.columns.remove(col);
+        self.columns.insert(target, column);
+        Some(target)
+    }
+
+    /// niri `move-column-to-first` / `move-column-to-last`: the column at `col`
+    /// goes to index `target`, the columns in between shift by one.  `None` when
+    /// it is already there or one of the indexes does not exist.
+    pub fn move_column_to(&mut self, col: usize, target: usize) -> Option<usize> {
+        if col >= self.columns.len() || target >= self.columns.len() || col == target {
+            return None;
+        }
         let column = self.columns.remove(col);
         self.columns.insert(target, column);
         Some(target)
@@ -1463,6 +1568,163 @@ mod tests {
             assert_eq!(ids(&ws), vec![vec![1, 2, 3]], "restore order {:?}", restore_order);
             assert_eq!(ws.columns[0].width, Some(500), "the column width came back");
         }
+    }
+
+    // --- niri column operations ---
+
+    #[test]
+    fn test_consume_or_expel_left_moves_a_lone_window_to_the_bottom_of_the_left_column() {
+        let mut ws = ws_with(&[&[1], &[2], &[3]]);
+        assert_eq!(ws.consume_or_expel_left(WindowId::new(2)), Some(0));
+        assert_eq!(ids(&ws), vec![vec![1, 2], vec![3]]);
+        assert_eq!(ws.consume_or_expel_left(WindowId::new(3)), Some(0));
+        assert_eq!(ids(&ws), vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn test_consume_or_expel_left_expels_a_window_to_the_left_of_its_column() {
+        let mut ws = ws_with(&[&[1], &[2, 3, 4], &[5]]);
+        ws.columns[1].width = Some(640);
+        assert_eq!(ws.consume_or_expel_left(WindowId::new(3)), Some(1));
+        // At the source column's place: the expelled window ends up on its left.
+        assert_eq!(ids(&ws), vec![vec![1], vec![3], vec![2, 4], vec![5]]);
+        assert_eq!(ws.columns[1].width, Some(640), "same width as the column it left");
+        assert_eq!(ws.columns[2].width, Some(640));
+    }
+
+    #[test]
+    fn test_consume_or_expel_left_does_nothing_for_a_lone_window_in_the_first_column() {
+        let mut ws = ws_with(&[&[1], &[2]]);
+        assert_eq!(ws.consume_or_expel_left(WindowId::new(1)), None);
+        assert_eq!(ids(&ws), vec![vec![1], vec![2]]);
+        assert_eq!(ws.consume_or_expel_left(WindowId::new(9)), None);
+    }
+
+    #[test]
+    fn test_consume_or_expel_right_moves_a_lone_window_to_the_bottom_of_the_right_column() {
+        let mut ws = ws_with(&[&[1], &[2], &[3]]);
+        assert_eq!(ws.consume_or_expel_right(WindowId::new(1)), Some(0));
+        assert_eq!(ids(&ws), vec![vec![2, 1], vec![3]]);
+        assert_eq!(ws.consume_or_expel_right(WindowId::new(1)), Some(1), "now it shares a column: it is expelled to the right");
+        assert_eq!(ids(&ws), vec![vec![2], vec![1], vec![3]]);
+    }
+
+    #[test]
+    fn test_consume_or_expel_right_expels_a_window_to_the_right_of_its_column() {
+        let mut ws = ws_with(&[&[1], &[2, 3, 4], &[5]]);
+        assert_eq!(ws.consume_or_expel_right(WindowId::new(3)), Some(2));
+        assert_eq!(ids(&ws), vec![vec![1], vec![2, 4], vec![3], vec![5]]);
+    }
+
+    #[test]
+    fn test_consume_or_expel_right_does_nothing_for_a_lone_window_in_the_last_column() {
+        let mut ws = ws_with(&[&[1], &[2]]);
+        assert_eq!(ws.consume_or_expel_right(WindowId::new(2)), None);
+        assert_eq!(ids(&ws), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn test_consume_into_column_pulls_the_first_window_of_the_right_column() {
+        let mut ws = ws_with(&[&[1], &[2, 3], &[4]]);
+        assert_eq!(ws.consume_into_column(0), Some(WindowId::new(2)));
+        assert_eq!(ids(&ws), vec![vec![1, 2], vec![3], vec![4]]);
+        assert_eq!(ws.consume_into_column(1), Some(WindowId::new(4)));
+        assert_eq!(ids(&ws), vec![vec![1, 2], vec![3, 4]], "the emptied column vanishes");
+        assert_eq!(ws.consume_into_column(1), None, "nothing on the right of the last column");
+    }
+
+    #[test]
+    fn test_expel_from_column_takes_the_bottom_window() {
+        let mut ws = ws_with(&[&[1, 2, 3], &[4]]);
+        assert_eq!(ws.expel_from_column(0), Some(WindowId::new(3)));
+        assert_eq!(ids(&ws), vec![vec![1, 2], vec![3], vec![4]]);
+        assert_eq!(ws.expel_from_column(0), Some(WindowId::new(2)));
+        assert_eq!(ids(&ws), vec![vec![1], vec![2], vec![3], vec![4]]);
+        assert_eq!(ws.expel_from_column(0), None, "a single window has nothing to expel");
+        assert_eq!(ws.expel_from_column(9), None);
+    }
+
+    #[test]
+    fn test_a_window_expelled_from_a_maximized_column_is_maximized_too() {
+        let mut ws = ws_with(&[&[1, 2]]);
+        ws.columns[0].width = Some(500);
+        ws.columns[0].toggle_maximized(900);
+        assert_eq!(ws.expel_from_column(0), Some(WindowId::new(2)));
+        for col in &ws.columns {
+            assert!(col.maximized);
+            assert_eq!(col.width, Some(900));
+            assert_eq!(col.pre_max_width, Some(Some(500)));
+        }
+    }
+
+    #[test]
+    fn test_move_tile_within_column_swaps_with_the_neighbour() {
+        let mut ws = ws_with(&[&[1, 2, 3]]);
+        assert!(ws.move_tile_within_column(WindowId::new(2), -1));
+        assert_eq!(ids(&ws), vec![vec![2, 1, 3]]);
+        assert!(!ws.move_tile_within_column(WindowId::new(2), -1), "already at the top");
+        assert!(ws.move_tile_within_column(WindowId::new(2), 1));
+        assert!(ws.move_tile_within_column(WindowId::new(2), 1));
+        assert_eq!(ids(&ws), vec![vec![1, 3, 2]]);
+        assert!(!ws.move_tile_within_column(WindowId::new(2), 1), "already at the bottom");
+        assert!(!ws.move_tile_within_column(WindowId::new(9), 1));
+    }
+
+    #[test]
+    fn test_a_tabbed_column_keeps_showing_the_same_window_when_tiles_swap() {
+        let mut ws = ws_with(&[&[1, 2, 3]]);
+        ws.columns[0].display = ColumnDisplay::Tabbed { active_tab: 1 };
+        assert!(ws.move_tile_within_column(WindowId::new(2), 1));
+        assert_eq!(ws.columns[0].display, ColumnDisplay::Tabbed { active_tab: 2 });
+        assert_eq!(ids(&ws), vec![vec![1, 3, 2]]);
+    }
+
+    #[test]
+    fn test_move_column_to_an_edge() {
+        let mut ws = ws_with(&[&[1], &[2, 3], &[4]]);
+        assert_eq!(ws.move_column_to(2, 0), Some(0));
+        assert_eq!(ids(&ws), vec![vec![4], vec![1], vec![2, 3]]);
+        assert_eq!(ws.move_column_to(0, 2), Some(2));
+        assert_eq!(ids(&ws), vec![vec![1], vec![2, 3], vec![4]]);
+        assert_eq!(ws.move_column_to(1, 1), None, "already there");
+        assert_eq!(ws.move_column_to(5, 0), None);
+        assert_eq!(ws.move_column_to(0, 5), None);
+    }
+
+    // --- maximize-column ---
+
+    #[test]
+    fn test_toggle_maximized_widens_and_restores_the_column() {
+        let mut col = Column::new();
+        col.add_tile(Tile::new(WindowId::new(1)));
+        col.toggle_maximized(900);
+        assert!(col.maximized);
+        assert_eq!(col.width, Some(900), "even a column of one window gets as wide as the view");
+        col.toggle_maximized(900);
+        assert!(!col.maximized);
+        assert_eq!(col.width, None, "back to the default width");
+
+        col.width = Some(500);
+        col.toggle_maximized(900);
+        assert_eq!(col.width, Some(900));
+        col.toggle_maximized(900);
+        assert_eq!(col.width, Some(500), "back to the width it had");
+    }
+
+    #[test]
+    fn test_an_explicit_width_ends_the_maximized_state() {
+        let mut col = Column::new();
+        col.width = Some(500);
+        col.toggle_maximized(900);
+        col.set_width(Some(640));
+        assert!(!col.maximized);
+        assert_eq!(col.width, Some(640));
+        assert_eq!(col.pre_max_width, None);
+        // ...so the next toggle maximizes again instead of restoring something stale.
+        col.toggle_maximized(900);
+        assert_eq!(col.width, Some(900));
+        col.toggle_maximized(900);
+        assert_eq!(col.width, Some(640));
     }
 
     #[test]
