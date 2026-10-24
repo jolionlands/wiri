@@ -478,7 +478,10 @@
             "data": {
               "type": "object",
               "required": ["command"],
-              "properties": { "command": { "type": "string", "description": "Command line to execute." } }
+              "properties": {
+                "command": { "type": "string", "description": "The program, or (when args is empty) a whole command line split with the Windows quoting rules." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments, each passed through intact. Optional." }
+              }
             }
           }
         },

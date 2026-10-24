@@ -429,7 +429,7 @@ Set the active workspace's layout mode.
 | `subscribe_events` | `event_types: string[]` | Subscribe to live events (see §6) |
 | `reload_config` | — | Hot-reload config.kdl |
 | `quit` | — | Gracefully shut down the wiri daemon |
-| `spawn_command` | `command: string` | Spawn an external process |
+| `spawn_command` | `command: string`, `args?: string[]` | Spawn an external process; with `args` the arguments are passed intact, without it `command` is split like a Windows command line (quoted paths with spaces work) and the program is searched on PATH |
 | `list_bindings` | — | List all registered Win32 hotkey bindings (raw: id, modifiers, vk_code) |
 | `get_bindings` | — | List bindings as human-readable `chord + action` table |
 | `set_auto_tile_threshold` | `threshold: usize \| null` | Window count above which auto-tile activates; null = disabled |

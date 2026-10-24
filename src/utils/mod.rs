@@ -2,6 +2,7 @@ pub use anyhow::{Context, Result};
 pub use thiserror::Error;
 pub use tracing::{debug, error, info, trace, warn};
 
+pub mod cmdline;
 pub mod id;
 pub mod rect;
 

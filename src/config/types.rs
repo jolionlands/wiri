@@ -909,6 +909,10 @@ pub struct HotkeyBinding {
     /// The action name from config (e.g. "focus-column-left", "close-window")
     pub command: String,
     pub args: Vec<String>,
+    /// Whether each argument was written in double quotes (parallel to `args`;
+    /// missing entries mean "not quoted").  `focus-workspace 2` is an index,
+    /// `focus-workspace "2"` the workspace named "2".
+    pub args_quoted: Vec<bool>,
     pub repeat: bool,
     pub release: bool,
 }
@@ -997,6 +1001,7 @@ impl Default for HotkeyBinding {
             modifiers: Vec::new(),
             command: String::new(),
             args: Vec::new(),
+            args_quoted: Vec::new(),
             repeat: false,
             release: false,
         }

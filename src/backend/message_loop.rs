@@ -75,9 +75,10 @@ fn bind_to_hotkey(
 }
 
 /// Default hotkey bindings using the configured modifier prefix. The Mod+Enter
-/// terminal-spawn binding is parameterised by `terminal_cmd` so callers can
-/// pick up the user's preferred shell instead of always launching cmd.exe.
-fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u32, u32, Action)> {
+/// terminal-spawn binding is parameterised by `terminal` (see
+/// [`resolve_terminal_action`]) so callers pick up the user's preferred terminal
+/// instead of always launching the same one.
+fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32, u32, Action)> {
     vec![
         (prefix, 0x25, Action::FocusColumnLeft),  // Left
         (prefix, 0x27, Action::FocusColumnRight), // Right
@@ -86,7 +87,7 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (shift_prefix, 0x25, Action::MoveColumnLeft),
         (shift_prefix, 0x27, Action::MoveColumnRight),
         (prefix, 0x51, Action::CloseWindow), // Q
-        (prefix, 0x0D, Action::Spawn(terminal_cmd.to_string())), // Enter
+        (prefix, 0x0D, terminal), // Enter
         (prefix, 0x46, Action::ToggleFullscreen), // F
         (prefix, 0x54, Action::ToggleFloating), // T
         (prefix, 0x48, Action::ScrollLeft),  // H
@@ -249,7 +250,7 @@ fn merge_hotkeys(
 ///      semantics), and an empty surviving table falls back to defaults
 ///      so the daemon never ships zero hotkeys after a bad reload.
 fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u32, u32, Action)> {
-    let terminal_cmd = resolve_terminal_command(engine);
+    let terminal = resolve_terminal_action(engine);
     let eng = engine.read();
     let binds = eng.config_binds();
     let config_binds = &binds.hotkeys;
@@ -262,7 +263,7 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
     // Always materialise the defaults first so we can both A) return them
     // verbatim when the user's binds block is missing, and B) merge with
     // user binds when extend_defaults=true.
-    let defaults = default_hotkeys(prefix, shift_prefix, &terminal_cmd);
+    let defaults = default_hotkeys(prefix, shift_prefix, terminal.clone());
     let default_count = defaults.len();
 
     if config_binds.is_empty() {
@@ -299,7 +300,7 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
     }
     if merged.is_empty() {
         warn!("Hotkey table empty after merge; defaults reinstated");
-        return default_hotkeys(prefix, shift_prefix, &terminal_cmd);
+        return default_hotkeys(prefix, shift_prefix, terminal);
     }
     merged
 }
@@ -824,8 +825,8 @@ fn execute_action(
         Action::CloseWindow => {
             engine.write().close_focused_window(backend);
         }
-        Action::Spawn(cmd) => {
-            spawn_process(cmd);
+        Action::Spawn(argv) => {
+            spawn_process(argv);
         }
         Action::SpawnCmd(cmd) => {
             // niri-style `spawn-cmd "<command>"` — route through the
@@ -1267,46 +1268,29 @@ fn take_screenshot() {
     }
 }
 
-fn spawn_process(cmd: &str) {
-    use std::os::windows::process::CommandExt;
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.is_empty() {
-        return;
-    }
-    // CREATE_NO_WINDOW = 0x08000000 — prevents console-subsystem children
-    // (like wiri-ctl, or any user-defined keybind action that resolves to a
-    // console exe) from popping a visible cmd window.
-    match std::process::Command::new(parts[0])
-        .args(&parts[1..])
-        .creation_flags(0x0800_0000)
-        .spawn()
-    {
-        Ok(_) => info!("Spawned: {}", cmd),
-        Err(e) => warn!("Spawn failed: {}", e),
+/// Run a program with its arguments intact (`Action::Spawn`).  Goes through the
+/// one shared spawner, so bind, `spawn-at-startup` and IPC `spawn` all quote and
+/// search the PATH the same way.
+fn spawn_process(argv: &[String]) {
+    match crate::hooks::spawner::spawn_argv(argv) {
+        Ok(pid) => info!("Spawned {:?} (pid {})", argv, pid),
+        Err(e) => warn!("Spawn failed for {:?}: {}", argv, e),
     }
 }
 
-/// Launch a single command line through `cmd.exe /C "<command>"`.
+/// Launch a single command line through `cmd.exe /d /s /c "<command>"`.
 ///
-/// Used by `Action::SpawnCmd` and the IPC `SpawnCommand` shell path.  The
-/// shell expands env vars (`%USERPROFILE%`, etc.), recognises built-ins
-/// (`start`, redirection, `&&`), and resolves PATH lookups for callers
-/// that don't want to deal with `std::process::Command`'s argv parsing.
+/// Used by `Action::SpawnCmd`.  The shell expands env vars (`%USERPROFILE%`,
+/// etc.), recognises built-ins (`start`, redirection, `&&`) and resolves PATH
+/// lookups for callers that want those.  The shell itself runs without a
+/// console window; whatever it starts shows its own.
 fn spawn_shell_command(cmd: &str) {
-    use std::os::windows::process::CommandExt;
     if cmd.trim().is_empty() {
         return;
     }
-    // CREATE_NO_WINDOW = 0x08000000 — without this, every keybinding that
-    // shells out (e.g. user `spawn-cmd` actions) flashes a console window
-    // before the actual program launches.
-    match std::process::Command::new("cmd.exe")
-        .args(["/C", cmd])
-        .creation_flags(0x0800_0000)
-        .spawn()
-    {
-        Ok(_) => info!("SpawnCmd (cmd.exe /C): {}", cmd),
-        Err(e) => warn!("SpawnCmd failed: {}", e),
+    match crate::hooks::spawner::spawn_shell(cmd) {
+        Ok(pid) => info!("SpawnCmd (cmd.exe /c): {} (pid {})", cmd, pid),
+        Err(e) => warn!("SpawnCmd failed for {:?}: {}", cmd, e),
     }
 }
 
@@ -1324,36 +1308,40 @@ fn mod_prefix_display_name(name: &str) -> String {
     }
 }
 
-/// Resolve the user's preferred "terminal" command, falling back to `cmd.exe`.
+/// What `Mod+Enter` launches when the config does not say: Windows Terminal,
+/// falling back to PowerShell, so the user is never dropped into a bare cmd.exe.
+const DEFAULT_TERMINAL_COMMAND: &str = "start wt.exe || start powershell.exe";
+
+/// Resolve the user's preferred "terminal" launch action.
 ///
 /// Looked up from the engine's full config in this order:
-/// 1. The first `Spawn(...)` entry in the configured binds (so a user bind
-///    `Mod+Enter { spawn "wt.exe" }` overrides cmd.exe automatically).
+/// 1. The first `spawn` / `spawn-cmd` bind (so a user bind
+///    `Mod+Enter { spawn "wt.exe" }` is also what the built-in default runs).
 /// 2. The first non-empty entry in `spawn_at_startup` (rare, but if a user
 ///    has only declared their terminal there we still find it).
-/// 3. Literal `"cmd.exe"`.
-fn resolve_terminal_command(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> String {
+/// 3. [`DEFAULT_TERMINAL_COMMAND`].
+fn resolve_terminal_action(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Action {
     let eng = engine.read();
-    if let Some(cfg) = eng.full_config() {
-        // 1. Look for a Spawn / SpawnCmd bind in the config — either flavour
-        // is treated as the user's terminal-launch preference for the
-        // Mod+Enter default.
+    terminal_action_from_config(eng.full_config())
+}
+
+/// Pure core of [`resolve_terminal_action`].
+fn terminal_action_from_config(cfg: Option<&crate::config::Config>) -> Action {
+    if let Some(cfg) = cfg {
         for bind in &cfg.binds.hotkeys {
             match bind.parse_action() {
-                Some(Action::Spawn(cmd)) | Some(Action::SpawnCmd(cmd)) => {
-                    if !cmd.trim().is_empty() {
-                        return cmd;
-                    }
+                Some(Action::Spawn(argv)) if !argv.is_empty() => return Action::Spawn(argv),
+                Some(Action::SpawnCmd(cmd)) if !cmd.trim().is_empty() => {
+                    return Action::SpawnCmd(cmd)
                 }
                 _ => {}
             }
         }
-        // 2. Look at spawn-at-startup entries.
         if let Some(entry) = cfg.spawn_at_startup.iter().find(|e| !e.is_empty()) {
-            return entry.join(" ");
+            return Action::Spawn(entry.clone());
         }
     }
-    "cmd.exe".to_string()
+    Action::SpawnCmd(DEFAULT_TERMINAL_COMMAND.to_string())
 }
 
 #[cfg(test)]
@@ -1361,7 +1349,11 @@ mod tests {
     use super::*;
 
     fn d(mods: u32, vk: u32, label: &str) -> (u32, u32, Action) {
-        (mods, vk, Action::Spawn(label.to_string()))
+        (mods, vk, Action::Spawn(vec![label.to_string()]))
+    }
+
+    fn spawn_of(label: &str) -> Action {
+        Action::Spawn(vec![label.to_string()])
     }
 
     /// extend_defaults=true preserves every default chord AND appends the
@@ -1376,9 +1368,9 @@ mod tests {
         let (merged, overridden) = merge_hotkeys(defaults, config, true);
         assert_eq!(overridden, 0);
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged[0].2, Action::Spawn("default-left".to_string()));
-        assert_eq!(merged[1].2, Action::Spawn("default-right".to_string()));
-        assert_eq!(merged[2].2, Action::Spawn("config-alt-p".to_string()));
+        assert_eq!(merged[0].2, spawn_of("default-left"));
+        assert_eq!(merged[1].2, spawn_of("default-right"));
+        assert_eq!(merged[2].2, spawn_of("config-alt-p"));
     }
 
     /// extend_defaults=true: config wins on a (mods, vk) collision; the
@@ -1391,7 +1383,7 @@ mod tests {
         let (merged, overridden) = merge_hotkeys(defaults, config, true);
         assert_eq!(overridden, 1);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].2, Action::Spawn("config-left".to_string()));
+        assert_eq!(merged[0].2, spawn_of("config-left"));
     }
 
     /// extend_defaults=false drops every default and uses the config table
@@ -1405,7 +1397,7 @@ mod tests {
         let config = vec![d(0x0001, 0x50, "config-alt-p")];
         let (merged, _overridden) = merge_hotkeys(defaults, config, false);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].2, Action::Spawn("config-alt-p".to_string()));
+        assert_eq!(merged[0].2, spawn_of("config-alt-p"));
     }
 
     /// Empty config + extend=true returns defaults untouched (a fresh user
@@ -1502,5 +1494,39 @@ mod tests {
         // Unknown key / action are still refused.
         assert!(bind_to_hotkey(&bind("Mod+Nonsense", "quit", &[]), mod_key).is_err());
         assert!(bind_to_hotkey(&bind("Mod+T", "no-such-action", &[]), mod_key).is_err());
+    }
+
+    #[test]
+    fn the_default_terminal_follows_the_config_and_never_is_a_bare_cmd() {
+        // No config at all: Windows Terminal, then PowerShell.
+        assert_eq!(
+            terminal_action_from_config(None),
+            Action::SpawnCmd(DEFAULT_TERMINAL_COMMAND.to_string())
+        );
+        let mut cfg = crate::config::Config::default();
+        assert_eq!(
+            terminal_action_from_config(Some(&cfg)),
+            Action::SpawnCmd(DEFAULT_TERMINAL_COMMAND.to_string())
+        );
+        // A `spawn` bind with arguments is used as the terminal, arguments intact.
+        cfg.binds
+            .hotkeys
+            .push(bind("Ctrl+Alt+Return", "spawn", &["wt.exe", "-d", "C:\\My Projects"]));
+        assert_eq!(
+            terminal_action_from_config(Some(&cfg)),
+            Action::Spawn(vec![
+                "wt.exe".to_string(),
+                "-d".to_string(),
+                "C:\\My Projects".to_string()
+            ])
+        );
+        // spawn-at-startup is the fallback when no bind spawns anything.
+        let mut cfg = crate::config::Config::default();
+        cfg.spawn_at_startup
+            .push(vec!["alacritty.exe".to_string(), "--hold".to_string()]);
+        assert_eq!(
+            terminal_action_from_config(Some(&cfg)),
+            Action::Spawn(vec!["alacritty.exe".to_string(), "--hold".to_string()])
+        );
     }
 }

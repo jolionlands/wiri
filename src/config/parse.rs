@@ -1013,37 +1013,14 @@ fn apply_window_rule_matcher_flag(token: &str, wr: &mut WindowRule) {
     }
 }
 
-/// Split a line of whitespace-separated tokens, respecting double-quoted strings.
-/// Quotes are stripped from each token.  No shell escaping is performed.
+/// Split a line of whitespace-separated tokens, respecting double-quoted strings
+/// (the Windows command-line rules, so `"C:\Program Files\x"` keeps its
+/// backslashes).  Quotes are stripped from each token.
 /// Examples:
-///   `"alacritty" "-e" "tmux"` → ["alacritty", "-e", "tmux"]
-///   `firefox`                  → ["firefox"]
+///   `"alacritty" "-e" "tmux"` -> ["alacritty", "-e", "tmux"]
+///   `firefox`                  -> ["firefox"]
 fn tokenize_shell_line(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-
-    for ch in line.chars() {
-        match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                // Don't push the quote character itself
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
-                }
-            }
-            c => {
-                current.push(c);
-            }
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+    crate::utils::cmdline::split_command_line(line)
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,48 +1324,11 @@ pub fn validate_kdl_config(input: &str) -> Vec<ValidationIssue> {
 /// Format: Mod+Key action-name [args]
 /// Example: Ctrl+Alt+Left focus-column-left
 ///          Ctrl+Alt+1 switch-workspace 1
-/// Split a binding action's tail into tokens, keeping anything inside double
-/// quotes as a single token (with the surrounding quotes stripped).
 ///
-/// Examples:
-///   `set-column-width "1/3"`            -> ["set-column-width", "1/3"]
-///   `spawn-cmd "wt.exe -p PowerShell"`  -> ["spawn-cmd", "wt.exe -p PowerShell"]
-///   `spawn "start cmd || exit"`         -> ["spawn", "start cmd || exit"]
-///
-/// Backslash escapes (`\"`) inside a quoted string are honoured.  An unbalanced
-/// final quote is treated as if it had been closed at end-of-line.
-fn tokenize_respecting_quotes(s: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                in_quotes = !in_quotes;
-                // Don't include the quote char itself in the token.
-            }
-            '\\' if in_quotes => {
-                if let Some(&next) = chars.peek() {
-                    cur.push(next);
-                    chars.next();
-                }
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
+/// The action and its arguments are split with the Windows command-line rules
+/// (see `utils::cmdline`): a quoted string is one word, backslashes in paths are
+/// literal, `\"` is a quote.  Whether each argument was quoted is kept too
+/// (`focus-workspace 2` is an index, `focus-workspace "2"` a workspace name).
 fn parse_bind_line(line: &str) -> Option<crate::config::HotkeyBinding> {
     let line = line.trim();
     if line.is_empty() || line.starts_with("//") {
@@ -1422,21 +1362,23 @@ fn parse_bind_line(line: &str) -> Option<crate::config::HotkeyBinding> {
     // We must respect quoted strings as a single token, otherwise
     //   spawn-cmd "start wt.exe || start powershell.exe"
     // gets split into 5 args, only the first of which ("start") survives the
-    // `args.first()` lookup downstream — silently turning the binding into a
+    // `args.first()` lookup downstream - silently turning the binding into a
     // useless `spawn-cmd start`.
-    let action_tokens = tokenize_respecting_quotes(action_rest);
+    let action_tokens = crate::utils::cmdline::split_command_line_flagged(action_rest);
     if action_tokens.is_empty() {
         return None;
     }
 
-    let command = action_tokens[0].clone();
-    let args: Vec<String> = action_tokens[1..].to_vec();
+    let command = action_tokens[0].0.clone();
+    let args: Vec<String> = action_tokens[1..].iter().map(|(w, _)| w.clone()).collect();
+    let args_quoted: Vec<bool> = action_tokens[1..].iter().map(|(_, q)| *q).collect();
 
     Some(crate::config::HotkeyBinding {
         modifiers,
         key,
         command,
         args,
+        args_quoted,
         repeat: false,
         release: false,
     })

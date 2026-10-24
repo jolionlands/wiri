@@ -22,10 +22,13 @@ pub use touch::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Action {
     Quit,
-    Spawn(String),
+    /// Run a program: `argv[0]` is the program (searched on PATH when it has no
+    /// directory part), the rest are its arguments, each passed through intact
+    /// (niri `spawn "wt.exe" "-d" "C:\My Projects"`).
+    Spawn(Vec<String>),
     /// Spawn a shell command via `cmd.exe /C "<command>"` (niri `spawn-sh`
-    /// parity). Distinct from `Spawn(...)` which splits on whitespace and
-    /// invokes the resulting argv directly.
+    /// parity). Distinct from `Spawn(...)`, which starts the program directly
+    /// without a shell.
     SpawnCmd(String),
     CloseWindow,
     MoveColumnLeft,
@@ -200,7 +203,15 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
             .first()
             .and_then(|s| s.parse::<i32>().ok())
             .map(Action::MoveWorkspace),
-        "spawn" | "exec" => args.first().map(|cmd| Action::Spawn(cmd.clone())),
+        // Every argument counts: `spawn "wt.exe" "-d" "C:\My Projects"` is three
+        // words, and the first one is the program.
+        "spawn" | "exec" => {
+            if args.is_empty() || args[0].trim().is_empty() {
+                None
+            } else {
+                Some(Action::Spawn(args.to_vec()))
+            }
+        }
         "spawn-cmd" | "spawn_cmd" | "spawn-sh" => {
             args.first().map(|cmd| Action::SpawnCmd(cmd.clone()))
         }
@@ -822,12 +833,26 @@ mod tests {
         );
         assert_eq!(
             parse_action_name("spawn", &["cmd.exe".to_string()]),
-            Some(Action::Spawn("cmd.exe".to_string()))
+            Some(Action::Spawn(vec!["cmd.exe".to_string()]))
         );
         assert_eq!(
             parse_action_name("exec", &["notepad".to_string()]),
-            Some(Action::Spawn("notepad".to_string()))
+            Some(Action::Spawn(vec!["notepad".to_string()]))
         );
+    }
+
+    #[test]
+    fn test_spawn_keeps_every_argument() {
+        let args: Vec<String> = ["wt.exe", "-d", "C:\\My Projects", "--title", "a b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_action_name("spawn", &args),
+            Some(Action::Spawn(args.clone()))
+        );
+        // A blank program is no program.
+        assert_eq!(parse_action_name("spawn", &["  ".to_string()]), None);
     }
 
     #[test]

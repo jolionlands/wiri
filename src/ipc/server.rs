@@ -909,17 +909,15 @@ impl IpcServer {
                     serde_json::json!({"success": true, "result": []})
                 }
             }
-            IpcMessage::SpawnCommand { command } => {
-                info!("IPC: SpawnCommand {:?}", command);
-                let parts: Vec<&str> = command.split_whitespace().collect();
-                if parts.is_empty() {
+            IpcMessage::SpawnCommand { command, args } => {
+                info!("IPC: SpawnCommand {:?} {:?}", command, args);
+                let argv = crate::hooks::spawner::spawn_command_argv(&command, &args);
+                if argv.is_empty() {
                     return serde_json::json!({"success": false, "error": "empty command"});
                 }
-                let program = std::path::Path::new(parts[0]);
-                let args: Vec<&str> = parts[1..].to_vec();
-                match crate::hooks::Spawner::new().spawn(program, &args, true) {
+                match crate::hooks::spawner::spawn_argv(&argv) {
                     Ok(pid) => serde_json::json!({"success": true, "pid": pid}),
-                    Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
+                    Err(e) => serde_json::json!({"success": false, "error": format!("{:#}", e)}),
                 }
             }
             IpcMessage::ConsumeWindow => {

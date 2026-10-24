@@ -15,6 +15,15 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   `Mod` token is understood: it resolves to the `input { mod-key }` modifier (Ctrl+Alt unless set,
   also `super`, `alt`, `win-alt`, `ctrl-shift`, `ctrl`), so `Mod+Shift+T` ports as written.  An
   unknown `mod-key` value warns instead of silently becoming Ctrl+Alt.
+- **`spawn`, `spawn-at-startup` and `wiri-ctl spawn` share one spawner** that keeps every argument
+  (`spawn "wt.exe" "-d" "C:\My Projects"` used to run `wt.exe` alone), understands quoted paths with
+  spaces and backslashes (the Windows command-line rules, also for `spawn-at-startup` lines), and
+  finds programs on the PATH, so the default config's `wt.exe` works (`CreateProcessW` is given a
+  properly quoted command line and no application name; `.cmd` / `.bat` launchers are found through
+  PATHEXT).  A program started with `spawn` gets its own console window and starts in the user's
+  profile; `spawn-sh` runs `cmd.exe /d /s /c` without one.  `wiri-ctl spawn prog arg...` passes the
+  arguments through, `wiri-ctl spawn '"C:\x y\a.exe" -f'` takes a whole command line.  The built-in
+  `Mod+Enter` starts Windows Terminal and falls back to PowerShell instead of a bare `cmd.exe`.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal

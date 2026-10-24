@@ -272,17 +272,16 @@ async fn main() -> Result<()> {
     // Spawn programs listed in spawn-at-startup config entries (niri parity).
     // --no-autostart suppresses this loop (useful when testing config changes).
     if !args.no_autostart {
-        use wiri::hooks::Spawner;
-        let spawner = Spawner::new();
         for entry in &config.spawn_at_startup {
             if entry.is_empty() {
                 continue;
             }
-            let program = std::path::Path::new(&entry[0]);
-            let arg_strs: Vec<&str> = entry[1..].iter().map(|s| s.as_str()).collect();
             info!("spawn-at-startup: {:?}", entry);
-            if let Err(e) = spawner.spawn(program, &arg_strs, true) {
-                warn!("spawn-at-startup failed for {:?}: {}", entry, e);
+            // Same spawner as the `spawn` bind and the IPC request: every
+            // argument kept, quoted paths with spaces, programs found on PATH.
+            match wiri::hooks::spawner::spawn_argv(entry) {
+                Ok(pid) => info!("spawn-at-startup: started {:?} (pid {})", entry, pid),
+                Err(e) => warn!("spawn-at-startup failed for {:?}: {}", entry, e),
             }
         }
     }

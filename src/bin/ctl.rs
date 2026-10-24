@@ -264,8 +264,16 @@ enum Commands {
     /// Focus the previous workspace
     FocusWorkspacePrevious,
 
-    /// Spawn a command (e.g. `wiri-ctl spawn 'wt.exe'`)
-    Spawn { command: String },
+    /// Spawn a program: `wiri-ctl spawn wt.exe -d "C:\My Projects"`. The
+    /// arguments are passed through intact; with none, the program may also be
+    /// a whole quoted command line (`wiri-ctl spawn 'wt.exe -d "C:\x y"'`).
+    Spawn {
+        /// Program to run (searched on PATH when it has no directory part)
+        command: String,
+        /// Arguments of the program
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     /// Focus the previously focused window (alt-tab through MRU history)
     FocusPrevious,
@@ -512,7 +520,7 @@ fn real_main() -> Result<()> {
         Commands::ResizeColumn { delta_px } => IpcMessage::ResizeColumn { delta_px },
         Commands::FocusWorkspaceNext => IpcMessage::FocusWorkspaceNext,
         Commands::FocusWorkspacePrevious => IpcMessage::FocusWorkspacePrevious,
-        Commands::Spawn { command } => IpcMessage::SpawnCommand { command },
+        Commands::Spawn { command, args } => IpcMessage::SpawnCommand { command, args },
         Commands::FocusPrevious => IpcMessage::FocusPrevious,
         Commands::ToggleAlwaysOnTop => IpcMessage::ToggleAlwaysOnTop,
         Commands::FocusWorkspaceNamed { name } => IpcMessage::FocusWorkspaceNamed { name },
@@ -709,11 +717,16 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 window_hwnd, *window_hwnd
             );
         }
-        IpcMessage::SpawnCommand { command } => {
+        IpcMessage::SpawnCommand { command, args } => {
+            let what = if args.is_empty() {
+                command.clone()
+            } else {
+                format!("{} {}", command, args.join(" "))
+            };
             let pid = resp.get("pid").and_then(|v| v.as_u64());
             match pid {
-                Some(p) => outln!("Spawned '{}'  (pid: {}).", command, p),
-                None => outln!("Spawned '{}'.", command),
+                Some(p) => outln!("Spawned '{}'  (pid: {}).", what, p),
+                None => outln!("Spawned '{}'.", what),
             }
         }
         IpcMessage::WindowFloat { window_hwnd } => {

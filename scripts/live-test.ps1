@@ -497,6 +497,67 @@ Set-Content (Join-Path $D 'h1-keys-seen.txt') $h1KeysSeen
 Start-Sleep -Milliseconds 1000
 $w = $w3
 
+# ---- H2: spawn - every argument kept, quoted paths with spaces, programs found on PATH ----------------------
+$argdump = Join-Path $D 'argdump.ps1'
+Set-Content -Path $argdump -Encoding ASCII -Value 'param([string]$OutFile)', 'ConvertTo-Json -InputObject @($args) -Compress | Set-Content -Path $OutFile -Encoding UTF8'
+Copy-Item (Join-Path $env:SystemRoot 'System32\cmd.exe') (Join-Path $pdir 'my cmd.exe') -Force
+foreach ($f in 'bind-spawn.json', 'bind-shell.txt', 'startup-spawn.json', 'ipc-spawn.json', 'ipc-line.txt') { Remove-Item (Join-Path $pdir $f) -Force -ErrorAction SilentlyContinue }
+
+# The built-in Mod+Enter (no spawn bind in this config) starts Windows Terminal: press it for real.
+$topBefore = [LT]::TopLevel()
+Chord 'ctrl+alt+return'
+$defaultTerm = $null
+for ($i = 0; $i -lt 40 -and -not $defaultTerm; $i++) {
+    Start-Sleep -Milliseconds 250
+    $defaultTerm = @(NewTopLevel $topBefore | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') }) | Select-Object -First 1
+}
+$spawnDefaultTerminal = [bool]$defaultTerm
+Shot '13-default-terminal'
+if ($defaultTerm) { [LT]::Close($defaultTerm) }
+Start-Sleep -Seconds 2
+
+$h2Config = @"
+binds {
+    Mod+F7 spawn "powershell" "-NoProfile" "-File" "$argdump" "$pdir\bind-spawn.json" "arg one" "C:\Program Files\x y" "double  space" "quote\"d"
+    Mod+F6 spawn-sh "echo shell ok> \"$pdir\bind-shell.txt\""
+}
+spawn-at-startup "powershell" "-NoProfile" "-File" "$argdump" "$pdir\startup-spawn.json" "start arg" "C:\Program Files\startup dir\\"
+"@
+$log4 = Join-Path $D 'wiri.stderr4.log'
+Stop-WiriGracefully $w 'h2'
+$w4 = Start-WiriWithConfig $h2Config $log4
+$null = WaitFile (Join-Path $pdir 'startup-spawn.json') 12
+$spawnStartupArgsOk = SameList (ReadJsonArray (Join-Path $pdir 'startup-spawn.json')) @('start arg', 'C:\Program Files\startup dir\')
+Chord 'ctrl+alt+f7'
+$null = WaitFile (Join-Path $pdir 'bind-spawn.json') 12
+$spawnBindArgsOk = SameList (ReadJsonArray (Join-Path $pdir 'bind-spawn.json')) @('arg one', 'C:\Program Files\x y', 'double  space', 'quote"d')
+Chord 'ctrl+alt+f6'
+$null = WaitFile (Join-Path $pdir 'bind-shell.txt') 8
+$shellText = if (Test-Path (Join-Path $pdir 'bind-shell.txt')) { (Get-Content (Join-Path $pdir 'bind-shell.txt') -Raw).Trim() } else { '' }
+$spawnShellOk = ($shellText -eq 'shell ok')
+# IPC spawn: arguments given separately, and a whole quoted command line whose program path has a space.
+$null = Ctl 'h2-ipc-spawn-args' @('spawn', 'powershell', '-NoProfile', '-File', (Q $argdump), (Q (Join-Path $pdir 'ipc-spawn.json')), (Q 'arg one'), (Q 'C:\Program Files\x y'))
+$null = WaitFile (Join-Path $pdir 'ipc-spawn.json') 12
+$spawnIpcArgsOk = SameList (ReadJsonArray (Join-Path $pdir 'ipc-spawn.json')) @('arg one', 'C:\Program Files\x y')
+$line = "`"$(Join-Path $pdir 'my cmd.exe')`" /c echo ipc line> `"$(Join-Path $pdir 'ipc-line.txt')`""
+$null = Ctl 'h2-ipc-spawn-line' @('spawn', (Q $line))
+$null = WaitFile (Join-Path $pdir 'ipc-line.txt') 8
+$ipcLineText = if (Test-Path (Join-Path $pdir 'ipc-line.txt')) { (Get-Content (Join-Path $pdir 'ipc-line.txt') -Raw).Trim() } else { '' }
+$spawnIpcLineOk = ($ipcLineText -eq 'ipc line')
+# A bare program name that lives only on PATH (an App Execution Alias): the example of the default config.
+$topBefore = [LT]::TopLevel()
+$null = Ctl 'h2-ipc-spawn-wt' @('spawn', 'wt.exe')
+$wtWin = $null
+for ($i = 0; $i -lt 40 -and -not $wtWin; $i++) {
+    Start-Sleep -Milliseconds 250
+    $wtWin = @(NewTopLevel $topBefore | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') }) | Select-Object -First 1
+}
+$spawnWtWindow = [bool]$wtWin
+Shot '13-spawn-wt'
+if ($wtWin) { [LT]::Close($wtWin) }
+Start-Sleep -Seconds 2
+$w = $w4
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -589,6 +650,14 @@ $summary = [ordered]@{
     h1_rejected_binds_registered = $h1StolenKeys
     h1_mod_bind_is_ctrl_alt = ($h1ModBind -eq 1)
     h1_f9_f8_reach_application = (($h1KeysSeen -match 'F9,') -and ($h1KeysSeen -match 'F8,'))
+    # --- Phase 1 / H2: spawn
+    h2_default_terminal_opens = $spawnDefaultTerminal
+    h2_startup_args_ok = $spawnStartupArgsOk
+    h2_bind_args_ok = $spawnBindArgsOk
+    h2_shell_ok = $spawnShellOk
+    h2_ipc_args_ok = $spawnIpcArgsOk
+    h2_ipc_command_line_with_spaced_program_ok = $spawnIpcLineOk
+    h2_wt_exe_found_on_path = $spawnWtWindow
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

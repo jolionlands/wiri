@@ -165,9 +165,18 @@ pub enum IpcMessage {
     #[serde(rename = "focus_workspace_previous")]
     FocusWorkspacePrevious,
 
-    /// Spawn an external process via the engine's process spawner.
+    /// Spawn an external process via the shared process spawner.
+    ///
+    /// With `args` empty, `command` is a whole command line, split with the
+    /// Windows quoting rules (`"C:\Program Files\x\x.exe" -d "a b"`).  With
+    /// `args`, `command` is the program alone and `args` are its arguments,
+    /// each passed through intact.
     #[serde(rename = "spawn_command")]
-    SpawnCommand { command: String },
+    SpawnCommand {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
 
     // ---- Niri-parity Round-2 ----
     /// Focus the previously focused window using the MRU history (like Alt+Tab).
