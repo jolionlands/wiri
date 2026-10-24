@@ -2169,6 +2169,19 @@ impl TilingEngine {
         self.os_foreground = Some(window_id);
         let (output_id, workspace_id, column_idx) = self.locate_window(window_id)?;
 
+        // A window on an inactive workspace that wiri itself hid is not the user asking
+        // to go there: Windows reports it as the foreground window when it picks a
+        // replacement for the window that was hidden a moment ago.  Following that report
+        // would switch straight back and undo the workspace switch that hid it.
+        let on_inactive_workspace = self
+            .monitors
+            .get(&output_id)
+            .map_or(false, |m| m.active_workspace != workspace_id);
+        let hidden_by_wiri = !self.applied_state.get(&window_id).map_or(true, |s| s.visible);
+        if on_inactive_workspace && hidden_by_wiri {
+            return None;
+        }
+
         // The OS is the authority on who is activated: remember it so the
         // layout pass does not try to "fix" the focus it just reported.
         self.last_activated = Some(window_id);
@@ -2723,16 +2736,29 @@ impl TilingEngine {
                 continue; // sticky windows stay visible at all times
             }
             let _ = backend.show_window(wid.as_isize(), false);
+            // Remember that wiri hid it: see `sync_os_foreground`.
+            self.applied_state
+                .entry(wid)
+                .or_insert_with(AppliedState::unset)
+                .visible = false;
         }
 
+        let mut shown: Vec<WindowId> = Vec::new();
         if let Some(monitor) = self.monitors.get(&focused_output) {
             if let Some(workspace) = monitor.workspace() {
                 for col in &workspace.columns {
                     for tile in &col.tiles {
                         let _ = backend.show_window(tile.window_id.as_isize(), true);
+                        shown.push(tile.window_id);
                     }
                 }
             }
+        }
+        for wid in shown {
+            self.applied_state
+                .entry(wid)
+                .or_insert_with(AppliedState::unset)
+                .visible = true;
         }
 
         // Kick off the workspace-slide animation now that the engine has
@@ -11079,6 +11105,57 @@ mod tests {
         // Windows wiri does not manage are ignored.
         assert_eq!(engine.sync_os_foreground(WindowId::new(555), &backend), None);
         assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+    }
+
+    #[test]
+    fn test_os_foreground_report_for_a_window_wiri_hid_does_not_undo_the_workspace_switch() {
+        // Switching workspace hides the windows of the old one.  Windows then picks a
+        // replacement foreground window - very often one of those windows, whose
+        // report arrives after the switch.  Following it would switch back.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        let oid = engine.focused_output().unwrap();
+
+        engine.switch_workspace(1, &backend);
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 1);
+
+        assert_eq!(engine.sync_os_foreground(WindowId::new(101), &backend), None);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            1,
+            "the late report for a hidden window switched the workspace back"
+        );
+
+        // Coming back shows the windows again; now their reports are welcome.
+        engine.switch_workspace(0, &backend);
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 0);
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(100), &backend),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn test_os_foreground_report_for_a_visible_window_on_another_workspace_switches_to_it() {
+        // An application that shows and activates its own window (a notification click)
+        // is the user asking for that window: follow it to its workspace.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        let oid = engine.focused_output().unwrap();
+        engine.apply_all(&backend);
+        // Move the engine to workspace 1 without wiri hiding anything.
+        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(1);
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 1);
+
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(100), &backend),
+            Some((0, 0))
+        );
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 0);
     }
 
     #[test]
