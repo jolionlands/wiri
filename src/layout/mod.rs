@@ -23,6 +23,21 @@ use crate::utils::{OutputId, Rect, Size, WindowId};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Workspace numbers are 1-based wherever a user types or reads one (the
+/// `Ctrl+Alt+1` hotkey, `wiri-ctl switch-workspace 2`, the IPC `id`
+/// fields), while the engine keeps 0-based ids and starts on id 0.  Without
+/// this conversion `Ctrl+Alt+1` went to the *second* workspace and
+/// `switch-workspace 1` after `switch-workspace 2` never brought the first
+/// workspace's windows back.
+pub fn workspace_id_from_number(number: i32) -> i32 {
+    (number - 1).max(0)
+}
+
+/// Inverse of [`workspace_id_from_number`]: the number shown to users.
+pub fn workspace_number(id: i32) -> i32 {
+    id + 1
+}
+
 /// MRU (most-recently-used) focus stack.
 /// The most recently focused window is at the front (index 0).
 /// Capped at `capacity` entries (default 32).
@@ -834,6 +849,20 @@ mod monitor_tests {
         // Window should still be there
         let ws = m.workspace().unwrap();
         assert_eq!(ws.columns.len(), 1);
+    }
+
+    #[test]
+    fn test_workspace_numbers_are_one_based_for_users() {
+        // `Ctrl+Alt+1` / `switch-workspace 1` is the workspace the engine starts on.
+        assert_eq!(workspace_id_from_number(1), 0);
+        assert_eq!(workspace_id_from_number(2), 1);
+        assert_eq!(workspace_id_from_number(9), 8);
+        // Nonsense input clamps to the first workspace instead of going negative.
+        assert_eq!(workspace_id_from_number(0), 0);
+        assert_eq!(workspace_id_from_number(-5), 0);
+        for id in 0..9 {
+            assert_eq!(workspace_id_from_number(workspace_number(id)), id);
+        }
     }
 
     #[test]

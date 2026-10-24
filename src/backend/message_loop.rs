@@ -862,8 +862,11 @@ fn execute_action(
                 warn!("Quit hotkey ignored: no quit channel configured");
             }
         }
-        Action::FocusWorkspace(id) => {
-            engine.write().switch_workspace(*id, backend);
+        Action::FocusWorkspace(number) => {
+            // `Ctrl+Alt+1` is workspace 1 = engine id 0.
+            engine
+                .write()
+                .switch_workspace(crate::layout::workspace_id_from_number(*number), backend);
         }
         Action::ScrollLeft => {
             engine.write().scroll(ScrollDirection::Left, backend);
@@ -992,9 +995,12 @@ fn execute_action(
             engine_w.apply_all(backend);
             info!("SwitchMonitor: focused {:?}", target);
         }
-        Action::MoveWorkspace(target_ws) => {
-            // Move the focused window to workspace `target_ws` (no switch).
-            engine.write().move_window_to_workspace(*target_ws, backend);
+        Action::MoveWorkspace(target_number) => {
+            // Move the focused window to workspace number `target_number` (no switch).
+            engine.write().move_window_to_workspace(
+                crate::layout::workspace_id_from_number(*target_number),
+                backend,
+            );
             engine.write().apply_all(backend);
         }
         Action::ColumnToggleTabbed => {
@@ -1012,8 +1018,11 @@ fn execute_action(
         Action::Refresh => {
             engine.write().apply_all(backend);
         }
-        Action::MoveToWorkspace(id) => {
-            engine.write().move_window_to_workspace(*id, backend);
+        Action::MoveToWorkspace(number) => {
+            engine.write().move_window_to_workspace(
+                crate::layout::workspace_id_from_number(*number),
+                backend,
+            );
             engine.write().apply_all(backend);
         }
         Action::MoveToMonitorLeft => {

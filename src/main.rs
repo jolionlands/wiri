@@ -725,7 +725,7 @@ async fn main() -> Result<()> {
                     // OutputId wraps a u64 name-hash; expose it via .as_u64().
                     if let Some(focused_oid) = engine.read().monitors().focused_id() {
                         ipc_server.broadcast_event(IpcEvent::WorkspaceSwitched {
-                            workspace_id: ws_id,
+                            workspace_id: wiri::layout::workspace_number(ws_id),
                             monitor_id: focused_oid.as_u64(),
                         });
                     }
@@ -1081,7 +1081,7 @@ fn handle_backend_event(
                 ipc_server.broadcast_event(IpcEvent::ColumnFocused {
                     window_hwnd: hwnd,
                     column_index: col_idx,
-                    workspace_id: ws_id,
+                    workspace_id: wiri::layout::workspace_number(ws_id),
                 });
             }
         }
