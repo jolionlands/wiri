@@ -10,7 +10,7 @@
 #          Ctrl+Alt+2 / Ctrl+Alt+1 hide and show the windows.
 # Phase H  Phase 1 scenarios, each under a config of its own (wiri is restarted for every one):
 #          H1 modifiers, H2 spawn, H3 actions follow the real foreground window (floats, dialogs),
-#          H4 minimized windows leave no gap.
+#          H4 minimized windows leave no gap, H5 floating windows belong to their workspace.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -53,6 +53,15 @@ public static class LT {
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  // The top-level window that is on top at a screen point (what the user sees there).
+  public static IntPtr TopWindowAt(int x, int y) {
+    POINT p; p.X = x; p.Y = y;
+    IntPtr h = WindowFromPoint(p);
+    return h == IntPtr.Zero ? h : GetAncestor(h, 2);
+  }
 
   public static string Title(IntPtr h) { var s = new StringBuilder(512); GetWindowText(h, s, 512); return s.ToString(); }
   public static string Class(IntPtr h) { var s = new StringBuilder(256); GetClassName(h, s, 256); return s.ToString(); }
@@ -776,6 +785,71 @@ Shot 'h4-06-closed-while-minimized'
 [TestForms]::CloseForm($m[1]); [TestForms]::CloseForm($m[0])
 Start-Sleep -Milliseconds 1200
 
+function OverlapsRect($h, $rc) { $t = [LT]::Visible($h); return ($t.L -lt $rc.R -and $t.R -gt $rc.L -and $t.T -lt $rc.B -and $t.B -gt $rc.T) }
+# ---- H5: a floating window belongs to its workspace, stays above the tiles and keeps its geometry ----------------
+$ff = [TestForms]::Open('wiri-h5-float', 150, 60, 60)
+Start-Sleep -Seconds 2
+Chord 'ctrl+alt+t'; Start-Sleep -Milliseconds 1800          # the window in front floats
+$g0 = Rc $ff
+$gcx = [int](($g0.L + $g0.R) / 2); $gcy = [int](($g0.T + $g0.B) / 2)
+$h5FloatOnTop = ([LT]::TopWindowAt($gcx, $gcy) -eq $ff)
+$lg = WinList 'h5-windows-floated'
+$h5IpcWorkspace1 = (((WinOf $lg $ff).floating -eq $true) -and ((WinOf $lg $ff).workspace -eq 1))
+Shot 'h5-01-floated'
+
+# (a) it is hidden with its workspace and shown with it, where it was
+Chord 'ctrl+alt+2'; Start-Sleep -Milliseconds 1800
+$h5HiddenOnWs2 = -not [LT]::IsWindowVisible($ff)
+Shot 'h5-02-workspace-2'
+Chord 'ctrl+alt+1'; Start-Sleep -Milliseconds 1800
+$g1 = Rc $ff
+$h5ShownOnWs1 = [LT]::IsWindowVisible($ff) -and (Near $g1.L $g0.L 4) -and (Near $g1.T $g0.T 4) -and (Near $g1.W $g0.W 4) -and (Near $g1.H $g0.H 4)
+$h5OnTopAfterReturn = ([LT]::TopWindowAt($gcx, $gcy) -eq $ff)
+Shot 'h5-03-back-on-workspace-1'
+
+# (b) a tile that overlaps it takes the focus: the float stays above it
+$under = @(WinList 'h5-windows-for-overlap' | Where-Object {
+    $_.floating -eq $false -and $_.minimized -eq $false -and $null -ne $_.column -and
+    [LT]::IsWindowVisible([IntPtr][int64]$_.hwnd) -and (OverlapsRect ([IntPtr][int64]$_.hwnd) $g0)
+}) | Select-Object -First 1
+if ($under) { $null = Ctl 'h5-focus-overlapping-tile' @('focus-window', [string][int64]$under.hwnd) }
+Start-Sleep -Milliseconds 1800
+$h5TileGotFocus = ($null -ne $under) -and ([LT]::GetForegroundWindow() -eq [IntPtr][int64]$under.hwnd)
+$h5FloatAboveFocusedTile = ([LT]::TopWindowAt($gcx, $gcy) -eq $ff)
+Shot 'h5-04-tile-focused'
+# (and the same after a real click-like activation: the workspace round trip activates the focused tile)
+Chord 'ctrl+alt+2'; Start-Sleep -Milliseconds 1500
+Chord 'ctrl+alt+1'; Start-Sleep -Milliseconds 1800
+$h5FloatAboveAfterRoundTrip = ([LT]::TopWindowAt($gcx, $gcy) -eq $ff)
+
+# (c) moved to workspace 2 with the key, it leaves workspace 1 and shows up on 2 at the same place
+$null = Ctl 'h5-focus-float' @('focus-window', [string][int64]$ff)
+Start-Sleep -Milliseconds 1500
+Chord 'ctrl+alt+shift+2'; Start-Sleep -Milliseconds 1800
+$h5MovedAwayHidden = -not [LT]::IsWindowVisible($ff)
+$lm = WinList 'h5-windows-moved'
+$h5IpcWorkspace2 = (((WinOf $lm $ff).floating -eq $true) -and ((WinOf $lm $ff).workspace -eq 2))
+Chord 'ctrl+alt+2'; Start-Sleep -Milliseconds 1800
+$g2 = Rc $ff
+$h5ShownOnWs2 = [LT]::IsWindowVisible($ff) -and (Near $g2.L $g0.L 4) -and (Near $g2.T $g0.T 4) -and (Near $g2.W $g0.W 4) -and (Near $g2.H $g0.H 4)
+Shot 'h5-05-float-on-workspace-2'
+
+# (d) focus-window on it from workspace 1 goes to its workspace
+Chord 'ctrl+alt+1'; Start-Sleep -Milliseconds 1500
+$h5HiddenAgainOnWs1 = -not [LT]::IsWindowVisible($ff)
+$null = Ctl 'h5-focus-float-from-ws1' @('focus-window', [string][int64]$ff)
+Start-Sleep -Milliseconds 1800
+$h5FocusSwitchesWorkspace = [LT]::IsWindowVisible($ff) -and ([LT]::GetForegroundWindow() -eq $ff)
+Shot 'h5-06-focus-window-switched-workspace'
+
+# put it back on workspace 1 and close it
+Chord 'ctrl+alt+shift+1'; Start-Sleep -Milliseconds 1500
+Chord 'ctrl+alt+1'; Start-Sleep -Milliseconds 1500
+$null = Ctl 'h5-focus-float-again' @('focus-window', [string][int64]$ff)
+Start-Sleep -Milliseconds 1200
+Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 1800
+$h5Closed = -not [LT]::IsWindow($ff)
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -914,6 +988,21 @@ $summary = [ordered]@{
     h4_closed_while_minimized_is_gone = $h4ClosedGone
     h4_closed_while_minimized_is_forgotten = $h4ClosedForgotten
     h4_neighbours_stay_after_closing_a_minimized_window = $h4NeighboursStay
+    # --- Phase 1 / H5: floating windows and workspaces
+    h5_float_on_top_when_it_floats = $h5FloatOnTop
+    h5_ipc_reports_float_on_workspace_1 = $h5IpcWorkspace1
+    h5_float_hidden_on_another_workspace = $h5HiddenOnWs2
+    h5_float_shown_again_at_its_place = $h5ShownOnWs1
+    h5_float_on_top_after_returning = $h5OnTopAfterReturn
+    h5_overlapping_tile_got_the_focus = $h5TileGotFocus
+    h5_float_stays_above_the_focused_tile = $h5FloatAboveFocusedTile
+    h5_float_stays_above_after_workspace_round_trip = $h5FloatAboveAfterRoundTrip
+    h5_move_to_workspace_hides_the_float_here = $h5MovedAwayHidden
+    h5_ipc_reports_float_on_workspace_2 = $h5IpcWorkspace2
+    h5_float_shown_on_its_new_workspace_at_the_same_place = $h5ShownOnWs2
+    h5_float_hidden_again_on_workspace_1 = $h5HiddenAgainOnWs1
+    h5_focus_window_switches_to_the_float_workspace = $h5FocusSwitchesWorkspace
+    h5_float_closed = $h5Closed
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

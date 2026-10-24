@@ -2521,6 +2521,9 @@ impl TilingEngine {
                     && m.focus_column == Some(column_idx)
             });
         if unchanged {
+            // The tile (already the engine focus) just came to the top, perhaps over a
+            // floating window: floats stay above the tiles.
+            self.raise_floats(output_id);
             return Some((column_idx, workspace_id));
         }
 
@@ -3119,6 +3122,8 @@ impl TilingEngine {
         if let Some(wid) = window_to_activate {
             self.activate_now(wid, backend);
         }
+        // Activating a tile brings it above the floating windows of the workspace.
+        self.raise_floats(focused_output);
     }
 
     /// Move the focused column one place left or right (niri `move-column-left`
@@ -6607,6 +6612,14 @@ impl TilingEngine {
     /// Ensure there is exactly one empty workspace at `highest_non_empty_id + 1`.
     /// Empty workspaces beyond that (except the active one) are removed.
     pub fn maintain_empty_workspace(&mut self, monitor_id: OutputId) {
+        // A workspace that holds only floating windows is not empty: it must survive
+        // (and count towards the trailing empty one) or its floats would lose their home.
+        let with_floats: HashSet<i32> = self
+            .float_homes
+            .values()
+            .filter(|home| home.output == monitor_id)
+            .map(|home| home.workspace)
+            .collect();
         let monitor = match self.monitors.get_mut(&monitor_id) {
             Some(m) => m,
             None => return,
@@ -6618,7 +6631,7 @@ impl TilingEngine {
         let highest_non_empty: i32 = monitor
             .workspaces
             .iter()
-            .filter(|(_, ws)| !ws.columns.is_empty())
+            .filter(|(id, ws)| !ws.columns.is_empty() || with_floats.contains(*id))
             .map(|(&id, _)| id)
             .max()
             .unwrap_or(-1);
@@ -6636,7 +6649,12 @@ impl TilingEngine {
         let to_remove: Vec<i32> = monitor
             .workspaces
             .iter()
-            .filter(|(&id, ws)| ws.columns.is_empty() && id != trailing_id && id != active_ws)
+            .filter(|(&id, ws)| {
+                ws.columns.is_empty()
+                    && id != trailing_id
+                    && id != active_ws
+                    && !with_floats.contains(&id)
+            })
             .map(|(&id, _)| id)
             .collect();
         for id in to_remove {
@@ -8636,6 +8654,33 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.workspaces.get(&ws2).unwrap().columns.len(), 1);
         assert_eq!(column_windows(&engine, oid), vec![vec![100]]);
+    }
+
+    #[test]
+    fn test_a_workspace_that_holds_only_a_floating_window_is_not_pruned() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let oid = engine.focused_output().unwrap();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        // Workspace id 2 gets no tile, only this float.
+        engine.float_move_to_workspace(float, 2, &be);
+        engine.maintain_empty_workspace(oid);
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert!(
+            monitor.workspaces.contains_key(&2),
+            "the workspace of a float is not empty: pruning it would orphan the float"
+        );
+        assert!(
+            monitor.workspaces.contains_key(&3),
+            "the trailing empty workspace comes after it"
+        );
+        // And it is a real place to go to: the float shows up when the user gets there.
+        engine.switch_workspace(2, &be);
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+        engine.switch_workspace(0, &be);
+        assert!(!engine.applied_state.get(&float).unwrap().visible);
+        assert!(engine.monitors().get(&oid).unwrap().workspaces.contains_key(&2));
     }
 
     #[test]

@@ -51,6 +51,14 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   A window that was fullscreen or floating keeps that state, and a window closed while minimized is
   forgotten.  `wiri-ctl focus-window` restores a minimized window; `wiri-ctl windows` reports
   `minimized` and the new `column` / `tile` position of every window.
+- **Floating windows belong to their workspace.**  A floating window is hidden when its workspace is
+  left and shown again, where it was, when the user comes back (it used to stay on screen on every
+  workspace), `move-window-to-workspace` / `Mod+Shift+N` move a float with its membership, and
+  `wiri-ctl windows` / `focus-window` know which workspace a float lives on (`focus-window` switches
+  to it).  Floats stay above the tiles: they are raised again whenever a tile takes the focus or a
+  workspace is entered (a tile that was just clicked used to cover the float), and a workspace that
+  holds only floating windows is no longer pruned as empty.  A window floats where it floated last
+  time.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal
