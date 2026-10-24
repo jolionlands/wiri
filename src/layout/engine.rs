@@ -379,6 +379,10 @@ pub struct TilingEngine {
     failed_position: HashMap<WindowId, u8>,
     /// Last window activated via SetForegroundWindow — avoids spamming the API on every layout pass.
     last_activated: Option<WindowId>,
+    /// The window the OS last reported as the foreground one (managed or not, tiled
+    /// or floating).  Floating windows are not in the focus ring, so this is how
+    /// `toggle_floating` finds the floating window the user is looking at.
+    os_foreground: Option<WindowId>,
     /// Optional channel to dispatch backend operations as `LayoutRequest`s instead of
     /// direct calls. When set, a sibling task on the backend drains this channel.
     /// When None, the engine continues to call `BackendApi` methods directly.
@@ -480,6 +484,7 @@ impl TilingEngine {
             overview: None,
             failed_position: HashMap::new(),
             last_activated: None,
+            os_foreground: None,
             layout_request_tx: None,
             applied_state: HashMap::new(),
             original_bounds: HashMap::new(),
@@ -1166,6 +1171,9 @@ impl TilingEngine {
             // The window is gone; make sure the next focus target is activated
             // even if it happens to be the same HWND value later.
             self.last_activated = None;
+        }
+        if self.os_foreground == Some(window_id) {
+            self.os_foreground = None;
         }
 
         if self.tiled_windows.remove(&window_id).is_some() {
@@ -2156,6 +2164,9 @@ impl TilingEngine {
         window_id: WindowId,
         backend: &BackendHandle,
     ) -> Option<(usize, i32)> {
+        // Whatever the window is (tiled, floating, unmanaged), it is what the user is
+        // looking at now.
+        self.os_foreground = Some(window_id);
         let (output_id, workspace_id, column_idx) = self.locate_window(window_id)?;
 
         // The OS is the authority on who is activated: remember it so the
@@ -2885,6 +2896,13 @@ impl TilingEngine {
             None => return,
         };
 
+        // A floating window the user is looking at wins: floating a window moves the
+        // keyboard focus on to a tile, so without this the second press floated that
+        // tile as well instead of putting the first window back into the layout.
+        let foreground_float = self
+            .os_foreground
+            .filter(|wid| self.floating_windows.contains(wid) && self.tiled_windows.contains_key(wid));
+
         // Check if the currently focused window is floating, OR if no tiled
         // window is focused but there's a recently floated window we can un-float.
         let (window_id, is_floating) = {
@@ -2892,7 +2910,9 @@ impl TilingEngine {
                 Some(m) => m,
                 None => return,
             };
-            if let Some(wid) = monitor.focus_window {
+            if let Some(wid) = foreground_float {
+                (wid, true)
+            } else if let Some(wid) = monitor.focus_window {
                 (wid, self.floating_windows.contains(&wid))
             } else {
                 // No focused tiled window — check if any floating window exists
@@ -2927,6 +2947,15 @@ impl TilingEngine {
             // Remove from workspace columns
             if let Some(monitor) = self.monitors.get_mut(&focused_output) {
                 monitor.remove_window(window_id);
+            }
+            // The window the user just floated keeps the keyboard focus (as in niri).  The
+            // layout pass would hand the foreground to the next tile, which then also
+            // takes the next toggle-floating; pretend that tile is already activated.
+            if self.os_foreground == Some(window_id) {
+                self.last_activated = self
+                    .monitors
+                    .get(&focused_output)
+                    .and_then(|m| m.focus_window);
             }
             info!("Floating window {:?}", window_id);
             self.apply_layout_for_monitor(focused_output, backend);
@@ -7213,6 +7242,52 @@ mod tests {
         let oid = engine.focused_output().unwrap();
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.workspace().unwrap().columns.len(), 1);
+    }
+
+    #[test]
+    fn test_toggle_floating_twice_puts_the_same_window_back() {
+        // Floating the focused window moves the engine focus to the next tile.  The OS
+        // keeps reporting the floated window as the foreground one, and the second
+        // toggle must act on it - not float that next tile as well.
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 500, 400), &be);
+        let oid = engine.focused_output().unwrap();
+        // Window 101 has the focus and the OS agrees.
+        engine.sync_os_foreground(WindowId::new(101), &be);
+
+        engine.toggle_floating(&be);
+        assert!(engine.is_floating(WindowId::new(101)));
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().focus_window,
+            Some(WindowId::new(100)),
+            "the engine focus moved on to the remaining tile"
+        );
+        // ...and wiri does not hand the foreground to that tile behind the user's back.
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+
+        // The OS still says: the floating window is what the user is looking at.
+        engine.sync_os_foreground(WindowId::new(101), &be);
+        engine.toggle_floating(&be);
+        assert!(!engine.is_floating(WindowId::new(101)), "back in the layout");
+        assert!(!engine.is_floating(WindowId::new(100)), "the other tile is untouched");
+        assert_eq!(column_windows(&engine, oid).len(), 2);
+    }
+
+    #[test]
+    fn test_toggle_floating_acts_on_a_tile_when_a_tile_is_in_the_foreground() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 500, 400), &be);
+        engine.sync_os_foreground(WindowId::new(101), &be);
+        engine.toggle_floating(&be); // 101 floats, focus moves to 100
+        // The user clicks the tile 100 and presses toggle-floating again.
+        engine.sync_os_foreground(WindowId::new(100), &be);
+        engine.toggle_floating(&be);
+        assert!(engine.is_floating(WindowId::new(100)), "the foreground tile floats");
+        assert!(engine.is_floating(WindowId::new(101)), "the first floating window stays floating");
     }
 
     #[test]
