@@ -73,9 +73,11 @@ If a binding doesn't fire:
 
 The default config (`resources/default_config.kdl`) uses `Ctrl+Alt+Space` and
 `Escape` for the overview toggle rather than `Ctrl+Alt+Tab` for exactly this
-reason.  `Escape` is state-gated — it only fires the overview toggle when
-overview is already active, so it stays available to other apps in normal
-mode.
+reason.  `Escape` leaves overview (and resize mode) through wiri's low-level
+keyboard hook, which sees the key without taking it away from the focused
+application; it is deliberately *not* registered with `RegisterHotKey`, because
+a registered `Escape` would be swallowed in every application.  For the same
+reason it is not listed by `wiri-ctl test-bindings`.
 
 ### How to verify wiri received your keypress
 

@@ -60,6 +60,29 @@ tests and was re-checked on that desktop.
   panic show them again, and a window an earlier killed wiri left off-screen
   is moved onto the work area.
 
+Second pass, same day, with real key presses and a real mouse on the same desktop:
+- **Escape did not work in any other application while wiri ran.**  The shipped
+  config binds `Escape` to the overview toggle and wiri registered it with
+  `RegisterHotKey`, which delivers the key to wiri and to nobody else.  It is no
+  longer registered; the low-level keyboard hook leaves overview and resize mode
+  and passes the key on.
+- **Leaving overview with Escape froze wiri** (every `wiri-ctl` call timed out; the
+  original build does the same).  The DWM-thumbnail host window belonged to
+  whichever thread entered overview and was hidden from whichever thread left, a
+  cross-thread call that waits for the owner while the engine lock is held.  The
+  host window now lives on a thread of its own.  It was also fully transparent, so
+  the thumbnails were invisible; it is now a dark translucent backdrop.
+- **Leaving fullscreen** left the window as big as the screen (the fullscreen
+  rect bypassed the applied-state cache).
+- **`move-column-left` / `move-column-right`** merged the column into its
+  neighbour instead of swapping the two.
+- **`toggle-floating`** acts on the floating window that has the focus, and the
+  window just floated keeps the focus; a floated window can be put back with the
+  keyboard.
+- **`Ctrl+Alt+2`** could be undone at once by the foreground report of a window
+  wiri had just hidden.
+- `wiri-ctl get-focus` prints the focused window.
+
 ### Added — opus pass K (2026-05-18)
 - ✅ **DwmRegisterThumbnail-based overview** — niri-parity overview rendering
   that leaves the underlying HWNDs at their normal size and instead
