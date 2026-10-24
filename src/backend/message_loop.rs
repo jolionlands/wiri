@@ -2,7 +2,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -325,18 +325,19 @@ fn is_system_critical_hotkey(mods: u32, vk: u32) -> Option<&'static str> {
         .map(|(_, _, label)| *label)
 }
 
-/// Register a list of hotkeys with Windows, returning the IDs, action map,
-/// and the subset of hotkey ids that must be state-gated on overview mode
-/// (i.e. bare Escape → OverviewToggle, which should only fire when overview
-/// is already active so the user can press Esc to exit).
-fn register_hotkeys(
-    hwnd: HWND,
-    hotkeys: &[(u32, u32, Action)],
-) -> (
-    Vec<i32>,
-    HashMap<i32, Action>,
-    std::collections::HashSet<i32>,
-) {
+/// A bare `Escape` bound to the overview toggle.  The low-level keyboard hook
+/// (`input::low_level_hook`) already delivers Escape to overview and resize
+/// mode *without consuming it*; registering it with `RegisterHotKey` as well
+/// would take Escape away from every application on the desktop (a registered
+/// hotkey is delivered to wiri only, never to the focused window), and made
+/// Escape unusable everywhere while wiri ran.
+fn is_overview_escape_binding(mods: u32, vk: u32, action: &Action) -> bool {
+    mods == 0 && vk == 0x1B && matches!(action, Action::OverviewToggle | Action::OverviewExit)
+}
+
+/// Register a list of hotkeys with Windows, returning the IDs and the action map
+/// of the ones that Windows accepted.
+fn register_hotkeys(hwnd: HWND, hotkeys: &[(u32, u32, Action)]) -> (Vec<i32>, HashMap<i32, Action>) {
     let base_id = 32768i32;
     let mut registered_ids: Vec<i32> = Vec::new();
 
@@ -350,6 +351,14 @@ fn register_hotkeys(
             warn!(
                 "SKIP hotkey id={} mods=0x{:X} vk=0x{:02X} {:?} — reserved by Windows ({})",
                 id, mods, vk, action, label,
+            );
+            continue;
+        }
+        if is_overview_escape_binding(*mods, *vk, action) {
+            info!(
+                "SKIP hotkey id={} Escape {:?} — handled by the keyboard hook (a registered \
+                 Escape would be swallowed in every application)",
+                id, action,
             );
             continue;
         }
@@ -381,22 +390,7 @@ fn register_hotkeys(
         .map(|(i, (_, _, action))| (base_id + i as i32, action.clone()))
         .collect();
 
-    // Detect bare-Escape → OverviewToggle bindings (mods=0, vk=0x1B) — those
-    // must be gated on `engine.is_overview()` so Esc remains usable outside
-    // overview mode.
-    let overview_exit_only: std::collections::HashSet<i32> = hotkeys
-        .iter()
-        .enumerate()
-        .filter(|(i, (mods, vk, action))| {
-            *mods == 0
-                && *vk == 0x1B
-                && matches!(action, Action::OverviewToggle)
-                && registered_ids.contains(&(base_id + *i as i32))
-        })
-        .map(|(i, _)| base_id + i as i32)
-        .collect();
-
-    (registered_ids, action_map, overview_exit_only)
+    (registered_ids, action_map)
 }
 
 /// Unregister all hotkeys by ID
@@ -506,7 +500,9 @@ impl MessageLoop {
             let quit_tx = quit_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(action) = keyboard_action_rx.recv() {
-                    info!("KEYHOOK -> {:?}", action);
+                    // Every Escape press in every application arrives here (the hook
+                    // reports it without consuming it), so this is not worth an INFO line.
+                    debug!("KEYHOOK -> {:?}", action);
                     execute_action(&action, &engine, &backend_handle, &quit_tx);
                 }
             });
@@ -580,8 +576,7 @@ impl MessageLoop {
         // Register initial hotkeys.  Keep `current_hotkeys` so the snapshot
         // and hot-reload paths share a single source of truth.
         let current_hotkeys = build_hotkey_list(&engine);
-        let (mut registered_ids, mut action_map, mut overview_exit_only) =
-            register_hotkeys(hwnd, &current_hotkeys);
+        let (mut registered_ids, mut action_map) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
         update_current_bindings_snapshot(&current_hotkeys, &registered_ids);
 
@@ -607,10 +602,9 @@ impl MessageLoop {
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
                     let new_hotkeys = build_hotkey_list(&engine);
-                    let (new_ids, new_map, new_exit_only) = register_hotkeys(hwnd, &new_hotkeys);
+                    let (new_ids, new_map) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
                     action_map = new_map;
-                    overview_exit_only = new_exit_only;
                     update_current_bindings_snapshot(&new_hotkeys, &registered_ids);
                     info!("Hotkey reload complete");
                     continue;
@@ -619,20 +613,6 @@ impl MessageLoop {
                     // WM_HOTKEY
                     let hotkey_id = msg.wParam.0 as i32;
                     if let Some(action) = action_map.get(&hotkey_id) {
-                        // Esc → OverviewToggle is registered globally but only
-                        // dispatched when overview is currently active OR
-                        // interactive resize-mode is engaged (Esc is the
-                        // canonical "exit resize mode" key).  Outside both
-                        // states the keypress is swallowed so Esc stays
-                        // available to other apps.
-                        if overview_exit_only.contains(&hotkey_id) {
-                            let eng = engine.read();
-                            let allow = eng.is_overview() || eng.is_resize_mode();
-                            drop(eng);
-                            if !allow {
-                                continue;
-                            }
-                        }
                         info!("HOTKEY id={} -> {:?}", hotkey_id, action);
                         execute_action(action, &engine, &backend_handle, &quit_tx);
                     }
@@ -1469,5 +1449,19 @@ mod tests {
             is_system_critical_hotkey(0, 0x4C).is_none(),
             "Bare L without Win is not a system-critical hotkey"
         );
+    }
+
+    #[test]
+    fn bare_escape_for_overview_is_left_to_the_keyboard_hook() {
+        // The shipped config binds `Escape` to the overview toggle.  Registering it
+        // with RegisterHotKey makes Escape unusable in every other application.
+        assert!(is_overview_escape_binding(0, 0x1B, &Action::OverviewToggle));
+        assert!(is_overview_escape_binding(0, 0x1B, &Action::OverviewExit));
+        // A modified Escape (Ctrl+Alt+Escape) does not steal the plain key.
+        assert!(!is_overview_escape_binding(MOD_CTRL | MOD_ALT, 0x1B, &Action::OverviewToggle));
+        // Other actions on a bare Escape are the user's explicit choice.
+        assert!(!is_overview_escape_binding(0, 0x1B, &Action::CloseWindow));
+        // Another bare key bound to the overview toggle is not Escape.
+        assert!(!is_overview_escape_binding(0, 0x20, &Action::OverviewToggle));
     }
 }
