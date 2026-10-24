@@ -972,6 +972,15 @@ impl TilingEngine {
         let window_id = WindowId::new(window.hwnd);
         let hwnd = window.hwnd; // Capture before move
 
+        // A window is managed once.  Two events (created, shown, foreground) and the
+        // reconcile pass can all find the same new window at the same moment; a second
+        // tile for it would be positioned over the first on every pass and would
+        // outlive the window's float / close / move (those remove one tile only).
+        if self.tiled_windows.contains_key(&window_id) {
+            debug!("add_window: {:?} is already managed", window_id);
+            return;
+        }
+
         // Capture original bounds (first registration only) so we can restore on quit.
         self.original_bounds
             .entry(window_id)
@@ -7086,6 +7095,26 @@ mod tests {
         let window = make_window(100, 500, 400);
         engine.add_window(window, &BackendHandle::default_for_test());
         assert_eq!(engine.tiled_windows().len(), 1);
+    }
+
+    #[test]
+    fn test_adding_a_window_twice_adds_one_tile() {
+        // Two events (and the reconcile pass) can find the same new window at the same
+        // moment: it must not get two tiles, or floating / closing it would leave one behind.
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 0, 0), &be);
+        engine.add_window(make_window(100, 500, 400), &be);
+        let oid = engine.focused_output().unwrap();
+        assert_eq!(engine.tiled_windows().len(), 2);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+        // ... and it is still removable and addable again afterwards.
+        engine.remove_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        engine.add_window(make_window(100, 500, 400), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101], vec![100]]);
     }
 
     #[test]

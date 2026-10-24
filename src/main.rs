@@ -1259,30 +1259,35 @@ fn add_window_if_tileable(
         return false;
     }
 
-    if source.is_empty() {
-        info!("+ {} ({})", window.title, window.class_name);
-    } else {
-        info!("+ {} ({}) [{}]", window.title, window.class_name, source);
+    // The check above ran without the write lock: the creation, show and foreground
+    // events and the reconcile pass can find the same new window at the same moment.
+    // Look again under the lock that adds it, so that only one of them does.
+    let opened = WindowInfoIpc {
+        hwnd,
+        title: window.title.clone(),
+        class_name: window.class_name.clone(),
+        process_id: window.process_id,
+        x: window.bounds.loc.x,
+        y: window.bounds.loc.y,
+        width: window.bounds.size.w,
+        height: window.bounds.size.h,
+    };
+    {
+        let mut eng = engine.write();
+        if eng.tiled_windows().contains_key(&window_id) {
+            return false;
+        }
+        if source.is_empty() {
+            info!("+ {} ({})", window.title, window.class_name);
+        } else {
+            info!("+ {} ({}) [{}]", window.title, window.class_name, source);
+        }
+        eng.add_window(window, handle);
+        // New windows take the focus; scroll the strip so the new column is on screen.
+        eng.reveal_focused();
+        eng.apply_all(handle);
     }
-
-    ipc_server.broadcast_event(IpcEvent::WindowOpened {
-        window: WindowInfoIpc {
-            hwnd,
-            title: window.title.clone(),
-            class_name: window.class_name.clone(),
-            process_id: window.process_id,
-            x: window.bounds.loc.x,
-            y: window.bounds.loc.y,
-            width: window.bounds.size.w,
-            height: window.bounds.size.h,
-        },
-    });
-
-    let mut eng = engine.write();
-    eng.add_window(window, handle);
-    // New windows take the focus; scroll the strip so the new column is on screen.
-    eng.reveal_focused();
-    eng.apply_all(handle);
+    ipc_server.broadcast_event(IpcEvent::WindowOpened { window: opened });
     true
 }
 
