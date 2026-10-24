@@ -2,12 +2,13 @@
 // event broadcaster, and pipe security attributes helper.
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::layout::TilingEngine;
 use super::messages::{BindingInfo, IpcEvent, IpcMessage, MonitorInfo, WorkspaceInfo};
 use super::PIPE_PATH;
+use crate::layout::TilingEngine;
+use crate::utils::{Rect, WindowId};
 
 pub struct IpcServer {
     event_tx: broadcast::Sender<IpcEvent>,
@@ -18,6 +19,8 @@ pub struct IpcServer {
     backend: Option<crate::backend::BackendHandle>,
     /// Optional one-shot sender to request graceful shutdown of main.
     shutdown_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Optional sender to request a config reload on the main loop.
+    reload_tx: parking_lot::Mutex<Option<mpsc::UnboundedSender<()>>>,
 }
 
 impl IpcServer {
@@ -28,6 +31,7 @@ impl IpcServer {
             engine: None,
             backend: None,
             shutdown_tx: parking_lot::Mutex::new(None),
+            reload_tx: parking_lot::Mutex::new(None),
         }
     }
 
@@ -46,6 +50,11 @@ impl IpcServer {
     /// when an IPC Quit message is received.
     pub fn set_shutdown_sender(&self, tx: tokio::sync::oneshot::Sender<()>) {
         *self.shutdown_tx.lock() = Some(tx);
+    }
+
+    /// Provide a sender that asks main to reload config from disk.
+    pub fn set_reload_sender(&self, tx: mpsc::UnboundedSender<()>) {
+        *self.reload_tx.lock() = Some(tx);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<IpcEvent> {
@@ -75,7 +84,10 @@ impl IpcServer {
     /// synchronous build first, *then* awaits `connect`.  The resulting future
     /// is `Send`, so plain `tokio::spawn` on the multi-thread runtime is fine.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        info!("IPC server starting on {} (ACL: Admins+Owner only)", PIPE_PATH);
+        info!(
+            "IPC server starting on {} (ACL: Admins+Owner only)",
+            PIPE_PATH
+        );
 
         const MAX_CREATE_RETRIES: u32 = 5;
         let mut retry_count = 0u32;
@@ -114,7 +126,9 @@ impl IpcServer {
                                 );
                                 return Err(anyhow::anyhow!(
                                     "Cannot create IPC pipe after {} attempts: {} / {}",
-                                    MAX_CREATE_RETRIES, e, e2
+                                    MAX_CREATE_RETRIES,
+                                    e,
+                                    e2
                                 ));
                             }
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -135,7 +149,8 @@ impl IpcServer {
                         );
                         return Err(anyhow::anyhow!(
                             "Cannot create IPC pipe after {} attempts: {}",
-                            MAX_CREATE_RETRIES, e
+                            MAX_CREATE_RETRIES,
+                            e
                         ));
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -209,10 +224,11 @@ impl IpcServer {
             // forward broadcast events to the client pipe until it disconnects.
             if let IpcMessage::SubscribeEvents { ref event_types } = message {
                 info!("IPC: Subscribe to events: {:?}", event_types);
-                let ack = serde_json::to_vec(&serde_json::json!({
+                let mut ack = serde_json::to_vec(&serde_json::json!({
                     "success": true,
                     "subscription_id": 1
                 }))?;
+                ack.push(b'\n');
                 let _ = pipe.write_all(&ack).await;
 
                 // Subscribe to the broadcast channel (64-entry buffer per spec)
@@ -220,13 +236,24 @@ impl IpcServer {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
-                            let bytes = match serde_json::to_vec(&event) {
+                            let value = match serde_json::to_value(&event) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!("IPC: Failed to encode event: {}", e);
+                                    continue;
+                                }
+                            };
+                            if !subscription_allows_event(event_types, &value) {
+                                continue;
+                            }
+                            let mut bytes = match serde_json::to_vec(&value) {
                                 Ok(b) => b,
                                 Err(e) => {
                                     warn!("IPC: Failed to serialize event: {}", e);
                                     continue;
                                 }
                             };
+                            bytes.push(b'\n');
                             if pipe.write_all(&bytes).await.is_err() {
                                 debug!("IPC event subscriber disconnected");
                                 return Ok(());
@@ -267,7 +294,9 @@ impl IpcServer {
                         workspaces.push(WorkspaceInfo {
                             name: format!("workspace-{}", monitor.active_workspace_id()),
                             id: monitor.active_workspace_id() as u32,
-                            window_count: ws.map(|w| w.columns.iter().map(|c| c.tiles.len()).sum()).unwrap_or(0),
+                            window_count: ws
+                                .map(|w| w.columns.iter().map(|c| c.tiles.len()).sum())
+                                .unwrap_or(0),
                         });
                     }
                     let active_workspace = workspaces.first().map(|w| w.name.clone());
@@ -336,12 +365,15 @@ impl IpcServer {
             }
             IpcMessage::CloseWindow { window_hwnd } => {
                 info!("IPC: Close window {}", window_hwnd);
+                use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
                 use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
-                use windows::Win32::Foundation::{HWND, WPARAM, LPARAM};
                 let hwnd = HWND(window_hwnd as *mut std::ffi::c_void);
                 // Validate the HWND before posting any message
                 if !unsafe { IsWindow(hwnd).as_bool() } {
-                    warn!("IPC CloseWindow: HWND {} is not a valid window", window_hwnd);
+                    warn!(
+                        "IPC CloseWindow: HWND {} is not a valid window",
+                        window_hwnd
+                    );
                     return serde_json::json!({
                         "success": false,
                         "error": format!("Invalid HWND: {}", window_hwnd)
@@ -359,7 +391,20 @@ impl IpcServer {
             }
             IpcMessage::ReloadConfig => {
                 info!("IPC: Reload config requested");
-                serde_json::json!({"success": true})
+                if let Some(tx) = self.reload_tx.lock().as_ref() {
+                    match tx.send(()) {
+                        Ok(()) => serde_json::json!({"success": true}),
+                        Err(_) => serde_json::json!({
+                            "success": false,
+                            "error": "reload channel is closed"
+                        }),
+                    }
+                } else {
+                    serde_json::json!({
+                        "success": false,
+                        "error": "reload channel not initialized"
+                    })
+                }
             }
             IpcMessage::Quit => {
                 info!("IPC: Quit requested — sending shutdown signal to main");
@@ -378,32 +423,66 @@ impl IpcServer {
             }
             IpcMessage::WindowMove { window_hwnd, x, y } => {
                 info!("IPC: Move window {} to ({}, {})", window_hwnd, x, y);
-                use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetWindowPos, SWP_NOSIZE, SWP_NOZORDER};
-                use windows::Win32::Foundation::HWND;
-                let hwnd = HWND(window_hwnd as *mut std::ffi::c_void);
-                if !unsafe { IsWindow(hwnd).as_bool() } {
-                    return serde_json::json!({"success": false, "error": format!("Invalid HWND: {}", window_hwnd)});
+                let Some(current) = self.current_window_bounds(window_hwnd) else {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": format!("Invalid or unknown HWND: {}", window_hwnd)
+                    });
+                };
+                let rect = Rect::new(x, y, current.size.w, current.size.h);
+                match self.apply_ipc_window_rect(window_hwnd, rect) {
+                    Ok(()) => {
+                        self.broadcast_event(IpcEvent::WindowMoved {
+                            window_hwnd,
+                            x,
+                            y,
+                            width: rect.size.w,
+                            height: rect.size.h,
+                        });
+                        serde_json::json!({"success": true})
+                    }
+                    Err(e) => serde_json::json!({"success": false, "error": e}),
                 }
-                unsafe {
-                    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-                }
-                serde_json::json!({"success": true})
             }
-            IpcMessage::WindowResize { window_hwnd, width, height } => {
+            IpcMessage::WindowResize {
+                window_hwnd,
+                width,
+                height,
+            } => {
                 info!("IPC: Resize window {} to {}x{}", window_hwnd, width, height);
-                use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetWindowPos, SWP_NOMOVE, SWP_NOZORDER};
-                use windows::Win32::Foundation::HWND;
-                let hwnd = HWND(window_hwnd as *mut std::ffi::c_void);
-                if !unsafe { IsWindow(hwnd).as_bool() } {
-                    return serde_json::json!({"success": false, "error": format!("Invalid HWND: {}", window_hwnd)});
+                if width == 0 || height == 0 {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": "width and height must be greater than zero"
+                    });
                 }
-                unsafe {
-                    let _ = SetWindowPos(hwnd, None, 0, 0, width as i32, height as i32, SWP_NOMOVE | SWP_NOZORDER);
+                let Some(current) = self.current_window_bounds(window_hwnd) else {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": format!("Invalid or unknown HWND: {}", window_hwnd)
+                    });
+                };
+                let rect = Rect::new(current.loc.x, current.loc.y, width, height);
+                match self.apply_ipc_window_rect(window_hwnd, rect) {
+                    Ok(()) => {
+                        self.broadcast_event(IpcEvent::WindowResized {
+                            window_hwnd,
+                            width,
+                            height,
+                        });
+                        serde_json::json!({"success": true})
+                    }
+                    Err(e) => serde_json::json!({"success": false, "error": e}),
                 }
-                serde_json::json!({"success": true})
             }
-            IpcMessage::TileRequest { window_hwnd, target_workspace } => {
-                info!("IPC: TileRequest for window {} workspace {:?}", window_hwnd, target_workspace);
+            IpcMessage::TileRequest {
+                window_hwnd,
+                target_workspace,
+            } => {
+                info!(
+                    "IPC: TileRequest for window {} workspace {:?}",
+                    window_hwnd, target_workspace
+                );
                 // Bring the window back into tiling: if it's currently floating
                 // we toggle it; if a target workspace name was provided we
                 // additionally move it there.
@@ -420,9 +499,19 @@ impl IpcServer {
                         if engine.read().is_floating(wid) {
                             engine.write().toggle_floating(backend);
                         }
-                        // Optional workspace move (by name).
+                        // Optional workspace move (by name or numeric id).
                         if let Some(name) = target_workspace.as_deref() {
-                            engine.write().focus_workspace_named(name, backend);
+                            let target_id = name
+                                .parse::<i32>()
+                                .ok()
+                                .or_else(|| engine.read().workspace_id_by_name(name));
+                            let Some(target_id) = target_id else {
+                                return serde_json::json!({
+                                    "success": false,
+                                    "error": format!("Unknown workspace: {}", name)
+                                });
+                            };
+                            engine.write().move_window_to_workspace(target_id, backend);
                         }
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true, "result": {"hwnd": window_hwnd}})
@@ -433,8 +522,14 @@ impl IpcServer {
                     }),
                 }
             }
-            IpcMessage::WindowMoveToWorkspace { window_hwnd, workspace_id } => {
-                info!("IPC: Move window {} to workspace {}", window_hwnd, workspace_id);
+            IpcMessage::WindowMoveToWorkspace {
+                window_hwnd,
+                workspace_id,
+            } => {
+                info!(
+                    "IPC: Move window {} to workspace {}",
+                    window_hwnd, workspace_id
+                );
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
                         if !focus_window_by_hwnd(engine, backend, window_hwnd) {
@@ -443,7 +538,9 @@ impl IpcServer {
                                 "error": format!("Unknown tiled window: hwnd={}", window_hwnd)
                             });
                         }
-                        engine.write().move_window_to_workspace(workspace_id, backend);
+                        engine
+                            .write()
+                            .move_window_to_workspace(workspace_id, backend);
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
@@ -505,13 +602,18 @@ impl IpcServer {
             IpcMessage::WorkspaceList => {
                 if let Some(engine) = &self.engine {
                     let eng = engine.read();
-                    let workspaces: Vec<_> = eng.monitors().iter().map(|(_oid, m)| {
-                        WorkspaceInfo {
+                    let workspaces: Vec<_> = eng
+                        .monitors()
+                        .iter()
+                        .map(|(_oid, m)| WorkspaceInfo {
                             name: format!("workspace-{}", m.active_workspace_id()),
                             id: m.active_workspace_id() as u32,
-                            window_count: m.workspace().map(|w| w.columns.iter().map(|c| c.tiles.len()).sum()).unwrap_or(0),
-                        }
-                    }).collect();
+                            window_count: m
+                                .workspace()
+                                .map(|w| w.columns.iter().map(|c| c.tiles.len()).sum())
+                                .unwrap_or(0),
+                        })
+                        .collect();
                     serde_json::json!({"success": true, "result": workspaces})
                 } else {
                     serde_json::json!({"success": true, "result": []})
@@ -547,11 +649,15 @@ impl IpcServer {
                 info!("IPC: MoveWindowToWorkspace {}", workspace_id);
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
-                        engine.write().move_window_to_workspace(workspace_id, backend);
+                        engine
+                            .write()
+                            .move_window_to_workspace(workspace_id, backend);
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine or backend not initialized"})
+                    }
                 }
             }
             IpcMessage::MoveWindowToMonitor { direction } => {
@@ -566,7 +672,9 @@ impl IpcServer {
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine or backend not initialized"})
+                    }
                 }
             }
             IpcMessage::CenterColumn => {
@@ -577,7 +685,9 @@ impl IpcServer {
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine or backend not initialized"})
+                    }
                 }
             }
             IpcMessage::SetColumnWidth { preset } => {
@@ -599,7 +709,9 @@ impl IpcServer {
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine or backend not initialized"})
+                    }
                 }
             }
             IpcMessage::ResizeColumn { delta_px } => {
@@ -610,29 +722,41 @@ impl IpcServer {
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine or backend not initialized"})
+                    }
                 }
             }
             IpcMessage::FocusWorkspaceNext => {
                 info!("IPC: FocusWorkspaceNext");
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
-                        engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Next, backend);
+                        engine.write().focus_workspace_relative(
+                            crate::layout::WorkspaceDirection::Next,
+                            backend,
+                        );
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine or backend not initialized"})
+                    }
                 }
             }
             IpcMessage::FocusWorkspacePrevious => {
                 info!("IPC: FocusWorkspacePrevious");
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
-                        engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Previous, backend);
+                        engine.write().focus_workspace_relative(
+                            crate::layout::WorkspaceDirection::Previous,
+                            backend,
+                        );
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine or backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine or backend not initialized"})
+                    }
                 }
             }
             IpcMessage::FocusPrevious => {
@@ -643,7 +767,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::ToggleAlwaysOnTop => {
@@ -653,7 +779,9 @@ impl IpcServer {
                         e.write().toggle_always_on_top_for_focused(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::FocusWorkspaceNamed { name } => {
@@ -664,7 +792,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::SetAutoTileThreshold { threshold } => {
@@ -675,7 +805,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::MonitorList => {
@@ -741,7 +873,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::ExpelWindow => {
@@ -752,7 +886,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::ExpandColumn => {
@@ -763,7 +899,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::MaximizeColumn => {
@@ -774,7 +912,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::GrowColumn => {
@@ -785,7 +925,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::ShrinkColumn => {
@@ -796,7 +938,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::GrowTile => {
@@ -807,7 +951,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::ShrinkTile => {
@@ -818,7 +964,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::ListBindings => {
@@ -851,7 +999,9 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::SaveSnapshot { name } => {
@@ -879,23 +1029,21 @@ impl IpcServer {
             IpcMessage::LoadSnapshot { name } => {
                 info!("IPC: LoadSnapshot name={}", name);
                 match (&self.engine, &self.backend) {
-                    (Some(e), Some(b)) => {
-                        match crate::layout::snapshot::load_from(&name) {
-                            Ok(snap) => {
-                                let mut eng = e.write();
-                                eng.apply_snapshot(&snap);
-                                eng.apply_all(b);
-                                serde_json::json!({
-                                    "success": true,
-                                    "result": { "name": name, "monitors": snap.monitors.len() },
-                                })
-                            }
-                            Err(e) => serde_json::json!({
-                                "success": false,
-                                "error": format!("load failed: {}", e),
-                            }),
+                    (Some(e), Some(b)) => match crate::layout::snapshot::load_from(&name) {
+                        Ok(snap) => {
+                            let mut eng = e.write();
+                            eng.apply_snapshot(&snap);
+                            eng.apply_all(b);
+                            serde_json::json!({
+                                "success": true,
+                                "result": { "name": name, "monitors": snap.monitors.len() },
+                            })
                         }
-                    }
+                        Err(e) => serde_json::json!({
+                            "success": false,
+                            "error": format!("load failed: {}", e),
+                        }),
+                    },
                     _ => serde_json::json!({
                         "success": false,
                         "error": "engine/backend not initialized",
@@ -1008,15 +1156,28 @@ impl IpcServer {
                         e.write().apply_all(b);
                         serde_json::json!({"success": true})
                     }
-                    _ => serde_json::json!({"success": false, "error": "engine/backend not initialized"}),
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
                 }
             }
             IpcMessage::SetWorkspaceLayout { mode } => {
                 info!("IPC: SetWorkspaceLayout mode={}", mode);
-                // TODO(audit): need set_workspace_layout helper on TilingEngine.
-                // Wire the call once the engine agent adds the method.
-                warn!("SetWorkspaceLayout: set_workspace_layout helper not yet available");
-                serde_json::json!({"success": false, "error": "set_workspace_layout not yet implemented"})
+                match (&self.engine, &self.backend) {
+                    (Some(e), Some(b)) => {
+                        let mut eng = e.write();
+                        match eng.set_workspace_layout(&mode) {
+                            Ok(()) => {
+                                eng.apply_all(b);
+                                serde_json::json!({"success": true, "result": {"layout": mode}})
+                            }
+                            Err(err) => serde_json::json!({"success": false, "error": err}),
+                        }
+                    }
+                    _ => {
+                        serde_json::json!({"success": false, "error": "engine/backend not initialized"})
+                    }
+                }
             }
             IpcMessage::RenameWorkspace { workspace_id, name } => {
                 info!("IPC: RenameWorkspace id={} name={:?}", workspace_id, name);
@@ -1025,7 +1186,9 @@ impl IpcServer {
                         Ok(()) => serde_json::json!({"success": true}),
                         Err(err) => serde_json::json!({"success": false, "error": err}),
                     },
-                    None => serde_json::json!({"success": false, "error": "engine not initialized"}),
+                    None => {
+                        serde_json::json!({"success": false, "error": "engine not initialized"})
+                    }
                 }
             }
             IpcMessage::ScreenshotWindow { hwnd, path } => {
@@ -1051,10 +1214,12 @@ impl IpcServer {
                     Some(p) => p,
                     None => match crate::hooks::spawner::default_window_capture_path(target_hwnd) {
                         Ok(p) => p,
-                        Err(e) => return serde_json::json!({
-                            "success": false,
-                            "error": format!("could not resolve default path: {}", e),
-                        }),
+                        Err(e) => {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("could not resolve default path: {}", e),
+                            })
+                        }
                     },
                 };
                 match crate::hooks::spawner::capture_window_to_file(target_hwnd, &dest) {
@@ -1112,7 +1277,8 @@ impl IpcServer {
                         for (&ws_id, ws) in monitor.workspaces.iter() {
                             let window_count: usize =
                                 ws.columns.iter().map(|c| c.tiles.len()).sum();
-                            let name = eng.workspace_name(ws_id)
+                            let name = eng
+                                .workspace_name(ws_id)
                                 .unwrap_or_else(|| format!("workspace-{}", ws_id));
                             workspaces.push(serde_json::json!({
                                 "id": ws_id,
@@ -1146,7 +1312,11 @@ impl IpcServer {
                     .collect();
                 serde_json::json!({"success": true, "result": entries})
             }
-            IpcMessage::ReserveArea { side, pixels, monitor_id: _ } => {
+            IpcMessage::ReserveArea {
+                side,
+                pixels,
+                monitor_id: _,
+            } => {
                 // TODO(audit): per-monitor reservations (monitor_id ignored for v1)
                 info!("IPC: ReserveArea side={} pixels={}", side, pixels);
                 if let Some(engine) = &self.engine {
@@ -1156,10 +1326,12 @@ impl IpcServer {
                         "bottom" => new_config.reserve_bottom = pixels,
                         "left" => new_config.reserve_left = pixels,
                         "right" => new_config.reserve_right = pixels,
-                        _ => return serde_json::json!({
-                            "success": false,
-                            "error": format!("invalid side {:?}: expected top | bottom | left | right", side),
-                        }),
+                        _ => {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("invalid side {:?}: expected top | bottom | left | right", side),
+                            })
+                        }
                     }
                     engine.write().update_config(new_config);
                     if let Some(backend) = &self.backend {
@@ -1194,10 +1366,12 @@ impl IpcServer {
                     Some(p) => p,
                     None => match crate::hooks::spawner::default_window_capture_path(window_hwnd) {
                         Ok(p) => p,
-                        Err(e) => return serde_json::json!({
-                            "success": false,
-                            "error": format!("could not resolve default path: {}", e),
-                        }),
+                        Err(e) => {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("could not resolve default path: {}", e),
+                            })
+                        }
                     },
                 };
                 match crate::hooks::spawner::capture_window_to_file(window_hwnd, &dest) {
@@ -1213,12 +1387,75 @@ impl IpcServer {
             }
         }
     }
+
+    fn current_window_bounds(&self, hwnd: isize) -> Option<Rect> {
+        if let Some(backend) = &self.backend {
+            if let Some(info) = backend.get_window(hwnd) {
+                return Some(info.bounds);
+            }
+        }
+
+        let window_id = WindowId::new(hwnd);
+        if let Some(engine) = &self.engine {
+            if let Some(info) = engine.read().tiled_windows().get(&window_id) {
+                return Some(info.bounds);
+            }
+        }
+
+        hwnd_bounds(hwnd)
+    }
+
+    fn apply_ipc_window_rect(&self, hwnd: isize, rect: Rect) -> std::result::Result<(), String> {
+        use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER};
+
+        let Some(backend) = &self.backend else {
+            return Err("backend not initialized".to_string());
+        };
+
+        backend
+            .set_window_position(hwnd, rect, SWP_NOZORDER | SWP_NOACTIVATE)
+            .map_err(|e| format!("SetWindowPos failed for {}: {}", hwnd, e))?;
+
+        if let Some(mut info) = backend.get_window(hwnd) {
+            info.bounds = rect;
+            backend.update_window(hwnd, info);
+        }
+        if let Some(engine) = &self.engine {
+            engine
+                .write()
+                .update_window_bounds(WindowId::new(hwnd), rect);
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for IpcServer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn hwnd_bounds(hwnd: isize) -> Option<Rect> {
+    use windows::Win32::Foundation::{HWND, RECT as WinRect};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow};
+
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    if !unsafe { IsWindow(hwnd).as_bool() } {
+        return None;
+    }
+
+    let mut rect = WinRect::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return None;
+    }
+
+    Some(Rect::new(
+        rect.left,
+        rect.top,
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    ))
 }
 
 /// Build the per-window reply used by both `GetState` and `WindowList`.
@@ -1229,8 +1466,8 @@ impl Default for IpcServer {
 /// of `WindowInfoIpc` aren't forced to track engine-side state).  Walks every
 /// monitor + workspace + column exactly once for O(W+T) total work.
 fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Value> {
-    use std::collections::HashMap;
     use crate::utils::WindowId;
+    use std::collections::HashMap;
 
     let mut ws_of: HashMap<WindowId, i32> = HashMap::new();
     for (_oid, monitor) in eng.monitors().iter() {
@@ -1260,10 +1497,23 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
     }
     // Stable order: hwnd ascending so `wiri-ctl windows` is deterministic.
     out.sort_by(|a, b| {
-        a.get("hwnd").and_then(|v| v.as_i64())
+        a.get("hwnd")
+            .and_then(|v| v.as_i64())
             .cmp(&b.get("hwnd").and_then(|v| v.as_i64()))
     });
     out
+}
+
+fn subscription_allows_event(event_types: &[String], event: &serde_json::Value) -> bool {
+    if event_types.is_empty() || event_types.iter().any(|t| t == "*") {
+        return true;
+    }
+
+    let Some(event_type) = event.get("type").and_then(|v| v.as_str()) else {
+        return false;
+    };
+
+    event_types.iter().any(|filter| filter == event_type)
 }
 
 /// Locate a window by its HWND across all monitors/workspaces and update the
@@ -1296,7 +1546,9 @@ fn focus_window_by_hwnd(
                     break;
                 }
             }
-            if found.is_some() { break; }
+            if found.is_some() {
+                break;
+            }
         }
         found
     };
@@ -1324,9 +1576,7 @@ fn focus_window_by_hwnd(
         let eng = engine.read();
         if let Some(window) = eng.tiled_windows().get(&wid) {
             use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{
-                IsWindow, SetForegroundWindow,
-            };
+            use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
             let h = HWND(window.hwnd as *mut std::ffi::c_void);
             unsafe {
                 if IsWindow(h).as_bool() {
@@ -1395,10 +1645,18 @@ fn create_pipe_with_sa(
 /// as a hex constant.
 pub fn format_chord(modifiers: u32, vk: u32) -> String {
     let mut parts: Vec<&'static str> = Vec::new();
-    if modifiers & 0x0002 != 0 { parts.push("Ctrl"); }
-    if modifiers & 0x0001 != 0 { parts.push("Alt"); }
-    if modifiers & 0x0004 != 0 { parts.push("Shift"); }
-    if modifiers & 0x0008 != 0 { parts.push("Win"); }
+    if modifiers & 0x0002 != 0 {
+        parts.push("Ctrl");
+    }
+    if modifiers & 0x0001 != 0 {
+        parts.push("Alt");
+    }
+    if modifiers & 0x0004 != 0 {
+        parts.push("Shift");
+    }
+    if modifiers & 0x0008 != 0 {
+        parts.push("Win");
+    }
     let key = match vk {
         0x08 => "Backspace".to_string(),
         0x09 => "Tab".to_string(),
@@ -1444,19 +1702,15 @@ pub fn format_chord(modifiers: u32, vk: u32) -> String {
 /// Build a SECURITY_ATTRIBUTES that grants full access only to
 /// BUILTIN\Administrators (BA) and the file owner (OW).
 pub fn build_pipe_security_attributes() -> Result<windows::Win32::Security::SECURITY_ATTRIBUTES> {
-    use windows::Win32::Security::{
-        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-    };
+    use windows::core::PCWSTR;
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows::core::PCWSTR;
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
     // D: = DACL; (A;;GA;;;BA) = Allow GenericAll to BUILTIN\Administrators
     //           (A;;GA;;;OW) = Allow GenericAll to the object Owner
-    let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;OW)\0"
-        .encode_utf16()
-        .collect();
+    let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;OW)\0".encode_utf16().collect();
 
     let mut sd = PSECURITY_DESCRIPTOR::default();
     unsafe {

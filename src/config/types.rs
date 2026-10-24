@@ -266,10 +266,18 @@ impl LayoutConfigPartial {
     /// base value (i.e. the global `layout { … }` block wins for unset keys).
     pub fn apply_to(&self, base: &LayoutConfig) -> LayoutConfig {
         let mut out = base.clone();
-        if let Some(v) = self.inner_gaps { out.inner_gaps = v; }
-        if let Some(v) = self.outer_gaps { out.outer_gaps = v; }
-        if let Some(v) = self.border_width { out.border_width = v; }
-        if let Some(ref v) = self.border_color { out.border_color = v.clone(); }
+        if let Some(v) = self.inner_gaps {
+            out.inner_gaps = v;
+        }
+        if let Some(v) = self.outer_gaps {
+            out.outer_gaps = v;
+        }
+        if let Some(v) = self.border_width {
+            out.border_width = v;
+        }
+        if let Some(ref v) = self.border_color {
+            out.border_color = v.clone();
+        }
         if let Some(ref v) = self.border_color_focused {
             // Per-output override: an "accent" / "windows-accent" sentinel
             // is intentionally NOT stored as a literal — the engine reads
@@ -280,33 +288,75 @@ impl LayoutConfigPartial {
             // string.  Empty overrides keep the parent value.
             out.border_color_focused = v.clone();
         }
-        if let Some(v) = self.focus_ring_width { out.focus_ring_width = v; }
-        if let Some(v) = self.dim_unfocused { out.dim_unfocused = v; }
-        if let Some(ref v) = self.focus_ring_color { out.focus_ring_color = v.clone(); }
-        if let Some(v) = self.shadow_enable { out.shadow_enable = v; }
-        if let Some(v) = self.shadow_opacity { out.shadow_opacity = v; }
-        if let Some(v) = self.shadow_offset_x { out.shadow_offset_x = v; }
-        if let Some(v) = self.shadow_offset_y { out.shadow_offset_y = v; }
-        if let Some(v) = self.shadow_blur { out.shadow_blur = v; }
-        if let Some(ref v) = self.shadow_color { out.shadow_color = v.clone(); }
-        if let Some(v) = self.split_ratio { out.split_ratio = v; }
-        if let Some(v) = self.auto_balance { out.auto_balance = v; }
-        if let Some(v) = self.scroll_step { out.scroll_step = v; }
-        if let Some(v) = self.column_width { out.column_width = v; }
-        if let Some(ref v) = self.column_width_mode { out.column_width_mode = v.clone(); }
-        if let Some(v) = self.strip_frame { out.strip_frame = v; }
-        if let Some(ref v) = self.border_color_urgent { out.border_color_urgent = v.clone(); }
-        if let Some(v) = self.border_radius { out.border_radius = v; }
-        if let Some(v) = self.border_padding { out.border_padding = v; }
-        if let Some(v) = self.focus_ring_gap { out.focus_ring_gap = v; }
-        if let Some(ref v) = self.focus_ring_inactive_color { out.focus_ring_inactive_color = v.clone(); }
-        if let Some(v) = self.shadow_spread { out.shadow_spread = v; }
-        if let Some(v) = self.smart_borders { out.smart_borders = v; }
+        if let Some(v) = self.focus_ring_width {
+            out.focus_ring_width = v;
+        }
+        if let Some(v) = self.dim_unfocused {
+            out.dim_unfocused = v;
+        }
+        if let Some(ref v) = self.focus_ring_color {
+            out.focus_ring_color = v.clone();
+        }
+        if let Some(v) = self.shadow_enable {
+            out.shadow_enable = v;
+        }
+        if let Some(v) = self.shadow_opacity {
+            out.shadow_opacity = v;
+        }
+        if let Some(v) = self.shadow_offset_x {
+            out.shadow_offset_x = v;
+        }
+        if let Some(v) = self.shadow_offset_y {
+            out.shadow_offset_y = v;
+        }
+        if let Some(v) = self.shadow_blur {
+            out.shadow_blur = v;
+        }
+        if let Some(ref v) = self.shadow_color {
+            out.shadow_color = v.clone();
+        }
+        if let Some(v) = self.split_ratio {
+            out.split_ratio = v;
+        }
+        if let Some(v) = self.auto_balance {
+            out.auto_balance = v;
+        }
+        if let Some(v) = self.scroll_step {
+            out.scroll_step = v;
+        }
+        if let Some(v) = self.column_width {
+            out.column_width = v;
+        }
+        if let Some(ref v) = self.column_width_mode {
+            out.column_width_mode = v.clone();
+        }
+        if let Some(v) = self.strip_frame {
+            out.strip_frame = v;
+        }
+        if let Some(ref v) = self.border_color_urgent {
+            out.border_color_urgent = v.clone();
+        }
+        if let Some(v) = self.border_radius {
+            out.border_radius = v;
+        }
+        if let Some(v) = self.border_padding {
+            out.border_padding = v;
+        }
+        if let Some(v) = self.focus_ring_gap {
+            out.focus_ring_gap = v;
+        }
+        if let Some(ref v) = self.focus_ring_inactive_color {
+            out.focus_ring_inactive_color = v.clone();
+        }
+        if let Some(v) = self.shadow_spread {
+            out.shadow_spread = v;
+        }
+        if let Some(v) = self.smart_borders {
+            out.smart_borders = v;
+        }
         out
     }
 }
-
-
 
 #[derive(Debug, Clone, Default)]
 pub struct Position {
@@ -441,7 +491,12 @@ impl LayoutConfig {
     /// Uses `inner_gaps` for all four sides; per-side overrides are a future addition.
     pub fn gaps_edges(&self) -> Edges<i32> {
         let g = self.inner_gaps as i32;
-        Edges { left: g, right: g, top: g, bottom: g }
+        Edges {
+            left: g,
+            right: g,
+            top: g,
+            bottom: g,
+        }
     }
 
     /// Return a nested border view built from the flat fields.
@@ -877,9 +932,9 @@ impl HotkeyBinding {
         let mut flags = 0u32;
         for m in &self.modifiers {
             match m.to_lowercase().as_str() {
-                "ctrl" | "control" => flags |= 0x0002, // MOD_CTRL
-                "alt" => flags |= 0x0001,              // MOD_ALT
-                "shift" => flags |= 0x0004,            // MOD_SHIFT
+                "ctrl" | "control" => flags |= 0x0002,       // MOD_CTRL
+                "alt" => flags |= 0x0001,                    // MOD_ALT
+                "shift" => flags |= 0x0004,                  // MOD_SHIFT
                 "super" | "win" | "meta" => flags |= 0x0008, // MOD_WIN
                 _ => {}
             }
@@ -899,7 +954,10 @@ impl HotkeyBinding {
     /// `backend/message_loop.rs`) consumes this to spawn the argument
     /// through `cmd.exe /C "<command>"`.
     pub fn is_spawn_cmd(&self) -> bool {
-        matches!(self.command.as_str(), "spawn-cmd" | "spawn_cmd" | "spawn-sh")
+        matches!(
+            self.command.as_str(),
+            "spawn-cmd" | "spawn_cmd" | "spawn-sh"
+        )
     }
 
     /// When this binding is `spawn-cmd "<command>"`, return the canonical
@@ -1144,7 +1202,10 @@ mod tests {
     fn test_hotkey_binding_parse_action() {
         let mut b = HotkeyBinding::default();
         b.command = "focus-column-left".to_string();
-        assert_eq!(b.parse_action(), Some(crate::input::Action::FocusColumnLeft));
+        assert_eq!(
+            b.parse_action(),
+            Some(crate::input::Action::FocusColumnLeft)
+        );
     }
 
     #[test]
@@ -1172,7 +1233,11 @@ mod tests {
         assert!(b.is_spawn_cmd());
         assert_eq!(
             b.shell_command_argv(),
-            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "wt.exe".to_string()]),
+            Some(vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                "wt.exe".to_string()
+            ]),
         );
     }
 
@@ -1187,7 +1252,11 @@ mod tests {
         assert!(b.is_spawn_cmd());
         assert_eq!(
             b.shell_command_argv(),
-            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "echo hi".to_string()]),
+            Some(vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                "echo hi".to_string()
+            ]),
         );
     }
 
@@ -1387,7 +1456,12 @@ mod tests {
         let mut rule = WindowRule::default();
         rule.instance = Some("main".to_string());
         rule.process_name = Some("firefox.exe".to_string());
-        let ok = ctx_full("Mozilla", "About:Mozilla", Some("main"), Some("firefox.exe"));
+        let ok = ctx_full(
+            "Mozilla",
+            "About:Mozilla",
+            Some("main"),
+            Some("firefox.exe"),
+        );
         let wrong_proc = ctx_full("Mozilla", "About:Mozilla", Some("main"), Some("chrome.exe"));
         assert!(rule.matches(&ok));
         assert!(!rule.matches(&wrong_proc));

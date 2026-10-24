@@ -16,21 +16,23 @@
 //! and only consumes the very last Alt-down that completes a double-tap
 //! (by returning `LRESULT(1)` for that single event).
 
-use std::sync::{Arc, LazyLock};
-use std::time::Instant;
 use parking_lot::Mutex;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx,
-    WH_MOUSE_LL, WH_KEYBOARD_LL, MSLLHOOKSTRUCT, KBDLLHOOKSTRUCT, HHOOK,
+    CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_USER,
 };
 
-use crate::input::grab::{MoveGrab, ResizeGrab, ColumnReorderGrab, COLUMN_REORDER_HIT_ZONE_PX};
-use crate::utils::{Point, Rect, WindowId};
 use crate::backend::BackendHandle;
-use crate::layout::TilingEngine;
+use crate::input::grab::{ColumnReorderGrab, MoveGrab, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
 use crate::layout::snap::{build_candidates, find_snap, SnapTarget};
+use crate::layout::TilingEngine;
+use crate::utils::{Point, Rect, WindowId};
 
 // WM_ mouse messages
 const WM_MOUSEMOVE: u32 = 0x0200;
@@ -48,6 +50,7 @@ const WM_SYSKEYUP: u32 = 0x0105;
 
 /// Virtual key code for the Alt key (either left or right Alt).
 const VK_MENU: u32 = 0x12;
+const VK_ESCAPE: u32 = 0x1B;
 
 /// Maximum gap between two Alt key-down events that counts as a double-tap (ms).
 const DOUBLE_TAP_WINDOW_MS: u128 = 250;
@@ -68,12 +71,24 @@ pub enum GrabState {
 }
 
 impl Default for GrabState {
-    fn default() -> Self { Self::None }
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// Wrapper to make HHOOK Send-safe (it's just a pointer we pass to Win32 API)
+#[derive(Clone, Copy)]
 struct SendHook(HHOOK);
 unsafe impl Send for SendHook {}
+
+#[derive(Clone, Copy)]
+struct HookThread {
+    hook: SendHook,
+    thread_id: u32,
+}
+unsafe impl Send for HookThread {}
+
+const WM_STOP_HOOK_LOOP: u32 = WM_USER + 301;
 
 /// Shared state accessible from the mouse hook callback
 struct HookState {
@@ -90,24 +105,18 @@ static HOOK_STATE: LazyLock<Mutex<HookState>> = LazyLock::new(|| {
     })
 });
 
-static HOOK_HANDLE: LazyLock<Mutex<Option<SendHook>>> = LazyLock::new(|| {
-    Mutex::new(None)
-});
+static HOOK_HANDLE: LazyLock<Mutex<Option<HookThread>>> = LazyLock::new(|| Mutex::new(None));
 
 // ---------------------------------------------------------------------------
 // Keyboard hook — double-Alt detection
 // ---------------------------------------------------------------------------
 
 /// Handle for the installed `WH_KEYBOARD_LL` hook.
-static KB_HOOK_HANDLE: LazyLock<Mutex<Option<SendHook>>> = LazyLock::new(|| {
-    Mutex::new(None)
-});
+static KB_HOOK_HANDLE: LazyLock<Mutex<Option<HookThread>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Timestamp of the last Alt key-down event.  `None` means the chain was
 /// broken (another key was pressed) or no Alt has been seen yet.
-static LAST_ALT_DOWN: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| {
-    Mutex::new(None)
-});
+static LAST_ALT_DOWN: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Whether the previous Alt-down is still being held (haven't seen an Alt-up yet).
 /// Used to distinguish a held Alt from a fresh second tap.
@@ -118,7 +127,34 @@ static ALT_HELD: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 static KB_ACTION_TX: LazyLock<Mutex<Option<std::sync::mpsc::Sender<crate::input::Action>>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// Start the low-level mouse hook. Must be called from a thread with a message pump.
+fn run_hook_message_loop(name: &str) {
+    let mut msg = MSG::default();
+    loop {
+        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if ret.0 == 0 || ret.0 == -1 || msg.message == WM_STOP_HOOK_LOOP {
+            break;
+        }
+        let _ = unsafe { TranslateMessage(&msg) };
+        unsafe {
+            DispatchMessageW(&msg);
+        }
+    }
+    info!("Low-level {} hook message loop exited", name);
+}
+
+fn take_hook_for_thread(
+    hook_slot: &LazyLock<Mutex<Option<HookThread>>>,
+    thread_id: u32,
+) -> Option<HookThread> {
+    let mut guard = hook_slot.lock();
+    if guard.as_ref().map(|h| h.thread_id) == Some(thread_id) {
+        guard.take()
+    } else {
+        None
+    }
+}
+
+/// Start the low-level mouse hook on a dedicated thread with a message pump.
 /// Guard against double-install: if the hook is already active, logs a warning and returns.
 pub fn start_mouse_hook(
     engine: Arc<parking_lot::RwLock<TilingEngine>>,
@@ -136,32 +172,64 @@ pub fn start_mouse_hook(
         state.backend = Some(backend);
     }
 
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_MOUSE_LL,
-            Some(mouse_hook_callback),
-            windows::Win32::Foundation::HMODULE::default(),
-            0,
-        )
-    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("wiri-mouse-hook".to_string())
+        .spawn(move || {
+            let thread_id = unsafe { GetCurrentThreadId() };
+            let hook = unsafe {
+                SetWindowsHookExW(
+                    WH_MOUSE_LL,
+                    Some(mouse_hook_callback),
+                    windows::Win32::Foundation::HMODULE::default(),
+                    0,
+                )
+            };
 
-    match hook {
-        Ok(h) => {
-            *HOOK_HANDLE.lock() = Some(SendHook(h));
-            info!("Low-level mouse hook installed");
-            Ok(())
-        }
-        Err(e) => {
-            let err = std::io::Error::last_os_error();
-            Err(format!("SetWindowsHookExW(WH_MOUSE_LL) failed: {:?} os_err={}", e, err))
-        }
-    }
+            match hook {
+                Ok(h) => {
+                    *HOOK_HANDLE.lock() = Some(HookThread {
+                        hook: SendHook(h),
+                        thread_id,
+                    });
+                    info!("Low-level mouse hook installed");
+                    let _ = ready_tx.send(Ok(()));
+                    run_hook_message_loop("mouse");
+                    if let Some(hook_thread) = take_hook_for_thread(&HOOK_HANDLE, thread_id) {
+                        unsafe {
+                            let _ = UnhookWindowsHookEx(hook_thread.hook.0);
+                        }
+                        info!("Low-level mouse hook removed");
+                    }
+                }
+                Err(e) => {
+                    let err = std::io::Error::last_os_error();
+                    let _ = ready_tx.send(Err(format!(
+                        "SetWindowsHookExW(WH_MOUSE_LL) failed: {:?} os_err={}",
+                        e, err
+                    )));
+                }
+            }
+        })
+        .map_err(|e| format!("failed to spawn mouse hook thread: {}", e))?;
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|e| format!("mouse hook did not start: {}", e))?
 }
 
 /// Stop the low-level mouse hook
 pub fn stop_mouse_hook() {
-    if let Some(h) = HOOK_HANDLE.lock().take() {
-        unsafe { let _ = UnhookWindowsHookEx(h.0); }
+    if let Some(hook_thread) = HOOK_HANDLE.lock().take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook_thread.hook.0);
+            let _ = PostThreadMessageW(
+                hook_thread.thread_id,
+                WM_STOP_HOOK_LOOP,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
         info!("Low-level mouse hook removed");
     }
 }
@@ -176,10 +244,14 @@ pub fn set_keyboard_action_sender(tx: std::sync::mpsc::Sender<crate::input::Acti
     *KB_ACTION_TX.lock() = Some(tx);
 }
 
+pub fn clear_keyboard_action_sender() {
+    *KB_ACTION_TX.lock() = None;
+}
+
 /// Install the low-level keyboard hook for double-Alt detection.
 ///
-/// Must be called from a thread that runs a Win32 message loop (the hook
-/// callback is driven by `GetMessage` / `DispatchMessage`).  Safe to call
+/// Installs the hook on a dedicated Win32 message-pump thread.
+/// The hook callback is driven by `GetMessage` / `DispatchMessage`. Safe to call
 /// again after `stop_keyboard_hook` — a fresh hook is installed.  Calling
 /// while already installed logs a warning and returns without re-installing.
 pub fn start_keyboard_hook() -> Result<(), String> {
@@ -188,31 +260,63 @@ pub fn start_keyboard_hook() -> Result<(), String> {
         return Ok(());
     }
 
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(keyboard_hook_callback),
-            windows::Win32::Foundation::HMODULE::default(),
-            0,
-        )
-    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("wiri-keyboard-hook".to_string())
+        .spawn(move || {
+            let thread_id = unsafe { GetCurrentThreadId() };
+            let hook = unsafe {
+                SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(keyboard_hook_callback),
+                    windows::Win32::Foundation::HMODULE::default(),
+                    0,
+                )
+            };
 
-    match hook {
-        Ok(h) => {
-            *KB_HOOK_HANDLE.lock() = Some(SendHook(h));
-            info!("Low-level keyboard hook installed (double-Alt detection)");
-            Ok(())
-        }
-        Err(e) => {
-            Err(format!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {:?}", e))
-        }
-    }
+            match hook {
+                Ok(h) => {
+                    *KB_HOOK_HANDLE.lock() = Some(HookThread {
+                        hook: SendHook(h),
+                        thread_id,
+                    });
+                    info!("Low-level keyboard hook installed (double-Alt detection)");
+                    let _ = ready_tx.send(Ok(()));
+                    run_hook_message_loop("keyboard");
+                    if let Some(hook_thread) = take_hook_for_thread(&KB_HOOK_HANDLE, thread_id) {
+                        unsafe {
+                            let _ = UnhookWindowsHookEx(hook_thread.hook.0);
+                        }
+                        info!("Low-level keyboard hook removed");
+                    }
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "SetWindowsHookExW(WH_KEYBOARD_LL) failed: {:?}",
+                        e
+                    )));
+                }
+            }
+        })
+        .map_err(|e| format!("failed to spawn keyboard hook thread: {}", e))?;
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|e| format!("keyboard hook did not start: {}", e))?
 }
 
 /// Uninstall the low-level keyboard hook.
 pub fn stop_keyboard_hook() {
-    if let Some(h) = KB_HOOK_HANDLE.lock().take() {
-        unsafe { let _ = UnhookWindowsHookEx(h.0); }
+    if let Some(hook_thread) = KB_HOOK_HANDLE.lock().take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook_thread.hook.0);
+            let _ = PostThreadMessageW(
+                hook_thread.thread_id,
+                WM_STOP_HOOK_LOOP,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
         info!("Low-level keyboard hook removed");
     }
 }
@@ -240,7 +344,7 @@ unsafe extern "system" fn keyboard_hook_callback(
     let vk = kb.vkCode;
 
     let is_key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-    let is_key_up   = msg == WM_KEYUP   || msg == WM_SYSKEYUP;
+    let is_key_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
 
     if is_key_down {
         if vk == VK_MENU {
@@ -273,6 +377,12 @@ unsafe extern "system" fn keyboard_hook_callback(
                 // First Alt-down.
                 *last = Some(Instant::now());
                 *held = true;
+            }
+        } else if vk == VK_ESCAPE {
+            *LAST_ALT_DOWN.lock() = None;
+            *ALT_HELD.lock() = false;
+            if let Some(tx) = KB_ACTION_TX.lock().as_ref() {
+                let _ = tx.send(crate::input::Action::OverviewExit);
             }
         } else {
             // Any non-Alt key-down breaks the double-tap chain.
@@ -356,9 +466,12 @@ unsafe extern "system" fn mouse_hook_callback(
     }
 
     // Skip events we don't handle at all
-    if msg != WM_LBUTTONDOWN && msg != WM_RBUTTONDOWN
-        && msg != WM_LBUTTONUP && msg != WM_RBUTTONUP
-        && msg != WM_MOUSEMOVE && msg != WM_MOUSEWHEEL
+    if msg != WM_LBUTTONDOWN
+        && msg != WM_RBUTTONDOWN
+        && msg != WM_LBUTTONUP
+        && msg != WM_RBUTTONUP
+        && msg != WM_MOUSEMOVE
+        && msg != WM_MOUSEWHEEL
     {
         return CallNextHookEx(None, n_code, w_param, l_param);
     }
@@ -433,7 +546,11 @@ unsafe extern "system" fn mouse_hook_callback(
         // Alt-only held → horizontal column scroll (existing behaviour).
         let mouse_cfg = crate::input::mouse_runtime_config();
         // Invert direction when natural_scroll is enabled (touchpad convention).
-        let effective_delta = if mouse_cfg.natural_scroll { -delta } else { delta };
+        let effective_delta = if mouse_cfg.natural_scroll {
+            -delta
+        } else {
+            delta
+        };
         let direction = if effective_delta > 0 {
             crate::layout::ScrollDirection::Right
         } else {
@@ -493,9 +610,10 @@ unsafe extern "system" fn mouse_hook_callback(
                 };
 
                 let hwnd_at_cursor = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(
-                        POINT { x: cursor.x, y: cursor.y },
-                    )
+                    windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT {
+                        x: cursor.x,
+                        y: cursor.y,
+                    })
                 };
 
                 if !hwnd_at_cursor.is_invalid() {
@@ -509,9 +627,12 @@ unsafe extern "system" fn mouse_hook_callback(
                                 if let Some(info) = eng.tiled_windows().get(&wid) {
                                     let pos = info.bounds.loc;
                                     let size = info.bounds.size;
-                                    let col_idx = eng.monitors().values()
-                                        .find_map(|m| m.workspace()
-                                            .and_then(|w| w.find_window_column(wid)))
+                                    let col_idx = eng
+                                        .monitors()
+                                        .values()
+                                        .find_map(|m| {
+                                            m.workspace().and_then(|w| w.find_window_column(wid))
+                                        })
                                         .unwrap_or(0);
 
                                     // Ctrl+Alt+LButton on the top strip of the tile →
@@ -538,7 +659,9 @@ unsafe extern "system" fn mouse_hook_callback(
                                 if let Some(info) = eng.tiled_windows().get(&wid) {
                                     let border_w = eng.config().border_width.max(4);
                                     if let Some(edge) = crate::input::grab::resize_edge_from_point(
-                                        cursor, info.bounds, border_w
+                                        cursor,
+                                        info.bounds,
+                                        border_w,
                                     ) {
                                         let grab = ResizeGrab::new(wid, edge, cursor, info.bounds);
                                         drop(eng);
@@ -589,10 +712,8 @@ unsafe extern "system" fn mouse_hook_callback(
                                             // Exclude the dragged window's own
                                             // column so we don't snap to the
                                             // starting position.
-                                            let is_self = col
-                                                .tiles
-                                                .iter()
-                                                .any(|t| t.window_id == window_id);
+                                            let is_self =
+                                                col.tiles.iter().any(|t| t.window_id == window_id);
                                             if is_self {
                                                 continue;
                                             }
@@ -601,8 +722,7 @@ unsafe extern "system" fn mouse_hook_callback(
                                                     eng.tiled_windows().get(&tile.window_id)
                                                 {
                                                     lefts.push(info.bounds.loc.x);
-                                                    rights
-                                                        .push(info.bounds.right());
+                                                    rights.push(info.bounds.right());
                                                 }
                                             }
                                         }
@@ -614,14 +734,11 @@ unsafe extern "system" fn mouse_hook_callback(
                                         wa.loc.x,
                                         wa.size.w as i32,
                                     );
-                                    if let Some(SnapTarget { x, .. }) = find_snap(
-                                        new_pos.x,
-                                        &cands,
-                                        snap_cfg.threshold_px,
-                                    ) {
+                                    if let Some(SnapTarget { x, .. }) =
+                                        find_snap(new_pos.x, &cands, snap_cfg.threshold_px)
+                                    {
                                         new_pos.x = x;
-                                        snap_overlay =
-                                            Some((x, wa.loc.y, wa.size.h as i32));
+                                        snap_overlay = Some((x, wa.loc.y, wa.size.h as i32));
                                     }
                                 }
                             }
@@ -632,7 +749,8 @@ unsafe extern "system" fn mouse_hook_callback(
                     if let Some(backend) = &state.backend {
                         let rect = Rect::new(new_pos.x, new_pos.y, grab_size.w, grab_size.h);
                         let _ = backend.set_window_position(
-                            window_id.as_isize(), rect,
+                            window_id.as_isize(),
+                            rect,
                             windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
                                 | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
                         );
@@ -671,12 +789,8 @@ unsafe extern "system" fn mouse_hook_callback(
                             if let Some(monitor) = eng.monitors_mut().get_mut(&oid) {
                                 if let Some(workspace) = monitor.workspace_mut() {
                                     let num_cols = workspace.columns.len().max(1);
-                                    let target_col = grab.target_column(
-                                        cursor,
-                                        col_width,
-                                        col_gap,
-                                        num_cols,
-                                    );
+                                    let target_col =
+                                        grab.target_column(cursor, col_width, col_gap, num_cols);
                                     let _ = workspace.move_window(window_id, target_col, 0);
                                 }
                             }
@@ -692,37 +806,36 @@ unsafe extern "system" fn mouse_hook_callback(
                 _ => CallNextHookEx(None, n_code, w_param, l_param),
             }
         }
-        GrabState::Resize(grab) => {
-            match msg {
-                WM_MOUSEMOVE => {
-                    let new_rect = grab.new_rect(cursor, (100, 100));
-                    let window_id = grab.window_id;
-                    let state = HOOK_STATE.lock();
-                    if let Some(backend) = &state.backend {
-                        let _ = backend.set_window_position(
-                            window_id.as_isize(), new_rect,
-                            windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                                | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                        );
-                    }
-                    LRESULT(1)
+        GrabState::Resize(grab) => match msg {
+            WM_MOUSEMOVE => {
+                let new_rect = grab.new_rect(cursor, (100, 100));
+                let window_id = grab.window_id;
+                let state = HOOK_STATE.lock();
+                if let Some(backend) = &state.backend {
+                    let _ = backend.set_window_position(
+                        window_id.as_isize(),
+                        new_rect,
+                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                    );
                 }
-                WM_RBUTTONUP => {
-                    info!("Resize grab finished: window {:?}", grab.window_id);
-                    let state = HOOK_STATE.lock();
-                    if let Some(engine) = &state.engine {
-                        let mut eng = engine.write();
-                        if let Some(backend) = &state.backend {
-                            eng.apply_all(backend);
-                        }
-                    }
-                    drop(state);
-                    HOOK_STATE.lock().grab = GrabState::None;
-                    LRESULT(1)
-                }
-                _ => CallNextHookEx(None, n_code, w_param, l_param),
+                LRESULT(1)
             }
-        }
+            WM_RBUTTONUP => {
+                info!("Resize grab finished: window {:?}", grab.window_id);
+                let state = HOOK_STATE.lock();
+                if let Some(engine) = &state.engine {
+                    let mut eng = engine.write();
+                    if let Some(backend) = &state.backend {
+                        eng.apply_all(backend);
+                    }
+                }
+                drop(state);
+                HOOK_STATE.lock().grab = GrabState::None;
+                LRESULT(1)
+            }
+            _ => CallNextHookEx(None, n_code, w_param, l_param),
+        },
         GrabState::ColumnReorder(grab) => {
             match msg {
                 WM_MOUSEMOVE => {

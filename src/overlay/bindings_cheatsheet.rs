@@ -7,28 +7,24 @@
 //! `set_global_cheatsheet` and retrieved inside `execute_action` via
 //! `get_global_cheatsheet`.
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, SelectObject, SetBkMode, SetTextColor, HFONT,
-    PAINTSTRUCT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    SelectObject, SetBkMode, SetTextColor, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HFONT, PAINTSTRUCT,
+    TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, RegisterClassExW,
-    SetWindowPos, ShowWindow, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, MSG, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOWNOACTIVATE,
-    WNDCLASSEXW, WM_CREATE, WM_DESTROY, WM_PAINT,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
+    RegisterClassExW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+    WM_CREATE, WM_DESTROY, WM_PAINT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::PCWSTR;
 
 // Overlay logical dimensions at 96 DPI baseline (scaled up for HiDPI).
 const OVERLAY_W: i32 = 560;
@@ -144,7 +140,11 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn primary_monitor_scale() -> f64 {
     let dpi = unsafe { GetDpiForSystem() };
-    if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 }
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f64 / 96.0
+    }
 }
 
 /// Move the overlay so it is centred on the primary monitor.
@@ -157,7 +157,15 @@ fn reposition_center(hwnd: HWND) {
     let x = (screen_w - sw) / 2;
     let y = (screen_h - sh) / 2;
     unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+        );
     }
 }
 
@@ -189,11 +197,8 @@ fn run_window_loop(state: Arc<CheatsheetState>) {
         let x = (screen_w - sw) / 2;
         let y = (screen_h - sh) / 2;
 
-        let ex_style = WS_EX_LAYERED
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_TRANSPARENT;
+        let ex_style =
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
 
         let state_ptr = Arc::into_raw(state.clone()) as *mut CheatsheetState;
 
@@ -202,8 +207,12 @@ fn run_window_loop(state: Arc<CheatsheetState>) {
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("").as_ptr()),
             WS_POPUP,
-            x, y, sw, sh,
-            None, None,
+            x,
+            y,
+            sw,
+            sh,
+            None,
+            None,
             hinstance,
             Some(state_ptr as *const _),
         )
@@ -225,7 +234,9 @@ fn run_window_loop(state: Arc<CheatsheetState>) {
         let mut msg = MSG::default();
         loop {
             let ret = GetMessageW(&mut msg, None, 0, 0);
-            if ret.0 <= 0 { break; }
+            if ret.0 <= 0 {
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -273,7 +284,12 @@ unsafe extern "system" fn wnd_proc(
 
             // ---- Background ----
             let bg_brush = CreateSolidBrush(COLORREF(0x00_1E_1E_1E));
-            let mut full_rc = RECT { left: 0, top: 0, right: win_w, bottom: win_h };
+            let full_rc = RECT {
+                left: 0,
+                top: 0,
+                right: win_w,
+                bottom: win_h,
+            };
             FillRect(hdc, &full_rc, bg_brush);
             let _ = DeleteObject(bg_brush);
 
@@ -285,23 +301,50 @@ unsafe extern "system" fn wnd_proc(
             // ---- Title ----
             let title_font: HFONT = CreateFontW(
                 -(s(17)),
-                0, 0, 0,
+                0,
+                0,
+                0,
                 700, // FW_BOLD
-                0, 0, 0, 1, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
                 PCWSTR(wide("Segoe UI").as_ptr()),
             );
             let body_font: HFONT = CreateFontW(
                 -(s(13)),
-                0, 0, 0,
+                0,
+                0,
+                0,
                 400, // FW_NORMAL
-                0, 0, 0, 1, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
                 PCWSTR(wide("Segoe UI").as_ptr()),
             );
             let header_font: HFONT = CreateFontW(
                 -(s(12)),
-                0, 0, 0,
+                0,
+                0,
+                0,
                 600, // semi-bold
-                0, 0, 0, 1, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
                 PCWSTR(wide("Segoe UI").as_ptr()),
             );
 
@@ -316,7 +359,12 @@ unsafe extern "system" fn wnd_proc(
                 bottom: title_h_px,
             };
             let mut title_text = "wiri key bindings".encode_utf16().collect::<Vec<u16>>();
-            let _ = DrawTextW(hdc, &mut title_text, &mut title_rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            let _ = DrawTextW(
+                hdc,
+                &mut title_text,
+                &mut title_rc,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
 
             // ---- Divider line under title ----
             let div_brush = CreateSolidBrush(COLORREF(0x00_44_44_44));
@@ -339,12 +387,32 @@ unsafe extern "system" fn wnd_proc(
             let col2_x = col1_x + s(COL_CHORD_W) + s(COL_GAP);
 
             let mut hdr1 = "Chord".encode_utf16().collect::<Vec<u16>>();
-            let mut rc_hdr1 = RECT { left: col1_x, top: header_top, right: col1_x + s(COL_CHORD_W), bottom: header_bot };
-            let _ = DrawTextW(hdc, &mut hdr1, &mut rc_hdr1, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            let mut rc_hdr1 = RECT {
+                left: col1_x,
+                top: header_top,
+                right: col1_x + s(COL_CHORD_W),
+                bottom: header_bot,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut hdr1,
+                &mut rc_hdr1,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
 
             let mut hdr2 = "Action".encode_utf16().collect::<Vec<u16>>();
-            let mut rc_hdr2 = RECT { left: col2_x, top: header_top, right: win_w - title_margin, bottom: header_bot };
-            let _ = DrawTextW(hdc, &mut hdr2, &mut rc_hdr2, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            let mut rc_hdr2 = RECT {
+                left: col2_x,
+                top: header_top,
+                right: win_w - title_margin,
+                bottom: header_bot,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut hdr2,
+                &mut rc_hdr2,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
 
             // ---- Divider below headers ----
             let div2_brush = CreateSolidBrush(COLORREF(0x00_33_33_33));
@@ -388,7 +456,12 @@ unsafe extern "system" fn wnd_proc(
                     right: col1_x + s(COL_CHORD_W),
                     bottom: row_y + row_h_px,
                 };
-                let _ = DrawTextW(hdc, &mut chord_text, &mut rc_chord, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                let _ = DrawTextW(
+                    hdc,
+                    &mut chord_text,
+                    &mut rc_chord,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                );
 
                 // Action (right column, white)
                 SetTextColor(hdc, COLORREF(0x00_DD_DD_DD));
@@ -399,21 +472,33 @@ unsafe extern "system" fn wnd_proc(
                     right: win_w - title_margin,
                     bottom: row_y + row_h_px,
                 };
-                let _ = DrawTextW(hdc, &mut action_text, &mut rc_action, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                let _ = DrawTextW(
+                    hdc,
+                    &mut action_text,
+                    &mut rc_action,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                );
             }
 
             // ---- Footer ----
             let footer_y = win_h - s(22);
             SelectObject(hdc, header_font);
             SetTextColor(hdc, COLORREF(0x00_55_55_55));
-            let mut footer_text = "Press prefix+? again to close".encode_utf16().collect::<Vec<u16>>();
+            let mut footer_text = "Press prefix+? again to close"
+                .encode_utf16()
+                .collect::<Vec<u16>>();
             let mut rc_footer = RECT {
                 left: title_margin,
                 top: footer_y,
                 right: win_w - title_margin,
                 bottom: win_h,
             };
-            let _ = DrawTextW(hdc, &mut footer_text, &mut rc_footer, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            let _ = DrawTextW(
+                hdc,
+                &mut footer_text,
+                &mut rc_footer,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
 
             // Clean up fonts
             SelectObject(hdc, old_font);
@@ -449,52 +534,58 @@ pub fn default_bindings_table(prefix_name: &str) -> Vec<BindingRow> {
     let p = prefix_name;
     let s = format!("{}+Shift", p);
     vec![
-        (format!("{}+Left", p),         "focus-column-left".into()),
-        (format!("{}+Right", p),        "focus-column-right".into()),
-        (format!("{}+Up", p),           "focus-up".into()),
-        (format!("{}+Down", p),         "focus-down".into()),
-        (format!("{}+Left", s),         "move-column-left".into()),
-        (format!("{}+Right", s),        "move-column-right".into()),
-        (format!("{}+Q", p),            "close-window".into()),
-        (format!("{}+Enter", p),        "spawn (terminal)".into()),
-        (format!("{}+F", p),            "toggle-fullscreen".into()),
-        (format!("{}+T", p),            "toggle-floating".into()),
-        (format!("{}+H", p),            "scroll-left".into()),
-        (format!("{}+L", p),            "scroll-right".into()),
-        (format!("{}+Q", s),            "quit".into()),
-        (format!("{}+Space", p),        "overview-toggle".into()),
-        ("Escape".into(),               "overview-select / exit-resize".into()),
-        (format!("{}+O", p),            "overview-select".into()),
-        (format!("{}+\\", p),           "column-toggle-tabbed".into()),
-        (format!("{}+]", p),            "tab-next".into()),
-        (format!("{}+[", p),            "tab-prev".into()),
-        (format!("{}+1…9", p),          "focus-workspace-N".into()),
-        (format!("{}+1…9", s),          "move-to-workspace-N".into()),
-        (format!("{}+PageUp", p),       "focus-workspace-previous".into()),
-        (format!("{}+PageDown", p),     "focus-workspace-next".into()),
-        (format!("{}+R", p),            "enter-resize-mode".into()),
-        (format!("{}+R", s),            "center-column".into()),
-        (format!("{}+W", p),            "column-width-cycle".into()),
-        (format!("{}+-", p),            "resize-column-left".into()),
-        (format!("{}++", p),            "resize-column-right".into()),
-        (format!("{}+Tab", p),          "focus-previous (alt-tab)".into()),
-        (format!("{}+P", p),            "screenshot".into()),
-        (format!("{}+A", p),            "toggle-always-on-top".into()),
-        (format!("{}+,", p),            "consume-window-into-column".into()),
-        (format!("{}+.", p),            "expel-window-from-column".into()),
-        (format!("{}+E", p),            "expand-column-to-available".into()),
-        (format!("{}+F", s),            "maximize-column".into()),
-        (format!("{}+L", s),            "grow-column-width".into()),
-        (format!("{}+H", s),            "shrink-column-width".into()),
-        (format!("{}+K", s),            "grow-tile-height".into()),
-        (format!("{}+J", s),            "shrink-tile-height".into()),
-        (format!("{}+PageUp", s),       "move-workspace-up".into()),
-        (format!("{}+PageDown", s),     "move-workspace-down".into()),
-        (format!("{}+Up", s),           "move-column-to-workspace-up".into()),
-        (format!("{}+Down", s),         "move-column-to-workspace-down".into()),
-        (format!("{}+,", s),            "move-column-to-monitor-left".into()),
-        (format!("{}+.", s),            "move-column-to-monitor-right".into()),
-        (format!("{}+S", p),            "toggle-sticky".into()),
-        (format!("{}+?", s),            "show-key-bindings (this overlay)".into()),
+        (format!("{}+Left", p), "focus-column-left".into()),
+        (format!("{}+Right", p), "focus-column-right".into()),
+        (format!("{}+Up", p), "focus-up".into()),
+        (format!("{}+Down", p), "focus-down".into()),
+        (format!("{}+Left", s), "move-column-left".into()),
+        (format!("{}+Right", s), "move-column-right".into()),
+        (format!("{}+Q", p), "close-window".into()),
+        (format!("{}+Enter", p), "spawn (terminal)".into()),
+        (format!("{}+F", p), "toggle-fullscreen".into()),
+        (format!("{}+T", p), "toggle-floating".into()),
+        (format!("{}+H", p), "scroll-left".into()),
+        (format!("{}+L", p), "scroll-right".into()),
+        (format!("{}+Q", s), "quit".into()),
+        (format!("{}+Space", p), "overview-toggle".into()),
+        ("Escape".into(), "overview-select / exit-resize".into()),
+        (format!("{}+O", p), "overview-select".into()),
+        (format!("{}+\\", p), "column-toggle-tabbed".into()),
+        (format!("{}+]", p), "tab-next".into()),
+        (format!("{}+[", p), "tab-prev".into()),
+        (format!("{}+1…9", p), "focus-workspace-N".into()),
+        (format!("{}+1…9", s), "move-to-workspace-N".into()),
+        (format!("{}+PageUp", p), "focus-workspace-previous".into()),
+        (format!("{}+PageDown", p), "focus-workspace-next".into()),
+        (format!("{}+R", p), "enter-resize-mode".into()),
+        (format!("{}+R", s), "center-column".into()),
+        (format!("{}+W", p), "column-width-cycle".into()),
+        (format!("{}+-", p), "resize-column-left".into()),
+        (format!("{}++", p), "resize-column-right".into()),
+        (format!("{}+Tab", p), "focus-previous (alt-tab)".into()),
+        (format!("{}+P", p), "screenshot".into()),
+        (format!("{}+A", p), "toggle-always-on-top".into()),
+        (format!("{}+,", p), "consume-window-into-column".into()),
+        (format!("{}+.", p), "expel-window-from-column".into()),
+        (format!("{}+E", p), "expand-column-to-available".into()),
+        (format!("{}+F", s), "maximize-column".into()),
+        (format!("{}+L", s), "grow-column-width".into()),
+        (format!("{}+H", s), "shrink-column-width".into()),
+        (format!("{}+K", s), "grow-tile-height".into()),
+        (format!("{}+J", s), "shrink-tile-height".into()),
+        (format!("{}+PageUp", s), "move-workspace-up".into()),
+        (format!("{}+PageDown", s), "move-workspace-down".into()),
+        (format!("{}+Up", s), "move-column-to-workspace-up".into()),
+        (
+            format!("{}+Down", s),
+            "move-column-to-workspace-down".into(),
+        ),
+        (format!("{}+,", s), "move-column-to-monitor-left".into()),
+        (format!("{}+.", s), "move-column-to-monitor-right".into()),
+        (format!("{}+S", p), "toggle-sticky".into()),
+        (
+            format!("{}+?", s),
+            "show-key-bindings (this overlay)".into(),
+        ),
     ]
 }

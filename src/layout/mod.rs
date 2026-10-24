@@ -1,25 +1,27 @@
-pub mod workspace;
-pub mod floating;
-pub mod engine;
 pub mod animation;
+pub mod engine;
+pub mod floating;
 pub mod snap;
 pub mod snapshot;
+pub mod workspace;
 
-pub use workspace::{Workspace, Column, ColumnDisplay, Tile, compute_column_layout, compute_workspace_layout};
-pub use workspace::{WorkspaceLayout};
-pub use floating::{FloatManager, FloatWindow};
-pub use floating::FloatingCorner;
-pub use engine::TilingEngine;
-pub use engine::LayoutConfig;
-pub use engine::ColumnWidthMode;
-pub use engine::AddWindowTarget;
-pub use engine::ColumnWidthPreset;
-pub use engine::WorkspaceDirection;
 pub use animation::{Animation, AnimationManager, AnimationTarget, Easing};
+pub use engine::AddWindowTarget;
+pub use engine::ColumnWidthMode;
+pub use engine::ColumnWidthPreset;
+pub use engine::LayoutConfig;
+pub use engine::TilingEngine;
+pub use engine::WorkspaceDirection;
+pub use floating::FloatingCorner;
+pub use floating::{FloatManager, FloatWindow};
+pub use workspace::WorkspaceLayout;
+pub use workspace::{
+    compute_column_layout, compute_workspace_layout, Column, ColumnDisplay, Tile, Workspace,
+};
 
+use crate::utils::{OutputId, Rect, Size, WindowId};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use crate::utils::{Rect, Size, OutputId, WindowId};
 
 /// MRU (most-recently-used) focus stack.
 /// The most recently focused window is at the front (index 0).
@@ -113,7 +115,10 @@ pub struct ConfigureThrottle {
 
 impl ConfigureThrottle {
     pub fn new(min_interval: Duration) -> Self {
-        Self { last_send: None, min_interval }
+        Self {
+            last_send: None,
+            min_interval,
+        }
     }
 
     /// Default throttle: ~60 fps (16 ms between configures).
@@ -154,10 +159,18 @@ impl Default for ConfigureThrottle {
 pub trait LayoutElement {
     fn window_id(&self) -> WindowId;
     fn bounds(&self) -> Rect;
-    fn min_size(&self) -> Size { Size::new(50, 50) }
-    fn max_size(&self) -> Option<Size> { None }
-    fn is_focused(&self) -> bool { false }
-    fn is_urgent(&self) -> bool { false }
+    fn min_size(&self) -> Size {
+        Size::new(50, 50)
+    }
+    fn max_size(&self) -> Option<Size> {
+        None
+    }
+    fn is_focused(&self) -> bool {
+        false
+    }
+    fn is_urgent(&self) -> bool {
+        false
+    }
     fn configure_intent(&self) -> ConfigureIntent;
 }
 
@@ -226,7 +239,9 @@ where
     /// Iterate in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
         let map = &self.map;
-        self.order.iter().filter_map(move |k| map.get(k).map(|v| (k, v)))
+        self.order
+            .iter()
+            .filter_map(move |k| map.get(k).map(|v| (k, v)))
     }
 
     /// Iterate mutably in insertion order.
@@ -312,7 +327,8 @@ where
     type IntoIter = std::vec::IntoIter<(&'a K, &'a V)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.order.iter()
+        self.order
+            .iter()
             .filter_map(|k| self.map.get(k).map(|v| (k, v)))
             .collect::<Vec<_>>()
             .into_iter()
@@ -331,9 +347,7 @@ where
         let MonitorSet { map, order, .. } = self;
         let mut pairs: Vec<(&'a K, &'a mut V)> = map.iter_mut().collect();
         // Sort by insertion order (position in `order`) to match &MonitorSet's iteration order.
-        pairs.sort_by_key(|(k, _)| {
-            order.iter().position(|ok| ok == *k).unwrap_or(usize::MAX)
-        });
+        pairs.sort_by_key(|(k, _)| order.iter().position(|ok| ok == *k).unwrap_or(usize::MAX));
         pairs.into_iter()
     }
 }
@@ -365,7 +379,12 @@ impl Monitor {
         Self::with_scale(output_id, bounds, work_area, 1.0)
     }
 
-    pub fn with_scale(output_id: OutputId, bounds: Rect, work_area: Rect, scale_factor: f64) -> Self {
+    pub fn with_scale(
+        output_id: OutputId,
+        bounds: Rect,
+        work_area: Rect,
+        scale_factor: f64,
+    ) -> Self {
         let mut workspaces = HashMap::new();
         workspaces.insert(0, Workspace::new());
         Self {
@@ -425,7 +444,7 @@ impl Monitor {
         (logical as f64 * self.scale_factor) as i32
     }
 
-    /// Get a DPI-aware rect for positioning. 
+    /// Get a DPI-aware rect for positioning.
     /// Returns a rect suitable for use with SetWindowPos.
     /// Note: With PER_MONITOR_AWARE_V2, this returns the work_area as-is.
     pub fn positioning_rect(&self) -> Rect {
@@ -480,17 +499,22 @@ impl Monitor {
                             None
                         } else if let Some(mru_wid) = mru_candidate {
                             // Verify the MRU candidate still exists in this workspace.
-                            workspace.find_window_column(mru_wid)
+                            workspace
+                                .find_window_column(mru_wid)
                                 .map(|col| (col, Some(mru_wid)))
                         } else {
                             // No MRU entry — fall back to adjacent column.
                             let adj = col_idx.min(num_cols - 1);
-                            let focus_wid = workspace.columns.get(adj)
+                            let focus_wid = workspace
+                                .columns
+                                .get(adj)
                                 .and_then(|col| col.tiles.first())
                                 .map(|tile| tile.window_id);
                             Some((adj, focus_wid))
                         }
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some((adj, focus_wid)) = new_focus {
                         self.focus_column = Some(adj);
                         self.focus_window = focus_wid;
@@ -512,19 +536,20 @@ impl Monitor {
                             None
                         } else if let Some(fwid) = focused_wid {
                             // Find where the focused window ended up
-                            workspace.find_window_column(fwid)
-                                .map(|col| (col, fwid))
+                            workspace.find_window_column(fwid).map(|col| (col, fwid))
                         } else {
                             // No focused window — clamp focus_column to valid range
-                            let clamped = self.focus_column
-                                .unwrap_or(0)
-                                .min(num_cols - 1);
-                            let focus_wid = workspace.columns.get(clamped)
+                            let clamped = self.focus_column.unwrap_or(0).min(num_cols - 1);
+                            let focus_wid = workspace
+                                .columns
+                                .get(clamped)
                                 .and_then(|col| col.tiles.first())
                                 .map(|t| t.window_id);
                             focus_wid.map(|wid| (clamped, wid))
                         }
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some((col, wid)) = new_focus {
                         self.focus_column = Some(col);
                         self.focus_window = Some(wid);
@@ -535,9 +560,8 @@ impl Monitor {
                             if num_cols == 0 {
                                 self.focus_column = None;
                             } else {
-                                self.focus_column = Some(
-                                    self.focus_column.unwrap_or(0).min(num_cols - 1),
-                                );
+                                self.focus_column =
+                                    Some(self.focus_column.unwrap_or(0).min(num_cols - 1));
                             }
                         }
                     }
@@ -568,9 +592,10 @@ impl Monitor {
             let info = self.workspace().and_then(|workspace| {
                 if col_idx < workspace.columns.len().saturating_sub(1) {
                     let new_col = col_idx + 1;
-                    workspace.columns.get(new_col).and_then(|col| {
-                        col.tiles.first().map(|tile| (new_col, tile.window_id))
-                    })
+                    workspace
+                        .columns
+                        .get(new_col)
+                        .and_then(|col| col.tiles.first().map(|tile| (new_col, tile.window_id)))
                 } else {
                     None
                 }
@@ -601,9 +626,15 @@ impl Monitor {
                         }
                     }
                     found
-                } else { None }
-            } else { None }
-        } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(wid) = new_wid {
             self.focus_window = Some(wid);
             self.focus_ring.push(wid);
@@ -628,9 +659,15 @@ impl Monitor {
                         }
                     }
                     found
-                } else { None }
-            } else { None }
-        } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(wid) = new_wid {
             self.focus_window = Some(wid);
             self.focus_ring.push(wid);
@@ -1019,4 +1056,3 @@ mod monitor_tests {
         assert_eq!(pairs[0], (b, 2));
     }
 }
-

@@ -1,22 +1,22 @@
-pub mod hotkey;
 pub mod grab;
-pub mod mouse;
+pub mod hotkey;
 pub mod low_level_hook;
-pub mod touch;
+pub mod mouse;
 pub mod snap_guide;
+pub mod touch;
 
+pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
 pub use hotkey::{HotkeyBinding, HotkeyId};
-pub use grab::{MoveGrab, ResizeGrab, ResizeEdge, ColumnReorderGrab, COLUMN_REORDER_HIT_ZONE_PX};
 pub use low_level_hook::{
-    GrabState,
-    begin_move_grab, begin_resize_grab, begin_column_reorder_grab,
-    cancel_grab, is_grab_active, current_grab,
-    start_mouse_hook, stop_mouse_hook,
-    start_keyboard_hook, stop_keyboard_hook, set_keyboard_action_sender,
+    begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab,
+    clear_keyboard_action_sender, current_grab, is_grab_active, set_keyboard_action_sender,
+    start_keyboard_hook, start_mouse_hook, stop_keyboard_hook, stop_mouse_hook, GrabState,
 };
-pub use mouse::{MouseTracker, MouseFocusConfig};
-pub use touch::{TouchConfig, TouchGesture, GestureRecognizer, start_touch_hook, stop_touch_hook,
-                set_action_sender as set_touch_action_sender};
+pub use mouse::{MouseFocusConfig, MouseTracker};
+pub use touch::{
+    set_action_sender as set_touch_action_sender, start_touch_hook, stop_touch_hook,
+    GestureRecognizer, TouchConfig, TouchGesture,
+};
 
 /// All actions that can be triggered by hotkeys or IPC
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -47,6 +47,8 @@ pub enum Action {
     ScrollRight,
     /// Toggle overview mode (zoom out to see all columns)
     OverviewToggle,
+    /// Exit overview or resize mode when one is active. No-op otherwise.
+    OverviewExit,
     /// Navigate left in overview mode (wraps)
     OverviewLeft,
     /// Navigate right in overview mode (wraps)
@@ -190,28 +192,30 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "center-window" => Some(Action::CenterWindow),
         "switch-monitor" => Some(Action::SwitchMonitor),
         "refresh" => Some(Action::Refresh),
-        "switch-workspace" | "workspace" => {
-            args.first().and_then(|s| s.parse::<i32>().ok()).map(Action::FocusWorkspace)
-        }
-        "move-workspace" => {
-            args.first().and_then(|s| s.parse::<i32>().ok()).map(Action::MoveWorkspace)
-        }
-        "spawn" | "exec" => {
-            args.first().map(|cmd| Action::Spawn(cmd.clone()))
-        }
+        "switch-workspace" | "workspace" => args
+            .first()
+            .and_then(|s| s.parse::<i32>().ok())
+            .map(Action::FocusWorkspace),
+        "move-workspace" => args
+            .first()
+            .and_then(|s| s.parse::<i32>().ok())
+            .map(Action::MoveWorkspace),
+        "spawn" | "exec" => args.first().map(|cmd| Action::Spawn(cmd.clone())),
         "spawn-cmd" | "spawn_cmd" | "spawn-sh" => {
             args.first().map(|cmd| Action::SpawnCmd(cmd.clone()))
         }
         "overview" | "overview-toggle" | "zoom-out" => Some(Action::OverviewToggle),
+        "overview-exit" | "exit-overview" => Some(Action::OverviewExit),
         "overview-left" => Some(Action::OverviewLeft),
         "overview-right" => Some(Action::OverviewRight),
         "overview-select" | "overview-accept" => Some(Action::OverviewSelect),
         "column-toggle-tabbed" => Some(Action::ColumnToggleTabbed),
         "tab-next" => Some(Action::TabNext),
         "tab-prev" => Some(Action::TabPrev),
-        "move-to-workspace" => {
-            args.first().and_then(|s| s.parse::<i32>().ok()).map(Action::MoveToWorkspace)
-        }
+        "move-to-workspace" => args
+            .first()
+            .and_then(|s| s.parse::<i32>().ok())
+            .map(Action::MoveToWorkspace),
         "move-to-monitor-left" => Some(Action::MoveToMonitorLeft),
         "move-to-monitor-right" => Some(Action::MoveToMonitorRight),
         "center-column" => Some(Action::CenterColumn),
@@ -246,19 +250,17 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "resize-column-left" | "shrink-column" => Some(Action::ResizeColumnLeft),
         "resize-column-right" | "grow-column" => Some(Action::ResizeColumnRight),
         "focus-workspace-next" | "workspace-next" => Some(Action::FocusWorkspaceNext),
-        "focus-workspace-previous" | "focus-workspace-prev" | "workspace-prev" => Some(Action::FocusWorkspacePrevious),
+        "focus-workspace-previous" | "focus-workspace-prev" | "workspace-prev" => {
+            Some(Action::FocusWorkspacePrevious)
+        }
         "focus-previous" | "alt-tab" | "focus-history-back" => Some(Action::FocusPrevious),
         "toggle-always-on-top" | "always-on-top" | "topmost" => Some(Action::ToggleAlwaysOnTop),
         "focus-workspace-named" | "focus-workspace" => {
             args.first().map(|s| Action::FocusWorkspaceNamed(s.clone()))
         }
         "screenshot" | "take-screenshot" | "capture-screen" => Some(Action::Screenshot),
-        "window-screenshot" | "capture-window" => {
-            Some(Action::WindowScreenshot)
-        }
-        "enter-resize-mode" | "resize-mode" | "interactive-resize" => {
-            Some(Action::EnterResizeMode)
-        }
+        "window-screenshot" | "capture-window" => Some(Action::WindowScreenshot),
+        "enter-resize-mode" | "resize-mode" | "interactive-resize" => Some(Action::EnterResizeMode),
         "move-column-to-workspace-up" | "move-column-up" | "move-column-to-workspace-above" => {
             Some(Action::MoveColumnToWorkspaceUp)
         }
@@ -286,9 +288,10 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
                 let raw = args[0].to_lowercase();
                 match raw.as_str() {
                     "off" | "none" => Some(Action::SetAutoTileThreshold(None)),
-                    v => v.parse::<usize>().ok().map(|n| {
-                        Action::SetAutoTileThreshold(if n == 0 { None } else { Some(n) })
-                    }),
+                    v => v
+                        .parse::<usize>()
+                        .ok()
+                        .map(|n| Action::SetAutoTileThreshold(if n == 0 { None } else { Some(n) })),
                 }
             }
         }
@@ -329,10 +332,18 @@ pub fn parse_key_name(name: &str) -> Option<u32> {
         "insert" | "ins" => Some(0x2D),
         "caps-lock" => Some(0x14),
         "num-lock" => Some(0x90),
-        "f1" => Some(0x70), "f2" => Some(0x71), "f3" => Some(0x72),
-        "f4" => Some(0x73), "f5" => Some(0x74), "f6" => Some(0x75),
-        "f7" => Some(0x76), "f8" => Some(0x77), "f9" => Some(0x78),
-        "f10" => Some(0x79), "f11" => Some(0x7A), "f12" => Some(0x7B),
+        "f1" => Some(0x70),
+        "f2" => Some(0x71),
+        "f3" => Some(0x72),
+        "f4" => Some(0x73),
+        "f5" => Some(0x74),
+        "f6" => Some(0x75),
+        "f7" => Some(0x76),
+        "f8" => Some(0x77),
+        "f9" => Some(0x78),
+        "f10" => Some(0x79),
+        "f11" => Some(0x7A),
+        "f12" => Some(0x7B),
         "print" | "print-screen" => Some(0x2C),
         "scroll-lock" => Some(0x91),
         "pause" => Some(0x13),
@@ -345,9 +356,9 @@ pub fn parse_modifiers(names: &[String]) -> u32 {
     let mut flags = 0u32;
     for m in names {
         match m.to_lowercase().as_str() {
-            "ctrl" | "control" => flags |= 0x0002, // MOD_CTRL
-            "alt" => flags |= 0x0001,              // MOD_ALT
-            "shift" => flags |= 0x0004,            // MOD_SHIFT
+            "ctrl" | "control" => flags |= 0x0002,       // MOD_CTRL
+            "alt" => flags |= 0x0001,                    // MOD_ALT
+            "shift" => flags |= 0x0004,                  // MOD_SHIFT
             "super" | "win" | "meta" => flags |= 0x0008, // MOD_WIN
             _ => {}
         }
@@ -374,7 +385,11 @@ pub struct KeyboardConfig {
 
 impl Default for KeyboardConfig {
     fn default() -> Self {
-        Self { enabled: true, repeat_rate: 30, repeat_delay: 500 }
+        Self {
+            enabled: true,
+            repeat_rate: 30,
+            repeat_delay: 500,
+        }
     }
 }
 
@@ -387,7 +402,10 @@ pub struct MouseConfig {
 
 impl Default for MouseConfig {
     fn default() -> Self {
-        Self { sensitivity: 1.0, pointer_visibility: PointerVisibility::Visible }
+        Self {
+            sensitivity: 1.0,
+            pointer_visibility: PointerVisibility::Visible,
+        }
     }
 }
 
@@ -444,7 +462,10 @@ pub struct MouseRuntimeConfig {
 
 impl Default for MouseRuntimeConfig {
     fn default() -> Self {
-        Self { natural_scroll: false, scroll_speed: 1.0 }
+        Self {
+            natural_scroll: false,
+            scroll_speed: 1.0,
+        }
     }
 }
 
@@ -481,58 +502,142 @@ mod tests {
 
     #[test]
     fn test_parse_action_focus() {
-        assert_eq!(parse_action_name("focus-column-left", &[]), Some(Action::FocusColumnLeft));
-        assert_eq!(parse_action_name("focus-left", &[]), Some(Action::FocusColumnLeft));
-        assert_eq!(parse_action_name("focus-column-right", &[]), Some(Action::FocusColumnRight));
-        assert_eq!(parse_action_name("focus-right", &[]), Some(Action::FocusColumnRight));
+        assert_eq!(
+            parse_action_name("focus-column-left", &[]),
+            Some(Action::FocusColumnLeft)
+        );
+        assert_eq!(
+            parse_action_name("focus-left", &[]),
+            Some(Action::FocusColumnLeft)
+        );
+        assert_eq!(
+            parse_action_name("focus-column-right", &[]),
+            Some(Action::FocusColumnRight)
+        );
+        assert_eq!(
+            parse_action_name("focus-right", &[]),
+            Some(Action::FocusColumnRight)
+        );
         assert_eq!(parse_action_name("focus-up", &[]), Some(Action::FocusUp));
-        assert_eq!(parse_action_name("focus-down", &[]), Some(Action::FocusDown));
+        assert_eq!(
+            parse_action_name("focus-down", &[]),
+            Some(Action::FocusDown)
+        );
     }
 
     #[test]
     fn test_parse_action_move() {
-        assert_eq!(parse_action_name("move-column-left", &[]), Some(Action::MoveColumnLeft));
-        assert_eq!(parse_action_name("move-left", &[]), Some(Action::MoveColumnLeft));
-        assert_eq!(parse_action_name("move-column-right", &[]), Some(Action::MoveColumnRight));
-        assert_eq!(parse_action_name("move-right", &[]), Some(Action::MoveColumnRight));
+        assert_eq!(
+            parse_action_name("move-column-left", &[]),
+            Some(Action::MoveColumnLeft)
+        );
+        assert_eq!(
+            parse_action_name("move-left", &[]),
+            Some(Action::MoveColumnLeft)
+        );
+        assert_eq!(
+            parse_action_name("move-column-right", &[]),
+            Some(Action::MoveColumnRight)
+        );
+        assert_eq!(
+            parse_action_name("move-right", &[]),
+            Some(Action::MoveColumnRight)
+        );
     }
 
     #[test]
     fn test_parse_action_misc() {
-        assert_eq!(parse_action_name("close-window", &[]), Some(Action::CloseWindow));
+        assert_eq!(
+            parse_action_name("close-window", &[]),
+            Some(Action::CloseWindow)
+        );
         assert_eq!(parse_action_name("close", &[]), Some(Action::CloseWindow));
-        assert_eq!(parse_action_name("toggle-fullscreen", &[]), Some(Action::ToggleFullscreen));
-        assert_eq!(parse_action_name("fullscreen", &[]), Some(Action::ToggleFullscreen));
-        assert_eq!(parse_action_name("toggle-floating", &[]), Some(Action::ToggleFloating));
-        assert_eq!(parse_action_name("float", &[]), Some(Action::ToggleFloating));
+        assert_eq!(
+            parse_action_name("toggle-fullscreen", &[]),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            parse_action_name("fullscreen", &[]),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            parse_action_name("toggle-floating", &[]),
+            Some(Action::ToggleFloating)
+        );
+        assert_eq!(
+            parse_action_name("float", &[]),
+            Some(Action::ToggleFloating)
+        );
         assert_eq!(parse_action_name("quit", &[]), Some(Action::Quit));
         assert_eq!(parse_action_name("exit", &[]), Some(Action::Quit));
     }
 
     #[test]
     fn test_parse_action_scroll() {
-        assert_eq!(parse_action_name("scroll-left", &[]), Some(Action::ScrollLeft));
-        assert_eq!(parse_action_name("scroll-right", &[]), Some(Action::ScrollRight));
+        assert_eq!(
+            parse_action_name("scroll-left", &[]),
+            Some(Action::ScrollLeft)
+        );
+        assert_eq!(
+            parse_action_name("scroll-right", &[]),
+            Some(Action::ScrollRight)
+        );
     }
 
     #[test]
     fn test_parse_action_overview() {
-        assert_eq!(parse_action_name("overview", &[]), Some(Action::OverviewToggle));
-        assert_eq!(parse_action_name("overview-toggle", &[]), Some(Action::OverviewToggle));
-        assert_eq!(parse_action_name("zoom-out", &[]), Some(Action::OverviewToggle));
-        assert_eq!(parse_action_name("overview-left", &[]), Some(Action::OverviewLeft));
-        assert_eq!(parse_action_name("overview-right", &[]), Some(Action::OverviewRight));
-        assert_eq!(parse_action_name("overview-select", &[]), Some(Action::OverviewSelect));
-        assert_eq!(parse_action_name("overview-accept", &[]), Some(Action::OverviewSelect));
+        assert_eq!(
+            parse_action_name("overview", &[]),
+            Some(Action::OverviewToggle)
+        );
+        assert_eq!(
+            parse_action_name("overview-toggle", &[]),
+            Some(Action::OverviewToggle)
+        );
+        assert_eq!(
+            parse_action_name("zoom-out", &[]),
+            Some(Action::OverviewToggle)
+        );
+        assert_eq!(
+            parse_action_name("overview-left", &[]),
+            Some(Action::OverviewLeft)
+        );
+        assert_eq!(
+            parse_action_name("overview-right", &[]),
+            Some(Action::OverviewRight)
+        );
+        assert_eq!(
+            parse_action_name("overview-select", &[]),
+            Some(Action::OverviewSelect)
+        );
+        assert_eq!(
+            parse_action_name("overview-accept", &[]),
+            Some(Action::OverviewSelect)
+        );
     }
 
     #[test]
     fn test_parse_action_with_args() {
-        assert_eq!(parse_action_name("switch-workspace", &["3".to_string()]), Some(Action::FocusWorkspace(3)));
-        assert_eq!(parse_action_name("workspace", &["1".to_string()]), Some(Action::FocusWorkspace(1)));
-        assert_eq!(parse_action_name("move-workspace", &["2".to_string()]), Some(Action::MoveWorkspace(2)));
-        assert_eq!(parse_action_name("spawn", &["cmd.exe".to_string()]), Some(Action::Spawn("cmd.exe".to_string())));
-        assert_eq!(parse_action_name("exec", &["notepad".to_string()]), Some(Action::Spawn("notepad".to_string())));
+        assert_eq!(
+            parse_action_name("switch-workspace", &["3".to_string()]),
+            Some(Action::FocusWorkspace(3))
+        );
+        assert_eq!(
+            parse_action_name("workspace", &["1".to_string()]),
+            Some(Action::FocusWorkspace(1))
+        );
+        assert_eq!(
+            parse_action_name("move-workspace", &["2".to_string()]),
+            Some(Action::MoveWorkspace(2))
+        );
+        assert_eq!(
+            parse_action_name("spawn", &["cmd.exe".to_string()]),
+            Some(Action::Spawn("cmd.exe".to_string()))
+        );
+        assert_eq!(
+            parse_action_name("exec", &["notepad".to_string()]),
+            Some(Action::Spawn("notepad".to_string()))
+        );
     }
 
     #[test]
@@ -651,7 +756,10 @@ mod tests {
 
     #[test]
     fn test_parse_action_toggle_sticky() {
-        assert_eq!(parse_action_name("toggle-sticky", &[]), Some(Action::ToggleSticky));
+        assert_eq!(
+            parse_action_name("toggle-sticky", &[]),
+            Some(Action::ToggleSticky)
+        );
         assert_eq!(parse_action_name("sticky", &[]), Some(Action::ToggleSticky));
     }
 
@@ -740,9 +848,7 @@ mod tests {
 
         // Helper: returns true when the elapsed time since `prev` is within
         // the double-tap window (< 250 ms).  Mirrors the hook's condition.
-        let is_double_tap = |prev: Instant| -> bool {
-            prev.elapsed().as_millis() < 250
-        };
+        let is_double_tap = |prev: Instant| -> bool { prev.elapsed().as_millis() < 250 };
 
         // Case 1: two Alt presses very close together → double tap detected.
         let t0 = Instant::now();
@@ -785,8 +891,17 @@ mod tests {
 
     #[test]
     fn test_parse_action_toggle_backdrop() {
-        assert_eq!(parse_action_name("toggle-backdrop", &[]), Some(Action::ToggleBackdrop));
-        assert_eq!(parse_action_name("backdrop-cycle", &[]),  Some(Action::ToggleBackdrop));
-        assert_eq!(parse_action_name("backdrop", &[]),         Some(Action::ToggleBackdrop));
+        assert_eq!(
+            parse_action_name("toggle-backdrop", &[]),
+            Some(Action::ToggleBackdrop)
+        );
+        assert_eq!(
+            parse_action_name("backdrop-cycle", &[]),
+            Some(Action::ToggleBackdrop)
+        );
+        assert_eq!(
+            parse_action_name("backdrop", &[]),
+            Some(Action::ToggleBackdrop)
+        );
     }
 }

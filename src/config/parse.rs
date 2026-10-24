@@ -116,10 +116,12 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                     let raw_val = trimmed
                         .splitn(2, |c: char| c.is_whitespace() || c == '=')
                         .nth(1)
-                        .map(|s| s.trim_matches(|c: char| c.is_whitespace() || c == '=' || c == '"').to_lowercase())
+                        .map(|s| {
+                            s.trim_matches(|c: char| c.is_whitespace() || c == '=' || c == '"')
+                                .to_lowercase()
+                        })
                         .unwrap_or_else(|| "true".to_string());
-                    let want_extend = matches!(raw_val.as_str(),
-                        "true" | "1" | "yes" | "on" | "");
+                    let want_extend = matches!(raw_val.as_str(), "true" | "1" | "yes" | "on" | "");
                     config.binds.extend_defaults = want_extend;
                     continue;
                 }
@@ -148,7 +150,9 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
         // Top-level `spawn-at-startup` directive: collect all quoted/unquoted tokens
         // on the line into a Vec<String> entry.  Must be handled before the
         // single-value parse_property path because it can have 2+ token arguments.
-        if section.is_empty() && (line.starts_with("spawn-at-startup") || line.starts_with("spawn_at_startup")) {
+        if section.is_empty()
+            && (line.starts_with("spawn-at-startup") || line.starts_with("spawn_at_startup"))
+        {
             let rest = if let Some(r) = line.splitn(2, |c: char| c.is_whitespace()).nth(1) {
                 r.trim()
             } else {
@@ -164,7 +168,9 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
         // Parse key-value pairs
         if let Some((key, value)) = parse_property(line) {
             match section.as_str() {
-                "input" | "input.keyboard" => apply_input_keyboard_property(&key, &value, &mut config),
+                "input" | "input.keyboard" => {
+                    apply_input_keyboard_property(&key, &value, &mut config)
+                }
                 // Bug fix #5: input.mouse now parsed.
                 "input.mouse" => apply_input_mouse_property(&key, &value, &mut config),
                 // Nested input.focus block: route follows-mouse/etc. to flat InputConfig fields.
@@ -187,7 +193,9 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                 // key=value pairs into `OutputConfig.layout_override`.
                 "output.layout" => {
                     if let Some(ref mut out) = current_output {
-                        let lo = out.layout_override.get_or_insert_with(LayoutConfigPartial::default);
+                        let lo = out
+                            .layout_override
+                            .get_or_insert_with(LayoutConfigPartial::default);
                         apply_output_layout_property(&key, &value, lo);
                     }
                 }
@@ -247,7 +255,11 @@ fn try_parse_section(line: &str) -> Option<(String, Option<String>)> {
     let name = parts[0].to_string();
     let arg = if parts.len() == 2 {
         let rest = parts[1].trim().trim_matches('"').to_string();
-        if rest.is_empty() { None } else { Some(rest) }
+        if rest.is_empty() {
+            None
+        } else {
+            Some(rest)
+        }
     } else {
         None
     };
@@ -338,7 +350,11 @@ fn apply_input_keyboard_property(key: &str, value: &str, config: &mut Config) {
         }
         "mod-key" | "mod_key" => {
             // Normalize: strip optional surrounding quotes, lowercase, replace + with -
-            let v = value.trim().trim_matches('"').to_lowercase().replace('+', "-");
+            let v = value
+                .trim()
+                .trim_matches('"')
+                .to_lowercase()
+                .replace('+', "-");
             config.input.mod_key = v;
         }
         _ => {}
@@ -543,16 +559,24 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
             config.layout.status_bar = value == "true" || value == "1";
         }
         "reserve_top" | "reserve-top" => {
-            if let Ok(v) = value.parse() { config.layout.reserve_top = v; }
+            if let Ok(v) = value.parse() {
+                config.layout.reserve_top = v;
+            }
         }
         "reserve_bottom" | "reserve-bottom" => {
-            if let Ok(v) = value.parse() { config.layout.reserve_bottom = v; }
+            if let Ok(v) = value.parse() {
+                config.layout.reserve_bottom = v;
+            }
         }
         "reserve_left" | "reserve-left" => {
-            if let Ok(v) = value.parse() { config.layout.reserve_left = v; }
+            if let Ok(v) = value.parse() {
+                config.layout.reserve_left = v;
+            }
         }
         "reserve_right" | "reserve-right" => {
-            if let Ok(v) = value.parse() { config.layout.reserve_right = v; }
+            if let Ok(v) = value.parse() {
+                config.layout.reserve_right = v;
+            }
         }
         _ => {}
     }
@@ -644,50 +668,82 @@ fn apply_output_property(key: &str, value: &str, out: &mut OutputConfig) {
 fn apply_output_layout_property(key: &str, value: &str, lo: &mut LayoutConfigPartial) {
     match key {
         "inner_gaps" | "inner-gaps" | "inner" => {
-            if let Ok(v) = value.parse() { lo.inner_gaps = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.inner_gaps = Some(v);
+            }
         }
         "outer_gaps" | "outer-gaps" | "outer" => {
-            if let Ok(v) = value.parse() { lo.outer_gaps = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.outer_gaps = Some(v);
+            }
         }
         "border_width" | "border-width" => {
-            if let Ok(v) = value.parse() { lo.border_width = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.border_width = Some(v);
+            }
         }
-        "border_color" | "border-color" => { lo.border_color = Some(value.to_string()); }
-        "border_color_focused" | "border-color-focused" => { lo.border_color_focused = Some(value.to_string()); }
+        "border_color" | "border-color" => {
+            lo.border_color = Some(value.to_string());
+        }
+        "border_color_focused" | "border-color-focused" => {
+            lo.border_color_focused = Some(value.to_string());
+        }
         "focus_ring_width" | "focus-ring-width" => {
-            if let Ok(v) = value.parse() { lo.focus_ring_width = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.focus_ring_width = Some(v);
+            }
         }
         "dim_unfocused" | "dim-unfocused" => {
-            if let Ok(v) = value.parse::<f32>() { lo.dim_unfocused = Some(v.clamp(0.1, 1.0)); }
+            if let Ok(v) = value.parse::<f32>() {
+                lo.dim_unfocused = Some(v.clamp(0.1, 1.0));
+            }
         }
-        "focus_ring_color" | "focus-ring-color" => { lo.focus_ring_color = Some(value.to_string()); }
+        "focus_ring_color" | "focus-ring-color" => {
+            lo.focus_ring_color = Some(value.to_string());
+        }
         "shadow_enable" | "shadow-enable" | "shadows-enable" => {
             lo.shadow_enable = Some(value == "true" || value == "1");
         }
         "shadow_opacity" | "shadow-opacity" => {
-            if let Ok(v) = value.parse() { lo.shadow_opacity = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.shadow_opacity = Some(v);
+            }
         }
         "shadow_offset_x" | "shadow-offset-x" => {
-            if let Ok(v) = value.parse() { lo.shadow_offset_x = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.shadow_offset_x = Some(v);
+            }
         }
         "shadow_offset_y" | "shadow-offset-y" => {
-            if let Ok(v) = value.parse() { lo.shadow_offset_y = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.shadow_offset_y = Some(v);
+            }
         }
         "shadow_blur" | "shadow-blur" => {
-            if let Ok(v) = value.parse() { lo.shadow_blur = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.shadow_blur = Some(v);
+            }
         }
-        "shadow_color" | "shadow-color" => { lo.shadow_color = Some(value.to_string()); }
+        "shadow_color" | "shadow-color" => {
+            lo.shadow_color = Some(value.to_string());
+        }
         "scroll_step" | "scroll-step" => {
-            if let Ok(v) = value.parse() { lo.scroll_step = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.scroll_step = Some(v);
+            }
         }
         "column_width" | "column-width" => {
-            if let Ok(v) = value.parse() { lo.column_width = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.column_width = Some(v);
+            }
         }
         "column_width_mode" | "column-width-mode" => {
             lo.column_width_mode = Some(value.to_string());
         }
         "split_ratio" | "split-ratio" => {
-            if let Ok(v) = value.parse() { lo.split_ratio = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.split_ratio = Some(v);
+            }
         }
         "auto_balance" | "auto-balance" => {
             lo.auto_balance = Some(value == "true" || value == "1");
@@ -699,19 +755,27 @@ fn apply_output_layout_property(key: &str, value: &str, lo: &mut LayoutConfigPar
             lo.border_color_urgent = Some(value.to_string());
         }
         "border_radius" | "border-radius" => {
-            if let Ok(v) = value.parse() { lo.border_radius = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.border_radius = Some(v);
+            }
         }
         "border_padding" | "border-padding" => {
-            if let Ok(v) = value.parse() { lo.border_padding = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.border_padding = Some(v);
+            }
         }
         "focus_ring_gap" | "focus-ring-gap" => {
-            if let Ok(v) = value.parse() { lo.focus_ring_gap = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.focus_ring_gap = Some(v);
+            }
         }
         "focus_ring_inactive_color" | "focus-ring-inactive-color" => {
             lo.focus_ring_inactive_color = Some(value.to_string());
         }
         "shadow_spread" | "shadow-spread" => {
-            if let Ok(v) = value.parse() { lo.shadow_spread = Some(v); }
+            if let Ok(v) = value.parse() {
+                lo.shadow_spread = Some(v);
+            }
         }
         // Per-output `smart-borders` override; mirrors the global flat field
         // plus the `border { smart true }` nested-block alias.
@@ -764,7 +828,8 @@ fn apply_window_rule_property(key: &str, value: &str, wr: &mut WindowRule) {
                     let c = v.clamp(0.0, 1.0);
                     tracing::warn!(
                         "window-rule opacity {} is outside [0.0, 1.0]; clamped to {}",
-                        v, c,
+                        v,
+                        c,
                     );
                     c
                 } else {
@@ -820,7 +885,8 @@ fn apply_window_rule_property(key: &str, value: &str, wr: &mut WindowRule) {
             } else {
                 tracing::warn!(
                     "window-rule open-max-bounds {:?} must have two dimensions (got {})",
-                    value, parts.len(),
+                    value,
+                    parts.len(),
                 );
             }
         }
@@ -843,12 +909,18 @@ fn apply_window_rule_matcher_kv(key: &str, value: &str, wr: &mut WindowRule) {
         "class-name" | "class" => wr.matchers.push(Matcher::ClassName(value.to_string())),
         "title" => wr.matchers.push(Matcher::Title(value.to_string())),
         "instance" => wr.matchers.push(Matcher::Instance(value.to_string())),
-        "process-name" | "process_name" => wr.matchers.push(Matcher::ProcessName(value.to_string())),
+        "process-name" | "process_name" => {
+            wr.matchers.push(Matcher::ProcessName(value.to_string()))
+        }
         // ── regex matchers ───────────────────────────────────────────────────
-        "class-name-regex" | "class-regex" => wr.matchers.push(Matcher::ClassNameRegex(value.to_string())),
+        "class-name-regex" | "class-regex" => {
+            wr.matchers.push(Matcher::ClassNameRegex(value.to_string()))
+        }
         "title-regex" => wr.matchers.push(Matcher::TitleRegex(value.to_string())),
         "instance-regex" => wr.matchers.push(Matcher::InstanceRegex(value.to_string())),
-        "process-name-regex" | "process-regex" => wr.matchers.push(Matcher::ProcessNameRegex(value.to_string())),
+        "process-name-regex" | "process-regex" => wr
+            .matchers
+            .push(Matcher::ProcessNameRegex(value.to_string())),
         // ── flag variants with an explicit value (e.g. `is-active true`) ────
         // Bare flags go through `apply_window_rule_matcher_flag`.
         "is-active" | "is_active" => {
@@ -1094,7 +1166,10 @@ pub fn validate_kdl_config(input: &str) -> Vec<ValidationIssue> {
                 continue;
             }
             let trimmed = line.trim();
-            if matches!(trimmed, "is-active" | "is-floating" | "is-urgent" | "at-startup") {
+            if matches!(
+                trimmed,
+                "is-active" | "is-floating" | "is-urgent" | "at-startup"
+            ) {
                 continue;
             }
             issues.push(ValidationIssue {
@@ -1152,19 +1227,32 @@ pub fn validate_kdl_config(input: &str) -> Vec<ValidationIssue> {
         // borders, widths, etc.) and surface a parse error early.
         let is_int_key = matches!(
             key.as_str(),
-            "inner_gaps" | "inner-gaps"
-                | "outer_gaps" | "outer-gaps"
-                | "border_width" | "border-width"
-                | "border_radius" | "border-radius"
-                | "border_padding" | "border-padding"
-                | "focus_ring_width" | "focus-ring-width"
-                | "focus_ring_gap" | "focus-ring-gap"
-                | "shadow_blur" | "shadow-blur"
-                | "shadow_spread" | "shadow-spread"
-                | "column_width" | "column-width"
-                | "scroll_step" | "scroll-step"
-                | "repeat_delay" | "repeat-delay"
-                | "repeat_rate" | "repeat-rate"
+            "inner_gaps"
+                | "inner-gaps"
+                | "outer_gaps"
+                | "outer-gaps"
+                | "border_width"
+                | "border-width"
+                | "border_radius"
+                | "border-radius"
+                | "border_padding"
+                | "border-padding"
+                | "focus_ring_width"
+                | "focus-ring-width"
+                | "focus_ring_gap"
+                | "focus-ring-gap"
+                | "shadow_blur"
+                | "shadow-blur"
+                | "shadow_spread"
+                | "shadow-spread"
+                | "column_width"
+                | "column-width"
+                | "scroll_step"
+                | "scroll-step"
+                | "repeat_delay"
+                | "repeat-delay"
+                | "repeat_rate"
+                | "repeat-rate"
                 | "duration"
         );
         if is_int_key && !value.is_empty() && value.parse::<i64>().is_err() {
@@ -1238,11 +1326,15 @@ fn tokenize_respecting_quotes(s: &str) -> Vec<String> {
 
 fn parse_bind_line(line: &str) -> Option<crate::config::HotkeyBinding> {
     let line = line.trim();
-    if line.is_empty() || line.starts_with("//") { return None; }
+    if line.is_empty() || line.starts_with("//") {
+        return None;
+    }
 
     // Split: first token is key combo, rest is action + args
     let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
 
     let key_combo = parts[0];
     let action_rest = parts[1].trim();
@@ -1252,9 +1344,11 @@ fn parse_bind_line(line: &str) -> Option<crate::config::HotkeyBinding> {
     let (modifiers, key) = if tokens.len() == 1 {
         (Vec::new(), tokens[0].to_string())
     } else {
-        let mods: Vec<String> = tokens[..tokens.len()-1]
-            .iter().map(|t| t.to_string()).collect();
-        let key = tokens[tokens.len()-1].to_string();
+        let mods: Vec<String> = tokens[..tokens.len() - 1]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let key = tokens[tokens.len() - 1].to_string();
         (mods, key)
     };
 
@@ -1266,7 +1360,9 @@ fn parse_bind_line(line: &str) -> Option<crate::config::HotkeyBinding> {
     // `args.first()` lookup downstream — silently turning the binding into a
     // useless `spawn-cmd start`.
     let action_tokens = tokenize_respecting_quotes(action_rest);
-    if action_tokens.is_empty() { return None; }
+    if action_tokens.is_empty() {
+        return None;
+    }
 
     let command = action_tokens[0].clone();
     let args: Vec<String> = action_tokens[1..].to_vec();
@@ -1343,32 +1439,38 @@ mod tests {
     fn test_parse_border_color_focused_accepts_hex_and_accent() {
         // Hex literal — the parser stores the raw string verbatim; the
         // engine's `LayoutConfig::from_config` is what interprets it.
-        let cfg = parse_kdl_config(r##"
+        let cfg = parse_kdl_config(
+            r##"
             layout {
                 border-color-focused "#abcdef"
             }
-        "##)
-            .expect("hex parse");
+        "##,
+        )
+        .expect("hex parse");
         assert_eq!(cfg.layout.border_color_focused, "#abcdef");
 
         // "accent" sentinel — also accepted verbatim; engine flips the
         // mode to WindowsAccent on `from_config`.
-        let cfg = parse_kdl_config(r#"
+        let cfg = parse_kdl_config(
+            r#"
             layout {
                 border-color-focused "accent"
             }
-        "#)
-            .expect("accent parse");
+        "#,
+        )
+        .expect("accent parse");
         assert_eq!(cfg.layout.border_color_focused, "accent");
 
         // "windows-accent" alias — same code path; the engine recognises
         // it as a sentinel too.
-        let cfg = parse_kdl_config(r#"
+        let cfg = parse_kdl_config(
+            r#"
             layout {
                 border-color-focused "windows-accent"
             }
-        "#)
-            .expect("windows-accent parse");
+        "#,
+        )
+        .expect("windows-accent parse");
         assert_eq!(cfg.layout.border_color_focused, "windows-accent");
     }
 
@@ -1440,7 +1542,10 @@ binds {
         let b = &config.binds.hotkeys[0];
         assert_eq!(b.vk_code(), Some(0x25)); // VK_LEFT
         assert_eq!(b.mod_flags(), 0x0002 | 0x0001); // MOD_CTRL | MOD_ALT
-        assert_eq!(b.parse_action(), Some(crate::input::Action::FocusColumnLeft));
+        assert_eq!(
+            b.parse_action(),
+            Some(crate::input::Action::FocusColumnLeft)
+        );
     }
 
     #[test]
@@ -1647,7 +1752,11 @@ output "HDMI-1" {
         assert!(b.is_spawn_cmd());
         assert_eq!(
             b.shell_command_argv(),
-            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "wt.exe".to_string()]),
+            Some(vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                "wt.exe".to_string()
+            ]),
         );
     }
 
@@ -1933,10 +2042,13 @@ layout {
         let input = "telemetry {\n  enabled true\n}\n";
         let issues = validate_kdl_config(input);
         assert!(
-            issues.iter().any(|i| i.severity == ValidationSeverity::Error
-                && i.message.contains("unknown top-level section")
-                && i.line == 1),
-            "expected error on line 1, got: {:?}", issues
+            issues
+                .iter()
+                .any(|i| i.severity == ValidationSeverity::Error
+                    && i.message.contains("unknown top-level section")
+                    && i.line == 1),
+            "expected error on line 1, got: {:?}",
+            issues
         );
     }
 
@@ -1945,9 +2057,12 @@ layout {
         let input = "layout {\n  inner_gaps 8\n";
         let issues = validate_kdl_config(input);
         assert!(
-            issues.iter().any(|i| i.severity == ValidationSeverity::Error
-                && i.message.contains("unclosed section 'layout'")),
-            "expected unclosed-section error, got: {:?}", issues
+            issues
+                .iter()
+                .any(|i| i.severity == ValidationSeverity::Error
+                    && i.message.contains("unclosed section 'layout'")),
+            "expected unclosed-section error, got: {:?}",
+            issues
         );
     }
 
@@ -1965,9 +2080,12 @@ layout {
         let input = "layout {\n  border_color \"red\"\n}\n";
         let issues = validate_kdl_config(input);
         assert!(
-            issues.iter().any(|i| i.severity == ValidationSeverity::Error
-                && i.message.contains("invalid colour 'red'")),
-            "expected colour error, got: {:?}", issues
+            issues
+                .iter()
+                .any(|i| i.severity == ValidationSeverity::Error
+                    && i.message.contains("invalid colour 'red'")),
+            "expected colour error, got: {:?}",
+            issues
         );
     }
 
@@ -1985,9 +2103,12 @@ layout {
         let input = "layout {\n  inner_gaps \"eight\"\n}\n";
         let issues = validate_kdl_config(input);
         assert!(
-            issues.iter().any(|i| i.severity == ValidationSeverity::Error
-                && i.message.contains("'inner_gaps' expects an integer")),
-            "expected integer parse error, got: {:?}", issues
+            issues
+                .iter()
+                .any(|i| i.severity == ValidationSeverity::Error
+                    && i.message.contains("'inner_gaps' expects an integer")),
+            "expected integer parse error, got: {:?}",
+            issues
         );
     }
 
@@ -1996,9 +2117,12 @@ layout {
         let input = "binds {\n  ____\n}\n";
         let issues = validate_kdl_config(input);
         assert!(
-            issues.iter().any(|i| i.severity == ValidationSeverity::Warning
-                && i.message.contains("bind line")),
-            "expected bind warning, got: {:?}", issues
+            issues
+                .iter()
+                .any(|i| i.severity == ValidationSeverity::Warning
+                    && i.message.contains("bind line")),
+            "expected bind warning, got: {:?}",
+            issues
         );
     }
 
@@ -2006,7 +2130,11 @@ layout {
     fn test_validate_window_rule_match_flag_keywords_accepted() {
         let input = "window-rule {\n  match {\n    is-active\n    is-floating\n    is-urgent\n    at-startup\n  }\n}\n";
         let issues = validate_kdl_config(input);
-        assert!(issues.is_empty(), "flag keywords must not produce issues, got: {:?}", issues);
+        assert!(
+            issues.is_empty(),
+            "flag keywords must not produce issues, got: {:?}",
+            issues
+        );
     }
 
     #[test]
@@ -2014,9 +2142,12 @@ layout {
         let input = "input {\n  joystick {\n    enable true\n  }\n}\n";
         let issues = validate_kdl_config(input);
         assert!(
-            issues.iter().any(|i| i.severity == ValidationSeverity::Warning
-                && i.message.contains("unknown nested section 'joystick'")),
-            "expected nested-section warning, got: {:?}", issues
+            issues
+                .iter()
+                .any(|i| i.severity == ValidationSeverity::Warning
+                    && i.message.contains("unknown nested section 'joystick'")),
+            "expected nested-section warning, got: {:?}",
+            issues
         );
     }
 
@@ -2042,7 +2173,10 @@ layout {
         let cfg = parse_kdl_config(input).unwrap();
         let out = &cfg.output[0];
         assert_eq!(out.name, "DP-1");
-        let lo = out.layout_override.as_ref().expect("layout override populated");
+        let lo = out
+            .layout_override
+            .as_ref()
+            .expect("layout override populated");
         assert_eq!(lo.column_width, Some(800));
         assert_eq!(lo.inner_gaps, Some(20));
         assert_eq!(lo.border_color.as_deref(), Some("#abcdef"));
@@ -2097,8 +2231,20 @@ output "HDMI-1" {
 }"##;
         let cfg = parse_kdl_config(input).unwrap();
         assert_eq!(cfg.output.len(), 2);
-        assert_eq!(cfg.output[0].layout_override.as_ref().and_then(|p| p.column_width), Some(800));
-        assert_eq!(cfg.output[1].layout_override.as_ref().and_then(|p| p.column_width), Some(400));
+        assert_eq!(
+            cfg.output[0]
+                .layout_override
+                .as_ref()
+                .and_then(|p| p.column_width),
+            Some(800)
+        );
+        assert_eq!(
+            cfg.output[1]
+                .layout_override
+                .as_ref()
+                .and_then(|p| p.column_width),
+            Some(400)
+        );
     }
 
     /// Validator recognises `output > layout` as a known nested section.
@@ -2106,10 +2252,15 @@ output "HDMI-1" {
     fn test_validate_output_layout_nested_section_is_known() {
         let input = "output \"DP-1\" {\n  layout {\n    column-width 800\n  }\n}\n";
         let issues = validate_kdl_config(input);
-        let unknown_nested = issues.iter().filter(|i|
-            i.message.contains("unknown nested section")
-        ).count();
-        assert_eq!(unknown_nested, 0, "output > layout must be known, got: {:?}", issues);
+        let unknown_nested = issues
+            .iter()
+            .filter(|i| i.message.contains("unknown nested section"))
+            .count();
+        assert_eq!(
+            unknown_nested, 0,
+            "output > layout must be known, got: {:?}",
+            issues
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -103,7 +103,11 @@ mod tests {
         MatcherContext::from_legacy(class, title, None, None)
     }
 
-    fn ctx_with_process<'a>(class: &'a str, title: &'a str, process: &'a str) -> MatcherContext<'a> {
+    fn ctx_with_process<'a>(
+        class: &'a str,
+        title: &'a str,
+        process: &'a str,
+    ) -> MatcherContext<'a> {
         MatcherContext::from_legacy(class, title, None, Some(process))
     }
 
@@ -159,7 +163,9 @@ mod tests {
 
         let rules = vec![rule];
         let resolved = resolve_window_rules(&rules, &ctx("Terminal", ""));
-        let got = resolved.opacity.expect("opacity should be Some after matching rule");
+        let got = resolved
+            .opacity
+            .expect("opacity should be Some after matching rule");
         assert!((got - 0.9).abs() < 0.01);
     }
 
@@ -223,7 +229,9 @@ mod tests {
         let rules = vec![rule1, rule2];
         let resolved = resolve_window_rules(&rules, &ctx("Chrome", ""));
         assert!(resolved.float); // from rule1
-        let got = resolved.opacity.expect("opacity should be Some after matching rule");
+        let got = resolved
+            .opacity
+            .expect("opacity should be Some after matching rule");
         assert!((got - 0.95).abs() < 0.01); // overridden by rule2
     }
 
@@ -243,7 +251,10 @@ mod tests {
         assert!(resolved_yes.float, "ClassName matcher should match");
 
         let resolved_no = resolve_window_rules(&rules, &ctx("Notepad", ""));
-        assert!(!resolved_no.float, "ClassName matcher should not match different class");
+        assert!(
+            !resolved_no.float,
+            "ClassName matcher should not match different class"
+        );
     }
 
     /// Match by `Matcher::ProcessName`.
@@ -260,11 +271,17 @@ mod tests {
         assert!(resolved_yes.float, "ProcessName matcher should match");
 
         let resolved_no = resolve_window_rules(&rules, &ctx_with_process("", "", "explorer.exe"));
-        assert!(!resolved_no.float, "ProcessName matcher should not match different process");
+        assert!(
+            !resolved_no.float,
+            "ProcessName matcher should not match different process"
+        );
 
         // No process_name in context → no match.
         let resolved_none = resolve_window_rules(&rules, &ctx("", ""));
-        assert!(!resolved_none.float, "ProcessName matcher should not match when process_name is None");
+        assert!(
+            !resolved_none.float,
+            "ProcessName matcher should not match when process_name is None"
+        );
     }
 
     /// Match by `Matcher::IsActive` — true and false cases.
@@ -278,20 +295,23 @@ mod tests {
         let rules = vec![rule];
 
         let resolved_active = resolve_window_rules(&rules, &ctx_active("Any", "", true));
-        assert!(resolved_active.float, "IsActive matcher should match when is_active=true");
+        assert!(
+            resolved_active.float,
+            "IsActive matcher should match when is_active=true"
+        );
 
         let resolved_inactive = resolve_window_rules(&rules, &ctx_active("Any", "", false));
-        assert!(!resolved_inactive.float, "IsActive matcher should not match when is_active=false");
+        assert!(
+            !resolved_inactive.float,
+            "IsActive matcher should not match when is_active=false"
+        );
     }
 
     /// Multi-matcher AND semantics: all matchers must pass.
     #[test]
     fn test_matcher_and_semantics() {
         let rule = WindowRule {
-            matchers: vec![
-                Matcher::ClassName("Firefox".to_string()),
-                Matcher::IsActive,
-            ],
+            matchers: vec![Matcher::ClassName("Firefox".to_string()), Matcher::IsActive],
             floating: true,
             ..WindowRule::default()
         };
@@ -308,7 +328,10 @@ mod tests {
             is_urgent: false,
             at_startup: false,
         };
-        assert!(resolve_window_rules(&rules, &ctx_both).float, "AND: both matchers met");
+        assert!(
+            resolve_window_rules(&rules, &ctx_both).float,
+            "AND: both matchers met"
+        );
 
         // Only class matches, not active → no match.
         let ctx_class_only = MatcherContext {
@@ -321,7 +344,10 @@ mod tests {
             is_urgent: false,
             at_startup: false,
         };
-        assert!(!resolve_window_rules(&rules, &ctx_class_only).float, "AND: only class matches → fail");
+        assert!(
+            !resolve_window_rules(&rules, &ctx_class_only).float,
+            "AND: only class matches → fail"
+        );
 
         // Only active, wrong class → no match.
         let ctx_active_only = MatcherContext {
@@ -334,7 +360,10 @@ mod tests {
             is_urgent: false,
             at_startup: false,
         };
-        assert!(!resolve_window_rules(&rules, &ctx_active_only).float, "AND: only active matches → fail");
+        assert!(
+            !resolve_window_rules(&rules, &ctx_active_only).float,
+            "AND: only active matches → fail"
+        );
     }
 
     /// Empty `matchers` vec falls back to flat-field matching.
@@ -350,10 +379,16 @@ mod tests {
         let rules = vec![rule];
 
         let resolved_yes = resolve_window_rules(&rules, &ctx("Emacs", ""));
-        assert!(resolved_yes.float, "Flat fallback: class match should float");
+        assert!(
+            resolved_yes.float,
+            "Flat fallback: class match should float"
+        );
 
         let resolved_no = resolve_window_rules(&rules, &ctx("Vim", ""));
-        assert!(!resolved_no.float, "Flat fallback: class mismatch should not float");
+        assert!(
+            !resolved_no.float,
+            "Flat fallback: class mismatch should not float"
+        );
     }
 
     // ── regex matcher tests ───────────────────────────────────────────────────
@@ -398,7 +433,10 @@ mod tests {
 
         // No process_name in context — unwrap_or("") produces empty string, no match.
         let no_proc = resolve_window_rules(&rules, &ctx("", ""));
-        assert!(!no_proc.float, "ProcessNameRegex should not match when process_name is None");
+        assert!(
+            !no_proc.float,
+            "ProcessNameRegex should not match when process_name is None"
+        );
     }
 
     // ── live-state matcher tests ──────────────────────────────────────────────
@@ -525,7 +563,9 @@ mod tests {
             "Composite: class without floating must NOT match"
         );
         assert!(
-            resolve_window_rules(&rules, &floating_only).opacity.is_none(),
+            resolve_window_rules(&rules, &floating_only)
+                .opacity
+                .is_none(),
             "Composite: floating without class must NOT match"
         );
     }
@@ -577,7 +617,10 @@ mod tests {
         let rules = vec![rule];
         let r = resolve_window_rules(&rules, &ctx("Calculator", ""));
         assert_eq!(r.open_floating, Some(true));
-        assert!(r.float, "open-floating true must also set the legacy .float flag");
+        assert!(
+            r.float,
+            "open-floating true must also set the legacy .float flag"
+        );
     }
 
     /// `open-max-bounds` is preserved on the resolved struct (engine wiring
@@ -612,8 +655,16 @@ mod tests {
         };
         let rules = vec![rule1, rule2];
         let r = resolve_window_rules(&rules, &ctx("App", ""));
-        assert_eq!(r.open_on_output.as_deref(), Some("HDMI-1"), "last-rule-wins");
-        assert_eq!(r.open_in_workspace, Some(2), "unset field on later rule preserves earlier");
+        assert_eq!(
+            r.open_on_output.as_deref(),
+            Some("HDMI-1"),
+            "last-rule-wins"
+        );
+        assert_eq!(
+            r.open_in_workspace,
+            Some(2),
+            "unset field on later rule preserves earlier"
+        );
     }
 
     /// An invalid regex pattern must not panic; the matcher returns `false`.
@@ -628,6 +679,9 @@ mod tests {
 
         // Must return without panicking and must NOT match.
         let result = resolve_window_rules(&rules, &ctx("anything", ""));
-        assert!(!result.float, "invalid regex pattern must return false, not panic");
+        assert!(
+            !result.float,
+            "invalid regex pattern must return false, not panic"
+        );
     }
 }

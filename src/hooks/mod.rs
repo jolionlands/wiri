@@ -7,10 +7,10 @@ use tracing::info;
 
 use crate::backend::BackendHandle;
 
+pub use crate::backend::hooks::clear_backend;
 pub use spawner::{Notification, ScreenshotEvent, Spawner};
 pub use startup::StartupManager;
-pub use tray::{TrayIcon, TrayAction};
-pub use crate::backend::hooks::clear_backend;
+pub use tray::{TrayAction, TrayIcon};
 
 /// Manages system-level integrations: tray icon, autostart, config reload.
 /// Processes tray actions and dispatches them to the engine.
@@ -85,17 +85,15 @@ impl SystemIntegration {
                     match self::capture_screenshot_to_pictures() {
                         Ok(path) => {
                             tracing::info!("Tray: screenshot saved to {}", path);
-                            let _ = self.tray.show_balloon(
-                                "wiri — screenshot",
-                                &format!("Saved to {}", path),
-                            );
+                            let _ = self
+                                .tray
+                                .show_balloon("wiri — screenshot", &format!("Saved to {}", path));
                         }
                         Err(e) => {
                             tracing::warn!("Tray: screenshot failed: {}", e);
-                            let _ = self.tray.show_balloon(
-                                "wiri — screenshot failed",
-                                &e.to_string(),
-                            );
+                            let _ = self
+                                .tray
+                                .show_balloon("wiri — screenshot failed", &e.to_string());
                         }
                     }
                     continue;
@@ -110,10 +108,9 @@ impl SystemIntegration {
                     };
                     if hwnd_isize == 0 {
                         tracing::warn!("Tray: CaptureWindow — no foreground window");
-                        let _ = self.tray.show_balloon(
-                            "wiri — capture failed",
-                            "No focused window to capture.",
-                        );
+                        let _ = self
+                            .tray
+                            .show_balloon("wiri — capture failed", "No focused window to capture.");
                         continue;
                     }
                     match capture_focused_window_to_pictures(hwnd_isize) {
@@ -126,10 +123,9 @@ impl SystemIntegration {
                         }
                         Err(e) => {
                             tracing::warn!("Tray: window capture failed: {}", e);
-                            let _ = self.tray.show_balloon(
-                                "wiri — capture failed",
-                                &e.to_string(),
-                            );
+                            let _ = self
+                                .tray
+                                .show_balloon("wiri — capture failed", &e.to_string());
                         }
                     }
                     continue;
@@ -182,7 +178,9 @@ pub fn capture_screenshot_to_pictures() -> anyhow::Result<String> {
         .ok()
         .map(|home| PathBuf::from(home).join("Pictures"))
         .and_then(|dir| {
-            std::fs::create_dir_all(&dir).ok().map(|_| dir.join(&filename))
+            std::fs::create_dir_all(&dir)
+                .ok()
+                .map(|_| dir.join(&filename))
         })
         .or_else(|| std::env::current_dir().ok().map(|d| d.join(&filename)))
         .ok_or_else(|| {

@@ -1,7 +1,7 @@
+use crate::utils::{Rect, Size, WindowId};
 use std::collections::HashMap;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
-use crate::utils::{Rect, Size, WindowId};
 
 pub mod rules;
 pub use rules::{resolve_window_rules, resolve_window_rules_legacy};
@@ -88,7 +88,9 @@ impl WindowHandle {
         let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
 
         let mut class_name_buf = [0u16; 256];
-        let class_len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class_name_buf) };
+        let class_len = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class_name_buf)
+        };
         let class_name = String::from_utf16_lossy(&class_name_buf[..class_len as usize]);
 
         let mut process_id = 0u32;
@@ -359,7 +361,11 @@ impl WindowSet {
         self.mapped
             .values()
             .map(|m| WindowRef::Mapped(m.clone()))
-            .chain(self.unmapped.values().map(|u| WindowRef::Unmapped(u.clone())))
+            .chain(
+                self.unmapped
+                    .values()
+                    .map(|u| WindowRef::Unmapped(u.clone())),
+            )
     }
 
     pub fn mapped_count(&self) -> usize {
@@ -386,9 +392,20 @@ impl WindowSet {
         self.unmapped.contains_key(&window_id)
     }
 
-    pub fn promote_to_mapped(&mut self, window_id: WindowId, bounds: Rect, state: WindowState) -> Option<Mapped> {
+    pub fn promote_to_mapped(
+        &mut self,
+        window_id: WindowId,
+        bounds: Rect,
+        state: WindowState,
+    ) -> Option<Mapped> {
         let unmapped = self.unmapped.remove(&window_id)?;
-        let mapped = Mapped::new(window_id, unmapped.handle, bounds, state, unmapped.pending_rules);
+        let mapped = Mapped::new(
+            window_id,
+            unmapped.handle,
+            bounds,
+            state,
+            unmapped.pending_rules,
+        );
         self.mapped.insert(window_id, mapped.clone());
         Some(mapped)
     }
@@ -446,6 +463,21 @@ pub fn should_skip_window(hwnd: HWND) -> bool {
         return true;
     }
 
+    if is_dwm_cloaked(hwnd) {
+        return true;
+    }
+
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
+    if owner.map(|owner| !owner.0.is_null()).unwrap_or(false) && ex_style & WS_EX_APPWINDOW.0 == 0 {
+        return true;
+    }
+
+    if let Some(bounds) = get_window_bounds(hwnd) {
+        if bounds.size.w < 80 || bounds.size.h < 60 {
+            return true;
+        }
+    }
+
     let mut class_name_buf = [0u16; 256];
     let class_len = unsafe { GetClassNameW(hwnd, &mut class_name_buf) };
     let class_name = String::from_utf16_lossy(&class_name_buf[..class_len as usize]);
@@ -454,7 +486,6 @@ pub fn should_skip_window(hwnd: HWND) -> bool {
         "Progman",
         "Shell_TrayWnd",
         "Windows.UI.Core.corewindow",
-        "ApplicationFrameWindow",
         "Windows.UI.Input.InputSite.WindowClass",
     ];
 
@@ -465,6 +496,22 @@ pub fn should_skip_window(hwnd: HWND) -> bool {
     }
 
     false
+}
+
+fn is_dwm_cloaked(hwnd: HWND) -> bool {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+
+    let mut cloaked = 0u32;
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+
+    result.is_ok() && cloaked != 0
 }
 
 pub fn filter_visible_windows(windows: &[WindowId]) -> Vec<WindowId> {
@@ -577,13 +624,25 @@ mod tests {
 
         let id1 = WindowId::new(100);
         let handle1 = WindowHandle::new("Win1".to_string(), "Class1".to_string(), 1234);
-        let mapped1 = Mapped::new(id1, handle1, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped1 = Mapped::new(
+            id1,
+            handle1,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped1);
         assert_eq!(set.mapped_count(), 1);
 
         let id2 = WindowId::new(101);
         let handle2 = WindowHandle::new("Win2".to_string(), "Class2".to_string(), 1235);
-        let mapped2 = Mapped::new(id2, handle2, Rect::new(0, 0, 400, 300), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped2 = Mapped::new(
+            id2,
+            handle2,
+            Rect::new(0, 0, 400, 300),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped2);
         assert_eq!(set.mapped_count(), 2);
     }
@@ -593,7 +652,13 @@ mod tests {
         let mut set = WindowSet::new();
         let id = WindowId::new(100);
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
-        let mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped);
 
         assert!(set.get(id).is_some());
@@ -609,7 +674,13 @@ mod tests {
         assert!(!set.contains(id));
 
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
-        let mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped);
         assert!(set.contains(id));
     }
@@ -619,7 +690,13 @@ mod tests {
         let id = WindowId::new(100);
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
 
-        let mut mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mut mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         assert!(mapped.is_normal());
         assert!(!mapped.is_floating());
         assert!(!mapped.is_minimized());
@@ -633,7 +710,13 @@ mod tests {
     fn test_mapped_bounds_update() {
         let id = WindowId::new(100);
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
-        let mut mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mut mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         assert_eq!(mapped.bounds.size.w, 800);
 
         mapped.set_bounds(Rect::new(100, 100, 1024, 768));
@@ -650,5 +733,4 @@ mod tests {
         assert!(rules.follow_cursor);
         assert!(rules.border);
     }
-
 }

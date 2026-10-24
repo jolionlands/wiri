@@ -1,22 +1,20 @@
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::{mpsc, Arc};
-use parking_lot::Mutex;
 use tracing::{info, warn};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, AppendMenuW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GetCursorPos, GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenu, TranslateMessage, CreateWindowExW,
-    CS_HREDRAW, CS_VREDRAW, MF_SEPARATOR, MF_STRING,
-    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RIGHTBUTTON,
-    WM_COMMAND, WM_DESTROY, WM_USER, WNDCLASSW,
-    WINDOW_EX_STYLE, WINDOW_STYLE,
+    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MF_SEPARATOR, MF_STRING,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+    WM_DESTROY, WM_USER, WNDCLASSW,
 };
 // NIF_INFO, NIIF_INFO, NIM_MODIFY etc. come from the Shell glob below
-use windows::Win32::UI::Shell::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::core::PCWSTR;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::*;
 
 const WM_TRAYICON: u32 = WM_USER + 100;
 const ID_TRAY_SHOW_HIDE: usize = 1001;
@@ -87,7 +85,10 @@ impl TrayIcon {
         Ok(())
     }
 
-    fn run_tray_loop(action_tx: mpsc::Sender<TrayAction>, hwnd_raw: Arc<Mutex<Option<isize>>>) -> Result<()> {
+    fn run_tray_loop(
+        action_tx: mpsc::Sender<TrayAction>,
+        hwnd_raw: Arc<Mutex<Option<isize>>>,
+    ) -> Result<()> {
         unsafe {
             let hinstance = GetModuleHandleW(None).context("GetModuleHandleW failed")?;
 
@@ -114,8 +115,14 @@ impl TrayIcon {
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(window_name.as_ptr()),
                 WINDOW_STYLE(0),
-                0, 0, 0, 0,
-                None, None, hinstance, None,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                hinstance,
+                None,
             );
             let hwnd = match hwnd {
                 Ok(w) => w,
@@ -211,14 +218,30 @@ impl TrayIcon {
                 if !tx_ptr.is_null() {
                     let tx = &*tx_ptr;
                     match cmd_id {
-                        ID_TRAY_SHOW_HIDE => { let _ = tx.send(TrayAction::ShowHide); }
-                        ID_TRAY_RELOAD_CONFIG => { let _ = tx.send(TrayAction::ReloadConfig); }
-                        ID_TRAY_OPEN_CONFIG_DIR => { let _ = tx.send(TrayAction::OpenConfigDir); }
-                        ID_TRAY_ABOUT => { let _ = tx.send(TrayAction::About); }
-                        ID_TRAY_FOCUS_PREV => { let _ = tx.send(TrayAction::FocusPrevious); }
-                        ID_TRAY_SCREENSHOT => { let _ = tx.send(TrayAction::Screenshot); }
-                        ID_TRAY_CAPTURE_WINDOW => { let _ = tx.send(TrayAction::CaptureWindow); }
-                        ID_TRAY_QUIT => { let _ = tx.send(TrayAction::Quit); }
+                        ID_TRAY_SHOW_HIDE => {
+                            let _ = tx.send(TrayAction::ShowHide);
+                        }
+                        ID_TRAY_RELOAD_CONFIG => {
+                            let _ = tx.send(TrayAction::ReloadConfig);
+                        }
+                        ID_TRAY_OPEN_CONFIG_DIR => {
+                            let _ = tx.send(TrayAction::OpenConfigDir);
+                        }
+                        ID_TRAY_ABOUT => {
+                            let _ = tx.send(TrayAction::About);
+                        }
+                        ID_TRAY_FOCUS_PREV => {
+                            let _ = tx.send(TrayAction::FocusPrevious);
+                        }
+                        ID_TRAY_SCREENSHOT => {
+                            let _ = tx.send(TrayAction::Screenshot);
+                        }
+                        ID_TRAY_CAPTURE_WINDOW => {
+                            let _ = tx.send(TrayAction::CaptureWindow);
+                        }
+                        ID_TRAY_QUIT => {
+                            let _ = tx.send(TrayAction::Quit);
+                        }
                         _ => {}
                     }
                 }
@@ -256,16 +279,33 @@ impl TrayIcon {
             let focus_prev: Vec<u16> = "Focus Last Tile\0".encode_utf16().collect();
             let show_hide_text: Vec<u16> = "Show/Hide\0".encode_utf16().collect();
             let screenshot_text: Vec<u16> = "Take screenshot\0".encode_utf16().collect();
-            let capture_window_text: Vec<u16> =
-                "Capture focused window\0".encode_utf16().collect();
+            let capture_window_text: Vec<u16> = "Capture focused window\0".encode_utf16().collect();
             let reload_text: Vec<u16> = "Reload Config\0".encode_utf16().collect();
             let open_dir_text: Vec<u16> = "Open Config Folder…\0".encode_utf16().collect();
             let about_text: Vec<u16> = "About wiri…\0".encode_utf16().collect();
             let quit_text: Vec<u16> = "Quit\0".encode_utf16().collect();
 
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_FOCUS_PREV, PCWSTR(focus_prev.as_ptr())).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_SHOW_HIDE, PCWSTR(show_hide_text.as_ptr())).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_SCREENSHOT, PCWSTR(screenshot_text.as_ptr())).ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_FOCUS_PREV,
+                PCWSTR(focus_prev.as_ptr()),
+            )
+            .ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_SHOW_HIDE,
+                PCWSTR(show_hide_text.as_ptr()),
+            )
+            .ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_SCREENSHOT,
+                PCWSTR(screenshot_text.as_ptr()),
+            )
+            .ok();
             AppendMenuW(
                 hmenu,
                 MF_STRING,
@@ -274,8 +314,20 @@ impl TrayIcon {
             )
             .ok();
             AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_RELOAD_CONFIG, PCWSTR(reload_text.as_ptr())).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_OPEN_CONFIG_DIR, PCWSTR(open_dir_text.as_ptr())).ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_RELOAD_CONFIG,
+                PCWSTR(reload_text.as_ptr()),
+            )
+            .ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_OPEN_CONFIG_DIR,
+                PCWSTR(open_dir_text.as_ptr()),
+            )
+            .ok();
             AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_ABOUT, PCWSTR(about_text.as_ptr())).ok();
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_QUIT, PCWSTR(quit_text.as_ptr())).ok();
@@ -310,7 +362,8 @@ impl TrayIcon {
         // Best-effort: create the folder if missing.
         let _ = std::fs::create_dir_all(&dir);
 
-        let dir_w: Vec<u16> = dir.as_os_str()
+        let dir_w: Vec<u16> = dir
+            .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
@@ -382,7 +435,10 @@ impl TrayIcon {
         Ok(())
     }
 
-    pub fn set_icon(&mut self, _icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Result<()> {
+    pub fn set_icon(
+        &mut self,
+        _icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+    ) -> Result<()> {
         Ok(())
     }
 

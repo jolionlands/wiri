@@ -208,10 +208,9 @@ mod win {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, RegisterClassExW,
-        SetLayeredWindowAttributes, ShowWindow, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA,
-        SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSEXW,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_POPUP,
+        SetLayeredWindowAttributes, ShowWindow, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, SM_CXSCREEN,
+        SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
     /// Win32-backed thumbnail overview.
@@ -233,27 +232,26 @@ mod win {
         /// Construct a new sink.  No Win32 resources are touched until
         /// the first `enter` call.
         pub fn new() -> Arc<Self> {
-            Arc::new(Self { state: Arc::new(Mutex::new(DwmState::default())) })
+            Arc::new(Self {
+                state: Arc::new(Mutex::new(DwmState::default())),
+            })
         }
 
         fn ensure_host_class() {
             static REGISTERED: OnceLock<()> = OnceLock::new();
-            REGISTERED.get_or_init(|| {
-                unsafe {
-                    let class_name = wide("WiriThumbnailOverviewHost");
-                    let hinstance =
-                        windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                            .expect("GetModuleHandleW failed");
-                    let wc = WNDCLASSEXW {
-                        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                        style: CS_HREDRAW | CS_VREDRAW,
-                        lpfnWndProc: Some(host_wnd_proc),
-                        hInstance: hinstance.into(),
-                        lpszClassName: PCWSTR(class_name.as_ptr()),
-                        ..Default::default()
-                    };
-                    let _ = RegisterClassExW(&wc);
-                }
+            REGISTERED.get_or_init(|| unsafe {
+                let class_name = wide("WiriThumbnailOverviewHost");
+                let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                    .expect("GetModuleHandleW failed");
+                let wc = WNDCLASSEXW {
+                    cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(host_wnd_proc),
+                    hInstance: hinstance.into(),
+                    lpszClassName: PCWSTR(class_name.as_ptr()),
+                    ..Default::default()
+                };
+                let _ = RegisterClassExW(&wc);
             });
         }
     }
@@ -266,15 +264,16 @@ mod win {
                 // Already entered — clear residual thumbnails so a
                 // re-entry starts fresh.
                 for (_wid, hthumb) in s.thumbnails.drain() {
-                    unsafe { let _ = DwmUnregisterThumbnail(hthumb); }
+                    unsafe {
+                        let _ = DwmUnregisterThumbnail(hthumb);
+                    }
                 }
                 return;
             }
             unsafe {
                 let class_name = wide("WiriThumbnailOverviewHost");
-                let hinstance =
-                    windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                        .expect("GetModuleHandleW failed");
+                let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                    .expect("GetModuleHandleW failed");
                 let screen_w = GetSystemMetrics(SM_CXSCREEN);
                 let screen_h = GetSystemMetrics(SM_CYSCREEN);
                 // Topmost layered transparent host.  WS_EX_TRANSPARENT
@@ -290,8 +289,14 @@ mod win {
                     PCWSTR(class_name.as_ptr()),
                     PCWSTR(wide("").as_ptr()),
                     WS_POPUP,
-                    0, 0, screen_w, screen_h,
-                    None, None, hinstance, None,
+                    0,
+                    0,
+                    screen_w,
+                    screen_h,
+                    None,
+                    None,
+                    hinstance,
+                    None,
                 ) {
                     Ok(h) => h,
                     Err(_) => {
@@ -363,7 +368,9 @@ mod win {
         fn exit(&self) {
             let mut s = self.state.lock();
             for (_wid, hthumb) in s.thumbnails.drain() {
-                unsafe { let _ = DwmUnregisterThumbnail(hthumb); }
+                unsafe {
+                    let _ = DwmUnregisterThumbnail(hthumb);
+                }
             }
             if let Some(raw) = s.host.take() {
                 unsafe {

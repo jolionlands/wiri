@@ -3,8 +3,8 @@
 //! Uses tick-based interpolation with configurable duration and easing.
 //! Animations are driven by the main event loop's periodic tick.
 
-use std::collections::HashMap;
 use crate::utils::WindowId;
+use std::collections::HashMap;
 
 /// Easing function type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,9 @@ pub enum Easing {
 }
 
 impl Default for Easing {
-    fn default() -> Self { Self::CubicOut }
+    fn default() -> Self {
+        Self::CubicOut
+    }
 }
 
 /// A single animation that interpolates a value from start to end
@@ -180,20 +182,28 @@ impl AnimationManager {
             self.animations.insert(target, Animation::instant(end));
             return;
         }
-        self.animations.insert(target, Animation::new(
-            start, end, self.default_duration_ms, self.default_easing,
-        ));
+        self.animations.insert(
+            target,
+            Animation::new(start, end, self.default_duration_ms, self.default_easing),
+        );
     }
 
     /// Start a new animation with custom duration
-    pub fn animate_with_duration(&mut self, target: AnimationTarget, start: f64, end: f64, duration_ms: u32) {
+    pub fn animate_with_duration(
+        &mut self,
+        target: AnimationTarget,
+        start: f64,
+        end: f64,
+        duration_ms: u32,
+    ) {
         if !self.enabled || start == end {
             self.animations.insert(target, Animation::instant(end));
             return;
         }
-        self.animations.insert(target, Animation::new(
-            start, end, duration_ms, self.default_easing,
-        ));
+        self.animations.insert(
+            target,
+            Animation::new(start, end, duration_ms, self.default_easing),
+        );
     }
 
     /// Advance all animations by delta_ms and return values that changed
@@ -260,12 +270,18 @@ impl AnimationManager {
     ) {
         let target = AnimationTarget::WorkspaceX(output);
         if !self.enabled || from_offset_px == to_offset_px {
-            self.animations.insert(target, Animation::instant(to_offset_px));
+            self.animations
+                .insert(target, Animation::instant(to_offset_px));
             return;
         }
-        let dur = if duration_ms == 0 { self.default_duration_ms } else { duration_ms };
+        let dur = if duration_ms == 0 {
+            self.default_duration_ms
+        } else {
+            duration_ms
+        };
         if dur == 0 {
-            self.animations.insert(target, Animation::instant(to_offset_px));
+            self.animations
+                .insert(target, Animation::instant(to_offset_px));
             return;
         }
         self.animations.insert(
@@ -473,7 +489,10 @@ mod tests {
         let oid = OutputId::from_name("ws-slide-1");
         // Slide in from +1920 px (incoming workspace pushed off to the right).
         mgr.start_workspace_slide(oid, 1920.0, 0.0, 200);
-        assert!(mgr.has_active(), "slide animation must be active immediately");
+        assert!(
+            mgr.has_active(),
+            "slide animation must be active immediately"
+        );
         assert!(
             (mgr.workspace_slide_offset(oid) - 1920.0).abs() < f64::EPSILON,
             "offset at t=0 should be the starting offset"
@@ -538,6 +557,9 @@ mod tests {
         // Both override and default = 0 → instant.
         mgr.start_workspace_slide(oid, 1000.0, 0.0, 0);
         let _ = mgr.tick(0);
-        assert!(!mgr.has_active(), "zero-duration slide must complete instantly");
+        assert!(
+            !mgr.has_active(),
+            "zero-duration slide must complete instantly"
+        );
     }
 }

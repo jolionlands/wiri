@@ -1,13 +1,13 @@
 use crate::config::error::{ConfigError, Result};
-use crate::config::types::Config;
 use crate::config::parse;
+use crate::config::types::Config;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 /// Maximum nesting depth for `include "…"` directives.  Prevents pathological
@@ -65,9 +65,7 @@ impl ConfigLoader {
         let mut last = self.last_reload.lock().unwrap();
 
         if now.duration_since(*last) < self.debounce_duration {
-            return Err(ConfigError::ReloadError(
-                "Reload debounced".to_string(),
-            ));
+            return Err(ConfigError::ReloadError("Reload debounced".to_string()));
         }
 
         *last = now;
@@ -93,9 +91,9 @@ impl ConfigLoader {
             move |res: std::result::Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     match event.kind {
-                        notify::EventKind::Create(_) |
-                        notify::EventKind::Modify(_) |
-                        notify::EventKind::Remove(_) => {
+                        notify::EventKind::Create(_)
+                        | notify::EventKind::Modify(_)
+                        | notify::EventKind::Remove(_) => {
                             let now = Instant::now();
                             let mut last = last_reload.lock().unwrap();
                             if now.duration_since(*last) < debounce {
@@ -105,8 +103,12 @@ impl ConfigLoader {
                             drop(last);
 
                             match load_sync_inner(&path) {
-                                Ok(config) => { let _ = tx.send(Ok(config)); }
-                                Err(e)     => { let _ = tx.send(Err(e)); }
+                                Ok(config) => {
+                                    let _ = tx.send(Ok(config));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e));
+                                }
                             }
                         }
                         _ => {}
@@ -119,14 +121,12 @@ impl ConfigLoader {
         match watcher_result {
             Ok(mut watcher) => {
                 if let Some(parent) = self.path.parent() {
-                    watcher.watch(parent, RecursiveMode::NonRecursive)
+                    watcher
+                        .watch(parent, RecursiveMode::NonRecursive)
                         .map_err(|e| ConfigError::WatchError(e.to_string()))?;
                 }
 
-                let _ = watcher.watch(
-                    self.path.as_path(),
-                    RecursiveMode::NonRecursive,
-                );
+                let _ = watcher.watch(self.path.as_path(), RecursiveMode::NonRecursive);
 
                 *self.watcher.lock().unwrap() = Some(watcher);
                 self.spawn_reload_handler(rx);
@@ -176,8 +176,7 @@ impl ConfigLoader {
 // can delegate without duplicating logic (bug fix #4).
 fn load_sync_inner(path: &Path) -> Result<Config> {
     if path.exists() {
-        let content = std::fs::read_to_string(path)
-            .map_err(ConfigError::IoError)?;
+        let content = std::fs::read_to_string(path).map_err(ConfigError::IoError)?;
         let base = path
             .parent()
             .map(Path::to_path_buf)
@@ -269,8 +268,7 @@ fn preprocess_includes(
                 // Canonicalise for cycle detection.  Fall back to the
                 // un-canonicalised path on failure (e.g. permission denied)
                 // so we still detect literal self-includes.
-                let canon = std::fs::canonicalize(&resolved)
-                    .unwrap_or_else(|_| resolved.clone());
+                let canon = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
 
                 if visited.contains(&canon) {
                     return Err(ConfigError::KdlParse(format!(
@@ -279,16 +277,14 @@ fn preprocess_includes(
                     )));
                 }
 
-                let body = std::fs::read_to_string(&resolved)
-                    .map_err(ConfigError::IoError)?;
+                let body = std::fs::read_to_string(&resolved).map_err(ConfigError::IoError)?;
 
                 visited.insert(canon.clone());
                 let nested_base = resolved
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| base_dir.to_path_buf());
-                let expanded =
-                    preprocess_includes(&body, &nested_base, depth + 1, visited)?;
+                let expanded = preprocess_includes(&body, &nested_base, depth + 1, visited)?;
                 visited.remove(&canon);
 
                 output.push_str(&expanded);
@@ -407,7 +403,10 @@ pub fn default_config_path() -> Option<PathBuf> {
 
     // 3. %USERPROFILE%\.config\wiri\config.kdl  (XDG-style fallback)
     if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(home).join(".config").join("wiri").join("config.kdl");
+        let pb = PathBuf::from(home)
+            .join(".config")
+            .join("wiri")
+            .join("config.kdl");
         if pb.exists() {
             return Some(pb);
         }
@@ -421,7 +420,9 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// tray menu's "Open config folder" entry uses it to create the directory on
 /// demand before opening it in Explorer.
 pub fn default_config_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|a| PathBuf::from(a).join("wiri"))
+    std::env::var("APPDATA")
+        .ok()
+        .map(|a| PathBuf::from(a).join("wiri"))
 }
 
 #[cfg(test)]
@@ -433,7 +434,8 @@ mod include_tests {
     fn write_temp(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let p = dir.join(name);
         let mut f = std::fs::File::create(&p).expect("create temp include file");
-        f.write_all(contents.as_bytes()).expect("write include body");
+        f.write_all(contents.as_bytes())
+            .expect("write include body");
         p
     }
 
@@ -465,7 +467,10 @@ mod include_tests {
 
         let main = "input {\n  repeat-delay 333\n}\n\ninclude \"binds.kdl\"\n";
         let cfg = Config::load_from_str_with_base(main, &dir).expect("parse with include");
-        assert_eq!(cfg.input.repeat_delay, 333, "host file's input block must survive");
+        assert_eq!(
+            cfg.input.repeat_delay, 333,
+            "host file's input block must survive"
+        );
         assert_eq!(cfg.binds.hotkeys.len(), 1, "included binds must be parsed");
         assert_eq!(cfg.binds.hotkeys[0].command, "spawn");
         assert_eq!(cfg.binds.hotkeys[0].args, vec!["notepad.exe".to_string()]);
@@ -475,8 +480,8 @@ mod include_tests {
     fn test_include_missing_file_is_an_error() {
         let dir = fresh_temp_dir("missing");
         let main = "include \"does_not_exist.kdl\"\n";
-        let err = Config::load_from_str_with_base(main, &dir)
-            .expect_err("missing include must error");
+        let err =
+            Config::load_from_str_with_base(main, &dir).expect_err("missing include must error");
         let msg = format!("{}", err);
         assert!(
             msg.contains("file not found") || msg.contains("not found"),
@@ -493,9 +498,12 @@ mod include_tests {
         let _b_path = write_temp(&dir, "b.kdl", "include \"a.kdl\"\n");
 
         // Load via path so the visited set seeds correctly.
-        let host = format!("include \"{}\"\n", a_path.file_name().unwrap().to_string_lossy());
-        let err = Config::load_from_str_with_base(&host, &dir)
-            .expect_err("cyclic include must error");
+        let host = format!(
+            "include \"{}\"\n",
+            a_path.file_name().unwrap().to_string_lossy()
+        );
+        let err =
+            Config::load_from_str_with_base(&host, &dir).expect_err("cyclic include must error");
         let msg = format!("{}", err);
         assert!(
             msg.contains("cyclic include"),
@@ -550,8 +558,14 @@ mod include_tests {
 
     #[test]
     fn test_parse_include_path_quoted() {
-        assert_eq!(parse_include_path("include \"foo.kdl\""), Some("foo.kdl".to_string()));
-        assert_eq!(parse_include_path("include=\"bar.kdl\""), Some("bar.kdl".to_string()));
+        assert_eq!(
+            parse_include_path("include \"foo.kdl\""),
+            Some("foo.kdl".to_string())
+        );
+        assert_eq!(
+            parse_include_path("include=\"bar.kdl\""),
+            Some("bar.kdl".to_string())
+        );
         assert_eq!(parse_include_path("includes \"x\""), None);
         assert_eq!(parse_include_path("include without_quotes"), None);
     }

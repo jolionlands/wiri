@@ -5,7 +5,7 @@ use tracing::warn;
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_WRITE, KEY_READ, REG_SZ,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
 
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -74,7 +74,10 @@ impl StartupManager {
             );
 
             if let Err(e) = RegCloseKey(hkey).ok() {
-                warn!("StartupManager::get_registered_path: RegCloseKey failed: {:?}", e);
+                warn!(
+                    "StartupManager::get_registered_path: RegCloseKey failed: {:?}",
+                    e
+                );
             }
 
             if result.is_ok() {
@@ -106,7 +109,10 @@ impl StartupManager {
                 &mut hkey,
             );
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to open Run registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to open Run registry key: {:?}",
+                    result
+                ));
             }
 
             let value_name: Vec<u16> = OsStr::new(&self.app_name)
@@ -129,12 +135,18 @@ impl StartupManager {
             );
             if result.is_err() {
                 let _ = RegCloseKey(hkey).ok();
-                return Err(anyhow::anyhow!("Failed to set registry value: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to set registry value: {:?}",
+                    result
+                ));
             }
 
             let result = RegCloseKey(hkey);
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to close registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to close registry key: {:?}",
+                    result
+                ));
             }
         }
 
@@ -157,7 +169,10 @@ impl StartupManager {
                 &mut hkey,
             );
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to open Run registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to open Run registry key: {:?}",
+                    result
+                ));
             }
 
             let value_name: Vec<u16> = OsStr::new(&self.app_name)
@@ -168,12 +183,18 @@ impl StartupManager {
             let result = RegDeleteValueW(hkey, PCWSTR::from_raw(value_name.as_ptr()));
             if result.is_err() {
                 let _ = RegCloseKey(hkey).ok();
-                return Err(anyhow::anyhow!("Failed to delete registry value: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to delete registry value: {:?}",
+                    result
+                ));
             }
 
             let result = RegCloseKey(hkey);
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to close registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to close registry key: {:?}",
+                    result
+                ));
             }
         }
 

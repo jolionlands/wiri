@@ -4,23 +4,22 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{BOOL, CloseHandle, HWND};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
-    HGDIOBJ, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
 };
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetProcessId, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    DETACHED_PROCESS, STARTUPINFOW, PROCESS_INFORMATION,
+    CreateProcessW, GetProcessId, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowRect,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, GetWindowRect, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
 };
-use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::Foundation::RECT;
 
 #[derive(Debug, Clone)]
 pub struct Notification {
@@ -284,7 +283,10 @@ impl Spawner {
         use windows::Win32::UI::WindowsAndMessaging::IsWindow;
         let hwnd_t = windows::Win32::Foundation::HWND(hwnd as *mut std::ffi::c_void);
         if !unsafe { IsWindow(hwnd_t).as_bool() } {
-            anyhow::bail!("Spawner::capture_window_to_file: HWND {} is not a valid window", hwnd);
+            anyhow::bail!(
+                "Spawner::capture_window_to_file: HWND {} is not a valid window",
+                hwnd
+            );
         }
         let (w, h) = unsafe { capture_window_to_bmp(hwnd_t, path)? };
         let _ = (w, h); // dimensions captured; caller uses path
@@ -304,13 +306,22 @@ impl Spawner {
 /// Returns `(width, height)` of the captured bitmap on success.  All GDI
 /// handles are released on every exit path.
 unsafe fn capture_window_to_bmp(hwnd: HWND, path: &Path) -> Result<(u32, u32)> {
-    let mut wnd_rect: RECT = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut wnd_rect: RECT = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     GetWindowRect(hwnd, &mut wnd_rect)
         .map_err(|e| anyhow::anyhow!("GetWindowRect failed: {:?}", e))?;
     let width = wnd_rect.right - wnd_rect.left;
     let height = wnd_rect.bottom - wnd_rect.top;
     if width <= 0 || height <= 0 {
-        anyhow::bail!("capture_window_to_bmp: window has zero or negative size ({}x{})", width, height);
+        anyhow::bail!(
+            "capture_window_to_bmp: window has zero or negative size ({}x{})",
+            width,
+            height
+        );
     }
 
     let wnd_dc = GetDC(hwnd);
@@ -364,8 +375,13 @@ unsafe fn capture_window_to_bmp(hwnd: HWND, path: &Path) -> Result<(u32, u32)> {
     let pixel_data_size = (width as u32 * 4 * height as u32) as usize;
     let mut pixels: Vec<u8> = vec![0u8; pixel_data_size];
     let scan_lines = GetDIBits(
-        mem_dc, bitmap, 0, height as u32,
-        Some(pixels.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS,
+        mem_dc,
+        bitmap,
+        0,
+        height as u32,
+        Some(pixels.as_mut_ptr() as *mut _),
+        &mut bmi,
+        DIB_RGB_COLORS,
     );
 
     let _ = SelectObject(mem_dc, old_obj);
@@ -426,7 +442,12 @@ pub fn capture_window_to_file(hwnd: isize, path: &Path) -> Result<()> {
         }
 
         // --- Window rect (in screen coords) ---
-        let mut wnd_rect: RECT = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut wnd_rect: RECT = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
         GetWindowRect(hwnd_t, &mut wnd_rect)
             .map_err(|e| anyhow::anyhow!("GetWindowRect failed: {:?}", e))?;
         let width = (wnd_rect.right - wnd_rect.left).max(0);
@@ -434,7 +455,9 @@ pub fn capture_window_to_file(hwnd: isize, path: &Path) -> Result<()> {
         if width == 0 || height == 0 {
             anyhow::bail!(
                 "capture_window_to_file: window {} has zero size ({}x{})",
-                hwnd, width, height
+                hwnd,
+                width,
+                height
             );
         }
 
@@ -483,10 +506,10 @@ pub fn capture_window_to_file(hwnd: isize, path: &Path) -> Result<()> {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: width,
-                biHeight: height,    // positive = bottom-up
+                biHeight: height, // positive = bottom-up
                 biPlanes: 1,
                 biBitCount: 32,
-                biCompression: 0,    // BI_RGB
+                biCompression: 0, // BI_RGB
                 biSizeImage: 0,
                 biXPelsPerMeter: 0,
                 biYPelsPerMeter: 0,
@@ -568,7 +591,11 @@ pub fn default_window_capture_path(hwnd: isize) -> Result<std::path::PathBuf> {
     let dest = std::env::var("USERPROFILE")
         .ok()
         .map(|home| PathBuf::from(home).join("Pictures"))
-        .and_then(|dir| std::fs::create_dir_all(&dir).ok().map(|_| dir.join(&filename)))
+        .and_then(|dir| {
+            std::fs::create_dir_all(&dir)
+                .ok()
+                .map(|_| dir.join(&filename))
+        })
         .or_else(|| std::env::current_dir().ok().map(|d| d.join(&filename)))
         .ok_or_else(|| {
             anyhow::anyhow!("no writable destination dir (Pictures and cwd both unavailable)")
@@ -641,7 +668,7 @@ fn capture_desktop_to_bmp(path: &Path) -> Result<()> {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: vw,
-                biHeight: vh,   // positive = bottom-up
+                biHeight: vh, // positive = bottom-up
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: 0, // BI_RGB
@@ -690,24 +717,24 @@ fn capture_desktop_to_bmp(path: &Path) -> Result<()> {
         let mut bmp: Vec<u8> = Vec::with_capacity(file_size as usize);
 
         // BITMAPFILEHEADER
-        bmp.extend_from_slice(b"BM");                         // bfType
-        bmp.extend_from_slice(&file_size.to_le_bytes());      // bfSize
-        bmp.extend_from_slice(&0u16.to_le_bytes());           // bfReserved1
-        bmp.extend_from_slice(&0u16.to_le_bytes());           // bfReserved2
-        bmp.extend_from_slice(&pixel_offset.to_le_bytes());   // bfOffBits
+        bmp.extend_from_slice(b"BM"); // bfType
+        bmp.extend_from_slice(&file_size.to_le_bytes()); // bfSize
+        bmp.extend_from_slice(&0u16.to_le_bytes()); // bfReserved1
+        bmp.extend_from_slice(&0u16.to_le_bytes()); // bfReserved2
+        bmp.extend_from_slice(&pixel_offset.to_le_bytes()); // bfOffBits
 
         // BITMAPINFOHEADER (40 bytes, BI_RGB)
-        bmp.extend_from_slice(&info_header_size.to_le_bytes());  // biSize
-        bmp.extend_from_slice(&(width as i32).to_le_bytes());    // biWidth
-        bmp.extend_from_slice(&(height as i32).to_le_bytes());   // biHeight (positive = bottom-up)
-        bmp.extend_from_slice(&1u16.to_le_bytes());              // biPlanes
-        bmp.extend_from_slice(&32u16.to_le_bytes());             // biBitCount
-        bmp.extend_from_slice(&0u32.to_le_bytes());              // biCompression (BI_RGB)
+        bmp.extend_from_slice(&info_header_size.to_le_bytes()); // biSize
+        bmp.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
+        bmp.extend_from_slice(&(height as i32).to_le_bytes()); // biHeight (positive = bottom-up)
+        bmp.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        bmp.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biCompression (BI_RGB)
         bmp.extend_from_slice(&(pixel_data_size as u32).to_le_bytes()); // biSizeImage
-        bmp.extend_from_slice(&0i32.to_le_bytes());              // biXPelsPerMeter
-        bmp.extend_from_slice(&0i32.to_le_bytes());              // biYPelsPerMeter
-        bmp.extend_from_slice(&0u32.to_le_bytes());              // biClrUsed
-        bmp.extend_from_slice(&0u32.to_le_bytes());              // biClrImportant
+        bmp.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        bmp.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
 
         // Pixel data
         bmp.extend_from_slice(&pixels);
@@ -737,13 +764,21 @@ mod tests {
                 let bytes = std::fs::read(&tmp_path)
                     .expect("BMP file should be readable after window capture");
                 assert!(bytes.len() >= 2, "BMP file must be at least 2 bytes");
-                assert_eq!(&bytes[0..2], b"BM", "BMP file must start with 'BM' signature");
+                assert_eq!(
+                    &bytes[0..2],
+                    b"BM",
+                    "BMP file must start with 'BM' signature"
+                );
                 let _ = std::fs::remove_file(&tmp_path);
             }
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("GetDC") || msg.contains("zero size") || msg.contains("PrintWindow") {
-                    eprintln!("Skipping window-capture test — no display / PrintWindow refused: {}", msg);
+                if msg.contains("GetDC") || msg.contains("zero size") || msg.contains("PrintWindow")
+                {
+                    eprintln!(
+                        "Skipping window-capture test — no display / PrintWindow refused: {}",
+                        msg
+                    );
                 } else {
                     panic!("capture_window_to_file failed unexpectedly: {}", e);
                 }
@@ -757,7 +792,11 @@ mod tests {
         // 0 is an explicitly-invalid HWND; the helper must reject without
         // panicking and without leaving a partial file behind.
         let result = capture_window_to_file(0, &tmp_path);
-        assert!(result.is_err(), "expected error for invalid HWND, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected error for invalid HWND, got {:?}",
+            result
+        );
         // No file should have been created on the failure path.
         let _ = std::fs::remove_file(&tmp_path);
     }
@@ -787,16 +826,18 @@ mod tests {
                     event.save_path.is_some(),
                     "ScreenshotEvent.save_path should be set"
                 );
-                let bytes = std::fs::read(&tmp_path)
-                    .expect("BMP file should be readable");
+                let bytes = std::fs::read(&tmp_path).expect("BMP file should be readable");
                 assert!(bytes.len() >= 2, "BMP must be at least 2 bytes");
                 assert_eq!(&bytes[0..2], b"BM", "BMP must start with 'BM' signature");
                 let _ = std::fs::remove_file(&tmp_path);
             }
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("GetDC") || msg.contains("zero") || msg.contains("PrintWindow")
-                    || msg.contains("negative") || msg.contains("not a valid window")
+                if msg.contains("GetDC")
+                    || msg.contains("zero")
+                    || msg.contains("PrintWindow")
+                    || msg.contains("negative")
+                    || msg.contains("not a valid window")
                 {
                     eprintln!("Skipping Spawner window-capture test — no display: {}", msg);
                 } else {
@@ -813,12 +854,9 @@ mod tests {
         match Spawner::capture_screenshot_to_file(None, &tmp_path) {
             Ok(event) => {
                 // Verify the BMP signature
-                let bytes = std::fs::read(&tmp_path)
-                    .expect("BMP file should be readable after capture");
-                assert!(
-                    bytes.len() >= 2,
-                    "BMP file must be at least 2 bytes"
-                );
+                let bytes =
+                    std::fs::read(&tmp_path).expect("BMP file should be readable after capture");
+                assert!(bytes.len() >= 2, "BMP file must be at least 2 bytes");
                 assert_eq!(
                     &bytes[0..2],
                     b"BM",
@@ -835,9 +873,7 @@ mod tests {
                 // In CI environments without a display, GetDC(NULL) may fail.
                 // Skip gracefully rather than failing the test.
                 let msg = e.to_string();
-                if msg.contains("GetDC(NULL) failed")
-                    || msg.contains("zero virtual desktop size")
-                {
+                if msg.contains("GetDC(NULL) failed") || msg.contains("zero virtual desktop size") {
                     eprintln!("Skipping screenshot test — no display: {}", msg);
                 } else {
                     panic!("capture_screenshot_to_file failed unexpectedly: {}", e);

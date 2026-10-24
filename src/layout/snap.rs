@@ -64,7 +64,10 @@ pub fn find_snap(
             _ => best = Some((dist, *cand)),
         }
     }
-    best.map(|(_, c)| SnapTarget { x: c.x, kind: c.kind })
+    best.map(|(_, c)| SnapTarget {
+        x: c.x,
+        kind: c.kind,
+    })
 }
 
 /// Build the candidate snap list for the current monitor: every column
@@ -79,14 +82,26 @@ pub fn build_candidates(
 ) -> Vec<SnapCandidate> {
     let mut out: Vec<SnapCandidate> = Vec::with_capacity(column_lefts.len() * 2 + 3);
     for &x in column_lefts {
-        out.push(SnapCandidate { x, kind: SnapKind::ColumnEdge });
+        out.push(SnapCandidate {
+            x,
+            kind: SnapKind::ColumnEdge,
+        });
     }
     for &x in column_rights {
-        out.push(SnapCandidate { x, kind: SnapKind::ColumnEdge });
+        out.push(SnapCandidate {
+            x,
+            kind: SnapKind::ColumnEdge,
+        });
     }
     let mid = work_area_x + work_area_width / 2;
-    out.push(SnapCandidate { x: mid, kind: SnapKind::MidScreen });
-    out.push(SnapCandidate { x: work_area_x, kind: SnapKind::MonitorEdge });
+    out.push(SnapCandidate {
+        x: mid,
+        kind: SnapKind::MidScreen,
+    });
+    out.push(SnapCandidate {
+        x: work_area_x,
+        kind: SnapKind::MonitorEdge,
+    });
     out.push(SnapCandidate {
         x: work_area_x + work_area_width,
         kind: SnapKind::MonitorEdge,
@@ -99,7 +114,10 @@ mod tests {
     use super::*;
 
     fn cand(x: i32) -> SnapCandidate {
-        SnapCandidate { x, kind: SnapKind::ColumnEdge }
+        SnapCandidate {
+            x,
+            kind: SnapKind::ColumnEdge,
+        }
     }
 
     #[test]
@@ -157,8 +175,14 @@ mod tests {
     #[test]
     fn mid_screen_kind_preserved() {
         let cands = vec![
-            SnapCandidate { x: 100, kind: SnapKind::ColumnEdge },
-            SnapCandidate { x: 960, kind: SnapKind::MidScreen },
+            SnapCandidate {
+                x: 100,
+                kind: SnapKind::ColumnEdge,
+            },
+            SnapCandidate {
+                x: 960,
+                kind: SnapKind::MidScreen,
+            },
         ];
         let r = find_snap(955, &cands, 20).expect("should snap to mid");
         assert_eq!(r.kind, SnapKind::MidScreen);
@@ -172,10 +196,16 @@ mod tests {
         // 2 lefts + 2 rights + mid + 2 monitor edges = 7
         assert_eq!(cands.len(), 7);
         // Mid-screen at 960.
-        assert!(cands.iter().any(|c| c.x == 960 && c.kind == SnapKind::MidScreen));
+        assert!(cands
+            .iter()
+            .any(|c| c.x == 960 && c.kind == SnapKind::MidScreen));
         // Monitor edges at 0 and 1920.
-        assert!(cands.iter().any(|c| c.x == 0 && c.kind == SnapKind::MonitorEdge));
-        assert!(cands.iter().any(|c| c.x == 1920 && c.kind == SnapKind::MonitorEdge));
+        assert!(cands
+            .iter()
+            .any(|c| c.x == 0 && c.kind == SnapKind::MonitorEdge));
+        assert!(cands
+            .iter()
+            .any(|c| c.x == 1920 && c.kind == SnapKind::MonitorEdge));
     }
 
     #[test]
@@ -183,7 +213,10 @@ mod tests {
         let cands = build_candidates(&[], &[], 100, 800);
         // No columns: still get mid + 2 edges = 3.
         assert_eq!(cands.len(), 3);
-        let mid = cands.iter().find(|c| c.kind == SnapKind::MidScreen).unwrap();
+        let mid = cands
+            .iter()
+            .find(|c| c.kind == SnapKind::MidScreen)
+            .unwrap();
         assert_eq!(mid.x, 500);
     }
 }

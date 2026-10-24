@@ -12,28 +12,25 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor, HFONT,
-    PAINTSTRUCT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    HFONT, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, KillTimer, MSG, PostQuitMessage,
-    RegisterClassExW, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    LWA_ALPHA, SM_CXSCREEN, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOWNOACTIVATE,
-    WNDCLASSEXW,
-    WM_CREATE, WM_DESTROY, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, KillTimer,
+    PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, MSG, SM_CXSCREEN,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_CREATE, WM_DESTROY,
+    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::PCWSTR;
 
 /// Convenience rectangle in screen space (logical pixels).  Mirrors the small
 /// data we want from `crate::utils::Rect` without pulling its full API into
@@ -52,7 +49,7 @@ const OVERLAY_H: i32 = 64;
 // Timer ID and interval
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 16; // ~60 Hz so fade-in feels smooth
-// Fade-out begins this many ms before expiry
+                          // Fade-out begins this many ms before expiry
 const FADE_OUT_MS: u128 = 300;
 // Fade-in completes this many ms after show()
 const FADE_IN_MS: u128 = 100;
@@ -161,7 +158,10 @@ fn reposition_to_monitor(hwnd: HWND, bounds: Option<MonitorBounds>) {
         let _ = SetWindowPos(
             hwnd,
             None,
-            x, y, 0, 0,
+            x,
+            y,
+            0,
+            0,
             SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
         );
     }
@@ -233,11 +233,8 @@ fn run_window_loop(state: Arc<IndicatorState>) {
         let y = 24;
 
         // ----- Create layered, topmost, no-activate popup --------------------
-        let ex_style = WS_EX_LAYERED
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_TRANSPARENT;
+        let ex_style =
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
 
         // We pass a raw pointer to `state` as the creation parameter so the
         // window proc can store it on WM_CREATE before we call SetWindowLongPtrW.
@@ -361,7 +358,7 @@ unsafe extern "system" fn wnd_proc(
                 0,
                 0,
                 0,
-                1,   // DEFAULT_CHARSET
+                1, // DEFAULT_CHARSET
                 0,
                 0,
                 0,
@@ -432,13 +429,12 @@ unsafe extern "system" fn wnd_proc(
                         let alpha_out = if remaining_ms >= FADE_OUT_MS {
                             255u8
                         } else {
-                            (remaining_ms as f32 / FADE_OUT_MS as f32 * 255.0)
-                                .clamp(0.0, 255.0) as u8
+                            (remaining_ms as f32 / FADE_OUT_MS as f32 * 255.0).clamp(0.0, 255.0)
+                                as u8
                         };
                         let alpha = alpha_in.min(alpha_out);
 
-                        let _ =
-                            SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+                        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
                         // Trigger repaint so the new alpha is applied.
                         let _ = InvalidateRect(hwnd, None, true);
                     }

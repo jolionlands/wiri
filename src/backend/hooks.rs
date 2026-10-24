@@ -1,15 +1,16 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use parking_lot::Mutex;
+use std::time::Duration;
 use tracing::{info, warn};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, MSG, TranslateMessage,
-    DispatchMessageW,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_USER,
 };
 
-use crate::backend::BackendEvent;
 use super::{BackendHandle, WindowInfo};
+use crate::backend::BackendEvent;
 
 // Event constants for SetWinEventHook
 const EVENT_SYSTEM_ALERT: u32 = 0x0002;
@@ -30,94 +31,131 @@ const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+const WM_STOP_WINEVENT_LOOP: u32 = WM_USER + 401;
 
 #[derive(Debug)]
 pub struct WinEventHook {
     #[allow(dead_code)]
-    handle: windows::Win32::Foundation::HMODULE,
-    hooks: Vec<HWINEVENTHOOK>,
+    thread_id: u32,
+    hook_count: usize,
 }
 
 impl WinEventHook {
     pub fn new(_backend: BackendHandle) -> Result<Self> {
-        let handle = unsafe {
-            windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-        }
-        .context("GetModuleHandleW failed")?;
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("wiri-winevent-hook".to_string())
+            .spawn(move || {
+                let thread_id = unsafe { GetCurrentThreadId() };
+                let hooks = register_winevent_hooks();
+                if hooks.is_empty() {
+                    let _ = ready_tx.send(Err(anyhow::anyhow!(
+                        "All SetWinEventHook registrations failed"
+                    )));
+                    return;
+                }
 
-        // Register separate hooks for each event range
-        let event_ranges: &[(u32, u32)] = &[
-            // EVENT_SYSTEM_ALERT (0x0002) — fires when an app calls FlashWindow(Ex)
-            // to request user attention. We use it to populate the urgent-window
-            // set so window rules with `is-urgent` matchers can react.
-            (EVENT_SYSTEM_ALERT, EVENT_SYSTEM_ALERT),
-            (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
-            (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
-            (EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE),
-            (EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY),
-            (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
-            // EVENT_OBJECT_STATECHANGE (0x800A) — fires when accessibility state
-            // changes including STATE_SYSTEM_ALERT. Bridges apps that request
-            // attention via IAccessible::accState rather than FlashWindow.
-            (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
-            (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
-            (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
-        ];
+                let hook_count = hooks.len();
+                let _ = ready_tx.send(Ok((thread_id, hook_count)));
+                run_winevent_message_loop();
+                for hook in hooks {
+                    unsafe {
+                        let _ = windows::Win32::UI::Accessibility::UnhookWinEvent(hook);
+                    }
+                }
+                info!(
+                    "WinEventHook thread exited, {} hooks unregistered",
+                    hook_count
+                );
+            })?;
 
-        let mut hooks = Vec::new();
-        for (event_min, event_max) in event_ranges {
-            let hook = unsafe {
-                SetWinEventHook(
-                    *event_min,
-                    *event_max,
-                    handle,
-                    Some(winevent_proc),
-                    0,
-                    0,
-                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-                )
-            };
-            if hook.is_invalid() {
-                warn!("SetWinEventHook failed for range 0x{:04X}-0x{:04X}", event_min, event_max);
-            } else {
-                info!("Registered WinEvent hook for range 0x{:04X}-0x{:04X}", event_min, event_max);
-                hooks.push(hook);
-            }
-        }
+        let (thread_id, hook_count) = ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| anyhow::anyhow!("WinEventHook did not start: {}", e))??;
 
-        if hooks.is_empty() {
-            return Err(anyhow::anyhow!("All SetWinEventHook registrations failed"));
-        }
-
-        Ok(Self { handle, hooks })
+        Ok(Self {
+            thread_id,
+            hook_count,
+        })
     }
 
-    /// Start a message pump thread for WinEvent hook callbacks.
-    /// GetMessageW blocks until a message arrives — no sleep needed.
+    /// Hook registration and pumping start in `new`; retained for callers that
+    /// still invoke `run` after construction.
     pub fn run(&self) {
-        info!("WinEventHook running ({} hooks active)", self.hooks.len());
-        std::thread::spawn(move || {
-            let mut msg = MSG::default();
-            loop {
-                let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-                if ret.0 == 0 || ret.0 == -1 {
-                    break;
-                }
-                let _ = unsafe { TranslateMessage(&msg) };
-                unsafe { DispatchMessageW(&msg); }
-            }
-        });
+        info!("WinEventHook running ({} hooks active)", self.hook_count);
     }
 }
 
 impl Drop for WinEventHook {
     fn drop(&mut self) {
-        for hook in &self.hooks {
-            unsafe {
-                let _ = windows::Win32::UI::Accessibility::UnhookWinEvent(*hook);
-            }
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_STOP_WINEVENT_LOOP, WPARAM(0), LPARAM(0));
         }
-        info!("WinEventHook dropped, {} hooks unregistered", self.hooks.len());
+        info!("WinEventHook stop requested");
+    }
+}
+
+fn register_winevent_hooks() -> Vec<HWINEVENTHOOK> {
+    let handle = match unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) } {
+        Ok(handle) => handle,
+        Err(e) => {
+            warn!("GetModuleHandleW failed for WinEventHook: {}", e);
+            windows::Win32::Foundation::HMODULE::default()
+        }
+    };
+
+    let event_ranges: &[(u32, u32)] = &[
+        (EVENT_SYSTEM_ALERT, EVENT_SYSTEM_ALERT),
+        (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+        (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
+        (EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE),
+        (EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY),
+        (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
+        (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+        (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
+    ];
+
+    let mut hooks = Vec::new();
+    for (event_min, event_max) in event_ranges {
+        let hook = unsafe {
+            SetWinEventHook(
+                *event_min,
+                *event_max,
+                handle,
+                Some(winevent_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        if hook.is_invalid() {
+            warn!(
+                "SetWinEventHook failed for range 0x{:04X}-0x{:04X}",
+                event_min, event_max
+            );
+        } else {
+            info!(
+                "Registered WinEvent hook for range 0x{:04X}-0x{:04X}",
+                event_min, event_max
+            );
+            hooks.push(hook);
+        }
+    }
+    hooks
+}
+
+fn run_winevent_message_loop() {
+    let mut msg = MSG::default();
+    loop {
+        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if ret.0 == 0 || ret.0 == -1 || msg.message == WM_STOP_WINEVENT_LOOP {
+            break;
+        }
+        let _ = unsafe { TranslateMessage(&msg) };
+        unsafe {
+            DispatchMessageW(&msg);
+        }
     }
 }
 
@@ -145,13 +183,18 @@ unsafe extern "system" fn winevent_proc(
     };
 
     match event_type {
-        0x0002 => { // EVENT_SYSTEM_ALERT — record window as flashing/urgent.
+        0x0002 => {
+            // EVENT_SYSTEM_ALERT — record window as flashing/urgent.
             let hwnd_isize = hwnd.0 as isize;
             URGENT_WINDOWS.lock().insert(hwnd_isize);
             // Notify the engine so it can update window rules / border colour.
-            backend.send_event(BackendEvent::WindowUrgent { hwnd: hwnd_isize, urgent: true });
+            backend.send_event(BackendEvent::WindowUrgent {
+                hwnd: hwnd_isize,
+                urgent: true,
+            });
         }
-        0x0003 => { // EVENT_SYSTEM_FOREGROUND
+        0x0003 => {
+            // EVENT_SYSTEM_FOREGROUND
             // Bringing a window to the foreground implicitly clears its urgent state
             // — the user is now looking at it, no need to keep nagging.
             let hwnd_isize = hwnd.0 as isize;
@@ -162,18 +205,28 @@ unsafe extern "system" fn winevent_proc(
             }
             backend.send_event(BackendEvent::ForegroundChanged { hwnd: hwnd_isize });
         }
-        0x000A => { // EVENT_SYSTEM_MOVESIZESTART
-            backend.send_event(BackendEvent::WindowMoveResizeStart { hwnd: hwnd.0 as isize });
+        0x000A => {
+            // EVENT_SYSTEM_MOVESIZESTART
+            backend.send_event(BackendEvent::WindowMoveResizeStart {
+                hwnd: hwnd.0 as isize,
+            });
         }
-        0x000B => { // EVENT_SYSTEM_MOVESIZEEND
-            backend.send_event(BackendEvent::WindowMoveResizeEnd { hwnd: hwnd.0 as isize });
+        0x000B => {
+            // EVENT_SYSTEM_MOVESIZEEND
+            backend.send_event(BackendEvent::WindowMoveResizeEnd {
+                hwnd: hwnd.0 as isize,
+            });
         }
-        0x8000 => { // EVENT_OBJECT_CREATE
+        0x8000 => {
+            // EVENT_OBJECT_CREATE
             let info = WindowInfo::new(hwnd);
-            backend.send_event(BackendEvent::WindowCreated { hwnd: hwnd.0 as isize });
+            backend.send_event(BackendEvent::WindowCreated {
+                hwnd: hwnd.0 as isize,
+            });
             backend.add_window(hwnd.0 as isize, info);
         }
-        0x8001 => { // EVENT_OBJECT_DESTROY
+        0x8001 => {
+            // EVENT_OBJECT_DESTROY
             let hwnd_isize = hwnd.0 as isize;
             // Prune LAST_LOCATION entry for closed windows (Bug #6)
             LAST_LOCATION.lock().remove(&hwnd_isize);
@@ -182,7 +235,8 @@ unsafe extern "system" fn winevent_proc(
             backend.send_event(BackendEvent::WindowDestroyed { hwnd: hwnd_isize });
             backend.remove_window(hwnd_isize);
         }
-        0x8003 => { // EVENT_OBJECT_SHOW
+        0x8003 => {
+            // EVENT_OBJECT_SHOW
             // A SHOW event is the first reliable point at which a top-level
             // window has its real title / class / styles set. The earlier
             // EVENT_OBJECT_CREATE often fires before WS_VISIBLE and before
@@ -199,14 +253,18 @@ unsafe extern "system" fn winevent_proc(
             backend.update_window(hwnd_isize, info);
             backend.send_event(BackendEvent::WindowShown { hwnd: hwnd_isize });
         }
-        0x8004 => { // EVENT_OBJECT_HIDE
+        0x8004 => {
+            // EVENT_OBJECT_HIDE
             if let Some(mut info) = backend.get_window(hwnd.0 as isize) {
                 info.is_visible = false;
                 backend.update_window(hwnd.0 as isize, info.clone());
-                backend.send_event(BackendEvent::WindowHidden { hwnd: hwnd.0 as isize });
+                backend.send_event(BackendEvent::WindowHidden {
+                    hwnd: hwnd.0 as isize,
+                });
             }
         }
-        0x800A => { // EVENT_OBJECT_STATECHANGE — accessibility state changed.
+        0x800A => {
+            // EVENT_OBJECT_STATECHANGE — accessibility state changed.
             // Some apps (e.g. terminals, chat clients) signal attention via the
             // IAccessible STATE_SYSTEM_ALERT bit rather than FlashWindow. We
             // emit WindowUrgent only for windows we are already tracking to
@@ -215,11 +273,15 @@ unsafe extern "system" fn winevent_proc(
             if backend.get_window(hwnd_isize).is_some() {
                 let newly_inserted = URGENT_WINDOWS.lock().insert(hwnd_isize);
                 if newly_inserted {
-                    backend.send_event(BackendEvent::WindowUrgent { hwnd: hwnd_isize, urgent: true });
+                    backend.send_event(BackendEvent::WindowUrgent {
+                        hwnd: hwnd_isize,
+                        urgent: true,
+                    });
                 }
             }
         }
-        0x800B => { // EVENT_OBJECT_LOCATIONCHANGE
+        0x800B => {
+            // EVENT_OBJECT_LOCATIONCHANGE
             let hwnd_isize = hwnd.0 as isize;
 
             // Fast-path: if wiri itself just moved this window, skip the entire
@@ -291,7 +353,8 @@ unsafe extern "system" fn winevent_proc(
                 }
             }
         }
-        0x800C => { // EVENT_OBJECT_NAMECHANGE
+        0x800C => {
+            // EVENT_OBJECT_NAMECHANGE
             // Refresh the cached WindowInfo's title (and class/bounds for
             // good measure — apps occasionally update class via SetClassLongPtr
             // mid-life). Then emit BOTH WindowTitleChanged (for listeners) and
@@ -310,9 +373,9 @@ unsafe extern "system" fn winevent_proc(
     }
 }
 
-use std::sync::LazyLock;
-use std::collections::{HashMap, HashSet};
 use crate::utils::Rect as UtilRect;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 /// Per-window location throttle state: (last_processed_time, last_known_rect)
 static LAST_LOCATION: LazyLock<Mutex<HashMap<isize, (std::time::Instant, UtilRect)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));

@@ -84,10 +84,23 @@ mod tests {
             IpcMessage::CloseWindow { window_hwnd: 456 },
             IpcMessage::ReloadConfig,
             IpcMessage::Quit,
-            IpcMessage::WindowMove { window_hwnd: 1, x: 10, y: 20 },
-            IpcMessage::WindowResize { window_hwnd: 1, width: 800, height: 600 },
-            IpcMessage::TileRequest { window_hwnd: 1, target_workspace: Some("ws2".to_string()) },
-            IpcMessage::SubscribeEvents { event_types: vec!["focus".to_string()] },
+            IpcMessage::WindowMove {
+                window_hwnd: 1,
+                x: 10,
+                y: 20,
+            },
+            IpcMessage::WindowResize {
+                window_hwnd: 1,
+                width: 800,
+                height: 600,
+            },
+            IpcMessage::TileRequest {
+                window_hwnd: 1,
+                target_workspace: Some("ws2".to_string()),
+            },
+            IpcMessage::SubscribeEvents {
+                event_types: vec!["focus".to_string()],
+            },
             // MonitorList is a new variant — make sure it round-trips
             // through the serde tagged-enum format unchanged.
             IpcMessage::MonitorList,
@@ -132,18 +145,36 @@ mod tests {
     #[test]
     fn test_all_event_types_roundtrip() {
         let events = vec![
-            IpcEvent::WindowOpened { window: WindowInfoIpc {
-                hwnd: 1, title: "t".into(), class_name: "c".into(),
-                process_id: 0, x: 0, y: 0, width: 100, height: 100,
-            }},
+            IpcEvent::WindowOpened {
+                window: WindowInfoIpc {
+                    hwnd: 1,
+                    title: "t".into(),
+                    class_name: "c".into(),
+                    process_id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+            },
             IpcEvent::WindowClosed { window_hwnd: 1 },
             IpcEvent::WindowFocused { window_hwnd: 1 },
-            IpcEvent::WorkspaceActivated { workspace: "ws-0".into() },
-            IpcEvent::ConfigLoaded { config_path: "test.kdl".into() },
-            IpcEvent::MonitorChanged { monitor_name: "Monitor1".into() },
-            IpcEvent::WorkspacesChanged { workspaces: vec![WorkspaceInfo {
-                name: "ws-0".into(), id: 0, window_count: 3,
-            }] },
+            IpcEvent::WorkspaceActivated {
+                workspace: "ws-0".into(),
+            },
+            IpcEvent::ConfigLoaded {
+                config_path: "test.kdl".into(),
+            },
+            IpcEvent::MonitorChanged {
+                monitor_name: "Monitor1".into(),
+            },
+            IpcEvent::WorkspacesChanged {
+                workspaces: vec![WorkspaceInfo {
+                    name: "ws-0".into(),
+                    id: 0,
+                    window_count: 3,
+                }],
+            },
         ];
         for event in &events {
             let json = serde_json::to_string(event).unwrap();
@@ -156,11 +187,19 @@ mod tests {
     fn test_state_response_serialization() {
         let resp = StateResponse {
             windows: vec![WindowInfoIpc {
-                hwnd: 100, title: "Test".into(), class_name: "Class".into(),
-                process_id: 999, x: 10, y: 20, width: 800, height: 600,
+                hwnd: 100,
+                title: "Test".into(),
+                class_name: "Class".into(),
+                process_id: 999,
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
             }],
             workspaces: vec![WorkspaceInfo {
-                name: "workspace-0".into(), id: 0, window_count: 5,
+                name: "workspace-0".into(),
+                id: 0,
+                window_count: 5,
             }],
             active_workspace: Some("workspace-0".into()),
         };

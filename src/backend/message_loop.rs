@@ -1,23 +1,27 @@
 use anyhow::Result;
-use std::sync::Arc;
-use tracing::{error, info, warn};
-use windows::Win32::Foundation::{HWND, WPARAM, LPARAM, LRESULT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, TranslateMessage,
-    WM_DESTROY, WM_USER, WM_DISPLAYCHANGE, WNDCLASSW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASS_STYLES,
-    ShowWindow, SetWindowPos, GetForegroundWindow, SW_MAXIMIZE, SW_MINIMIZE,
-    HWND_TOP, SWP_NOZORDER, SWP_NOACTIVATE,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::{mpsc, Arc};
+use tracing::{error, info, warn};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+    GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SetWindowPos, ShowWindow,
+    TranslateMessage, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE, WM_USER, WNDCLASSW,
+    WNDCLASS_STYLES,
+};
 
 use super::BackendHandle;
 use crate::input::Action;
-use crate::layout::{TilingEngine, ScrollDirection};
+use crate::layout::{ScrollDirection, TilingEngine};
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
 /// Custom message sent to the hotkey thread to trigger re-registration
@@ -61,32 +65,25 @@ fn resolve_mod_prefix(name: &str) -> (u32, u32) {
 /// pick up the user's preferred shell instead of always launching cmd.exe.
 fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u32, u32, Action)> {
     vec![
-        (prefix, 0x25, Action::FocusColumnLeft),       // Left
-        (prefix, 0x27, Action::FocusColumnRight),      // Right
-        (prefix, 0x26, Action::FocusUp),               // Up
-        (prefix, 0x28, Action::FocusDown),             // Down
+        (prefix, 0x25, Action::FocusColumnLeft),  // Left
+        (prefix, 0x27, Action::FocusColumnRight), // Right
+        (prefix, 0x26, Action::FocusUp),          // Up
+        (prefix, 0x28, Action::FocusDown),        // Down
         (shift_prefix, 0x25, Action::MoveColumnLeft),
         (shift_prefix, 0x27, Action::MoveColumnRight),
-        (prefix, 0x51, Action::CloseWindow),           // Q
+        (prefix, 0x51, Action::CloseWindow), // Q
         (prefix, 0x0D, Action::Spawn(terminal_cmd.to_string())), // Enter
-        (prefix, 0x46, Action::ToggleFullscreen),      // F
-        (prefix, 0x54, Action::ToggleFloating),        // T
-        (prefix, 0x48, Action::ScrollLeft),            // H
-        (prefix, 0x4C, Action::ScrollRight),           // L
-        (shift_prefix, 0x51, Action::Quit),            // Shift+Q
-        (prefix, 0x20, Action::OverviewToggle),        // Space
-        // Bare Escape → OverviewToggle.  Conceptually wrong on its own
-        // (we don't want Escape to enter overview), so the WM_HOTKEY
-        // dispatcher in `run_message_loop` state-gates this binding: the
-        // action only fires when overview is already active.  Registered
-        // unconditionally so the OS knows the chord belongs to wiri while
-        // overview is on.
-        (0, 0x1B, Action::OverviewToggle),             // Escape (gated)
-        (prefix, 0x4F, Action::OverviewSelect),        // O
-        (prefix, 0xDC, Action::ColumnToggleTabbed),    // \
-        (prefix, 0xDD, Action::TabNext),               // ]
-        (prefix, 0xDB, Action::TabPrev),               // [
-        (prefix, 0x31, Action::FocusWorkspace(1)),     // 1
+        (prefix, 0x46, Action::ToggleFullscreen), // F
+        (prefix, 0x54, Action::ToggleFloating), // T
+        (prefix, 0x48, Action::ScrollLeft),  // H
+        (prefix, 0x4C, Action::ScrollRight), // L
+        (shift_prefix, 0x51, Action::Quit),  // Shift+Q
+        (prefix, 0x20, Action::OverviewToggle), // Space
+        (prefix, 0x4F, Action::OverviewSelect), // O
+        (prefix, 0xDC, Action::ColumnToggleTabbed), // \
+        (prefix, 0xDD, Action::TabNext),     // ]
+        (prefix, 0xDB, Action::TabPrev),     // [
+        (prefix, 0x31, Action::FocusWorkspace(1)), // 1
         (prefix, 0x32, Action::FocusWorkspace(2)),
         (prefix, 0x33, Action::FocusWorkspace(3)),
         (prefix, 0x34, Action::FocusWorkspace(4)),
@@ -105,13 +102,13 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (shift_prefix, 0x37, Action::MoveToWorkspace(7)),
         (shift_prefix, 0x38, Action::MoveToWorkspace(8)),
         (shift_prefix, 0x39, Action::MoveToWorkspace(9)),
-        (prefix, 0x21, Action::FocusWorkspacePrevious),   // PageUp
-        (prefix, 0x22, Action::FocusWorkspaceNext),       // PageDown
-        (prefix, 0x52, Action::EnterResizeMode),          // R — niri-style interactive resize
-        (shift_prefix, 0x52, Action::CenterColumn),       // Shift+R — center-on-screen
-        (prefix, 0x57, Action::ColumnWidthPresetCycle),   // W
-        (prefix, 0xBD, Action::ResizeColumnLeft),         // VK_OEM_MINUS
-        (prefix, 0xBB, Action::ResizeColumnRight),        // VK_OEM_PLUS
+        (prefix, 0x21, Action::FocusWorkspacePrevious), // PageUp
+        (prefix, 0x22, Action::FocusWorkspaceNext),     // PageDown
+        (prefix, 0x52, Action::EnterResizeMode),        // R — niri-style interactive resize
+        (shift_prefix, 0x52, Action::CenterColumn),     // Shift+R — center-on-screen
+        (prefix, 0x57, Action::ColumnWidthPresetCycle), // W
+        (prefix, 0xBD, Action::ResizeColumnLeft),       // VK_OEM_MINUS
+        (prefix, 0xBB, Action::ResizeColumnRight),      // VK_OEM_PLUS
         // NOTE: Shift+H / Shift+L are repurposed below to Shrink/GrowColumnWidth
         // for niri parity. MoveToMonitorLeft/Right remain available via the
         // KDL `binds {}` block (e.g. Ctrl+Alt+Comma+Shift) or wiri-ctl.
@@ -121,9 +118,9 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         // NOTE: if prefix is Ctrl+Alt, prefix+Tab conflicts with the Windows system
         // Ctrl+Alt+Tab switcher. RegisterHotKey will fail; that's OK — the warning
         // will be logged and the action remains available via custom KDL binds.
-        (prefix, 0x09, Action::FocusPrevious),            // Tab
-        (prefix, 0x50, Action::Screenshot),               // P (capture desktop to file)
-        (prefix, 0x41, Action::ToggleAlwaysOnTop),        // A (always-on-top)
+        (prefix, 0x09, Action::FocusPrevious),     // Tab
+        (prefix, 0x50, Action::Screenshot),        // P (capture desktop to file)
+        (prefix, 0x41, Action::ToggleAlwaysOnTop), // A (always-on-top)
         // niri-parity Round 4: rearrange / sizing actions.
         //   Ctrl+Alt+Comma   → consume window into next column
         //   Ctrl+Alt+Period  → expel window into a new column to the right
@@ -134,21 +131,21 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         //   Ctrl+Alt+Shift+K → grow tile height (5%)
         //   Ctrl+Alt+Shift+J → shrink tile height (5%)
         //   Ctrl+Alt+Shift+PgUp/PgDn → move column to monitor left/right
-        (prefix, 0xBC, Action::ConsumeWindowIntoColumn),   // VK_OEM_COMMA  ","
-        (prefix, 0xBE, Action::ExpelWindowFromColumn),     // VK_OEM_PERIOD "."
-        (prefix, 0x45, Action::ExpandColumnToAvailable),   // E
-        (shift_prefix, 0x46, Action::MaximizeColumn),      // Shift+F
-        (shift_prefix, 0x4C, Action::GrowColumnWidth),     // Shift+L (overrides MoveToMonitorRight above)
-        (shift_prefix, 0x48, Action::ShrinkColumnWidth),   // Shift+H (overrides MoveToMonitorLeft above)
-        (shift_prefix, 0x4B, Action::GrowTileHeight),      // Shift+K
-        (shift_prefix, 0x4A, Action::ShrinkTileHeight),    // Shift+J
+        (prefix, 0xBC, Action::ConsumeWindowIntoColumn), // VK_OEM_COMMA  ","
+        (prefix, 0xBE, Action::ExpelWindowFromColumn),   // VK_OEM_PERIOD "."
+        (prefix, 0x45, Action::ExpandColumnToAvailable), // E
+        (shift_prefix, 0x46, Action::MaximizeColumn),    // Shift+F
+        (shift_prefix, 0x4C, Action::GrowColumnWidth), // Shift+L (overrides MoveToMonitorRight above)
+        (shift_prefix, 0x48, Action::ShrinkColumnWidth), // Shift+H (overrides MoveToMonitorLeft above)
+        (shift_prefix, 0x4B, Action::GrowTileHeight),    // Shift+K
+        (shift_prefix, 0x4A, Action::ShrinkTileHeight),  // Shift+J
         // Workspace swap (reorder the workspace stack) — niri-parity
         // `Mod+Ctrl+Page_Up/Down`.  Our default prefix is Ctrl+Alt, so the
         // shifted variant naturally lands on `Ctrl+Alt+Shift+Page_Up/Down`,
         // which is what we used to dedicate to move-column-to-monitor.  The
         // column-to-monitor chords move to Ctrl+Alt+Shift+Comma/Period below.
-        (shift_prefix, 0x21, Action::MoveWorkspaceUp),    // Shift+PageUp
-        (shift_prefix, 0x22, Action::MoveWorkspaceDown),  // Shift+PageDown
+        (shift_prefix, 0x21, Action::MoveWorkspaceUp), // Shift+PageUp
+        (shift_prefix, 0x22, Action::MoveWorkspaceDown), // Shift+PageDown
         // Niri parity: move focused column vertically between workspaces.
         // Ctrl+Alt+Shift+Up/Down (VK_UP=0x26, VK_DOWN=0x28).
         (shift_prefix, 0x26, Action::MoveColumnToWorkspaceUp),
@@ -255,7 +252,10 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
     let default_count = defaults.len();
 
     if config_binds.is_empty() {
-        info!("Hotkeys: {} from defaults, 0 from config (0 overridden)", default_count);
+        info!(
+            "Hotkeys: {} from defaults, 0 from config (0 overridden)",
+            default_count
+        );
         return defaults;
     }
 
@@ -332,7 +332,11 @@ fn is_system_critical_hotkey(mods: u32, vk: u32) -> Option<&'static str> {
 fn register_hotkeys(
     hwnd: HWND,
     hotkeys: &[(u32, u32, Action)],
-) -> (Vec<i32>, HashMap<i32, Action>, std::collections::HashSet<i32>) {
+) -> (
+    Vec<i32>,
+    HashMap<i32, Action>,
+    std::collections::HashSet<i32>,
+) {
     let base_id = 32768i32;
     let mut registered_ids: Vec<i32> = Vec::new();
 
@@ -349,18 +353,26 @@ fn register_hotkeys(
             );
             continue;
         }
-        let result = unsafe {
-            RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(*mods), *vk)
-        };
+        let result = unsafe { RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(*mods), *vk) };
         if result.is_ok() {
             registered_ids.push(id);
-            info!("OK hotkey id={} mods=0x{:X} vk=0x{:02X} {:?}", id, mods, vk, action);
+            info!(
+                "OK hotkey id={} mods=0x{:X} vk=0x{:02X} {:?}",
+                id, mods, vk, action
+            );
         } else {
             let err = std::io::Error::last_os_error();
-            warn!("FAIL hotkey id={} mods=0x{:X} vk=0x{:02X} {:?} os_err={}", id, mods, vk, action, err);
+            warn!(
+                "FAIL hotkey id={} mods=0x{:X} vk=0x{:02X} {:?} os_err={}",
+                id, mods, vk, action, err
+            );
         }
     }
-    info!("Hotkeys: {}/{} registered", registered_ids.len(), hotkeys.len());
+    info!(
+        "Hotkeys: {}/{} registered",
+        registered_ids.len(),
+        hotkeys.len()
+    );
 
     let action_map: HashMap<i32, Action> = hotkeys
         .iter()
@@ -390,7 +402,9 @@ fn register_hotkeys(
 /// Unregister all hotkeys by ID
 fn unregister_hotkeys(hwnd: HWND, ids: &[i32]) {
     for id in ids {
-        unsafe { let _ = UnregisterHotKey(hwnd, *id); }
+        unsafe {
+            let _ = UnregisterHotKey(hwnd, *id);
+        }
     }
 }
 
@@ -432,10 +446,7 @@ pub struct RegisteredBinding {
 /// Refresh the global REGISTERED_BINDINGS snapshot after a (re-)registration
 /// pass.  Stores only bindings that Windows actually accepted (i.e. whose ID
 /// appears in `registered_ids`) so users get a true picture of what's live.
-fn update_current_bindings_snapshot(
-    hotkeys: &[(u32, u32, Action)],
-    registered_ids: &[i32],
-) {
+fn update_current_bindings_snapshot(hotkeys: &[(u32, u32, Action)], registered_ids: &[i32]) {
     let base_id = 32768i32;
     let mut snap: Vec<RegisteredBinding> = Vec::with_capacity(hotkeys.len());
     for (i, (mods, vk, action)) in hotkeys.iter().enumerate() {
@@ -461,12 +472,20 @@ pub fn current_bindings() -> Vec<RegisteredBinding> {
 
 pub struct MessageLoop {
     running: Arc<Mutex<bool>>,
+    quit_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 }
 
 impl MessageLoop {
     pub fn new() -> Result<Self> {
         let running = Arc::new(Mutex::new(false));
-        Ok(Self { running })
+        Ok(Self {
+            running,
+            quit_tx: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub fn set_quit_sender(&self, tx: mpsc::Sender<()>) {
+        *self.quit_tx.lock() = Some(tx);
     }
 
     pub fn start_hotkey_loop(
@@ -475,8 +494,25 @@ impl MessageLoop {
         backend_handle: BackendHandle,
     ) {
         let running = self.running.clone();
+        let quit_tx = self.quit_tx.clone();
+        let (keyboard_action_tx, keyboard_action_rx) = mpsc::channel();
+        crate::input::set_keyboard_action_sender(keyboard_action_tx);
+        if let Err(e) = crate::input::start_keyboard_hook() {
+            warn!("Double-Alt keyboard hook disabled: {}", e);
+        }
+        {
+            let engine = engine.clone();
+            let backend_handle = backend_handle.clone();
+            let quit_tx = quit_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(action) = keyboard_action_rx.recv() {
+                    info!("KEYHOOK -> {:?}", action);
+                    execute_action(&action, &engine, &backend_handle, &quit_tx);
+                }
+            });
+        }
         std::thread::spawn(move || {
-            Self::run_message_loop(running, engine, backend_handle);
+            Self::run_message_loop(running, engine, backend_handle, quit_tx);
         });
     }
 
@@ -484,6 +520,7 @@ impl MessageLoop {
         running: Arc<Mutex<bool>>,
         engine: Arc<parking_lot::RwLock<TilingEngine>>,
         backend_handle: BackendHandle,
+        quit_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     ) {
         let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
 
@@ -494,14 +531,19 @@ impl MessageLoop {
             lpfnWndProc: Some(Self::window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
-            hInstance: unsafe { GetModuleHandleW(None) }.ok().map(|h| h.into()).unwrap_or_default(),
+            hInstance: unsafe { GetModuleHandleW(None) }
+                .ok()
+                .map(|h| h.into())
+                .unwrap_or_default(),
             hIcon: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
             hCursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR::default(),
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
             lpszMenuName: windows::core::PCWSTR::null(),
             lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
         };
-        unsafe { let _ = RegisterClassW(&wnd_class); }
+        unsafe {
+            let _ = RegisterClassW(&wnd_class);
+        }
 
         let window_name: Vec<u16> = "WiriHotkeyWindow\0".encode_utf16().collect();
         let hwnd = unsafe {
@@ -510,8 +552,12 @@ impl MessageLoop {
                 windows::core::PCWSTR(class_name.as_ptr()),
                 windows::core::PCWSTR(window_name.as_ptr()),
                 WINDOW_STYLE(0),
-                0, 0, 0, 0,
-                None, None,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
                 windows::Win32::Foundation::HMODULE::default(),
                 None,
             )
@@ -540,7 +586,10 @@ impl MessageLoop {
         update_current_bindings_snapshot(&current_hotkeys, &registered_ids);
 
         *running.lock() = true;
-        info!("Hotkey message loop started on thread {:?}", std::thread::current().id());
+        info!(
+            "Hotkey message loop started on thread {:?}",
+            std::thread::current().id()
+        );
 
         // Standard GetMessageW message loop
         unsafe {
@@ -558,8 +607,7 @@ impl MessageLoop {
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
                     let new_hotkeys = build_hotkey_list(&engine);
-                    let (new_ids, new_map, new_exit_only) =
-                        register_hotkeys(hwnd, &new_hotkeys);
+                    let (new_ids, new_map, new_exit_only) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
                     action_map = new_map;
                     overview_exit_only = new_exit_only;
@@ -567,7 +615,8 @@ impl MessageLoop {
                     info!("Hotkey reload complete");
                     continue;
                 }
-                if msg.message == 0x0312 { // WM_HOTKEY
+                if msg.message == 0x0312 {
+                    // WM_HOTKEY
                     let hotkey_id = msg.wParam.0 as i32;
                     if let Some(action) = action_map.get(&hotkey_id) {
                         // Esc → OverviewToggle is registered globally but only
@@ -585,7 +634,7 @@ impl MessageLoop {
                             }
                         }
                         info!("HOTKEY id={} -> {:?}", hotkey_id, action);
-                        execute_action(action, &engine, &backend_handle);
+                        execute_action(action, &engine, &backend_handle, &quit_tx);
                     }
                 } else {
                     let _ = TranslateMessage(&msg);
@@ -597,23 +646,31 @@ impl MessageLoop {
                 // engine lock semantics as keyboard hotkeys.
                 for action in crate::input::touch::take_pending_actions() {
                     info!("TOUCH -> {:?}", action);
-                    execute_action(&action, &engine, &backend_handle);
+                    execute_action(&action, &engine, &backend_handle, &quit_tx);
                 }
             }
         }
 
         unregister_hotkeys(hwnd, &registered_ids);
-        unsafe { let _ = DestroyWindow(hwnd); }
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
         *HOTKEY_THREAD.lock() = None;
         *running.lock() = false;
         info!("Hotkey message loop exited");
     }
 
     unsafe extern "system" fn window_proc(
-        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
     ) -> LRESULT {
         match msg {
-            WM_DESTROY => { PostQuitMessage(0); LRESULT(0) }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
             WM_DISPLAYCHANGE => {
                 // Monitor hot-plug: re-enumerate monitors and notify the backend
                 // via the static `backend::hooks::set_backend` handle that the
@@ -634,12 +691,7 @@ impl MessageLoop {
         let state = HOTKEY_THREAD.lock();
         if let Some(s) = &*state {
             unsafe {
-                let _ = PostThreadMessageW(
-                    s.thread_id,
-                    WM_RELOAD_HOTKEYS,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ = PostThreadMessageW(s.thread_id, WM_RELOAD_HOTKEYS, WPARAM(0), LPARAM(0));
             }
             info!("Sent WM_RELOAD_HOTKEYS to hotkey thread");
         }
@@ -647,20 +699,19 @@ impl MessageLoop {
 
     pub fn stop(&self) {
         *self.running.lock() = false;
+        crate::input::stop_keyboard_hook();
+        crate::input::clear_keyboard_action_sender();
         let state = HOTKEY_THREAD.lock();
         if let Some(s) = &*state {
             unsafe {
-                let _ = PostThreadMessageW(
-                    s.thread_id,
-                    WM_STOP_MESSAGE_LOOP,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ = PostThreadMessageW(s.thread_id, WM_STOP_MESSAGE_LOOP, WPARAM(0), LPARAM(0));
             }
         }
     }
 
-    pub fn is_running(&self) -> bool { *self.running.lock() }
+    pub fn is_running(&self) -> bool {
+        *self.running.lock()
+    }
 
     /// Diagnostic accessor: return a clone of the currently registered hotkey
     /// table (after the most recent `register_hotkeys` pass).  Used by the
@@ -682,11 +733,15 @@ impl MessageLoop {
 }
 
 impl Drop for MessageLoop {
-    fn drop(&mut self) { self.stop(); }
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl Default for MessageLoop {
-    fn default() -> Self { Self::new().expect("Failed to create message loop") }
+    fn default() -> Self {
+        Self::new().expect("Failed to create message loop")
+    }
 }
 
 /// Key-repeat debounce state. Allows max 8 actions/sec for held keys.
@@ -703,6 +758,7 @@ fn execute_action(
     action: &Action,
     engine: &Arc<parking_lot::RwLock<TilingEngine>>,
     backend: &BackendHandle,
+    quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
     // Debounce key repeat: derive from config keyboard.repeat_rate (defaults to ~8/sec).
     {
@@ -736,19 +792,22 @@ fn execute_action(
                 return;
             }
             Action::FocusUp => {
-                engine.write().resize_focused_tile_height_by_percent(-5, backend);
+                engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(-5, backend);
                 engine.write().apply_all(backend);
                 return;
             }
             Action::FocusDown => {
-                engine.write().resize_focused_tile_height_by_percent(5, backend);
+                engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(5, backend);
                 engine.write().apply_all(backend);
                 return;
             }
-            Action::OverviewToggle => {
-                // Bare Escape (which is registered as OverviewToggle and
-                // state-gated below) is the canonical "exit resize mode"
-                // chord.  Swallow the action so overview doesn't open.
+            Action::OverviewToggle | Action::OverviewExit => {
+                // Escape is the canonical "exit resize mode" chord. Swallow
+                // the action so overview doesn't open.
                 engine.write().exit_resize_mode();
                 return;
             }
@@ -797,7 +856,11 @@ fn execute_action(
             engine.write().toggle_fullscreen(backend);
         }
         Action::Quit => {
-            std::process::exit(0);
+            if let Some(tx) = quit_tx.lock().as_ref() {
+                let _ = tx.send(());
+            } else {
+                warn!("Quit hotkey ignored: no quit channel configured");
+            }
         }
         Action::FocusWorkspace(id) => {
             engine.write().switch_workspace(*id, backend);
@@ -813,6 +876,11 @@ fn execute_action(
         }
         Action::OverviewToggle => {
             engine.write().toggle_overview(backend);
+        }
+        Action::OverviewExit => {
+            if engine.read().is_overview() {
+                engine.write().toggle_overview(backend);
+            }
         }
         Action::OverviewLeft => {
             if engine.read().is_overview() {
@@ -835,7 +903,9 @@ fn execute_action(
             // Maximize the currently focused window
             let fg = unsafe { GetForegroundWindow() };
             if !fg.0.is_null() {
-                unsafe { let _ = ShowWindow(fg, SW_MAXIMIZE); }
+                unsafe {
+                    let _ = ShowWindow(fg, SW_MAXIMIZE);
+                }
                 info!("Maximize: hwnd={:?}", fg);
             } else {
                 warn!("Maximize: no foreground window");
@@ -845,7 +915,9 @@ fn execute_action(
             // Minimize the currently focused window
             let fg = unsafe { GetForegroundWindow() };
             if !fg.0.is_null() {
-                unsafe { let _ = ShowWindow(fg, SW_MINIMIZE); }
+                unsafe {
+                    let _ = ShowWindow(fg, SW_MINIMIZE);
+                }
                 info!("Minimize: hwnd={:?}", fg);
             } else {
                 warn!("Minimize: no foreground window");
@@ -871,11 +943,19 @@ fn execute_action(
                     let y = wa.top + (wa_h - win_h) / 2;
                     unsafe {
                         let _ = SetWindowPos(
-                            fg, HWND_TOP, x, y, win_w, win_h,
+                            fg,
+                            HWND_TOP,
+                            x,
+                            y,
+                            win_w,
+                            win_h,
                             SWP_NOZORDER | SWP_NOACTIVATE,
                         );
                     }
-                    info!("CenterWindow: hwnd={:?} x={} y={} w={} h={}", fg, x, y, win_w, win_h);
+                    info!(
+                        "CenterWindow: hwnd={:?} x={} y={} w={} h={}",
+                        fg, x, y, win_w, win_h
+                    );
                 } else {
                     warn!("CenterWindow: GetMonitorInfoW failed");
                 }
@@ -887,7 +967,9 @@ fn execute_action(
             // which move the focused window across monitors.
             let mut engine_w = engine.write();
             let order: Vec<_> = {
-                let mut v: Vec<_> = engine_w.monitors().iter()
+                let mut v: Vec<_> = engine_w
+                    .monitors()
+                    .iter()
                     .map(|(oid, m)| (m.bounds.loc.x, *oid))
                     .collect();
                 v.sort_by_key(|(x, _)| *x);
@@ -898,7 +980,9 @@ fn execute_action(
             }
             let cur = engine_w.focused_output();
             let next_idx = match cur {
-                Some(oid) => order.iter().position(|(_, o)| *o == oid)
+                Some(oid) => order
+                    .iter()
+                    .position(|(_, o)| *o == oid)
                     .map(|i| (i + 1) % order.len())
                     .unwrap_or(0),
                 None => 0,
@@ -933,11 +1017,15 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::MoveToMonitorLeft => {
-            engine.write().move_window_to_monitor(crate::layout::ScrollDirection::Left, backend);
+            engine
+                .write()
+                .move_window_to_monitor(crate::layout::ScrollDirection::Left, backend);
             engine.write().apply_all(backend);
         }
         Action::MoveToMonitorRight => {
-            engine.write().move_window_to_monitor(crate::layout::ScrollDirection::Right, backend);
+            engine
+                .write()
+                .move_window_to_monitor(crate::layout::ScrollDirection::Right, backend);
             engine.write().apply_all(backend);
         }
         Action::CenterColumn => {
@@ -945,23 +1033,33 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetCycle => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::Cycle, backend);
+            engine
+                .write()
+                .set_column_width_preset(crate::layout::ColumnWidthPreset::Cycle, backend);
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetHalf => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::Half, backend);
+            engine
+                .write()
+                .set_column_width_preset(crate::layout::ColumnWidthPreset::Half, backend);
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetThird => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::OneThird, backend);
+            engine
+                .write()
+                .set_column_width_preset(crate::layout::ColumnWidthPreset::OneThird, backend);
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetTwoThirds => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::TwoThirds, backend);
+            engine
+                .write()
+                .set_column_width_preset(crate::layout::ColumnWidthPreset::TwoThirds, backend);
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetFull => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::Full, backend);
+            engine
+                .write()
+                .set_column_width_preset(crate::layout::ColumnWidthPreset::Full, backend);
             engine.write().apply_all(backend);
         }
         Action::ResizeColumnLeft => {
@@ -973,11 +1071,15 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::FocusWorkspaceNext => {
-            engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Next, backend);
+            engine
+                .write()
+                .focus_workspace_relative(crate::layout::WorkspaceDirection::Next, backend);
             engine.write().apply_all(backend);
         }
         Action::FocusWorkspacePrevious => {
-            engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Previous, backend);
+            engine
+                .write()
+                .focus_workspace_relative(crate::layout::WorkspaceDirection::Previous, backend);
             engine.write().apply_all(backend);
         }
         Action::FocusPrevious => {
@@ -999,11 +1101,15 @@ fn execute_action(
             take_screenshot();
         }
         Action::ColumnWidthPresetQuarter => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::OneQuarter, backend);
+            engine
+                .write()
+                .set_column_width_preset(crate::layout::ColumnWidthPreset::OneQuarter, backend);
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetThreeQuarters => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::ThreeQuarters, backend);
+            engine
+                .write()
+                .set_column_width_preset(crate::layout::ColumnWidthPreset::ThreeQuarters, backend);
             engine.write().apply_all(backend);
         }
         Action::ConsumeWindowIntoColumn => {
@@ -1031,19 +1137,27 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::GrowTileHeight => {
-            engine.write().resize_focused_tile_height_by_percent(5, backend);
+            engine
+                .write()
+                .resize_focused_tile_height_by_percent(5, backend);
             engine.write().apply_all(backend);
         }
         Action::ShrinkTileHeight => {
-            engine.write().resize_focused_tile_height_by_percent(-5, backend);
+            engine
+                .write()
+                .resize_focused_tile_height_by_percent(-5, backend);
             engine.write().apply_all(backend);
         }
         Action::MoveColumnToMonitorLeft => {
-            engine.write().move_column_to_monitor(crate::layout::ScrollDirection::Left, backend);
+            engine
+                .write()
+                .move_column_to_monitor(crate::layout::ScrollDirection::Left, backend);
             engine.write().apply_all(backend);
         }
         Action::MoveColumnToMonitorRight => {
-            engine.write().move_column_to_monitor(crate::layout::ScrollDirection::Right, backend);
+            engine
+                .write()
+                .move_column_to_monitor(crate::layout::ScrollDirection::Right, backend);
             engine.write().apply_all(backend);
         }
         Action::WindowScreenshot => {
@@ -1080,10 +1194,11 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::SetWorkspaceLayout(mode) => {
-            // TODO(audit): need set_workspace_layout helper on TilingEngine.
-            // The engine agent may add engine.set_workspace_layout(id, mode).
-            // Until then, log the intent and no-op so the action arm is wired.
-            warn!("SetWorkspaceLayout({}): not yet wired — set_workspace_layout helper missing", mode);
+            let mut eng = engine.write();
+            match eng.set_workspace_layout(&mode) {
+                Ok(()) => eng.apply_all(backend),
+                Err(err) => warn!("SetWorkspaceLayout({}): {}", mode, err),
+            }
         }
         Action::RenameWorkspace(name) => {
             // Rename the currently-focused workspace.
@@ -1164,7 +1279,9 @@ fn take_screenshot() {
 fn spawn_process(cmd: &str) {
     use std::os::windows::process::CommandExt;
     let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.is_empty() { return; }
+    if parts.is_empty() {
+        return;
+    }
     // CREATE_NO_WINDOW = 0x08000000 — prevents console-subsystem children
     // (like wiri-ctl, or any user-defined keybind action that resolves to a
     // console exe) from popping a visible cmd window.

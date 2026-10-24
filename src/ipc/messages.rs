@@ -43,7 +43,6 @@ impl From<serde_json::Error> for IpcError {
 #[serde(tag = "type", content = "data")]
 pub enum IpcMessage {
     // ---- Window Management ----
-
     /// Force `window_hwnd` into the tiling layout, un-floating it if necessary.
     /// Optionally moves it to the named workspace afterwards.
     #[serde(rename = "tile_request")]
@@ -54,11 +53,7 @@ pub enum IpcMessage {
 
     /// Move `window_hwnd` to the absolute screen position (`x`, `y`).
     #[serde(rename = "window_move")]
-    WindowMove {
-        window_hwnd: isize,
-        x: i32,
-        y: i32,
-    },
+    WindowMove { window_hwnd: isize, x: i32, y: i32 },
 
     /// Resize `window_hwnd` to the given pixel dimensions.
     #[serde(rename = "window_resize")]
@@ -74,9 +69,7 @@ pub enum IpcMessage {
 
     /// Search tracked windows by title substring. Returns matching windows.
     #[serde(rename = "window_find")]
-    WindowFind {
-        query: String,
-    },
+    WindowFind { query: String },
 
     /// Set keyboard focus to `window_hwnd`.
     #[serde(rename = "focus_window")]
@@ -102,7 +95,6 @@ pub enum IpcMessage {
     },
 
     // ---- Workspace Management ----
-
     /// List all active workspaces (one per monitor). Returns an array of `WorkspaceInfo`.
     #[serde(rename = "workspace_list")]
     WorkspaceList,
@@ -120,7 +112,6 @@ pub enum IpcMessage {
     SwitchWorkspace { id: i32 },
 
     // ---- Layout Presets ----
-
     /// List all saved layout presets by name.
     #[serde(rename = "preset_list")]
     PresetList,
@@ -142,14 +133,15 @@ pub enum IpcMessage {
     LayoutExport,
 
     // ---- Niri-parity Layout Commands ----
-
     /// Move the focused window to the given workspace id.
     #[serde(rename = "move_window_to_workspace")]
     MoveWindowToWorkspace { workspace_id: i32 },
 
     /// Move the focused window to the monitor in the given direction (`"left"` or `"right"`).
     #[serde(rename = "move_window_to_monitor")]
-    MoveWindowToMonitor { direction: String /* "left" or "right" */ },
+    MoveWindowToMonitor {
+        direction: String, /* "left" or "right" */
+    },
 
     /// Scroll the focused column to the horizontal center of the work area.
     #[serde(rename = "center_column")]
@@ -157,7 +149,9 @@ pub enum IpcMessage {
 
     /// Set the focused column to a width preset (`"1/3"`, `"1/2"`, `"2/3"`, `"full"`, `"cycle"`).
     #[serde(rename = "set_column_width")]
-    SetColumnWidth { preset: String /* "1/3", "1/2", "2/3", "full", "cycle" */ },
+    SetColumnWidth {
+        preset: String, /* "1/3", "1/2", "2/3", "full", "cycle" */
+    },
 
     /// Resize the focused column by `delta_px` pixels (positive = wider, negative = narrower).
     #[serde(rename = "resize_column")]
@@ -176,7 +170,6 @@ pub enum IpcMessage {
     SpawnCommand { command: String },
 
     // ---- Niri-parity Round-2 ----
-
     /// Focus the previously focused window using the MRU history (like Alt+Tab).
     #[serde(rename = "focus_previous")]
     FocusPrevious,
@@ -225,7 +218,6 @@ pub enum IpcMessage {
     MoveColumnToMonitor { direction: String },
 
     // ---- Diagnostics ----
-
     /// Enumerate every monitor the engine currently tracks, returning
     /// per-monitor geometry (bounds, work area), DPI scale factor, the
     /// currently active workspace id, and the active focused-output marker.
@@ -244,7 +236,6 @@ pub enum IpcMessage {
     ListBindings,
 
     // ---- System ----
-
     /// Return the full engine state: managed windows, workspaces, and the active workspace name.
     #[serde(rename = "get_state")]
     GetState,
@@ -253,9 +244,7 @@ pub enum IpcMessage {
     /// streams newline-delimited JSON events until the client disconnects.
     /// An empty `event_types` list (or `["*"]`) subscribes to all event types.
     #[serde(rename = "subscribe_events")]
-    SubscribeEvents {
-        event_types: Vec<String>,
-    },
+    SubscribeEvents { event_types: Vec<String> },
 
     /// Hot-reload `config.kdl` without restarting the daemon.
     /// A `config_loaded` event is broadcast after a successful reload.
@@ -321,7 +310,6 @@ pub enum IpcMessage {
     MoveWorkspaceDown,
 
     // ---- Round-4 parity ----
-
     /// Toggle sticky (visible on all workspaces) for the focused window.
     /// A sticky window appears on every workspace on its monitor.
     #[serde(rename = "toggle_sticky")]
@@ -454,10 +442,7 @@ pub enum IpcEvent {
     WindowUrgent { window_hwnd: isize, urgent: bool },
     /// Emitted when the active workspace on a monitor changes.
     #[serde(rename = "workspace_switched")]
-    WorkspaceSwitched {
-        workspace_id: i32,
-        monitor_id: u64,
-    },
+    WorkspaceSwitched { workspace_id: i32, monitor_id: u64 },
     /// Emitted when the focused column changes (derived from ForegroundChanged).
     #[serde(rename = "column_focused")]
     ColumnFocused {
@@ -548,7 +533,11 @@ mod tests {
             path: Some(r"C:\tmp\out.bmp".to_string()),
         };
         let raw = serde_json::to_string(&msg).expect("serialize");
-        assert!(raw.contains("capture_window"), "tag should be capture_window: {}", raw);
+        assert!(
+            raw.contains("capture_window"),
+            "tag should be capture_window: {}",
+            raw
+        );
         let parsed: IpcMessage = serde_json::from_str(&raw).expect("deserialize");
         match parsed {
             IpcMessage::CaptureWindow { window_hwnd, path } => {

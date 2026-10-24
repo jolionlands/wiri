@@ -5,7 +5,9 @@ pub struct OutputId(u64);
 
 impl OutputId {
     pub fn from_name(name: &str) -> Self {
-        let hash = name.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        let hash = name
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
         Self(hash)
     }
 

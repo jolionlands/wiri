@@ -4,22 +4,26 @@
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use wiri::backend::{Backend, BackendEvent};
 use wiri::backend::message_loop::MessageLoop;
-use wiri::config::{Config, loader::ConfigLoader};
+use wiri::backend::{Backend, BackendEvent, BackendHandle, MonitorInfo as BackendMonitorInfo};
+use wiri::config::{loader::ConfigLoader, Config};
 use wiri::hooks::{SystemIntegration, TrayAction};
-use wiri::layout::{TilingEngine, LayoutConfig};
-use wiri::input::{MouseTracker, MouseFocusConfig, start_mouse_hook, stop_mouse_hook, apply_mouse_config};
-use wiri::ipc::{IpcServer, IpcEvent, WindowInfoIpc};
-use wiri::overlay::{BindingsCheatsheet, OverviewBanner, StatusBar, StatusBarContent, WorkspaceIndicator};
-use wiri::utils::WindowId;
+use wiri::input::{
+    apply_mouse_config, start_mouse_hook, stop_mouse_hook, MouseFocusConfig, MouseTracker,
+};
+use wiri::ipc::{IpcEvent, IpcServer, WindowInfoIpc};
+use wiri::layout::{LayoutConfig, TilingEngine};
+use wiri::overlay::{
+    BindingsCheatsheet, OverviewBanner, StatusBar, StatusBarContent, WorkspaceIndicator,
+};
+use wiri::utils::{OutputId, WindowId};
 
 use parking_lot::RwLock;
 
@@ -73,7 +77,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    
     // // Single-instance check: warn if hotkeys may conflict
     // (RegisterHotKey will fail if another process has the same key combo)
     let args = Args::parse();
@@ -171,11 +174,14 @@ async fn main() -> Result<()> {
                 if !path.exists() {
                     if let Err(e) = std::fs::create_dir_all(&dir) {
                         warn!("Could not create {}: {}", dir.display(), e);
-                    } else if let Err(e) = std::fs::write(
-                        &path,
-                        include_str!("../resources/default_config.kdl"),
-                    ) {
-                        warn!("Could not write default config to {}: {}", path.display(), e);
+                    } else if let Err(e) =
+                        std::fs::write(&path, include_str!("../resources/default_config.kdl"))
+                    {
+                        warn!(
+                            "Could not write default config to {}: {}",
+                            path.display(),
+                            e
+                        );
                     } else {
                         info!("Wrote default config to {}", path.display());
                     }
@@ -203,7 +209,10 @@ async fn main() -> Result<()> {
     let mut config_loader = ConfigLoader::new(config_path.clone());
     let mut config_reload_rx = config_loader.subscribe();
     if let Err(e) = config_loader.start_watching() {
-        warn!("Config watcher could not start: {} (live-reload disabled)", e);
+        warn!(
+            "Config watcher could not start: {} (live-reload disabled)",
+            e
+        );
     }
 
     // Spawn programs listed in spawn-at-startup config entries (niri parity).
@@ -246,8 +255,8 @@ async fn main() -> Result<()> {
             monitor.bounds.loc.x,
             monitor.bounds.loc.y,
             if monitor.is_primary { "[primary]" } else { "" },
-                monitor.scale_factor * 100.0
-            );
+            monitor.scale_factor * 100.0
+        );
     }
 
     // Initialize tiling engine
@@ -257,7 +266,8 @@ async fn main() -> Result<()> {
     // The engine can opt-in to dispatching ops over this channel via
     // `engine.dispatch_request(...)`. Direct calls still work today; the channel
     // is set up so future async/throttled paths can use it without restructuring.
-    let (layout_req_tx, mut layout_req_rx) = tokio::sync::mpsc::unbounded_channel::<wiri::backend::LayoutRequest>();
+    let (layout_req_tx, mut layout_req_rx) =
+        tokio::sync::mpsc::unbounded_channel::<wiri::backend::LayoutRequest>();
     {
         let drain_handle = backend.handle();
         tokio::spawn(async move {
@@ -301,9 +311,11 @@ async fn main() -> Result<()> {
         // Physical repositioning via CCD APIs is out of scope on Windows.
         for (idx, monitor) in monitors.iter().enumerate() {
             // Find a matching OutputConfig: prefer name match, fall back to index.
-            let cfg_output = config.output.iter().find(|o| {
-                !o.name.is_empty() && (o.name == monitor.name)
-            }).or_else(|| config.output.get(idx));
+            let cfg_output = config
+                .output
+                .iter()
+                .find(|o| !o.name.is_empty() && (o.name == monitor.name))
+                .or_else(|| config.output.get(idx));
 
             let mut effective_scale = monitor.scale_factor;
             let mut skip = false;
@@ -312,7 +324,9 @@ async fn main() -> Result<()> {
                 if !out_cfg.enable {
                     info!("Skipping disabled output: {}", monitor.name);
                     skip = true;
-                } else if out_cfg.scale != 0.0 && (out_cfg.scale - monitor.scale_factor).abs() > 1e-6 {
+                } else if out_cfg.scale != 0.0
+                    && (out_cfg.scale - monitor.scale_factor).abs() > 1e-6
+                {
                     info!(
                         "Output {}: overriding scale {:.2} → {:.2} (from config)",
                         monitor.name, monitor.scale_factor, out_cfg.scale
@@ -322,7 +336,12 @@ async fn main() -> Result<()> {
             }
 
             if !skip {
-                engine.register_monitor_with_scale(monitor.id, monitor.bounds, monitor.work_area, effective_scale);
+                engine.register_monitor_with_scale(
+                    monitor.id,
+                    monitor.bounds,
+                    monitor.work_area,
+                    effective_scale,
+                );
             }
         }
     }
@@ -332,18 +351,14 @@ async fn main() -> Result<()> {
 
     // Start message loop with hotkey handling
     let message_loop = MessageLoop::new()?;
-    message_loop.start_hotkey_loop(
-        engine.clone(),
-        backend.handle(),
-    );
+    let (hotkey_quit_tx, hotkey_quit_rx) = std::sync::mpsc::channel::<()>();
+    message_loop.set_quit_sender(hotkey_quit_tx);
+    message_loop.start_hotkey_loop(engine.clone(), backend.handle());
     info!("Hotkeys registered and message loop started");
 
-// Start low-level mouse hook for interactive move/resize
-start_mouse_hook(
-    engine.clone(),
-    backend.handle(),
-).map_err(|e| anyhow::anyhow!("{}", e))?;
-info!("Mouse hook installed");
+    // Start low-level mouse hook for interactive move/resize
+    start_mouse_hook(engine.clone(), backend.handle()).map_err(|e| anyhow::anyhow!("{}", e))?;
+    info!("Mouse hook installed");
 
     // Tile existing windows
     {
@@ -360,7 +375,9 @@ info!("Mouse hook installed");
         }
         for window in windows {
             // Initial enumeration: at_startup=true so window rules with `at-startup` matchers fire.
-            engine.write().add_window_at_startup(window, &backend_handle);
+            engine
+                .write()
+                .add_window_at_startup(window, &backend_handle);
         }
         engine.write().apply_all(&backend_handle);
     }
@@ -373,7 +390,10 @@ info!("Mouse hook installed");
         use wiri::hooks::StartupManager;
         let sm = StartupManager::new();
         if sm.is_registered() {
-            info!("Autostart: registered ({})", sm.get_registered_path().unwrap_or_default());
+            info!(
+                "Autostart: registered ({})",
+                sm.get_registered_path().unwrap_or_default()
+            );
         } else {
             info!("Autostart: not registered (use --register-autostart to enable)");
         }
@@ -396,6 +416,8 @@ info!("Mouse hook installed");
     ipc_server.set_backend(backend.handle());
     let (ipc_shutdown_tx, ipc_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     ipc_server.set_shutdown_sender(ipc_shutdown_tx);
+    let (ipc_reload_tx, mut ipc_reload_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    ipc_server.set_reload_sender(ipc_reload_tx);
     let ipc_server = Arc::new(ipc_server);
     let ipc_server_clone = ipc_server.clone();
     tokio::spawn(async move {
@@ -422,6 +444,20 @@ info!("Mouse hook installed");
         }
     });
 
+    // Periodic reconciliation catches windows that missed CREATE/SHOW events
+    // (common with launchers) and reasserts workspace visibility if the shell
+    // re-shows a hidden inactive-workspace HWND behind wiri's back.
+    let handle_reconcile = handle.clone();
+    let engine_reconcile = engine.clone();
+    let ipc_server_reconcile = ipc_server.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(750));
+        loop {
+            interval.tick().await;
+            reconcile_visible_windows(&handle_reconcile, &engine_reconcile, &ipc_server_reconcile);
+        }
+    });
+
     // Mouse focus tracking. `focus_follows_mouse` is a flat boolean on the
     // InputConfig; user toggles it in their KDL config under `input { ... }`.
     let mouse_config = MouseFocusConfig {
@@ -442,7 +478,8 @@ info!("Mouse hook installed");
                     let pos = tracker.cursor_pos();
                     // Find which monitor the cursor is on
                     let eng = mouse_engine.read();
-                    let monitors_map: std::collections::HashMap<_, _> = eng.monitors()
+                    let monitors_map: std::collections::HashMap<_, _> = eng
+                        .monitors()
                         .iter()
                         .map(|(oid, m)| (*oid, (m.bounds, m.work_area)))
                         .collect();
@@ -453,10 +490,12 @@ info!("Mouse hook installed");
                             if let Some(workspace) = monitor.workspace() {
                                 for (col_idx, col) in workspace.columns.iter().enumerate() {
                                     for tile in &col.tiles {
-                                        if let Some(info) = eng.tiled_windows().get(&tile.window_id) {
+                                        if let Some(info) = eng.tiled_windows().get(&tile.window_id)
+                                        {
                                             if info.bounds.contains_point(pos) {
                                                 if monitor.focus_window != Some(tile.window_id) {
-                                                    found_window = Some((tile.window_id, col_idx, output_id));
+                                                    found_window =
+                                                        Some((tile.window_id, col_idx, output_id));
                                                 }
                                                 break;
                                             }
@@ -520,29 +559,40 @@ info!("Mouse hook installed");
                 let (workspace_label, focused_title) = {
                     let eng = sb_engine.read();
 
-                    let ws_label = eng.monitors().focused().map(|m| {
-                        let ws_id = m.active_workspace_id();
-                        // Try configured workspace name; fall back to "Workspace N".
-                        eng.full_config()
-                            .and_then(|c| {
-                                c.workspace
-                                    .iter()
-                                    .enumerate()
-                                    .find(|(idx, w)| {
-                                        *idx as i32 == ws_id
-                                            || w.name == ws_id.to_string()
-                                    })
-                                    .and_then(|(_, w)| {
-                                        if w.name.is_empty() { None } else { Some(w.name.clone()) }
-                                    })
-                            })
-                            .unwrap_or_else(|| format!("[{}]", ws_id + 1))
-                    }).unwrap_or_default();
+                    let ws_label = eng
+                        .monitors()
+                        .focused()
+                        .map(|m| {
+                            let ws_id = m.active_workspace_id();
+                            // Try configured workspace name; fall back to "Workspace N".
+                            eng.full_config()
+                                .and_then(|c| {
+                                    c.workspace
+                                        .iter()
+                                        .enumerate()
+                                        .find(|(idx, w)| {
+                                            *idx as i32 == ws_id || w.name == ws_id.to_string()
+                                        })
+                                        .and_then(|(_, w)| {
+                                            if w.name.is_empty() {
+                                                None
+                                            } else {
+                                                Some(w.name.clone())
+                                            }
+                                        })
+                                })
+                                .unwrap_or_else(|| format!("[{}]", ws_id + 1))
+                        })
+                        .unwrap_or_default();
 
                     // Focused window title from the focused monitor's focus_window.
-                    let title = eng.monitors().focused()
+                    let title = eng
+                        .monitors()
+                        .focused()
                         .and_then(|m| m.focus_window)
-                        .and_then(|wid| eng.tiled_windows().get(&wid).map(|info| info.title.clone()))
+                        .and_then(|wid| {
+                            eng.tiled_windows().get(&wid).map(|info| info.title.clone())
+                        })
                         .unwrap_or_default();
 
                     (ws_label, title)
@@ -631,7 +681,9 @@ info!("Mouse hook installed");
                             c.workspace
                                 .iter()
                                 .enumerate()
-                                .find(|(idx, w)| *idx as i32 == ws_id || w.name == ws_id.to_string())
+                                .find(|(idx, w)| {
+                                    *idx as i32 == ws_id || w.name == ws_id.to_string()
+                                })
                                 .and_then(|(_, w)| {
                                     if w.name.is_empty() {
                                         None
@@ -644,13 +696,17 @@ info!("Mouse hook installed");
                     // Show the overlay centred over the focused monitor so it
                     // lands on the screen the user is looking at — falls back
                     // to the primary monitor if no focused monitor is set.
-                    let focused_bounds = engine.read().monitors().focused()
-                        .map(|m| wiri::overlay::MonitorBounds {
-                            x: m.bounds.loc.x,
-                            y: m.bounds.loc.y,
-                            w: m.bounds.size.w as i32,
-                            h: m.bounds.size.h as i32,
-                        });
+                    let focused_bounds =
+                        engine
+                            .read()
+                            .monitors()
+                            .focused()
+                            .map(|m| wiri::overlay::MonitorBounds {
+                                x: m.bounds.loc.x,
+                                y: m.bounds.loc.y,
+                                w: m.bounds.size.w as i32,
+                                h: m.bounds.size.h as i32,
+                            });
                     match focused_bounds {
                         Some(b) => overlay.show_at(&label, b),
                         None => overlay.show(&label),
@@ -680,30 +736,50 @@ info!("Mouse hook installed");
         match config_reload_rx.try_recv() {
             Ok(new_config) => {
                 info!("Config file changed — reloading");
-                let new_layout_config = LayoutConfig::from_config(&new_config);
-                apply_mouse_config(&new_config.input);
-                engine.write().update_config(new_layout_config);
-                engine.write().set_full_config(new_config);
-                engine.write().apply_all(&handle);
-                message_loop.reload_hotkeys();
+                apply_loaded_config(new_config, &engine, &handle, &message_loop, &mouse_tracker);
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                warn!("Config reload channel lagged {} events — reloading from disk", n);
-                if let Ok(new_config) = Config::load(&config_path) {
-                    let new_layout_config = LayoutConfig::from_config(&new_config);
-                    apply_mouse_config(&new_config.input);
-                    engine.write().update_config(new_layout_config);
-                    engine.write().set_full_config(new_config);
-                    engine.write().apply_all(&handle);
-                    message_loop.reload_hotkeys();
-                }
+                warn!(
+                    "Config reload channel lagged {} events — reloading from disk",
+                    n
+                );
+                reload_config_from_disk(
+                    &config_path,
+                    &engine,
+                    &handle,
+                    &message_loop,
+                    &mouse_tracker,
+                );
             }
             Err(_) => {} // Empty or closed — normal
+        }
+
+        // Handle IPC-initiated config reloads.
+        loop {
+            match ipc_reload_rx.try_recv() {
+                Ok(()) => {
+                    info!("IPC: Reloading config from disk");
+                    reload_config_from_disk(
+                        &config_path,
+                        &engine,
+                        &handle,
+                        &message_loop,
+                        &mouse_tracker,
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
 
         // Check for IPC-initiated graceful shutdown
         if let Ok(()) = ipc_shutdown_rx.try_recv() {
             info!("Shutting down (IPC Quit)...");
+            break 'main;
+        }
+
+        if hotkey_quit_rx.try_recv().is_ok() {
+            info!("Shutting down (hotkey)...");
             break 'main;
         }
 
@@ -719,12 +795,7 @@ info!("Mouse hook installed");
                     *hidden = !*hidden;
                     let show = !*hidden;
                     info!("Tray: Show/Hide → {}", if show { "show" } else { "hide" });
-                    let wids: Vec<_> = engine
-                        .read()
-                        .tiled_windows()
-                        .keys()
-                        .copied()
-                        .collect();
+                    let wids: Vec<_> = engine.read().tiled_windows().keys().copied().collect();
                     for wid in wids {
                         let _ = handle.show_window(wid.as_isize(), show);
                     }
@@ -734,20 +805,13 @@ info!("Mouse hook installed");
                     // Tray reload bypasses the file-watcher channel (used for explicit
                     // user-driven reloads, e.g. after editing the file in a different
                     // editor) — load directly from disk and re-apply everything.
-                    match Config::load(&config_path) {
-                        Ok(new_config) => {
-                            let new_layout_config = LayoutConfig::from_config(&new_config);
-                            apply_mouse_config(&new_config.input);
-                            engine.write().update_config(new_layout_config);
-                            engine.write().set_full_config(new_config.clone());
-                            engine.write().apply_all(&handle);
-                            message_loop.reload_hotkeys();
-                            info!("Config reloaded successfully");
-                        }
-                        Err(e) => {
-                            warn!("Config reload failed: {}", e);
-                        }
-                    }
+                    reload_config_from_disk(
+                        &config_path,
+                        &engine,
+                        &handle,
+                        &message_loop,
+                        &mouse_tracker,
+                    );
                 }
                 TrayAction::Quit => {
                     info!("Quit requested via tray icon");
@@ -811,6 +875,126 @@ info!("Mouse hook installed");
     Ok(())
 }
 
+fn reload_config_from_disk(
+    config_path: &Path,
+    engine: &Arc<RwLock<TilingEngine>>,
+    handle: &BackendHandle,
+    message_loop: &MessageLoop,
+    mouse_tracker: &Arc<RwLock<MouseTracker>>,
+) -> bool {
+    match Config::load(config_path) {
+        Ok(new_config) => {
+            apply_loaded_config(new_config, engine, handle, message_loop, mouse_tracker);
+            info!("Config reloaded successfully");
+            true
+        }
+        Err(e) => {
+            warn!("Config reload failed: {}", e);
+            false
+        }
+    }
+}
+
+fn apply_loaded_config(
+    new_config: Config,
+    engine: &Arc<RwLock<TilingEngine>>,
+    handle: &BackendHandle,
+    message_loop: &MessageLoop,
+    mouse_tracker: &Arc<RwLock<MouseTracker>>,
+) {
+    let new_layout_config = LayoutConfig::from_config(&new_config);
+    let mouse_config = MouseFocusConfig {
+        focus_follows_mouse: new_config.input.focus_follows_mouse,
+        warp_on_focus: false,
+        focus_delay_ms: 200,
+        raise_on_click: true,
+    };
+
+    apply_mouse_config(&new_config.input);
+    mouse_tracker.write().set_config(mouse_config);
+    {
+        let mut engine = engine.write();
+        engine.update_config(new_layout_config);
+        engine.set_full_config(new_config);
+        engine.apply_all(handle);
+    }
+    message_loop.reload_hotkeys();
+}
+
+fn configured_monitor_scale(
+    config: Option<&Config>,
+    monitor: &BackendMonitorInfo,
+    index: usize,
+) -> Option<f64> {
+    let mut effective_scale = monitor.scale_factor;
+
+    if let Some(config) = config {
+        let cfg_output = config
+            .output
+            .iter()
+            .find(|o| !o.name.is_empty() && o.name == monitor.name)
+            .or_else(|| config.output.get(index));
+
+        if let Some(out_cfg) = cfg_output {
+            if !out_cfg.enable {
+                return None;
+            }
+            if out_cfg.scale != 0.0 {
+                effective_scale = out_cfg.scale;
+            }
+        }
+    }
+
+    Some(effective_scale)
+}
+
+fn sync_monitors_from_backend(
+    handle: &BackendHandle,
+    engine: &Arc<RwLock<TilingEngine>>,
+    ipc_server: &Arc<IpcServer>,
+) {
+    let backend_monitors = handle.get_monitors();
+    let config = engine.read().full_config().cloned();
+    {
+        let mut engine = engine.write();
+        let detected_ids: Vec<_> = backend_monitors.iter().map(|m| m.id).collect();
+        let to_remove: Vec<_> = engine
+            .monitors()
+            .keys()
+            .filter(|oid| !detected_ids.contains(*oid))
+            .copied()
+            .collect();
+
+        for oid in to_remove {
+            engine.unregister_monitor(&oid);
+        }
+
+        for (idx, monitor) in backend_monitors.iter().enumerate() {
+            match configured_monitor_scale(config.as_ref(), monitor, idx) {
+                Some(scale) => engine.sync_monitor_with_scale(
+                    monitor.id,
+                    monitor.bounds,
+                    monitor.work_area,
+                    scale,
+                ),
+                None => {
+                    if engine.monitors().contains_key(&monitor.id) {
+                        engine.unregister_monitor(&monitor.id);
+                    }
+                }
+            }
+        }
+
+        engine.apply_all(handle);
+    }
+
+    for monitor in backend_monitors {
+        ipc_server.broadcast_event(IpcEvent::MonitorChanged {
+            monitor_name: monitor.name,
+        });
+    }
+}
+
 fn print_help() {
     info!("══════════════════════════════════════════");
     info!("Navigation │ Ctrl+Alt+←/→ Focus columns");
@@ -852,32 +1036,7 @@ fn handle_backend_event(
             // Most windows fail `should_tile_window` at CREATE time because the
             // title/visibility aren't set yet — that's expected; SHOW/NAMECHANGE
             // re-trigger this path. Guard against double-add in case both fire.
-            if let Some(window) = handle.get_window(hwnd) {
-                if should_tile_window(&window) {
-                    let window_id = WindowId::new(hwnd);
-                    let already_tiled = engine
-                        .read()
-                        .tiled_windows()
-                        .contains_key(&window_id);
-                    if !already_tiled {
-                        info!("+ {} ({})", window.title, window.class_name);
-                        ipc_server.broadcast_event(IpcEvent::WindowOpened {
-                            window: WindowInfoIpc {
-                                hwnd,
-                                title: window.title.clone(),
-                                class_name: window.class_name.clone(),
-                                process_id: window.process_id,
-                                x: window.bounds.loc.x,
-                                y: window.bounds.loc.y,
-                                width: window.bounds.size.w,
-                                height: window.bounds.size.h,
-                            },
-                        });
-                        engine.write().add_window(window, handle);
-                        engine.write().apply_all(handle);
-                    }
-                }
-            }
+            add_window_if_tileable(hwnd, "", handle, engine, ipc_server);
         }
         BackendEvent::WindowDestroyed { hwnd } => {
             info!("- Window {}", hwnd);
@@ -892,87 +1051,19 @@ fn handle_backend_event(
             // (we re-emit Shown from there to retry classification of windows
             // that had an empty title at CREATE time). Without this guard we
             // would add the same HWND to a new column every time.
-            if let Some(window) = handle.get_window(hwnd) {
-                if should_tile_window(&window) {
-                    let window_id = WindowId::new(hwnd);
-                    let already_tiled = engine
-                        .read()
-                        .tiled_windows()
-                        .contains_key(&window_id);
-                    if !already_tiled {
-                        info!("+ {} ({}) [via show/namechange]", window.title, window.class_name);
-                        ipc_server.broadcast_event(IpcEvent::WindowOpened {
-                            window: WindowInfoIpc {
-                                hwnd,
-                                title: window.title.clone(),
-                                class_name: window.class_name.clone(),
-                                process_id: window.process_id,
-                                x: window.bounds.loc.x,
-                                y: window.bounds.loc.y,
-                                width: window.bounds.size.w,
-                                height: window.bounds.size.h,
-                            },
-                        });
-                        engine.write().add_window(window, handle);
-                        engine.write().apply_all(handle);
-                    }
-                }
-            }
+            add_window_if_tileable(hwnd, "via show/namechange", handle, engine, ipc_server);
         }
         BackendEvent::WindowHidden { hwnd } => {
-            ipc_server.broadcast_event(IpcEvent::WindowClosed { window_hwnd: hwnd });
-            engine.write().remove_window(WindowId::new(hwnd), handle);
-            engine.write().apply_all(handle);
+            debug!("Window {} hidden", hwnd);
         }
-        BackendEvent::MonitorConnected { .. } => {
-            for monitor in handle.get_monitors() {
-                if !engine.read().monitors().contains_key(&monitor.id) {
-                    engine.write().register_monitor(monitor.id, monitor.bounds, monitor.work_area);
-                }
-                ipc_server.broadcast_event(IpcEvent::MonitorChanged {
-                    monitor_name: monitor.name.clone(),
-                });
-            }
-            engine.write().apply_all(handle);
-        }
-        BackendEvent::MonitorDisconnected { .. } => {
-            let to_remove: Vec<_> = engine
-                .read()
-                .monitors()
-                .keys()
-                .filter(|oid| !handle.get_monitors().iter().any(|m| m.id == **oid))
-                .cloned()
-                .collect();
-            for oid in to_remove {
-                engine.write().unregister_monitor(&oid);
-            }
-            engine.write().apply_all(handle);
+        BackendEvent::MonitorConnected { .. } | BackendEvent::MonitorDisconnected { .. } => {
+            sync_monitors_from_backend(handle, engine, ipc_server);
         }
         BackendEvent::ForegroundChanged { hwnd } => {
             let window_id = WindowId::new(hwnd);
+            add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
             ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
-            let mut eng = engine.write();
-            // Track which monitor/column gained focus and emit ColumnFocused.
-            let mut focused_col: Option<(usize, i32)> = None;
-            for (_, monitor) in eng.monitors_mut().iter_mut() {
-                if monitor
-                    .workspace()
-                    .and_then(|w| w.find_window_column(window_id))
-                    .is_some()
-                {
-                    monitor.focus_window = Some(window_id);
-                    if let Some(col_idx) =
-                        monitor.workspace().and_then(|w| w.find_window_column(window_id))
-                    {
-                        monitor.focus_column = Some(col_idx);
-                        let ws_id = monitor.active_workspace_id();
-                        focused_col = Some((col_idx, ws_id));
-                    }
-                    break;
-                }
-            }
-            drop(eng);
-            if let Some((col_idx, ws_id)) = focused_col {
+            if let Some((col_idx, ws_id)) = focus_tiled_window(window_id, handle, engine) {
                 ipc_server.broadcast_event(IpcEvent::ColumnFocused {
                     window_hwnd: hwnd,
                     column_index: col_idx,
@@ -1050,6 +1141,138 @@ fn handle_backend_event(
     }
 }
 
+fn live_window_info(handle: &BackendHandle, hwnd: isize) -> Option<wiri::backend::WindowInfo> {
+    let hwnd_win = windows::Win32::Foundation::HWND(hwnd as *mut std::ffi::c_void);
+    if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd_win).as_bool() } {
+        return None;
+    }
+
+    let window = wiri::backend::WindowInfo::new(hwnd_win);
+    handle.update_window(hwnd, window.clone());
+    Some(window)
+}
+
+fn add_window_if_tileable(
+    hwnd: isize,
+    source: &str,
+    handle: &BackendHandle,
+    engine: &Arc<RwLock<TilingEngine>>,
+    ipc_server: &Arc<IpcServer>,
+) -> bool {
+    let window_id = WindowId::new(hwnd);
+    if engine.read().tiled_windows().contains_key(&window_id) {
+        return false;
+    }
+
+    let Some(window) = live_window_info(handle, hwnd) else {
+        return false;
+    };
+
+    if !should_tile_window(&window) {
+        return false;
+    }
+
+    if source.is_empty() {
+        info!("+ {} ({})", window.title, window.class_name);
+    } else {
+        info!("+ {} ({}) [{}]", window.title, window.class_name, source);
+    }
+
+    ipc_server.broadcast_event(IpcEvent::WindowOpened {
+        window: WindowInfoIpc {
+            hwnd,
+            title: window.title.clone(),
+            class_name: window.class_name.clone(),
+            process_id: window.process_id,
+            x: window.bounds.loc.x,
+            y: window.bounds.loc.y,
+            width: window.bounds.size.w,
+            height: window.bounds.size.h,
+        },
+    });
+
+    let mut eng = engine.write();
+    eng.add_window(window, handle);
+    eng.apply_all(handle);
+    true
+}
+
+fn reconcile_visible_windows(
+    handle: &BackendHandle,
+    engine: &Arc<RwLock<TilingEngine>>,
+    ipc_server: &Arc<IpcServer>,
+) {
+    let visible_windows = handle.refresh_visible_windows();
+    let mut added_any = false;
+
+    for window in visible_windows {
+        let window_id = WindowId::new(window.hwnd);
+        if engine.read().tiled_windows().contains_key(&window_id) {
+            continue;
+        }
+        if should_tile_window(&window) {
+            added_any |=
+                add_window_if_tileable(window.hwnd, "via reconcile", handle, engine, ipc_server);
+        }
+    }
+
+    if !added_any {
+        // Re-hide any inactive-workspace windows that Windows re-shown outside
+        // wiri's model. try_write keeps this maintenance loop from blocking IPC
+        // or hotkey handlers.
+        if let Some(mut eng) = engine.try_write() {
+            eng.apply_all(handle);
+        }
+    }
+}
+
+fn tiled_window_location(
+    engine: &TilingEngine,
+    window_id: WindowId,
+) -> Option<(OutputId, i32, usize)> {
+    for (output_id, monitor) in engine.monitors().iter() {
+        for (workspace_id, workspace) in &monitor.workspaces {
+            for (column_idx, column) in workspace.columns.iter().enumerate() {
+                if column.tiles.iter().any(|tile| tile.window_id == window_id) {
+                    return Some((*output_id, *workspace_id, column_idx));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn focus_tiled_window(
+    window_id: WindowId,
+    handle: &BackendHandle,
+    engine: &Arc<RwLock<TilingEngine>>,
+) -> Option<(usize, i32)> {
+    let (output_id, workspace_id, column_idx) = {
+        let eng = engine.read();
+        tiled_window_location(&eng, window_id)?
+    };
+
+    let mut eng = engine.write();
+    let did_focus = {
+        let monitor = eng.monitors_mut().get_mut(&output_id)?;
+        if monitor.active_workspace_id() != workspace_id {
+            monitor.switch_workspace(workspace_id);
+        }
+        monitor.focus_window = Some(window_id);
+        monitor.focus_column = Some(column_idx);
+        monitor.focus_ring.push(window_id);
+        true
+    };
+
+    if did_focus {
+        eng.monitors_mut().set_focused(output_id);
+        eng.apply_all(handle);
+        Some((column_idx, workspace_id))
+    } else {
+        None
+    }
+}
+
 /// Determine if a window should be managed by the tiling engine
 fn should_tile_window(window: &wiri::backend::WindowInfo) -> bool {
     // Skip windows with empty titles (usually system/utility windows)
@@ -1065,20 +1288,20 @@ fn should_tile_window(window: &wiri::backend::WindowInfo) -> bool {
     // inner Windows.UI.Core.CoreWindow is still skipped below (correct
     // granularity — ApplicationFrameWindow is the OUTER top-level we want).
     let skip_classes = [
-        "Shell_TrayWnd",          // Taskbar
-        "Shell_SecondaryTrayWnd", // Secondary taskbar
-        "Progman",                 // Desktop
-        "WorkerW",                 // Desktop worker
+        "Shell_TrayWnd",                               // Taskbar
+        "Shell_SecondaryTrayWnd",                      // Secondary taskbar
+        "Progman",                                     // Desktop
+        "WorkerW",                                     // Desktop worker
         "Windows.UI.Core.CoreWindow", // UWP shell (inner child of ApplicationFrameWindow)
-        "DV2ControlHost",         // Start menu
-        "NotifyIconOverflowWindow", // Tray overflow
-        "ToolbarWindow32",        // Toolbars
-        "TaskManagerWindow",      // Task manager
-        "SysListView32",          // List views (desktop icons)
-        "DesktopUserPicture",     // Lock screen
-        "InputIndicator",         // Input indicator
+        "DV2ControlHost",             // Start menu
+        "NotifyIconOverflowWindow",   // Tray overflow
+        "ToolbarWindow32",            // Toolbars
+        "TaskManagerWindow",          // Task manager
+        "SysListView32",              // List views (desktop icons)
+        "DesktopUserPicture",         // Lock screen
+        "InputIndicator",             // Input indicator
         "Microsoft.UI.Content.DesktopChildSiteBridge", // WinUI
-            "WireGuard UI - Manage Tunnels", // WireGuard (stubborn, refuses SetWindowPos)
+        "WireGuard UI - Manage Tunnels", // WireGuard (stubborn, refuses SetWindowPos)
     ];
 
     for skip in &skip_classes {

@@ -1,12 +1,12 @@
 //! CBT (Computer-Based Training) Hook for intercepting window events before they happen.
-//! 
+//!
 //! Unlike WinEventHook which fires AFTER events, CBT hook fires BEFORE window creation,
 //! destruction, activation, focus, and moves/resizes. This allows wiri to:
-//! 
+//!
 //! - Set initial window size/position before the window is shown
 //! - Prevent unwanted windows from appearing
 //! - Intercept focus changes for better control
-//! 
+//!
 //! Reference: <https://docs.microsoft.com/en-us/windows/win32/winmsg/using-hooks>
 
 use anyhow::Result;
@@ -15,13 +15,12 @@ use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx,
-    HHOOK, WH_CBT,
-    HCBT_ACTIVATE, HCBT_CREATEWND, HCBT_DESTROYWND, HCBT_MOVESIZE, HCBT_SETFOCUS,
+    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HCBT_ACTIVATE, HCBT_CREATEWND,
+    HCBT_DESTROYWND, HCBT_MOVESIZE, HCBT_SETFOCUS, HHOOK, WH_CBT,
 };
 
-use crate::backend::BackendEvent;
 use super::BackendHandle;
+use crate::backend::BackendEvent;
 
 /// CBT Hook codes (for reference)
 /// HCBT_CLICKSKIPPED = 4 - mouse click skipped
@@ -52,16 +51,17 @@ impl CbtHook {
         // CBT hook is thread-local — intercepts wiri's own thread, not system-wide.
         // A system-wide hook would require a DLL.
         let current_thread_id = unsafe { GetCurrentThreadId() };
-        let hook = unsafe {
-            SetWindowsHookExW(WH_CBT, Some(cbt_hook_proc), None, current_thread_id)
-        };
+        let hook =
+            unsafe { SetWindowsHookExW(WH_CBT, Some(cbt_hook_proc), None, current_thread_id) };
 
         match hook {
             Ok(handle) => {
                 info!("CBT hook installed successfully: {:?}", handle);
                 // Store the backend handle for the hook callback
                 CBT_BACKEND.lock().replace(backend);
-                Ok(Self { hook_handle: Some(handle) })
+                Ok(Self {
+                    hook_handle: Some(handle),
+                })
             }
             Err(e) => {
                 warn!("Failed to install CBT hook: {:?}", e);
@@ -95,7 +95,7 @@ lazy_static::lazy_static! {
 }
 
 /// CBT Hook procedure
-/// 
+///
 /// This is called by Windows before:
 /// - HCBT_CREATEWND: A window is about to be created
 /// - HCBT_DESTROYWND: A window is about to be destroyed
@@ -104,7 +104,11 @@ lazy_static::lazy_static! {
 /// - HCBT_SETFOCUS: A window is about to receive focus
 /// - HCBT_CLICKSKIPPED: A mouse click message is about to be removed from the queue
 /// - HCBT_KEYSTROKE: A keystroke message is about to be removed from the queue
-unsafe extern "system" fn cbt_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> windows::Win32::Foundation::LRESULT {
+unsafe extern "system" fn cbt_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
     if code < 0 {
         // Chain to next hook — must not hold CBT_BACKEND lock while calling
         return CallNextHookEx(HHOOK::default(), code, WPARAM(wparam.0), lparam);
@@ -137,35 +141,45 @@ unsafe extern "system" fn cbt_hook_proc(code: i32, wparam: WPARAM, lparam: LPARA
             // However, this requires the CREATESTRUCT pointer from lparam
 
             // Send event to backend for tracking
-            backend.send_event(BackendEvent::CbtCreateWindow { hwnd: hwnd.0 as isize });
+            backend.send_event(BackendEvent::CbtCreateWindow {
+                hwnd: hwnd.0 as isize,
+            });
         }
 
         HCBT_DESTROYWND => {
             // A window is about to be destroyed
             let hwnd = HWND(wparam.0 as *mut std::ffi::c_void);
             debug!("CBT: HCBT_DESTROYWND for window {:p}", hwnd.0);
-            backend.send_event(BackendEvent::CbtDestroyWindow { hwnd: hwnd.0 as isize });
+            backend.send_event(BackendEvent::CbtDestroyWindow {
+                hwnd: hwnd.0 as isize,
+            });
         }
 
         HCBT_ACTIVATE => {
             // A window is about to be activated
             let hwnd = HWND(wparam.0 as *mut std::ffi::c_void);
             debug!("CBT: HCBT_ACTIVATE for window {:p}", hwnd.0);
-            backend.send_event(BackendEvent::CbtActivate { hwnd: hwnd.0 as isize });
+            backend.send_event(BackendEvent::CbtActivate {
+                hwnd: hwnd.0 as isize,
+            });
         }
 
         HCBT_MOVESIZE => {
             // A window is about to be moved or sized
             let hwnd = HWND(wparam.0 as *mut std::ffi::c_void);
             debug!("CBT: HCBT_MOVESIZE for window {:p}", hwnd.0);
-            backend.send_event(BackendEvent::CbtMoveSize { hwnd: hwnd.0 as isize });
+            backend.send_event(BackendEvent::CbtMoveSize {
+                hwnd: hwnd.0 as isize,
+            });
         }
 
         HCBT_SETFOCUS => {
             // A window is about to receive focus
             let hwnd = HWND(wparam.0 as *mut std::ffi::c_void);
             debug!("CBT: HCBT_SETFOCUS for window {:p}", hwnd.0);
-            backend.send_event(BackendEvent::CbtSetFocus { hwnd: hwnd.0 as isize });
+            backend.send_event(BackendEvent::CbtSetFocus {
+                hwnd: hwnd.0 as isize,
+            });
         }
 
         _ => {

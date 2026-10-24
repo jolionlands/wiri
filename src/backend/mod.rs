@@ -1,12 +1,12 @@
-pub mod hooks;
-pub mod message_loop;
-pub mod cbt_hook;
-pub mod hotkey_conflicts;
 pub mod accent;
+pub mod cbt_hook;
+pub mod hooks;
+pub mod hotkey_conflicts;
+pub mod message_loop;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -18,17 +18,19 @@ const SELF_APPLIED_PRUNE_MS: u128 = 1000;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, MONITORINFOEXW, MONITORINFO,
-    MonitorFromWindow, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW};
+#[cfg_attr(test, allow(unused_imports))]
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos,
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, IsWindow, MoveWindow, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    HDWP, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SWP_NOMOVE,
-    SWP_ASYNCWINDOWPOS, SWP_NOCOPYBITS, SHOW_WINDOW_CMD, SW_MINIMIZE, SW_MAXIMIZE, SW_RESTORE, WM_CLOSE,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetClassNameW,
+    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, MoveWindow, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    HWND_TOP, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+    WM_CLOSE,
 };
-use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_INVALIDATE, RDW_ALLCHILDREN, RDW_UPDATENOW};
 
 /// Force a window to repaint after a tile move. Fixes apps (Cascadia/Windows
 /// Terminal, Edge, some Electron) that show a black client area after
@@ -44,9 +46,9 @@ fn request_redraw(hwnd: HWND) {
     }
 }
 
+use crate::utils::{OutputId, Rect};
 pub use hooks::WinEventHook;
 pub use message_loop::MessageLoop;
-use crate::utils::{OutputId, Rect};
 
 /// Spec-aligned alias for the concrete Win32 backend.
 /// New code should prefer this name; existing call-sites continue to use
@@ -63,37 +65,78 @@ pub enum WindowState {
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
-    WindowCreated { hwnd: isize },
-    WindowDestroyed { hwnd: isize },
-    WindowMoved { hwnd: isize, rect: Rect },
-    WindowResized { hwnd: isize, rect: Rect },
-    WindowShown { hwnd: isize },
-    WindowHidden { hwnd: isize },
-    MonitorConnected { id: u64 },
-    MonitorDisconnected { id: u64 },
-    ForegroundChanged { hwnd: isize },
-    WindowTitleChanged { hwnd: isize },
+    WindowCreated {
+        hwnd: isize,
+    },
+    WindowDestroyed {
+        hwnd: isize,
+    },
+    WindowMoved {
+        hwnd: isize,
+        rect: Rect,
+    },
+    WindowResized {
+        hwnd: isize,
+        rect: Rect,
+    },
+    WindowShown {
+        hwnd: isize,
+    },
+    WindowHidden {
+        hwnd: isize,
+    },
+    MonitorConnected {
+        id: u64,
+    },
+    MonitorDisconnected {
+        id: u64,
+    },
+    ForegroundChanged {
+        hwnd: isize,
+    },
+    WindowTitleChanged {
+        hwnd: isize,
+    },
     // CBT Hook events (fire BEFORE window operations)
-    CbtCreateWindow { hwnd: isize },
-    CbtDestroyWindow { hwnd: isize },
-    CbtActivate { hwnd: isize },
-    CbtMoveSize { hwnd: isize },
-    CbtSetFocus { hwnd: isize },
+    CbtCreateWindow {
+        hwnd: isize,
+    },
+    CbtDestroyWindow {
+        hwnd: isize,
+    },
+    CbtActivate {
+        hwnd: isize,
+    },
+    CbtMoveSize {
+        hwnd: isize,
+    },
+    CbtSetFocus {
+        hwnd: isize,
+    },
     /// Fires when the user starts a manual move/resize via window chrome.
-    WindowMoveResizeStart { hwnd: isize },
+    WindowMoveResizeStart {
+        hwnd: isize,
+    },
     /// Fires when the user finishes a manual move/resize via window chrome.
-    WindowMoveResizeEnd { hwnd: isize },
+    WindowMoveResizeEnd {
+        hwnd: isize,
+    },
     /// Fires when a window enters the urgent / attention-demanding state.
     /// Sourced from EVENT_SYSTEM_ALERT (FlashWindow / FlashWindowEx) and
     /// EVENT_OBJECT_STATECHANGE (accessibility alert state).  `urgent: true`
     /// means "now flashing"; callers should highlight the window in the
     /// taskbar / border.  `urgent: false` is emitted when the engine focuses
     /// the window (i.e. the user has acknowledged it).
-    WindowUrgent { hwnd: isize, urgent: bool },
+    WindowUrgent {
+        hwnd: isize,
+        urgent: bool,
+    },
     /// Fired on EVENT_SYSTEM_FOREGROUND for a window that was previously
     /// in the urgent set — signals that the urgent state was implicitly
     /// cleared by the user switching to that window.
-    WindowUrgentCleared { hwnd: isize },
+    WindowUrgentCleared {
+        hwnd: isize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +223,13 @@ impl WindowInfo {
     }
 }
 
+fn should_cache_window_info(info: &WindowInfo) -> bool {
+    !info.class_name.is_empty()
+        && !info.class_name.starts_with("Shell_")
+        && info.class_name != "Progman"
+        && info.class_name != "WorkerW"
+}
+
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
     pub id: OutputId,
@@ -201,7 +251,11 @@ impl MonitorInfo {
             let info_ptr = &mut info as *mut MONITORINFOEXW as *mut MONITORINFO;
             if GetMonitorInfoW(hmonitor, info_ptr).as_bool() {
                 let device_name = String::from_utf16_lossy(
-                    &info.szDevice[..info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len())]
+                    &info.szDevice[..info
+                        .szDevice
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(info.szDevice.len())],
                 );
                 let id = OutputId::from_name(&device_name);
                 let bounds = Rect::new(
@@ -219,18 +273,22 @@ impl MonitorInfo {
                 // MONITORINFOF_PRIMARY = 1
                 let is_primary = (info.monitorInfo.dwFlags & 1) != 0;
 
-            // Get DPI scaling for this monitor
-            let scale_factor = {
-                let mut dpi_x: u32 = 96;
-                let mut dpi_y: u32 = 96;
-                let hr = windows::Win32::UI::HiDpi::GetDpiForMonitor(
-                    hmonitor,
-                    windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
-                    &mut dpi_x,
-                    &mut dpi_y,
-                );
-                if hr.is_ok() { dpi_x as f64 / 96.0 } else { 1.0 }
-            };
+                // Get DPI scaling for this monitor
+                let scale_factor = {
+                    let mut dpi_x: u32 = 96;
+                    let mut dpi_y: u32 = 96;
+                    let hr = windows::Win32::UI::HiDpi::GetDpiForMonitor(
+                        hmonitor,
+                        windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
+                        &mut dpi_x,
+                        &mut dpi_y,
+                    );
+                    if hr.is_ok() {
+                        dpi_x as f64 / 96.0
+                    } else {
+                        1.0
+                    }
+                };
 
                 Some(Self {
                     id,
@@ -238,8 +296,8 @@ impl MonitorInfo {
                     bounds,
                     work_area,
                     is_primary,
-                scale_factor,
-            })
+                    scale_factor,
+                })
             } else {
                 None
             }
@@ -295,7 +353,7 @@ impl Backend {
 
         let handle = backend.handle();
         hooks::set_backend(handle.clone());
-        
+
         // Setup WinEventHook for AFTER events
         let hook = WinEventHook::new(handle.clone())?;
         hook.run();
@@ -323,7 +381,10 @@ impl Backend {
         Ok(result)
     }
 
-    fn enumerate_monitors(&self, monitors: Arc<RwLock<HashMap<OutputId, MonitorInfo>>>) -> Result<()> {
+    fn enumerate_monitors(
+        &self,
+        monitors: Arc<RwLock<HashMap<OutputId, MonitorInfo>>>,
+    ) -> Result<()> {
         unsafe {
             let ok = EnumDisplayMonitors(
                 HDC::default(),
@@ -366,21 +427,14 @@ impl Backend {
         Ok(())
     }
 
-    unsafe extern "system" fn window_enum_callback(
-        hwnd: HWND,
-        lparam: LPARAM,
-    ) -> BOOL {
+    unsafe extern "system" fn window_enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let windows = &*(lparam.0 as *const RwLock<HashMap<isize, WindowInfo>>);
 
         // Only include visible windows
         if IsWindowVisible(hwnd).as_bool() {
             let info = WindowInfo::new(hwnd);
             // Skip tool windows and other special windows
-            if !info.class_name.is_empty()
-                && !info.class_name.starts_with("Shell_")
-                && info.class_name != "Progman"
-                && info.class_name != "WorkerW"
-            {
+            if should_cache_window_info(&info) {
                 windows.write().insert(info.hwnd, info);
             }
         }
@@ -399,10 +453,13 @@ impl Backend {
     }
 
     pub fn take_event_rx(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<BackendEvent> {
-        self.event_rx.write().take().expect("event_rx already taken")
+        self.event_rx
+            .write()
+            .take()
+            .expect("event_rx already taken")
     }
 
-        /// Run the backend message loop. This blocks until the message loop exits.
+    /// Run the backend message loop. This blocks until the message loop exits.
     /// Event processing is done externally via take_event_rx().
     pub async fn run(&mut self) -> Result<()> {
         {
@@ -451,6 +508,47 @@ impl BackendHandle {
         self.windows.read().get(&hwnd).cloned()
     }
 
+    /// Refresh the backend cache from currently visible top-level windows and
+    /// return the visible snapshot. Hidden valid HWNDs remain cached so wiri can
+    /// keep tracking windows it hid on inactive workspaces.
+    pub fn refresh_visible_windows(&self) -> Vec<WindowInfo> {
+        let visible = Arc::new(RwLock::new(Vec::<WindowInfo>::new()));
+        let result = unsafe {
+            EnumWindows(
+                Some(Self::visible_window_enum_callback),
+                LPARAM(&*visible as *const _ as isize),
+            )
+        };
+        if let Err(e) = result {
+            warn!("EnumWindows refresh failed: {:?}", e);
+        }
+
+        let visible_windows = visible.read().clone();
+        let mut cached = self.windows.write();
+        cached.retain(|hwnd, _| {
+            let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
+            unsafe { IsWindow(hwnd_win).as_bool() }
+        });
+        for info in &visible_windows {
+            cached.insert(info.hwnd, info.clone());
+        }
+
+        visible_windows
+    }
+
+    unsafe extern "system" fn visible_window_enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let visible = &*(lparam.0 as *const RwLock<Vec<WindowInfo>>);
+
+        if IsWindowVisible(hwnd).as_bool() {
+            let info = WindowInfo::new(hwnd);
+            if should_cache_window_info(&info) {
+                visible.write().push(info);
+            }
+        }
+
+        BOOL(1)
+    }
+
     pub fn get_monitors(&self) -> Vec<MonitorInfo> {
         self.monitors.read().values().cloned().collect()
     }
@@ -460,10 +558,19 @@ impl BackendHandle {
     }
 
     pub fn get_primary_monitor(&self) -> Option<MonitorInfo> {
-        self.monitors.read().values().find(|m| m.is_primary).cloned()
+        self.monitors
+            .read()
+            .values()
+            .find(|m| m.is_primary)
+            .cloned()
     }
 
-    pub fn set_window_position(&self, hwnd: isize, rect: Rect, flags: SET_WINDOW_POS_FLAGS) -> Result<()> {
+    pub fn set_window_position(
+        &self,
+        hwnd: isize,
+        rect: Rect,
+        flags: SET_WINDOW_POS_FLAGS,
+    ) -> Result<()> {
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
         // Compensate for the invisible DWM shadow margin so the *visible*
         // window edges land at `rect`, not the frame edges (which include the
@@ -489,7 +596,10 @@ impl BackendHandle {
             )
         };
         if result.is_ok() {
-            debug!("SetWindowPos SUCCESS: hwnd={} rect=({},{}) {}x{}", hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
+            debug!(
+                "SetWindowPos SUCCESS: hwnd={} rect=({},{}) {}x{}",
+                hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+            );
             self.mark_self_applied(hwnd);
             request_redraw(hwnd_win);
             return Ok(());
@@ -506,7 +616,10 @@ impl BackendHandle {
             )
         };
         if move_result.is_ok() {
-            debug!("MoveWindow SUCCESS: hwnd={} rect=({},{}) {}x{}", hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
+            debug!(
+                "MoveWindow SUCCESS: hwnd={} rect=({},{}) {}x{}",
+                hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+            );
             self.mark_self_applied(hwnd);
             request_redraw(hwnd_win);
             return Ok(());
@@ -529,7 +642,10 @@ impl BackendHandle {
             request_redraw(hwnd_win);
             return Ok(());
         }
-        debug!("All position methods FAILED: hwnd={} rect=({},{}) {}x{}", hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
+        debug!(
+            "All position methods FAILED: hwnd={} rect=({},{}) {}x{}",
+            hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+        );
         Err(anyhow::anyhow!("Failed to position window {}", hwnd))
     }
 
@@ -542,74 +658,110 @@ impl BackendHandle {
         &self,
         positions: &[(isize, Rect, SET_WINDOW_POS_FLAGS)],
     ) -> usize {
-        let n = positions.len();
-        if n == 0 { return 0; }
+        self.set_window_positions_batched_with_results(positions)
+            .len()
+    }
 
-        let hdwp_initial = unsafe { BeginDeferWindowPos(n as i32) };
-        let mut hdwp = match hdwp_initial {
-            Ok(h) if !h.is_invalid() => h,
-            _ => {
-                // Fall back to one-by-one positioning.
-                let mut applied = 0;
-                for (hwnd, rect, flags) in positions {
-                    if self.set_window_position(*hwnd, *rect, *flags).is_ok() {
-                        applied += 1;
+    /// Batched positioning with per-HWND success reporting.
+    ///
+    /// `BeginDeferWindowPos` is still used for smooth multi-window updates, but
+    /// callers that need circuit-breaker behavior can distinguish windows that
+    /// actually made it into the committed batch from those that rejected the
+    /// move/resize request.
+    pub fn set_window_positions_batched_with_results(
+        &self,
+        positions: &[(isize, Rect, SET_WINDOW_POS_FLAGS)],
+    ) -> HashSet<isize> {
+        let n = positions.len();
+        let mut applied = HashSet::new();
+        if n == 0 {
+            return applied;
+        }
+
+        #[cfg(test)]
+        {
+            // Unit tests use fabricated HWNDs with BackendHandle::default_for_test().
+            // Treat batch attempts as successful there so engine state-machine tests
+            // are not coupled to live Win32 windows.
+            applied.extend(positions.iter().map(|(hwnd, _, _)| *hwnd));
+        }
+
+        #[cfg(not(test))]
+        {
+            let hdwp_initial = unsafe { BeginDeferWindowPos(n as i32) };
+            let mut hdwp = match hdwp_initial {
+                Ok(h) if !h.is_invalid() => h,
+                _ => {
+                    // Fall back to one-by-one positioning.
+                    for (hwnd, rect, flags) in positions {
+                        if self.set_window_position(*hwnd, *rect, *flags).is_ok() {
+                            applied.insert(*hwnd);
+                        }
+                    }
+                    return applied;
+                }
+            };
+
+            let mut deferred = Vec::new();
+            for (hwnd, rect, flags) in positions {
+                let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
+                // Same shadow-margin compensation as set_window_position above.
+                let rect = expand_for_shadow_margin(hwnd_win, *rect);
+                // DeferWindowPos returns a new HDWP that incorporates this change.
+                // We feed each new HDWP back in.
+                let result = unsafe {
+                    DeferWindowPos(
+                        hdwp,
+                        hwnd_win,
+                        HWND_TOP,
+                        rect.loc.x,
+                        rect.loc.y,
+                        rect.size.w as i32,
+                        rect.size.h as i32,
+                        *flags | SWP_NOCOPYBITS,
+                    )
+                };
+                match result {
+                    Ok(new_hdwp) if !new_hdwp.is_invalid() => {
+                        hdwp = new_hdwp;
+                        deferred.push(*hwnd);
+                    }
+                    _ => {
+                        debug!("DeferWindowPos failed for hwnd={}", hwnd);
                     }
                 }
+            }
+
+            // Commit the entire batch atomically.
+            if let Err(e) = unsafe { EndDeferWindowPos(hdwp) } {
+                warn!("EndDeferWindowPos failed: {:?}", e);
                 return applied;
             }
-        };
 
-        let mut count = 0;
-        for (hwnd, rect, flags) in positions {
-            let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
-            // Same shadow-margin compensation as set_window_position above.
-            let rect = expand_for_shadow_margin(hwnd_win, *rect);
-            // DeferWindowPos returns a new HDWP that incorporates this change.
-            // We feed each new HDWP back in.
-            let result = unsafe {
-                DeferWindowPos(
-                    hdwp,
-                    hwnd_win,
-                    HWND_TOP,
-                    rect.loc.x,
-                    rect.loc.y,
-                    rect.size.w as i32,
-                    rect.size.h as i32,
-                    *flags | SWP_NOCOPYBITS,
-                )
-            };
-            match result {
-                Ok(new_hdwp) if !new_hdwp.is_invalid() => {
-                    hdwp = new_hdwp;
-                    self.mark_self_applied(*hwnd);
-                    count += 1;
-                }
-                _ => {
-                    debug!("DeferWindowPos failed for hwnd={}", hwnd);
-                }
+            for hwnd in deferred {
+                self.mark_self_applied(hwnd);
+                applied.insert(hwnd);
+            }
+
+            // Trigger redraws AFTER commit so apps see the final size.
+            for hwnd in &applied {
+                let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
+                request_redraw(hwnd_win);
             }
         }
 
-        // Commit the entire batch atomically.
-        if let Err(e) = unsafe { EndDeferWindowPos(hdwp) } {
-            warn!("EndDeferWindowPos failed: {:?}", e);
-        }
-
-        // Trigger redraws AFTER commit so apps see the final size.
-        for (hwnd, _, _) in positions {
-            let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
-            request_redraw(hwnd_win);
-        }
-
-        count
+        applied
     }
 
     pub fn show_window(&self, hwnd: isize, show: bool) -> Result<()> {
         unsafe {
             let _ = ShowWindow(
                 HWND(hwnd as *mut std::ffi::c_void),
-                if show { SHOW_WINDOW_CMD(1) } else { SHOW_WINDOW_CMD(0) },
+                if show {
+                    SHOW_WINDOW_CMD(1)
+                } else {
+                    SHOW_WINDOW_CMD(0)
+                },
             );
         }
         Ok(())
@@ -631,24 +783,36 @@ impl BackendHandle {
             let current_thread = windows::Win32::System::Threading::GetCurrentThreadId();
             let fg_hwnd = GetForegroundWindow();
             if fg_hwnd.0.is_null() {
-                return Err(anyhow::anyhow!("activate_window: SetForegroundWindow failed and no current foreground window"));
+                return Err(anyhow::anyhow!(
+                    "activate_window: SetForegroundWindow failed and no current foreground window"
+                ));
             }
             let fg_thread = GetWindowThreadProcessId(fg_hwnd, None);
             if fg_thread != 0 && fg_thread != current_thread {
                 let _ = windows::Win32::System::Threading::AttachThreadInput(
-                    current_thread, fg_thread, true,
+                    current_thread,
+                    fg_thread,
+                    true,
                 );
                 let ok = SetForegroundWindow(hwnd_win).as_bool();
                 let _ = windows::Win32::System::Threading::AttachThreadInput(
-                    current_thread, fg_thread, false,
+                    current_thread,
+                    fg_thread,
+                    false,
                 );
                 if ok {
-                    debug!("activate_window: AttachThreadInput+SetForegroundWindow OK hwnd={}", hwnd);
+                    debug!(
+                        "activate_window: AttachThreadInput+SetForegroundWindow OK hwnd={}",
+                        hwnd
+                    );
                     return Ok(());
                 }
             }
         }
-        Err(anyhow::anyhow!("activate_window: failed to bring hwnd={} to foreground", hwnd))
+        Err(anyhow::anyhow!(
+            "activate_window: failed to bring hwnd={} to foreground",
+            hwnd
+        ))
     }
 
     pub fn send_event(&self, event: BackendEvent) {
@@ -673,11 +837,13 @@ impl BackendHandle {
     /// Returns the file stem (e.g. "firefox" for "C:\Program Files\Mozilla Firefox\firefox.exe").
     /// Returns None on failure or for PID 0.
     pub fn process_name_for_pid(&self, pid: u32) -> Option<String> {
-        if pid == 0 { return None; }
+        if pid == 0 {
+            return None;
+        }
         unsafe {
             use windows::Win32::System::Threading::{
-                OpenProcess, QueryFullProcessImageNameW,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_FORMAT,
+                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+                PROCESS_QUERY_LIMITED_INFORMATION,
             };
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
             let mut buf = [0u16; 260];
@@ -689,7 +855,9 @@ impl BackendHandle {
                 &mut size,
             );
             let _ = windows::Win32::Foundation::CloseHandle(handle);
-            if result.is_err() { return None; }
+            if result.is_err() {
+                return None;
+            }
             let path = String::from_utf16_lossy(&buf[..size as usize]);
             std::path::Path::new(&path)
                 .file_stem()
@@ -754,7 +922,9 @@ impl BackendHandle {
                 WPARAM(0),
                 LPARAM(0),
             )
-            .map_err(|e| anyhow::anyhow!("close_window: PostMessageW failed for hwnd={}: {}", hwnd, e))
+            .map_err(|e| {
+                anyhow::anyhow!("close_window: PostMessageW failed for hwnd={}: {}", hwnd, e)
+            })
         }
     }
 
@@ -786,7 +956,11 @@ impl BackendHandle {
             let info_ptr = &mut info as *mut MONITORINFOEXW as *mut MONITORINFO;
             if GetMonitorInfoW(hmon, info_ptr).as_bool() {
                 Some(String::from_utf16_lossy(
-                    &info.szDevice[..info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len())]
+                    &info.szDevice[..info
+                        .szDevice
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(info.szDevice.len())],
                 ))
             } else {
                 None
@@ -999,7 +1173,10 @@ mod tests {
     #[test]
     fn test_layout_request_apply_show_window() {
         let handle = BackendHandle::default_for_test();
-        let request = LayoutRequest::ShowWindow { hwnd: 0, show: true };
+        let request = LayoutRequest::ShowWindow {
+            hwnd: 0,
+            show: true,
+        };
         // Result may be Ok or Err (hwnd=0 is invalid); must not panic.
         let _ = request.apply(&handle as &dyn BackendApi);
     }
@@ -1054,7 +1231,10 @@ mod tests {
         handle.mark_self_applied(9999);
         // After prune all stale entries should be gone; only the fresh one remains.
         let len = handle.self_applied.read().len();
-        assert_eq!(len, 1, "only the freshly-marked hwnd should remain after prune");
+        assert_eq!(
+            len, 1,
+            "only the freshly-marked hwnd should remain after prune"
+        );
     }
 }
 

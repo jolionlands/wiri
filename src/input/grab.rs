@@ -29,7 +29,13 @@ pub struct MoveGrab {
 }
 
 impl MoveGrab {
-    pub fn new(window_id: WindowId, cursor: Point, window_pos: Point, initial_size: Size, column: usize) -> Self {
+    pub fn new(
+        window_id: WindowId,
+        cursor: Point,
+        window_pos: Point,
+        initial_size: Size,
+        column: usize,
+    ) -> Self {
         Self {
             window_id,
             initial_cursor: cursor,
@@ -198,7 +204,11 @@ pub struct ColumnReorderGrab {
 
 impl ColumnReorderGrab {
     pub fn new(window_id: WindowId, source_col: usize, cursor: Point) -> Self {
-        Self { window_id, source_col, initial_cursor: cursor }
+        Self {
+            window_id,
+            source_col,
+            initial_cursor: cursor,
+        }
     }
 }
 
@@ -206,7 +216,11 @@ impl ColumnReorderGrab {
 ///
 /// Returns `None` if the point lies outside the window rect entirely, preventing
 /// spurious edge matches (e.g. a point left of the window matching Top/Bottom).
-pub fn resize_edge_from_point(point: Point, window_rect: Rect, border_size: i32) -> Option<ResizeEdge> {
+pub fn resize_edge_from_point(
+    point: Point,
+    window_rect: Rect,
+    border_size: i32,
+) -> Option<ResizeEdge> {
     // Guard: reject points that are outside the window bounds.
     if point.x < window_rect.loc.x
         || point.x > window_rect.right()
@@ -223,18 +237,18 @@ pub fn resize_edge_from_point(point: Point, window_rect: Rect, border_size: i32)
     let near_bottom = point.y >= window_rect.bottom() - border && point.y <= window_rect.bottom();
 
     match (near_left, near_right, near_top, near_bottom) {
-            // Corners take priority (check first)
-            (true, _, true, _) => Some(ResizeEdge::TopLeft),
-            (_, true, true, _) => Some(ResizeEdge::TopRight),
-            (true, _, _, true) => Some(ResizeEdge::BottomLeft),
-            (_, true, _, true) => Some(ResizeEdge::BottomRight),
-            // Edges
-            (true, _, false, false) => Some(ResizeEdge::Left),
-            (_, true, false, false) => Some(ResizeEdge::Right),
-            (false, false, true, _) => Some(ResizeEdge::Top),
-            (false, false, _, true) => Some(ResizeEdge::Bottom),
-            _ => None,
-        }
+        // Corners take priority (check first)
+        (true, _, true, _) => Some(ResizeEdge::TopLeft),
+        (_, true, true, _) => Some(ResizeEdge::TopRight),
+        (true, _, _, true) => Some(ResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(ResizeEdge::BottomRight),
+        // Edges
+        (true, _, false, false) => Some(ResizeEdge::Left),
+        (_, true, false, false) => Some(ResizeEdge::Right),
+        (false, false, true, _) => Some(ResizeEdge::Top),
+        (false, false, _, true) => Some(ResizeEdge::Bottom),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +432,4 @@ mod tests {
         let target = grab.target_column(Point::new(50, 100), 500, 8, 5);
         assert_eq!(target, 0);
     }
-
 }

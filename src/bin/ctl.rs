@@ -10,8 +10,8 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 
-use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::core::PCWSTR;
+use windows::Win32::System::Pipes::WaitNamedPipeW;
 
 use wiri::ipc::{IpcMessage, PIPE_PATH};
 
@@ -75,7 +75,11 @@ enum Commands {
     MoveWindow { hwnd: isize, x: i32, y: i32 },
 
     /// Resize a window
-    ResizeWindow { hwnd: isize, width: u32, height: u32 },
+    ResizeWindow {
+        hwnd: isize,
+        width: u32,
+        height: u32,
+    },
 
     /// Toggle floating state for a specific HWND
     FloatWindow { hwnd: isize },
@@ -267,7 +271,6 @@ enum Commands {
     MoveWorkspaceDown,
 
     // ---- Round-4 ----
-
     /// Toggle sticky (visible on all workspaces) for the focused window.
     ToggleSticky,
 
@@ -322,7 +325,12 @@ fn main() -> Result<()> {
 
     // SubscribeEvents has bespoke streaming behaviour — handle it before the
     // single-request/response path below.
-    if let Commands::Events { types, stream, filter } = &cli.command {
+    if let Commands::Events {
+        types,
+        stream,
+        filter,
+    } = &cli.command
+    {
         // --filter takes precedence over the legacy --types flag.
         let effective_types = filter.as_deref().unwrap_or(types.as_str());
         // --stream or --json both select raw newline-delimited JSON output;
@@ -388,7 +396,11 @@ fn main() -> Result<()> {
         Commands::ToggleAlwaysOnTop => IpcMessage::ToggleAlwaysOnTop,
         Commands::FocusWorkspaceNamed { name } => IpcMessage::FocusWorkspaceNamed { name },
         Commands::SetAutoTile { threshold } => IpcMessage::SetAutoTileThreshold {
-            threshold: if threshold == 0 { None } else { Some(threshold) },
+            threshold: if threshold == 0 {
+                None
+            } else {
+                Some(threshold)
+            },
         },
         Commands::ListMonitors => IpcMessage::MonitorList,
         Commands::ValidateConfig { .. } => unreachable!("handled above"),
@@ -429,9 +441,15 @@ fn main() -> Result<()> {
         Commands::GetFocus => IpcMessage::GetFocus,
         Commands::GetWorkspaceList => IpcMessage::GetWorkspaceList,
         Commands::Bindings => IpcMessage::GetBindings,
-        Commands::ReserveArea { side, pixels, monitor_id } => {
-            IpcMessage::ReserveArea { side, pixels, monitor_id }
-        }
+        Commands::ReserveArea {
+            side,
+            pixels,
+            monitor_id,
+        } => IpcMessage::ReserveArea {
+            side,
+            pixels,
+            monitor_id,
+        },
     };
 
     let response = send_ipc_message(&message, cli.timeout)?;
@@ -545,7 +563,10 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
 fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
     // First detect a daemon-side error and surface it cleanly.
     if let Some(false) = resp.get("success").and_then(|v| v.as_bool()) {
-        let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        let err = resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
         eprintln!("error: {}", err);
         std::process::exit(1);
     }
@@ -562,7 +583,10 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
             println!("Focused window {} (0x{:x}).", window_hwnd, *window_hwnd);
         }
         IpcMessage::CloseWindow { window_hwnd } => {
-            println!("Close request sent to window {} (0x{:x}).", window_hwnd, *window_hwnd);
+            println!(
+                "Close request sent to window {} (0x{:x}).",
+                window_hwnd, *window_hwnd
+            );
         }
         IpcMessage::SpawnCommand { command } => {
             let pid = resp.get("pid").and_then(|v| v.as_u64());
@@ -580,8 +604,14 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
         IpcMessage::TileRequest { window_hwnd, .. } => {
             println!("Tile request queued for window {}.", window_hwnd);
         }
-        IpcMessage::WindowMoveToWorkspace { window_hwnd, workspace_id } => {
-            println!("Moved window {} to workspace {}.", window_hwnd, workspace_id);
+        IpcMessage::WindowMoveToWorkspace {
+            window_hwnd,
+            workspace_id,
+        } => {
+            println!(
+                "Moved window {} to workspace {}.",
+                window_hwnd, workspace_id
+            );
         }
         IpcMessage::MonitorList => print_monitor_list(resp),
         IpcMessage::ListBindings => print_bindings(resp),
@@ -665,9 +695,20 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
 /// Format the response to `GetState` as a multi-line summary block.
 fn print_state(resp: &serde_json::Value) {
     let result = resp.get("result").cloned().unwrap_or(serde_json::json!({}));
-    let windows = result.get("windows").and_then(|w| w.as_array()).cloned().unwrap_or_default();
-    let workspaces = result.get("workspaces").and_then(|w| w.as_array()).cloned().unwrap_or_default();
-    let active = result.get("active_workspace").and_then(|v| v.as_str()).unwrap_or("<none>");
+    let windows = result
+        .get("windows")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let workspaces = result
+        .get("workspaces")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active = result
+        .get("active_workspace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>");
 
     let total_windows = windows.len();
     let total_workspaces = workspaces.len();
@@ -692,7 +733,11 @@ fn print_state(resp: &serde_json::Value) {
 
 /// Format the response to `WindowList` as a Hwnd|PID|Class|Title table.
 fn print_window_list(resp: &serde_json::Value) {
-    let result = resp.get("result").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    let result = resp
+        .get("result")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
     if result.is_empty() {
         println!("No managed windows.");
         return;
@@ -737,7 +782,11 @@ fn print_window_list(resp: &serde_json::Value) {
         );
     }
     println!();
-    println!("  {} window{}", result.len(), if result.len() == 1 { "" } else { "s" });
+    println!(
+        "  {} window{}",
+        result.len(),
+        if result.len() == 1 { "" } else { "s" }
+    );
 }
 
 /// Format `MonitorList` as a human-readable table — bounds, work area, DPI
@@ -775,10 +824,22 @@ fn print_monitor_list(resp: &serde_json::Value) {
         let bh = m.get("bounds_height").and_then(|v| v.as_u64()).unwrap_or(0);
         let wx = m.get("work_area_x").and_then(|v| v.as_i64()).unwrap_or(0);
         let wy = m.get("work_area_y").and_then(|v| v.as_i64()).unwrap_or(0);
-        let ww = m.get("work_area_width").and_then(|v| v.as_u64()).unwrap_or(0);
-        let wh = m.get("work_area_height").and_then(|v| v.as_u64()).unwrap_or(0);
-        let scale = m.get("scale_factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
-        let ws = m.get("active_workspace").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ww = m
+            .get("work_area_width")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let wh = m
+            .get("work_area_height")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let scale = m
+            .get("scale_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        let ws = m
+            .get("active_workspace")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let win_count = m.get("window_count").and_then(|v| v.as_u64()).unwrap_or(0);
         let id = m.get("output_id").and_then(|v| v.as_u64()).unwrap_or(0);
         let focused = m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -881,19 +942,16 @@ fn print_bindings_table(resp: &serde_json::Value) {
     let chord_w = 26usize;
     let action_w = 40usize;
 
+    println!("  {:<cw$}  {}", "Chord", "Action", cw = chord_w);
     println!(
         "  {:<cw$}  {}",
-        "Chord", "Action",
-        cw = chord_w
-    );
-    println!(
-        "  {:<cw$}  {}",
-        "─".repeat(chord_w), "─".repeat(action_w),
+        "─".repeat(chord_w),
+        "─".repeat(action_w),
         cw = chord_w
     );
 
     for e in &entries {
-        let chord  = e.get("chord").and_then(|v| v.as_str()).unwrap_or("?");
+        let chord = e.get("chord").and_then(|v| v.as_str()).unwrap_or("?");
         let action = e.get("action").and_then(|v| v.as_str()).unwrap_or("?");
         println!(
             "  {:<cw$}  {}",
@@ -904,7 +962,11 @@ fn print_bindings_table(resp: &serde_json::Value) {
     }
 
     println!();
-    println!("  {} binding{} registered.", entries.len(), if entries.len() == 1 { "" } else { "s" });
+    println!(
+        "  {} binding{} registered.",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" }
+    );
 }
 
 /// Print the hardcoded default bindings table as a fallback (no daemon needed).
@@ -913,69 +975,71 @@ fn print_default_bindings_table() {
     let p = "Ctrl+Alt";
     let s = "Ctrl+Alt+Shift";
     let defaults: &[(&str, &str)] = &[
-        ("Ctrl+Alt+Left",         "focus-column-left"),
-        ("Ctrl+Alt+Right",        "focus-column-right"),
-        ("Ctrl+Alt+Up",           "focus-up"),
-        ("Ctrl+Alt+Down",         "focus-down"),
-        (&format!("{}+Left", s),  "move-column-left"),
+        ("Ctrl+Alt+Left", "focus-column-left"),
+        ("Ctrl+Alt+Right", "focus-column-right"),
+        ("Ctrl+Alt+Up", "focus-up"),
+        ("Ctrl+Alt+Down", "focus-down"),
+        (&format!("{}+Left", s), "move-column-left"),
         (&format!("{}+Right", s), "move-column-right"),
-        (&format!("{}+Q", p),     "close-window"),
+        (&format!("{}+Q", p), "close-window"),
         (&format!("{}+Enter", p), "spawn (terminal)"),
-        (&format!("{}+F", p),     "toggle-fullscreen"),
-        (&format!("{}+T", p),     "toggle-floating"),
-        (&format!("{}+H", p),     "scroll-left"),
-        (&format!("{}+L", p),     "scroll-right"),
-        (&format!("{}+Q", s),     "quit"),
+        (&format!("{}+F", p), "toggle-fullscreen"),
+        (&format!("{}+T", p), "toggle-floating"),
+        (&format!("{}+H", p), "scroll-left"),
+        (&format!("{}+L", p), "scroll-right"),
+        (&format!("{}+Q", s), "quit"),
         (&format!("{}+Space", p), "overview-toggle"),
-        ("Escape",                "exit overview / resize mode"),
-        (&format!("{}+O", p),     "overview-select"),
-        (&format!("{}+\\", p),    "column-toggle-tabbed"),
-        (&format!("{}+]", p),     "tab-next"),
-        (&format!("{}+[", p),     "tab-prev"),
-        (&format!("{}+1…9", p),   "focus-workspace-N"),
-        (&format!("{}+1…9", s),   "move-to-workspace-N"),
-        (&format!("{}+PageUp", p),    "focus-workspace-previous"),
-        (&format!("{}+PageDown", p),  "focus-workspace-next"),
-        (&format!("{}+R", p),     "enter-resize-mode"),
-        (&format!("{}+R", s),     "center-column"),
-        (&format!("{}+W", p),     "column-width-cycle"),
-        (&format!("{}+-", p),     "resize-column-left"),
-        (&format!("{}++", p),     "resize-column-right"),
-        (&format!("{}+Tab", p),   "focus-previous (alt-tab)"),
-        (&format!("{}+P", p),     "screenshot"),
-        (&format!("{}+A", p),     "toggle-always-on-top"),
-        (&format!("{}+,", p),     "consume-window-into-column"),
-        (&format!("{}+.", p),     "expel-window-from-column"),
-        (&format!("{}+E", p),     "expand-column-to-available"),
-        (&format!("{}+F", s),     "maximize-column"),
-        (&format!("{}+L", s),     "grow-column-width"),
-        (&format!("{}+H", s),     "shrink-column-width"),
-        (&format!("{}+K", s),     "grow-tile-height"),
-        (&format!("{}+J", s),     "shrink-tile-height"),
-        (&format!("{}+PageUp", s),    "move-workspace-up"),
-        (&format!("{}+PageDown", s),  "move-workspace-down"),
-        (&format!("{}+Up", s),    "move-column-to-workspace-up"),
-        (&format!("{}+Down", s),  "move-column-to-workspace-down"),
-        (&format!("{}+,", s),     "move-column-to-monitor-left"),
-        (&format!("{}+.", s),     "move-column-to-monitor-right"),
-        (&format!("{}+S", p),     "toggle-sticky"),
-        (&format!("{}+?", s),     "show-key-bindings (cheatsheet)"),
+        ("Escape", "exit overview / resize mode"),
+        (&format!("{}+O", p), "overview-select"),
+        (&format!("{}+\\", p), "column-toggle-tabbed"),
+        (&format!("{}+]", p), "tab-next"),
+        (&format!("{}+[", p), "tab-prev"),
+        (&format!("{}+1…9", p), "focus-workspace-N"),
+        (&format!("{}+1…9", s), "move-to-workspace-N"),
+        (&format!("{}+PageUp", p), "focus-workspace-previous"),
+        (&format!("{}+PageDown", p), "focus-workspace-next"),
+        (&format!("{}+R", p), "enter-resize-mode"),
+        (&format!("{}+R", s), "center-column"),
+        (&format!("{}+W", p), "column-width-cycle"),
+        (&format!("{}+-", p), "resize-column-left"),
+        (&format!("{}++", p), "resize-column-right"),
+        (&format!("{}+Tab", p), "focus-previous (alt-tab)"),
+        (&format!("{}+P", p), "screenshot"),
+        (&format!("{}+A", p), "toggle-always-on-top"),
+        (&format!("{}+,", p), "consume-window-into-column"),
+        (&format!("{}+.", p), "expel-window-from-column"),
+        (&format!("{}+E", p), "expand-column-to-available"),
+        (&format!("{}+F", s), "maximize-column"),
+        (&format!("{}+L", s), "grow-column-width"),
+        (&format!("{}+H", s), "shrink-column-width"),
+        (&format!("{}+K", s), "grow-tile-height"),
+        (&format!("{}+J", s), "shrink-tile-height"),
+        (&format!("{}+PageUp", s), "move-workspace-up"),
+        (&format!("{}+PageDown", s), "move-workspace-down"),
+        (&format!("{}+Up", s), "move-column-to-workspace-up"),
+        (&format!("{}+Down", s), "move-column-to-workspace-down"),
+        (&format!("{}+,", s), "move-column-to-monitor-left"),
+        (&format!("{}+.", s), "move-column-to-monitor-right"),
+        (&format!("{}+S", p), "toggle-sticky"),
+        (&format!("{}+?", s), "show-key-bindings (cheatsheet)"),
     ];
 
     let chord_w = 28usize;
     let action_w = 36usize;
+    println!("  {:<cw$}  {}", "Chord", "Action", cw = chord_w);
     println!(
         "  {:<cw$}  {}",
-        "Chord", "Action",
-        cw = chord_w
-    );
-    println!(
-        "  {:<cw$}  {}",
-        "─".repeat(chord_w), "─".repeat(action_w),
+        "─".repeat(chord_w),
+        "─".repeat(action_w),
         cw = chord_w
     );
     for (chord, action) in defaults {
-        println!("  {:<cw$}  {}", truncate(chord, chord_w), action, cw = chord_w);
+        println!(
+            "  {:<cw$}  {}",
+            truncate(chord, chord_w),
+            action,
+            cw = chord_w
+        );
     }
     println!();
     println!("  {} built-in bindings.", defaults.len());
@@ -1000,10 +1064,16 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
     let event_types: Vec<String> = if types.is_empty() || types == "*" {
         vec![]
     } else {
-        types.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        types
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
 
-    let message = IpcMessage::SubscribeEvents { event_types: event_types.clone() };
+    let message = IpcMessage::SubscribeEvents {
+        event_types: event_types.clone(),
+    };
 
     let pipe_wide: Vec<u16> = OsStr::new(PIPE_PATH)
         .encode_wide()
@@ -1011,8 +1081,7 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
         .collect();
     let timeout_ms: u32 = timeout_secs.saturating_mul(1000).min(u32::MAX as u64) as u32;
 
-    let wait_ok =
-        unsafe { WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), timeout_ms) };
+    let wait_ok = unsafe { WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), timeout_ms) };
     if !wait_ok.as_bool() {
         let os_err = std::io::Error::last_os_error();
         anyhow::bail!(
@@ -1026,10 +1095,13 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
         .read(true)
         .write(true)
         .open(PIPE_PATH)
-        .map_err(|e| anyhow::anyhow!(
-            "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-            PIPE_PATH, e
-        ))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
+                PIPE_PATH,
+                e
+            )
+        })?;
 
     let data = serde_json::to_vec(&message)?;
     file.write_all(&data)?;
@@ -1040,8 +1112,15 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
     } else {
         event_types.join(",")
     };
-    let mode_desc = if raw { "newline-delimited JSON" } else { "human-readable" };
-    eprintln!("Subscribed to events ({}) [{}]. Press Ctrl+C to exit.", filter_desc, mode_desc);
+    let mode_desc = if raw {
+        "newline-delimited JSON"
+    } else {
+        "human-readable"
+    };
+    eprintln!(
+        "Subscribed to events ({}) [{}]. Press Ctrl+C to exit.",
+        filter_desc, mode_desc
+    );
 
     // The server streams length-implicit JSON objects back-to-back; serde_json
     // tolerates concatenated values in a Deserializer stream.
@@ -1117,13 +1196,9 @@ fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_jso
         .chain(std::iter::once(0u16))
         .collect();
 
-    let timeout_ms: u32 = timeout_secs
-        .saturating_mul(1000)
-        .min(u32::MAX as u64) as u32;
+    let timeout_ms: u32 = timeout_secs.saturating_mul(1000).min(u32::MAX as u64) as u32;
 
-    let wait_ok = unsafe {
-        WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), timeout_ms)
-    };
+    let wait_ok = unsafe { WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), timeout_ms) };
 
     if !wait_ok.as_bool() {
         let os_err = std::io::Error::last_os_error();
@@ -1133,7 +1208,8 @@ fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_jso
             anyhow::bail!(
                 "wiri busy: pipe wait timed out after {}s at {}.\n\
                  Try increasing --timeout, or restart wiri if it is unresponsive.",
-                timeout_secs, PIPE_PATH
+                timeout_secs,
+                PIPE_PATH
             );
         } else if os_err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) {
             anyhow::bail!(
@@ -1144,7 +1220,8 @@ fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_jso
             anyhow::bail!(
                 "WaitNamedPipeW failed for {}: {}\n\
                  (is wiri running?)",
-                PIPE_PATH, os_err
+                PIPE_PATH,
+                os_err
             );
         }
     }
@@ -1153,10 +1230,13 @@ fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_jso
         .read(true)
         .write(true)
         .open(PIPE_PATH)
-        .map_err(|e| anyhow::anyhow!(
-            "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-            PIPE_PATH, e
-        ))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
+                PIPE_PATH,
+                e
+            )
+        })?;
 
     let data = serde_json::to_vec(message)?;
     file.write_all(&data)?;

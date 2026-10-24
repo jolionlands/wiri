@@ -27,7 +27,10 @@ impl IpcClient {
         Ok(())
     }
 
-    pub async fn send_message(&mut self, message: &IpcMessage) -> Result<serde_json::Value, IpcError> {
+    pub async fn send_message(
+        &mut self,
+        message: &IpcMessage,
+    ) -> Result<serde_json::Value, IpcError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let pipe = self.pipe.as_mut().ok_or(IpcError::ClientDisconnected)?;
@@ -71,12 +74,14 @@ impl IpcClient {
     }
 
     pub async fn switch_workspace(&mut self, id: i32) -> Result<(), IpcError> {
-        self.send_message(&IpcMessage::SwitchWorkspace { id }).await?;
+        self.send_message(&IpcMessage::SwitchWorkspace { id })
+            .await?;
         Ok(())
     }
 
     pub async fn close_window(&mut self, hwnd: isize) -> Result<(), IpcError> {
-        self.send_message(&IpcMessage::CloseWindow { window_hwnd: hwnd }).await?;
+        self.send_message(&IpcMessage::CloseWindow { window_hwnd: hwnd })
+            .await?;
         Ok(())
     }
 }

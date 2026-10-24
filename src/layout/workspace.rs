@@ -1,5 +1,5 @@
-use crate::utils::{Rect, Point, Size, WindowId};
-use super::{LayoutElement, ConfigureIntent, ConfigureThrottle};
+use super::{ConfigureIntent, ConfigureThrottle, LayoutElement};
+use crate::utils::{Point, Rect, Size, WindowId};
 
 #[derive(Debug, Clone)]
 pub struct Tile {
@@ -255,7 +255,11 @@ impl Workspace {
     }
 
     /// Add a window to a new column with an explicit width hint.
-    pub fn add_window_to_new_column_with_width(&mut self, window_id: WindowId, width: Option<u32>) -> usize {
+    pub fn add_window_to_new_column_with_width(
+        &mut self,
+        window_id: WindowId,
+        width: Option<u32>,
+    ) -> usize {
         let tile = Tile::new(window_id);
         let mut column = Column::new();
         column.width = width;
@@ -304,13 +308,17 @@ impl Workspace {
     /// Returns true on success, false when there is no column to the right
     /// or the window cannot be located. Empty source columns are dropped.
     pub fn consume_window_into_right_column(&mut self, window_id: WindowId) -> bool {
-        let Some(src_col_idx) = self.find_window_column(window_id) else { return false };
+        let Some(src_col_idx) = self.find_window_column(window_id) else {
+            return false;
+        };
         // Need a column to the right of the source.
         if src_col_idx + 1 >= self.columns.len() {
             return false;
         }
         // Remove the tile from its source column.
-        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else { return false };
+        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else {
+            return false;
+        };
         let source_now_empty = self.columns[src_col_idx].tiles.is_empty();
         // If the source becomes empty after removal it is dropped, shifting
         // the target index left by one.
@@ -334,13 +342,23 @@ impl Workspace {
     /// and make it the sole tile of a brand-new column inserted immediately
     /// to the right of the source. Returns true on success.
     pub fn expel_window_into_new_column(&mut self, window_id: WindowId) -> bool {
-        let Some(src_col_idx) = self.find_window_column(window_id) else { return false };
+        let Some(src_col_idx) = self.find_window_column(window_id) else {
+            return false;
+        };
         // No-op when the source column has only one tile — there is nothing
         // to expel (the column would just be cloned and the source removed).
-        if self.columns.get(src_col_idx).map(|c| c.tiles.len()).unwrap_or(0) <= 1 {
+        if self
+            .columns
+            .get(src_col_idx)
+            .map(|c| c.tiles.len())
+            .unwrap_or(0)
+            <= 1
+        {
             return false;
         }
-        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else { return false };
+        let Some(tile) = self.columns[src_col_idx].remove_tile(window_id) else {
+            return false;
+        };
         let mut new_col = Column::new();
         new_col.add_tile(tile);
         let insert_at = src_col_idx + 1;
@@ -349,7 +367,12 @@ impl Workspace {
     }
 
     /// Move a window to a different column
-    pub fn move_window(&mut self, window_id: WindowId, target_col: usize, target_index: usize) -> bool {
+    pub fn move_window(
+        &mut self,
+        window_id: WindowId,
+        target_col: usize,
+        target_index: usize,
+    ) -> bool {
         // Find and remove the window
         let removed = self.remove_window(window_id);
         if removed.is_none() {
@@ -402,16 +425,26 @@ impl Workspace {
         if self.columns.is_empty() {
             return 0;
         }
-        self.columns.iter().enumerate().map(|(i, col)| {
-            let w = col.width.map(|w| w as i32).unwrap_or(column_width);
-            w + if i < self.columns.len() - 1 { gap } else { 0 }
-        }).sum()
+        self.columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let w = col.width.map(|w| w as i32).unwrap_or(column_width);
+                w + if i < self.columns.len() - 1 { gap } else { 0 }
+            })
+            .sum()
     }
 
     /// Ensure a specific column is visible by adjusting scroll offset.
     /// Supports variable-width columns.
     /// Returns true if scroll offset was changed.
-    pub fn scroll_to_column(&mut self, column_idx: usize, default_width: i32, gap: i32, view_width: i32) -> bool {
+    pub fn scroll_to_column(
+        &mut self,
+        column_idx: usize,
+        default_width: i32,
+        gap: i32,
+        view_width: i32,
+    ) -> bool {
         if column_idx >= self.columns.len() || view_width <= 0 {
             return false;
         }
@@ -441,22 +474,21 @@ impl Workspace {
         self.scroll_offset.x != old_offset
     }
 
-    /// Clamp scroll offset so it doesn't go below 0 or past the last column.
+    /// Clamp scroll offset so it doesn't go below 0 or beyond the last column.
     /// Supports variable-width columns.
-    pub fn clamp_scroll(&mut self, default_width: i32, gap: i32, view_width: i32) {
+    pub fn clamp_scroll(&mut self, default_width: i32, gap: i32, _view_width: i32) {
         if self.columns.is_empty() {
             self.scroll_offset.x = 0;
             return;
         }
-        // Compute total width with variable column widths
-        let total: i32 = self.columns.iter().enumerate().map(|(i, col)| {
-            let w = col.width.map(|w| w as i32).unwrap_or(default_width);
-            w + if i < self.columns.len() - 1 { gap } else { 0 }
-        }).sum();
-        // Allow scrolling until the last column's right edge
-        // reaches the left edge of the view. This gives a niri-like
-        // "infinite scroll" feel where you can always scroll right.
-        let max_scroll = total.max(view_width) - view_width;
+
+        // A scrollable strip should still pan when total content is narrower
+        // than the monitor. Clamp at the last column's left edge, not at
+        // total_width - viewport_width, so every column can be brought to the
+        // leading edge of the viewport.
+        let last_col_idx = self.columns.len().saturating_sub(1);
+        let (last_col_start, _) = self.column_x_and_width(last_col_idx, default_width, gap);
+        let max_scroll = last_col_start.max(0);
         self.scroll_offset.x = self.scroll_offset.x.clamp(0, max_scroll);
     }
 
@@ -496,7 +528,12 @@ impl Workspace {
     /// Return the calculated x position of a window given per-column layout.
     /// `default_width` is the fallback column width when a column has no explicit width.
     /// Returns `None` if the window is not found.
-    pub fn current_position_for(&self, window_id: WindowId, default_width: i32, gap: i32) -> Option<crate::utils::Rect> {
+    pub fn current_position_for(
+        &self,
+        window_id: WindowId,
+        default_width: i32,
+        gap: i32,
+    ) -> Option<crate::utils::Rect> {
         let mut x = 0i32;
         for col in &self.columns {
             let w = col.width.map(|w| w as i32).unwrap_or(default_width);
@@ -530,7 +567,11 @@ impl Default for Workspace {
 }
 
 /// Compute the layout for a single column
-pub fn compute_column_layout(column: &Column, column_rect: Rect, gap: i32) -> Vec<(WindowId, Rect)> {
+pub fn compute_column_layout(
+    column: &Column,
+    column_rect: Rect,
+    gap: i32,
+) -> Vec<(WindowId, Rect)> {
     let tile_count = column.tile_count();
     if tile_count == 0 {
         return Vec::new();
@@ -563,14 +604,21 @@ pub fn compute_workspace_layout(
 
     for (col_idx, column) in workspace.columns.iter().enumerate() {
         // Calculate column X position
-        let x = output_rect.loc.x + (col_idx as i32 * (column_width + column_gap)) - scroll_offset.x;
+        let x =
+            output_rect.loc.x + (col_idx as i32 * (column_width + column_gap)) - scroll_offset.x;
 
         // Skip columns outside the visible area
-        if x + column_width < output_rect.loc.x || x > output_rect.loc.x + output_rect.size.w as i32 {
+        if x + column_width < output_rect.loc.x || x > output_rect.loc.x + output_rect.size.w as i32
+        {
             continue;
         }
 
-        let column_rect = Rect::new(x, output_rect.loc.y, column_width as u32, output_rect.size.h);
+        let column_rect = Rect::new(
+            x,
+            output_rect.loc.y,
+            column_width as u32,
+            output_rect.size.h,
+        );
         let col_tiles = compute_column_layout(column, column_rect, window_gap);
         result.extend(col_tiles);
     }
@@ -615,7 +663,7 @@ mod tests {
         ws.add_window_to_new_column(WindowId::new(1));
         ws.add_window_to_new_column(WindowId::new(2));
         assert_eq!(ws.column_count(), 2);
-        
+
         let removed = ws.remove_window(WindowId::new(1));
         assert!(removed.is_some());
         assert_eq!(ws.column_count(), 1);
@@ -626,10 +674,10 @@ mod tests {
         let mut ws: Workspace = Workspace::new();
         ws.add_window_to_new_column(WindowId::new(1));
         ws.add_window_to_new_column(WindowId::new(2));
-        
+
         let output_rect = Rect::new(0, 0, 1920, 1080);
         let positions = compute_workspace_layout(&ws, output_rect, 600, 16, 8);
-        
+
         assert_eq!(positions.len(), 2);
     }
 
@@ -752,8 +800,9 @@ mod tests {
         // Set an unreasonably large scroll offset
         ws.scroll_offset.x = 10000;
         ws.clamp_scroll(500, 8, 1920);
-        // Total = 1008, max_scroll = max(1008 - 1920, 0) = 0
-        assert_eq!(ws.scroll_offset.x, 0);
+        // Last column starts at x=508, even though total content fits in the
+        // viewport. Scrolling can still bring that column to the leading edge.
+        assert_eq!(ws.scroll_offset.x, 508);
     }
 
     #[test]
@@ -762,11 +811,10 @@ mod tests {
         for i in 1..=10 {
             ws.add_window_to_new_column(WindowId::new(i));
         }
-        // Total = 10*500 + 9*8 = 5072
-        // Max scroll = 5072 - 1920 = 3152
+        // Last column starts at 9 * (500 + 8) = 4572.
         ws.scroll_offset.x = 10000;
         ws.clamp_scroll(500, 8, 1920);
-        assert_eq!(ws.scroll_offset.x, 3152);
+        assert_eq!(ws.scroll_offset.x, 4572);
     }
 
     #[test]
@@ -805,7 +853,6 @@ mod tests {
         assert_eq!(positions[0].1.loc.x, -100);
     }
 
-
     #[test]
     fn test_scroll_to_column_centers() {
         let mut ws = Workspace::new();
@@ -820,12 +867,11 @@ mod tests {
         assert!(scrolled);
         // Column 4 starts at x=2064, center=2314
         // Target scroll = 2314 - 400 = 1914
-        // But clamped by max_scroll = 2564 - 800 = 1764
-        // So scroll should be clamped to 1764
+        // New niri-like clamp allows the last column to reach the leading
+        // edge, so the centered target remains valid.
         // Clamp scroll to valid range
         ws.clamp_scroll(500, 16, 800);
-        assert!(ws.scroll_offset.x > 0);
-        assert!(ws.scroll_offset.x <= 1764, "scroll={} > 1764", ws.scroll_offset.x);
+        assert_eq!(ws.scroll_offset.x, 1914);
     }
 
     #[test]
@@ -914,9 +960,15 @@ mod tests {
     #[test]
     fn test_workspace_layout_from_str() {
         assert_eq!(WorkspaceLayout::from_str("bstack"), WorkspaceLayout::BStack);
-        assert_eq!(WorkspaceLayout::from_str("bottom-stack"), WorkspaceLayout::BStack);
+        assert_eq!(
+            WorkspaceLayout::from_str("bottom-stack"),
+            WorkspaceLayout::BStack
+        );
         assert_eq!(WorkspaceLayout::from_str("spiral"), WorkspaceLayout::Spiral);
-        assert_eq!(WorkspaceLayout::from_str("tile"), WorkspaceLayout::Scrolling);
+        assert_eq!(
+            WorkspaceLayout::from_str("tile"),
+            WorkspaceLayout::Scrolling
+        );
         assert_eq!(WorkspaceLayout::from_str(""), WorkspaceLayout::Scrolling);
         assert_eq!(WorkspaceLayout::from_str("BSTACK"), WorkspaceLayout::BStack);
     }
@@ -927,5 +979,4 @@ mod tests {
         assert_eq!(ws.layout_mode, WorkspaceLayout::BStack);
         assert!(ws.columns.is_empty());
     }
-
 }
