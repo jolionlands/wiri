@@ -37,6 +37,11 @@ Minimum Rust: stable 1.78+. No build-script magic.
 
 First run writes a default config to `%APPDATA%\wiri\config.kdl`. Edit it and save — wiri hot-reloads.
 
+`wiri.exe` is a GUI program: starting it opens no console window.  Its log is
+`%LOCALAPPDATA%\wiri\wiri.log`, and `-v` also shows it in the shell that started wiri.  If wiri is
+ever killed, start it again: windows it had hidden are shown again (see
+[Troubleshooting](docs/TROUBLESHOOTING.md)).
+
 To stop: `wiri-ctl quit`, the tray menu, or `Ctrl+Alt+Shift+Q`.
 
 ## Default key bindings

@@ -171,7 +171,12 @@ Edit `config.kdl` while wiri is running and changes take effect automatically vi
 
 ### Logging
 
-Logs are written to stderr. Use `RUST_LOG` env var for fine-grained control:
+`wiri.exe` is a GUI-subsystem program (it opens no console window), so its log goes to
+`%LOCALAPPDATA%\wiri\wiri.log`, rotated at 4 MB (the previous log is kept as `wiri.log.1`).
+Started from a shell with `-v` (or `--help`, `--version`) wiri attaches to that shell's console and
+shows the log there as well; `wiri -v 2> out.log` redirects it instead.  A plain `wiri` never attaches
+to a console, because a daemon attached to a console dies when the console is closed.
+Use the `RUST_LOG` env var for fine-grained control:
 ```sh
 RUST_LOG=debug wiri
 RUST_LOG=wiri::layout=trace wiri
@@ -201,6 +206,7 @@ input {
 layout {
     column-width 500
     column-width-mode "proportional"   // "proportional" or "fixed"
+    max-visible-columns 3              // proportional: at most this many columns share the screen
     inner-gaps 16
     outer-gaps 8
     border-width 4
@@ -299,6 +305,7 @@ output "\\\\.\\DISPLAY2" {
 |---|---|---|---|
 | `column-width` | u32 | `500` | Default column width (px) |
 | `column-width-mode` | string | `"proportional"` | `"proportional"` (fill screen) or `"fixed"` (per-column width) |
+| `max-visible-columns` | u32 | `3` | Proportional mode: the screen is shared by at most this many columns (1 window = full screen, 2 = halves, 3 = thirds, more windows scroll in at a third); `0` = no limit (down to `column-width / 2`) |
 | `inner-gaps` | u32 | `16` | Gap between columns and stacked tiles (px) |
 | `outer-gaps` | u32 | `8` | Margin around the monitor edges (px) |
 | `border-width` | u32 | `4` | Window border thickness (px) |
@@ -413,10 +420,15 @@ All default bindings use the `Ctrl+Alt` prefix:
 | **Digits** | `0`–`9` |
 | **Arrows** | `Left`, `Right`, `Up`, `Down` |
 | **Arrow aliases** | `Arrow-Left`, `Arrow-Right`, `Arrow-Up`, `Arrow-Down` |
-| **Special** | `Enter`, `Return`, `Space`, `Tab`, `Escape`, `Esc`, `Backspace`, `Delete`, `Del`, `Home`, `End`, `Page-Up`, `Prior`, `Page-Down`, `Next`, `Insert`, `Ins` |
+| **Special** | `Enter`, `Return`, `Space`, `Tab`, `Escape`, `Esc`, `Backspace`, `Delete`, `Del`, `Home`, `End`, `Page-Up` (also `Page_Up`, `PageUp`), `Prior`, `Page-Down` (also `Page_Down`, `PageDown`), `Next`, `Insert`, `Ins` |
 | **Lock** | `Caps-Lock`, `Num-Lock`, `Scroll-Lock` |
-| **Function** | `F1`–`F12` |
+| **Function** | `F1`–`F24` |
 | **Other** | `Print`, `Print-Screen`, `Pause` |
+| **Punctuation** | `Comma`, `Period`, `Minus`, `Equal`, `Semicolon`, `Slash`, `Backslash`, `Bracket_Left`, `Bracket_Right`, `Apostrophe`, `Grave` (xkb names), or the character itself: `,` `.` `-` `=` `;` `/` `\` `[` `]` `'` |
+| **Keypad** | `KP_0`–`KP_9`, `KP_Add`, `KP_Subtract`, `KP_Multiply`, `KP_Divide`, `KP_Decimal`, `KP_Enter` |
+
+Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Bracket_Left`,
+`bracketleft` and `bracket-left` are the same key.
 
 ### Supported Action Names
 
@@ -1401,8 +1413,8 @@ RUST_LOG=wiri=debug wiri
 RUST_LOG=wiri::layout=trace wiri
 RUST_LOG=wiri::input=debug wiri
 
-# Check log file
-cat wiri_log.txt
+# Check log file (PowerShell)
+Get-Content $env:LOCALAPPDATA\wiri\wiri.log -Tail 50
 ```
 
 Common debugging areas:

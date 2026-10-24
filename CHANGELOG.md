@@ -5,6 +5,61 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — live-desktop shakedown (2026-10-24)
+First long run on a real desktop (Windows 11, 1366x768, Windows Terminal
+windows, one hung application) turned up nine defects.  Each is fixed with unit
+tests and was re-checked on that desktop.
+- **Repositioning loop (~68 log lines a second).**  Windows nested inside
+  another window (the XAML island in every Windows Terminal window, WebView
+  hosts) were tiled as columns of their own, and the host and the island passed
+  the foreground back and forth.  Child windows, wiri's own windows and a
+  console that only wiri is attached to are never tiled
+  (`window::classify_skip`).
+- **`wiri-ctl` starved for minutes behind a hung application.**  The layout
+  pass made synchronous cross-process calls (`DeferWindowPos`, `RedrawWindow`
+  with `RDW_UPDATENOW`, `ShowWindow`) while holding the engine lock.
+  Positioning is now one asynchronous `SetWindowPos` per window, redraw only
+  invalidates, show and hide use `ShowWindowAsync`, and every IPC request is
+  answered within 1.5 s ("wiri is busy" instead of a hung pipe).
+- **New windows were never tiled.**  Columns outside the visible strip were
+  skipped by the layout; they are parked below the screen instead, and a new
+  column is scrolled into view by the minimal amount.  A window that closes on
+  an inactive workspace no longer leaves a ghost tile.
+- **Foreground fight.**  The OS foreground is mirrored into the focus state
+  instead of being activated again.  Activation is attempted once per focus
+  target, escalates (`SetForegroundWindow`, an injected F24 key,
+  `AttachThreadInput`, `SwitchToThisWindow`) and a refusal is logged once.  The
+  focused tile's inset no longer differs, so a focus change cannot resize
+  anything.
+- **Key names.**  `Bracket_Left`, `Bracket_Right`, `Backslash`, `Comma`,
+  `Period`, `Page_Up` and `Page_Down` (the xkb/niri spellings; case, `_`, `-`
+  and spaces are ignored) are accepted, so the default config and both examples
+  load without unknown-key warnings.  `set-column-width` is an action.  In
+  `focus-ring {}` and `shadows {}` the keys `width` and `color` no longer
+  overwrite the border settings.
+- **`wiri.exe` is a GUI-subsystem program** (release builds): it opens no
+  console window that wiri could tile.  The log is
+  `%LOCALAPPDATA%\wiri\wiri.log`, rotated at 4 MB with one backup
+  (`wiri.log.1`).  `-v`, `--help`, `--version` and command-line errors attach
+  to the console of the shell that started wiri.
+- **`wiri-ctl` output** is folded to ASCII when stdout or stderr is a pipe or a
+  file (the box-drawing characters used to arrive garbled); a real console
+  keeps the Unicode tables.  `WIRI_ASCII=1` / `WIRI_UNICODE=1` override it and
+  `--json` is untouched.
+- **238 px columns on a 1366 px display.**  In proportional mode every window
+  got an equal share of the screen, down to `column-width / 2`.  The new
+  layout option `max-visible-columns` (default 3) bounds the split: one window
+  fills the screen, two get halves, three get thirds, further windows scroll
+  in at a third.  Explicit widths (`set-column-width`, grow/shrink) now apply
+  in proportional mode too.
+- **Workspace numbers are 1-based** at every user-visible edge (hotkeys,
+  `switch-workspace`, IPC replies, events).  `Ctrl+Alt+1` and
+  `switch-workspace 1` used to select the second workspace.
+- **Crash safety.**  Every hidden window is recorded in
+  `%LOCALAPPDATA%\wiri\hidden.json`; the next start, `wiri-ctl quit` and a
+  panic show them again, and a window an earlier killed wiri left off-screen
+  is moved onto the work area.
+
 ### Added — opus pass K (2026-05-18)
 - ✅ **DwmRegisterThumbnail-based overview** — niri-parity overview rendering
   that leaves the underlying HWNDs at their normal size and instead

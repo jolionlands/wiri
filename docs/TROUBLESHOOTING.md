@@ -17,6 +17,31 @@ Get-Process wiri | Stop-Process
 
 Then start wiri again.
 
+### Where is wiri's log?
+
+`wiri.exe` is a GUI-subsystem program: it has no console of its own, and
+starting it from Explorer, the Run key or a shell opens no extra window.  Its
+log is `%LOCALAPPDATA%\wiri\wiri.log`; the file is rotated at 4 MB and the
+previous log is kept as `wiri.log.1`.  `RUST_LOG` and `-v` change the level
+as before.
+
+To watch the log live, start wiri from a shell with `-v`: it attaches to that
+shell's console and shows the log there as well (closing that console then
+stops wiri).  `wiri.exe -v 2> out.log` redirects it to a file instead.  A plain
+`wiri` never attaches to a console.
+
+### wiri was killed and some windows disappeared
+
+Windows on other workspaces are hidden, and windows scrolled out of view are
+parked below the screen.  If wiri is killed or crashes meanwhile, they stay
+that way until wiri runs again.  Every hide is recorded in
+`%LOCALAPPDATA%\wiri\hidden.json` (with the process id and window class, so a
+recycled window handle is never touched).  Just start wiri again: it shows
+those windows before it enumerates the desktop and tiles everything.
+`wiri-ctl quit`, the tray menu and a panic do the same on the way out, and a
+window that an earlier killed wiri left off-screen is moved back onto the work
+area.
+
 ### Known hotkey conflicts on Windows
 
 Windows reserves a handful of chords for the OS itself or its GPU/accessibility
@@ -63,8 +88,9 @@ Two tools help isolate "didn't fire" issues:
 
 2. **Verbose log of WM_HOTKEY dispatches** — restart wiri with
    `RUST_LOG=wiri::backend::message_loop=trace .\wiri.exe -v 2>wiri.log`.
-   Every received WM_HOTKEY prints an `HOTKEY id=…` line.  If no line shows
-   up when you press the chord, Windows is intercepting it before wiri.
+   Every received WM_HOTKEY prints an `HOTKEY id=…` line (they are also in
+   `%LOCALAPPDATA%\wiri\wiri.log`).  If no line shows up when you press the
+   chord, Windows is intercepting it before wiri.
 
 ### Hotkeys don't fire on ARM64
 
@@ -114,6 +140,20 @@ layout {
 }
 ```
 
+### Columns are narrower than expected, or windows overlap
+
+In the default `column-width-mode "proportional"` the screen is shared by at
+most `max-visible-columns` columns (default 3): one window fills the screen,
+two get halves, three get thirds, and further windows scroll in at a third.
+`max-visible-columns 0` restores the old behaviour (every window gets an equal
+share, down to `column-width / 2`).  Resize one column with
+`wiri-ctl set-column-width 1/2` (`1/3`, `2/3`, `full`, `cycle`, `50%`, ...).
+
+Some applications refuse to get narrower than a minimum width: Windows Terminal
+needs about 460 px, while three columns on a 1366 px display are about 430 px
+wide, so a terminal overlaps its neighbour.  Use `max-visible-columns 2` on
+small displays.
+
 ### Borders aren't coloured on Windows 10
 
 Coloured borders use `DWMWA_BORDER_COLOR`, which was added in Windows 11 build
@@ -146,6 +186,14 @@ wiri-ctl --timeout 30 state
 If wiri *is* running, look for a deadlock — check `wiri-ctl state` for
 suspicious `failed_position` entries or zero monitors.
 
+### `wiri-ctl ...` says "wiri is busy"
+
+wiri answers every request within 1.5 s.  This message means the engine lock
+was still held after that time, typically because a layout pass is waiting on
+an unresponsive window.  The request stays queued and takes effect when the
+lock is free; repeat the command.  `%LOCALAPPDATA%\wiri\wiri.log` has a
+`replying 'busy'` line each time it happens.
+
 ### JSON output instead of formatted text
 
 Add `--json` if you wanted that, omit it if you didn't. Default is
@@ -176,4 +224,4 @@ Open an issue at <https://github.com/jolionlands/wiri/issues> with:
 - wiri version output (`wiri --version`)
 - The full output of `wiri-ctl list-monitors`
 - A minimal config that reproduces the issue
-- The tail of `wiri_log.txt` (or stderr captured with `-v`)
+- The tail of `%LOCALAPPDATA%\wiri\wiri.log`
