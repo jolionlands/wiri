@@ -1159,6 +1159,8 @@ impl TilingEngine {
         // is about to be destroyed (and on auto-float, the window will keep
         // its blur — the user expects a floating "frosted glass" effect).
         self.blur_applied.remove(&window_id);
+        // A destroyed window needs no "show me again after a crash" record.
+        crate::backend::hidden::forget(window_id.as_isize());
 
         if self.last_activated == Some(window_id) {
             // The window is gone; make sure the next focus target is activated
@@ -5695,6 +5697,21 @@ impl TilingEngine {
             self.original_bounds.len()
         );
 
+        // Show every window wiri hid (inactive workspaces, the fullscreen
+        // cover-up, parked columns are merely moved).  Before this a quit with
+        // another workspace active left those windows hidden for good.
+        let mut shown: HashSet<isize> = HashSet::new();
+        for window_id in self.tiled_windows.keys() {
+            let _ = backend.show_window(window_id.as_isize(), true);
+            shown.insert(window_id.as_isize());
+        }
+        for hidden in crate::backend::hidden::snapshot() {
+            if shown.insert(hidden.hwnd) {
+                let _ = backend.show_window(hidden.hwnd, true);
+            }
+        }
+        crate::backend::hidden::restore_all_hidden();
+
         // Restore styles first (un-strips frames if strip_frame was enabled)
         for (window_id, &orig_style) in &self.saved_styles {
             let hwnd = HWND(window_id.as_isize() as *mut std::ffi::c_void);
@@ -5724,12 +5741,13 @@ impl TilingEngine {
             }
         }
 
-        // Restore original bounds.
+        // Restore original bounds (plain GetWindowRect rectangles, so no
+        // shadow-margin compensation).  Windows that no longer exist are skipped.
+        let work_areas: Vec<Rect> = self.monitors.values().map(|m| m.work_area).collect();
         for (window_id, &rect) in &self.original_bounds {
-            let _ = backend.set_window_position(
+            let _ = backend.restore_window_rect(
                 window_id.as_isize(),
-                rect,
-                SWP_NOZORDER | SWP_NOACTIVATE,
+                restorable_bounds(rect, &work_areas),
             );
         }
     }
@@ -6012,6 +6030,37 @@ impl Default for TilingEngine {
     fn default() -> Self {
         Self::new(LayoutConfig::default())
     }
+}
+
+/// Where to put a window back when wiri lets go of it.
+///
+/// Normally that is the rectangle it had when wiri first saw it.  But a window
+/// that an earlier wiri run (one that was killed, or crashed, before it could
+/// restore anything) left parked below the screen is first seen *there*, and
+/// "restoring" it to where it already is would leave it lost.  A rectangle with
+/// less than 64x64 px on any work area is therefore replaced by one centred on
+/// the first work area, at most 70% of its size.
+fn restorable_bounds(original: Rect, work_areas: &[Rect]) -> Rect {
+    const MIN_VISIBLE: i32 = 64;
+    let overlap = |a_start: i32, a_end: i32, b_start: i32, b_end: i32| a_end.min(b_end) - a_start.max(b_start);
+    let usable = work_areas.iter().any(|wa| {
+        overlap(original.loc.x, original.right(), wa.loc.x, wa.right()) >= MIN_VISIBLE
+            && overlap(original.loc.y, original.bottom(), wa.loc.y, wa.bottom()) >= MIN_VISIBLE
+    });
+    let Some(wa) = work_areas.first() else {
+        return original;
+    };
+    if usable {
+        return original;
+    }
+    let w = original.size.w.min(wa.size.w * 7 / 10).max(200);
+    let h = original.size.h.min(wa.size.h * 7 / 10).max(150);
+    Rect::new(
+        wa.loc.x + (wa.size.w as i32 - w as i32) / 2,
+        wa.loc.y + (wa.size.h as i32 - h as i32) / 2,
+        w,
+        h,
+    )
 }
 
 #[cfg(test)]
@@ -10737,6 +10786,30 @@ mod tests {
         // re-position windows nobody can see.
         let far = Rect::new(9000, 8, 400, 700);
         assert_eq!(parked_rect(far, view, 832), parked_rect(right, view, 832));
+    }
+
+    #[test]
+    fn test_restorable_bounds_rescues_windows_left_off_screen() {
+        let work = [Rect::new(0, 0, 1366, 728)];
+        // A normal original position is kept.
+        let normal = Rect::new(104, 104, 520, 380);
+        assert_eq!(restorable_bounds(normal, &work), normal);
+        // Partly off the edge but still plenty visible: kept.
+        let edge = Rect::new(-300, 40, 520, 380);
+        assert_eq!(restorable_bounds(edge, &work), edge);
+        // Parked below the screen by an earlier, killed wiri: brought back,
+        // centred, at its own size.
+        let parked = Rect::new(4, 836, 445, 711);
+        let rescued = restorable_bounds(parked, &work);
+        assert_eq!(rescued.size.w, 445);
+        assert_eq!(rescued.size.h, 509); // capped at 70% of the 728 px work area
+        assert!(rescued.loc.y >= 0 && rescued.bottom() <= 728, "{:?}", rescued);
+        assert!(rescued.loc.x >= 0 && rescued.right() <= 1366, "{:?}", rescued);
+        // A sliver of a few pixels does not count as visible.
+        let sliver = Rect::new(-510, 100, 520, 380);
+        assert_ne!(restorable_bounds(sliver, &work), sliver);
+        // No monitors known: nothing to correct against.
+        assert_eq!(restorable_bounds(parked, &[]), parked);
     }
 
     #[test]

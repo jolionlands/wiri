@@ -1,5 +1,6 @@
 pub mod accent;
 pub mod cbt_hook;
+pub mod hidden;
 pub mod hooks;
 pub mod hotkey_conflicts;
 pub mod message_loop;
@@ -735,6 +736,9 @@ impl BackendHandle {
     /// IPC server) inside a synchronous `ShowWindow`.
     pub fn show_window(&self, hwnd: isize, show: bool) -> Result<()> {
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        // Record the hide first: if wiri dies right after the call, the next
+        // start still knows this window must be shown again.
+        hidden::note_hidden(hwnd, !show);
         unsafe {
             let _ = ShowWindowAsync(hwnd_win, if show { SW_SHOWNA } else { SW_HIDE });
         }
@@ -875,6 +879,24 @@ impl BackendHandle {
         }
     }
 
+    /// Put a window back exactly where it was before wiri tiled it.  `rect` is
+    /// the plain `GetWindowRect` rectangle recorded at that time, so unlike
+    /// [`Self::set_window_position`] no shadow-margin compensation is applied.
+    pub fn restore_window_rect(&self, hwnd: isize, rect: Rect) -> Result<()> {
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        unsafe {
+            SetWindowPos(
+                hwnd_win,
+                HWND::default(), // ignored: SWP_NOZORDER
+                rect.loc.x,
+                rect.loc.y,
+                rect.size.w as i32,
+                rect.size.h as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            )
+            .map_err(|e| anyhow::anyhow!("restore_window_rect: hwnd={}: {}", hwnd, e))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

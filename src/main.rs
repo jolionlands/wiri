@@ -196,6 +196,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Crash safety: windows on inactive workspaces are hidden, and a hidden
+    // window has no taskbar button.  If a previous wiri was killed or crashed
+    // while some were hidden, show them again now - before the desktop is
+    // enumerated, so they are tiled like every other window - and keep
+    // recording new hides from here on.
+    if let Some(path) = wiri::backend::hidden::default_path() {
+        wiri::backend::hidden::restore_from_file(&path);
+        wiri::backend::hidden::enable_persistence(path);
+    }
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Whatever is going wrong, do not strand hidden windows.
+            wiri::backend::hidden::restore_all_hidden();
+            default_hook(info);
+        }));
+    }
+
     // Resolve config path: explicit --config wins, otherwise search the standard locations.
     let config_path: PathBuf = args
         .config
@@ -914,6 +932,9 @@ async fn main() -> Result<()> {
     // user doesn't lose their layout on quit.
     info!("Restoring windows...");
     engine.write().restore_all(&handle);
+    // The show/move requests are posted to the windows' own threads; let them
+    // be picked up before the process (and our hooks) go away.
+    std::thread::sleep(Duration::from_millis(100));
 
     stop_mouse_hook();
     wiri::hooks::clear_backend();
