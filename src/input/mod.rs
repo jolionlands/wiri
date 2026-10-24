@@ -452,18 +452,108 @@ pub fn parse_key_name(name: &str) -> Option<u32> {
 }
 
 /// Parse modifier name strings into Windows MOD_* flags.
+///
+/// Lenient: names it does not know are skipped.  Key binds must not use this -
+/// a dropped modifier turns `Hyper+T` into a bare `T` hotkey - they go through
+/// [`resolve_bind_modifiers`], which rejects what it does not understand.
 pub fn parse_modifiers(names: &[String]) -> u32 {
     let mut flags = 0u32;
     for m in names {
         match m.to_lowercase().as_str() {
-            "ctrl" | "control" => flags |= 0x0002,       // MOD_CTRL
-            "alt" => flags |= 0x0001,                    // MOD_ALT
-            "shift" => flags |= 0x0004,                  // MOD_SHIFT
-            "super" | "win" | "meta" => flags |= 0x0008, // MOD_WIN
+            "ctrl" | "control" => flags |= MOD_CTRL,
+            "alt" => flags |= MOD_ALT,
+            "shift" => flags |= MOD_SHIFT,
+            "super" | "win" | "meta" => flags |= MOD_WIN,
             _ => {}
         }
     }
     flags
+}
+
+/// Win32 `RegisterHotKey` modifier flags.
+pub const MOD_ALT: u32 = 0x0001;
+pub const MOD_CTRL: u32 = 0x0002;
+pub const MOD_SHIFT: u32 = 0x0004;
+pub const MOD_WIN: u32 = 0x0008;
+
+/// What `Mod` stands for when `input { mod-key }` is not set: wiri's long-standing
+/// default prefix, Ctrl+Alt.
+pub const DEFAULT_MOD_KEY: u32 = MOD_CTRL | MOD_ALT;
+
+/// The modifier flags a `mod-key` value stands for, or `None` when the value is
+/// not one wiri knows.  Case, `+`, `_` and `-` are interchangeable, so niri's
+/// `"Super"` / `"Alt"` and wiri's `"ctrl-alt"` / `"win-alt"` all resolve.
+pub fn mod_key_flags(name: &str) -> Option<u32> {
+    let canon: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | '+' | ' '))
+        .collect();
+    match canon.as_str() {
+        "ctrlalt" | "altctrl" | "controlalt" | "altcontrol" => Some(MOD_CTRL | MOD_ALT),
+        "alt" => Some(MOD_ALT),
+        "ctrl" | "control" => Some(MOD_CTRL),
+        "super" | "win" | "meta" => Some(MOD_WIN),
+        "winalt" | "superalt" | "metaalt" | "altwin" | "altsuper" | "altmeta" => {
+            Some(MOD_WIN | MOD_ALT)
+        }
+        "ctrlshift" | "shiftctrl" | "controlshift" | "shiftcontrol" => Some(MOD_CTRL | MOD_SHIFT),
+        "winctrl" | "superctrl" | "metactrl" | "ctrlwin" | "ctrlsuper" => {
+            Some(MOD_WIN | MOD_CTRL)
+        }
+        _ => None,
+    }
+}
+
+/// Why a bind's modifier list was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModifierError {
+    /// Not a modifier name at all (a typo, or a name from another WM).
+    Unknown(String),
+    /// A valid niri modifier that Windows cannot bind (AltGr / level-5 shift).
+    Unsupported(String),
+}
+
+impl std::fmt::Display for ModifierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModifierError::Unknown(name) => write!(
+                f,
+                "unknown modifier '{}' (use Mod, Ctrl, Shift, Alt or Super)",
+                name
+            ),
+            ModifierError::Unsupported(name) => write!(
+                f,
+                "modifier '{}' (AltGr / level shift) cannot be bound on Windows",
+                name
+            ),
+        }
+    }
+}
+
+/// Resolve the modifier names of one key bind (`Mod+Ctrl+T` has `Mod`, `Ctrl`)
+/// into `RegisterHotKey` flags.  `mod_key` is what `Mod` stands for (see
+/// [`mod_key_flags`] and [`DEFAULT_MOD_KEY`]).  Unlike [`parse_modifiers`] a name
+/// that is not understood is an error: silently dropping it registers a bare
+/// global hotkey that steals the key from every application.
+pub fn resolve_bind_modifiers(names: &[String], mod_key: u32) -> Result<u32, ModifierError> {
+    let mut flags = 0u32;
+    for raw in names {
+        let name = raw.trim();
+        match name.to_lowercase().as_str() {
+            "mod" => flags |= mod_key,
+            "ctrl" | "control" => flags |= MOD_CTRL,
+            "alt" => flags |= MOD_ALT,
+            "shift" => flags |= MOD_SHIFT,
+            "super" | "win" | "meta" => flags |= MOD_WIN,
+            "iso_level3_shift" | "mod5" | "iso_level5_shift" | "mod3" => {
+                return Err(ModifierError::Unsupported(name.to_string()))
+            }
+            _ => return Err(ModifierError::Unknown(name.to_string())),
+        }
+    }
+    Ok(flags)
 }
 
 /// Modifier keys used in hotkey bindings
@@ -738,6 +828,80 @@ mod tests {
             parse_action_name("exec", &["notepad".to_string()]),
             Some(Action::Spawn("notepad".to_string()))
         );
+    }
+
+    #[test]
+    fn test_mod_key_flags_accepts_niri_and_wiri_spellings() {
+        assert_eq!(mod_key_flags("ctrl-alt"), Some(MOD_CTRL | MOD_ALT));
+        assert_eq!(mod_key_flags("Ctrl+Alt"), Some(MOD_CTRL | MOD_ALT));
+        assert_eq!(mod_key_flags("Super"), Some(MOD_WIN));
+        assert_eq!(mod_key_flags("win"), Some(MOD_WIN));
+        assert_eq!(mod_key_flags("Alt"), Some(MOD_ALT));
+        assert_eq!(mod_key_flags("Ctrl"), Some(MOD_CTRL));
+        assert_eq!(mod_key_flags("win-alt"), Some(MOD_WIN | MOD_ALT));
+        assert_eq!(mod_key_flags("ctrl-shift"), Some(MOD_CTRL | MOD_SHIFT));
+        // Linux-only modifiers and nonsense are not silently turned into Ctrl+Alt.
+        assert_eq!(mod_key_flags("Mod5"), None);
+        assert_eq!(mod_key_flags("hyper"), None);
+        assert_eq!(mod_key_flags(""), None);
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_unknown_modifier_is_rejected_not_dropped() {
+        // `Hyper+T` used to register a bare global `T`.
+        assert_eq!(
+            resolve_bind_modifiers(&names(&["Hyper"]), DEFAULT_MOD_KEY),
+            Err(ModifierError::Unknown("Hyper".to_string()))
+        );
+        assert_eq!(
+            resolve_bind_modifiers(&names(&["Ctrl", "Typo"]), DEFAULT_MOD_KEY),
+            Err(ModifierError::Unknown("Typo".to_string()))
+        );
+        // Valid niri names that Windows cannot bind are refused with their own reason.
+        for name in ["Mod5", "ISO_Level3_Shift", "Mod3", "iso_level5_shift"] {
+            assert!(
+                matches!(
+                    resolve_bind_modifiers(&names(&[name]), DEFAULT_MOD_KEY),
+                    Err(ModifierError::Unsupported(_))
+                ),
+                "{} must be refused as unsupported",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_mod_token_resolves_from_mod_key() {
+        assert_eq!(
+            resolve_bind_modifiers(&names(&["Mod"]), DEFAULT_MOD_KEY),
+            Ok(MOD_CTRL | MOD_ALT)
+        );
+        assert_eq!(
+            resolve_bind_modifiers(&names(&["mod", "Shift"]), MOD_WIN),
+            Ok(MOD_WIN | MOD_SHIFT)
+        );
+        assert_eq!(
+            resolve_bind_modifiers(&names(&["MOD", "Ctrl"]), MOD_ALT),
+            Ok(MOD_ALT | MOD_CTRL)
+        );
+        // Plain modifiers, a bare key, and the aliases.
+        assert_eq!(
+            resolve_bind_modifiers(&names(&["Control", "Win", "Meta", "Super"]), MOD_ALT),
+            Ok(MOD_CTRL | MOD_WIN)
+        );
+        assert_eq!(resolve_bind_modifiers(&[], DEFAULT_MOD_KEY), Ok(0));
+    }
+
+    #[test]
+    fn test_modifier_error_messages_name_the_modifier() {
+        let unknown = ModifierError::Unknown("Hyper".to_string()).to_string();
+        assert!(unknown.contains("Hyper") && unknown.contains("unknown modifier"));
+        let unsupported = ModifierError::Unsupported("Mod5".to_string()).to_string();
+        assert!(unsupported.contains("Mod5") && unsupported.contains("Windows"));
     }
 
     #[test]

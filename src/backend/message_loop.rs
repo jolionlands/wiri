@@ -48,16 +48,30 @@ const MOD_WIN: u32 = 0x0008;
 // `TilingEngine::is_over_gap` is implemented in `src/layout/engine.rs`.
 
 /// Resolve a `mod-key` config string to a (prefix, prefix+shift) pair of Win32 modifier flags.
+/// A value wiri does not know falls back to Ctrl+Alt (config loading already warned about it).
 fn resolve_mod_prefix(name: &str) -> (u32, u32) {
-    let prefix = match name.trim().to_lowercase().as_str() {
-        "alt" => MOD_ALT,
-        "ctrl" | "control" => MOD_CTRL,
-        "super" | "win" | "meta" => MOD_WIN,
-        "win-alt" | "super-alt" | "meta-alt" => MOD_WIN | MOD_ALT,
-        "ctrl-shift" => MOD_CTRL | MOD_SHIFT,
-        _ => MOD_CTRL | MOD_ALT, // "ctrl-alt" or anything unrecognized
-    };
+    let prefix = crate::input::mod_key_flags(name).unwrap_or(crate::input::DEFAULT_MOD_KEY);
     (prefix, prefix | MOD_SHIFT)
+}
+
+/// Turn one config bind into a `(modifiers, vk, action)` hotkey row, or say why
+/// it cannot become one.  `mod_key` is what `Mod` stands for.  A bind with a
+/// modifier wiri does not understand is refused, never registered as the bare
+/// key (which would steal that key from every application).
+fn bind_to_hotkey(
+    bind: &crate::config::HotkeyBinding,
+    mod_key: u32,
+) -> Result<(u32, u32, Action), String> {
+    let mods = bind
+        .resolve_modifiers(mod_key)
+        .map_err(|e| format!("{}: {}", bind.chord_text(), e))?;
+    let vk = bind
+        .vk_code()
+        .ok_or_else(|| format!("{}: unknown key '{}'", bind.chord_text(), bind.key))?;
+    let action = bind
+        .parse_action()
+        .ok_or_else(|| format!("{}: unknown action '{}'", bind.chord_text(), bind.command))?;
+    Ok((mods, vk, action))
 }
 
 /// Default hotkey bindings using the configured modifier prefix. The Mod+Enter
@@ -262,22 +276,10 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
     // Parse every config bind once.
     let mut parsed_config: Vec<(u32, u32, Action)> = Vec::with_capacity(config_binds.len());
     for bind in config_binds {
-        let mods = bind.mod_flags();
-        let vk = match bind.vk_code() {
-            Some(v) => v,
-            None => {
-                warn!("Config bind: unknown key '{}', skipping", bind.key);
-                continue;
-            }
-        };
-        let action = match bind.parse_action() {
-            Some(a) => a,
-            None => {
-                warn!("Config bind: unknown action '{}', skipping", bind.command);
-                continue;
-            }
-        };
-        parsed_config.push((mods, vk, action));
+        match bind_to_hotkey(bind, prefix) {
+            Ok(row) => parsed_config.push(row),
+            Err(why) => warn!("Config bind: {}, skipping", why),
+        }
     }
 
     let config_count = parsed_config.len();
@@ -1463,5 +1465,42 @@ mod tests {
         assert!(!is_overview_escape_binding(0, 0x1B, &Action::CloseWindow));
         // Another bare key bound to the overview toggle is not Escape.
         assert!(!is_overview_escape_binding(0, 0x20, &Action::OverviewToggle));
+    }
+
+    fn bind(chord: &str, command: &str, args: &[&str]) -> crate::config::HotkeyBinding {
+        let mut parts: Vec<String> = chord.split('+').map(|s| s.to_string()).collect();
+        let key = parts.pop().unwrap_or_default();
+        crate::config::HotkeyBinding {
+            modifiers: parts,
+            key,
+            command: command.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            ..crate::config::HotkeyBinding::default()
+        }
+    }
+
+    #[test]
+    fn a_bind_with_an_unknown_modifier_never_becomes_a_hotkey() {
+        let mod_key = MOD_CTRL | MOD_ALT;
+        // `Hyper+T` must not turn into a bare `T`.
+        let err = bind_to_hotkey(&bind("Hyper+T", "close-window", &[]), mod_key).unwrap_err();
+        assert!(err.contains("Hyper"), "{}", err);
+        // `Mod` is the configured prefix; `Mod+Shift` adds Shift.
+        assert_eq!(
+            bind_to_hotkey(&bind("Mod+T", "toggle-floating", &[]), mod_key),
+            Ok((MOD_CTRL | MOD_ALT, 0x54, Action::ToggleFloating))
+        );
+        assert_eq!(
+            bind_to_hotkey(&bind("Mod+Shift+T", "toggle-floating", &[]), MOD_WIN),
+            Ok((MOD_WIN | MOD_SHIFT, 0x54, Action::ToggleFloating))
+        );
+        // A bare key stays a bare key: that is a legitimate bind (the shipped Escape).
+        assert_eq!(
+            bind_to_hotkey(&bind("Escape", "overview-toggle", &[]), mod_key),
+            Ok((0, 0x1B, Action::OverviewToggle))
+        );
+        // Unknown key / action are still refused.
+        assert!(bind_to_hotkey(&bind("Mod+Nonsense", "quit", &[]), mod_key).is_err());
+        assert!(bind_to_hotkey(&bind("Mod+T", "no-such-action", &[]), mod_key).is_err());
     }
 }

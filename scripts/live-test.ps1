@@ -8,6 +8,7 @@
 #          windows are still hidden, start wiri again, check they come back.
 # Phase G  real key presses: Escape reaches applications, Escape leaves overview without freezing wiri,
 #          Ctrl+Alt+2 / Ctrl+Alt+1 hide and show the windows.
+# Phase H  Phase 1 scenarios, each under a config of its own (wiri is restarted for every one).
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -381,7 +382,11 @@ if (-not $conF.HasExited) { Stop-Process -Id $conF.Id -Force }
 Start-Sleep -Seconds 1
 
 # ---- Phase G: real key presses (RegisterHotKey + the keyboard hook) --------------------------------
-$vk = @{ ctrl = 0x11; alt = 0x12; esc = 0x1B; space = 0x20; '1' = 0x31; '2' = 0x32; a = 0x41 }
+$vk = @{
+    ctrl = 0x11; alt = 0x12; shift = 0x10; esc = 0x1B; space = 0x20; 'return' = 0x0D
+    '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; a = 0x41; q = 0x51; t = 0x54
+    f6 = 0x75; f7 = 0x76; f8 = 0x77; f9 = 0x78
+}
 function Chord([string]$spec) {
     $keys = @($spec.ToLower().Split('+') | ForEach-Object { [byte]$vk[$_] })
     foreach ($k in $keys) { [LT]::Key($k, $false); Start-Sleep -Milliseconds 40 }
@@ -416,6 +421,81 @@ Shot '12-hotkey-workspace-2'
 Chord 'ctrl+alt+1'; Start-Sleep -Milliseconds 1500
 $hotkeyBack = VisibleCount $forms
 Shot '12-hotkey-workspace-1'
+
+# ---- Phase H: Phase 1 scenarios - wiri restarted under a config of its own per scenario ------------------
+# The generated default config is kept for the record before it is overwritten.
+if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.generated') -Force }
+$log3 = Join-Path $D 'wiri.stderr3.log'
+$pdir = Join-Path $D 'p1 dir'      # a directory with a space in its name
+New-Item -ItemType Directory -Force $pdir | Out-Null
+
+# One command-line argument, quoted the way every Windows program (and Start-Process, which does not quote)
+# reads it back.
+function Q([string]$s) {
+    if ($s -ne '' -and $s -notmatch '[\s"]') { return $s }
+    $s = [regex]::Replace($s, '(\\*)"', '$1$1\"')
+    $s = [regex]::Replace($s, '(\\+)$', '$1$1')
+    return '"' + $s + '"'
+}
+function Stop-WiriGracefully($proc, [string]$tag) {
+    Ctl "$tag-quit" @('quit') | Out-Null
+    $null = $proc.WaitForExit(10000)
+    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+    Start-Sleep -Milliseconds 800
+}
+function Start-WiriWithConfig([string]$text, [string]$stderr) {
+    [IO.File]::WriteAllText($cfg, $text, (New-Object Text.UTF8Encoding($false)))
+    $p = Start-Wiri $stderr ($stderr + '.out')
+    Start-Sleep -Seconds 4
+    return $p
+}
+# Poll for a file that a program started by wiri writes.
+function WaitFile([string]$path, [int]$sec) {
+    for ($i = 0; $i -lt ($sec * 4) -and -not (Test-Path $path); $i++) { Start-Sleep -Milliseconds 250 }
+    return (Test-Path $path)
+}
+function ReadJsonArray([string]$path) {
+    if (-not (Test-Path $path)) { return @() }
+    $raw = Get-Content $path -Raw -ErrorAction SilentlyContinue
+    if (-not $raw) { return @() }
+    return @($raw.TrimStart([char]0xFEFF) | ConvertFrom-Json | ForEach-Object { $_ })   # PS 5.1 hands the array back as one object
+}
+function SameList($a, $b) {
+    $a = @($a); $b = @($b)
+    if ($a.Count -ne $b.Count) { return $false }
+    for ($i = 0; $i -lt $a.Count; $i++) { if ([string]$a[$i] -ne [string]$b[$i]) { return $false } }
+    return $true
+}
+
+# ---- H1: modifiers - an unknown one is rejected (it used to register a bare global key), `Mod` follows mod-key
+$h1Config = @"
+input {
+    mod-key "ctrl-alt"
+}
+binds {
+    Hyper+F9 close-window
+    Mod5+F8 close-window
+    Mod+F7 refresh
+}
+"@
+Stop-WiriGracefully $w 'h1'
+$w3 = Start-WiriWithConfig $h1Config $log3
+$h1Raw = Ctl 'h1-bindings' @('--json', 'bindings')
+$h1Entries = @()
+try { $h1Entries = @(($h1Raw | ConvertFrom-Json).result) } catch { }
+# Windows virtual keys: F7 = 0x76 (118), F8 = 0x77 (119), F9 = 0x78 (120).
+$h1StolenKeys = @($h1Entries | Where-Object { $_.vk_code -eq 119 -or $_.vk_code -eq 120 }).Count
+$h1ModBind = @($h1Entries | Where-Object { $_.vk_code -eq 118 -and $_.modifiers -eq 3 }).Count
+[TestForms]::ClearKeys()
+$h1Keys = [TestForms]::OpenKeys('wiri-keys-h1')
+Start-Sleep -Milliseconds 1800
+Chord 'f9'; Start-Sleep -Milliseconds 400
+Chord 'f8'; Start-Sleep -Milliseconds 400
+$h1KeysSeen = [TestForms]::KeyLog()
+Set-Content (Join-Path $D 'h1-keys-seen.txt') $h1KeysSeen
+[TestForms]::CloseForm($h1Keys)
+Start-Sleep -Milliseconds 1000
+$w = $w3
 
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
@@ -503,9 +583,15 @@ $summary = [ordered]@{
     overview_escape_responsive = $overviewResponsive
     hotkey_workspace_hidden = $hotkeyHidden
     hotkey_workspace_back_visible = $hotkeyBack
+    # --- Phase 1 / H1: modifiers
+    h1_unknown_modifier_warnings = (LogLines $log3 'unknown modifier').Count
+    h1_unsupported_modifier_warnings = (LogLines $log3 'cannot be bound on Windows').Count
+    h1_rejected_binds_registered = $h1StolenKeys
+    h1_mod_bind_is_ctrl_alt = ($h1ModBind -eq 1)
+    h1_f9_f8_reach_application = (($h1KeysSeen -match 'F9,') -and ($h1KeysSeen -match 'F8,'))
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
-if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.generated') -Force }
+if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }
 'done' | Set-Content (Join-Path $D 'DONE')

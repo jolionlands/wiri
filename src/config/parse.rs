@@ -254,7 +254,35 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
         });
     }
 
+    reject_binds_with_bad_modifiers(&mut config);
+
     Ok(config)
+}
+
+/// Drop every bind whose modifiers wiri does not understand, with a warning
+/// naming the bind and the offending modifier.  `Mod` resolves from
+/// `input { mod-key }` (Ctrl+Alt unless set).  Before this, `Hyper+T` quietly
+/// registered a bare global `T` hotkey, which took the key away from every
+/// application.
+fn reject_binds_with_bad_modifiers(config: &mut Config) {
+    let mod_key = match crate::input::mod_key_flags(&config.input.mod_key) {
+        Some(flags) => flags,
+        None => {
+            tracing::warn!(
+                "input mod-key '{}' is not understood (use ctrl-alt, alt, ctrl, super, win-alt \
+                 or ctrl-shift); using Ctrl+Alt",
+                config.input.mod_key
+            );
+            crate::input::DEFAULT_MOD_KEY
+        }
+    };
+    config.binds.hotkeys.retain(|bind| match bind.resolve_modifiers(mod_key) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("Config bind {}: {}; the bind is ignored", bind.chord_text(), e);
+            false
+        }
+    });
 }
 
 /// Try to detect a section header like `input {`, `keyboard {`, or `output "DP-1" {`.
@@ -1173,13 +1201,25 @@ pub fn validate_kdl_config(input: &str) -> Vec<ValidationIssue> {
 
         // binds {} entries are validated separately — they're not key=value.
         if section_path.as_str() == "binds" {
-            if parse_bind_line(line).is_none() {
-                issues.push(ValidationIssue {
+            match parse_bind_line(line) {
+                None => issues.push(ValidationIssue {
                     severity: ValidationSeverity::Warning,
                     line: line_no,
                     column: 1,
                     message: "could not parse as a `Mod+Key action` bind line".to_string(),
-                });
+                }),
+                Some(bind) => {
+                    // Any `Mod` is fine here; what matters is that every modifier is
+                    // a name wiri can bind.
+                    if let Err(e) = bind.resolve_modifiers(crate::input::DEFAULT_MOD_KEY) {
+                        issues.push(ValidationIssue {
+                            severity: ValidationSeverity::Error,
+                            line: line_no,
+                            column: 1,
+                            message: format!("bind {}: {}", bind.chord_text(), e),
+                        });
+                    }
+                }
             }
             continue;
         }
@@ -1816,6 +1856,51 @@ binds {
         let input = "binds { }";
         let config = parse_kdl_config(input).unwrap();
         assert!(config.binds.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn test_bind_with_unknown_modifier_is_dropped_at_parse_time() {
+        // `Hyper+F9` used to register a bare global F9.
+        let input = "binds {\n  Hyper+F9 close-window\n  Ctrl+Alt+Q close-window\n  Mod5+T quit\n}\n";
+        let config = parse_kdl_config(input).unwrap();
+        assert_eq!(config.binds.hotkeys.len(), 1, "{:?}", config.binds.hotkeys);
+        assert_eq!(config.binds.hotkeys[0].key, "Q");
+    }
+
+    #[test]
+    fn test_mod_token_is_a_valid_modifier_and_follows_mod_key() {
+        let input = "input {\n  mod-key \"super\"\n}\nbinds {\n  Mod+T toggle-floating\n  Mod+Shift+Q quit\n}\n";
+        let config = parse_kdl_config(input).unwrap();
+        assert_eq!(config.binds.hotkeys.len(), 2);
+        let mod_key = crate::input::mod_key_flags(&config.input.mod_key).unwrap();
+        assert_eq!(mod_key, crate::input::MOD_WIN);
+        assert_eq!(
+            config.binds.hotkeys[0].resolve_modifiers(mod_key),
+            Ok(crate::input::MOD_WIN)
+        );
+        assert_eq!(
+            config.binds.hotkeys[1].resolve_modifiers(mod_key),
+            Ok(crate::input::MOD_WIN | crate::input::MOD_SHIFT)
+        );
+        // Without a mod-key the prefix is wiri's long-standing Ctrl+Alt.
+        let plain = parse_kdl_config("binds {\n  Mod+T toggle-floating\n}\n").unwrap();
+        assert_eq!(
+            plain.binds.hotkeys[0]
+                .resolve_modifiers(crate::input::mod_key_flags(&plain.input.mod_key).unwrap()),
+            Ok(crate::input::MOD_CTRL | crate::input::MOD_ALT)
+        );
+    }
+
+    #[test]
+    fn test_validate_reports_a_bad_modifier_as_an_error() {
+        let issues = validate_kdl_config("binds {\n  Hyper+F9 close-window\n  Mod+T quit\n}\n");
+        let errors: Vec<_> = issues
+            .iter()
+            .filter(|i| i.severity == ValidationSeverity::Error)
+            .collect();
+        assert_eq!(errors.len(), 1, "{:?}", issues);
+        assert!(errors[0].message.contains("Hyper"), "{:?}", errors[0]);
+        assert_eq!(errors[0].line, 2);
     }
 
     #[test]

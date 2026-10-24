@@ -931,19 +931,27 @@ impl HotkeyBinding {
         crate::input::parse_action_name(&self.command, &self.args)
     }
 
-    /// Parse modifier strings to Windows MOD flags
+    /// Parse modifier strings to Windows MOD flags.
+    ///
+    /// Lenient: a modifier it does not know is skipped, and `Mod` is not
+    /// understood.  Registering hotkeys must use [`Self::resolve_modifiers`],
+    /// which refuses such binds instead of turning them into a bare key.
     pub fn mod_flags(&self) -> u32 {
-        let mut flags = 0u32;
-        for m in &self.modifiers {
-            match m.to_lowercase().as_str() {
-                "ctrl" | "control" => flags |= 0x0002,       // MOD_CTRL
-                "alt" => flags |= 0x0001,                    // MOD_ALT
-                "shift" => flags |= 0x0004,                  // MOD_SHIFT
-                "super" | "win" | "meta" => flags |= 0x0008, // MOD_WIN
-                _ => {}
-            }
-        }
-        flags
+        crate::input::parse_modifiers(&self.modifiers)
+    }
+
+    /// Strict modifier resolution: `Mod` becomes `mod_key` (what `input {
+    /// mod-key }` stands for), and any modifier that is not understood is an
+    /// error.
+    pub fn resolve_modifiers(&self, mod_key: u32) -> Result<u32, crate::input::ModifierError> {
+        crate::input::resolve_bind_modifiers(&self.modifiers, mod_key)
+    }
+
+    /// The bind as the user wrote it, for log messages (`Mod+Shift+T`).
+    pub fn chord_text(&self) -> String {
+        let mut parts: Vec<&str> = self.modifiers.iter().map(|m| m.as_str()).collect();
+        parts.push(self.key.as_str());
+        parts.join("+")
     }
 
     /// Parse key string to a Windows virtual key code.

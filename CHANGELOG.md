@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 1 — safe to daily-drive (2026-10-24)
+Each item is verified on a spare Windows 11 laptop with `scripts/live-test.ps1` (real key
+presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phase1-report.md`.
+- **Unknown modifiers are rejected.**  `Hyper+T`, `Mod5+T` or a typo such as `Crtl+T` used to be
+  dropped silently, which registered a bare global `T` hotkey and took that key away from every
+  application.  Such a bind is now ignored at parse time with a warning naming the bind and the
+  modifier (`wiri-ctl validate-config` reports it as an error), and nothing is registered.  niri's
+  `Mod` token is understood: it resolves to the `input { mod-key }` modifier (Ctrl+Alt unless set,
+  also `super`, `alt`, `win-alt`, `ctrl-shift`, `ctrl`), so `Mod+Shift+T` ports as written.  An
+  unknown `mod-key` value warns instead of silently becoming Ctrl+Alt.
+
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal
 windows, one hung application) turned up nine defects.  Each is fixed with unit
