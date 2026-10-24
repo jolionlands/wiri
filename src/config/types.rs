@@ -391,6 +391,9 @@ pub struct LayoutConfig {
     pub scroll_step: u32,
     pub column_width: u32,
     pub column_width_mode: String,
+    /// Proportional mode: split the screen among at most this many columns
+    /// (default 3); further windows scroll in.  0 = no limit.
+    pub max_visible_columns: u32,
     /// Strip native frame (caption + thick frame) from tiled windows for pixel-perfect tiles.
     /// Default false — some apps render their content area black after style changes
     /// until they receive a paint message. Off by default for compatibility.
@@ -469,6 +472,7 @@ impl LayoutConfig {
             scroll_step: 200,
             column_width: 500,
             column_width_mode: "proportional".to_string(),
+            max_visible_columns: 3,
             strip_frame: false,
             border_color_urgent: "#cc3344".to_string(),
             border_radius: 0,

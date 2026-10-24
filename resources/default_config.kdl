@@ -75,14 +75,24 @@ layout {
         // color "#000000"
     }
 
-    // Column width mode: "proportional" (fill screen) or "fixed" (exact pixels).
+    // Column width mode: "proportional" (the columns share the screen) or
+    // "fixed" (every column is exactly `column-width` pixels wide).
     column-width-mode "proportional"
-    // Column width in pixels (used in fixed mode, or as a minimum in proportional).
+    // In proportional mode the screen is shared by at most this many columns:
+    // one window fills the screen, two get half each, three get a third each,
+    // and from the fourth window on the columns stop shrinking and the strip
+    // scrolls instead.  0 = no limit (columns shrink down to column-width / 2).
+    max-visible-columns 3
+    // Column width in pixels (the width in fixed mode; half of it is the
+    // narrowest a proportional column may get).  Resize a single column with
+    // the set-column-width / grow-column-width binds below.
     column-width 500
     // Pixels scrolled per scroll-left / scroll-right action.
     scroll-step 200
-    // Dim unfocused windows (0.1-1.0, 1.0 = no dimming).
-    dim-unfocused 0.92
+    // Dim unfocused windows (0.1-1.0, 1.0 = no dimming).  Dimming makes wiri
+    // turn every managed window into a layered window, which some apps (Windows
+    // Terminal, Chromium) do not like - opt in with e.g. 0.92.
+    dim-unfocused 1.0
 
     // Strip native frame (caption + thick border) from tiled windows for
     // pixel-perfect tiles.  Default false — some apps (Windows Terminal,

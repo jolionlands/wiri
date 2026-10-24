@@ -219,6 +219,9 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "move-to-monitor-left" => Some(Action::MoveToMonitorLeft),
         "move-to-monitor-right" => Some(Action::MoveToMonitorRight),
         "center-column" => Some(Action::CenterColumn),
+        // `set-column-width "1/3"` — the spelling the default config and the
+        // cheatsheet example use (niri: `set-column-width "33.333%"`).
+        "set-column-width" => args.first().and_then(|a| parse_column_width_arg(a)),
         "column-width-preset" | "column-width-cycle" => Some(Action::ColumnWidthPresetCycle),
         "column-width-half" | "column-width-1/2" => Some(Action::ColumnWidthPresetHalf),
         "column-width-third" | "column-width-1/3" => Some(Action::ColumnWidthPresetThird),
@@ -299,9 +302,44 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
     }
 }
 
+/// Map the argument of `set-column-width` to a width-preset action.
+/// Accepts fractions (`1/4`, `1/3`, `1/2`, `2/3`, `3/4`), `full`, `cycle`, and
+/// the percentages niri uses (`25%`, `33.3%`, `50%`, `66.6%`, `75%`, `100%`).
+pub fn parse_column_width_arg(arg: &str) -> Option<Action> {
+    let a = arg.trim().to_lowercase();
+    match a.as_str() {
+        "cycle" | "preset" | "next" => return Some(Action::ColumnWidthPresetCycle),
+        "full" | "100%" => return Some(Action::ColumnWidthPresetFull),
+        "1/4" | "quarter" => return Some(Action::ColumnWidthPresetQuarter),
+        "1/3" | "third" => return Some(Action::ColumnWidthPresetThird),
+        "1/2" | "half" => return Some(Action::ColumnWidthPresetHalf),
+        "2/3" | "two-thirds" => return Some(Action::ColumnWidthPresetTwoThirds),
+        "3/4" | "three-quarters" => return Some(Action::ColumnWidthPresetThreeQuarters),
+        _ => {}
+    }
+    let percent: f64 = a.strip_suffix('%')?.trim().parse().ok()?;
+    let nearest = [
+        (25.0, Action::ColumnWidthPresetQuarter),
+        (100.0 / 3.0, Action::ColumnWidthPresetThird),
+        (50.0, Action::ColumnWidthPresetHalf),
+        (200.0 / 3.0, Action::ColumnWidthPresetTwoThirds),
+        (75.0, Action::ColumnWidthPresetThreeQuarters),
+        (100.0, Action::ColumnWidthPresetFull),
+    ]
+    .into_iter()
+    .find(|(p, _)| (percent - p).abs() < 1.0);
+    nearest.map(|(_, action)| action)
+}
+
 /// Parse a key name string (from config) into a Windows virtual key code.
+///
+/// Names are matched case-insensitively and ignoring `_`, `-` and spaces, so
+/// every spelling in use resolves to the same key: niri / xkb names
+/// (`bracketleft`, `Page_Up`, `Return`), the hyphenated wiri spellings
+/// (`page-up`, `arrow-left`) and the underscored ones the generated default
+/// config used (`Bracket_Left`, `Backslash`, `Comma`, `Period`).
 pub fn parse_key_name(name: &str) -> Option<u32> {
-    let k = name.to_lowercase();
+    let k = name.trim().to_lowercase();
     // Letters: a-z → 0x41-0x5A
     // Use chars().count() (not .len()) so the guard is correct for multi-byte UTF-8.
     if k.chars().count() == 1 {
@@ -313,13 +351,35 @@ pub fn parse_key_name(name: &str) -> Option<u32> {
         if ch.is_ascii_digit() {
             return Some(0x30 + (ch as u32) - ('0' as u32));
         }
+        // Punctuation typed as the character itself (OEM keys of a US layout).
+        let oem = match ch {
+            ';' => Some(0xBA),
+            '=' => Some(0xBB),
+            ',' => Some(0xBC),
+            '-' => Some(0xBD),
+            '.' => Some(0xBE),
+            '/' => Some(0xBF),
+            '`' => Some(0xC0),
+            '[' => Some(0xDB),
+            '\\' => Some(0xDC),
+            ']' => Some(0xDD),
+            '\'' => Some(0xDE),
+            _ => None,
+        };
+        if oem.is_some() {
+            return oem;
+        }
     }
-    match k.as_str() {
-        "left" | "arrow-left" => Some(0x25),
-        "right" | "arrow-right" => Some(0x27),
-        "up" | "arrow-up" => Some(0x26),
-        "down" | "arrow-down" => Some(0x28),
-        "enter" | "return" => Some(0x0D),
+    let canon: String = k
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .collect();
+    match canon.as_str() {
+        "left" | "arrowleft" => Some(0x25),
+        "right" | "arrowright" => Some(0x27),
+        "up" | "arrowup" => Some(0x26),
+        "down" | "arrowdown" => Some(0x28),
+        "enter" | "return" | "kpenter" | "numpadenter" => Some(0x0D),
         "space" => Some(0x20),
         "tab" => Some(0x09),
         "escape" | "esc" => Some(0x1B),
@@ -327,11 +387,11 @@ pub fn parse_key_name(name: &str) -> Option<u32> {
         "delete" | "del" => Some(0x2E),
         "home" => Some(0x24),
         "end" => Some(0x23),
-        "page-up" | "prior" => Some(0x21),
-        "page-down" | "next" => Some(0x22),
+        "pageup" | "prior" => Some(0x21),
+        "pagedown" | "next" => Some(0x22),
         "insert" | "ins" => Some(0x2D),
-        "caps-lock" => Some(0x14),
-        "num-lock" => Some(0x90),
+        "capslock" => Some(0x14),
+        "numlock" => Some(0x90),
         "f1" => Some(0x70),
         "f2" => Some(0x71),
         "f3" => Some(0x72),
@@ -344,9 +404,49 @@ pub fn parse_key_name(name: &str) -> Option<u32> {
         "f10" => Some(0x79),
         "f11" => Some(0x7A),
         "f12" => Some(0x7B),
-        "print" | "print-screen" => Some(0x2C),
-        "scroll-lock" => Some(0x91),
-        "pause" => Some(0x13),
+        "f13" => Some(0x7C),
+        "f14" => Some(0x7D),
+        "f15" => Some(0x7E),
+        "f16" => Some(0x7F),
+        "f17" => Some(0x80),
+        "f18" => Some(0x81),
+        "f19" => Some(0x82),
+        "f20" => Some(0x83),
+        "f21" => Some(0x84),
+        "f22" => Some(0x85),
+        "f23" => Some(0x86),
+        "f24" => Some(0x87),
+        "print" | "printscreen" | "sysrq" => Some(0x2C),
+        "scrolllock" => Some(0x91),
+        "pause" | "break" => Some(0x13),
+        // Punctuation keys (US layout), xkb names.
+        "semicolon" => Some(0xBA),
+        "equal" | "plus" => Some(0xBB),
+        "comma" => Some(0xBC),
+        "minus" => Some(0xBD),
+        "period" | "dot" => Some(0xBE),
+        "slash" => Some(0xBF),
+        "grave" | "backtick" | "quoteleft" => Some(0xC0),
+        "bracketleft" => Some(0xDB),
+        "backslash" => Some(0xDC),
+        "bracketright" => Some(0xDD),
+        "apostrophe" | "quote" => Some(0xDE),
+        // Numeric keypad: `KP_1` / `kp1` / `numpad1`, and its operators.
+        "kp0" | "numpad0" => Some(0x60),
+        "kp1" | "numpad1" => Some(0x61),
+        "kp2" | "numpad2" => Some(0x62),
+        "kp3" | "numpad3" => Some(0x63),
+        "kp4" | "numpad4" => Some(0x64),
+        "kp5" | "numpad5" => Some(0x65),
+        "kp6" | "numpad6" => Some(0x66),
+        "kp7" | "numpad7" => Some(0x67),
+        "kp8" | "numpad8" => Some(0x68),
+        "kp9" | "numpad9" => Some(0x69),
+        "kpmultiply" | "numpadmultiply" => Some(0x6A),
+        "kpadd" | "numpadadd" => Some(0x6B),
+        "kpsubtract" | "numpadsubtract" => Some(0x6D),
+        "kpdecimal" | "numpaddecimal" => Some(0x6E),
+        "kpdivide" | "numpaddivide" => Some(0x6F),
         _ => None,
     }
 }
@@ -696,6 +796,65 @@ mod tests {
     fn test_parse_key_invalid() {
         assert_eq!(parse_key_name("invalid"), None);
         assert_eq!(parse_key_name(""), None);
+        assert_eq!(parse_key_name("_"), None);
+    }
+
+    #[test]
+    fn test_parse_key_punctuation_accepts_every_spelling() {
+        // The names the generated default config uses...
+        assert_eq!(parse_key_name("Bracket_Left"), Some(0xDB));
+        assert_eq!(parse_key_name("Bracket_Right"), Some(0xDD));
+        assert_eq!(parse_key_name("Backslash"), Some(0xDC));
+        assert_eq!(parse_key_name("Comma"), Some(0xBC));
+        assert_eq!(parse_key_name("Period"), Some(0xBE));
+        // ...and the niri / xkb spellings of the same keys.
+        assert_eq!(parse_key_name("BracketLeft"), Some(0xDB));
+        assert_eq!(parse_key_name("bracketleft"), Some(0xDB));
+        assert_eq!(parse_key_name("bracket-right"), Some(0xDD));
+        assert_eq!(parse_key_name("comma"), Some(0xBC));
+        assert_eq!(parse_key_name("minus"), Some(0xBD));
+        assert_eq!(parse_key_name("equal"), Some(0xBB));
+        assert_eq!(parse_key_name("slash"), Some(0xBF));
+        assert_eq!(parse_key_name("semicolon"), Some(0xBA));
+        assert_eq!(parse_key_name("apostrophe"), Some(0xDE));
+        assert_eq!(parse_key_name("grave"), Some(0xC0));
+        // The characters themselves.
+        assert_eq!(parse_key_name(","), Some(0xBC));
+        assert_eq!(parse_key_name("."), Some(0xBE));
+        assert_eq!(parse_key_name("["), Some(0xDB));
+        assert_eq!(parse_key_name("]"), Some(0xDD));
+        assert_eq!(parse_key_name("\\"), Some(0xDC));
+    }
+
+    #[test]
+    fn test_parse_key_paging_and_keypad_spellings() {
+        for name in ["Page_Up", "PageUp", "page-up", "pageup", "Prior"] {
+            assert_eq!(parse_key_name(name), Some(0x21), "{}", name);
+        }
+        for name in ["Page_Down", "PageDown", "page-down", "Next"] {
+            assert_eq!(parse_key_name(name), Some(0x22), "{}", name);
+        }
+        assert_eq!(parse_key_name("KP_5"), Some(0x65));
+        assert_eq!(parse_key_name("kp_add"), Some(0x6B));
+        assert_eq!(parse_key_name("F24"), Some(0x87));
+        assert_eq!(parse_key_name("Caps_Lock"), Some(0x14));
+    }
+
+    #[test]
+    fn test_parse_column_width_arg() {
+        assert_eq!(parse_column_width_arg("1/3"), Some(Action::ColumnWidthPresetThird));
+        assert_eq!(parse_column_width_arg("2/3"), Some(Action::ColumnWidthPresetTwoThirds));
+        assert_eq!(parse_column_width_arg("cycle"), Some(Action::ColumnWidthPresetCycle));
+        assert_eq!(parse_column_width_arg("Full"), Some(Action::ColumnWidthPresetFull));
+        assert_eq!(parse_column_width_arg("50%"), Some(Action::ColumnWidthPresetHalf));
+        assert_eq!(parse_column_width_arg("33.3%"), Some(Action::ColumnWidthPresetThird));
+        assert_eq!(parse_column_width_arg("nonsense"), None);
+        assert_eq!(parse_column_width_arg("42%"), None);
+        assert_eq!(
+            parse_action_name("set-column-width", &["1/3".to_string()]),
+            Some(Action::ColumnWidthPresetThird)
+        );
+        assert_eq!(parse_action_name("set-column-width", &[]), None);
     }
 
     #[test]

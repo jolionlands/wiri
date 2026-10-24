@@ -180,8 +180,28 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                 "layout" => apply_layout_property(&key, &value, &mut config),
                 "layout.gaps" => apply_layout_property(&key, &value, &mut config),
                 "layout.borders" => apply_layout_property(&key, &value, &mut config),
-                "layout.focus-ring" => apply_layout_property(&key, &value, &mut config),
-                "layout.shadows" => apply_layout_property(&key, &value, &mut config),
+                // `width` and `color` mean different things in `borders`, `focus-ring`
+                // and `shadows`; without scoping, the `focus-ring { width 3 }` line
+                // overwrote the border width and `focus-ring { color ... }` the
+                // (unfocused) border colour.
+                "layout.focus-ring" => {
+                    let scoped = match key.as_str() {
+                        "width" => "focus-ring-width",
+                        "color" => "focus-ring-color",
+                        other => other,
+                    };
+                    apply_layout_property(scoped, &value, &mut config)
+                }
+                "layout.shadows" => {
+                    let scoped = match key.as_str() {
+                        "color" => "shadow-color",
+                        "blur" => "shadow-blur",
+                        "offset-x" => "shadow-offset-x",
+                        "offset-y" => "shadow-offset-y",
+                        other => other,
+                    };
+                    apply_layout_property(scoped, &value, &mut config)
+                }
                 "animations" => apply_animations_property(&key, &value, &mut config),
                 // Bug fix #6: output block properties.
                 "output" => {
@@ -505,6 +525,11 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
         }
         "column_width_mode" | "column-width-mode" => {
             config.layout.column_width_mode = value.to_string();
+        }
+        "max_visible_columns" | "max-visible-columns" => {
+            if let Ok(v) = value.parse() {
+                config.layout.max_visible_columns = v;
+            }
         }
         "split_ratio" | "split-ratio" => {
             if let Ok(v) = value.parse() {
@@ -2413,5 +2438,83 @@ output "HDMI-1" {
             cfg.output[0].mod_key.is_none(),
             "mod_key should be None when not specified in output block",
         );
+    }
+
+    /// Every bind of a shipped config must resolve to a real key and a real
+    /// action: a bind that does not is skipped with a warning at startup, and
+    /// the shipped files must start warning-free.
+    fn assert_every_bind_resolves(label: &str, text: &str, expect_binds: bool) {
+        let cfg = parse_kdl_config(text).unwrap();
+        if expect_binds {
+            assert!(!cfg.binds.hotkeys.is_empty(), "{}: no binds parsed", label);
+        }
+        for bind in &cfg.binds.hotkeys {
+            assert!(
+                bind.vk_code().is_some(),
+                "{}: unknown key '{}' in bind '{} {:?}'",
+                label,
+                bind.key,
+                bind.command,
+                bind.args
+            );
+            assert!(
+                bind.parse_action().is_some(),
+                "{}: unknown action '{}' {:?} (bound to '{}')",
+                label,
+                bind.command,
+                bind.args,
+                bind.key
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_config_binds_all_resolve() {
+        assert_every_bind_resolves(
+            "resources/default_config.kdl",
+            include_str!("../../resources/default_config.kdl"),
+            true,
+        );
+    }
+
+    #[test]
+    fn test_example_configs_binds_all_resolve() {
+        assert_every_bind_resolves(
+            "examples/cheatsheet.kdl",
+            include_str!("../../examples/cheatsheet.kdl"),
+            true,
+        );
+        assert_every_bind_resolves(
+            "examples/minimal.kdl",
+            include_str!("../../examples/minimal.kdl"),
+            false,
+        );
+    }
+
+    /// `width` / `color` are valid in `borders`, `focus-ring` and `shadows`;
+    /// the later `focus-ring` block of the default config used to overwrite the
+    /// border width and the unfocused border colour.
+    #[test]
+    fn test_default_config_layout_values_stay_in_their_own_blocks() {
+        let cfg =
+            parse_kdl_config(include_str!("../../resources/default_config.kdl")).unwrap();
+        assert_eq!(cfg.layout.border_width, 4);
+        assert_eq!(cfg.layout.border_color, "#4d4d4d");
+        assert_eq!(cfg.layout.border_color_focused, "#3381d9");
+        assert_eq!(cfg.layout.focus_ring_width, 3);
+        assert_eq!(cfg.layout.focus_ring_color, "#3381d9");
+        assert_eq!(cfg.layout.inner_gaps, 16);
+        assert_eq!(cfg.layout.outer_gaps, 8);
+        assert!(!cfg.layout.shadow_enable);
+    }
+
+    #[test]
+    fn test_max_visible_columns_parses_and_defaults_to_three() {
+        let cfg = parse_kdl_config("").unwrap();
+        assert_eq!(cfg.layout.max_visible_columns, 3);
+        let cfg = parse_kdl_config("layout {\n    max-visible-columns 4\n}\n").unwrap();
+        assert_eq!(cfg.layout.max_visible_columns, 4);
+        let cfg = parse_kdl_config("layout {\n    max-visible-columns 0\n}\n").unwrap();
+        assert_eq!(cfg.layout.max_visible_columns, 0);
     }
 }
