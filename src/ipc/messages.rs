@@ -178,6 +178,17 @@ pub enum IpcMessage {
         args: Vec<String>,
     },
 
+    /// Run any action by its niri name, exactly as if its key were pressed
+    /// (`"focus-column-left"`, `"set-column-width"` with `["+10%"]`,
+    /// `"focus-workspace"` with `["2"]`, ...).  The arguments are the words
+    /// that follow the action name in a `binds {}` line.
+    #[serde(rename = "run_action")]
+    RunAction {
+        name: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+
     // ---- Niri-parity Round-2 ----
     /// Focus the previously focused window using the MRU history (like Alt+Tab).
     #[serde(rename = "focus_previous")]
@@ -569,6 +580,45 @@ mod tests {
             IpcMessage::CaptureWindow { window_hwnd, path } => {
                 assert_eq!(window_hwnd, 7);
                 assert!(path.is_none());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_action_and_spawn_accept_missing_args() {
+        // Old clients send `spawn_command` without `args`; `run_action` may omit them too.
+        let spawn: IpcMessage =
+            serde_json::from_str(r#"{"type":"spawn_command","data":{"command":"wt.exe"}}"#)
+                .expect("deserialize spawn_command");
+        match spawn {
+            IpcMessage::SpawnCommand { command, args } => {
+                assert_eq!(command, "wt.exe");
+                assert!(args.is_empty());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+        let run: IpcMessage =
+            serde_json::from_str(r#"{"type":"run_action","data":{"name":"close-window"}}"#)
+                .expect("deserialize run_action");
+        match run {
+            IpcMessage::RunAction { name, args } => {
+                assert_eq!(name, "close-window");
+                assert!(args.is_empty());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+        let with_args = IpcMessage::RunAction {
+            name: "set-column-width".to_string(),
+            args: vec!["+10%".to_string()],
+        };
+        let raw = serde_json::to_string(&with_args).expect("serialize");
+        assert!(raw.contains("\"run_action\""), "{}", raw);
+        let back: IpcMessage = serde_json::from_str(&raw).expect("deserialize");
+        match back {
+            IpcMessage::RunAction { name, args } => {
+                assert_eq!(name, "set-column-width");
+                assert_eq!(args, vec!["+10%".to_string()]);
             }
             other => panic!("unexpected variant: {:?}", other),
         }

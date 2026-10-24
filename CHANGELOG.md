@@ -24,6 +24,22 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   profile; `spawn-sh` runs `cmd.exe /d /s /c` without one.  `wiri-ctl spawn prog arg...` passes the
   arguments through, `wiri-ctl spawn '"C:\x y\a.exe" -f'` takes a whole command line.  The built-in
   `Mod+Enter` starts Windows Terminal and falls back to PowerShell instead of a bare `cmd.exe`.
+- **Actions act on the window you are looking at, a floating one included.**  The target of
+  `close-window`, `toggle-floating`, `fullscreen`, `center-window`, the width/height presets and the
+  float move/resize actions is resolved from `GetForegroundWindow()` first (the application window
+  that owns a dialog or popup is found through the owner chain), the engine's own focus second.
+  Before, a floating window never held the engine focus, so with a float in front `close-window`
+  closed the last focused *tile* behind it and a second `toggle-floating` floated the next tile
+  instead of putting the float back.  `close-window` with a dialog in front closes the dialog (like
+  Alt+F4), and it refuses to guess when an unmanaged window (the Start menu, an elevated program) has
+  the focus.  A floating window is moved by 50 px with `move-column-left/right`, resized with the
+  width/height actions and centred with `center-window`; `fullscreen` covers the monitor the window
+  lives on and gives a float its rectangle back.  A window floats where it floated last time (the
+  first time: its own size, in the middle of the work area) and is remembered per window.
+  `wiri-ctl focus-window <hwnd>` now raises a floating window (it used to answer "ok" and do
+  nothing), `wiri-ctl windows` reports the workspace of a floating window, and the new
+  `wiri-ctl action <name> [args]` (IPC `run_action`) runs any bindable action through the same code
+  as its hotkey, so scripts and status bars can drive wiri.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal

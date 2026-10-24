@@ -4,19 +4,15 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SetWindowPos, ShowWindow,
-    TranslateMessage, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE, WM_USER, WNDCLASSW,
-    WNDCLASS_STYLES,
+    GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, ShowWindow, TranslateMessage,
+    SW_MAXIMIZE, SW_MINIMIZE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE, WM_USER,
+    WNDCLASSW, WNDCLASS_STYLES,
 };
 
 use super::BackendHandle;
@@ -756,6 +752,34 @@ fn execute_action(
         }
         *last = (action.clone(), std::time::Instant::now());
     }
+    perform_action(action, engine, backend, quit_tx);
+}
+
+/// Run one action against the engine.  Hotkeys reach it through
+/// [`execute_action`] (which first drops key-repeat duplicates); the IPC
+/// `run_action` request calls it directly, so `wiri-ctl action <name>` behaves
+/// exactly like pressing the bound key.
+pub(crate) fn perform_action(
+    action: &Action,
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
+) {
+    // The window the action acts on is the one the user is looking at: the OS foreground window
+    // (or the application window that owns it), a floating window as well as a tile.  The
+    // engine's own focus is only the fallback.  `close-window` refuses to guess when an
+    // unmanaged window (the Start menu, an elevated program) has the focus.
+    let target = match action {
+        Action::Quit
+        | Action::Spawn(_)
+        | Action::SpawnCmd(_)
+        | Action::Screenshot
+        | Action::WindowScreenshot
+        | Action::ScreenshotWindow
+        | Action::ShowKeyBindings => None,
+        Action::CloseWindow => engine.write().resolve_action_target_strict(backend),
+        _ => engine.write().resolve_action_target(backend),
+    };
 
     // niri-style interactive-resize mode: while engaged, the arrow-focus
     // chords resize the focused column / tile instead of moving focus.
@@ -816,15 +840,18 @@ fn execute_action(
         Action::FocusDown => {
             engine.write().focus_down(backend);
         }
-        Action::MoveColumnLeft => {
-            engine.write().move_column(ScrollDirection::Left, backend);
-        }
-        Action::MoveColumnRight => {
-            engine.write().move_column(ScrollDirection::Right, backend);
-        }
-        Action::CloseWindow => {
-            engine.write().close_focused_window(backend);
-        }
+        Action::MoveColumnLeft => match float_of(target) {
+            Some(window) => engine.write().float_move_by(window, -FLOAT_STEP_PX, 0, backend),
+            None => engine.write().move_column(ScrollDirection::Left, backend),
+        },
+        Action::MoveColumnRight => match float_of(target) {
+            Some(window) => engine.write().float_move_by(window, FLOAT_STEP_PX, 0, backend),
+            None => engine.write().move_column(ScrollDirection::Right, backend),
+        },
+        Action::CloseWindow => match target {
+            Some(t) => engine.write().close_target(t),
+            None => info!("close-window: the focused window is not managed by wiri; nothing closed"),
+        },
         Action::Spawn(argv) => {
             spawn_process(argv);
         }
@@ -836,7 +863,9 @@ fn execute_action(
             spawn_shell_command(cmd);
         }
         Action::ToggleFullscreen => {
-            engine.write().toggle_fullscreen(backend);
+            if let Some(t) = target {
+                engine.write().toggle_fullscreen_for(t.window, backend);
+            }
         }
         Action::Quit => {
             if let Some(tx) = quit_tx.lock().as_ref() {
@@ -858,7 +887,9 @@ fn execute_action(
             engine.write().scroll(ScrollDirection::Right, backend);
         }
         Action::ToggleFloating => {
-            engine.write().toggle_floating(backend);
+            if let Some(t) = target {
+                engine.write().toggle_floating_for(t.window, backend);
+            }
         }
         Action::OverviewToggle => {
             engine.write().toggle_overview(backend);
@@ -909,44 +940,13 @@ fn execute_action(
                 warn!("Minimize: no foreground window");
             }
         }
-        Action::CenterWindow => {
-            // Center the focused window on its current monitor's work area
-            let fg = unsafe { GetForegroundWindow() };
-            if fg.0.is_null() {
-                warn!("CenterWindow: no foreground window");
-            } else {
-                let hmon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
-                let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
-                mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-                if unsafe { GetMonitorInfoW(hmon, &mut mi).as_bool() } {
-                    let wa = mi.rcWork;
-                    let wa_w = wa.right - wa.left;
-                    let wa_h = wa.bottom - wa.top;
-                    // Place at 60% of work area, centered
-                    let win_w = wa_w * 6 / 10;
-                    let win_h = wa_h * 6 / 10;
-                    let x = wa.left + (wa_w - win_w) / 2;
-                    let y = wa.top + (wa_h - win_h) / 2;
-                    unsafe {
-                        let _ = SetWindowPos(
-                            fg,
-                            HWND_TOP,
-                            x,
-                            y,
-                            win_w,
-                            win_h,
-                            SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                    }
-                    info!(
-                        "CenterWindow: hwnd={:?} x={} y={} w={} h={}",
-                        fg, x, y, win_w, win_h
-                    );
-                } else {
-                    warn!("CenterWindow: GetMonitorInfoW failed");
-                }
+        Action::CenterWindow => match float_of(target) {
+            Some(window) => engine.write().float_center(window, backend),
+            None => {
+                engine.write().center_focused_column(backend);
+                engine.write().apply_all(backend);
             }
-        }
+        },
         Action::SwitchMonitor => {
             // Generic "switch monitor" — cycle focus to the next monitor in
             // x-order, wrapping around. Distinct from MoveToMonitorLeft/Right,
@@ -980,10 +980,11 @@ fn execute_action(
         }
         Action::MoveWorkspace(target_number) => {
             // Move the focused window to workspace number `target_number` (no switch).
-            engine.write().move_window_to_workspace(
-                crate::layout::workspace_id_from_number(*target_number),
-                backend,
-            );
+            let workspace = crate::layout::workspace_id_from_number(*target_number);
+            match float_of(target) {
+                Some(window) => engine.write().float_move_to_workspace(window, workspace, backend),
+                None => engine.write().move_window_to_workspace(workspace, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ColumnToggleTabbed => {
@@ -1002,10 +1003,11 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::MoveToWorkspace(number) => {
-            engine.write().move_window_to_workspace(
-                crate::layout::workspace_id_from_number(*number),
-                backend,
-            );
+            let workspace = crate::layout::workspace_id_from_number(*number);
+            match float_of(target) {
+                Some(window) => engine.write().float_move_to_workspace(window, workspace, backend),
+                None => engine.write().move_window_to_workspace(workspace, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::MoveToMonitorLeft => {
@@ -1021,45 +1023,78 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::CenterColumn => {
-            engine.write().center_focused_column(backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_center(window, backend),
+                None => engine.write().center_focused_column(backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetCycle => {
-            engine
-                .write()
-                .set_column_width_preset(crate::layout::ColumnWidthPreset::Cycle, backend);
+            match float_of(target) {
+                // niri's presets: a third, a half, two thirds of the work area.
+                Some(window) => engine.write().float_cycle_width(window, backend),
+                None => engine
+                    .write()
+                    .set_column_width_preset(crate::layout::ColumnWidthPreset::Cycle, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetHalf => {
-            engine
-                .write()
-                .set_column_width_preset(crate::layout::ColumnWidthPreset::Half, backend);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_set_width_fraction(window, 0.5, backend),
+                None => engine
+                    .write()
+                    .set_column_width_preset(crate::layout::ColumnWidthPreset::Half, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetThird => {
-            engine
-                .write()
-                .set_column_width_preset(crate::layout::ColumnWidthPreset::OneThird, backend);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_set_width_fraction(window, 1.0 / 3.0, backend),
+                None => engine
+                    .write()
+                    .set_column_width_preset(crate::layout::ColumnWidthPreset::OneThird, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetTwoThirds => {
-            engine
-                .write()
-                .set_column_width_preset(crate::layout::ColumnWidthPreset::TwoThirds, backend);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_set_width_fraction(window, 2.0 / 3.0, backend),
+                None => engine
+                    .write()
+                    .set_column_width_preset(crate::layout::ColumnWidthPreset::TwoThirds, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetFull => {
-            engine
-                .write()
-                .set_column_width_preset(crate::layout::ColumnWidthPreset::Full, backend);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_set_width_fraction(window, 1.0, backend),
+                None => engine
+                    .write()
+                    .set_column_width_preset(crate::layout::ColumnWidthPreset::Full, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ResizeColumnLeft => {
-            engine.write().resize_focused_column_by(-100, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_by(window, -100, 0, backend),
+                None => engine.write().resize_focused_column_by(-100, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ResizeColumnRight => {
-            engine.write().resize_focused_column_by(100, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_by(window, 100, 0, backend),
+                None => engine.write().resize_focused_column_by(100, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::FocusWorkspaceNext => {
@@ -1093,15 +1128,25 @@ fn execute_action(
             take_screenshot();
         }
         Action::ColumnWidthPresetQuarter => {
-            engine
-                .write()
-                .set_column_width_preset(crate::layout::ColumnWidthPreset::OneQuarter, backend);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_set_width_fraction(window, 0.25, backend),
+                None => engine
+                    .write()
+                    .set_column_width_preset(crate::layout::ColumnWidthPreset::OneQuarter, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ColumnWidthPresetThreeQuarters => {
-            engine
-                .write()
-                .set_column_width_preset(crate::layout::ColumnWidthPreset::ThreeQuarters, backend);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_set_width_fraction(window, 0.75, backend),
+                None => engine
+                    .write()
+                    .set_column_width_preset(crate::layout::ColumnWidthPreset::ThreeQuarters, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ConsumeWindowIntoColumn => {
@@ -1121,23 +1166,35 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::GrowColumnWidth => {
-            engine.write().resize_focused_column_by_percent(5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, 5, 0, backend),
+                None => engine.write().resize_focused_column_by_percent(5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ShrinkColumnWidth => {
-            engine.write().resize_focused_column_by_percent(-5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, -5, 0, backend),
+                None => engine.write().resize_focused_column_by_percent(-5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::GrowTileHeight => {
-            engine
-                .write()
-                .resize_focused_tile_height_by_percent(5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, 0, 5, backend),
+                None => engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ShrinkTileHeight => {
-            engine
-                .write()
-                .resize_focused_tile_height_by_percent(-5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, 0, -5, backend),
+                None => engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(-5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::MoveColumnToMonitorLeft => {
@@ -1240,6 +1297,15 @@ fn execute_action(
             }
         }
     }
+}
+
+/// How far a floating window moves for one `move-column-left` / `move-column-right` /
+/// `move-window-up` / `move-window-down` (niri nudges by 50).
+const FLOAT_STEP_PX: i32 = 50;
+
+/// The floating window an action targets, if it targets one.
+fn float_of(target: Option<crate::layout::ActionTarget>) -> Option<crate::utils::WindowId> {
+    target.filter(|t| t.floating).map(|t| t.window)
 }
 
 /// Capture the foreground window's bounding rect via the shared helper in

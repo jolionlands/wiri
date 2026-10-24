@@ -43,6 +43,119 @@ impl AppliedState {
     }
 }
 
+/// Where a floating window lives: the monitor and workspace it belongs to, the
+/// rectangle it floats at, and its place in the stack of floating windows.
+#[derive(Debug, Clone)]
+struct FloatHome {
+    output: OutputId,
+    workspace: i32,
+    /// Where the window floats (visible rectangle, screen coordinates).
+    rect: Rect,
+    /// Position in the float stack: a higher number is raised more recently.
+    seq: u64,
+}
+
+/// What the window that has the keyboard focus looks like to the engine.
+///
+/// Built from `GetForegroundWindow()`: the window itself and the root of its
+/// owner chain (a dialog or popup is owned by the application window wiri
+/// manages), plus whether it is something wiri never acts on (the desktop, the
+/// taskbar, wiri's own windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundWindow {
+    pub hwnd: isize,
+    pub root_owner: isize,
+    pub ignorable: bool,
+}
+
+/// The application window that `hwnd` belongs to: the end of its owner chain (a
+/// dialog or popup is owned by the window that opened it).
+///
+/// `GetAncestor(GA_ROOTOWNER)` alone is not enough: it follows `GetParent`, which
+/// reports the owner only for `WS_POPUP` windows.  A dialog without that style (a
+/// WinForms or WPF form shown with an owner) would be its own root.  So the owner
+/// chain is walked with `GetWindow(GW_OWNER)` first, and `GA_ROOTOWNER` then
+/// resolves what is left (a child window, or a popup owned through its parent).
+pub fn root_owner_of(hwnd: isize) -> isize {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetWindow, GA_ROOTOWNER, GW_OWNER};
+    unsafe {
+        let mut current = HWND(hwnd as *mut std::ffi::c_void);
+        // Owner chains are short; the bound only guards against a cycle.
+        for _ in 0..16 {
+            match GetWindow(current, GW_OWNER) {
+                Ok(owner) if !owner.0.is_null() => current = owner,
+                _ => break,
+            }
+        }
+        let root = GetAncestor(current, GA_ROOTOWNER);
+        if root.0.is_null() {
+            current.0 as isize
+        } else {
+            root.0 as isize
+        }
+    }
+}
+
+/// Read the OS foreground window.  `None` when no window has the focus.
+pub fn query_foreground() -> Option<ForegroundWindow> {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return None;
+        }
+        let mut class = [0u16; 128];
+        let len = GetClassNameW(fg, &mut class).max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..len.min(class.len())]);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        let own = pid != 0 && pid == GetCurrentProcessId();
+        Some(ForegroundWindow {
+            hwnd: fg.0 as isize,
+            root_owner: root_owner_of(fg.0 as isize),
+            ignorable: own
+                || matches!(
+                    class.as_str(),
+                    "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+                ),
+        })
+    }
+}
+
+/// The managed window an action acts on, and which layer it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionTarget {
+    /// The window wiri manages (an application's main window).
+    pub window: WindowId,
+    /// It floats instead of sitting in a column.
+    pub floating: bool,
+    /// The window that really has the keyboard focus: `window` itself, or a
+    /// dialog / popup it owns.
+    pub focus_hwnd: isize,
+}
+
+impl ActionTarget {
+    fn tile(window: WindowId) -> Self {
+        Self {
+            window,
+            floating: false,
+            focus_hwnd: window.as_isize(),
+        }
+    }
+
+    fn float(window: WindowId) -> Self {
+        Self {
+            window,
+            floating: true,
+            focus_hwnd: window.as_isize(),
+        }
+    }
+}
+
 /// Parse a `"#RRGGBB"` color string to a packed `0x00RRGGBB` u32.
 /// Returns `0xFFFF_FFFF` (sentinel) on parse failure.
 fn parse_color_to_u32(color_hex: &str) -> u32 {
@@ -364,6 +477,16 @@ pub struct TilingEngine {
     tiled_windows: HashMap<WindowId, WindowInfo>,
     fullscreen_windows: HashSet<WindowId>,
     floating_windows: HashSet<WindowId>,
+    /// Where each floating window lives (monitor + workspace), the rectangle it
+    /// floats at and its place in the float stack.  Every id in `floating_windows`
+    /// is expected to have an entry; a float without one (a test that fills the set
+    /// directly) is treated as living on the focused monitor's active workspace.
+    float_homes: HashMap<WindowId, FloatHome>,
+    /// The geometry a window had the last time it floated, so that floating it
+    /// again puts it back where the user left it.
+    float_memory: HashMap<WindowId, Rect>,
+    /// Source of `FloatHome::seq`.
+    float_seq: u64,
     window_sizing: HashMap<WindowId, SizingMode>,
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
@@ -475,6 +598,9 @@ impl TilingEngine {
             tiled_windows: HashMap::new(),
             fullscreen_windows: HashSet::new(),
             floating_windows: HashSet::new(),
+            float_homes: HashMap::new(),
+            float_memory: HashMap::new(),
+            float_seq: 0,
             window_sizing: HashMap::new(),
             saved_styles: HashMap::new(),
             saved_ex_styles: HashMap::new(),
@@ -889,7 +1015,18 @@ impl TilingEngine {
         };
 
         if rules.float {
-            self.floating_windows.insert(window_id);
+            // A floating window belongs to a workspace like any other: the active one
+            // of the monitor it opens on.
+            let output_id = self.get_target_output(&window);
+            let workspace = self
+                .monitors
+                .get(&output_id)
+                .map_or(0, |m| m.active_workspace);
+            let rect = match self.monitors.get(&output_id).map(|m| m.work_area) {
+                Some(work) => Self::fit_rect_into(window.bounds, work),
+                None => window.bounds,
+            };
+            self.register_float(window_id, output_id, workspace, rect);
             self.tiled_windows.insert(window_id, window);
             info!("Window {:?} started as floating (rule)", window_id);
             return;
@@ -1148,6 +1285,8 @@ impl TilingEngine {
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
         self.fullscreen_windows.remove(&window_id);
         self.floating_windows.remove(&window_id);
+        self.float_homes.remove(&window_id);
+        self.float_memory.remove(&window_id);
         self.window_sizing.remove(&window_id);
         self.saved_styles.remove(&window_id);
         self.saved_ex_styles.remove(&window_id);
@@ -1466,6 +1605,7 @@ impl TilingEngine {
         let overview_active = self.is_overview();
         if !overview_active {
             self.hide_inactive_workspace_windows_for_monitor(output_id, backend);
+            self.reconcile_floats(output_id, backend);
         }
 
         let monitor = match self.monitors.get(&output_id) {
@@ -2101,7 +2241,19 @@ impl TilingEngine {
         // mid-iteration. The window stays in `tiled_windows` (so it's still
         // tracked) but is removed from the column layout and added to floating.
         for wid in windows_to_auto_float {
-            self.floating_windows.insert(wid);
+            // It floats where it is, on the workspace it was tiled on.
+            let workspace = self
+                .monitors
+                .get(&output_id)
+                .map_or(0, |m| m.active_workspace);
+            let rect = self
+                .applied_state
+                .get(&wid)
+                .map(|s| s.rect)
+                .filter(|r| r.size.w > 0 && r.size.h > 0)
+                .or_else(|| self.tiled_windows.get(&wid).map(|w| w.bounds))
+                .unwrap_or_else(|| Rect::new(0, 0, 800, 600));
+            self.register_float(wid, output_id, workspace, rect);
             self.window_sizing.insert(wid, SizingMode::Normal);
             // Drop the failure counter so toggle-floating back to tiled can try again.
             self.failed_position.remove(&wid);
@@ -2167,6 +2319,11 @@ impl TilingEngine {
         // Whatever the window is (tiled, floating, unmanaged), it is what the user is
         // looking at now.
         self.os_foreground = Some(window_id);
+        if self.floating_windows.contains(&window_id) {
+            // The user is looking at a floating window: it goes to the top of the float stack.
+            self.touch_float(window_id);
+            return None;
+        }
         let (output_id, workspace_id, column_idx) = self.locate_window(window_id)?;
 
         // A window on an inactive workspace that wiri itself hid is not the user asking
@@ -2208,6 +2365,8 @@ impl TilingEngine {
         self.monitors.set_focused(output_id);
         self.reveal_focused_column(output_id);
         self.apply_layout_for_monitor(output_id, backend);
+        // The tile that just got the focus is on top now; floating windows stay above tiles.
+        self.raise_floats(output_id);
         Some((column_idx, workspace_id))
     }
 
@@ -2833,66 +2992,699 @@ impl TilingEngine {
         self.apply_layout_for_monitor(focused_output, backend);
     }
 
-    /// Close the focused window
-    pub fn close_focused_window(&mut self, _backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        let hwnd = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            match monitor.focus_window {
-                Some(wid) => self.tiled_windows.get(&wid).map(|w| w.hwnd),
-                None => None,
+    // =========================================================================
+    // Which window does an action act on?
+    //
+    // The window the user is looking at: the OS foreground window (or the
+    // application window that owns it), floating windows included.  The engine's
+    // own idea of the focus is only the fallback, for when the foreground is the
+    // desktop, the taskbar or wiri itself.
+    // =========================================================================
+
+    /// The managed window that `foreground` (a window, or a dialog/popup it is
+    /// owned by) belongs to.
+    pub fn managed_window_for(&self, foreground: isize, root_owner: isize) -> Option<WindowId> {
+        [foreground, root_owner]
+            .into_iter()
+            .map(WindowId::new)
+            .find(|wid| self.tiled_windows.contains_key(wid))
+    }
+
+    /// The target the engine's own state points at: the floating window the OS last
+    /// reported as the foreground one, else the focused tile, else the topmost
+    /// floating window.  This is what an action acts on when it cannot ask the OS.
+    pub fn state_target(&self) -> Option<ActionTarget> {
+        if let Some(wid) = self
+            .os_foreground
+            .filter(|w| self.floating_windows.contains(w) && self.tiled_windows.contains_key(w))
+        {
+            return Some(ActionTarget::float(wid));
+        }
+        if let Some(wid) = self
+            .monitors
+            .focused()
+            .and_then(|m| m.focus_window)
+            .filter(|w| self.tiled_windows.contains_key(w))
+        {
+            return Some(ActionTarget::tile(wid));
+        }
+        self.floating_windows
+            .iter()
+            .filter(|w| self.tiled_windows.contains_key(*w))
+            .max_by_key(|w| self.float_homes.get(*w).map_or(0, |h| h.seq))
+            .map(|w| ActionTarget::float(*w))
+    }
+
+    /// Resolve the window an action acts on from the OS foreground window and, when
+    /// it is a tile, make it the engine's focus (the OS already has it activated, so
+    /// no activation request is sent).  `strict` refuses to guess when the
+    /// foreground is an ordinary window wiri does not manage (the Start menu, an
+    /// elevated program): closing a background tile then would be a surprise.
+    /// Otherwise, and when the foreground is the desktop, the taskbar or wiri
+    /// itself, the engine's own focus decides.
+    pub fn resolve_action_target_for(
+        &mut self,
+        foreground: Option<ForegroundWindow>,
+        strict: bool,
+        backend: &BackendHandle,
+    ) -> Option<ActionTarget> {
+        if let Some(fg) = foreground {
+            if let Some(wid) = self.managed_window_for(fg.hwnd, fg.root_owner) {
+                if self.floating_windows.contains(&wid) {
+                    self.os_foreground = Some(wid);
+                    self.touch_float(wid);
+                    return Some(ActionTarget {
+                        window: wid,
+                        floating: true,
+                        focus_hwnd: fg.hwnd,
+                    });
+                }
+                self.sync_os_foreground(wid, backend);
+                if self.locate_window(wid).is_some() {
+                    return Some(ActionTarget {
+                        window: wid,
+                        floating: false,
+                        focus_hwnd: fg.hwnd,
+                    });
+                }
+                // Managed, but not in any strip right now (it is minimized): the
+                // engine's focus decides.
+            } else if strict && !fg.ignorable {
+                return None;
             }
-        };
-        if let Some(hwnd) = hwnd {
-            self.close_window(hwnd);
-            // Note: the actual removal from layout happens when we receive
-            // the WindowDestroyed event from the WinEvent hook.
+        }
+        self.state_target()
+    }
+
+    /// [`Self::resolve_action_target_for`] for the real OS foreground window.
+    pub fn resolve_action_target(&mut self, backend: &BackendHandle) -> Option<ActionTarget> {
+        self.resolve_action_target_for(query_foreground(), false, backend)
+    }
+
+    /// Like [`Self::resolve_action_target`], but `None` when an unmanaged window has
+    /// the focus.  For actions that destroy something (`close-window`).
+    pub fn resolve_action_target_strict(
+        &mut self,
+        backend: &BackendHandle,
+    ) -> Option<ActionTarget> {
+        self.resolve_action_target_for(query_foreground(), true, backend)
+    }
+
+    // =========================================================================
+    // Floating windows: they belong to a workspace, stay above the tiles and
+    // remember where they were
+    // =========================================================================
+
+    /// The (monitor, workspace) a floating window lives on.  A float without
+    /// bookkeeping (it predates it, or a test filled the set directly) lives on the
+    /// focused monitor's active workspace.
+    fn float_location(&self, window_id: WindowId) -> Option<(OutputId, i32)> {
+        if let Some(home) = self.float_homes.get(&window_id) {
+            return Some((home.output, home.workspace));
+        }
+        let output = self.monitors.focused_id()?;
+        let workspace = self.monitors.get(&output)?.active_workspace;
+        Some((output, workspace))
+    }
+
+    fn next_float_seq(&mut self) -> u64 {
+        self.float_seq += 1;
+        self.float_seq
+    }
+
+    /// Put `window_id` on top of the float stack (the user just looked at it).
+    fn touch_float(&mut self, window_id: WindowId) {
+        let seq = self.next_float_seq();
+        if let Some(home) = self.float_homes.get_mut(&window_id) {
+            home.seq = seq;
         }
     }
 
-    /// Toggle fullscreen for the focused window
-    pub fn toggle_fullscreen(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
+    /// Start tracking `window_id` as a floating window of `workspace` on `output`.
+    fn register_float(
+        &mut self,
+        window_id: WindowId,
+        output: OutputId,
+        workspace: i32,
+        rect: Rect,
+    ) {
+        let seq = self.next_float_seq();
+        self.floating_windows.insert(window_id);
+        self.float_homes.insert(
+            window_id,
+            FloatHome {
+                output,
+                workspace,
+                rect,
+                seq,
+            },
+        );
+    }
 
-        // Get window info before mutating
-        let (window_id, hwnd, is_fullscreen, monitor_bounds) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            let wid = match monitor.focus_window {
-                Some(id) => id,
-                None => return,
-            };
-            let window = match self.tiled_windows.get(&wid) {
-                Some(w) => w,
-                None => return,
-            };
-            (
-                wid,
-                window.hwnd,
-                self.fullscreen_windows.contains(&wid),
-                monitor.bounds,
+    /// Where a window floats the first time: its own size (at most 90 percent of
+    /// the work area), centred on the monitor.
+    fn initial_float_rect(&self, window_id: WindowId, output_id: OutputId) -> Rect {
+        let work = self
+            .monitors
+            .get(&output_id)
+            .map(|m| m.work_area)
+            .unwrap_or_else(|| Rect::new(0, 0, 1280, 720));
+        let own = self
+            .original_bounds
+            .get(&window_id)
+            .copied()
+            .or_else(|| self.tiled_windows.get(&window_id).map(|w| w.bounds))
+            .unwrap_or_else(|| Rect::new(0, 0, work.size.w * 6 / 10, work.size.h * 6 / 10));
+        let max_w = (work.size.w * 9 / 10).max(1);
+        let max_h = (work.size.h * 9 / 10).max(1);
+        let w = own.size.w.clamp(240u32.min(max_w), max_w);
+        let h = own.size.h.clamp(160u32.min(max_h), max_h);
+        Rect::new(
+            work.loc.x + (work.size.w as i32 - w as i32) / 2,
+            work.loc.y + (work.size.h as i32 - h as i32) / 2,
+            w,
+            h,
+        )
+    }
+
+    /// `rect` moved (and shrunk, when it is larger) so that it lies inside `work`.
+    fn fit_rect_into(rect: Rect, work: Rect) -> Rect {
+        let w = rect.size.w.min(work.size.w).max(1);
+        let h = rect.size.h.min(work.size.h).max(1);
+        let x = rect
+            .loc
+            .x
+            .clamp(work.loc.x, work.loc.x + work.size.w as i32 - w as i32);
+        let y = rect
+            .loc
+            .y
+            .clamp(work.loc.y, work.loc.y + work.size.h as i32 - h as i32);
+        Rect::new(x, y, w, h)
+    }
+
+    /// The rectangle a window occupies on screen right now (its visible frame),
+    /// when it can be read: not for a minimized or hidden window, nor for one that
+    /// is gone.
+    fn live_window_rect(window_id: WindowId) -> Option<Rect> {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow};
+        let hwnd = HWND(window_id.as_isize() as *mut std::ffi::c_void);
+        unsafe {
+            if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                return None;
+            }
+            let mut r = RECT::default();
+            let framed = DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut r as *mut _ as *mut _,
+                std::mem::size_of::<RECT>() as u32,
             )
+            .is_ok();
+            if !framed && GetWindowRect(hwnd, &mut r).is_err() {
+                return None;
+            }
+            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            if w <= 0 || h <= 0 || r.left <= -30000 {
+                return None;
+            }
+            Some(Rect::new(r.left, r.top, w as u32, h as u32))
+        }
+    }
+
+    /// Where a floating window is now: on screen if that can be read, else where
+    /// wiri last put it.
+    fn float_rect_of(&self, window_id: WindowId) -> Option<Rect> {
+        Self::live_window_rect(window_id)
+            .or_else(|| self.float_homes.get(&window_id).map(|h| h.rect))
+    }
+
+    /// Show the floating windows of the active workspace of `output_id` and hide
+    /// the ones of its other workspaces.  Part of every layout pass, next to the
+    /// same job for tiles: a floating window is not left behind on screen when its
+    /// workspace is left.
+    fn reconcile_floats(&mut self, output_id: OutputId, backend: &BackendHandle) {
+        let Some(active) = self.monitors.get(&output_id).map(|m| m.active_workspace) else {
+            return;
+        };
+        let mut to_hide: Vec<WindowId> = Vec::new();
+        let mut to_show: Vec<WindowId> = Vec::new();
+        for (wid, home) in &self.float_homes {
+            if home.output != output_id || self.sticky_windows.contains(wid) {
+                continue;
+            }
+            if home.workspace == active {
+                to_show.push(*wid);
+            } else {
+                to_hide.push(*wid);
+            }
+        }
+        for wid in to_hide {
+            // Authoritative, like for tiles: the shell may re-show a hidden window.
+            let _ = backend.show_window(wid.as_isize(), false);
+            self.applied_state
+                .entry(wid)
+                .or_insert_with(AppliedState::unset)
+                .visible = false;
+        }
+        let mut newly_shown = false;
+        for wid in to_show {
+            let visible = self.applied_state.get(&wid).map_or(false, |s| s.visible);
+            if !visible {
+                let _ = backend.show_window(wid.as_isize(), true);
+                self.applied_state
+                    .entry(wid)
+                    .or_insert_with(AppliedState::unset)
+                    .visible = true;
+                newly_shown = true;
+            }
+        }
+        if newly_shown {
+            self.raise_floats(output_id);
+        }
+    }
+
+    /// Put the floating windows of the active workspace of `output_id` above every
+    /// tile again, oldest first so that the most recently used stays on top.  The
+    /// request is asynchronous (it never waits for a hung application).
+    fn raise_floats(&self, output_id: OutputId) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOP, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        let Some(active) = self.monitors.get(&output_id).map(|m| m.active_workspace) else {
+            return;
+        };
+        let mut floats: Vec<(u64, WindowId)> = self
+            .float_homes
+            .iter()
+            .filter(|(wid, home)| {
+                home.output == output_id
+                    && home.workspace == active
+                    && !self.fullscreen_windows.contains(*wid)
+            })
+            .map(|(wid, home)| (home.seq, *wid))
+            .collect();
+        floats.sort_by_key(|(seq, _)| *seq);
+        for (_, wid) in floats {
+            unsafe {
+                let _ = SetWindowPos(
+                    HWND(wid.as_isize() as *mut std::ffi::c_void),
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                );
+            }
+        }
+    }
+
+    /// Take a tiled window out of its column and float it, where it floated last
+    /// time (or, the first time, at its own size in the middle of the work area).
+    fn float_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some((output, workspace, _)) = self.locate_window(window_id) else {
+            return;
+        };
+        let work = self.monitors.get(&output).map(|m| m.work_area);
+        let rect = match (self.float_memory.get(&window_id).copied(), work) {
+            (Some(remembered), Some(work)) => Self::fit_rect_into(remembered, work),
+            _ => self.initial_float_rect(window_id, output),
+        };
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            monitor.remove_window(window_id);
+        }
+        self.window_sizing.insert(window_id, SizingMode::Normal);
+        self.register_float(window_id, output, workspace, rect);
+        // The window just floated keeps the keyboard focus (as in niri).  The layout pass
+        // would hand the foreground to the next tile, which then also takes the next
+        // toggle-floating; pretend that tile is already activated.
+        if self.os_foreground == Some(window_id) {
+            self.last_activated = self.monitors.get(&output).and_then(|m| m.focus_window);
+        }
+        let on_active_workspace = self
+            .monitors
+            .get(&output)
+            .map_or(false, |m| m.active_workspace == workspace);
+        if on_active_workspace {
+            // No SWP_NOZORDER: it comes to the top, above the tiles.
+            let _ = backend.set_window_position(
+                window_id.as_isize(),
+                rect,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+            );
+        }
+        // The layout cache must forget the tile rectangle it holds: when the window is tiled
+        // again the layout pass would find that rectangle "already applied" and leave the window
+        // where it floats.
+        let was_visible = self.applied_state.get(&window_id).map_or(false, |s| s.visible);
+        let mut cached = AppliedState::unset();
+        cached.visible = on_active_workspace || was_visible;
+        self.applied_state.insert(window_id, cached);
+        info!("Floating window {:?} at {:?}", window_id, rect);
+        self.maintain_empty_workspace(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// Put a floating window back into the strip of the workspace it belongs to,
+    /// and remember where it floated.
+    fn unfloat_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some((output, workspace)) = self.float_location(window_id) else {
+            return;
+        };
+        if let Some(rect) = self.float_rect_of(window_id) {
+            self.float_memory.insert(window_id, rect);
+        }
+        self.float_homes.remove(&window_id);
+        self.floating_windows.remove(&window_id);
+        self.window_sizing.insert(window_id, SizingMode::Normal);
+        // Whatever the layout cache knows about the window is stale: it was moved around as a
+        // float.  The next layout pass places it from scratch.
+        self.applied_state.remove(&window_id);
+        let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
+            Some(self.config.column_width)
+        } else {
+            None
+        };
+        let Some(monitor) = self.monitors.get_mut(&output) else {
+            return;
+        };
+        let workspace = if monitor.workspaces.contains_key(&workspace) {
+            workspace
+        } else {
+            monitor.active_workspace
+        };
+        let column = monitor
+            .workspaces
+            .entry(workspace)
+            .or_insert_with(crate::layout::Workspace::new)
+            .add_window_to_new_column_with_width(window_id, width_hint);
+        if monitor.active_workspace == workspace {
+            monitor.focus_column = Some(column);
+            monitor.focus_window = Some(window_id);
+            monitor.focus_ring.push(window_id);
+        }
+        info!("Un-floating window {:?}", window_id);
+        self.maintain_empty_workspace(output);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// Float `window_id` if it is tiled, tile it if it floats.
+    pub fn toggle_floating_for(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        if !self.tiled_windows.contains_key(&window_id) {
+            return;
+        }
+        if self.floating_windows.contains(&window_id) {
+            self.unfloat_window(window_id, backend);
+        } else {
+            self.float_window(window_id, backend);
+        }
+    }
+
+    /// Toggle floating for the window the engine's own state points at (see
+    /// [`Self::state_target`]).  The hotkey path resolves the OS foreground window
+    /// first and calls [`Self::toggle_floating_for`].
+    pub fn toggle_floating(&mut self, backend: &BackendHandle) {
+        if let Some(target) = self.state_target() {
+            self.toggle_floating_for(target.window, backend);
+        }
+    }
+
+    /// Set the rectangle of a floating window (kept on its monitor's work area).
+    fn place_float(&mut self, window_id: WindowId, rect: Rect, backend: &BackendHandle) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let rect = match self.monitors.get(&output).map(|m| m.work_area) {
+            Some(work) => Self::fit_rect_into(rect, work),
+            None => rect,
+        };
+        let _ = backend.set_window_position(
+            window_id.as_isize(),
+            rect,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+        if let Some(home) = self.float_homes.get_mut(&window_id) {
+            home.rect = rect;
+        }
+        self.float_memory.insert(window_id, rect);
+    }
+
+    /// Move a floating window by `(dx, dy)` pixels (niri nudges by 50).
+    pub fn float_move_by(&mut self, window_id: WindowId, dx: i32, dy: i32, backend: &BackendHandle) {
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        self.place_float(
+            window_id,
+            Rect::new(rect.loc.x + dx, rect.loc.y + dy, rect.size.w, rect.size.h),
+            backend,
+        );
+    }
+
+    /// Resize a floating window by `(dw, dh)` pixels; the top-left corner stays.
+    pub fn float_resize_by(
+        &mut self,
+        window_id: WindowId,
+        dw: i32,
+        dh: i32,
+        backend: &BackendHandle,
+    ) {
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let w = (rect.size.w as i32 + dw).max(120) as u32;
+        let h = (rect.size.h as i32 + dh).max(80) as u32;
+        self.place_float(window_id, Rect::new(rect.loc.x, rect.loc.y, w, h), backend);
+    }
+
+    /// Resize a floating window by a percentage of its monitor's work area.
+    pub fn float_resize_percent(
+        &mut self,
+        window_id: WindowId,
+        width_percent: i32,
+        height_percent: i32,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        self.float_resize_by(
+            window_id,
+            work.size.w as i32 * width_percent / 100,
+            work.size.h as i32 * height_percent / 100,
+            backend,
+        );
+    }
+
+    /// Give a floating window the width `fraction` of its monitor's work area.
+    pub fn float_set_width_fraction(
+        &mut self,
+        window_id: WindowId,
+        fraction: f64,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let w = ((work.size.w as f64 * fraction).round() as u32).max(120);
+        self.place_float(window_id, Rect::new(rect.loc.x, rect.loc.y, w, rect.size.h), backend);
+    }
+
+    /// Give a floating window the keyboard focus (switching to its workspace first
+    /// when that is not the active one) and bring it to the top of the float stack.
+    /// `false` when `window_id` is not a floating window.
+    pub fn focus_float(&mut self, window_id: WindowId, backend: &BackendHandle) -> bool {
+        if !self.floating_windows.contains(&window_id) {
+            return false;
+        }
+        if let Some((output, workspace)) = self.float_location(window_id) {
+            self.monitors.set_focused(output);
+            let needs_switch = self
+                .monitors
+                .get(&output)
+                .map_or(false, |m| m.active_workspace != workspace);
+            if needs_switch {
+                self.switch_workspace(workspace, backend);
+            }
+            self.touch_float(window_id);
+            self.os_foreground = Some(window_id);
+            self.activate_now(window_id, backend);
+            // The tile that holds the engine focus is not the target of this activation: the
+            // layout pass must not hand the foreground to it now.
+            self.last_activated = self
+                .monitors
+                .get(&output)
+                .and_then(|m| m.focus_window)
+                .or(Some(window_id));
+            self.raise_floats(output);
+        }
+        true
+    }
+
+    /// Switch a floating window between niri's width presets: a third, a half and
+    /// two thirds of its monitor's work area.
+    pub fn float_cycle_width(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        const PRESETS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let current = rect.size.w as f64;
+        let next = PRESETS
+            .iter()
+            .copied()
+            .find(|f| work.size.w as f64 * *f > current + 1.0)
+            .unwrap_or(PRESETS[0]);
+        self.float_set_width_fraction(window_id, next, backend);
+    }
+
+    /// Centre a floating window on its monitor's work area, keeping its size.
+    pub fn float_center(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        self.place_float(
+            window_id,
+            Rect::new(
+                work.loc.x + (work.size.w as i32 - rect.size.w as i32) / 2,
+                work.loc.y + (work.size.h as i32 - rect.size.h as i32) / 2,
+                rect.size.w,
+                rect.size.h,
+            ),
+            backend,
+        );
+    }
+
+    /// Move a floating window to workspace id `workspace_id` of its monitor.  The
+    /// window disappears with its old workspace and shows up with the new one.
+    pub fn float_move_to_workspace(
+        &mut self,
+        window_id: WindowId,
+        workspace_id: i32,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let rect = self.float_rect_of(window_id);
+        let seq = self.next_float_seq();
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            monitor
+                .workspaces
+                .entry(workspace_id)
+                .or_insert_with(crate::layout::Workspace::new);
+        }
+        match self.float_homes.get_mut(&window_id) {
+            Some(home) => {
+                home.workspace = workspace_id;
+                home.seq = seq;
+            }
+            None => {
+                let rect = rect.unwrap_or_else(|| self.initial_float_rect(window_id, output));
+                self.float_homes.insert(
+                    window_id,
+                    FloatHome {
+                        output,
+                        workspace: workspace_id,
+                        rect,
+                        seq,
+                    },
+                );
+            }
+        }
+        self.maintain_empty_workspace(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// Ask a window to close.  For a dialog or popup that has the focus the dialog is
+    /// closed, not the application window that owns it (like Alt+F4).
+    pub fn close_target(&mut self, target: ActionTarget) {
+        let hwnd = if target.focus_hwnd != 0 {
+            target.focus_hwnd
+        } else {
+            target.window.as_isize()
+        };
+        self.close_window(hwnd);
+        // The window leaves the layout when its destroy event arrives.
+    }
+
+    /// Close the window the engine's own state points at.
+    pub fn close_focused_window(&mut self, _backend: &BackendHandle) {
+        if let Some(target) = self.state_target() {
+            self.close_target(target);
+        }
+    }
+
+    /// Toggle fullscreen for the window the engine's own state points at.
+    pub fn toggle_fullscreen(&mut self, backend: &BackendHandle) {
+        if let Some(target) = self.state_target() {
+            self.toggle_fullscreen_for(target.window, backend);
+        }
+    }
+
+    /// Toggle fullscreen for `window_id`, a tile or a floating window: it covers
+    /// the monitor it lives on.  A floating window gets its rectangle back when it
+    /// leaves fullscreen.
+    pub fn toggle_fullscreen_for(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) else {
+            return;
+        };
+        let is_float = self.floating_windows.contains(&window_id);
+        let output = if is_float {
+            self.float_location(window_id).map(|(o, _)| o)
+        } else {
+            self.locate_window(window_id).map(|(o, _, _)| o)
+        };
+        let Some(output) = output.or_else(|| self.monitors.focused_id()) else {
+            return;
+        };
+        let Some(monitor_bounds) = self.monitors.get(&output).map(|m| m.bounds) else {
+            return;
         };
 
-        if is_fullscreen {
+        if self.fullscreen_windows.contains(&window_id) {
             // Exit fullscreen
             self.fullscreen_windows.remove(&window_id);
             self.window_sizing.insert(window_id, SizingMode::Normal);
             self.restore_window_style(hwnd);
+            if is_float {
+                if let Some(rect) = self.float_memory.get(&window_id).copied() {
+                    self.place_float(window_id, rect, backend);
+                }
+            }
             info!("Exiting fullscreen for window {}", hwnd);
         } else {
             // Enter fullscreen
+            if is_float {
+                if let Some(rect) = self.float_rect_of(window_id) {
+                    self.float_memory.insert(window_id, rect);
+                }
+            }
             self.fullscreen_windows.insert(window_id);
             self.window_sizing.insert(window_id, SizingMode::Fullscreen);
             let fullscreen_rect = Rect::new(
@@ -2910,82 +3702,7 @@ impl TilingEngine {
         // tile rect "already applied" and the window stays as big as the screen.
         self.applied_state.remove(&window_id);
 
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
-    /// Toggle floating for the focused window.
-    /// Floating windows are not managed by the tiling layout
-    /// and can be freely positioned.
-    pub fn toggle_floating(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // A floating window the user is looking at wins: floating a window moves the
-        // keyboard focus on to a tile, so without this the second press floated that
-        // tile as well instead of putting the first window back into the layout.
-        let foreground_float = self
-            .os_foreground
-            .filter(|wid| self.floating_windows.contains(wid) && self.tiled_windows.contains_key(wid));
-
-        // Check if the currently focused window is floating, OR if no tiled
-        // window is focused but there's a recently floated window we can un-float.
-        let (window_id, is_floating) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            if let Some(wid) = foreground_float {
-                (wid, true)
-            } else if let Some(wid) = monitor.focus_window {
-                (wid, self.floating_windows.contains(&wid))
-            } else {
-                // No focused tiled window — check if any floating window exists
-                // on this monitor that we can un-float
-                let float_on_monitor: Vec<WindowId> = self
-                    .floating_windows
-                    .iter()
-                    .filter(|wid| self.tiled_windows.contains_key(wid))
-                    .copied()
-                    .collect();
-                match float_on_monitor.first() {
-                    Some(wid) => (*wid, true),
-                    None => return,
-                }
-            }
-        };
-
-        if is_floating {
-            // Float -> Tiled: re-add to the workspace layout
-            self.floating_windows.remove(&window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
-            // Re-add the window to the active workspace
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.add_window(window_id);
-            }
-            info!("Un-floating window {:?}", window_id);
-            self.apply_layout_for_monitor(focused_output, backend);
-        } else {
-            // Tiled -> Floating: remove from layout but keep visible
-            self.floating_windows.insert(window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
-            // Remove from workspace columns
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.remove_window(window_id);
-            }
-            // The window the user just floated keeps the keyboard focus (as in niri).  The
-            // layout pass would hand the foreground to the next tile, which then also
-            // takes the next toggle-floating; pretend that tile is already activated.
-            if self.os_foreground == Some(window_id) {
-                self.last_activated = self
-                    .monitors
-                    .get(&focused_output)
-                    .and_then(|m| m.focus_window);
-            }
-            info!("Floating window {:?}", window_id);
-            self.apply_layout_for_monitor(focused_output, backend);
-        }
+        self.apply_layout_for_monitor(output, backend);
     }
 
     /// Apply the configured DWM drop-shadow state to a single window.
@@ -3342,6 +4059,14 @@ impl TilingEngine {
     /// Check if a window is floating
     pub fn is_floating(&self, window_id: WindowId) -> bool {
         self.floating_windows.contains(&window_id)
+    }
+
+    /// The workspace id (not the user's number) a floating window belongs to.
+    pub fn float_workspace(&self, window_id: WindowId) -> Option<i32> {
+        if !self.floating_windows.contains(&window_id) {
+            return None;
+        }
+        self.float_location(window_id).map(|(_, workspace)| workspace)
     }
 
     /// Get all tiled windows (for IPC queries)
@@ -7314,6 +8039,498 @@ mod tests {
         engine.toggle_floating(&be);
         assert!(engine.is_floating(WindowId::new(100)), "the foreground tile floats");
         assert!(engine.is_floating(WindowId::new(101)), "the first floating window stays floating");
+    }
+
+    // --- Which window does an action act on? ---
+
+    fn foreground(hwnd: isize, root_owner: isize) -> Option<ForegroundWindow> {
+        Some(ForegroundWindow {
+            hwnd,
+            root_owner,
+            ignorable: false,
+        })
+    }
+
+    /// An engine with the tiles 100 and 101; the OS and the engine focus 101.
+    fn engine_with_two_tiles() -> TilingEngine {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 500, 400), &be);
+        engine.sync_os_foreground(WindowId::new(101), &be);
+        engine
+    }
+
+    fn focus_window_of(engine: &TilingEngine) -> Option<WindowId> {
+        let oid = engine.focused_output().unwrap();
+        engine.monitors().get(&oid).unwrap().focus_window
+    }
+
+    #[test]
+    fn test_managed_window_for_maps_a_dialog_to_the_window_that_owns_it() {
+        let engine = engine_with_two_tiles();
+        assert_eq!(engine.managed_window_for(100, 100), Some(WindowId::new(100)));
+        // A dialog (999) owned by the application window 101.
+        assert_eq!(engine.managed_window_for(999, 101), Some(WindowId::new(101)));
+        // Neither the window nor its owner is managed.
+        assert_eq!(engine.managed_window_for(998, 997), None);
+    }
+
+    #[test]
+    fn test_action_target_is_the_os_foreground_tile_not_the_engine_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+
+        // The user clicked 100 and the OS says so, but wiri has not heard the event yet.
+        let target = engine
+            .resolve_action_target_for(foreground(100, 100), false, &be)
+            .expect("a target");
+        assert_eq!(
+            target,
+            ActionTarget {
+                window: WindowId::new(100),
+                floating: false,
+                focus_hwnd: 100
+            }
+        );
+        assert_eq!(
+            focus_window_of(&engine),
+            Some(WindowId::new(100)),
+            "the engine focus follows the OS"
+        );
+    }
+
+    #[test]
+    fn test_action_target_is_a_floating_window_in_the_foreground() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating(&be); // 101 floats; the engine focus moves on to the tile 100
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(100)));
+
+        let target = engine
+            .resolve_action_target_for(foreground(101, 101), false, &be)
+            .expect("a target");
+        assert!(target.floating);
+        assert_eq!(target.window, WindowId::new(101));
+        assert_eq!(
+            focus_window_of(&engine),
+            Some(WindowId::new(100)),
+            "looking at a floating window leaves the tile focus alone"
+        );
+    }
+
+    #[test]
+    fn test_action_target_is_the_window_that_owns_the_foreground_dialog() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        // A save dialog (999) owned by the tile 100 has the focus.
+        let target = engine
+            .resolve_action_target_for(foreground(999, 100), false, &be)
+            .expect("a target");
+        assert_eq!(target.window, WindowId::new(100));
+        assert!(!target.floating);
+        assert_eq!(
+            target.focus_hwnd, 999,
+            "the dialog is what has the focus, so close-window closes the dialog"
+        );
+
+        // The same for a dialog of a floating window.
+        engine.toggle_floating_for(WindowId::new(101), &be);
+        let target = engine
+            .resolve_action_target_for(foreground(888, 101), false, &be)
+            .expect("a target");
+        assert!(target.floating);
+        assert_eq!(target.window, WindowId::new(101));
+        assert_eq!(target.focus_hwnd, 888);
+    }
+
+    #[test]
+    fn test_strict_action_target_refuses_an_unmanaged_foreground_window() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        // The Start menu or an elevated program has the focus: close-window must not
+        // guess and close a tile in the background.
+        let unmanaged = foreground(777, 777);
+        assert_eq!(engine.resolve_action_target_for(unmanaged, true, &be), None);
+        // Actions that do no harm fall back to the engine focus.
+        let target = engine
+            .resolve_action_target_for(unmanaged, false, &be)
+            .expect("the engine focus");
+        assert_eq!(target.window, WindowId::new(101));
+    }
+
+    #[test]
+    fn test_action_target_falls_back_to_the_engine_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        // The desktop, the taskbar and wiri's own windows are never a target.
+        let ignorable = Some(ForegroundWindow {
+            hwnd: 5,
+            root_owner: 5,
+            ignorable: true,
+        });
+        for strict in [false, true] {
+            let target = engine
+                .resolve_action_target_for(ignorable, strict, &be)
+                .expect("the engine focus");
+            assert_eq!(target.window, WindowId::new(101));
+            assert!(!target.floating);
+        }
+        // So is no foreground window at all.
+        let target = engine
+            .resolve_action_target_for(None, true, &be)
+            .expect("the engine focus");
+        assert_eq!(target.window, WindowId::new(101));
+    }
+
+    #[test]
+    fn test_action_target_with_no_windows_is_none() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        assert_eq!(engine.state_target(), None);
+        assert_eq!(engine.resolve_action_target_for(None, false, &be), None);
+        assert_eq!(
+            engine.resolve_action_target_for(foreground(5, 5), true, &be),
+            None
+        );
+    }
+
+    #[test]
+    fn test_state_target_prefers_the_floating_window_the_os_reported() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating(&be); // 101 floats, the engine focus is the tile 100
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::float(WindowId::new(101)))
+        );
+        // The user clicks the tile: it is the target again.
+        engine.sync_os_foreground(WindowId::new(100), &be);
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::tile(WindowId::new(100)))
+        );
+    }
+
+    #[test]
+    fn test_state_target_is_the_topmost_floating_window_when_no_tile_is_left() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating_for(WindowId::new(101), &be);
+        engine.toggle_floating_for(WindowId::new(100), &be);
+        engine.os_foreground = None;
+        // 100 floated last, so it is on top of the stack...
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::float(WindowId::new(100)))
+        );
+        // ...until the other one is raised.
+        engine.touch_float(WindowId::new(101));
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::float(WindowId::new(101)))
+        );
+    }
+
+    #[test]
+    fn test_toggle_floating_for_ignores_a_window_wiri_does_not_manage() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating_for(WindowId::new(999), &be);
+        assert!(!engine.is_floating(WindowId::new(999)));
+        assert!(!engine.is_floating(WindowId::new(100)));
+        assert!(!engine.is_floating(WindowId::new(101)));
+    }
+
+    // --- Floating windows: geometry, workspace, stacking ---
+
+    #[test]
+    fn test_a_window_floats_at_its_own_size_in_the_middle_of_the_work_area() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating_for(WindowId::new(100), &be);
+        let rect = engine.float_homes.get(&WindowId::new(100)).unwrap().rect;
+        assert_eq!((rect.size.w, rect.size.h), (800, 600));
+        assert_eq!(rect.loc.x, (1920 - 800) / 2);
+        assert_eq!(rect.loc.y, (1040 - 600) / 2);
+    }
+
+    #[test]
+    fn test_root_owner_of_an_unknown_window_is_the_window_itself() {
+        // Neither an owner nor a root can be found for a handle that is not a window.
+        assert_eq!(root_owner_of(0x7777_0001), 0x7777_0001);
+    }
+
+    #[test]
+    fn test_floating_makes_the_layout_cache_forget_the_tile_rect() {
+        // Found live: the window floated and was tiled again, but the layout found its old tile
+        // rectangle "already applied" in the cache and never moved it back.
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.apply_all(&be);
+        let wid = WindowId::new(101);
+        let tile_rect = engine.applied_state.get(&wid).unwrap().rect;
+        assert_ne!(tile_rect, Rect::new(0, 0, 0, 0));
+
+        engine.toggle_floating_for(wid, &be);
+        let cached = engine.applied_state.get(&wid).unwrap();
+        assert_eq!(cached.rect, Rect::new(0, 0, 0, 0), "the float is not at the tile rect");
+        assert!(cached.visible);
+
+        engine.toggle_floating_for(wid, &be);
+        let cached = engine.applied_state.get(&wid).unwrap();
+        assert_ne!(cached.rect, Rect::new(0, 0, 0, 0), "the layout placed the tile again");
+        assert!(cached.visible);
+    }
+
+    #[test]
+    fn test_focus_float_keeps_the_layout_from_activating_the_tile_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        // The tile 100 holds the engine focus; the user focuses the float.
+        assert!(engine.focus_float(float, &be));
+        // Not the float: the layout pass must find nothing left to activate (it would hand the
+        // foreground to the tile 100 straight away).
+        assert_eq!(
+            engine.last_activated,
+            Some(WindowId::new(100)),
+            "the tile focus counts as already activated"
+        );
+        engine.apply_all(&be);
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+        assert_eq!(engine.os_foreground, Some(float));
+    }
+
+    #[test]
+    fn test_a_floating_window_remembers_where_it_floated() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be);
+        let first = engine.float_homes.get(&wid).unwrap().rect;
+
+        engine.float_move_by(wid, 50, -30, &be);
+        let moved = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!(
+            (moved.loc.x, moved.loc.y),
+            (first.loc.x + 50, first.loc.y - 30)
+        );
+        assert_eq!(moved.size, first.size);
+
+        engine.toggle_floating_for(wid, &be); // back into a column
+        assert!(!engine.is_floating(wid));
+        assert!(!engine.float_homes.contains_key(&wid));
+        engine.toggle_floating_for(wid, &be); // float again
+        assert_eq!(
+            engine.float_homes.get(&wid).unwrap().rect,
+            moved,
+            "it floats where it floated last time"
+        );
+    }
+
+    #[test]
+    fn test_remembered_float_geometry_is_pulled_back_onto_the_monitor() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        // Remembered on a bigger desktop that is gone.
+        engine.float_memory.insert(wid, Rect::new(3000, 2000, 800, 600));
+        engine.toggle_floating_for(wid, &be);
+        let rect = engine.float_homes.get(&wid).unwrap().rect;
+        assert!(rect.loc.x >= 0 && rect.loc.y >= 0);
+        assert!(rect.loc.x + rect.size.w as i32 <= 1920);
+        assert!(rect.loc.y + rect.size.h as i32 <= 1040);
+        assert_eq!(rect.size, Rect::new(0, 0, 800, 600).size);
+    }
+
+    #[test]
+    fn test_float_resize_and_centre_work_on_the_remembered_rectangle() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be);
+        engine.float_resize_by(wid, 100, -50, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!((r.size.w, r.size.h), (900, 550));
+
+        engine.float_set_width_fraction(wid, 0.5, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!(r.size.w, 960);
+
+        engine.float_move_by(wid, -2000, -2000, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!((r.loc.x, r.loc.y), (0, 0), "kept on the work area");
+
+        engine.float_center(wid, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!(r.loc.x, (1920 - 960) / 2);
+        assert_eq!(r.loc.y, (1040 - 550) / 2);
+    }
+
+    #[test]
+    fn test_float_cycle_width_walks_through_a_third_a_half_and_two_thirds() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be); // 800 wide
+        let mut widths = Vec::new();
+        for _ in 0..4 {
+            engine.float_cycle_width(wid, &be);
+            widths.push(engine.float_homes.get(&wid).unwrap().rect.size.w);
+        }
+        // 800 -> a half (960) -> two thirds (1280) -> a third (640) -> a half again.
+        assert_eq!(widths, vec![960, 1280, 640, 960]);
+    }
+
+    #[test]
+    fn test_floating_windows_are_hidden_with_their_workspace_and_shown_with_it() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.apply_all(&be);
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+
+        engine.switch_workspace(crate::layout::workspace_id_from_number(2), &be);
+        assert!(
+            !engine.applied_state.get(&float).unwrap().visible,
+            "left behind on screen when its workspace was left"
+        );
+        assert!(!engine.applied_state.get(&WindowId::new(100)).unwrap().visible);
+
+        engine.switch_workspace(crate::layout::workspace_id_from_number(1), &be);
+        assert!(
+            engine.applied_state.get(&float).unwrap().visible,
+            "back with its workspace"
+        );
+    }
+
+    #[test]
+    fn test_a_floating_window_moved_to_another_workspace_leaves_this_one() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.apply_all(&be);
+        let ws2 = crate::layout::workspace_id_from_number(2);
+
+        assert_eq!(engine.float_workspace(float), Some(0));
+        engine.float_move_to_workspace(float, ws2, &be);
+        assert_eq!(engine.float_homes.get(&float).unwrap().workspace, ws2);
+        assert_eq!(engine.float_workspace(float), Some(ws2));
+        assert_eq!(engine.float_workspace(WindowId::new(100)), None, "a tile");
+        assert!(
+            !engine.applied_state.get(&float).unwrap().visible,
+            "it is hidden on the workspace it left"
+        );
+        assert!(engine.is_floating(float));
+
+        engine.switch_workspace(ws2, &be);
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+        engine.switch_workspace(crate::layout::workspace_id_from_number(1), &be);
+        assert!(!engine.applied_state.get(&float).unwrap().visible);
+    }
+
+    #[test]
+    fn test_a_floating_window_is_tiled_again_on_its_own_workspace() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        let oid = engine.focused_output().unwrap();
+        let ws2 = crate::layout::workspace_id_from_number(2);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_to_workspace(float, ws2, &be);
+
+        // The workspace 1 is active, the float lives on workspace 2: toggling it tiles it
+        // there, not into the strip the user is looking at.
+        engine.toggle_floating_for(float, &be);
+        assert!(!engine.is_floating(float));
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.workspaces.get(&ws2).unwrap().columns.len(), 1);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100]]);
+    }
+
+    #[test]
+    fn test_removing_a_window_forgets_its_floating_state() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_by(float, 10, 10, &be);
+        assert!(engine.float_memory.contains_key(&float));
+
+        engine.remove_window(float, &be);
+        assert!(!engine.is_floating(float));
+        assert!(!engine.float_homes.contains_key(&float));
+        assert!(!engine.float_memory.contains_key(&float));
+        assert_eq!(engine.state_target().map(|t| t.window), Some(WindowId::new(100)));
+    }
+
+    #[test]
+    fn test_a_window_that_floats_by_rule_belongs_to_the_active_workspace() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        let mut rule = crate::config::WindowRule::default();
+        rule.class = Some("TestClass".to_string());
+        rule.floating = true;
+        engine.set_window_rules(vec![rule]);
+        engine.add_window(make_window(200, 500, 400), &be);
+
+        let home = engine.float_homes.get(&WindowId::new(200)).expect("a home");
+        assert_eq!(home.workspace, 0);
+        assert_eq!(Some(home.output), engine.focused_output());
+        assert!(home.rect.loc.x >= 0 && home.rect.loc.y >= 0);
+        assert!(home.rect.loc.x + home.rect.size.w as i32 <= 1920);
+        assert!(home.rect.loc.y + home.rect.size.h as i32 <= 1040);
+    }
+
+    #[test]
+    fn test_focus_float_goes_to_the_workspace_the_window_lives_on() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        let oid = engine.focused_output().unwrap();
+        let ws2 = crate::layout::workspace_id_from_number(2);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_to_workspace(float, ws2, &be);
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace, 0);
+
+        assert!(engine.focus_float(float, &be));
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace, ws2);
+        assert_eq!(engine.os_foreground, Some(float));
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+        // A tile is not a floating window.
+        assert!(!engine.focus_float(WindowId::new(100), &be));
+    }
+
+    #[test]
+    fn test_fullscreen_of_a_floating_window_gives_it_its_rectangle_back() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_by(float, 40, 20, &be);
+        let before = engine.float_homes.get(&float).unwrap().rect;
+
+        engine.toggle_fullscreen_for(float, &be);
+        assert!(engine.is_fullscreen(float));
+        assert!(engine.is_floating(float), "still a floating window");
+        engine.toggle_fullscreen_for(float, &be);
+        assert!(!engine.is_fullscreen(float));
+        assert_eq!(engine.float_homes.get(&float).unwrap().rect, before);
+    }
+
+    #[test]
+    fn test_toggle_fullscreen_for_acts_on_the_given_window_not_the_focused_one() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+        engine.toggle_fullscreen_for(WindowId::new(100), &be);
+        assert!(engine.is_fullscreen(WindowId::new(100)));
+        assert!(!engine.is_fullscreen(WindowId::new(101)));
     }
 
     #[test]

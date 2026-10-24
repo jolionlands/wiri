@@ -264,6 +264,17 @@ enum Commands {
     /// Focus the previous workspace
     FocusWorkspacePrevious,
 
+    /// Run any action by its niri name, as if its key were pressed:
+    /// `wiri-ctl action focus-column-left`, `wiri-ctl action set-column-width +10%`,
+    /// `wiri-ctl action focus-workspace 2`.
+    Action {
+        /// Action name, e.g. close-window, consume-or-expel-window-left
+        name: String,
+        /// The words that follow the action name in a `binds {}` line
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Spawn a program: `wiri-ctl spawn wt.exe -d "C:\My Projects"`. The
     /// arguments are passed through intact; with none, the program may also be
     /// a whole quoted command line (`wiri-ctl spawn 'wt.exe -d "C:\x y"'`).
@@ -521,6 +532,7 @@ fn real_main() -> Result<()> {
         Commands::FocusWorkspaceNext => IpcMessage::FocusWorkspaceNext,
         Commands::FocusWorkspacePrevious => IpcMessage::FocusWorkspacePrevious,
         Commands::Spawn { command, args } => IpcMessage::SpawnCommand { command, args },
+        Commands::Action { name, args } => IpcMessage::RunAction { name, args },
         Commands::FocusPrevious => IpcMessage::FocusPrevious,
         Commands::ToggleAlwaysOnTop => IpcMessage::ToggleAlwaysOnTop,
         Commands::FocusWorkspaceNamed { name } => IpcMessage::FocusWorkspaceNamed { name },

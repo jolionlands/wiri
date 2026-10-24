@@ -8,7 +8,8 @@
 #          windows are still hidden, start wiri again, check they come back.
 # Phase G  real key presses: Escape reaches applications, Escape leaves overview without freezing wiri,
 #          Ctrl+Alt+2 / Ctrl+Alt+1 hide and show the windows.
-# Phase H  Phase 1 scenarios, each under a config of its own (wiri is restarted for every one).
+# Phase H  Phase 1 scenarios, each under a config of its own (wiri is restarted for every one):
+#          H1 modifiers, H2 spawn, H3 actions follow the real foreground window (floats, dialogs).
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -141,6 +142,48 @@ public static class TestForms {
     t.SetApartmentState(ApartmentState.STA);
     t.IsBackground = true;
     t.Start();
+    ready.WaitOne(15000);
+    return handle;
+  }
+  // A tool window (WS_EX_TOOLWINDOW): a window wiri does not manage.
+  public static IntPtr OpenTool(string title) {
+    IntPtr handle = IntPtr.Zero;
+    var ready = new ManualResetEvent(false);
+    var t = new Thread(delegate() {
+      var f = new Form();
+      f.Text = title; f.Width = 520; f.Height = 380;
+      f.FormBorderStyle = FormBorderStyle.FixedToolWindow;
+      f.ShowInTaskbar = false;
+      f.BackColor = Color.FromArgb(170, 130, 20);
+      f.StartPosition = FormStartPosition.Manual;
+      f.Location = new Point(200, 120);
+      f.Shown += delegate(object s, EventArgs e) { handle = f.Handle; ready.Set(); };
+      lock (forms) { forms.Add(f); }
+      Application.Run(f);
+    });
+    t.SetApartmentState(ApartmentState.STA);
+    t.IsBackground = true;
+    t.Start();
+    ready.WaitOne(15000);
+    return handle;
+  }
+  // A dialog owned by the form `owner` (an owned top-level window, like an "Open file" box).
+  public static IntPtr OpenOwned(IntPtr owner, string title) {
+    IntPtr handle = IntPtr.Zero;
+    var ready = new ManualResetEvent(false);
+    Form ownerForm = null;
+    lock (forms) { foreach (var f in forms) { if (f.IsHandleCreated && f.Handle == owner) { ownerForm = f; } } }
+    if (ownerForm == null) { return IntPtr.Zero; }
+    ownerForm.BeginInvoke((MethodInvoker)delegate() {
+      var d = new Form();
+      d.Text = title; d.Width = 300; d.Height = 200;
+      d.ShowInTaskbar = false;
+      d.StartPosition = FormStartPosition.CenterParent;
+      d.BackColor = Color.FromArgb(200, 200, 200);
+      d.Shown += delegate(object s, EventArgs e) { handle = d.Handle; ready.Set(); };
+      lock (forms) { forms.Add(d); }
+      d.Show(ownerForm);
+    });
     ready.WaitOne(15000);
     return handle;
   }
@@ -384,7 +427,8 @@ Start-Sleep -Seconds 1
 # ---- Phase G: real key presses (RegisterHotKey + the keyboard hook) --------------------------------
 $vk = @{
     ctrl = 0x11; alt = 0x12; shift = 0x10; esc = 0x1B; space = 0x20; 'return' = 0x0D
-    '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; a = 0x41; q = 0x51; t = 0x54
+    '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; a = 0x41; f = 0x46; q = 0x51; t = 0x54
+    left = 0x25; right = 0x27
     f6 = 0x75; f7 = 0x76; f8 = 0x77; f9 = 0x78
 }
 function Chord([string]$spec) {
@@ -558,6 +602,116 @@ if ($wtWin) { [LT]::Close($wtWin) }
 Start-Sleep -Seconds 2
 $w = $w4
 
+# ---- H3: actions act on the window the user is looking at - a floating one included, a dialog's owner, never a guess ----
+# The visible rectangle of a window as a small object, and "within tol pixels".
+function Rc($h) { $v = [LT]::Visible($h); return [pscustomobject]@{ L = $v.L; T = $v.T; R = $v.R; B = $v.B; W = ($v.R - $v.L); H = ($v.B - $v.T) } }
+function Near([double]$a, [double]$b, [double]$tol) { return ([Math]::Abs($a - $b) -le $tol) }
+function AliveCount($hwnds) { @($hwnds | Where-Object { [LT]::IsWindow($_) }).Count }
+$log5 = Join-Path $D 'wiri.stderr5.log'
+$h3Config = @"
+input {
+    mod-key "ctrl-alt"
+}
+"@
+Stop-WiriGracefully $w 'h3'
+$w5 = Start-WiriWithConfig $h3Config $log5
+$w = $w5
+$scr = [System.Windows.Forms.Screen]::PrimaryScreen
+$sb = $scr.Bounds
+$swa = $scr.WorkingArea
+
+# The windows wiri manages, as `wiri-ctl --json windows` reports them (hwnd, workspace, floating).
+function WinList([string]$tag) {
+    $raw = Ctl $tag @('--json', 'windows')
+    try { return @(($raw | ConvertFrom-Json).result) } catch { return @() }
+}
+function WinOf($list, $hwnd) { return (@($list | Where-Object { [int64]$_.hwnd -eq [int64]$hwnd }) | Select-Object -First 1) }
+
+# (a) a floating window that has the keyboard focus is what toggle-floating, move, fullscreen and close act on -
+# the engine's own focus is a tile behind it.
+$fa = [TestForms]::Open('wiri-h3-float', 90, 40, 140)
+Start-Sleep -Seconds 2
+$list0 = WinList 'h3-windows-before'
+$floatsBefore = @($list0 | Where-Object { $_.floating -eq $true }).Count
+Chord 'ctrl+alt+t'; Start-Sleep -Milliseconds 1800
+$h3FloatKeepsForeground = ([LT]::GetForegroundWindow() -eq $fa)
+$r1 = Rc $fa
+$init = [TestForms]::Initial['wiri-h3-float']
+$h3FloatOwnSize = (Near $r1.W ($init.R - $init.L) 24) -and (Near $r1.H ($init.B - $init.T) 24)
+$h3FloatCentered = (Near (($r1.L + $r1.R) / 2) (($swa.Left + $swa.Right) / 2) 10) -and (Near (($r1.T + $r1.B) / 2) (($swa.Top + $swa.Bottom) / 2) 10)
+$list1 = WinList 'h3-windows-floated'
+$h3ReportedFloating = ((WinOf $list1 $fa).floating -eq $true)
+Shot 'h3-01-floated'
+
+# A second press puts the SAME window back into the strip (it used to float the next tile as well).
+Chord 'ctrl+alt+t'; Start-Sleep -Milliseconds 1800
+$list2 = WinList 'h3-windows-tiled-again'
+$h3SecondPressTiles = ((WinOf $list2 $fa).floating -eq $false)
+$h3SecondPressFloatsNothingElse = (@($list2 | Where-Object { $_.floating -eq $true }).Count -eq $floatsBefore)
+$rt = Rc $fa
+$h3TiledAgainHasColumnHeight = ($rt.H -gt $r1.H + 40)
+Shot 'h3-02-tiled-again'
+# ... and the third press floats it again exactly where it floated before (remembered geometry).
+Chord 'ctrl+alt+t'; Start-Sleep -Milliseconds 1800
+$r1b = Rc $fa
+$h3FloatGeometryRemembered = (Near $r1b.L $r1.L 4) -and (Near $r1b.T $r1.T 4) -and (Near $r1b.W $r1.W 4) -and (Near $r1b.H $r1.H 4)
+$h3ForegroundAfterThirdPress = ([LT]::GetForegroundWindow() -eq $fa)
+
+Chord 'ctrl+alt+shift+left'; Start-Sleep -Milliseconds 1200
+$r2 = Rc $fa
+$h3FloatNudged = (Near ($r2.L - $r1b.L) (-50) 4) -and (Near $r2.T $r1b.T 4) -and (Near $r2.W $r1b.W 4) -and (Near $r2.H $r1b.H 4)
+Chord 'ctrl+alt+f'; Start-Sleep -Milliseconds 1800
+$r3 = Rc $fa
+Shot 'h3-03-float-fullscreen'
+$h3FullscreenCovers = ($r3.L -le $sb.Left + 1) -and ($r3.T -le $sb.Top + 1) -and ($r3.R -ge $sb.Right - 1) -and ($r3.B -ge $sb.Bottom - 1)
+$h3FullscreenOthers = @($forms | Where-Object { [LT]::IsWindow($_) } | Where-Object { $v = Rc $_; ($v.W -ge $sb.Width - 40) -and ($v.H -ge $sb.Height - 40) }).Count
+Chord 'ctrl+alt+f'; Start-Sleep -Milliseconds 1800
+$r4 = Rc $fa
+Shot 'h3-04-float-fullscreen-left'
+$h3FullscreenRestores = (Near $r4.L $r2.L 4) -and (Near $r4.T $r2.T 4) -and (Near $r4.W $r2.W 4) -and (Near $r4.H $r2.H 4)
+
+# IPC focus-window raises a floating window (it used to answer "ok" and do nothing), tiles still get it too.
+$null = Ctl 'h3-ipc-focus-tile' @('focus-window', [string][int64]$forms[0])
+Start-Sleep -Milliseconds 1500
+$h3IpcFocusTile = ([LT]::GetForegroundWindow() -eq $forms[0])
+$null = Ctl 'h3-ipc-focus-float' @('focus-window', [string][int64]$fa)
+Start-Sleep -Milliseconds 1500
+$h3IpcFocusFloat = ([LT]::GetForegroundWindow() -eq $fa)
+
+# The same through IPC: `wiri-ctl action center-window` acts on the foreground floating window.
+$null = Ctl 'h3-ipc-center' @('action', 'center-window')
+Start-Sleep -Milliseconds 1200
+$r5 = Rc $fa
+$h3IpcCenters = (Near (($r5.L + $r5.R) / 2) (($swa.Left + $swa.Right) / 2) 6) -and (Near (($r5.T + $r5.B) / 2) (($swa.Top + $swa.Bottom) / 2) 6) -and (Near $r5.W $r4.W 4)
+$tilesBefore = AliveCount $forms
+Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 2000
+$h3FloatClosed = -not [LT]::IsWindow($fa)
+$h3TilesSurviveFloatClose = ((AliveCount $forms) -eq $tilesBefore)
+Shot 'h3-05-float-closed'
+
+# (b) a dialog has the focus: close-window closes the dialog, not the application window that owns it.
+$fb = [TestForms]::Open('wiri-h3-owner', 140, 90, 40)
+Start-Sleep -Seconds 2
+$dlg = [TestForms]::OpenOwned($fb, 'wiri-h3-dialog')
+Start-Sleep -Milliseconds 1500
+$h3DialogForeground = ($dlg -ne [IntPtr]::Zero) -and ([LT]::GetForegroundWindow() -eq $dlg)
+Shot 'h3-06-dialog'
+Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 2000
+$h3DialogClosed = ($dlg -ne [IntPtr]::Zero) -and -not [LT]::IsWindow($dlg)
+$h3OwnerSurvives = [LT]::IsWindow($fb)
+
+# (c) an unmanaged window (a tool window) has the focus: close-window must not guess and close a tile behind it.
+$tool = [TestForms]::OpenTool('wiri-h3-tool')
+Start-Sleep -Milliseconds 1500
+$h3ToolForeground = ([LT]::GetForegroundWindow() -eq $tool)
+$aliveBefore = AliveCount (@($forms) + @($fb, $tool))
+Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 2000
+$h3CloseRefusedOnUnmanaged = ((AliveCount (@($forms) + @($fb, $tool))) -eq $aliveBefore)
+Shot 'h3-07-unmanaged-foreground'
+[TestForms]::CloseForm($tool)
+[TestForms]::CloseForm($fb)
+Start-Sleep -Milliseconds 1200
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -658,6 +812,29 @@ $summary = [ordered]@{
     h2_ipc_args_ok = $spawnIpcArgsOk
     h2_ipc_command_line_with_spaced_program_ok = $spawnIpcLineOk
     h2_wt_exe_found_on_path = $spawnWtWindow
+    # --- Phase 1 / H3: actions target the real foreground window
+    h3_float_keeps_foreground = $h3FloatKeepsForeground
+    h3_float_reported_floating = $h3ReportedFloating
+    h3_second_press_tiles_the_same_window = $h3SecondPressTiles
+    h3_second_press_floats_nothing_else = $h3SecondPressFloatsNothingElse
+    h3_tiled_again_has_column_height = $h3TiledAgainHasColumnHeight
+    h3_float_geometry_remembered = $h3FloatGeometryRemembered
+    h3_float_keeps_foreground_after_retoggle = $h3ForegroundAfterThirdPress
+    h3_float_keeps_own_size = $h3FloatOwnSize
+    h3_float_is_centered = $h3FloatCentered
+    h3_move_nudges_float_50px = $h3FloatNudged
+    h3_fullscreen_covers_monitor = $h3FullscreenCovers
+    h3_fullscreen_only_the_float = ($h3FullscreenOthers -eq 0)
+    h3_fullscreen_exit_restores_float = $h3FullscreenRestores
+    h3_ipc_focus_window_tile = $h3IpcFocusTile
+    h3_ipc_focus_window_float = $h3IpcFocusFloat
+    h3_ipc_action_centers_float = $h3IpcCenters
+    h3_close_closes_the_float = $h3FloatClosed
+    h3_tiles_survive_float_close = $h3TilesSurviveFloatClose
+    h3_dialog_was_foreground = $h3DialogForeground
+    h3_close_hits_dialog_not_owner = ($h3DialogClosed -and $h3OwnerSurvives)
+    h3_tool_window_was_foreground = $h3ToolForeground
+    h3_close_refuses_unmanaged_foreground = $h3CloseRefusedOnUnmanaged
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

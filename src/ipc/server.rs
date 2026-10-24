@@ -466,6 +466,32 @@ impl IpcServer {
                 }
                 serde_json::json!({"success": true})
             }
+            IpcMessage::RunAction { name, args } => {
+                info!("IPC: RunAction {} {:?}", name, args);
+                let Some(action) = crate::input::parse_action_name(&name, &args) else {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": format!("unknown action or bad arguments: {} {:?}", name, args)
+                    });
+                };
+                if matches!(action, crate::input::Action::Quit) {
+                    return self.process_message(IpcMessage::Quit);
+                }
+                match (&self.engine, &self.backend) {
+                    (Some(engine), Some(backend)) => {
+                        // No quit channel: `quit` is handled above.
+                        let no_quit = Arc::new(parking_lot::Mutex::new(None));
+                        crate::backend::message_loop::perform_action(
+                            &action, engine, backend, &no_quit,
+                        );
+                        serde_json::json!({"success": true})
+                    }
+                    _ => serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    }),
+                }
+            }
             IpcMessage::SubscribeEvents { event_types } => {
                 info!("IPC: Subscribe to events: {:?}", event_types);
                 serde_json::json!({"success": true, "subscription_id": 1})
@@ -546,7 +572,7 @@ impl IpcServer {
                         // Un-float if floating.
                         let wid = crate::utils::WindowId::new(window_hwnd);
                         if engine.read().is_floating(wid) {
-                            engine.write().toggle_floating(backend);
+                            engine.write().toggle_floating_for(wid, backend);
                         }
                         // Optional workspace move (by name or numeric id).
                         if let Some(name) = target_workspace.as_deref() {
@@ -588,10 +614,13 @@ impl IpcServer {
                                 "error": format!("Unknown tiled window: hwnd={}", window_hwnd)
                             });
                         }
-                        engine.write().move_window_to_workspace(
-                            crate::layout::workspace_id_from_number(workspace_id),
-                            backend,
-                        );
+                        let wid = crate::utils::WindowId::new(window_hwnd);
+                        let workspace = crate::layout::workspace_id_from_number(workspace_id);
+                        if engine.read().is_floating(wid) {
+                            engine.write().float_move_to_workspace(wid, workspace, backend);
+                        } else {
+                            engine.write().move_window_to_workspace(workspace, backend);
+                        }
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
@@ -614,7 +643,7 @@ impl IpcServer {
                         let wid = crate::utils::WindowId::new(window_hwnd);
                         // Only toggle if not already floating, so this is idempotent.
                         if !engine.read().is_floating(wid) {
-                            engine.write().toggle_floating(backend);
+                            engine.write().toggle_floating_for(wid, backend);
                         }
                         serde_json::json!({"success": true, "floating": true})
                     }
@@ -636,7 +665,7 @@ impl IpcServer {
                         }
                         let wid = crate::utils::WindowId::new(window_hwnd);
                         if engine.read().is_floating(wid) {
-                            engine.write().toggle_floating(backend);
+                            engine.write().toggle_floating_for(wid, backend);
                         }
                         serde_json::json!({"success": true, "floating": false})
                     }
@@ -1553,7 +1582,12 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
             "y": info.bounds.loc.y,
             "width": info.bounds.size.w,
             "height": info.bounds.size.h,
-            "workspace": ws_of.get(wid).copied().map(crate::layout::workspace_number),
+            // A floating window is in no column; it belongs to the workspace it floats on.
+            "workspace": ws_of
+                .get(wid)
+                .copied()
+                .or_else(|| eng.float_workspace(*wid))
+                .map(crate::layout::workspace_number),
             "floating": eng.is_floating(*wid),
         }));
     }
@@ -1616,8 +1650,11 @@ fn focus_window_by_hwnd(
     };
 
     let Some((oid, ws_id, col_idx)) = location else {
-        // Window is registered (e.g. floating) but not in any workspace column —
-        // still treat as "focusable" by raising it; the engine will reconcile.
+        // Registered but not in any column: a floating window (focused here, on its
+        // own workspace) or one that is minimized.
+        if engine.write().focus_float(wid, backend) {
+            engine.write().apply_all(backend);
+        }
         return true;
     };
 

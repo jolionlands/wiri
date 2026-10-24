@@ -430,6 +430,7 @@ Set the active workspace's layout mode.
 | `reload_config` | — | Hot-reload config.kdl |
 | `quit` | — | Gracefully shut down the wiri daemon |
 | `spawn_command` | `command: string`, `args?: string[]` | Spawn an external process; with `args` the arguments are passed intact, without it `command` is split like a Windows command line (quoted paths with spaces work) and the program is searched on PATH |
+| `run_action` | `name: string`, `args?: string[]` | Run any action by its niri name as if its key were pressed (`wiri-ctl action focus-column-left`, `wiri-ctl action set-column-width +10%`); `args` are the words after the action name in a `binds {}` line |
 | `list_bindings` | — | List all registered Win32 hotkey bindings (raw: id, modifiers, vk_code) |
 | `get_bindings` | — | List bindings as human-readable `chord + action` table |
 | `set_auto_tile_threshold` | `threshold: usize \| null` | Window count above which auto-tile activates; null = disabled |

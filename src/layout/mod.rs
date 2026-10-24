@@ -7,6 +7,7 @@ pub mod workspace;
 
 pub use animation::{Animation, AnimationManager, AnimationTarget, Easing};
 pub use engine::AddWindowTarget;
+pub use engine::{query_foreground, ActionTarget, ForegroundWindow};
 pub use engine::ColumnWidthMode;
 pub use engine::ColumnWidthPreset;
 pub use engine::LayoutConfig;

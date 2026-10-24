@@ -487,6 +487,23 @@
         },
 
         {
+          "description": "Run any action by its niri name, as if its key were pressed.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "run_action" },
+            "data": {
+              "type": "object",
+              "required": ["name"],
+              "properties": {
+                "name": { "type": "string", "description": "Action name, e.g. focus-column-left." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "The words after the action name in a binds line. Optional." }
+              }
+            }
+          }
+        },
+
+        {
           "description": "Focus the previously focused window (MRU history).",
           "type": "object",
           "required": ["type"],
