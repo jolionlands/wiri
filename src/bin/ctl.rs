@@ -15,6 +15,120 @@ use windows::Win32::System::Pipes::WaitNamedPipeW;
 
 use wiri::ipc::{IpcMessage, PIPE_PATH};
 
+// ---------------------------------------------------------------------------
+// Console-safe output
+//
+// The tables use box-drawing characters and `…` / `→` / `—`.  When stdout is a
+// real console Rust writes UTF-16 and they render fine.  When stdout is a pipe
+// or a file (PowerShell decodes native-command output with the console's *OEM*
+// code page, usually 437) the same UTF-8 bytes come out as `ΓöÇ`.  So output
+// that is not going to a console is folded to plain ASCII; set
+// `WIRI_UNICODE=1` to keep Unicode anyway, `WIRI_ASCII=1` to force ASCII.
+// `--json` output is untouched.
+// ---------------------------------------------------------------------------
+
+/// Replace the decorative non-ASCII characters of the human-readable output
+/// with ASCII look-alikes, and any other non-ASCII character with `?`.
+fn fold_to_ascii(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            c if c.is_ascii() => out.push(c),
+            '─' | '━' | '═' | '—' | '–' | '‒' => out.push('-'),
+            '│' | '┃' | '║' | '¦' => out.push('|'),
+            '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' | '╔' | '╗' | '╚' | '╝' => {
+                out.push('+')
+            }
+            '…' => out.push_str("..."),
+            '→' => out.push_str("->"),
+            '←' => out.push_str("<-"),
+            '↑' => out.push('^'),
+            '↓' => out.push('v'),
+            '•' | '·' => out.push('*'),
+            '✓' => out.push_str("ok"),
+            '‘' | '’' => out.push('\''),
+            '“' | '”' => out.push('"'),
+            _ => out.push('?'),
+        }
+    }
+    out
+}
+
+/// Is the given standard stream attached to a console (as opposed to a pipe or
+/// a file)?
+fn is_console(std_handle: windows::Win32::System::Console::STD_HANDLE) -> bool {
+    use windows::Win32::System::Console::{GetConsoleMode, GetStdHandle, CONSOLE_MODE};
+    unsafe {
+        match GetStdHandle(std_handle) {
+            Ok(handle) => {
+                let mut mode = CONSOLE_MODE(0);
+                GetConsoleMode(handle, &mut mode).is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Whether human-readable output must be folded to ASCII for this stream.
+fn ascii_only(to_stderr: bool) -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    static FORCED: OnceLock<Option<bool>> = OnceLock::new();
+    let forced = FORCED.get_or_init(|| {
+        let on = |name: &str| {
+            std::env::var(name)
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false)
+        };
+        if on("WIRI_UNICODE") {
+            Some(false)
+        } else if on("WIRI_ASCII") {
+            Some(true)
+        } else {
+            None
+        }
+    });
+    match forced {
+        Some(v) => *v,
+        None => !is_console(if to_stderr {
+            STD_ERROR_HANDLE
+        } else {
+            STD_OUTPUT_HANDLE
+        }),
+    }
+}
+
+fn print_line(to_stderr: bool, text: String) {
+    let text = if ascii_only(to_stderr) {
+        fold_to_ascii(&text)
+    } else {
+        text
+    };
+    if to_stderr {
+        eprintln!("{}", text);
+    } else {
+        println!("{}", text);
+    }
+}
+
+macro_rules! outln {
+    () => {
+        println!()
+    };
+    ($($arg:tt)*) => {
+        print_line(false, format!($($arg)*))
+    };
+}
+
+macro_rules! errln {
+    () => {
+        eprintln!()
+    };
+    ($($arg:tt)*) => {
+        print_line(true, format!($($arg)*))
+    };
+}
+
 /// Build version string. The optional build script (`build.rs`) sets
 /// `WIRI_GIT_HASH` to the short commit hash when available; otherwise we just
 /// render the crate version from Cargo.toml.
@@ -320,7 +434,14 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = real_main() {
+        errln!("Error: {:#}", error);
+        std::process::exit(1);
+    }
+}
+
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     // SubscribeEvents has bespoke streaming behaviour — handle it before the
@@ -488,7 +609,7 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
     let resolved = match resolve_config_path(path) {
         Some(p) => p,
         None => {
-            eprintln!(
+            errln!(
                 "error: no config file found. Set WIRI_CONFIG or create %APPDATA%\\wiri\\config.kdl"
             );
             std::process::exit(1);
@@ -498,7 +619,7 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
     let content = match std::fs::read_to_string(&resolved) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: could not read {}: {}", resolved.display(), e);
+            errln!("error: could not read {}: {}", resolved.display(), e);
             std::process::exit(1);
         }
     };
@@ -535,13 +656,13 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
     } else {
         let path_str = resolved.display();
         if issues.is_empty() {
-            println!("{}: ok (no issues)", path_str);
+            outln!("{}: ok (no issues)", path_str);
         } else {
             for issue in &issues {
                 // Format mirrors common compiler output: `path:line:col: sev: msg`.
-                println!("{}:{}", path_str, issue);
+                outln!("{}:{}", path_str, issue);
             }
-            println!(
+            outln!(
                 "{}: {} error(s), {} warning(s)",
                 path_str, error_count, warning_count
             );
@@ -567,23 +688,23 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown error");
-        eprintln!("error: {}", err);
+        errln!("error: {}", err);
         std::process::exit(1);
     }
 
     match req {
         IpcMessage::GetState => print_state(resp),
         IpcMessage::WindowList => print_window_list(resp),
-        IpcMessage::ReloadConfig => println!("Configuration reloaded."),
-        IpcMessage::Quit => println!("Shutdown request sent to wiri."),
+        IpcMessage::ReloadConfig => outln!("Configuration reloaded."),
+        IpcMessage::Quit => outln!("Shutdown request sent to wiri."),
         IpcMessage::SwitchWorkspace { id } => {
-            println!("Switched to workspace {}.", id);
+            outln!("Switched to workspace {}.", id);
         }
         IpcMessage::FocusWindow { window_hwnd } => {
-            println!("Focused window {} (0x{:x}).", window_hwnd, *window_hwnd);
+            outln!("Focused window {} (0x{:x}).", window_hwnd, *window_hwnd);
         }
         IpcMessage::CloseWindow { window_hwnd } => {
-            println!(
+            outln!(
                 "Close request sent to window {} (0x{:x}).",
                 window_hwnd, *window_hwnd
             );
@@ -591,24 +712,24 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
         IpcMessage::SpawnCommand { command } => {
             let pid = resp.get("pid").and_then(|v| v.as_u64());
             match pid {
-                Some(p) => println!("Spawned '{}'  (pid: {}).", command, p),
-                None => println!("Spawned '{}'.", command),
+                Some(p) => outln!("Spawned '{}'  (pid: {}).", command, p),
+                None => outln!("Spawned '{}'.", command),
             }
         }
         IpcMessage::WindowFloat { window_hwnd } => {
-            println!("Window {} is now floating.", window_hwnd);
+            outln!("Window {} is now floating.", window_hwnd);
         }
         IpcMessage::WindowUnfloat { window_hwnd } => {
-            println!("Window {} is now tiled.", window_hwnd);
+            outln!("Window {} is now tiled.", window_hwnd);
         }
         IpcMessage::TileRequest { window_hwnd, .. } => {
-            println!("Tile request queued for window {}.", window_hwnd);
+            outln!("Tile request queued for window {}.", window_hwnd);
         }
         IpcMessage::WindowMoveToWorkspace {
             window_hwnd,
             workspace_id,
         } => {
-            println!(
+            outln!(
                 "Moved window {} to workspace {}.",
                 window_hwnd, workspace_id
             );
@@ -621,7 +742,7 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 .and_then(|r| r.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("<unknown>");
-            println!("Captured window {} → {}", window_hwnd, path);
+            outln!("Captured window {} → {}", window_hwnd, path);
         }
         IpcMessage::SaveSnapshot { name } => {
             let path = resp
@@ -629,7 +750,7 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 .and_then(|r| r.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("<unknown>");
-            println!("Saved snapshot '{}' → {}", name, path);
+            outln!("Saved snapshot '{}' → {}", name, path);
         }
         IpcMessage::LoadSnapshot { name } => {
             let monitors = resp
@@ -637,7 +758,7 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 .and_then(|r| r.get("monitors"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            println!("Restored snapshot '{}' ({} monitor(s)).", name, monitors);
+            outln!("Restored snapshot '{}' ({} monitor(s)).", name, monitors);
         }
         IpcMessage::ListSnapshots => {
             let names = resp
@@ -647,19 +768,19 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 .cloned()
                 .unwrap_or_default();
             if names.is_empty() {
-                println!("No saved snapshots.");
+                outln!("No saved snapshots.");
             } else {
                 for n in &names {
                     if let Some(s) = n.as_str() {
-                        println!("  {}", s);
+                        outln!("  {}", s);
                     }
                 }
-                println!();
-                println!("  {} snapshot(s)", names.len());
+                outln!();
+                outln!("  {} snapshot(s)", names.len());
             }
         }
         IpcMessage::DeleteSnapshot { name } => {
-            println!("Deleted snapshot '{}'.", name);
+            outln!("Deleted snapshot '{}'.", name);
         }
         IpcMessage::ToggleResizeMode => {
             let active = resp
@@ -668,25 +789,25 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if active {
-                println!("Resize mode: ON (Mod+Arrow grows/shrinks; Esc exits)");
+                outln!("Resize mode: ON (Mod+Arrow grows/shrinks; Esc exits)");
             } else {
-                println!("Resize mode: OFF");
+                outln!("Resize mode: OFF");
             }
         }
         IpcMessage::GetBindings => print_bindings_table(resp),
         IpcMessage::ReserveArea { side, pixels, .. } => {
             if *pixels == 0 {
-                println!("Released {} reservation.", side);
+                outln!("Released {} reservation.", side);
             } else {
-                println!("Reserved {} px on the {} edge.", pixels, side);
+                outln!("Reserved {} px on the {} edge.", pixels, side);
             }
         }
         _ => {
             // Generic: report success with a hint when present.
             if let Some(note) = resp.get("note").and_then(|v| v.as_str()) {
-                println!("ok ({})", note);
+                outln!("ok ({})", note);
             } else {
-                println!("ok");
+                outln!("ok");
             }
         }
     }
@@ -713,20 +834,20 @@ fn print_state(resp: &serde_json::Value) {
     let total_windows = windows.len();
     let total_workspaces = workspaces.len();
 
-    println!("wiri state");
-    println!("──────────");
-    println!("  monitors / workspaces : {}", total_workspaces);
-    println!("  managed windows       : {}", total_windows);
-    println!("  active workspace      : {}", active);
+    outln!("wiri state");
+    outln!("──────────");
+    outln!("  monitors / workspaces : {}", total_workspaces);
+    outln!("  managed windows       : {}", total_windows);
+    outln!("  active workspace      : {}", active);
 
     if !workspaces.is_empty() {
-        println!();
-        println!("  workspace             windows");
-        println!("  ────────────────────  ───────");
+        outln!();
+        outln!("  workspace             windows");
+        outln!("  ────────────────────  ───────");
         for ws in &workspaces {
             let name = ws.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             let count = ws.get("window_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            println!("  {:<20}  {:>7}", truncate(name, 20), count);
+            outln!("  {:<20}  {:>7}", truncate(name, 20), count);
         }
     }
 }
@@ -739,7 +860,7 @@ fn print_window_list(resp: &serde_json::Value) {
         .cloned()
         .unwrap_or_default();
     if result.is_empty() {
-        println!("No managed windows.");
+        outln!("No managed windows.");
         return;
     }
 
@@ -748,11 +869,11 @@ fn print_window_list(resp: &serde_json::Value) {
     let prefix_cols = 12 + 8 + 22 + 6 + 4; // hwnd | pid | class | ws | spaces
     let title_w = term_cols.saturating_sub(prefix_cols).max(20);
 
-    println!(
+    outln!(
         "  {:>10}  {:>6}  {:<20}  {:<3}  {}",
         "HWND", "PID", "CLASS", "WS", "TITLE"
     );
-    println!(
+    outln!(
         "  {:>10}  {:>6}  {:<20}  {:<3}  {}",
         "─".repeat(10),
         "─".repeat(6),
@@ -772,7 +893,7 @@ fn print_window_list(resp: &serde_json::Value) {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "-".to_string());
 
-        println!(
+        outln!(
             "  {:>10}  {:>6}  {:<20}  {:<3}  {}",
             hwnd,
             pid,
@@ -781,8 +902,8 @@ fn print_window_list(resp: &serde_json::Value) {
             truncate(title, title_w)
         );
     }
-    println!();
-    println!(
+    outln!();
+    outln!(
         "  {} window{}",
         result.len(),
         if result.len() == 1 { "" } else { "s" }
@@ -798,15 +919,15 @@ fn print_monitor_list(resp: &serde_json::Value) {
         .cloned()
         .unwrap_or_default();
     if result.is_empty() {
-        println!("No monitors registered with the running wiri.");
+        outln!("No monitors registered with the running wiri.");
         return;
     }
 
-    println!(
+    outln!(
         "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {}",
         "F", "BOUNDS (x,y wxh)", "DPI", "WS", "WIN", "ID", "WORK AREA (x,y wxh)"
     );
-    println!(
+    outln!(
         "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {}",
         "─".repeat(3),
         "─".repeat(18),
@@ -844,7 +965,7 @@ fn print_monitor_list(resp: &serde_json::Value) {
         let id = m.get("output_id").and_then(|v| v.as_u64()).unwrap_or(0);
         let focused = m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        println!(
+        outln!(
             "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5x}  {}",
             if focused { "*" } else { " " },
             format!("{},{} {}x{}", bx, by, bw, bh),
@@ -856,8 +977,8 @@ fn print_monitor_list(resp: &serde_json::Value) {
         );
     }
 
-    println!();
-    println!(
+    outln!();
+    outln!(
         "  {} monitor{}  (* = focused output)",
         result.len(),
         if result.len() == 1 { "" } else { "s" }
@@ -875,17 +996,17 @@ fn print_bindings(resp: &serde_json::Value) {
         .cloned()
         .unwrap_or_default();
     if bindings.is_empty() {
-        println!("No hotkey bindings registered.");
-        println!("If the daemon just started, try again in a moment; otherwise");
-        println!("check the logs for `RegisterHotKey` failures.");
+        outln!("No hotkey bindings registered.");
+        outln!("If the daemon just started, try again in a moment; otherwise");
+        outln!("check the logs for `RegisterHotKey` failures.");
         return;
     }
 
-    println!(
+    outln!(
         "  {:<5}  {:<28}  {:<7}  {:<5}  {}",
         "ID", "CHORD", "MODS", "VK", "ACTION"
     );
-    println!(
+    outln!(
         "  {:<5}  {:<28}  {:<7}  {:<5}  {}",
         "─".repeat(5),
         "─".repeat(28),
@@ -900,7 +1021,7 @@ fn print_bindings(resp: &serde_json::Value) {
         let mods = b.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
         let vk = b.get("vk_code").and_then(|v| v.as_u64()).unwrap_or(0);
         let action = b.get("action").and_then(|v| v.as_str()).unwrap_or("?");
-        println!(
+        outln!(
             "  {:<5}  {:<28}  0x{:04X}   0x{:02X}   {}",
             id,
             truncate(chord, 28),
@@ -910,13 +1031,13 @@ fn print_bindings(resp: &serde_json::Value) {
         );
     }
 
-    println!();
-    println!(
+    outln!();
+    outln!(
         "  {} binding{} registered.  See `docs/TROUBLESHOOTING.md` for known",
         bindings.len(),
         if bindings.len() == 1 { "" } else { "s" }
     );
-    println!("  Windows hotkey conflicts that may swallow your chord.");
+    outln!("  Windows hotkey conflicts that may swallow your chord.");
 }
 
 /// Format the response to `GetBindings` (`wiri-ctl bindings`) as a
@@ -930,11 +1051,11 @@ fn print_bindings_table(resp: &serde_json::Value) {
         .unwrap_or_default();
 
     if entries.is_empty() {
-        println!("No live bindings reported by the daemon.");
-        println!("(Hotkey thread may not have started yet — try again in a moment.)");
-        println!();
-        println!("Default bindings (Ctrl+Alt prefix):");
-        println!();
+        outln!("No live bindings reported by the daemon.");
+        outln!("(Hotkey thread may not have started yet — try again in a moment.)");
+        outln!();
+        outln!("Default bindings (Ctrl+Alt prefix):");
+        outln!();
         print_default_bindings_table();
         return;
     }
@@ -942,8 +1063,8 @@ fn print_bindings_table(resp: &serde_json::Value) {
     let chord_w = 26usize;
     let action_w = 40usize;
 
-    println!("  {:<cw$}  {}", "Chord", "Action", cw = chord_w);
-    println!(
+    outln!("  {:<cw$}  {}", "Chord", "Action", cw = chord_w);
+    outln!(
         "  {:<cw$}  {}",
         "─".repeat(chord_w),
         "─".repeat(action_w),
@@ -953,7 +1074,7 @@ fn print_bindings_table(resp: &serde_json::Value) {
     for e in &entries {
         let chord = e.get("chord").and_then(|v| v.as_str()).unwrap_or("?");
         let action = e.get("action").and_then(|v| v.as_str()).unwrap_or("?");
-        println!(
+        outln!(
             "  {:<cw$}  {}",
             truncate(chord, chord_w),
             truncate(action, action_w),
@@ -961,8 +1082,8 @@ fn print_bindings_table(resp: &serde_json::Value) {
         );
     }
 
-    println!();
-    println!(
+    outln!();
+    outln!(
         "  {} binding{} registered.",
         entries.len(),
         if entries.len() == 1 { "" } else { "s" }
@@ -1026,23 +1147,23 @@ fn print_default_bindings_table() {
 
     let chord_w = 28usize;
     let action_w = 36usize;
-    println!("  {:<cw$}  {}", "Chord", "Action", cw = chord_w);
-    println!(
+    outln!("  {:<cw$}  {}", "Chord", "Action", cw = chord_w);
+    outln!(
         "  {:<cw$}  {}",
         "─".repeat(chord_w),
         "─".repeat(action_w),
         cw = chord_w
     );
     for (chord, action) in defaults {
-        println!(
+        outln!(
             "  {:<cw$}  {}",
             truncate(chord, chord_w),
             action,
             cw = chord_w
         );
     }
-    println!();
-    println!("  {} built-in bindings.", defaults.len());
+    outln!();
+    outln!("  {} built-in bindings.", defaults.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,7 +1238,7 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
     } else {
         "human-readable"
     };
-    eprintln!(
+    errln!(
         "Subscribed to events ({}) [{}]. Press Ctrl+C to exit.",
         filter_desc, mode_desc
     );
@@ -1138,11 +1259,11 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
                     // expect one object per line.
                     println!("{}", serde_json::to_string(&value)?);
                 } else {
-                    println!("{}", format_event(&value));
+                    outln!("{}", format_event(&value));
                 }
             }
             Err(e) => {
-                eprintln!("event stream closed: {}", e);
+                errln!("event stream closed: {}", e);
                 break;
             }
         }
@@ -1307,4 +1428,31 @@ fn wall_clock_hms() -> String {
         return format!("{:02}:{:02}:{:02}", h, m, s);
     }
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fold_to_ascii;
+
+    #[test]
+    fn test_fold_to_ascii_replaces_table_decoration() {
+        assert_eq!(fold_to_ascii("wiri state\n──────────"), "wiri state\n----------");
+        assert_eq!(fold_to_ascii("  ID  │ CHORD"), "  ID  | CHORD");
+        assert_eq!(fold_to_ascii("SpawnCmd(\"start wt.exe…\")"), "SpawnCmd(\"start wt.exe...\")");
+        assert_eq!(fold_to_ascii("Captured window 5 → C:\\x.bmp"), "Captured window 5 -> C:\\x.bmp");
+        assert_eq!(
+            fold_to_ascii("Could not find the pipe — is wiri running?"),
+            "Could not find the pipe - is wiri running?"
+        );
+    }
+
+    #[test]
+    fn test_fold_to_ascii_leaves_ascii_alone_and_never_emits_non_ascii() {
+        let plain = "  workspace-1  3 windows | 100%";
+        assert_eq!(fold_to_ascii(plain), plain);
+        // A title the folding table does not know becomes '?', not mojibake.
+        let folded = fold_to_ascii("Caf\u{e9} \u{1f600} ──");
+        assert!(folded.is_ascii(), "{:?}", folded);
+        assert_eq!(folded, "Caf? ? --");
+    }
 }

@@ -2,6 +2,14 @@
 // for `spawn-at-startup`, `mod-key`, and `strip-frame` so first-run users
 // discover these options.
 
+// wiri is a background daemon.  Built as a console program it opened a console
+// window every time it started - which wiri then tiled like any other window.
+// Release builds use the GUI subsystem instead; the log goes to
+// %LOCALAPPDATA%\wiri\wiri.log (see `wiri::logging`) and, when started from a
+// shell, to that shell's console.  Debug builds and the test harness keep the
+// console so `cargo run` / `cargo test` output stays visible.
+#![cfg_attr(not(any(debug_assertions, test)), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -53,6 +61,9 @@ struct Args {
     /// then %USERPROFILE%/.config/wiri/config.kdl, then fall back to ./config.kdl.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// Log debug output.  When wiri is started from a console the log is also
+    /// shown there (closing that console then stops wiri); it always goes to
+    /// %LOCALAPPDATA%\wiri\wiri.log.
     #[arg(short, long)]
     verbose: bool,
     #[arg(long)]
@@ -77,24 +88,49 @@ async fn main() -> Result<()> {
         );
     }
 
+    // A GUI-subsystem process has no console.  When wiri was started from a
+    // shell and the user asked for output (`-v`, `--help`, `--version`, a
+    // command-line mistake), attach to that shell's console so it appears there
+    // (redirected streams are left alone).  A plain `wiri` never attaches: a
+    // daemon attached to a console dies when that console is closed.
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) => {
+            wiri::logging::attach_parent_console();
+            e.exit()
+        }
+    };
+    if args.verbose || args.register_autostart || args.unregister_autostart {
+        wiri::logging::attach_parent_console();
+    }
+    // Remember a console that only wiri is attached to (console-subsystem
+    // builds) so it is never tiled.  Must run after the attach above.
+    wiri::window::init_own_console();
+
     // // Single-instance check: warn if hotkeys may conflict
     // (RegisterHotKey will fail if another process has the same key combo)
-    let args = Args::parse();
 
-    // Setup logging
+    // Setup logging: stderr when there is one (console or redirect), and always
+    // %LOCALAPPDATA%\wiri\wiri.log, rotated by size.
     let filter = if args.verbose {
         EnvFilter::from_default_env().add_directive(Level::DEBUG.into())
     } else {
         EnvFilter::from_default_env().add_directive(Level::INFO.into())
     };
-    tracing_subscriber::registry()
-        .with(
+    // stdout stays clean for any future machine-consumable output, so the log
+    // goes to stderr (`wiri.exe 2>wiri.log` captures everything that matters).
+    let stderr_layer = wiri::logging::stderr_is_usable()
+        .then(|| fmt::layer().with_writer(std::io::stderr));
+    let file_layer = wiri::logging::default_log_path()
+        .and_then(|path| wiri::logging::RotatingFile::open(path, wiri::logging::LOG_MAX_BYTES).ok())
+        .map(|file| {
             fmt::layer()
-                // Route logs to stderr so stdout stays clean for any future
-                // machine-consumable output (and so `wiri.exe 2>wiri.log`
-                // captures everything that matters).
-                .with_writer(std::io::stderr),
-        )
+                .with_ansi(false)
+                .with_writer(wiri::logging::SharedLog::new(file))
+        });
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
         .with(filter)
         .init();
 

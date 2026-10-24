@@ -4,6 +4,7 @@ pub mod hooks;
 pub mod input;
 pub mod ipc;
 pub mod layout;
+pub mod logging;
 pub mod overlay;
 pub mod utils;
 pub mod window;
