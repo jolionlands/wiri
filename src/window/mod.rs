@@ -444,58 +444,194 @@ impl Default for WindowSet {
     }
 }
 
-pub fn should_skip_window(hwnd: HWND) -> bool {
+/// Everything `should_skip_window` needs to know about a window.  The Win32
+/// calls live in [`gather_skip_facts`]; the decision itself is the pure
+/// function [`classify_skip`] so it can be unit-tested without a desktop.
+#[derive(Debug, Clone, Default)]
+pub struct SkipFacts {
+    pub visible: bool,
+    pub tool_window: bool,
+    pub no_activate: bool,
+    pub topmost: bool,
+    pub cloaked: bool,
+    /// Owned top-level window without `WS_EX_APPWINDOW` (dialogs, popups).
+    pub owned_popup: bool,
+    /// `WS_CHILD`, or a parent other than the desktop: never a real top-level
+    /// window.  Hosted UI (the XAML island inside every Windows Terminal
+    /// window, WebView hosts, ...) shows up here and must never be tiled:
+    /// `SetWindowPos` on a child takes parent-relative coordinates, so tiling
+    /// it with screen coordinates mangles the host window.
+    pub child: bool,
+    /// The window belongs to wiri's own process (overlays, hotkey window).
+    pub own_process: bool,
+    /// The console window (or the terminal that hosts it) that wiri created
+    /// for itself.
+    pub own_console: bool,
+    pub width: u32,
+    pub height: u32,
+    pub class_name: String,
+}
+
+/// Window classes that are never managed.  Compared case-insensitively.
+const SKIP_CLASSES: &[&str] = &[
+    "Progman",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "Windows.UI.Core.CoreWindow",
+    "Windows.UI.Input.InputSite.WindowClass",
+    // XAML-island / WinUI bridge windows are children of a real top-level
+    // window; skipping the class is a second line of defence next to `child`.
+    "Windows.UI.Composition.DesktopWindowContentBridge",
+    "Microsoft.UI.Content.DesktopChildSiteBridge",
+    // Hidden helper window every console session owns.
+    "PseudoConsoleWindow",
+];
+
+/// Decide whether a window must be left alone.  Returns the reason when it
+/// must, `None` when it may be tiled.
+pub fn classify_skip(f: &SkipFacts) -> Option<&'static str> {
+    if f.own_process {
+        return Some("belongs to wiri itself");
+    }
+    if f.own_console {
+        return Some("wiri's own console window");
+    }
+    if f.child {
+        return Some("child window (not a top-level window)");
+    }
+    if !f.visible {
+        return Some("not visible");
+    }
+    if f.tool_window {
+        return Some("tool window");
+    }
+    if f.no_activate {
+        return Some("no-activate window");
+    }
+    if f.topmost {
+        return Some("topmost window");
+    }
+    if f.cloaked {
+        return Some("cloaked by DWM");
+    }
+    if f.owned_popup {
+        return Some("owned popup");
+    }
+    if f.width < 80 || f.height < 60 {
+        return Some("too small");
+    }
+    let class = f.class_name.to_ascii_lowercase();
+    if SKIP_CLASSES
+        .iter()
+        .any(|skip| class.contains(&skip.to_ascii_lowercase()))
+    {
+        return Some("system or hosted window class");
+    }
+    None
+}
+
+/// Console windows that only wiri is attached to, recorded once at startup.
+/// With the GUI-subsystem build this stays empty; it matters for a
+/// console-subsystem build (debug builds, `cargo run`), where Windows opens a
+/// console for wiri that must never end up as a tile.
+static OWN_CONSOLE_WINDOWS: std::sync::OnceLock<Vec<isize>> = std::sync::OnceLock::new();
+
+/// Record the console window wiri owns, if it owns one.  A console counts as
+/// wiri's own when wiri is the only process attached to it; a console wiri
+/// merely inherited from the shell that launched it belongs to the user.
+/// Call once, after any `AttachConsole`, before the first window is tiled.
+pub fn init_own_console() {
+    use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetWindow, GA_ROOTOWNER, GW_OWNER};
+
+    let mut own: Vec<isize> = Vec::new();
+    unsafe {
+        let console = GetConsoleWindow();
+        if !console.0.is_null() {
+            let mut pids = [0u32; 4];
+            let attached = GetConsoleProcessList(&mut pids);
+            if attached == 1 {
+                own.push(console.0 as isize);
+                // With Windows Terminal as the default terminal the console
+                // window is an invisible helper owned by the visible window.
+                if let Ok(owner) = GetWindow(console, GW_OWNER) {
+                    if !owner.0.is_null() {
+                        own.push(owner.0 as isize);
+                    }
+                }
+                let root = GetAncestor(console, GA_ROOTOWNER);
+                if !root.0.is_null() {
+                    own.push(root.0 as isize);
+                }
+            }
+        }
+    }
+    own.sort_unstable();
+    own.dedup();
+    let _ = OWN_CONSOLE_WINDOWS.set(own);
+}
+
+fn is_own_console_window(hwnd: HWND) -> bool {
+    OWN_CONSOLE_WINDOWS
+        .get()
+        .map(|windows| windows.contains(&(hwnd.0 as isize)))
+        .unwrap_or(false)
+}
+
+/// Collect the Win32 facts about `hwnd` that [`classify_skip`] judges.
+pub fn gather_skip_facts(hwnd: HWND) -> SkipFacts {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
     let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
 
-    if style & WS_VISIBLE.0 == 0 {
-        return true;
-    }
-    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
-        return true;
-    }
-    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
-        return true;
-    }
-    if ex_style & WS_EX_TOPMOST.0 != 0 {
-        return true;
-    }
-
-    if is_dwm_cloaked(hwnd) {
-        return true;
-    }
-
     let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
-    if owner.map(|owner| !owner.0.is_null()).unwrap_or(false) && ex_style & WS_EX_APPWINDOW.0 == 0 {
-        return true;
-    }
+    let owned_popup = owner
+        .map(|owner| !owner.0.is_null())
+        .unwrap_or(false)
+        && ex_style & WS_EX_APPWINDOW.0 == 0;
 
-    if let Some(bounds) = get_window_bounds(hwnd) {
-        if bounds.size.w < 80 || bounds.size.h < 60 {
-            return true;
-        }
-    }
+    let child = style & WS_CHILD.0 != 0 || {
+        let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
+        !parent.0.is_null() && parent != unsafe { GetDesktopWindow() }
+    };
+
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let own_process = pid != 0 && pid == unsafe { GetCurrentProcessId() };
+
+    let (width, height) = get_window_bounds(hwnd)
+        .map(|b| (b.size.w, b.size.h))
+        .unwrap_or((u32::MAX, u32::MAX));
 
     let mut class_name_buf = [0u16; 256];
     let class_len = unsafe { GetClassNameW(hwnd, &mut class_name_buf) };
     let class_name = String::from_utf16_lossy(&class_name_buf[..class_len as usize]);
 
-    let skip_classes = [
-        "Progman",
-        "Shell_TrayWnd",
-        "Windows.UI.Core.corewindow",
-        "Windows.UI.Input.InputSite.WindowClass",
-    ];
-
-    for skip in &skip_classes {
-        if class_name.contains(skip) {
-            return true;
-        }
+    SkipFacts {
+        visible: style & WS_VISIBLE.0 != 0,
+        tool_window: ex_style & WS_EX_TOOLWINDOW.0 != 0,
+        no_activate: ex_style & WS_EX_NOACTIVATE.0 != 0,
+        topmost: ex_style & WS_EX_TOPMOST.0 != 0,
+        cloaked: is_dwm_cloaked(hwnd),
+        owned_popup,
+        child,
+        own_process,
+        own_console: is_own_console_window(hwnd),
+        width,
+        height,
+        class_name,
     }
+}
 
-    false
+/// Why `hwnd` must not be tiled, or `None` when it may be.
+pub fn skip_reason(hwnd: HWND) -> Option<&'static str> {
+    classify_skip(&gather_skip_facts(hwnd))
+}
+
+pub fn should_skip_window(hwnd: HWND) -> bool {
+    skip_reason(hwnd).is_some()
 }
 
 fn is_dwm_cloaked(hwnd: HWND) -> bool {
@@ -732,5 +868,74 @@ mod tests {
         assert!(rules.column.is_none());
         assert!(rules.follow_cursor);
         assert!(rules.border);
+    }
+
+    fn normal_window() -> SkipFacts {
+        SkipFacts {
+            visible: true,
+            width: 800,
+            height: 600,
+            class_name: "Notepad".to_string(),
+            ..SkipFacts::default()
+        }
+    }
+
+    #[test]
+    fn test_classify_skip_allows_an_ordinary_window() {
+        assert_eq!(classify_skip(&normal_window()), None);
+    }
+
+    #[test]
+    fn test_classify_skip_rejects_child_windows() {
+        // The XAML island inside every Windows Terminal window: tiling it with
+        // screen coordinates moved it inside its host and made wiri fight the
+        // terminal for focus forever.
+        let mut f = normal_window();
+        f.child = true;
+        f.class_name = "Windows.UI.Composition.DesktopWindowContentBridge".to_string();
+        assert!(classify_skip(&f).is_some());
+        // Even if the parent lookup were to fail, the class alone is enough.
+        f.child = false;
+        assert!(classify_skip(&f).is_some());
+    }
+
+    #[test]
+    fn test_classify_skip_rejects_wiri_own_windows_and_console() {
+        let mut f = normal_window();
+        f.own_process = true;
+        assert!(classify_skip(&f).is_some());
+
+        let mut f = normal_window();
+        f.own_console = true;
+        f.class_name = "CASCADIA_HOSTING_WINDOW_CLASS".to_string();
+        assert!(classify_skip(&f).is_some());
+    }
+
+    #[test]
+    fn test_classify_skip_rejects_system_and_transient_windows() {
+        for mutate in [
+            (|f: &mut SkipFacts| f.visible = false) as fn(&mut SkipFacts),
+            |f| f.tool_window = true,
+            |f| f.no_activate = true,
+            |f| f.topmost = true,
+            |f| f.cloaked = true,
+            |f| f.owned_popup = true,
+            |f| f.width = 79,
+            |f| f.height = 59,
+            |f| f.class_name = "Shell_TrayWnd".to_string(),
+            |f| f.class_name = "windows.ui.core.corewindow".to_string(),
+        ] {
+            let mut f = normal_window();
+            mutate(&mut f);
+            assert!(classify_skip(&f).is_some(), "{:?} must be skipped", f);
+        }
+    }
+
+    #[test]
+    fn test_classify_skip_keeps_terminal_hosting_window() {
+        // A user's terminal window is a legitimate tile.
+        let mut f = normal_window();
+        f.class_name = "CASCADIA_HOSTING_WINDOW_CLASS".to_string();
+        assert_eq!(classify_skip(&f), None);
     }
 }
