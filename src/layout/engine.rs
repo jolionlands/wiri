@@ -2874,6 +2874,11 @@ impl TilingEngine {
             info!("Entering fullscreen for window {}", hwnd);
         }
 
+        // The fullscreen rect is applied behind the applied-state cache's back.  Forget
+        // what the cache knows about this window, or leaving fullscreen finds its old
+        // tile rect "already applied" and the window stays as big as the screen.
+        self.applied_state.remove(&window_id);
+
         self.apply_layout_for_monitor(focused_output, backend);
     }
 
@@ -7181,6 +7186,34 @@ mod tests {
         assert!(engine.is_fullscreen(WindowId::new(100)));
         engine.toggle_fullscreen(&BackendHandle::default_for_test());
         assert!(!engine.is_fullscreen(WindowId::new(100)));
+    }
+
+    #[test]
+    fn test_leaving_fullscreen_reapplies_the_tile_rect() {
+        // Fullscreen is positioned outside the applied-state cache.  If the cache keeps
+        // its old entry, leaving fullscreen finds the tile rect "already applied" and
+        // never moves the window back: it stays as big as the screen.
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
+        engine.add_window(make_window(101, 500, 400), &BackendHandle::default_for_test());
+        engine.apply_all(&BackendHandle::default_for_test());
+        let wid = WindowId::new(101);
+        assert!(engine.applied_state.get(&wid).expect("tiled and applied").visible);
+
+        engine.toggle_fullscreen(&BackendHandle::default_for_test());
+        assert!(engine.is_fullscreen(wid));
+        assert!(
+            !engine.applied_state.contains_key(&wid),
+            "entering fullscreen must drop the cached tile state"
+        );
+
+        engine.toggle_fullscreen(&BackendHandle::default_for_test());
+        assert!(!engine.is_fullscreen(wid));
+        let after = engine
+            .applied_state
+            .get(&wid)
+            .expect("the layout pass after leaving fullscreen re-applies the window");
+        assert!(after.visible, "shown again as a tile");
     }
 
     #[test]
