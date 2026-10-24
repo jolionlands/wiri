@@ -406,6 +406,24 @@ impl Workspace {
         true
     }
 
+    /// niri `move-column-left` / `move-column-right`: the whole column at `col`
+    /// (all its tiles, in order) changes places with its neighbour `delta`
+    /// columns away.  Returns the column's new index, or `None` when it is
+    /// already at that edge or `col` does not exist.
+    pub fn move_column_by(&mut self, col: usize, delta: i32) -> Option<usize> {
+        if col >= self.columns.len() {
+            return None;
+        }
+        let target = col as i64 + delta as i64;
+        if target < 0 || target >= self.columns.len() as i64 {
+            return None;
+        }
+        let target = target as usize;
+        let column = self.columns.remove(col);
+        self.columns.insert(target, column);
+        Some(target)
+    }
+
     /// Scroll the workspace view
     pub fn scroll_left(&mut self, amount: i32) {
         self.scroll_offset.x = self.scroll_offset.x.saturating_sub(amount).max(0);
@@ -808,6 +826,51 @@ mod tests {
         assert!(moved);
         // Col0 removed (was empty), now 2 columns
         assert_eq!(ws.columns.len(), 2);
+    }
+
+    fn column_order(ws: &Workspace) -> Vec<Vec<isize>> {
+        ws.columns
+            .iter()
+            .map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_workspace_move_column_swaps_with_the_neighbour() {
+        let mut ws = Workspace::new();
+        for id in 1..=3 {
+            ws.add_window_to_new_column(WindowId::new(id));
+        }
+        assert_eq!(ws.move_column_by(2, -1), Some(1));
+        assert_eq!(column_order(&ws), vec![vec![1], vec![3], vec![2]]);
+        assert_eq!(ws.move_column_by(0, 1), Some(1));
+        assert_eq!(column_order(&ws), vec![vec![3], vec![1], vec![2]]);
+        // Never merges columns: the count stays the same.
+        assert_eq!(ws.columns.len(), 3);
+    }
+
+    #[test]
+    fn test_workspace_move_column_moves_all_stacked_tiles_together() {
+        let mut ws = Workspace::new();
+        for id in 1..=3 {
+            ws.add_window_to_new_column(WindowId::new(id));
+        }
+        // Stack window 4 under window 2.
+        assert!(ws.add_window_to_column(1, WindowId::new(4)));
+        assert_eq!(column_order(&ws), vec![vec![1], vec![2, 4], vec![3]]);
+        assert_eq!(ws.move_column_by(1, -1), Some(0));
+        assert_eq!(column_order(&ws), vec![vec![2, 4], vec![1], vec![3]]);
+    }
+
+    #[test]
+    fn test_workspace_move_column_stops_at_the_edges() {
+        let mut ws = Workspace::new();
+        ws.add_window_to_new_column(WindowId::new(1));
+        ws.add_window_to_new_column(WindowId::new(2));
+        assert_eq!(ws.move_column_by(0, -1), None);
+        assert_eq!(ws.move_column_by(1, 1), None);
+        assert_eq!(ws.move_column_by(5, -1), None);
+        assert_eq!(column_order(&ws), vec![vec![1], vec![2]]);
     }
 
     #[test]

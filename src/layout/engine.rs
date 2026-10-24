@@ -2754,14 +2754,18 @@ impl TilingEngine {
         }
     }
 
-    /// Move the focused window left/right
+    /// Move the focused column one place left or right (niri `move-column-left`
+    /// / `move-column-right`): it swaps places with its neighbour, taking all
+    /// its stacked tiles along.  Moving a window *into* the neighbouring column
+    /// is `consume-window-into-column`, a separate action.  At the edge of the
+    /// strip this does nothing.
     pub fn move_column(&mut self, direction: ScrollDirection, backend: &BackendHandle) {
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
         };
 
-        let (moved, window_id) = {
+        let new_col = {
             let monitor = match self.monitors.get_mut(&focused_output) {
                 Some(m) => m,
                 None => return,
@@ -2770,36 +2774,26 @@ impl TilingEngine {
                 Some(c) => c,
                 None => return,
             };
-            let window_id = match monitor.focus_window {
-                Some(id) => id,
-                None => return,
+            let delta = match direction {
+                ScrollDirection::Left => -1,
+                ScrollDirection::Right => 1,
             };
             let workspace = match monitor.workspace_mut() {
                 Some(w) => w,
                 None => return,
             };
-            let target_col = match direction {
-                ScrollDirection::Left => focus_col.saturating_sub(1),
-                ScrollDirection::Right => focus_col + 1,
-            };
-            (workspace.move_window(window_id, target_col, 0), window_id)
+            match workspace.move_column_by(focus_col, delta) {
+                Some(col) => col,
+                None => return,
+            }
         };
 
-        if moved {
-            // After move_window, the window is now at target_col.
-            // The source column may have been removed (if it became empty),
-            // so focus_column could be stale. Find the window's new position.
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                // Find where the moved window ended up
-                if let Some(workspace) = monitor.workspace() {
-                    let new_col = workspace.find_window_column(window_id);
-                    if let Some(col) = new_col {
-                        monitor.focus_column = Some(col);
-                    }
-                }
-            }
-            self.apply_layout_for_monitor(focused_output, backend);
+        // The focused tile moved with its column; only its index changed.
+        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+            monitor.focus_column = Some(new_col);
         }
+        self.reveal_focused_column(focused_output);
+        self.apply_layout_for_monitor(focused_output, backend);
     }
 
     /// Close the focused window
@@ -6928,6 +6922,48 @@ mod tests {
         // Focus should be on the moved window (102) at its new position (col1)
         assert_eq!(monitor.focus_window, Some(WindowId::new(102)));
         assert_eq!(monitor.focus_column, Some(1));
+        // The column swapped places with its neighbour; nothing was merged.
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![101]]
+        );
+    }
+
+    /// The window ids of every column of the focused monitor's active workspace.
+    fn column_windows(engine: &TilingEngine, oid: OutputId) -> Vec<Vec<isize>> {
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_move_column_takes_the_stacked_tiles_along() {
+        let mut engine = make_engine();
+        for i in 100..103 {
+            let window = make_window(i, 500, 400);
+            engine.add_window(window, &BackendHandle::default_for_test());
+        }
+        let oid = engine.focused_output().unwrap();
+        // Stack 101 into the column of 102 (consume-into-column); focus stays on 101.
+        engine.focus_left(&BackendHandle::default_for_test());
+        engine.consume_window_into_column(&BackendHandle::default_for_test());
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102, 101]]);
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.focus_column, Some(1));
+        assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
+
+        engine.move_column(ScrollDirection::Left, &BackendHandle::default_for_test());
+        assert_eq!(column_windows(&engine, oid), vec![vec![102, 101], vec![100]]);
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.focus_column, Some(0));
+        assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
     }
 
     #[test]
@@ -6951,6 +6987,10 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_window, Some(WindowId::new(100)));
         assert_eq!(monitor.focus_column, Some(1));
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101], vec![100], vec![102]]
+        );
     }
 
     #[test]
