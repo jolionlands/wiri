@@ -1160,6 +1160,12 @@ impl TilingEngine {
         // its blur — the user expects a floating "frosted glass" effect).
         self.blur_applied.remove(&window_id);
 
+        if self.last_activated == Some(window_id) {
+            // The window is gone; make sure the next focus target is activated
+            // even if it happens to be the same HWND value later.
+            self.last_activated = None;
+        }
+
         if self.tiled_windows.remove(&window_id).is_some() {
             // Look on every workspace, not just the active one: a window can
             // close while it is parked on an inactive workspace.
@@ -1807,12 +1813,12 @@ impl TilingEngine {
                 0xFFFF_FFFF
             };
 
-            // Focused windows get a wider border for visual emphasis.
-            let inset = if is_focused {
-                border_w + eff_cfg.focus_ring_width
-            } else {
-                border_w
-            };
+            // Every tile gets the same inset, focused or not.  A focus-
+            // dependent size means each focus change resizes two windows
+            // (terminals re-wrap their text, browsers re-layout) and lets a
+            // focus flap turn into an endless SetWindowPos storm.  Focus is
+            // shown with the DWM border colour instead of with geometry.
+            let inset = border_w;
             let inset_rect = Rect::new(
                 rect.loc.x + inset,
                 rect.loc.y + inset,
@@ -2103,19 +2109,80 @@ impl TilingEngine {
         }
 
         // Bring the focused window to the foreground if it changed since last layout.
-        // Only the focused monitor's focus drives Win32 activation.
+        // Only the focused monitor's focus drives Win32 activation.  The attempt is
+        // made once per focus target (success or not): retrying a refused request on
+        // every layout pass is what used to flood the log and fight the foreground lock.
         if Some(output_id) == self.monitors.focused_id() {
             let current_focus = self.monitors.get(&output_id).and_then(|m| m.focus_window);
-            if current_focus.is_some() && current_focus != self.last_activated {
-                if let Some(wid) = current_focus {
-                    if let Err(e) = backend.activate_window(wid.as_isize()) {
-                        debug!("activate_window({}) failed: {:?}", wid, e);
-                    } else {
-                        self.last_activated = Some(wid);
-                    }
+            if let Some(wid) = current_focus {
+                if Some(wid) != self.last_activated {
+                    self.activate_now(wid, backend);
                 }
             }
         }
+    }
+
+    /// Ask Windows to make `wid` the foreground window and remember that we did.
+    ///
+    /// Called for every user-driven focus change (hotkeys, IPC) and, once per
+    /// focus target, from the layout pass.  A refusal (foreground lock) is
+    /// logged once here and never retried until the focus target changes again.
+    fn activate_now(&mut self, wid: WindowId, backend: &BackendHandle) {
+        self.last_activated = Some(wid);
+        if let Err(e) = backend.activate_window(wid.as_isize()) {
+            tracing::warn!(
+                "Could not bring {} to the foreground: {} (not retrying until focus moves)",
+                wid,
+                e
+            );
+        }
+    }
+
+    /// Mirror the OS foreground window into the engine's focus state.
+    ///
+    /// Called when Windows reports that `window_id` became the foreground
+    /// window (the user clicked it, alt-tabbed to it, an app activated itself,
+    /// or wiri's own activation request took effect).  The window already *is*
+    /// the foreground window, so no activation of our own is issued - issuing
+    /// one made wiri and apps with several top-level windows hand the focus
+    /// back and forth forever.
+    ///
+    /// Returns `(column index, workspace id)` when the window is tiled, `None`
+    /// for windows wiri does not manage.
+    pub fn sync_os_foreground(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) -> Option<(usize, i32)> {
+        let (output_id, workspace_id, column_idx) = self.locate_window(window_id)?;
+
+        // The OS is the authority on who is activated: remember it so the
+        // layout pass does not try to "fix" the focus it just reported.
+        self.last_activated = Some(window_id);
+
+        let unchanged = self.monitors.focused_id() == Some(output_id)
+            && self.monitors.get(&output_id).map_or(false, |m| {
+                m.active_workspace == workspace_id
+                    && m.focus_window == Some(window_id)
+                    && m.focus_column == Some(column_idx)
+            });
+        if unchanged {
+            return Some((column_idx, workspace_id));
+        }
+
+        {
+            let monitor = self.monitors.get_mut(&output_id)?;
+            if monitor.active_workspace != workspace_id {
+                monitor.switch_workspace(workspace_id);
+            }
+            monitor.focus_window = Some(window_id);
+            monitor.focus_column = Some(column_idx);
+            monitor.focus_ring.push(window_id);
+        }
+        self.monitors.set_focused(output_id);
+        self.reveal_focused_column(output_id);
+        self.apply_layout_for_monitor(output_id, backend);
+        Some((column_idx, workspace_id))
     }
 
     /// Calculate window positions for a workspace.
@@ -2536,8 +2603,8 @@ impl TilingEngine {
             monitor.focus_window
         };
         if let Some(wid) = focused_wid {
-            if let Some(window) = self.tiled_windows.get(&wid) {
-                self.activate_window(window.hwnd);
+            if self.tiled_windows.contains_key(&wid) {
+                self.activate_now(wid, backend);
             }
             self.apply_layout_for_monitor(focused_output, backend);
         }
@@ -2553,8 +2620,8 @@ impl TilingEngine {
             monitor.focus_window
         };
         if let Some(wid) = focused_wid {
-            if let Some(window) = self.tiled_windows.get(&wid) {
-                self.activate_window(window.hwnd);
+            if self.tiled_windows.contains_key(&wid) {
+                self.activate_now(wid, backend);
             }
             self.apply_layout_for_monitor(focused_output, backend);
         }
@@ -2567,41 +2634,18 @@ impl TilingEngine {
         focused_output: OutputId,
         backend: &BackendHandle,
     ) -> Option<WindowId> {
-        // Step 1: Get focus column, work area, and column count
-        let focus_col = self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.focus_column);
-        let view_width = self
-            .monitors
-            .get(&focused_output)
-            .map(|m| Self::view_width_for_monitor(m, &self.config));
-        let num_cols = self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.workspace().map(|w| w.columns.len()));
-
-        // Step 2: Scroll workspace to show focused column
-        if let (Some(col_idx), Some(vw), Some(nc)) = (focus_col, view_width, num_cols) {
-            let col_w = Self::effective_column_width(nc, vw, &self.config);
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    workspace.scroll_to_column(col_idx, col_w, self.config.column_gap, vw);
-                    // Clamp to valid scroll range
-                    workspace.clamp_scroll(col_w, self.config.column_gap, vw);
-                }
-            }
-        }
+        // Steps 1-2: scroll the workspace to show the focused column.
+        self.reveal_focused_column(focused_output);
 
         // Step 3: Activate the focused window
-        let hwnd_to_activate = self
+        let window_to_activate = self
             .monitors
             .get(&focused_output)
             .and_then(|m| m.focus_window)
-            .and_then(|wid| self.tiled_windows.get(&wid).map(|w| w.hwnd));
+            .filter(|wid| self.tiled_windows.contains_key(wid));
 
-        if let Some(hwnd) = hwnd_to_activate {
-            self.activate_window(hwnd);
+        if let Some(wid) = window_to_activate {
+            self.activate_now(wid, backend);
         }
 
         // Step 4: Apply layout
@@ -2693,17 +2737,18 @@ impl TilingEngine {
                 .start_workspace_slide(focused_output, from_offset, 0.0, 0);
         }
 
+        self.reveal_focused_column(focused_output);
         self.apply_layout_for_monitor(focused_output, backend);
 
         // Activate the focused window on the new workspace
-        let hwnd_to_activate = self
+        let window_to_activate = self
             .monitors
             .get(&focused_output)
             .and_then(|m| m.focus_window)
-            .and_then(|wid| self.tiled_windows.get(&wid).map(|w| w.hwnd));
+            .filter(|wid| self.tiled_windows.contains_key(wid));
 
-        if let Some(hwnd) = hwnd_to_activate {
-            self.activate_window(hwnd);
+        if let Some(wid) = window_to_activate {
+            self.activate_now(wid, backend);
         }
     }
 
@@ -4318,46 +4363,6 @@ impl TilingEngine {
             .unwrap_or(&self.config)
     }
 
-    /// Activate a window (bring to foreground).
-    /// Uses multiple strategies to work around Windows' foreground lock restrictions:
-    /// Activate a window (bring to foreground)
-    fn activate_window(&self, hwnd: isize) {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            BringWindowToTop, GetWindowThreadProcessId, IsIconic, SetForegroundWindow,
-        };
-
-        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
-        unsafe {
-            // If minimized, restore first
-            if IsIconic(hwnd_win).as_bool() {
-                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd_win,
-                    windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
-                );
-            }
-
-            // AttachThreadInput trick to bypass foreground lock
-            let mut target_pid: u32 = 0;
-            let target_tid = GetWindowThreadProcessId(hwnd_win, Some(&mut target_pid));
-            let current_tid = GetCurrentThreadId();
-
-            if target_tid != 0 && current_tid != 0 && target_tid != current_tid {
-                let attached = AttachThreadInput(current_tid, target_tid, true);
-                let _ = SetForegroundWindow(hwnd_win);
-                if attached.as_bool() {
-                    let _ = AttachThreadInput(current_tid, target_tid, false);
-                }
-            } else {
-                let _ = SetForegroundWindow(hwnd_win);
-            }
-
-            // Fallback
-            let _ = BringWindowToTop(hwnd_win);
-        }
-    }
-
     /// Apply opacity to a window using DWMWA_EXCLUDED_FROM_PEEK + layered window
     /// Set the DWM border color for a window (Windows 11+).
     /// Falls back silently on older Windows.
@@ -5615,16 +5620,17 @@ impl TilingEngine {
             }
         }
 
+        self.reveal_focused_column(focused_output);
         self.apply_layout_for_monitor(focused_output, backend);
 
         // Activate focused window on new workspace
-        let hwnd_to_activate = self
+        let window_to_activate = self
             .monitors
             .get(&focused_output)
             .and_then(|m| m.focus_window)
-            .and_then(|wid| self.tiled_windows.get(&wid).map(|w| w.hwnd));
-        if let Some(hwnd) = hwnd_to_activate {
-            self.activate_window(hwnd);
+            .filter(|wid| self.tiled_windows.contains_key(wid));
+        if let Some(wid) = window_to_activate {
+            self.activate_now(wid, backend);
         }
     }
 
@@ -5774,10 +5780,11 @@ impl TilingEngine {
         }
 
         // Activate the window at the OS level.
-        if let Some(hwnd) = self.tiled_windows.get(&prev_wid).map(|w| w.hwnd) {
-            self.activate_window(hwnd);
+        if self.tiled_windows.contains_key(&prev_wid) {
+            self.activate_now(prev_wid, backend);
         }
 
+        self.reveal_focused_column(target_output);
         self.apply_layout_for_monitor(target_output, backend);
     }
 
@@ -10788,6 +10795,87 @@ mod tests {
             TilingEngine::column_widths(&[Some(300), None], 1350, 16, &fixed),
             vec![300, 500]
         );
+    }
+
+    #[test]
+    fn test_focus_change_does_not_change_tile_geometry() {
+        // A focus-dependent inset made every focus change resize two windows,
+        // and turned a focus flap into an endless SetWindowPos storm.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        engine.apply_all(&backend);
+        let rects = |e: &TilingEngine| -> HashMap<WindowId, Rect> {
+            e.applied_state.iter().map(|(k, v)| (*k, v.rect)).collect()
+        };
+        let before = rects(&engine);
+        assert_eq!(before.len(), 2);
+
+        // The configure throttle (16 ms) would hide a changed rect by simply
+        // not sending it, so let it expire before each pass: a focus-dependent
+        // inset then shows up as a different applied rect.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.sync_os_foreground(WindowId::new(100), &backend);
+        engine.apply_all(&backend);
+        assert_eq!(before, rects(&engine), "focus must not resize tiles");
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.sync_os_foreground(WindowId::new(101), &backend);
+        engine.apply_all(&backend);
+        assert_eq!(before, rects(&engine), "focus must not resize tiles");
+    }
+
+    #[test]
+    fn test_sync_os_foreground_mirrors_the_os_without_reactivating() {
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        let oid = engine.focused_output().unwrap();
+        {
+            // 101 was added last and holds the focus.
+            let m = engine.monitors().get(&oid).unwrap();
+            assert_eq!(m.focus_window, Some(WindowId::new(101)));
+        }
+
+        // Windows reports window 100 as the foreground window.
+        let located = engine.sync_os_foreground(WindowId::new(100), &backend);
+        assert_eq!(located, Some((0, 0)));
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
+        // The OS already activated it: the layout pass must not issue an
+        // activation of its own (that is what ping-ponged the focus).
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+
+        // Reporting the same window again changes nothing.
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(100), &backend),
+            Some((0, 0))
+        );
+
+        // Windows wiri does not manage are ignored.
+        assert_eq!(engine.sync_os_foreground(WindowId::new(555), &backend), None);
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+    }
+
+    #[test]
+    fn test_failed_activation_is_attempted_once_per_focus_target() {
+        // HWNDs in unit tests are fake, so every activation fails - like a
+        // foreground lock that refuses wiri.  The layout pass must try once for
+        // a given focus target and then leave it alone.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        assert_eq!(engine.last_activated, None);
+        engine.apply_all(&backend);
+        // The attempt is recorded even though it failed...
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+        // ...so later passes do not try again for the same target.
+        engine.apply_all(&backend);
+        engine.apply_all(&backend);
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
     }
 
     #[test]

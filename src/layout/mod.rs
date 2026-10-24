@@ -66,6 +66,11 @@ impl FocusRing {
         self.stack.get(1).copied()
     }
 
+    /// Iterate from the most recently focused window to the least recent.
+    pub fn iter_mru(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.stack.iter().copied()
+    }
+
     /// Number of entries in the ring.
     pub fn len(&self) -> usize {
         self.stack.len()
@@ -419,6 +424,37 @@ impl Monitor {
         self.active_workspace = id;
         self.focus_column = None;
         self.focus_window = None;
+        self.restore_focus_in_active_workspace();
+    }
+
+    /// Give the freshly activated workspace a focused window again: the one
+    /// that was focused most recently (per the MRU ring), else the first tile
+    /// of its first column.  An empty workspace keeps "no focus".  Without
+    /// this every workspace switch left the keyboard focus commands dead until
+    /// the OS happened to report a foreground change.
+    fn restore_focus_in_active_workspace(&mut self) {
+        let target = {
+            let workspace = match self.workspaces.get(&self.active_workspace) {
+                Some(w) if !w.columns.is_empty() => w,
+                _ => return,
+            };
+            self.focus_ring
+                .iter_mru()
+                .find_map(|wid| workspace.find_window_column(wid).map(|col| (col, wid)))
+                .or_else(|| {
+                    workspace
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find_map(|(col, column)| {
+                            column.tiles.first().map(|tile| (col, tile.window_id))
+                        })
+                })
+        };
+        if let Some((col, wid)) = target {
+            self.focus_column = Some(col);
+            self.focus_window = Some(wid);
+        }
     }
 
     /// Get the logical width of the work area (accounts for DPI scaling).
@@ -801,6 +837,23 @@ mod monitor_tests {
     }
 
     #[test]
+    fn test_monitor_switch_back_restores_most_recent_focus() {
+        let mut m = make_monitor();
+        m.add_window(WindowId::new(100));
+        m.add_window(WindowId::new(101));
+        m.focus_left();
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+
+        m.switch_workspace(1);
+        assert!(m.focus_window.is_none());
+        m.switch_workspace(0);
+        // Without this the keyboard focus commands stayed dead after every
+        // workspace switch until the OS reported a foreground change.
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
+    }
+
+    #[test]
     fn test_monitor_remove_window_on_inactive_workspace() {
         let mut m = make_monitor();
         m.add_window(WindowId::new(100));
@@ -817,6 +870,7 @@ mod monitor_tests {
         // The window on the (then active) workspace is untouched.
         m.switch_workspace(1);
         assert_eq!(m.workspace().unwrap().columns.len(), 1);
+        assert_eq!(m.focus_window, Some(WindowId::new(200)));
     }
 
     #[test]

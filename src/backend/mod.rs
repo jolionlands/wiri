@@ -25,11 +25,29 @@ use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDAT
 #[cfg_attr(test, allow(unused_imports))]
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, MoveWindow, PostMessageW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, HWND_TOP,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MoveWindow, PostMessageW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, SwitchToThisWindow, HWND_TOP,
     SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
 };
+
+/// Inject a harmless key press (F24, which no keyboard has and nothing binds).
+///
+/// Windows grants the right to call `SetForegroundWindow` to the process that
+/// injected the most recent input, so a synthetic key event lifts the
+/// foreground lock for the activation request that follows.  F24 is used
+/// instead of the classic Alt tap because a lone Alt press activates the menu
+/// bar of the window that receives it (and would trip the double-Alt detector).
+fn nudge_foreground_lock() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    };
+    const VK_F24: u8 = 0x87;
+    unsafe {
+        keybd_event(VK_F24, 0, KEYBD_EVENT_FLAGS(0), 0);
+        keybd_event(VK_F24, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
 
 /// Ask a window to repaint after a tile move. Fixes apps (Cascadia/Windows
 /// Terminal, Edge, some Electron) that show a black client area after
@@ -742,50 +760,85 @@ impl BackendHandle {
         self.windows.write().insert(hwnd, info);
     }
 
-    /// Bring `hwnd` to the foreground. Uses the AttachThreadInput trick as a fallback
-    /// when another process holds the foreground lock.
+    /// Bring `hwnd` to the foreground, defeating the foreground lock.
+    ///
+    /// Windows only lets a process set the foreground window when it owns the
+    /// "foreground lock" (it received the last input event, for example).  wiri
+    /// usually does not - it acts on IPC requests, timers and WinEvents - so a
+    /// plain `SetForegroundWindow` is routinely refused.  The escalation, from
+    /// cheapest to most invasive:
+    ///   1. nothing to do when the window already is the foreground window;
+    ///   2. plain `SetForegroundWindow`;
+    ///   3. inject a harmless key event (F24): the process that injected the
+    ///      last input is the "input provider" and is allowed to switch;
+    ///   4. `AttachThreadInput` to the thread that owns the foreground;
+    ///   5. `SwitchToThisWindow`, the call Alt+Tab itself uses.
+    /// Returns an error only when every step failed; callers log that once and
+    /// do not retry (see `TilingEngine::activate_now`).
     pub fn activate_window(&self, hwnd: isize) -> Result<()> {
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
         unsafe {
             if !IsWindow(hwnd_win).as_bool() {
                 return Err(anyhow::anyhow!("activate_window: invalid HWND {}", hwnd));
             }
+            if GetForegroundWindow() == hwnd_win {
+                return Ok(());
+            }
+            if IsIconic(hwnd_win).as_bool() {
+                let _ = ShowWindowAsync(hwnd_win, SW_RESTORE);
+            }
+
+            // 2. Plain request.
             if SetForegroundWindow(hwnd_win).as_bool() {
                 debug!("activate_window: SetForegroundWindow OK hwnd={}", hwnd);
                 return Ok(());
             }
-            // Fallback: AttachThreadInput trick to overcome the foreground lock.
+
+            // 3. Injected input lifts the foreground lock for this process.
+            nudge_foreground_lock();
+            if SetForegroundWindow(hwnd_win).as_bool() {
+                debug!("activate_window: input nudge + SetForegroundWindow OK hwnd={}", hwnd);
+                return Ok(());
+            }
+
+            // 4. Share the input queue of the thread that owns the foreground.
             let current_thread = windows::Win32::System::Threading::GetCurrentThreadId();
             let fg_hwnd = GetForegroundWindow();
-            if fg_hwnd.0.is_null() {
-                return Err(anyhow::anyhow!(
-                    "activate_window: SetForegroundWindow failed and no current foreground window"
-                ));
-            }
-            let fg_thread = GetWindowThreadProcessId(fg_hwnd, None);
-            if fg_thread != 0 && fg_thread != current_thread {
-                let _ = windows::Win32::System::Threading::AttachThreadInput(
-                    current_thread,
-                    fg_thread,
-                    true,
-                );
-                let ok = SetForegroundWindow(hwnd_win).as_bool();
-                let _ = windows::Win32::System::Threading::AttachThreadInput(
-                    current_thread,
-                    fg_thread,
-                    false,
-                );
-                if ok {
-                    debug!(
-                        "activate_window: AttachThreadInput+SetForegroundWindow OK hwnd={}",
-                        hwnd
+            if !fg_hwnd.0.is_null() {
+                let fg_thread = GetWindowThreadProcessId(fg_hwnd, None);
+                if fg_thread != 0 && fg_thread != current_thread {
+                    let _ = windows::Win32::System::Threading::AttachThreadInput(
+                        current_thread,
+                        fg_thread,
+                        true,
                     );
-                    return Ok(());
+                    let ok = SetForegroundWindow(hwnd_win).as_bool();
+                    let _ = windows::Win32::System::Threading::AttachThreadInput(
+                        current_thread,
+                        fg_thread,
+                        false,
+                    );
+                    if ok {
+                        debug!(
+                            "activate_window: AttachThreadInput+SetForegroundWindow OK hwnd={}",
+                            hwnd
+                        );
+                        return Ok(());
+                    }
                 }
+            }
+
+            // 5. Alt+Tab's own entry point.
+            SwitchToThisWindow(hwnd_win, windows::Win32::Foundation::BOOL(1));
+            // It takes effect asynchronously; give it a moment before judging.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if GetForegroundWindow() == hwnd_win {
+                debug!("activate_window: SwitchToThisWindow OK hwnd={}", hwnd);
+                return Ok(());
             }
         }
         Err(anyhow::anyhow!(
-            "activate_window: failed to bring hwnd={} to foreground",
+            "Windows refused to bring hwnd={} to the foreground (foreground lock)",
             hwnd
         ))
     }

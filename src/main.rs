@@ -23,7 +23,7 @@ use wiri::layout::{LayoutConfig, TilingEngine};
 use wiri::overlay::{
     BindingsCheatsheet, OverviewBanner, StatusBar, StatusBarContent, WorkspaceIndicator,
 };
-use wiri::utils::{OutputId, WindowId};
+use wiri::utils::WindowId;
 
 use parking_lot::RwLock;
 
@@ -381,6 +381,12 @@ async fn main() -> Result<()> {
         }
         {
             let mut eng = engine.write();
+            // Focus follows what the user is looking at, not whichever window
+            // the enumeration happened to list last.
+            let foreground = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            if !foreground.0.is_null() {
+                eng.sync_os_foreground(WindowId::new(foreground.0 as isize), &backend_handle);
+            }
             eng.reveal_focused();
             eng.apply_all(&backend_handle);
         }
@@ -1067,7 +1073,11 @@ fn handle_backend_event(
             let window_id = WindowId::new(hwnd);
             add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
             ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
-            if let Some((col_idx, ws_id)) = focus_tiled_window(window_id, handle, engine) {
+            // The OS already activated this window; only mirror that into the
+            // engine's focus state (no activation request of our own, which
+            // would hand the focus back and forth between windows of one app).
+            let synced = engine.write().sync_os_foreground(window_id, handle);
+            if let Some((col_idx, ws_id)) = synced {
                 ipc_server.broadcast_event(IpcEvent::ColumnFocused {
                     window_hwnd: hwnd,
                     column_index: col_idx,
@@ -1229,53 +1239,6 @@ fn reconcile_visible_windows(
         if let Some(mut eng) = engine.try_write() {
             eng.apply_all(handle);
         }
-    }
-}
-
-fn tiled_window_location(
-    engine: &TilingEngine,
-    window_id: WindowId,
-) -> Option<(OutputId, i32, usize)> {
-    for (output_id, monitor) in engine.monitors().iter() {
-        for (workspace_id, workspace) in &monitor.workspaces {
-            for (column_idx, column) in workspace.columns.iter().enumerate() {
-                if column.tiles.iter().any(|tile| tile.window_id == window_id) {
-                    return Some((*output_id, *workspace_id, column_idx));
-                }
-            }
-        }
-    }
-    None
-}
-
-fn focus_tiled_window(
-    window_id: WindowId,
-    handle: &BackendHandle,
-    engine: &Arc<RwLock<TilingEngine>>,
-) -> Option<(usize, i32)> {
-    let (output_id, workspace_id, column_idx) = {
-        let eng = engine.read();
-        tiled_window_location(&eng, window_id)?
-    };
-
-    let mut eng = engine.write();
-    let did_focus = {
-        let monitor = eng.monitors_mut().get_mut(&output_id)?;
-        if monitor.active_workspace_id() != workspace_id {
-            monitor.switch_workspace(workspace_id);
-        }
-        monitor.focus_window = Some(window_id);
-        monitor.focus_column = Some(column_idx);
-        monitor.focus_ring.push(window_id);
-        true
-    };
-
-    if did_focus {
-        eng.monitors_mut().set_focused(output_id);
-        eng.apply_all(handle);
-        Some((column_idx, workspace_id))
-    } else {
-        None
     }
 }
 
