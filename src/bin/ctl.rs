@@ -735,6 +735,7 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
             );
         }
         IpcMessage::MonitorList => print_monitor_list(resp),
+        IpcMessage::GetFocus => outln!("{}", format_focus(resp)),
         IpcMessage::ListBindings => print_bindings(resp),
         IpcMessage::CaptureWindow { window_hwnd, .. } => {
             let path = resp
@@ -810,6 +811,22 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 outln!("ok");
             }
         }
+    }
+}
+
+/// Format the response to `GetFocus`: the focused window and its workspace.
+fn format_focus(resp: &serde_json::Value) -> String {
+    let result = resp.get("result").cloned().unwrap_or(serde_json::json!({}));
+    let workspace = result
+        .get("workspace_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    match result.get("window_hwnd").and_then(|v| v.as_i64()) {
+        Some(hwnd) => format!(
+            "Focused window {} (0x{:x}) on workspace {}.",
+            hwnd, hwnd, workspace
+        ),
+        None => format!("No window is focused (workspace {}).", workspace),
     }
 }
 
@@ -1432,7 +1449,24 @@ fn wall_clock_hms() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fold_to_ascii;
+    use super::{fold_to_ascii, format_focus};
+
+    #[test]
+    fn test_format_focus_names_the_window_and_the_workspace() {
+        let resp = serde_json::json!({
+            "success": true,
+            "result": { "window_hwnd": 4720612, "workspace_id": 2, "monitor_id": 7 }
+        });
+        assert_eq!(
+            format_focus(&resp),
+            "Focused window 4720612 (0x4807e4) on workspace 2."
+        );
+        let empty = serde_json::json!({
+            "success": true,
+            "result": { "window_hwnd": null, "workspace_id": 1, "monitor_id": 7 }
+        });
+        assert_eq!(format_focus(&empty), "No window is focused (workspace 1).");
+    }
 
     #[test]
     fn test_fold_to_ascii_replaces_table_decoration() {
