@@ -21,28 +21,26 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, MONITORINFO, MONITORINFOEXW,
     MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW};
+use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
 #[cfg_attr(test, allow(unused_imports))]
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetClassNameW,
-    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, MoveWindow, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    HWND_TOP, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-    WM_CLOSE,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, MoveWindow, PostMessageW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, HWND_TOP,
+    SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
 };
 
-/// Force a window to repaint after a tile move. Fixes apps (Cascadia/Windows
+/// Ask a window to repaint after a tile move. Fixes apps (Cascadia/Windows
 /// Terminal, Edge, some Electron) that show a black client area after
 /// SetWindowPos because they don't process WM_SIZE eagerly.
+///
+/// Only *invalidates*: `RDW_UPDATENOW` would send WM_PAINT synchronously to the
+/// other process, and a slow or hung application then froze wiri while it held
+/// the engine lock - which is also what froze the IPC server for minutes.
 fn request_redraw(hwnd: HWND) {
     unsafe {
-        let _ = RedrawWindow(
-            hwnd,
-            None,
-            None,
-            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-        );
+        let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
     }
 }
 
@@ -688,83 +686,60 @@ impl BackendHandle {
 
         #[cfg(not(test))]
         {
-            let hdwp_initial = unsafe { BeginDeferWindowPos(n as i32) };
-            let mut hdwp = match hdwp_initial {
-                Ok(h) if !h.is_invalid() => h,
-                _ => {
-                    // Fall back to one-by-one positioning.
-                    for (hwnd, rect, flags) in positions {
-                        if self.set_window_position(*hwnd, *rect, *flags).is_ok() {
-                            applied.insert(*hwnd);
-                        }
-                    }
-                    return applied;
-                }
-            };
-
-            let mut deferred = Vec::new();
+            // One asynchronous SetWindowPos per window (see `set_window_position`).
+            // This used to be a BeginDeferWindowPos/EndDeferWindowPos batch, which
+            // moves every window synchronously inside one call: a single slow or
+            // hung application then stalled the whole layout pass while the engine
+            // lock was held.  SWP_ASYNCWINDOWPOS (valid for SetWindowPos only -
+            // DeferWindowPos rejects it) posts each move to the window's own thread.
             for (hwnd, rect, flags) in positions {
-                let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
-                // Same shadow-margin compensation as set_window_position above.
-                let rect = expand_for_shadow_margin(hwnd_win, *rect);
-                // DeferWindowPos returns a new HDWP that incorporates this change.
-                // We feed each new HDWP back in.
-                let result = unsafe {
-                    DeferWindowPos(
-                        hdwp,
-                        hwnd_win,
-                        HWND_TOP,
-                        rect.loc.x,
-                        rect.loc.y,
-                        rect.size.w as i32,
-                        rect.size.h as i32,
-                        *flags | SWP_NOCOPYBITS,
-                    )
-                };
-                match result {
-                    Ok(new_hdwp) if !new_hdwp.is_invalid() => {
-                        hdwp = new_hdwp;
-                        deferred.push(*hwnd);
+                match self.set_window_position(*hwnd, *rect, *flags) {
+                    Ok(()) => {
+                        applied.insert(*hwnd);
                     }
-                    _ => {
-                        debug!("DeferWindowPos failed for hwnd={}", hwnd);
-                    }
+                    Err(e) => debug!("SetWindowPos failed for hwnd={}: {}", hwnd, e),
                 }
-            }
-
-            // Commit the entire batch atomically.
-            if let Err(e) = unsafe { EndDeferWindowPos(hdwp) } {
-                warn!("EndDeferWindowPos failed: {:?}", e);
-                return applied;
-            }
-
-            for hwnd in deferred {
-                self.mark_self_applied(hwnd);
-                applied.insert(hwnd);
-            }
-
-            // Trigger redraws AFTER commit so apps see the final size.
-            for hwnd in &applied {
-                let hwnd_win = HWND(*hwnd as *mut std::ffi::c_void);
-                request_redraw(hwnd_win);
             }
         }
 
         applied
     }
 
+    /// Show or hide a window without ever blocking on it and without stealing
+    /// the focus.
+    ///
+    /// Showing uses `SW_SHOWNA` ("show in its current state, do not activate")
+    /// rather than `SW_SHOWNORMAL`, which activates the window and restores a
+    /// maximised or minimised one - each of those made wiri grab the focus away
+    /// from whatever the user was typing into.  The request goes through
+    /// `ShowWindowAsync`, which posts to the window's own thread: a hung
+    /// application can no longer freeze wiri (and, through the engine lock, its
+    /// IPC server) inside a synchronous `ShowWindow`.
     pub fn show_window(&self, hwnd: isize, show: bool) -> Result<()> {
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
         unsafe {
-            let _ = ShowWindow(
-                HWND(hwnd as *mut std::ffi::c_void),
-                if show {
-                    SHOW_WINDOW_CMD(1)
-                } else {
-                    SHOW_WINDOW_CMD(0)
-                },
-            );
+            let _ = ShowWindowAsync(hwnd_win, if show { SW_SHOWNA } else { SW_HIDE });
         }
         Ok(())
+    }
+
+    pub fn send_event(&self, event: BackendEvent) {
+        if let Err(_) = self.event_tx.send(event) {
+            debug!("send_event: channel closed (receiver dropped)");
+        }
+    }
+
+    pub fn add_window(&self, hwnd: isize, info: WindowInfo) {
+        self.windows.write().insert(hwnd, info);
+    }
+
+    pub fn remove_window(&self, hwnd: isize) {
+        self.windows.write().remove(&hwnd);
+        SHADOW_MARGINS.lock().remove(&hwnd);
+    }
+
+    pub fn update_window(&self, hwnd: isize, info: WindowInfo) {
+        self.windows.write().insert(hwnd, info);
     }
 
     /// Bring `hwnd` to the foreground. Uses the AttachThreadInput trick as a fallback
@@ -815,24 +790,6 @@ impl BackendHandle {
         ))
     }
 
-    pub fn send_event(&self, event: BackendEvent) {
-        if let Err(_) = self.event_tx.send(event) {
-            debug!("send_event: channel closed (receiver dropped)");
-        }
-    }
-
-    pub fn add_window(&self, hwnd: isize, info: WindowInfo) {
-        self.windows.write().insert(hwnd, info);
-    }
-
-    pub fn remove_window(&self, hwnd: isize) {
-        self.windows.write().remove(&hwnd);
-    }
-
-    pub fn update_window(&self, hwnd: isize, info: WindowInfo) {
-        self.windows.write().insert(hwnd, info);
-    }
-
     /// Look up the process executable name for a PID via QueryFullProcessImageNameW.
     /// Returns the file stem (e.g. "firefox" for "C:\Program Files\Mozilla Firefox\firefox.exe").
     /// Returns None on failure or for PID 0.
@@ -864,6 +821,7 @@ impl BackendHandle {
                 .map(|s| s.to_string_lossy().into_owned())
         }
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1169,61 @@ mod tests {
         );
     }
 
+    fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
+        RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        }
+    }
+
+    #[test]
+    fn test_shadow_margins_from_a_normal_window() {
+        // A typical Windows 11 window: 7 px of invisible border left, right
+        // and bottom, none on top.
+        let frame = rect(93, 100, 807, 507);
+        let visible = rect(100, 100, 800, 500);
+        assert_eq!(shadow_margins_from(&frame, &visible), Some([7, 0, 7, 7]));
+    }
+
+    #[test]
+    fn test_shadow_margins_reject_implausible_measurements() {
+        // Hidden / minimised window: DWM reports an empty rectangle.
+        assert_eq!(
+            shadow_margins_from(&rect(19, 26, 553, 413), &rect(0, 0, 0, 0)),
+            None
+        );
+        // Visible rect far outside the frame (mid-move disagreement).
+        assert_eq!(
+            shadow_margins_from(&rect(100, 100, 700, 500), &rect(10, 10, 600, 400)),
+            None
+        );
+        // Custom non-client area: more than 32 px of "margin".
+        assert_eq!(
+            shadow_margins_from(&rect(0, 0, 800, 600), &rect(40, 0, 760, 560)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_shadow_margins_tolerate_a_pixel_of_rounding() {
+        let frame = rect(100, 100, 700, 500);
+        let visible = rect(99, 100, 700, 500);
+        assert_eq!(shadow_margins_from(&frame, &visible), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_apply_shadow_margins_puts_the_visible_edges_on_the_target() {
+        // The visible rect of the window below must land on (100, 50) 600x400:
+        // the frame is 7 px wider on both sides and 7 px taller at the bottom.
+        let wanted = Rect::new(100, 50, 600, 400);
+        let frame = apply_shadow_margins(wanted, [7, 0, 7, 7]);
+        assert_eq!(frame, Rect::new(93, 50, 614, 407));
+        // And it is a no-op without margins (WinUI windows have none).
+        assert_eq!(apply_shadow_margins(wanted, [0, 0, 0, 0]), wanted);
+    }
+
     /// mark_self_applied for many HWNDs triggers the internal prune when len > 256.
     #[test]
     fn test_self_applied_tracker_bulk_prune() {
@@ -1254,6 +1267,15 @@ fn expand_for_shadow_margin(hwnd: HWND, rect: Rect) -> Rect {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
+    // The invisible border of a window does not change while it is managed, but
+    // measuring it needs `GetWindowRect` and DWM's frame bounds to agree - and
+    // right after a (now asynchronous) move they briefly do not.  Measure once,
+    // while the window is at rest, and reuse the answer.
+    let key = hwnd.0 as isize;
+    if let Some(margins) = SHADOW_MARGINS.lock().get(&key).copied() {
+        return apply_shadow_margins(rect, margins);
+    }
+
     let mut frame = RECT::default();
     let mut visible = RECT::default();
     unsafe {
@@ -1271,19 +1293,50 @@ fn expand_for_shadow_margin(hwnd: HWND, rect: Rect) -> Rect {
         }
     }
 
-    // visible is strictly inside or equal to frame on each side.
-    let left = (visible.left - frame.left).max(0);
-    let top = (visible.top - frame.top).max(0);
-    let right = (frame.right - visible.right).max(0);
-    let bottom = (frame.bottom - visible.bottom).max(0);
-
-    // Sanity cap — if any side margin exceeds 32 px the window is doing
-    // something unusual (custom non-client area) and our compensation may
-    // hurt more than help.  Bail to the uncompensated rect in that case.
-    if left > 32 || top > 32 || right > 32 || bottom > 32 {
-        return rect;
+    match shadow_margins_from(&frame, &visible) {
+        Some(margins) => {
+            SHADOW_MARGINS.lock().insert(key, margins);
+            apply_shadow_margins(rect, margins)
+        }
+        // Hidden, minimised or mid-move window, or a custom non-client area:
+        // placing it uncompensated is better than guessing.
+        None => rect,
     }
+}
 
+/// Invisible-border margins `[left, top, right, bottom]` per window.
+static SHADOW_MARGINS: std::sync::LazyLock<parking_lot::Mutex<HashMap<isize, [i32; 4]>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Margins between the full window rect (`frame`, what `GetWindowRect` reports)
+/// and the visible one (`visible`, DWM's extended frame bounds), ordered
+/// `[left, top, right, bottom]`.  `None` when the pair is not a plausible
+/// measurement: the visible rect must lie inside the frame (give or take a
+/// pixel of DPI rounding) and no margin may exceed 32 px - anything else is a
+/// hidden or minimised window (DWM reports an empty rect) or a window with a
+/// custom non-client area where compensating would hurt more than help.
+fn shadow_margins_from(
+    frame: &windows::Win32::Foundation::RECT,
+    visible: &windows::Win32::Foundation::RECT,
+) -> Option<[i32; 4]> {
+    let raw = [
+        visible.left - frame.left,
+        visible.top - frame.top,
+        frame.right - visible.right,
+        frame.bottom - visible.bottom,
+    ];
+    if raw.iter().all(|m| (-2..=32).contains(m)) {
+        Some(raw.map(|m| m.max(0)))
+    } else {
+        None
+    }
+}
+
+/// Grow `rect` (the wanted *visible* rectangle) by the invisible margins so
+/// that, once the window frame occupies the result, the visible edges land on
+/// `rect`.
+fn apply_shadow_margins(rect: Rect, margins: [i32; 4]) -> Rect {
+    let [left, top, right, bottom] = margins;
     Rect::new(
         rect.loc.x - left,
         rect.loc.y - top,

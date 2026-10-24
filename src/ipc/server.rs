@@ -10,6 +10,11 @@ use super::PIPE_PATH;
 use crate::layout::TilingEngine;
 use crate::utils::{Rect, WindowId};
 
+/// How long a client waits for the answer to one request before it is told
+/// that wiri is busy.  `wiri-ctl` and scripts rely on a reply within about two
+/// seconds, whatever the window manager is doing.
+const IPC_RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
 pub struct IpcServer {
     event_tx: broadcast::Sender<IpcEvent>,
     engine: Option<Arc<parking_lot::RwLock<TilingEngine>>>,
@@ -179,7 +184,7 @@ impl IpcServer {
     }
 
     async fn handle_client(
-        &self,
+        self: Arc<Self>,
         mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
     ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -271,7 +276,12 @@ impl IpcServer {
             }
 
             // Process the message and send response.
-            let response = self.process_message(message);
+            //
+            // The handlers take the engine lock and make Win32 calls, which can
+            // wait on a busy or hung application.  Run them on a blocking thread
+            // (so they never pin a runtime worker) and answer within
+            // `IPC_RESPONSE_BUDGET` whatever happens: `wiri-ctl` must never hang.
+            let response = self.respond(message).await;
             let response_bytes = serde_json::to_vec(&response)?;
             let _ = pipe.write_all(&response_bytes).await;
             // Flush + disconnect: ctl uses read_to_end which waits for EOF.
@@ -279,6 +289,37 @@ impl IpcServer {
             let _ = pipe.flush().await;
             let _ = pipe.shutdown().await;
             return Ok(());
+        }
+    }
+
+    /// Run `process_message` on a blocking thread and reply within
+    /// [`IPC_RESPONSE_BUDGET`].  If the handler is still waiting (typically for
+    /// the engine lock while a layout pass is stuck on an unresponsive window)
+    /// the client gets a clear "busy" error instead of a hung pipe; the request
+    /// itself stays queued and takes effect when the lock frees up.
+    async fn respond(self: &Arc<Self>, message: IpcMessage) -> serde_json::Value {
+        let ipc = Arc::clone(self);
+        let work = tokio::task::spawn_blocking(move || ipc.process_message(message));
+        match tokio::time::timeout(IPC_RESPONSE_BUDGET, work).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(join_error)) => {
+                error!("IPC handler panicked: {}", join_error);
+                serde_json::json!({
+                    "success": false,
+                    "error": format!("internal error while handling the request: {}", join_error)
+                })
+            }
+            Err(_) => {
+                warn!(
+                    "IPC request still running after {:?}; replying 'busy' (engine lock held?)",
+                    IPC_RESPONSE_BUDGET
+                );
+                serde_json::json!({
+                    "success": false,
+                    "error": "wiri is busy (the window layout is being updated); \
+                              the request is queued and will be handled shortly"
+                })
+            }
         }
     }
 
