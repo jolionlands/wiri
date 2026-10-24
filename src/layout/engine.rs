@@ -54,6 +54,19 @@ fn parse_color_to_u32(color_hex: &str) -> u32 {
     }
 }
 
+/// The rect to give a tile whose layout rect is `rect` while `view` is what is
+/// on screen.  A tile that intersects the view keeps its rect.  One that lies
+/// completely outside is parked at `park_y` (below every monitor) at the left
+/// edge of the view, keeping its size, so that it is out of sight on every
+/// monitor and its rect does not change while the strip is scrolled.
+fn parked_rect(rect: Rect, view: Rect, park_y: i32) -> Rect {
+    if rect.intersects(view) {
+        rect
+    } else {
+        Rect::new(view.loc.x, park_y, rect.size.w, rect.size.h)
+    }
+}
+
 /// State stored while overview mode is active.
 ///
 /// Wraps the legacy `f64` zoom level with extra context — namely the precomputed
@@ -137,6 +150,12 @@ impl Default for BorderColorMode {
 pub struct LayoutConfig {
     pub column_width: u32,
     pub column_width_mode: ColumnWidthMode,
+    /// Proportional mode only: never split the view among more than this many
+    /// columns.  With 3, one window fills the screen, two share it, three get a
+    /// third each, and a fourth window scrolls in instead of squeezing every
+    /// column narrower.  0 = no limit (the columns shrink to the `column_width`
+    /// floor, which is the historic behaviour).
+    pub max_visible_columns: u32,
     pub column_gap: i32,
     pub window_gap: i32,
     pub border_width: i32,
@@ -200,6 +219,7 @@ impl Default for LayoutConfig {
         Self {
             column_width: 500,
             column_width_mode: ColumnWidthMode::Fixed,
+            max_visible_columns: 0,
             column_gap: 16,
             window_gap: 12,
             border_width: 4,
@@ -268,6 +288,7 @@ impl LayoutConfig {
         }
         lc.scroll_step = config.layout.scroll_step as i32;
         lc.column_width = config.layout.column_width;
+        lc.max_visible_columns = config.layout.max_visible_columns;
         lc.column_width_mode = match config.layout.column_width_mode.as_str() {
             "fixed" => ColumnWidthMode::Fixed,
             _ => ColumnWidthMode::Proportional,
@@ -1140,23 +1161,19 @@ impl TilingEngine {
         self.blur_applied.remove(&window_id);
 
         if self.tiled_windows.remove(&window_id).is_some() {
-            let mut found_output = None;
-            for (output_id, monitor) in self.monitors.iter() {
-                if monitor
-                    .workspace()
-                    .and_then(|w| w.find_window_column(window_id))
-                    .is_some()
-                {
-                    found_output = Some(*output_id);
-                    break;
-                }
-            }
+            // Look on every workspace, not just the active one: a window can
+            // close while it is parked on an inactive workspace.
+            let found_output = self.locate_window(window_id).map(|(output_id, _, _)| output_id);
             if let Some(output_id) = found_output {
                 if let Some(monitor) = self.monitors.get_mut(&output_id) {
                     monitor.remove_window(window_id);
                 }
                 // Item 7: maintain trailing empty workspace
                 self.maintain_empty_workspace(output_id);
+                // The strip got shorter: bring the survivors (and the newly
+                // focused column) back into view instead of leaving them
+                // scrolled off to the left.
+                self.reveal_focused_column(output_id);
                 self.apply_layout_for_monitor(output_id, backend);
             }
         }
@@ -1182,7 +1199,77 @@ impl TilingEngine {
     }
 
     fn view_width_for_monitor(monitor: &Monitor, config: &LayoutConfig) -> i32 {
-        monitor.work_area.size.w as i32 - config.outer_gaps.1 - config.outer_gaps.3
+        monitor.work_area.size.w as i32
+            - config.outer_gaps.1
+            - config.outer_gaps.3
+            - config.reserve_left as i32
+            - config.reserve_right as i32
+    }
+
+    /// Y coordinate just below the bottom edge of every monitor: the parking
+    /// lot for tiles that are scrolled completely out of view.
+    fn parking_y(&self) -> i32 {
+        self.monitors
+            .values()
+            .map(|m| m.bounds.bottom())
+            .max()
+            .unwrap_or(0)
+            + 64
+    }
+
+    /// Find `window_id` on any monitor and workspace.
+    /// Returns `(monitor, workspace id, column index)`.
+    pub fn locate_window(&self, window_id: WindowId) -> Option<(OutputId, i32, usize)> {
+        for (output_id, monitor) in self.monitors.iter() {
+            for (workspace_id, workspace) in &monitor.workspaces {
+                if let Some(column_idx) = workspace.find_window_column(window_id) {
+                    return Some((*output_id, *workspace_id, column_idx));
+                }
+            }
+        }
+        None
+    }
+
+    /// Scroll the focused monitor's active workspace so that its focused column
+    /// is fully visible.  Called after a window was added (new windows take the
+    /// focus), so that a window opened beyond the right edge scrolls into view
+    /// instead of landing off screen.
+    pub fn reveal_focused(&mut self) {
+        if let Some(output_id) = self.monitors.focused_id() {
+            self.reveal_focused_column(output_id);
+        }
+    }
+
+    /// Scroll the active workspace of `focused_output` the least amount that
+    /// brings the focused column fully into view.  A column that is already
+    /// visible is left where it is (no scroll), and the offset stays inside the
+    /// valid range.
+    fn reveal_focused_column(&mut self, focused_output: OutputId) {
+        let focus_col = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_column);
+        let view_width = self
+            .monitors
+            .get(&focused_output)
+            .map(|m| Self::view_width_for_monitor(m, &self.config));
+        let default_width = match (view_width, self.monitors.get(&focused_output)) {
+            (Some(vw), Some(m)) => m
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, &self.config)),
+            _ => None,
+        };
+
+        if let (Some(col_idx), Some(vw), Some(col_w)) = (focus_col, view_width, default_width) {
+            let gap = self.config.column_gap;
+            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+                if let Some(workspace) = monitor.workspace_mut() {
+                    workspace.reveal_column(col_idx, col_w, gap, vw);
+                    // Keep the strip filling the view (no empty space at the right).
+                    workspace.fit_scroll(col_w, gap, vw);
+                }
+            }
+        }
     }
 
     fn hide_inactive_workspace_windows_for_monitor(
@@ -1230,12 +1317,86 @@ impl TilingEngine {
                 if num_columns == 0 {
                     config.column_width as i32
                 } else {
-                    let total_gaps = config.column_gap * (num_columns as i32 - 1).max(0);
-                    let available = view_width - total_gaps;
-                    (available / num_columns as i32).max(config.column_width as i32 / 2)
+                    Self::auto_column_width(
+                        &vec![None; num_columns],
+                        view_width,
+                        config.column_gap,
+                        config,
+                    )
                 }
             }
         }
+    }
+
+    /// Narrowest column the equal split of proportional mode may produce.
+    ///
+    /// The historic floor is half of `column_width`.  With `max_visible_columns`
+    /// set (the default config uses 3) the floor is also the width at which that
+    /// many columns exactly fill the view, so a fourth window scrolls into view
+    /// instead of squeezing every column down to a sliver.
+    fn min_proportional_width(view_width: i32, gap: i32, cfg: &LayoutConfig) -> i32 {
+        let historic = cfg.column_width as i32 / 2;
+        if cfg.max_visible_columns == 0 {
+            return historic;
+        }
+        let k = cfg.max_visible_columns as i32;
+        let share = (view_width - gap * (k - 1)) / k;
+        historic.max(share)
+    }
+
+    /// Width of a column that has no explicit width of its own.
+    ///
+    /// Fixed mode: the configured pixel width.  Proportional mode: the columns
+    /// without an explicit width split whatever the explicitly sized ones leave
+    /// over, but never get narrower than [`Self::min_proportional_width`].
+    fn auto_column_width(
+        explicit: &[Option<u32>],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> i32 {
+        match cfg.column_width_mode {
+            ColumnWidthMode::Fixed => cfg.column_width as i32,
+            ColumnWidthMode::Proportional => {
+                let n_auto = explicit.iter().filter(|w| w.is_none()).count() as i32;
+                if n_auto == 0 {
+                    return cfg.column_width as i32;
+                }
+                let explicit_total: i32 = explicit.iter().flatten().map(|w| *w as i32).sum();
+                let total_gaps = gap * (explicit.len() as i32 - 1).max(0);
+                let available = view_width - total_gaps - explicit_total;
+                (available / n_auto).max(Self::min_proportional_width(view_width, gap, cfg))
+            }
+        }
+    }
+
+    /// Width of every column of a workspace, in order.  A column with an
+    /// explicit width (set by the width presets or the grow/shrink actions)
+    /// keeps it in both layout modes; the rest get [`Self::auto_column_width`].
+    pub fn column_widths(
+        explicit: &[Option<u32>],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> Vec<i32> {
+        let auto = Self::auto_column_width(explicit, view_width, gap, cfg);
+        explicit
+            .iter()
+            .map(|w| w.map(|w| w as i32).unwrap_or(auto))
+            .collect()
+    }
+
+    /// The width a column without explicit width gets on `workspace`.
+    fn workspace_default_width(
+        workspace: &crate::layout::workspace::Workspace,
+        view_width: i32,
+        cfg: &LayoutConfig,
+    ) -> i32 {
+        let explicit: Vec<Option<u32>> = workspace.columns.iter().map(|c| c.width).collect();
+        if explicit.is_empty() {
+            return Self::effective_column_width(0, view_width, cfg);
+        }
+        Self::auto_column_width(&explicit, view_width, cfg.column_gap, cfg)
     }
 
     pub fn apply_layout_for_monitor(&mut self, output_id: OutputId, backend: &BackendHandle) {
@@ -1474,6 +1635,23 @@ impl TilingEngine {
                 .collect()
         } else {
             positions
+        };
+
+        // Park columns that are scrolled completely out of view below every
+        // monitor, so they neither show up on a neighbouring monitor nor lie on
+        // top of the visible tiles.  The parked rect is independent of the
+        // scroll offset, so scrolling does not re-position invisible windows.
+        // (Not while overview or a workspace slide is positioning tiles
+        // outside the monitor on purpose.)
+        let positions: Vec<(WindowId, Rect)> = if overview_active || slide_offset_y != 0 {
+            positions
+        } else {
+            let view = monitor.bounds;
+            let park_y = self.parking_y();
+            positions
+                .into_iter()
+                .map(|(wid, r)| (wid, parked_rect(r, view, park_y)))
+                .collect()
         };
 
         // Snapshot positions for later write-back to Tile.cached_bounds so that
@@ -2143,23 +2321,9 @@ impl TilingEngine {
         // overview is active.  Falls back to overview_zoom() when overview is on.
         let zoom = self.effective_zoom();
 
-        let proportional_width = {
-            let total_gaps = column_gap * (num_columns as i32 - 1).max(0);
-            let available = work_rect.size.w as i32 - total_gaps;
-            (available / num_columns as i32).max(cfg.column_width as i32 / 2)
-        };
-
-        let col_widths: Vec<i32> = workspace
-            .columns
-            .iter()
-            .map(|col| match cfg.column_width_mode {
-                ColumnWidthMode::Proportional => proportional_width,
-                ColumnWidthMode::Fixed => col
-                    .width
-                    .map(|w| w as i32)
-                    .unwrap_or(cfg.column_width as i32),
-            })
-            .collect();
+        let explicit_widths: Vec<Option<u32>> = workspace.columns.iter().map(|c| c.width).collect();
+        let col_widths: Vec<i32> =
+            Self::column_widths(&explicit_widths, work_rect.size.w as i32, column_gap, cfg);
 
         let mut col_x: Vec<i32> = Vec::with_capacity(num_columns);
         let mut x = 0i32;
@@ -2199,12 +2363,10 @@ impl TilingEngine {
             let screen_x = work_rect.loc.x + scaled_x;
             let scaled_w = (cw as f64 * zoom) as u32;
 
-            if zoom >= 1.0
-                && (screen_x + (scaled_w as i32) < work_rect.loc.x
-                    || screen_x > work_rect.loc.x + work_rect.size.w as i32)
-            {
-                continue;
-            }
+            // Columns scrolled out of view are NOT skipped here.  A window that
+            // is left out of the layout keeps whatever position it last had -
+            // usually on top of the visible tiles.  `apply_layout_for_monitor`
+            // parks the fully-off-screen ones out of sight instead.
 
             if column.tiles.is_empty() {
                 continue;
@@ -2331,8 +2493,10 @@ impl TilingEngine {
         {
             let monitor = self.monitors.get_mut(&focused_output).unwrap();
             let view_width = Self::view_width_for_monitor(monitor, &self.config);
-            let num_cols = monitor.workspace().map(|w| w.columns.len()).unwrap_or(0);
-            let col_w = Self::effective_column_width(num_cols, view_width, &self.config);
+            let col_w = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, view_width, &self.config))
+                .unwrap_or_else(|| Self::effective_column_width(0, view_width, &self.config));
             if let Some(workspace) = monitor.workspace_mut() {
                 workspace.clamp_scroll(col_w, self.config.column_gap, view_width);
             }
@@ -4751,8 +4915,10 @@ impl TilingEngine {
                 None => return,
             };
             let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            let cw = Self::effective_column_width(nc, vw, &self.config);
+            let cw = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, &self.config))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, &self.config));
             (fc, vw, cw, self.config.column_gap)
         };
 
@@ -4846,17 +5012,18 @@ impl TilingEngine {
             None => return,
         };
 
-        let (view_width, num_cols) = {
+        let (_view_width, default_col_w) = {
             let monitor = match self.monitors.get(&focused_output) {
                 Some(m) => m,
                 None => return,
             };
             let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            (vw, nc)
+            let dw = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, &self.config))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, &self.config));
+            (vw, dw)
         };
-
-        let default_col_w = Self::effective_column_width(num_cols, view_width, &self.config);
 
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             if let Some(focus_col) = monitor.focus_column {
@@ -4967,16 +5134,17 @@ impl TilingEngine {
             return;
         };
 
-        let (view_width, num_cols) = {
+        let (view_width, default_col_w) = {
             let Some(monitor) = self.monitors.get(&focused_output) else {
                 return;
             };
             let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            (vw, nc)
+            let dw = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, &self.config))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, &self.config));
+            (vw, dw)
         };
-
-        let default_col_w = Self::effective_column_width(num_cols, view_width, &self.config);
         let gap = self.config.column_gap;
 
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
@@ -5036,16 +5204,17 @@ impl TilingEngine {
             return;
         };
 
-        let (view_width, num_cols) = {
+        let (view_width, default_col_w) = {
             let Some(monitor) = self.monitors.get(&focused_output) else {
                 return;
             };
             let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            (vw, nc)
+            let dw = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, &self.config))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, &self.config));
+            (vw, dw)
         };
-
-        let default_col_w = Self::effective_column_width(num_cols, view_width, &self.config);
         // 10% .. 95% of view_width, but never smaller than 50 px.
         let min_w = ((view_width as f32) * 0.10).round().max(50.0) as i32;
         let max_w = ((view_width as f32) * 0.95).round() as i32;
@@ -10537,5 +10706,170 @@ mod tests {
             !engine_single.is_over_gap(mid_gap_x, mid_y),
             "single-column workspace has no gap",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime-defect regression tests (live desktop: focus loop, ghost tiles,
+    // windows left behind, narrow columns)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parked_rect_keeps_visible_tiles_and_parks_off_screen_ones() {
+        let view = Rect::new(0, 0, 1366, 768);
+        let visible = Rect::new(100, 8, 400, 700);
+        assert_eq!(parked_rect(visible, view, 832), visible);
+        // Partly on screen: keeps its place (the strip is clipped by the edge).
+        let partly = Rect::new(-200, 8, 400, 700);
+        assert_eq!(parked_rect(partly, view, 832), partly);
+        // Completely off to the left or the right: parked below the screen.
+        let left = Rect::new(-500, 8, 400, 700);
+        assert_eq!(parked_rect(left, view, 832), Rect::new(0, 832, 400, 700));
+        let right = Rect::new(1366, 8, 400, 700);
+        assert_eq!(parked_rect(right, view, 832), Rect::new(0, 832, 400, 700));
+        // How far out of view a tile is does not matter: scrolling must not
+        // re-position windows nobody can see.
+        let far = Rect::new(9000, 8, 400, 700);
+        assert_eq!(parked_rect(far, view, 832), parked_rect(right, view, 832));
+    }
+
+    #[test]
+    fn test_column_widths_proportional_stop_shrinking_at_max_visible_columns() {
+        let cfg = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 500,
+            max_visible_columns: 3,
+            ..LayoutConfig::default()
+        };
+        let widths = |n: usize| TilingEngine::column_widths(&vec![None; n], 1350, 16, &cfg);
+        assert_eq!(widths(1), vec![1350]);
+        assert_eq!(widths(2), vec![667, 667]);
+        assert_eq!(widths(3), vec![439, 439, 439]);
+        // From the fourth window on the columns stop shrinking and the strip
+        // scrolls: this is the "238 px columns on a 1366 px display" fix.
+        assert_eq!(widths(4), vec![439; 4]);
+        assert_eq!(widths(8), vec![439; 8]);
+
+        // Without the cap the historic floor (column_width / 2) applies.
+        let uncapped = LayoutConfig {
+            max_visible_columns: 0,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            TilingEngine::column_widths(&vec![None; 8], 1350, 16, &uncapped),
+            vec![250; 8]
+        );
+    }
+
+    #[test]
+    fn test_column_widths_explicit_width_wins_in_proportional_mode() {
+        let cfg = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 500,
+            max_visible_columns: 3,
+            ..LayoutConfig::default()
+        };
+        // The width presets and grow/shrink actions set an explicit width; the
+        // proportional mode used to ignore it, so those keys did nothing.
+        assert_eq!(
+            TilingEngine::column_widths(&[Some(300), None], 1350, 16, &cfg),
+            vec![300, 1034]
+        );
+        assert_eq!(
+            TilingEngine::column_widths(&[Some(600), None, None], 1350, 16, &cfg),
+            vec![600, 439, 439]
+        );
+        // Fixed mode is unchanged: explicit width or the configured one.
+        let fixed = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            ..LayoutConfig::default()
+        };
+        assert_eq!(
+            TilingEngine::column_widths(&[Some(300), None], 1350, 16, &fixed),
+            vec![300, 500]
+        );
+    }
+
+    #[test]
+    fn test_remove_window_clears_ghost_tiles_on_inactive_workspaces() {
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        let oid = engine.focused_output().unwrap();
+        engine.add_window_with_target(
+            make_window(100, 0, 0),
+            AddWindowTarget::Workspace {
+                output: oid,
+                workspace_id: 1,
+            },
+            &backend,
+            false,
+        );
+        assert!(engine.locate_window(WindowId::new(100)).is_some());
+
+        // The window closes while workspace 1 is not the active one.
+        engine.remove_window(WindowId::new(100), &backend);
+        assert!(
+            engine.locate_window(WindowId::new(100)).is_none(),
+            "a closed window left a ghost tile on its inactive workspace"
+        );
+        assert!(engine.tiled_windows().is_empty());
+    }
+
+    #[test]
+    fn test_columns_beyond_the_view_are_positioned_not_left_behind() {
+        // Windows whose column is scrolled out of view were skipped by the
+        // layout and stayed wherever they were created - on top of the tiles.
+        let mut engine = make_engine(); // fixed 500 px columns, 1904 px view
+        let backend = BackendHandle::default_for_test();
+        for i in 100..108 {
+            engine.add_window(make_window(i, 52, 52), &backend);
+        }
+        engine.apply_all(&backend);
+        for i in 100..108 {
+            let st = engine
+                .applied_state
+                .get(&WindowId::new(i))
+                .unwrap_or_else(|| panic!("window {} was never positioned", i));
+            assert_ne!(
+                st.rect,
+                Rect::new(0, 0, 0, 0),
+                "window {} not positioned",
+                i
+            );
+        }
+        // The first columns are on screen; the last ones are parked below it.
+        let first = engine.applied_state.get(&WindowId::new(100)).unwrap();
+        assert!(first.rect.loc.y < 1080, "first column should be visible");
+        let last = engine.applied_state.get(&WindowId::new(107)).unwrap();
+        assert!(
+            last.rect.loc.y >= 1080,
+            "an off-screen column must be parked below the monitor, got y={}",
+            last.rect.loc.y
+        );
+    }
+
+    #[test]
+    fn test_reveal_focused_scrolls_a_new_window_into_view() {
+        let mut engine = make_engine(); // 500 px columns, 16 px gaps, 1904 px view
+        let backend = BackendHandle::default_for_test();
+        let oid = engine.focused_output().unwrap();
+        for i in 100..105 {
+            engine.add_window(make_window(i, 0, 0), &backend);
+        }
+        let scroll = |e: &TilingEngine| {
+            e.monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .scroll_offset
+                .x
+        };
+        // Nothing scrolls on its own...
+        assert_eq!(scroll(&engine), 0);
+        // ...until the caller reveals the focused (newest) column: its right
+        // edge (5 * 500 + 4 * 16 = 2564) lines up with the view's (1904).
+        engine.reveal_focused();
+        assert_eq!(scroll(&engine), 2564 - 1904);
     }
 }

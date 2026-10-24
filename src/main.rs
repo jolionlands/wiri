@@ -379,7 +379,11 @@ async fn main() -> Result<()> {
                 .write()
                 .add_window_at_startup(window, &backend_handle);
         }
-        engine.write().apply_all(&backend_handle);
+        {
+            let mut eng = engine.write();
+            eng.reveal_focused();
+            eng.apply_all(&backend_handle);
+        }
     }
 
     // System integration (tray icon, autostart, spawner)
@@ -1193,6 +1197,8 @@ fn add_window_if_tileable(
 
     let mut eng = engine.write();
     eng.add_window(window, handle);
+    // New windows take the focus; scroll the strip so the new column is on screen.
+    eng.reveal_focused();
     eng.apply_all(handle);
     true
 }

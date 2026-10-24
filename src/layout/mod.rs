@@ -485,6 +485,16 @@ impl Monitor {
         // Remove from MRU ring unconditionally.
         self.focus_ring.remove(window_id);
 
+        // A window that closes while it is parked on an inactive workspace must
+        // leave that workspace too; otherwise it lingers as a ghost tile that
+        // is positioned (and fails to position) on every later layout pass.
+        let active = self.active_workspace;
+        for (id, workspace) in self.workspaces.iter_mut() {
+            if *id != active {
+                workspace.remove_window(window_id);
+            }
+        }
+
         if let Some(workspace) = self.workspace_mut() {
             let removed = workspace.remove_window(window_id);
             if let Some((col_idx, _)) = removed {
@@ -788,6 +798,25 @@ mod monitor_tests {
         // Window should still be there
         let ws = m.workspace().unwrap();
         assert_eq!(ws.columns.len(), 1);
+    }
+
+    #[test]
+    fn test_monitor_remove_window_on_inactive_workspace() {
+        let mut m = make_monitor();
+        m.add_window(WindowId::new(100));
+        m.switch_workspace(1);
+        m.add_window(WindowId::new(200));
+        // Window 100 closes while workspace 1 is the active one.
+        m.remove_window(WindowId::new(100));
+        m.switch_workspace(0);
+        assert_eq!(
+            m.workspace().unwrap().columns.len(),
+            0,
+            "the closed window must not linger on workspace 0"
+        );
+        // The window on the (then active) workspace is untouched.
+        m.switch_workspace(1);
+        assert_eq!(m.workspace().unwrap().columns.len(), 1);
     }
 
     #[test]

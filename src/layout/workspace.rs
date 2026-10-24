@@ -474,6 +474,55 @@ impl Workspace {
         self.scroll_offset.x != old_offset
     }
 
+    /// Scroll the *least* amount that brings `column_idx` fully into view
+    /// (niri's default `center-focused-column "never"`): a column that is
+    /// already fully visible does not move the view; one hanging off the left
+    /// edge is aligned to the left edge; one hanging off the right edge is
+    /// aligned to the right edge, so its left-hand neighbours stay on screen.
+    /// A column wider than the view is aligned to the left edge.
+    /// Returns true if the scroll offset changed.
+    pub fn reveal_column(
+        &mut self,
+        column_idx: usize,
+        default_width: i32,
+        gap: i32,
+        view_width: i32,
+    ) -> bool {
+        if column_idx >= self.columns.len() || view_width <= 0 {
+            return false;
+        }
+        let (col_start, col_width) = self.column_x_and_width(column_idx, default_width, gap);
+        let col_end = col_start + col_width;
+        let view_start = self.scroll_offset.x;
+        let view_end = view_start + view_width;
+        let old_offset = self.scroll_offset.x;
+
+        if col_width >= view_width || col_start < view_start {
+            self.scroll_offset.x = col_start.max(0);
+        } else if col_end > view_end {
+            self.scroll_offset.x = (col_end - view_width).max(0);
+        }
+
+        self.scroll_offset.x != old_offset
+    }
+
+    /// Pull the scroll offset back into the range in which the strip leaves no
+    /// empty space at its right edge: `0 ..= total_width - view_width` (just
+    /// `0` when everything fits).  Unlike [`Self::clamp_scroll`], which lets a
+    /// deliberate scroll command pan until the last column reaches the leading
+    /// edge, this is what keeps the strip filling the screen after windows
+    /// close - otherwise the survivors stay scrolled off to the left.
+    pub fn fit_scroll(&mut self, default_width: i32, gap: i32, view_width: i32) {
+        if self.columns.is_empty() {
+            self.scroll_offset.x = 0;
+            return;
+        }
+        let last = self.columns.len() - 1;
+        let (last_start, last_width) = self.column_x_and_width(last, default_width, gap);
+        let max_scroll = (last_start + last_width - view_width).max(0);
+        self.scroll_offset.x = self.scroll_offset.x.clamp(0, max_scroll);
+    }
+
     /// Clamp scroll offset so it doesn't go below 0 or beyond the last column.
     /// Supports variable-width columns.
     pub fn clamp_scroll(&mut self, default_width: i32, gap: i32, _view_width: i32) {
@@ -872,6 +921,89 @@ mod tests {
         // Clamp scroll to valid range
         ws.clamp_scroll(500, 16, 800);
         assert_eq!(ws.scroll_offset.x, 1914);
+    }
+
+    #[test]
+    fn test_reveal_column_scrolls_minimally_to_the_right() {
+        let mut ws = Workspace::new();
+        // 4 columns of 400 px, 16 px gaps, view 1350 px: columns start at
+        // 0, 416, 832, 1248.
+        for i in 1..=4 {
+            ws.add_window_to_new_column(WindowId::new(i));
+        }
+        // Column 3 ends at 1648, 298 px past the view: align its right edge.
+        assert!(ws.reveal_column(3, 400, 16, 1350));
+        assert_eq!(ws.scroll_offset.x, 1648 - 1350);
+        // Column 1 (416..816) is still fully inside [298, 1648]: no movement.
+        assert!(!ws.reveal_column(1, 400, 16, 1350));
+        assert_eq!(ws.scroll_offset.x, 298);
+    }
+
+    #[test]
+    fn test_reveal_column_scrolls_minimally_to_the_left() {
+        let mut ws = Workspace::new();
+        for i in 1..=4 {
+            ws.add_window_to_new_column(WindowId::new(i));
+        }
+        ws.scroll_offset.x = 600;
+        // Column 1 starts at 416, left of the view start (600): align left edges.
+        assert!(ws.reveal_column(1, 400, 16, 1350));
+        assert_eq!(ws.scroll_offset.x, 416);
+    }
+
+    #[test]
+    fn test_fit_scroll_keeps_the_strip_filling_the_view() {
+        let mut ws = Workspace::new();
+        for i in 1..=4 {
+            ws.add_window_to_new_column(WindowId::new(i));
+        }
+        // 4 columns of 400 px + 3 gaps of 16 = 1648 px of content, view 1350:
+        // the furthest useful offset is 1648 - 1350 = 298.
+        ws.scroll_offset.x = 1248; // last column at the leading edge
+        ws.fit_scroll(400, 16, 1350);
+        assert_eq!(ws.scroll_offset.x, 298);
+        ws.scroll_offset.x = -50;
+        ws.fit_scroll(400, 16, 1350);
+        assert_eq!(ws.scroll_offset.x, 0);
+        ws.scroll_offset.x = 100;
+        ws.fit_scroll(400, 16, 1350);
+        assert_eq!(ws.scroll_offset.x, 100, "an in-range offset is left alone");
+    }
+
+    #[test]
+    fn test_fit_scroll_resets_when_everything_fits() {
+        // Two windows are left after the others closed: both must be on screen.
+        let mut ws = Workspace::new();
+        ws.add_window_to_new_column(WindowId::new(1));
+        ws.add_window_to_new_column(WindowId::new(2));
+        ws.scroll_offset.x = 900;
+        ws.fit_scroll(400, 16, 1350);
+        assert_eq!(ws.scroll_offset.x, 0);
+        // No columns at all.
+        let mut empty = Workspace::new();
+        empty.scroll_offset.x = 500;
+        empty.fit_scroll(400, 16, 1350);
+        assert_eq!(empty.scroll_offset.x, 0);
+    }
+
+    #[test]
+    fn test_reveal_column_visible_or_out_of_range_is_a_no_op() {
+        let mut ws = Workspace::new();
+        ws.add_window_to_new_column(WindowId::new(1));
+        ws.add_window_to_new_column(WindowId::new(2));
+        assert!(!ws.reveal_column(1, 400, 16, 1350));
+        assert_eq!(ws.scroll_offset.x, 0);
+        assert!(!ws.reveal_column(9, 400, 16, 1350));
+        assert!(!ws.reveal_column(0, 400, 16, 0));
+    }
+
+    #[test]
+    fn test_reveal_column_wider_than_view_aligns_left_edge() {
+        let mut ws = Workspace::new();
+        ws.add_window_to_new_column(WindowId::new(1));
+        ws.add_window_to_new_column(WindowId::new(2));
+        assert!(ws.reveal_column(1, 2000, 16, 1350));
+        assert_eq!(ws.scroll_offset.x, 2016);
     }
 
     #[test]
