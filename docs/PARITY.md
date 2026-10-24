@@ -1,5 +1,10 @@
 # wiri ↔ niri parity
 
+> **Superseded on 2026-10-24.** Most of the "done" rows below did not hold up when the
+> code was checked against niri `main` (13 of 485 features done, 172 partial, 215
+> missing, 85 not applicable on Windows). See [docs/parity/](parity/README.md) for the
+> verified matrices and the plan. This page is kept for history.
+
 A frank stocktake of what wiri has shipped from
 [niri](https://github.com/YaLTeR/niri)'s feature set, what's missing, and
 what's intentionally out of scope.
