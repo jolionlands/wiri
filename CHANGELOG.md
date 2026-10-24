@@ -40,6 +40,17 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   nothing), `wiri-ctl windows` reports the workspace of a floating window, and the new
   `wiri-ctl action <name> [args]` (IPC `run_action`) runs any bindable action through the same code
   as its hotkey, so scripts and status bars can drive wiri.
+- **A minimized window leaves no gap.**  wiri now listens to `EVENT_SYSTEM_MINIMIZESTART` and
+  `EVENT_SYSTEM_MINIMIZEEND`.  A window that is minimized leaves its column, the others close up and
+  the view keeps the focused column visible; when the window is restored it goes back where it sat:
+  into the column it shared with other windows at its old place, or into a column of its own, at its
+  old position and with its old width.  The place is found again by neighbour, not by index, so
+  windows that came and went in the meantime do not misplace it, and a whole desktop minimized at
+  once (Win+D) comes back in its old order whichever window is restored first.  Restored after the
+  user switched to another workspace, the window comes back on the workspace they are looking at.
+  A window that was fullscreen or floating keeps that state, and a window closed while minimized is
+  forgotten.  `wiri-ctl focus-window` restores a minimized window; `wiri-ctl windows` reports
+  `minimized` and the new `column` / `tile` position of every window.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal

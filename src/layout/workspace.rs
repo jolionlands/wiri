@@ -222,6 +222,71 @@ impl WorkspaceLayout {
     }
 }
 
+/// Where a window sat in a workspace's strip, kept while the window is out of the
+/// layout for a while (minimized) so that it can be put back where it was.
+///
+/// Column and tile indexes shift while the window is away, so the place is also
+/// described by the windows around it: the ones above and below it in its column
+/// and the windows of the columns on either side (all nearest first).  Windows
+/// minimized earlier are folded in by [`WindowSlot::learn_from`], so a whole
+/// desktop that was minimized at once (Win+D) comes back in its old order
+/// whichever window is restored first.
+#[derive(Debug, Clone)]
+pub struct WindowSlot {
+    pub window_id: WindowId,
+    pub tile: Tile,
+    /// Index of its column and of the tile inside it when it left.
+    pub column: usize,
+    pub index: usize,
+    /// The column's own settings; they are lost with the column when this was its
+    /// only window.
+    pub column_width: Option<u32>,
+    pub column_display: ColumnDisplay,
+    pub column_maximized: bool,
+    /// Windows above it in its column, nearest first.
+    pub above: Vec<WindowId>,
+    /// Windows below it in its column, nearest first.
+    pub below: Vec<WindowId>,
+    /// Windows of the columns to its left, nearest first.
+    pub left_of: Vec<WindowId>,
+    /// Windows of the columns to its right, nearest first.
+    pub right_of: Vec<WindowId>,
+}
+
+/// Put `other` into `list` (windows on one side of a window, nearest first).  `beyond`
+/// are the windows on the far side of `other`: `other` is nearer than any of them.
+fn insert_nearest_first(list: &mut Vec<WindowId>, other: WindowId, beyond: &[WindowId]) {
+    let at = list
+        .iter()
+        .position(|w| beyond.contains(w))
+        .unwrap_or(list.len());
+    list.insert(at, other);
+}
+
+impl WindowSlot {
+    /// Fold in a window that was minimized earlier (`earlier`): where it sat relative
+    /// to this one is what the earlier slot recorded about this window.
+    pub fn learn_from(&mut self, earlier: &WindowSlot) {
+        let other = earlier.window_id;
+        if [&self.above, &self.below, &self.left_of, &self.right_of]
+            .iter()
+            .any(|list| list.contains(&other))
+        {
+            return;
+        }
+        let me = self.window_id;
+        if earlier.below.contains(&me) {
+            insert_nearest_first(&mut self.above, other, &earlier.above);
+        } else if earlier.above.contains(&me) {
+            insert_nearest_first(&mut self.below, other, &earlier.below);
+        } else if earlier.right_of.contains(&me) {
+            insert_nearest_first(&mut self.left_of, other, &earlier.left_of);
+        } else if earlier.left_of.contains(&me) {
+            insert_nearest_first(&mut self.right_of, other, &earlier.right_of);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub columns: Vec<Column>,
@@ -291,6 +356,90 @@ impl Workspace {
             }
         }
         None
+    }
+
+    /// Record where `window_id` sits, so that [`Self::put_back`] can restore it after
+    /// the window was taken out (`remove_window`).  `None` when it is not here.
+    pub fn slot_of(&self, window_id: WindowId) -> Option<WindowSlot> {
+        let column = self.find_window_column(window_id)?;
+        let col = &self.columns[column];
+        let index = col.index_of(window_id)?;
+        let ids_of = |c: &Column| c.tiles.iter().map(|t| t.window_id).collect::<Vec<_>>();
+        Some(WindowSlot {
+            window_id,
+            tile: col.tiles[index].clone(),
+            column,
+            index,
+            column_width: col.width,
+            column_display: col.display.clone(),
+            column_maximized: col.maximized,
+            above: col.tiles[..index].iter().rev().map(|t| t.window_id).collect(),
+            below: col.tiles[index + 1..].iter().map(|t| t.window_id).collect(),
+            left_of: self.columns[..column].iter().rev().flat_map(ids_of).collect(),
+            right_of: self.columns[column + 1..].iter().flat_map(ids_of).collect(),
+        })
+    }
+
+    /// Put a window back where `slot` says it was.  It rejoins the column it shared
+    /// with other windows if one of them is still here, at its old place among them;
+    /// otherwise it gets a column of its own (with the width it had) next to the
+    /// windows that were its neighbours, or, when none of them is here any more, at
+    /// the column index it had.  Returns the index of the column it ended up in.
+    pub fn put_back(&mut self, slot: WindowSlot) -> usize {
+        let WindowSlot {
+            mut tile,
+            column,
+            index,
+            column_width,
+            column_display,
+            column_maximized,
+            above,
+            below,
+            left_of,
+            right_of,
+            ..
+        } = slot;
+        // The old geometry says nothing about the new place.
+        tile.cached_bounds = Rect::default();
+
+        if let Some(col) = above
+            .iter()
+            .chain(below.iter())
+            .find_map(|w| self.find_window_column(*w))
+        {
+            let tiles = &mut self.columns[col].tiles;
+            let position_of = |tiles: &Vec<Tile>, w: &WindowId| {
+                tiles.iter().position(|t| t.window_id == *w)
+            };
+            let at = above
+                .iter()
+                .find_map(|w| position_of(tiles, w))
+                .map(|i| i + 1)
+                .or_else(|| below.iter().find_map(|w| position_of(tiles, w)))
+                .unwrap_or(index)
+                .min(tiles.len());
+            tiles.insert(at, tile);
+            return col;
+        }
+
+        let insert_at = left_of
+            .iter()
+            .find_map(|w| self.find_window_column(*w))
+            .map(|c| c + 1)
+            .or_else(|| right_of.iter().find_map(|w| self.find_window_column(*w)))
+            .unwrap_or(column)
+            .min(self.columns.len());
+        let mut col = Column::new();
+        col.width = column_width;
+        col.maximized = column_maximized;
+        col.display = match column_display {
+            // One tile left: its tab is the first.
+            ColumnDisplay::Tabbed { .. } => ColumnDisplay::Tabbed { active_tab: 0 },
+            other => other,
+        };
+        col.add_tile(tile);
+        self.columns.insert(insert_at, col);
+        insert_at
     }
 
     /// Find which column a window is in
@@ -1173,5 +1322,155 @@ mod tests {
         let ws = Workspace::with_layout(WorkspaceLayout::BStack);
         assert_eq!(ws.layout_mode, WorkspaceLayout::BStack);
         assert!(ws.columns.is_empty());
+    }
+
+    // --- window slots (minimize / restore) ---
+
+    /// A workspace whose columns hold the given window ids, top to bottom.
+    fn ws_with(columns: &[&[isize]]) -> Workspace {
+        let mut ws = Workspace::new();
+        for col in columns {
+            let c = ws.add_window_to_new_column(WindowId::new(col[0]));
+            for w in &col[1..] {
+                ws.add_window_to_column(c, WindowId::new(*w));
+            }
+        }
+        ws
+    }
+
+    fn ids(ws: &Workspace) -> Vec<Vec<isize>> {
+        ws.columns
+            .iter()
+            .map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()).collect())
+            .collect()
+    }
+
+    fn take(ws: &mut Workspace, id: isize) -> WindowSlot {
+        let slot = ws.slot_of(WindowId::new(id)).expect("window is here");
+        ws.remove_window(WindowId::new(id));
+        slot
+    }
+
+    #[test]
+    fn test_slot_of_an_unknown_window_is_none() {
+        let ws = ws_with(&[&[1], &[2]]);
+        assert!(ws.slot_of(WindowId::new(9)).is_none());
+    }
+
+    #[test]
+    fn test_put_back_restores_a_single_window_column_in_place() {
+        let mut ws = ws_with(&[&[1], &[2], &[3]]);
+        ws.columns[1].width = Some(777);
+        ws.columns[1].maximized = true;
+        let slot = take(&mut ws, 2);
+        assert_eq!(ids(&ws), vec![vec![1], vec![3]], "no gap while it is away");
+        assert_eq!(ws.put_back(slot), 1);
+        assert_eq!(ids(&ws), vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(ws.columns[1].width, Some(777), "the column kept its width");
+        assert!(ws.columns[1].maximized);
+    }
+
+    #[test]
+    fn test_put_back_rejoins_the_column_it_shared() {
+        let mut ws = ws_with(&[&[1], &[2, 3, 4], &[5]]);
+        ws.columns[1].tiles[1].height_weight = 2.5;
+        let slot = take(&mut ws, 3);
+        assert_eq!(ids(&ws), vec![vec![1], vec![2, 4], vec![5]]);
+        // Another column opens at the front meanwhile: every index shifts.
+        ws.columns.insert(0, Column::new());
+        ws.columns[0].add_tile(Tile::new(WindowId::new(9)));
+        assert_eq!(ws.put_back(slot), 2);
+        assert_eq!(ids(&ws), vec![vec![9], vec![1], vec![2, 3, 4], vec![5]]);
+        assert_eq!(ws.columns[2].tiles[1].height_weight, 2.5, "the tile keeps its height");
+    }
+
+    #[test]
+    fn test_put_back_follows_its_neighbours_when_the_indexes_shifted() {
+        let mut ws = ws_with(&[&[1], &[2], &[3]]);
+        let slot = take(&mut ws, 2);
+        // 1 closes, 7 opens at the end: the slot's own column index (1) would be wrong.
+        ws.remove_window(WindowId::new(1));
+        ws.add_window_to_new_column(WindowId::new(7));
+        assert_eq!(ids(&ws), vec![vec![3], vec![7]]);
+        // The left neighbour is gone, the right one (3) is here: in front of it.
+        assert_eq!(ws.put_back(slot), 0);
+        assert_eq!(ids(&ws), vec![vec![2], vec![3], vec![7]]);
+    }
+
+    #[test]
+    fn test_put_back_uses_the_old_column_index_when_every_neighbour_is_gone() {
+        let mut ws = ws_with(&[&[1], &[2], &[3]]);
+        let slot = take(&mut ws, 2);
+        for gone in [1, 3] {
+            ws.remove_window(WindowId::new(gone));
+        }
+        ws.add_window_to_new_column(WindowId::new(7));
+        assert_eq!(ws.put_back(slot), 1);
+        assert_eq!(ids(&ws), vec![vec![7], vec![2]]);
+        // And into an empty workspace, whatever the old index was.
+        let mut empty = Workspace::new();
+        let slot = take(&mut ws, 2);
+        assert_eq!(empty.put_back(slot), 0);
+        assert_eq!(ids(&empty), vec![vec![2]]);
+    }
+
+    #[test]
+    fn test_a_whole_desktop_comes_back_in_order_whichever_window_is_restored_first() {
+        // Win+D: the windows are minimized one after the other.
+        let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        for restore_order in orders {
+            let mut ws = ws_with(&[&[1], &[2], &[3]]);
+            let mut slots: Vec<Option<WindowSlot>> = Vec::new();
+            for id in [1, 2, 3] {
+                let mut slot = ws.slot_of(WindowId::new(id)).unwrap();
+                for earlier in slots.iter().flatten() {
+                    slot.learn_from(earlier);
+                }
+                ws.remove_window(WindowId::new(id));
+                slots.push(Some(slot));
+            }
+            assert!(ws.columns.is_empty());
+            for i in restore_order {
+                ws.put_back(slots[i].take().unwrap());
+            }
+            assert_eq!(
+                ids(&ws),
+                vec![vec![1], vec![2], vec![3]],
+                "restore order {:?}",
+                restore_order
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_whole_column_comes_back_in_order_whichever_window_is_restored_first() {
+        let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        for restore_order in orders {
+            let mut ws = ws_with(&[&[1, 2, 3]]);
+            ws.columns[0].width = Some(500);
+            let mut slots: Vec<Option<WindowSlot>> = Vec::new();
+            for id in [1, 2, 3] {
+                let mut slot = ws.slot_of(WindowId::new(id)).unwrap();
+                for earlier in slots.iter().flatten() {
+                    slot.learn_from(earlier);
+                }
+                ws.remove_window(WindowId::new(id));
+                slots.push(Some(slot));
+            }
+            for i in restore_order {
+                ws.put_back(slots[i].take().unwrap());
+            }
+            assert_eq!(ids(&ws), vec![vec![1, 2, 3]], "restore order {:?}", restore_order);
+            assert_eq!(ws.columns[0].width, Some(500), "the column width came back");
+        }
+    }
+
+    #[test]
+    fn test_learn_from_ignores_a_window_that_is_already_known() {
+        let ws = ws_with(&[&[1], &[2]]);
+        let first = ws.slot_of(WindowId::new(1)).unwrap();
+        let mut second = ws.slot_of(WindowId::new(2)).unwrap();
+        second.learn_from(&first); // 1 is already one of its left neighbours
+        assert_eq!(second.left_of, vec![WindowId::new(1)]);
     }
 }

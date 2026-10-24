@@ -1122,6 +1122,23 @@ fn handle_backend_event(
         BackendEvent::WindowHidden { hwnd } => {
             debug!("Window {} hidden", hwnd);
         }
+        BackendEvent::WindowMinimized { hwnd } => {
+            // The strip closes the gap the window would leave.
+            let window_id = WindowId::new(hwnd);
+            engine.write().minimize_window(window_id, handle);
+            engine.write().apply_all(handle);
+        }
+        BackendEvent::WindowRestored { hwnd } => {
+            // Back into its old column.  A window wiri never managed (it was minimized
+            // when wiri started, or opened minimized) is added like a new one.
+            let window_id = WindowId::new(hwnd);
+            if engine.read().is_minimized(window_id) {
+                engine.write().restore_window(window_id, handle);
+                engine.write().apply_all(handle);
+            } else {
+                add_window_if_tileable(hwnd, "via restore", handle, engine, ipc_server);
+            }
+        }
         BackendEvent::MonitorConnected { .. } | BackendEvent::MonitorDisconnected { .. } => {
             sync_monitors_from_backend(handle, engine, ipc_server);
         }

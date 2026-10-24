@@ -154,6 +154,14 @@ pub enum BackendEvent {
     WindowUrgentCleared {
         hwnd: isize,
     },
+    /// EVENT_SYSTEM_MINIMIZESTART: the window is about to be minimized.
+    WindowMinimized {
+        hwnd: isize,
+    },
+    /// EVENT_SYSTEM_MINIMIZEEND: the window is about to be restored.
+    WindowRestored {
+        hwnd: isize,
+    },
 }
 
 #[derive(Debug, Clone)]

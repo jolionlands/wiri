@@ -17,6 +17,8 @@ const EVENT_SYSTEM_ALERT: u32 = 0x0002;
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
 const EVENT_SYSTEM_MOVESIZESTART: u32 = 0x000A;
 const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
+const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
 const EVENT_OBJECT_DESTROY: u32 = 0x8001;
 const EVENT_OBJECT_SHOW: u32 = 0x8003;
@@ -108,6 +110,7 @@ fn register_winevent_hooks() -> Vec<HWINEVENTHOOK> {
         (EVENT_SYSTEM_ALERT, EVENT_SYSTEM_ALERT),
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
+        (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE),
         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY),
         (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
@@ -214,6 +217,18 @@ unsafe extern "system" fn winevent_proc(
         0x000B => {
             // EVENT_SYSTEM_MOVESIZEEND
             backend.send_event(BackendEvent::WindowMoveResizeEnd {
+                hwnd: hwnd.0 as isize,
+            });
+        }
+        0x0016 => {
+            // EVENT_SYSTEM_MINIMIZESTART
+            backend.send_event(BackendEvent::WindowMinimized {
+                hwnd: hwnd.0 as isize,
+            });
+        }
+        0x0017 => {
+            // EVENT_SYSTEM_MINIMIZEEND
+            backend.send_event(BackendEvent::WindowRestored {
                 hwnd: hwnd.0 as isize,
             });
         }

@@ -1560,12 +1560,15 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
     use crate::utils::WindowId;
     use std::collections::HashMap;
 
+    // Workspace id, column index and tile index of every window that sits in a strip.
     let mut ws_of: HashMap<WindowId, i32> = HashMap::new();
+    let mut place_of: HashMap<WindowId, (usize, usize)> = HashMap::new();
     for (_oid, monitor) in eng.monitors().iter() {
         for (&ws_id, ws) in monitor.workspaces.iter() {
-            for col in &ws.columns {
-                for tile in &col.tiles {
+            for (col_idx, col) in ws.columns.iter().enumerate() {
+                for (tile_idx, tile) in col.tiles.iter().enumerate() {
                     ws_of.insert(tile.window_id, ws_id);
+                    place_of.insert(tile.window_id, (col_idx, tile_idx));
                 }
             }
         }
@@ -1582,13 +1585,19 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
             "y": info.bounds.loc.y,
             "width": info.bounds.size.w,
             "height": info.bounds.size.h,
-            // A floating window is in no column; it belongs to the workspace it floats on.
+            // A floating or minimized window is in no column; it belongs to the workspace
+            // it floats on / comes back to.
             "workspace": ws_of
                 .get(wid)
                 .copied()
                 .or_else(|| eng.float_workspace(*wid))
+                .or_else(|| eng.minimized_workspace(*wid))
                 .map(crate::layout::workspace_number),
+            // Position in the strip (0-based); null for a floating or minimized window.
+            "column": place_of.get(wid).map(|p| p.0),
+            "tile": place_of.get(wid).map(|p| p.1),
             "floating": eng.is_floating(*wid),
+            "minimized": eng.is_minimized(*wid),
         }));
     }
     // Stable order: hwnd ascending so `wiri-ctl windows` is deterministic.
@@ -1650,9 +1659,18 @@ fn focus_window_by_hwnd(
     };
 
     let Some((oid, ws_id, col_idx)) = location else {
-        // Registered but not in any column: a floating window (focused here, on its
-        // own workspace) or one that is minimized.
-        if engine.write().focus_float(wid, backend) {
+        // Registered but not in any column: a minimized window (brought back, into its
+        // old column) or a floating one (focused here, on its own workspace).
+        if engine.read().is_minimized(wid) {
+            // Asynchronous: a hung application must not hold the IPC thread.
+            unsafe {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_RESTORE};
+                let _ = ShowWindowAsync(HWND(hwnd as *mut std::ffi::c_void), SW_RESTORE);
+            }
+            engine.write().restore_window(wid, backend);
+            engine.write().apply_all(backend);
+        } else if engine.write().focus_float(wid, backend) {
             engine.write().apply_all(backend);
         }
         return true;

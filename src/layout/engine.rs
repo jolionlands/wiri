@@ -55,6 +55,19 @@ struct FloatHome {
     seq: u64,
 }
 
+/// A window the user minimized: out of the layout until it comes back, so that the
+/// others close the gap it would leave.
+#[derive(Debug, Clone)]
+struct MinimizedWindow {
+    output: OutputId,
+    workspace: i32,
+    /// Where it sat in its strip.  `None` for a floating window, which keeps its
+    /// float state and needs no place to come back to.
+    slot: Option<crate::layout::workspace::WindowSlot>,
+    /// It was fullscreen when it was minimized.
+    was_fullscreen: bool,
+}
+
 /// What the window that has the keyboard focus looks like to the engine.
 ///
 /// Built from `GetForegroundWindow()`: the window itself and the root of its
@@ -487,6 +500,9 @@ pub struct TilingEngine {
     float_memory: HashMap<WindowId, Rect>,
     /// Source of `FloatHome::seq`.
     float_seq: u64,
+    /// Windows the user minimized, with the place they come back to.  They stay in
+    /// `tiled_windows` (wiri still knows them) but are in no column.
+    minimized: HashMap<WindowId, MinimizedWindow>,
     window_sizing: HashMap<WindowId, SizingMode>,
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
@@ -601,6 +617,7 @@ impl TilingEngine {
             float_homes: HashMap::new(),
             float_memory: HashMap::new(),
             float_seq: 0,
+            minimized: HashMap::new(),
             window_sizing: HashMap::new(),
             saved_styles: HashMap::new(),
             saved_ex_styles: HashMap::new(),
@@ -1284,6 +1301,7 @@ impl TilingEngine {
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
         self.fullscreen_windows.remove(&window_id);
+        self.minimized.remove(&window_id);
         self.floating_windows.remove(&window_id);
         self.float_homes.remove(&window_id);
         self.float_memory.remove(&window_id);
@@ -1331,6 +1349,159 @@ impl TilingEngine {
                 self.reveal_focused_column(output_id);
                 self.apply_layout_for_monitor(output_id, backend);
             }
+        }
+    }
+
+    /// The window was minimized (`EVENT_SYSTEM_MINIMIZESTART`).  It leaves the strip so
+    /// that the other windows close the gap it would leave, and its place is
+    /// remembered for [`Self::restore_window`].  A floating window keeps its float
+    /// state and is just left alone until it comes back.
+    pub fn minimize_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        if !self.tiled_windows.contains_key(&window_id) || self.minimized.contains_key(&window_id)
+        {
+            return;
+        }
+        let was_fullscreen = self.fullscreen_windows.contains(&window_id);
+        if was_fullscreen {
+            // A minimized fullscreen window must not keep every other tile hidden, and it
+            // comes back with the frame the application gave it.
+            self.fullscreen_windows.remove(&window_id);
+            self.window_sizing.insert(window_id, SizingMode::Normal);
+            if let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) {
+                self.restore_window_style(hwnd);
+            }
+        }
+
+        if self.floating_windows.contains(&window_id) {
+            let Some((output, workspace)) = self.float_location(window_id) else {
+                return;
+            };
+            self.minimized.insert(
+                window_id,
+                MinimizedWindow {
+                    output,
+                    workspace,
+                    slot: None,
+                    was_fullscreen,
+                },
+            );
+            info!("Floating window {:?} minimized", window_id);
+            return;
+        }
+
+        let Some((output, workspace, _)) = self.locate_window(window_id) else {
+            return;
+        };
+        let Some(mut slot) = self
+            .monitors
+            .get(&output)
+            .and_then(|m| m.workspaces.get(&workspace))
+            .and_then(|w| w.slot_of(window_id))
+        else {
+            return;
+        };
+        // Windows minimized from this workspace before: where they sat relative to this
+        // one, so that all of them come back in the old order whichever is restored first.
+        for earlier in self
+            .minimized
+            .values()
+            .filter(|m| m.output == output && m.workspace == workspace)
+        {
+            if let Some(earlier_slot) = &earlier.slot {
+                slot.learn_from(earlier_slot);
+            }
+        }
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            monitor.remove_window(window_id);
+        }
+        self.minimized.insert(
+            window_id,
+            MinimizedWindow {
+                output,
+                workspace,
+                slot: Some(slot),
+                was_fullscreen,
+            },
+        );
+        self.applied_state.remove(&window_id);
+        if self.last_activated == Some(window_id) {
+            self.last_activated = None;
+        }
+        info!("Window {:?} minimized; the strip closes the gap", window_id);
+        self.maintain_empty_workspace(output);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// The window was restored (`EVENT_SYSTEM_MINIMIZEEND`): put it back where it sat.
+    ///
+    /// On the workspace it was minimized from it rejoins its column, or gets a column
+    /// of its own at its old place, with the width it had.  When the user has gone to
+    /// another workspace meanwhile, the window comes back where the user is looking
+    /// (they asked for it, and a window hidden at once on an inactive workspace would
+    /// look like the restore did nothing).  The restored window takes the focus.
+    pub fn restore_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some(minimized) = self.minimized.remove(&window_id) else {
+            return;
+        };
+        if !self.tiled_windows.contains_key(&window_id) {
+            return;
+        }
+        // Whatever the layout cache knows about the window is stale.
+        self.applied_state.remove(&window_id);
+        let MinimizedWindow {
+            output,
+            workspace,
+            slot,
+            was_fullscreen,
+        } = minimized;
+
+        let Some(slot) = slot else {
+            // A floating window comes back where it floated, on top of the float stack.
+            self.touch_float(window_id);
+            if let Some((float_output, _)) = self.float_location(window_id) {
+                self.apply_layout_for_monitor(float_output, backend);
+                self.raise_floats(float_output);
+            }
+            if was_fullscreen {
+                self.toggle_fullscreen_for(window_id, backend);
+            }
+            return;
+        };
+
+        let output = if self.monitors.contains_key(&output) {
+            output
+        } else {
+            match self.monitors.focused_id() {
+                Some(focused) => focused,
+                None => return,
+            }
+        };
+        {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let active = monitor.active_workspace;
+            let strip = monitor
+                .workspaces
+                .entry(active)
+                .or_insert_with(crate::layout::Workspace::new);
+            let column = if workspace == active {
+                strip.put_back(slot)
+            } else {
+                strip.add_window_to_new_column_with_width(window_id, slot.column_width)
+            };
+            monitor.focus_column = Some(column);
+            monitor.focus_window = Some(window_id);
+            monitor.focus_ring.push(window_id);
+        }
+        self.monitors.set_focused(output);
+        info!("Window {:?} restored into its column", window_id);
+        self.maintain_empty_workspace(output);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+        if was_fullscreen {
+            self.toggle_fullscreen_for(window_id, backend);
         }
     }
 
@@ -3030,7 +3201,7 @@ impl TilingEngine {
         }
         self.floating_windows
             .iter()
-            .filter(|w| self.tiled_windows.contains_key(*w))
+            .filter(|w| self.tiled_windows.contains_key(*w) && !self.minimized.contains_key(*w))
             .max_by_key(|w| self.float_homes.get(*w).map_or(0, |h| h.seq))
             .map(|w| ActionTarget::float(*w))
     }
@@ -3231,7 +3402,10 @@ impl TilingEngine {
         let mut to_hide: Vec<WindowId> = Vec::new();
         let mut to_show: Vec<WindowId> = Vec::new();
         for (wid, home) in &self.float_homes {
-            if home.output != output_id || self.sticky_windows.contains(wid) {
+            if home.output != output_id
+                || self.sticky_windows.contains(wid)
+                || self.minimized.contains_key(wid)
+            {
                 continue;
             }
             if home.workspace == active {
@@ -3283,6 +3457,7 @@ impl TilingEngine {
                 home.output == output_id
                     && home.workspace == active
                     && !self.fullscreen_windows.contains(*wid)
+                    && !self.minimized.contains_key(*wid)
             })
             .map(|(wid, home)| (home.seq, *wid))
             .collect();
@@ -4059,6 +4234,16 @@ impl TilingEngine {
     /// Check if a window is floating
     pub fn is_floating(&self, window_id: WindowId) -> bool {
         self.floating_windows.contains(&window_id)
+    }
+
+    /// The user minimized this window; it is in no column until it is restored.
+    pub fn is_minimized(&self, window_id: WindowId) -> bool {
+        self.minimized.contains_key(&window_id)
+    }
+
+    /// The workspace id (not the user's number) a minimized window comes back to.
+    pub fn minimized_workspace(&self, window_id: WindowId) -> Option<i32> {
+        self.minimized.get(&window_id).map(|m| m.workspace)
     }
 
     /// The workspace id (not the user's number) a floating window belongs to.
@@ -8531,6 +8716,213 @@ mod tests {
         engine.toggle_fullscreen_for(WindowId::new(100), &be);
         assert!(engine.is_fullscreen(WindowId::new(100)));
         assert!(!engine.is_fullscreen(WindowId::new(101)));
+    }
+
+    // --- Minimized windows leave no gap ---
+
+    /// An engine with one tile per id (one column each), the last one focused.
+    fn engine_with_tiles(ids: &[isize]) -> TilingEngine {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        for id in ids {
+            engine.add_window(make_window(*id, 500, 400), &be);
+        }
+        if let Some(last) = ids.last() {
+            engine.sync_os_foreground(WindowId::new(*last), &be);
+        }
+        engine
+    }
+
+    #[test]
+    fn test_a_minimized_window_leaves_no_gap_and_comes_back_in_its_place() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101, 102]);
+        let oid = engine.focused_output().unwrap();
+        engine.sync_os_foreground(WindowId::new(101), &be);
+
+        engine.minimize_window(WindowId::new(101), &be);
+        assert!(engine.is_minimized(WindowId::new(101)));
+        assert!(
+            engine.tiled_windows().contains_key(&WindowId::new(101)),
+            "wiri still knows the window"
+        );
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102]]);
+        assert!(engine.locate_window(WindowId::new(101)).is_none());
+        // The focus moved on to a window that is still there.
+        let focus = focus_window_of(&engine).expect("a focus");
+        assert!(focus == WindowId::new(100) || focus == WindowId::new(102));
+
+        engine.restore_window(WindowId::new(101), &be);
+        assert!(!engine.is_minimized(WindowId::new(101)));
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![102]]
+        );
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+        assert!(
+            engine.applied_state.get(&WindowId::new(101)).unwrap().visible,
+            "the layout placed it again"
+        );
+    }
+
+    #[test]
+    fn test_a_minimized_window_keeps_its_column_width_and_stack() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101, 102, 103]);
+        let oid = engine.focused_output().unwrap();
+        // 101 and 102 share a column of their own.
+        {
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(102), 1, 1));
+            ws.columns[1].width = Some(640);
+        }
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101, 102], vec![103]]
+        );
+
+        engine.minimize_window(WindowId::new(102), &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![103]]
+        );
+        engine.restore_window(WindowId::new(102), &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101, 102], vec![103]]
+        );
+
+        // The sole window of a column: the column and its width come back.
+        engine.minimize_window(WindowId::new(103), &be);
+        engine.minimize_window(WindowId::new(101), &be);
+        engine.minimize_window(WindowId::new(102), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100]]);
+        engine.restore_window(WindowId::new(101), &be);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[1].width,
+            Some(640),
+            "the column it lived in is rebuilt with its width"
+        );
+    }
+
+    #[test]
+    fn test_several_minimized_windows_come_back_in_their_old_order() {
+        // Win+D minimizes everything; the restore order is up to the shell.
+        let orders = [[100, 101, 102], [102, 101, 100], [101, 100, 102], [101, 102, 100]];
+        for restore_order in orders {
+            let be = BackendHandle::default_for_test();
+            let mut engine = engine_with_tiles(&[100, 101, 102]);
+            let oid = engine.focused_output().unwrap();
+            for id in [100, 101, 102] {
+                engine.minimize_window(WindowId::new(id), &be);
+            }
+            assert_eq!(column_windows(&engine, oid), Vec::<Vec<isize>>::new());
+            for id in restore_order {
+                engine.restore_window(WindowId::new(id), &be);
+            }
+            assert_eq!(
+                column_windows(&engine, oid),
+                vec![vec![100], vec![101], vec![102]],
+                "restored in the order {:?}",
+                restore_order
+            );
+        }
+    }
+
+    #[test]
+    fn test_minimizing_twice_or_an_unknown_window_changes_nothing() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        engine.minimize_window(WindowId::new(999), &be);
+        engine.restore_window(WindowId::new(999), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+
+        engine.minimize_window(WindowId::new(100), &be);
+        engine.minimize_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        // Restoring a window that is not minimized does nothing either.
+        engine.restore_window(WindowId::new(101), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        engine.restore_window(WindowId::new(100), &be);
+        engine.restore_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+    }
+
+    #[test]
+    fn test_a_window_closed_while_minimized_is_forgotten() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        engine.minimize_window(WindowId::new(100), &be);
+        engine.remove_window(WindowId::new(100), &be);
+        assert!(!engine.is_minimized(WindowId::new(100)));
+        assert!(!engine.tiled_windows().contains_key(&WindowId::new(100)));
+        engine.restore_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+    }
+
+    #[test]
+    fn test_a_window_restored_on_another_workspace_comes_back_where_the_user_is() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        engine.minimize_window(WindowId::new(101), &be);
+        engine.switch_workspace(crate::layout::workspace_id_from_number(2), &be);
+        assert_eq!(engine.minimized_workspace(WindowId::new(101)), Some(0));
+
+        engine.restore_window(WindowId::new(101), &be);
+        // The user is on workspace 2 and asked for the window: it is shown there.
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.workspaces.get(&0).unwrap().columns.len(), 1, "100 stays on workspace 1");
+    }
+
+    #[test]
+    fn test_a_minimized_fullscreen_window_leaves_fullscreen_and_returns_to_it() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let wid = WindowId::new(101);
+        engine.toggle_fullscreen_for(wid, &be);
+        assert!(engine.is_fullscreen(wid));
+
+        engine.minimize_window(wid, &be);
+        assert!(!engine.is_fullscreen(wid), "it no longer hides the other tile");
+        engine.restore_window(wid, &be);
+        assert!(engine.is_fullscreen(wid), "and covers the monitor again when restored");
+    }
+
+    #[test]
+    fn test_a_minimized_floating_window_stays_floating_and_is_no_target() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.os_foreground = None;
+        assert_eq!(engine.state_target().map(|t| t.window), Some(WindowId::new(100)));
+        engine.toggle_floating_for(WindowId::new(100), &be);
+        engine.os_foreground = None;
+        assert_eq!(engine.state_target().map(|t| t.window), Some(WindowId::new(100)));
+
+        engine.minimize_window(WindowId::new(100), &be);
+        assert!(engine.is_minimized(WindowId::new(100)));
+        assert!(engine.is_floating(WindowId::new(100)), "still a floating window");
+        // The topmost float that is not minimized is what an action acts on.
+        assert_eq!(engine.state_target().map(|t| t.window), Some(float));
+
+        engine.restore_window(WindowId::new(100), &be);
+        assert!(!engine.is_minimized(WindowId::new(100)));
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100)),
+            "it is on top of the float stack again"
+        );
     }
 
     #[test]

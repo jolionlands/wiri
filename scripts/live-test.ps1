@@ -9,7 +9,8 @@
 # Phase G  real key presses: Escape reaches applications, Escape leaves overview without freezing wiri,
 #          Ctrl+Alt+2 / Ctrl+Alt+1 hide and show the windows.
 # Phase H  Phase 1 scenarios, each under a config of its own (wiri is restarted for every one):
-#          H1 modifiers, H2 spawn, H3 actions follow the real foreground window (floats, dialogs).
+#          H1 modifiers, H2 spawn, H3 actions follow the real foreground window (floats, dialogs),
+#          H4 minimized windows leave no gap.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -626,6 +627,8 @@ function WinList([string]$tag) {
     try { return @(($raw | ConvertFrom-Json).result) } catch { return @() }
 }
 function WinOf($list, $hwnd) { return (@($list | Where-Object { [int64]$_.hwnd -eq [int64]$hwnd }) | Select-Object -First 1) }
+# The column of a window in its strip (-1 when it is in none: floating, minimized, unknown).
+function ColOf($list, $hwnd) { $e = WinOf $list $hwnd; if ($null -eq $e -or $null -eq $e.column) { return -1 } else { return [int]$e.column } }
 
 # (a) a floating window that has the keyboard focus is what toggle-floating, move, fullscreen and close act on -
 # the engine's own focus is a tile behind it.
@@ -710,6 +713,67 @@ $h3CloseRefusedOnUnmanaged = ((AliveCount (@($forms) + @($fb, $tool))) -eq $aliv
 Shot 'h3-07-unmanaged-foreground'
 [TestForms]::CloseForm($tool)
 [TestForms]::CloseForm($fb)
+Start-Sleep -Milliseconds 1200
+
+# ---- H4: a minimized window leaves no gap and comes back into its old place -------------------------------
+# The title bar button's message (WM_SYSCOMMAND): SC_MINIMIZE = 0xF020, SC_RESTORE = 0xF120.
+function Minimize($h) { [void][LT]::PostMessage($h, 0x0112, [IntPtr]0xF020, [IntPtr]::Zero) }
+function Restore($h) { [void][LT]::PostMessage($h, 0x0112, [IntPtr]0xF120, [IntPtr]::Zero) }
+$m = @()
+foreach ($i in 1..3) { $m += [TestForms]::Open("wiri-h4-$i", (60 * $i), 120, 90); Start-Sleep -Milliseconds 1500 }
+Start-Sleep -Seconds 1
+$a1 = Rc $m[0]; $a2 = Rc $m[1]; $a3 = Rc $m[2]
+$h4OrderBefore = ($a1.L -lt $a2.L) -and ($a2.L -lt $a3.L)
+$h4GapBefore = $a3.L - $a1.R
+Shot 'h4-01-three-windows'
+
+# (a) the middle one is minimized: its neighbours close up
+Minimize $m[1]; Start-Sleep -Milliseconds 1800
+$h4Iconic = [LT]::IsIconic($m[1])
+$b1 = Rc $m[0]; $b3 = Rc $m[2]
+$h4GapAfter = $b3.L - $b1.R
+$h4NoGap = ($h4GapAfter -ge 0) -and ($h4GapAfter -lt 60) -and ($h4GapBefore -gt 300)
+$h4IpcMinimized = ((WinOf (WinList 'h4-windows-minimized') $m[1]).minimized -eq $true)
+Shot 'h4-02-middle-minimized'
+
+# ... and it is restored between them again, at its old size
+Restore $m[1]; Start-Sleep -Milliseconds 1800
+$c2 = Rc $m[1]
+$lc = WinList 'h4-windows-restored'
+# Consecutive columns: nothing else squeezed in between, and the window is back in the middle.
+$h4RestoredBetween = (-not [LT]::IsIconic($m[1])) -and ((ColOf $lc $m[0]) -ge 0) -and ((ColOf $lc $m[1]) -eq ((ColOf $lc $m[0]) + 1)) -and ((ColOf $lc $m[2]) -eq ((ColOf $lc $m[1]) + 1))
+$h4RestoredSize = (Near $c2.W $a2.W 8) -and (Near $c2.H $a2.H 8)
+$h4IpcNotMinimized = ((WinOf $lc $m[1]).minimized -eq $false)
+Shot 'h4-03-restored'
+
+# (b) all three minimized (Win+D), restored in another order: the old order comes back
+foreach ($h in $m) { Minimize $h; Start-Sleep -Milliseconds 500 }
+Start-Sleep -Milliseconds 1200
+$h4AllIconic = (@($m | Where-Object { [LT]::IsIconic($_) }).Count -eq 3)
+Shot 'h4-04-all-minimized'
+foreach ($h in @($m[2], $m[0], $m[1])) { Restore $h; Start-Sleep -Milliseconds 900 }
+Start-Sleep -Milliseconds 1200
+$ld = WinList 'h4-windows-restored-in-order'
+$h4AllRestored = (@($m | Where-Object { [LT]::IsIconic($_) }).Count -eq 0)
+$h4OrderKept = ((ColOf $ld $m[0]) -ge 0) -and ((ColOf $ld $m[1]) -eq ((ColOf $ld $m[0]) + 1)) -and ((ColOf $ld $m[2]) -eq ((ColOf $ld $m[1]) + 1))
+Shot 'h4-05-restored-in-order'
+
+# (c) wiri-ctl focus-window brings a minimized window back
+Minimize $m[1]; Start-Sleep -Milliseconds 1500
+$null = Ctl 'h4-ipc-focus-minimized' @('focus-window', [string][int64]$m[1])
+Start-Sleep -Milliseconds 1800
+$e2 = Rc $m[1]
+$h4FocusRestores = (-not [LT]::IsIconic($m[1])) -and ([LT]::GetForegroundWindow() -eq $m[1]) -and (Near $e2.W $a2.W 8)
+
+# (d) a window closed while it is minimized is forgotten
+Minimize $m[2]; Start-Sleep -Milliseconds 1500
+[TestForms]::CloseForm($m[2]); Start-Sleep -Milliseconds 1800
+$h4ClosedGone = -not [LT]::IsWindow($m[2])
+$h4ClosedForgotten = ($null -eq (WinOf (WinList 'h4-windows-after-close-gone') $m[2]))
+$lf = WinList 'h4-windows-after-close'
+$h4NeighboursStay = (-not [LT]::IsIconic($m[0])) -and (-not [LT]::IsIconic($m[1])) -and ((ColOf $lf $m[0]) -ge 0) -and ((ColOf $lf $m[1]) -eq ((ColOf $lf $m[0]) + 1))
+Shot 'h4-06-closed-while-minimized'
+[TestForms]::CloseForm($m[1]); [TestForms]::CloseForm($m[0])
 Start-Sleep -Milliseconds 1200
 
 # ---- Phase D: close one window, quit -----------------------------------------------------------
@@ -835,6 +899,21 @@ $summary = [ordered]@{
     h3_close_hits_dialog_not_owner = ($h3DialogClosed -and $h3OwnerSurvives)
     h3_tool_window_was_foreground = $h3ToolForeground
     h3_close_refuses_unmanaged_foreground = $h3CloseRefusedOnUnmanaged
+    # --- Phase 1 / H4: minimized windows
+    h4_three_windows_in_order = $h4OrderBefore
+    h4_minimized_window_is_iconic = $h4Iconic
+    h4_neighbours_close_the_gap = $h4NoGap
+    h4_ipc_reports_minimized = $h4IpcMinimized
+    h4_restored_between_its_neighbours = $h4RestoredBetween
+    h4_restored_keeps_its_size = $h4RestoredSize
+    h4_ipc_reports_restored = $h4IpcNotMinimized
+    h4_all_minimized = $h4AllIconic
+    h4_all_restored = $h4AllRestored
+    h4_old_order_kept_after_restoring_in_another_order = $h4OrderKept
+    h4_focus_window_restores_a_minimized_window = $h4FocusRestores
+    h4_closed_while_minimized_is_gone = $h4ClosedGone
+    h4_closed_while_minimized_is_forgotten = $h4ClosedForgotten
+    h4_neighbours_stay_after_closing_a_minimized_window = $h4NeighboursStay
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
