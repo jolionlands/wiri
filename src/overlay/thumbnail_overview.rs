@@ -19,9 +19,11 @@
 //! can call into during overview mode, plus a [`DwmThumbnailOverview`]
 //! Win32 implementation that owns:
 //!
-//! * one fullscreen layered topmost transparent host HWND, created on
-//!   [`enter`](ThumbnailOverviewSink::enter) and destroyed on
-//!   [`exit`](ThumbnailOverviewSink::exit);
+//! * one fullscreen layered topmost host HWND, created on its own
+//!   message-pump thread by the first [`enter`](ThumbnailOverviewSink::enter),
+//!   shown for each overview session and hidden again on
+//!   [`exit`](ThumbnailOverviewSink::exit) (a window belongs to the thread that
+//!   created it, and the engine enters and leaves overview from several threads);
 //! * a `HashMap<WindowId, HTHUMBNAIL>` of every registered thumbnail.
 //!
 //! For unit-testing the engine wiring without standing up a real Win32
@@ -72,7 +74,8 @@ pub trait ThumbnailOverviewSink: Send + Sync {
     fn update_thumbnail(&self, window_id: WindowId, dst_rect: Rect);
 
     /// Tear down every thumbnail registered since the last
-    /// [`enter`](Self::enter) call, and destroy the host window(s).
+    /// [`enter`](Self::enter) call, and hide the host window(s).  Must not
+    /// block on another thread: the engine lock is held across this call.
     fn exit(&self);
 
     /// Returns the number of currently-registered thumbnails.  Used by
@@ -206,12 +209,23 @@ mod win {
         DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
         DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
     };
+    use windows::Win32::Graphics::Gdi::CreateSolidBrush;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, RegisterClassExW,
-        SetLayeredWindowAttributes, ShowWindow, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, SM_CXSCREEN,
-        SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, MSG,
+        RegisterClassExW, SetLayeredWindowAttributes, SetWindowPos, ShowWindowAsync,
+        TranslateMessage, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, LWA_ALPHA, SM_CXSCREEN,
+        SM_CYSCREEN, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSEXW,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_POPUP,
     };
+
+    /// Opacity of the host window (0-255).  The thumbnails are composited *inside* the
+    /// host window, so a fully transparent host shows nothing at all; slightly below
+    /// opaque keeps a hint of the desktop behind the dark backdrop.
+    const HOST_ALPHA: u8 = 235;
+
+    /// Backdrop colour of the host window (`0x00BBGGRR`).
+    const HOST_BACKDROP: u32 = 0x0020_1810;
 
     /// Win32-backed thumbnail overview.
     pub struct DwmThumbnailOverview {
@@ -220,9 +234,11 @@ mod win {
 
     #[derive(Default)]
     struct DwmState {
-        /// Host HWND raw value; `None` while no overview session is
-        /// active.  Created on `enter`, destroyed on `exit`.
+        /// Host HWND raw value.  Created once, on a thread of its own that pumps its
+        /// messages, and kept hidden between overview sessions.
         host: Option<isize>,
+        /// An overview session is in progress (the host window is shown).
+        active: bool,
         /// Map from layout-engine window id → DWM thumbnail handle.
         /// Each `HTHUMBNAIL` is an `isize` in `windows 0.58`.
         thumbnails: HashMap<WindowId, isize>,
@@ -236,85 +252,51 @@ mod win {
                 state: Arc::new(Mutex::new(DwmState::default())),
             })
         }
-
-        fn ensure_host_class() {
-            static REGISTERED: OnceLock<()> = OnceLock::new();
-            REGISTERED.get_or_init(|| unsafe {
-                let class_name = wide("WiriThumbnailOverviewHost");
-                let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                    .expect("GetModuleHandleW failed");
-                let wc = WNDCLASSEXW {
-                    cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                    style: CS_HREDRAW | CS_VREDRAW,
-                    lpfnWndProc: Some(host_wnd_proc),
-                    hInstance: hinstance.into(),
-                    lpszClassName: PCWSTR(class_name.as_ptr()),
-                    ..Default::default()
-                };
-                let _ = RegisterClassExW(&wc);
-            });
-        }
     }
 
     impl ThumbnailOverviewSink for DwmThumbnailOverview {
         fn enter(&self) {
-            Self::ensure_host_class();
             let mut s = self.state.lock();
-            if s.host.is_some() {
-                // Already entered — clear residual thumbnails so a
-                // re-entry starts fresh.
-                for (_wid, hthumb) in s.thumbnails.drain() {
-                    unsafe {
-                        let _ = DwmUnregisterThumbnail(hthumb);
-                    }
+            if s.host.is_none() {
+                s.host = spawn_host_window();
+            }
+            let Some(raw) = s.host else {
+                // Couldn't create the host; bail without leaving state half-set.
+                return;
+            };
+            // A re-entry starts fresh.
+            for (_wid, hthumb) in s.thumbnails.drain() {
+                unsafe {
+                    let _ = DwmUnregisterThumbnail(hthumb);
                 }
+            }
+            if s.active {
                 return;
             }
+            s.active = true;
+            // Every call below is asynchronous: the host window belongs to its own
+            // thread, and a synchronous cross-thread call would wait for that thread
+            // while the engine lock is held here.
             unsafe {
-                let class_name = wide("WiriThumbnailOverviewHost");
-                let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                    .expect("GetModuleHandleW failed");
-                let screen_w = GetSystemMetrics(SM_CXSCREEN);
-                let screen_h = GetSystemMetrics(SM_CYSCREEN);
-                // Topmost layered transparent host.  WS_EX_TRANSPARENT
-                // lets mouse events pass through so the engine's own
-                // overview hit-testing keeps working.
-                let ex_style = WS_EX_LAYERED
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_TOPMOST
-                    | WS_EX_TRANSPARENT;
-                let hwnd = match CreateWindowExW(
-                    ex_style,
-                    PCWSTR(class_name.as_ptr()),
-                    PCWSTR(wide("").as_ptr()),
-                    WS_POPUP,
+                let hwnd = HWND(raw as *mut _);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
                     0,
                     0,
-                    screen_w,
-                    screen_h,
-                    None,
-                    None,
-                    hinstance,
-                    None,
-                ) {
-                    Ok(h) => h,
-                    Err(_) => {
-                        // Couldn't create the host; bail without
-                        // leaving state half-set.
-                        return;
-                    }
-                };
-                // Fully transparent background — only the thumbnails
-                // composited by DWM are visible.
-                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                s.host = Some(hwnd.0 as isize);
+                    GetSystemMetrics(SM_CXSCREEN),
+                    GetSystemMetrics(SM_CYSCREEN),
+                    SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                );
+                let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
             }
         }
 
         fn register(&self, window_id: WindowId, source_hwnd: isize) {
             let mut s = self.state.lock();
+            if !s.active {
+                return;
+            }
             let host_raw = match s.host {
                 Some(h) => h,
                 None => return,
@@ -372,11 +354,14 @@ mod win {
                     let _ = DwmUnregisterThumbnail(hthumb);
                 }
             }
-            if let Some(raw) = s.host.take() {
-                unsafe {
-                    let hwnd = HWND(raw as *mut _);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                    let _ = DestroyWindow(hwnd);
+            if s.active {
+                s.active = false;
+                if let Some(raw) = s.host {
+                    // Hide, don't destroy: the window is owned by its pump thread, and a
+                    // hidden window costs nothing until the next overview.
+                    unsafe {
+                        let _ = ShowWindowAsync(HWND(raw as *mut _), SW_HIDE);
+                    }
                 }
             }
         }
@@ -388,6 +373,94 @@ mod win {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn ensure_host_class() {
+        static REGISTERED: OnceLock<()> = OnceLock::new();
+        REGISTERED.get_or_init(|| unsafe {
+            let class_name = wide("WiriThumbnailOverviewHost");
+            let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                .expect("GetModuleHandleW failed");
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(host_wnd_proc),
+                hInstance: hinstance.into(),
+                hbrBackground: CreateSolidBrush(COLORREF(HOST_BACKDROP)),
+                lpszClassName: PCWSTR(class_name.as_ptr()),
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc);
+        });
+    }
+
+    /// Create the host window on a dedicated thread that pumps its messages for the
+    /// life of the process, and return its handle (`None` when it could not be created).
+    ///
+    /// A window belongs to the thread that created it.  The engine enters and leaves
+    /// overview from different threads (the hotkey thread, the keyboard-hook thread, ...),
+    /// and a cross-thread `ShowWindow` / `DestroyWindow` waits for the owning thread to pump
+    /// messages - a deadlock when that thread is itself waiting for the engine lock the
+    /// caller holds (Escape does exactly that: it reaches wiri as a hotkey *and* through
+    /// the keyboard hook).  `DestroyWindow` from another thread does not work at all.
+    fn spawn_host_window() -> Option<isize> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<isize>>(1);
+        let spawned = std::thread::Builder::new()
+            .name("wiri-overview-host".to_string())
+            .spawn(move || unsafe { host_thread(tx) });
+        if spawned.is_err() {
+            return None;
+        }
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .ok()
+            .flatten()
+    }
+
+    unsafe fn host_thread(ready: std::sync::mpsc::SyncSender<Option<isize>>) {
+        ensure_host_class();
+        let class_name = wide("WiriThumbnailOverviewHost");
+        let hinstance = match windows::Win32::System::LibraryLoader::GetModuleHandleW(None) {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = ready.send(None);
+                return;
+            }
+        };
+        // Topmost layered host.  WS_EX_TRANSPARENT lets mouse events pass through so the
+        // engine's own overview hit-testing keeps working.
+        let ex_style = WS_EX_LAYERED
+            | WS_EX_NOACTIVATE
+            | WS_EX_TOOLWINDOW
+            | WS_EX_TOPMOST
+            | WS_EX_TRANSPARENT;
+        let hwnd = match CreateWindowExW(
+            ex_style,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(wide("").as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+            None,
+            None,
+            hinstance,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = ready.send(None);
+                return;
+            }
+        };
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), HOST_ALPHA, LWA_ALPHA);
+        let _ = ready.send(Some(hwnd.0 as isize));
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 
     unsafe extern "system" fn host_wnd_proc(
