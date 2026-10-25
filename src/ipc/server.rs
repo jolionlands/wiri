@@ -6,6 +6,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use super::messages::{BindingInfo, IpcEvent, IpcMessage, MonitorInfo, WorkspaceInfo};
+use super::state::{self, IpcSnapshot};
 use super::PIPE_PATH;
 use crate::layout::TilingEngine;
 use crate::utils::{Rect, WindowId};
@@ -28,6 +29,24 @@ pub struct IpcServer {
     reload_tx: parking_lot::Mutex<Option<mpsc::UnboundedSender<()>>>,
     /// The config file wiri loaded, so `reload_config` can answer with what is wrong in it.
     config_path: parking_lot::Mutex<Option<std::path::PathBuf>>,
+    /// What event-stream clients were last told about the windows and workspaces: what the
+    /// next change is compared with, and what a new subscriber is brought up to date with.
+    /// Held while the state is described, compared and sent, so that two such passes never
+    /// interleave (lock order: this one, then the engine).
+    mirror: parking_lot::Mutex<Mirror>,
+    /// The last `config_loaded` event, which a new subscriber gets after the state (niri sends
+    /// how the config loaded on connect).
+    last_config: parking_lot::Mutex<Option<IpcEvent>>,
+}
+
+/// See [`IpcServer::mirror`].
+#[derive(Default)]
+struct Mirror {
+    /// What the subscribers know.
+    last: IpcSnapshot,
+    /// The file name of the program of each process that has a window (asking the system for
+    /// it costs a process handle; a process id is not looked up twice).
+    app_ids: std::collections::HashMap<u32, Option<String>>,
 }
 
 impl IpcServer {
@@ -40,6 +59,8 @@ impl IpcServer {
             shutdown_tx: parking_lot::Mutex::new(None),
             reload_tx: parking_lot::Mutex::new(None),
             config_path: parking_lot::Mutex::new(None),
+            mirror: parking_lot::Mutex::new(Mirror::default()),
+            last_config: parking_lot::Mutex::new(None),
         }
     }
 
@@ -75,7 +96,105 @@ impl IpcServer {
     }
 
     pub fn broadcast_event(&self, event: IpcEvent) {
+        // How the config loaded is part of what a new subscriber is told first.
+        if matches!(event, IpcEvent::ConfigLoaded { .. }) {
+            *self.last_config.lock() = Some(event.clone());
+        }
         let _ = self.event_tx.send(event);
+    }
+
+    // ---- the event stream's state: niri's contract ---------------------------------------------
+    //
+    // A client that subscribes is told the state first (the workspaces, the windows, whether
+    // the overview is open, how the config loaded) and then what changes, so that it never has
+    // to ask.  `sync_state` finds the changes by describing the engine and comparing the
+    // description with the one the clients were last told; it runs when something that can
+    // change the state has happened (`notify_state_changed`), and only while somebody listens.
+
+    /// Describe the engine now: its windows and workspaces, with the program of every window
+    /// the window rules had not looked at (they know the program of the windows they
+    /// evaluated).  `None` before the engine is connected.
+    fn describe(&self, mirror: &mut Mirror) -> Option<IpcSnapshot> {
+        let engine = self.engine.as_ref()?;
+        let mut snapshot = engine.read().ipc_snapshot();
+        let mut live = std::collections::HashSet::new();
+        for window in &mut snapshot.windows {
+            let Some(pid) = window.pid else { continue };
+            live.insert(pid);
+            if window.app_id.is_none() {
+                let backend = self.backend.as_ref();
+                let name = mirror
+                    .app_ids
+                    .entry(pid)
+                    .or_insert_with(|| backend.and_then(|b| b.process_name_for_pid(pid)));
+                window.app_id = name.clone();
+            }
+        }
+        // A process id can be given to another process once the first one has gone.
+        mirror.app_ids.retain(|pid, _| live.contains(pid));
+        Some(snapshot)
+    }
+
+    /// Send the subscribers what changed since they were last told.
+    pub fn sync_state(&self) {
+        if self.event_tx.receiver_count() == 0 {
+            return;
+        }
+        let mut mirror = self.mirror.lock();
+        self.sync_locked(&mut mirror);
+    }
+
+    fn sync_locked(&self, mirror: &mut Mirror) {
+        let Some(snapshot) = self.describe(mirror) else {
+            return;
+        };
+        for event in state::diff(&mirror.last, &snapshot) {
+            let _ = self.event_tx.send(event);
+        }
+        mirror.last = snapshot;
+    }
+
+    /// A new subscriber: bring what the others were told up to date, subscribe, and return
+    /// what the new one is told first.  Nothing is sent between the subscription and the
+    /// description (the mirror is held), so the replay and the events that follow it neither
+    /// miss a change nor repeat one.
+    fn subscribe_with_replay(&self) -> (broadcast::Receiver<IpcEvent>, Vec<IpcEvent>) {
+        let mut mirror = self.mirror.lock();
+        self.sync_locked(&mut mirror);
+        let receiver = self.event_tx.subscribe();
+        let mut replay = state::replay(&mirror.last);
+        if let Some(config) = self.last_config.lock().clone() {
+            replay.push(config);
+        }
+        (receiver, replay)
+    }
+
+    /// `subscribe_with_replay` on a thread that may wait for the engine.
+    async fn subscribe_blocking(
+        self: &Arc<Self>,
+    ) -> Option<(broadcast::Receiver<IpcEvent>, Vec<IpcEvent>)> {
+        let server = Arc::clone(self);
+        tokio::task::spawn_blocking(move || server.subscribe_with_replay())
+            .await
+            .ok()
+    }
+
+    /// Tell the subscribers about changes, once for a burst of them, and only while somebody is
+    /// subscribed.  It sleeps until `notify_state_changed` wakes it: no timer, no polling.
+    pub async fn run_state_task(self: Arc<Self>) {
+        loop {
+            super::STATE_CHANGED.notified().await;
+            if self.event_tx.receiver_count() == 0 {
+                continue;
+            }
+            let server = Arc::clone(&self);
+            if tokio::task::spawn_blocking(move || server.sync_state())
+                .await
+                .is_err()
+            {
+                error!("IPC: describing the state for the event stream panicked");
+            }
+        }
     }
 
     /// Start the IPC server listening on the named pipe.
@@ -244,36 +363,40 @@ impl IpcServer {
                 ack.push(b'\n');
                 let _ = pipe.write_all(&ack).await;
 
-                // Subscribe to the broadcast channel (64-entry buffer per spec)
-                let mut event_rx = self.event_tx.subscribe();
+                // The state first (niri's contract), then what changes.  The broadcast channel
+                // keeps 64 events per subscriber.
+                let Some((mut event_rx, replay)) = self.subscribe_blocking().await else {
+                    return Ok(());
+                };
+                for event in &replay {
+                    if !write_event(&mut pipe, event_types, event).await {
+                        debug!("IPC event subscriber disconnected");
+                        return Ok(());
+                    }
+                }
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
-                            let value = match serde_json::to_value(&event) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warn!("IPC: Failed to encode event: {}", e);
-                                    continue;
-                                }
-                            };
-                            if !subscription_allows_event(event_types, &value) {
-                                continue;
-                            }
-                            let mut bytes = match serde_json::to_vec(&value) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    warn!("IPC: Failed to serialize event: {}", e);
-                                    continue;
-                                }
-                            };
-                            bytes.push(b'\n');
-                            if pipe.write_all(&bytes).await.is_err() {
+                            if !write_event(&mut pipe, event_types, &event).await {
                                 debug!("IPC event subscriber disconnected");
                                 return Ok(());
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("IPC event subscriber lagged by {} events", n);
+                            // The client missed events, so what it knows is not what is.  Tell
+                            // it the state again (the lists replace what it had), as when it
+                            // subscribed.
+                            warn!("IPC event subscriber lagged by {} events; sending the state again", n);
+                            let Some((rx, replay)) = self.subscribe_blocking().await else {
+                                return Ok(());
+                            };
+                            event_rx = rx;
+                            for event in &replay {
+                                if !write_event(&mut pipe, event_types, event).await {
+                                    debug!("IPC event subscriber disconnected");
+                                    return Ok(());
+                                }
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             debug!("IPC event broadcast channel closed");
@@ -332,6 +455,8 @@ impl IpcServer {
     }
 
     fn process_message(&self, message: IpcMessage) -> serde_json::Value {
+        // Event-stream clients are told what the request did to the windows and workspaces.
+        let _state_changed = (!is_query(&message)).then_some(super::StateChangeGuard);
         match message {
             IpcMessage::GetState => {
                 if let Some(engine) = &self.engine {
@@ -486,9 +611,58 @@ impl IpcServer {
                 }
                 serde_json::json!({"success": true})
             }
-            IpcMessage::RunAction { name, args } => {
+            IpcMessage::RunAction { name, args, quoted } => {
                 info!("IPC: RunAction {} {:?}", name, args);
-                let Some(action) = crate::input::parse_action_name(&name, &args) else {
+                // niri's `--id <n>`: the window to act on.
+                let (args, quoted, target) = match split_window_target(&args, &quoted) {
+                    Ok(split) => split,
+                    Err(error) => return serde_json::json!({"success": false, "error": error}),
+                };
+                let (Some(engine), Some(backend)) = (&self.engine, &self.backend) else {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": "engine or backend not initialized"
+                    });
+                };
+                if let Some(hwnd) = target {
+                    // Only a window wiri manages can be named (a handle is not a licence to
+                    // close or move whatever window of the desktop).
+                    if !engine
+                        .read()
+                        .tiled_windows()
+                        .contains_key(&WindowId::new(hwnd))
+                    {
+                        return serde_json::json!({
+                            "success": false,
+                            "error": format!(
+                                "no window with id {} (the handle that `wiri-ctl windows` shows)",
+                                hwnd
+                            )
+                        });
+                    }
+                    // niri's `close-window --id` closes that window and leaves the focus alone.
+                    if matches!(name.as_str(), "close-window" | "close") {
+                        return self.process_message(IpcMessage::CloseWindow { window_hwnd: hwnd });
+                    }
+                    // Any other action acts on the focused window: the window is focused first
+                    // (niri leaves the focus where it is; the focus follows the window here).
+                    if !focus_window_by_hwnd(engine, backend, hwnd) {
+                        return serde_json::json!({
+                            "success": false,
+                            "error": format!("no window with id {} to focus", hwnd)
+                        });
+                    }
+                    if name == "focus-window" {
+                        engine.write().apply_all(backend);
+                        return serde_json::json!({"success": true});
+                    }
+                } else if name == "focus-window" {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": "focus-window needs --id <window id> (the handle that `wiri-ctl windows` shows)"
+                    });
+                }
+                let Some(action) = crate::input::parse_action_flagged(&name, &args, &quoted) else {
                     return serde_json::json!({
                         "success": false,
                         "error": format!("unknown action or bad arguments: {} {:?}", name, args)
@@ -497,20 +671,13 @@ impl IpcServer {
                 if matches!(action, crate::input::Action::Quit) {
                     return self.process_message(IpcMessage::Quit);
                 }
-                match (&self.engine, &self.backend) {
-                    (Some(engine), Some(backend)) => {
-                        // No quit channel: `quit` is handled above.
-                        let no_quit = Arc::new(parking_lot::Mutex::new(None));
-                        crate::backend::message_loop::perform_action(
-                            &action, engine, backend, &no_quit,
-                        );
-                        serde_json::json!({"success": true})
-                    }
-                    _ => serde_json::json!({
-                        "success": false,
-                        "error": "engine or backend not initialized"
-                    }),
-                }
+                // No quit channel: `quit` is handled above.  With `--id` the action acts on that
+                // window whatever the OS reports as the foreground window by now.
+                let no_quit = Arc::new(parking_lot::Mutex::new(None));
+                crate::backend::message_loop::perform_action_on(
+                    &action, engine, backend, &no_quit, target,
+                );
+                serde_json::json!({"success": true})
             }
             IpcMessage::SubscribeEvents { event_types } => {
                 info!("IPC: Subscribe to events: {:?}", event_types);
@@ -1637,6 +1804,104 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
     out
 }
 
+/// Requests that only read: they cannot change what event-stream clients are told, so they
+/// do not wake the task that finds out what changed.
+fn is_query(message: &IpcMessage) -> bool {
+    matches!(
+        message,
+        IpcMessage::GetState
+            | IpcMessage::WindowList
+            | IpcMessage::WindowFind { .. }
+            | IpcMessage::WorkspaceList
+            | IpcMessage::GetWorkspaceList
+            | IpcMessage::MonitorList
+            | IpcMessage::GetFocus
+            | IpcMessage::ListBindings
+            | IpcMessage::GetBindings
+            | IpcMessage::PresetList
+            | IpcMessage::ListSnapshots
+            | IpcMessage::LayoutExport
+            | IpcMessage::SubscribeEvents { .. }
+    )
+}
+
+/// niri's `--id <n>` (also `--id=<n>`, and `--window-id` where niri's action calls it so) in
+/// the arguments of an action: the window to act on instead of the focused one.  Returns the
+/// arguments without it, the `quoted` flags that go with them, and the window.
+fn split_window_target(
+    args: &[String],
+    quoted: &[bool],
+) -> Result<(Vec<String>, Vec<bool>, Option<isize>), String> {
+    let mut rest = Vec::new();
+    let mut rest_quoted = Vec::new();
+    let mut target = None;
+    let mut i = 0;
+    while i < args.len() {
+        let word = args[i].as_str();
+        let value = if let Some(v) = word
+            .strip_prefix("--id=")
+            .or_else(|| word.strip_prefix("--window-id="))
+        {
+            i += 1;
+            Some(v.to_string())
+        } else if word == "--id" || word == "--window-id" {
+            let Some(v) = args.get(i + 1) else {
+                return Err(format!("{} needs a window id", word));
+            };
+            i += 2;
+            Some(v.clone())
+        } else {
+            None
+        };
+        match value {
+            Some(value) => {
+                let id: isize = value.trim().parse().map_err(|_| {
+                    format!(
+                        "`{}` is not a window id (the number that `wiri-ctl windows` shows as hwnd)",
+                        value
+                    )
+                })?;
+                target = Some(id);
+            }
+            None => {
+                rest.push(args[i].clone());
+                rest_quoted.push(quoted.get(i).copied().unwrap_or(false));
+                i += 1;
+            }
+        }
+    }
+    Ok((rest, rest_quoted, target))
+}
+
+/// Write one event to a subscriber as a line of JSON, when its filter lets the type through.
+/// `false` when the client is gone.
+async fn write_event(
+    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
+    event_types: &[String],
+    event: &IpcEvent,
+) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let value = match serde_json::to_value(event) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("IPC: Failed to encode event: {}", e);
+            return true;
+        }
+    };
+    if !subscription_allows_event(event_types, &value) {
+        return true;
+    }
+    let mut bytes = match serde_json::to_vec(&value) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("IPC: Failed to serialize event: {}", e);
+            return true;
+        }
+    };
+    bytes.push(b'\n');
+    pipe.write_all(&bytes).await.is_ok()
+}
+
 fn subscription_allows_event(event_types: &[String], event: &serde_json::Value) -> bool {
     if event_types.is_empty() || event_types.iter().any(|t| t == "*") {
         return true;
@@ -1876,4 +2141,307 @@ pub fn build_pipe_security_attributes() -> Result<windows::Win32::Security::SECU
         lpSecurityDescriptor: sd.0,
         bInheritHandle: false.into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{BackendHandle, WindowInfo, WindowState};
+    use crate::layout::LayoutConfig;
+    use crate::utils::OutputId;
+
+    fn words(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn niris_id_flag_names_the_window_and_is_taken_out_of_the_arguments() {
+        let (args, quoted, target) =
+            split_window_target(&words(&["--id", "1234", "+10%"]), &[]).unwrap();
+        assert_eq!(args, words(&["+10%"]));
+        assert_eq!(quoted, vec![false]);
+        assert_eq!(target, Some(1234));
+        // niri spells it `--window-id` for move-window-to-workspace; `=` works too.
+        let (args, _, target) =
+            split_window_target(&words(&["--window-id", "77", "2"]), &[]).unwrap();
+        assert_eq!((args, target), (words(&["2"]), Some(77)));
+        let (args, _, target) = split_window_target(&words(&["2", "--id=9"]), &[]).unwrap();
+        assert_eq!((args, target), (words(&["2"]), Some(9)));
+        // No flag: the arguments are left alone, with their quoting.
+        let (args, quoted, target) =
+            split_window_target(&words(&["2", "name"]), &[true, false]).unwrap();
+        assert_eq!(args, words(&["2", "name"]));
+        assert_eq!(quoted, vec![true, false]);
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn a_window_flag_without_a_window_is_an_error_that_says_so() {
+        assert!(split_window_target(&words(&["--id"]), &[]).unwrap_err().contains("needs a window id"));
+        let error = split_window_target(&words(&["--id", "abc"]), &[]).unwrap_err();
+        assert!(error.contains("`abc` is not a window id"), "{}", error);
+    }
+
+    #[test]
+    fn quoting_stays_with_the_argument_it_was_written_on() {
+        // `focus-workspace "2"` after the window flag was taken out of the middle.
+        let (args, quoted, target) = split_window_target(
+            &words(&["--id", "5", "2"]),
+            &[false, false, true],
+        )
+        .unwrap();
+        assert_eq!(args, words(&["2"]));
+        assert_eq!(quoted, vec![true]);
+        assert_eq!(target, Some(5));
+    }
+
+    #[test]
+    fn only_requests_that_can_change_the_state_wake_the_state_task() {
+        assert!(is_query(&IpcMessage::GetState));
+        assert!(is_query(&IpcMessage::WindowList));
+        assert!(is_query(&IpcMessage::MonitorList));
+        assert!(is_query(&IpcMessage::GetFocus));
+        assert!(!is_query(&IpcMessage::FocusWindow { window_hwnd: 1 }));
+        assert!(!is_query(&IpcMessage::RunAction {
+            name: "close-window".into(),
+            args: Vec::new(),
+            quoted: Vec::new(),
+        }));
+        assert!(!is_query(&IpcMessage::ReloadConfig));
+    }
+
+    fn action(name: &str, args: &[&str]) -> IpcMessage {
+        IpcMessage::RunAction {
+            name: name.to_string(),
+            args: words(args),
+            quoted: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_action_with_id_acts_on_that_window_not_on_the_focused_one() {
+        let (mut server, engine) = server_with_windows(&[100, 101]);
+        server.set_backend(BackendHandle::default_for_test());
+        // 101 is the engine's focus (the window that was added last).
+        let reply = server.process_message(action("fullscreen-window", &["--id", "100"]));
+        assert_eq!(reply["success"], true, "{}", reply);
+        assert!(engine.read().is_fullscreen(WindowId::new(100)));
+        assert!(!engine.read().is_fullscreen(WindowId::new(101)));
+        // The same with niri's other spelling.
+        let reply = server.process_message(action("fullscreen-window", &["--id=100"]));
+        assert_eq!(reply["success"], true, "{}", reply);
+        assert!(!engine.read().is_fullscreen(WindowId::new(100)), "toggled back");
+    }
+
+    #[test]
+    fn an_action_can_only_name_a_window_wiri_manages() {
+        let (mut server, engine) = server_with_windows(&[100]);
+        server.set_backend(BackendHandle::default_for_test());
+        for name in ["fullscreen-window", "close-window", "focus-window"] {
+            let reply = server.process_message(action(name, &["--id", "4242"]));
+            assert_eq!(reply["success"], false, "{}: {}", name, reply);
+            let error = reply["error"].as_str().unwrap_or_default();
+            assert!(error.contains("no window with id 4242"), "{}: {}", name, error);
+        }
+        assert!(!engine.read().is_fullscreen(WindowId::new(100)));
+        // focus-window without a window says what it needs; a bad number says so too.
+        let reply = server.process_message(action("focus-window", &[]));
+        assert!(reply["error"].as_str().unwrap_or_default().contains("needs --id"), "{}", reply);
+        let reply = server.process_message(action("fullscreen-window", &["--id", "abc"]));
+        assert!(reply["error"].as_str().unwrap_or_default().contains("not a window id"), "{}", reply);
+    }
+
+    #[test]
+    fn a_quoted_workspace_word_reaches_the_action_as_a_name() {
+        let (mut server, engine) = server_with_windows(&[100]);
+        server.set_backend(BackendHandle::default_for_test());
+        let before = engine.read().monitors().focused().map(|m| m.active_workspace);
+        // `focus-workspace 2` is the second workspace...
+        let reply = server.process_message(action("focus-workspace", &["2"]));
+        assert_eq!(reply["success"], true, "{}", reply);
+        let second = engine.read().monitors().focused().map(|m| m.active_workspace);
+        assert_ne!(before, second, "the second workspace");
+        // ...and `focus-workspace "1"` is the workspace named 1, which there is none of.
+        let reply = server.process_message(IpcMessage::RunAction {
+            name: "focus-workspace".into(),
+            args: words(&["1"]),
+            quoted: vec![true],
+        });
+        assert_eq!(reply["success"], true, "{}", reply);
+        assert_eq!(
+            engine.read().monitors().focused().map(|m| m.active_workspace),
+            second,
+            "a name that no workspace has does not switch anything"
+        );
+    }
+
+    // ---- the event stream's state ----------------------------------------------------------
+
+    fn window(hwnd: isize) -> WindowInfo {
+        WindowInfo {
+            hwnd,
+            title: format!("Window {}", hwnd),
+            class_name: "TestClass".to_string(),
+            process_id: 1000,
+            bounds: Rect::new(0, 0, 800, 600),
+            state: WindowState::Normal,
+            is_visible: true,
+        }
+    }
+
+    fn server_with_windows(ids: &[isize]) -> (IpcServer, Arc<parking_lot::RwLock<TilingEngine>>) {
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        engine.register_monitor(
+            OutputId::from_name("TestMonitor"),
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        let backend = BackendHandle::default_for_test();
+        for id in ids {
+            engine.add_window(window(*id), &backend);
+        }
+        let engine = Arc::new(parking_lot::RwLock::new(engine));
+        let mut server = IpcServer::new();
+        server.set_engine(engine.clone());
+        (server, engine)
+    }
+
+    fn drain(receiver: &mut broadcast::Receiver<IpcEvent>) -> Vec<IpcEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn types(events: &[IpcEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap()["type"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_subscriber_is_told_the_state_first_and_how_the_config_loaded() {
+        let (server, _engine) = server_with_windows(&[100, 101]);
+        server.broadcast_event(IpcEvent::ConfigLoaded {
+            config_path: "config.kdl".into(),
+            failed: true,
+            error: Some("config.kdl:3:5: error: x".into()),
+            warnings: 1,
+        });
+        let (_rx, replay) = server.subscribe_with_replay();
+        assert_eq!(
+            types(&replay),
+            [
+                "workspaces_changed",
+                "windows_changed",
+                "overview_opened_or_closed",
+                "config_loaded"
+            ]
+        );
+        match &replay[1] {
+            IpcEvent::WindowsChanged { windows } => {
+                assert_eq!(windows.iter().map(|w| w.id).collect::<Vec<_>>(), vec![100, 101]);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        match &replay[3] {
+            IpcEvent::ConfigLoaded { failed, error, .. } => {
+                assert!(*failed);
+                assert!(error.as_deref().unwrap().contains("config.kdl:3:5"));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_subscriber_that_comes_late_is_told_the_state_as_it_is_not_as_it_was() {
+        // Nobody listened while the windows came: nothing was described (the work is done
+        // only for subscribers), yet the first subscriber is told all of them.
+        let (server, engine) = server_with_windows(&[100]);
+        engine.write().add_window(window(101), &BackendHandle::default_for_test());
+        server.sync_state();
+        assert!(server.mirror.lock().last.windows.is_empty(), "nobody is listening");
+        let (_rx, replay) = server.subscribe_with_replay();
+        match &replay[1] {
+            IpcEvent::WindowsChanged { windows } => assert_eq!(windows.len(), 2),
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn changes_after_the_subscription_are_sent_once_as_events() {
+        let (server, engine) = server_with_windows(&[100]);
+        let (mut rx, _replay) = server.subscribe_with_replay();
+        // Nothing happened: nothing is sent.
+        server.sync_state();
+        assert!(drain(&mut rx).is_empty());
+
+        let backend = BackendHandle::default_for_test();
+        engine.write().add_window(window(101), &backend);
+        server.sync_state();
+        let events = drain(&mut rx);
+        // The new window is the active one of its workspace (niri tells the workspace first).
+        assert_eq!(
+            types(&events),
+            ["workspace_active_window_changed", "window_opened_or_changed"]
+        );
+        // The same state again: nothing more.
+        server.sync_state();
+        assert!(drain(&mut rx).is_empty());
+
+        engine.write().remove_window(WindowId::new(101), &backend);
+        server.sync_state();
+        let events = drain(&mut rx);
+        let closed = events
+            .iter()
+            .find_map(|e| match e {
+                IpcEvent::WindowClosed { window_hwnd, id } => Some((*window_hwnd, *id)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no window_closed in {:?}", types(&events)));
+        assert_eq!(closed, (101, 101));
+        assert_eq!(
+            types(&events).iter().filter(|t| *t == "window_closed").count(),
+            1,
+            "{:?}",
+            types(&events)
+        );
+    }
+
+    #[test]
+    fn the_focus_the_os_reports_is_the_focus_the_stream_reports() {
+        let (server, engine) = server_with_windows(&[100, 101]);
+        let (mut rx, replay) = server.subscribe_with_replay();
+        match &replay[1] {
+            IpcEvent::WindowsChanged { windows } => {
+                assert!(windows.iter().all(|w| !w.is_focused), "no foreground report yet");
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        let backend = BackendHandle::default_for_test();
+        engine.write().sync_os_foreground(WindowId::new(101), &backend);
+        server.sync_state();
+        let events = drain(&mut rx);
+        assert_eq!(types(&events), ["window_focus_changed"]);
+        match &events[0] {
+            IpcEvent::WindowFocusChanged { id } => assert_eq!(*id, Some(101)),
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_overview_that_opens_is_reported() {
+        let (server, engine) = server_with_windows(&[100]);
+        let (mut rx, _replay) = server.subscribe_with_replay();
+        engine.write().enter_overview(&BackendHandle::default_for_test());
+        server.sync_state();
+        let events = drain(&mut rx);
+        assert!(types(&events).contains(&"overview_opened_or_closed".to_string()), "{:?}", types(&events));
+        match events.last().unwrap() {
+            IpcEvent::OverviewOpenedOrClosed { is_open } => assert!(*is_open),
+            other => panic!("unexpected {:?}", other),
+        }
+    }
 }

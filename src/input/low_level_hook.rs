@@ -562,6 +562,7 @@ unsafe extern "system" fn mouse_hook_callback(
                     let mut eng = engine.write();
                     eng.focus_workspace_relative(dir, &backend);
                     eng.apply_all(&backend);
+                    crate::ipc::notify_state_changed();
                 });
             }
             // Consume the event — do not forward to the app under the cursor.
@@ -822,6 +823,8 @@ unsafe extern "system" fn mouse_hook_callback(
                             if let Some(backend) = &state.backend {
                                 eng.apply_layout_for_monitor(oid, backend);
                             }
+                            // The window may have moved to another column.
+                            crate::ipc::notify_state_changed();
                         }
                     }
                     drop(state);
@@ -889,6 +892,7 @@ unsafe extern "system" fn mouse_hook_callback(
                         let dst = engine.read().column_at_x(cursor.x);
                         if let Some(dst_col) = dst {
                             engine.write().swap_columns(src, dst_col, &backend);
+                            crate::ipc::notify_state_changed();
                         }
                     }
                     LRESULT(1)

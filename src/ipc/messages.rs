@@ -37,6 +37,29 @@ impl From<serde_json::Error> for IpcError {
     }
 }
 
+/// The arguments of `run_action`: strings, or numbers and booleans standing for their text
+/// (`[2]` is `["2"]`), so that a client written in a typed language can pass what niri's
+/// own action arguments are.
+fn deserialize_action_args<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::String(text) => Ok(text),
+            serde_json::Value::Number(number) => Ok(number.to_string()),
+            serde_json::Value::Bool(flag) => Ok(flag.to_string()),
+            other => Err(D::Error::custom(format!(
+                "an action argument is a string, a number or a boolean, not {}",
+                other
+            ))),
+        })
+        .collect()
+}
+
 // ---- Message types ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,13 +207,22 @@ pub enum IpcMessage {
 
     /// Run any action by its niri name, exactly as if its key were pressed
     /// (`"focus-column-left"`, `"set-column-width"` with `["+10%"]`,
-    /// `"focus-workspace"` with `["2"]`, ...).  The arguments are the words
-    /// that follow the action name in a `binds {}` line.
-    #[serde(rename = "run_action")]
+    /// `"focus-workspace"` with `[2]`, ...).  The arguments are the words
+    /// that follow the action name in a `binds {}` line; a number or a boolean
+    /// stands for its text (`2` is `"2"`).  `quoted[i]` says that `args[i]` was
+    /// written in double quotes: `focus-workspace 2` is the second workspace,
+    /// `focus-workspace "2"` the workspace named "2".  A window can be named
+    /// with `--id <hwnd>` (niri's `--id`; `--window-id` where niri has that
+    /// spelling), see `docs/IPC_PROTOCOL.md`.  The message is also accepted
+    /// as `{"type":"action","data":{"action":...}}`.
+    #[serde(rename = "run_action", alias = "action")]
     RunAction {
+        #[serde(alias = "action")]
         name: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_action_args")]
         args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        quoted: Vec<bool>,
     },
 
     // ---- Niri-parity Round-2 ----
@@ -406,23 +438,74 @@ pub enum IpcMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum IpcEvent {
-    /// Broadcast when the set of workspaces changes (create, delete, or rename).
-    /// Carries the full updated workspace list for easy state reconciliation.
+    // ---- niri's event stream: the state first (replayed to a new subscriber), then deltas ----
+    /// niri `WorkspacesChanged`: the workspaces were created, removed, renamed, moved or
+    /// reordered.  Carries the full list, which replaces what the client knew.
     #[serde(rename = "workspaces_changed")]
-    WorkspacesChanged { workspaces: Vec<WorkspaceInfo> },
+    WorkspacesChanged { workspaces: Vec<WorkspaceIpc> },
 
+    /// niri `WorkspaceUrgencyChanged`: a window of the workspace asked for attention, or the
+    /// last one that did stopped.
+    #[serde(rename = "workspace_urgency_changed")]
+    WorkspaceUrgencyChanged { id: u64, urgent: bool },
+
+    /// niri `WorkspaceActivated`: the workspace became the active one of its output.
+    /// `focused` says that it is now the focused workspace (the active one of the focused
+    /// output): every other workspace is not focused any more, but may stay active on its own
+    /// output.  Sent as well when the focus moves to another output.
+    #[serde(rename = "workspace_activated")]
+    WorkspaceActivated { id: u64, focused: bool },
+
+    /// niri `WorkspaceActiveWindowChanged`: the window that is the active one of the
+    /// workspace changed (`null`: none).
+    #[serde(rename = "workspace_active_window_changed")]
+    WorkspaceActiveWindowChanged {
+        workspace_id: u64,
+        active_window_id: Option<u64>,
+    },
+
+    /// niri `WindowsChanged`: every window that wiri manages.  Replaces what the client
+    /// knew; part of the replay a new subscriber gets first.
+    #[serde(rename = "windows_changed")]
+    WindowsChanged { windows: Vec<WindowIpc> },
+
+    /// niri `WindowOpenedOrChanged`: a window appeared, or its title, application,
+    /// workspace, floating state (and wiri's fullscreen, maximized and minimized states)
+    /// changed.  Focus, urgency and the place in the strip have events of their own.
+    #[serde(rename = "window_opened_or_changed")]
+    WindowOpenedOrChanged { window: WindowIpc },
+
+    /// niri `WindowFocusChanged`: the window that has the keyboard focus changed (`null`:
+    /// a window wiri does not manage has it, or none).
+    #[serde(rename = "window_focus_changed")]
+    WindowFocusChanged { id: Option<u64> },
+
+    /// niri `WindowUrgencyChanged`: the window asks for attention, or stopped.
+    #[serde(rename = "window_urgency_changed")]
+    WindowUrgencyChanged { id: u64, urgent: bool },
+
+    /// niri `WindowLayoutsChanged`: the windows' places in their strips changed.
+    #[serde(rename = "window_layouts_changed")]
+    WindowLayoutsChanged { changes: Vec<(u64, WindowLayoutIpc)> },
+
+    /// niri `OverviewOpenedOrClosed`.
+    #[serde(rename = "overview_opened_or_closed")]
+    OverviewOpenedOrClosed { is_open: bool },
+
+    // ---- wiri's own events (kept from before the niri ones; they carry the window handle) ----
     /// Fired when a new window is added to the tiling engine layout.
     /// Includes full `WindowInfoIpc` with title, class, PID, and initial geometry.
     #[serde(rename = "window_opened")]
     WindowOpened { window: WindowInfoIpc },
 
-    /// Fired when a tiled window is destroyed or explicitly removed from the layout.
+    /// niri `WindowClosed`: a window wiri managed is gone, destroyed or taken out of the
+    /// layout.  `window_hwnd` and `id` are the same number (the window handle).
     #[serde(rename = "window_closed")]
-    WindowClosed { window_hwnd: isize },
-
-    /// Fired when a named workspace becomes active on any monitor.
-    #[serde(rename = "workspace_activated")]
-    WorkspaceActivated { workspace: String },
+    WindowClosed {
+        window_hwnd: isize,
+        #[serde(default)]
+        id: u64,
+    },
 
     /// Fired when `config.kdl` is hot-reloaded, by the file watcher, `reload_config` or the
     /// tray menu.  niri's `ConfigLoaded { failed }`: `failed` is true when the file has errors
@@ -505,6 +588,67 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub id: u32,
     pub window_count: usize,
+}
+
+/// niri's `WindowLayout`, the part wiri knows: where the window sits in its workspace's
+/// strip.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowLayoutIpc {
+    /// Column and tile of the window in the scrolling layout, both counted from 1; `null`
+    /// for a floating or minimized window.
+    pub pos_in_scrolling_layout: Option<(usize, usize)>,
+}
+
+/// A window as the event stream describes it: niri's `Window` (`id`, `title`, `app_id`,
+/// `pid`, `workspace_id`, `is_focused`, `is_floating`, `is_urgent`, `layout`), plus what
+/// wiri adds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowIpc {
+    /// The window handle (HWND) as a number; it is what `--id` takes in `run_action`.
+    pub id: u64,
+    /// The title; `null` while the window has none.
+    pub title: Option<String>,
+    /// The file name of the window's program (`WindowsTerminal.exe`): the closest thing
+    /// Windows has to a Wayland `app_id`, and what the `app-id` of a window rule matches
+    /// first.  `null` when it cannot be read (an elevated program).
+    pub app_id: Option<String>,
+    pub pid: Option<u32>,
+    /// The workspace the window is on (see [`WorkspaceIpc::id`]).
+    pub workspace_id: Option<u64>,
+    pub is_focused: bool,
+    pub is_floating: bool,
+    pub is_urgent: bool,
+    pub layout: WindowLayoutIpc,
+    // ---- what wiri adds ----
+    /// The Win32 window class (`CASCADIA_HOSTING_WINDOW_CLASS`).
+    pub class_name: String,
+    /// The device name of the monitor the window is on (`\\.\DISPLAY1`).
+    pub output: Option<String>,
+    pub is_fullscreen: bool,
+    /// Maximized to the edges of the work area (niri `maximize-window-to-edges`).
+    pub is_maximized: bool,
+    pub is_minimized: bool,
+}
+
+/// A workspace as the event stream describes it: niri's `Workspace`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceIpc {
+    /// Unique among all workspaces of all monitors, and the same for as long as the
+    /// workspace exists (an unplugged monitor's workspaces get new ids on the monitor that
+    /// takes them).  Small enough for a JavaScript number.
+    pub id: u64,
+    /// The number of the workspace on its monitor, counted from 1 at the top: what
+    /// `focus-workspace 2` means.
+    pub idx: u32,
+    pub name: Option<String>,
+    /// The device name of the monitor the workspace is on (`\\.\DISPLAY1`).
+    pub output: Option<String>,
+    pub is_urgent: bool,
+    /// The workspace is the active one of its monitor.
+    pub is_active: bool,
+    /// The workspace is the active one of the focused monitor.
+    pub is_focused: bool,
+    pub active_window_id: Option<u64>,
 }
 
 /// Diagnostic info for one registered hotkey binding (`ListBindings`).
@@ -622,26 +766,68 @@ mod tests {
             serde_json::from_str(r#"{"type":"run_action","data":{"name":"close-window"}}"#)
                 .expect("deserialize run_action");
         match run {
-            IpcMessage::RunAction { name, args } => {
+            IpcMessage::RunAction { name, args, quoted } => {
                 assert_eq!(name, "close-window");
                 assert!(args.is_empty());
+                assert!(quoted.is_empty());
             }
             other => panic!("unexpected variant: {:?}", other),
         }
         let with_args = IpcMessage::RunAction {
             name: "set-column-width".to_string(),
             args: vec!["+10%".to_string()],
+            quoted: Vec::new(),
         };
         let raw = serde_json::to_string(&with_args).expect("serialize");
         assert!(raw.contains("\"run_action\""), "{}", raw);
+        assert!(!raw.contains("quoted"), "an empty `quoted` is not written: {}", raw);
         let back: IpcMessage = serde_json::from_str(&raw).expect("deserialize");
         match back {
-            IpcMessage::RunAction { name, args } => {
+            IpcMessage::RunAction { name, args, .. } => {
                 assert_eq!(name, "set-column-width");
                 assert_eq!(args, vec!["+10%".to_string()]);
             }
             other => panic!("unexpected variant: {:?}", other),
         }
+    }
+
+    fn run_action_of(raw: &str) -> (String, Vec<String>, Vec<bool>) {
+        match serde_json::from_str::<IpcMessage>(raw).expect("deserialize") {
+            IpcMessage::RunAction { name, args, quoted } => (name, args, quoted),
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_action_takes_numbers_and_booleans_as_their_text() {
+        // `niri msg action focus-workspace 2` passes a number; a typed client sends one.
+        let (name, args, _) =
+            run_action_of(r#"{"type":"run_action","data":{"name":"focus-workspace","args":[2]}}"#);
+        assert_eq!(name, "focus-workspace");
+        assert_eq!(args, vec!["2".to_string()]);
+        let (_, args, _) = run_action_of(
+            r#"{"type":"run_action","data":{"name":"spawn","args":["wt.exe","-d",3,true,0.5]}}"#,
+        );
+        assert_eq!(args, vec!["wt.exe", "-d", "3", "true", "0.5"]);
+        // Anything else is not an argument.
+        let bad = serde_json::from_str::<IpcMessage>(
+            r#"{"type":"run_action","data":{"name":"spawn","args":[["a"]]}}"#,
+        );
+        assert!(bad.is_err(), "an array is not an action argument");
+        let bad = serde_json::from_str::<IpcMessage>(
+            r#"{"type":"run_action","data":{"name":"spawn","args":[null]}}"#,
+        );
+        assert!(bad.is_err(), "null is not an action argument");
+    }
+
+    #[test]
+    fn an_action_is_also_spelled_action() {
+        let (name, args, quoted) = run_action_of(
+            r#"{"type":"action","data":{"action":"focus-workspace","args":["2"],"quoted":[true]}}"#,
+        );
+        assert_eq!(name, "focus-workspace");
+        assert_eq!(args, vec!["2".to_string()]);
+        assert_eq!(quoted, vec![true], "the workspace named \"2\", not the second one");
     }
 
     #[test]

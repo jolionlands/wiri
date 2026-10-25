@@ -159,10 +159,14 @@ mod tests {
                     height: 100,
                 },
             },
-            IpcEvent::WindowClosed { window_hwnd: 1 },
+            IpcEvent::WindowClosed {
+                window_hwnd: 1,
+                id: 1,
+            },
             IpcEvent::WindowFocused { window_hwnd: 1 },
             IpcEvent::WorkspaceActivated {
-                workspace: "ws-0".into(),
+                id: 4_294_967_296,
+                focused: true,
             },
             IpcEvent::ConfigLoaded {
                 config_path: "test.kdl".into(),
@@ -174,17 +178,138 @@ mod tests {
                 monitor_name: "Monitor1".into(),
             },
             IpcEvent::WorkspacesChanged {
-                workspaces: vec![WorkspaceInfo {
-                    name: "ws-0".into(),
-                    id: 0,
-                    window_count: 3,
+                workspaces: vec![WorkspaceIpc {
+                    id: 4_294_967_296,
+                    idx: 1,
+                    name: Some("web".into()),
+                    output: Some("\\\\.\\DISPLAY1".into()),
+                    is_urgent: false,
+                    is_active: true,
+                    is_focused: true,
+                    active_window_id: Some(1),
                 }],
             },
+            IpcEvent::WorkspaceUrgencyChanged {
+                id: 4_294_967_296,
+                urgent: true,
+            },
+            IpcEvent::WorkspaceActiveWindowChanged {
+                workspace_id: 4_294_967_296,
+                active_window_id: None,
+            },
+            IpcEvent::WindowsChanged {
+                windows: vec![sample_window()],
+            },
+            IpcEvent::WindowOpenedOrChanged {
+                window: sample_window(),
+            },
+            IpcEvent::WindowFocusChanged { id: Some(1) },
+            IpcEvent::WindowFocusChanged { id: None },
+            IpcEvent::WindowUrgencyChanged { id: 1, urgent: true },
+            IpcEvent::WindowLayoutsChanged {
+                changes: vec![(
+                    1,
+                    WindowLayoutIpc {
+                        pos_in_scrolling_layout: Some((2, 1)),
+                    },
+                )],
+            },
+            IpcEvent::OverviewOpenedOrClosed { is_open: true },
         ];
         for event in &events {
             let json = serde_json::to_string(event).unwrap();
             let parsed: IpcEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(json, serde_json::to_string(&parsed).unwrap());
+        }
+    }
+
+    fn sample_window() -> WindowIpc {
+        WindowIpc {
+            id: 1,
+            title: Some("t".into()),
+            app_id: Some("app.exe".into()),
+            pid: Some(10),
+            workspace_id: Some(4_294_967_296),
+            is_focused: true,
+            is_floating: false,
+            is_urgent: false,
+            layout: WindowLayoutIpc {
+                pos_in_scrolling_layout: Some((1, 1)),
+            },
+            class_name: "C".into(),
+            output: Some("\\\\.\\DISPLAY1".into()),
+            is_fullscreen: false,
+            is_maximized: false,
+            is_minimized: false,
+        }
+    }
+
+    #[test]
+    fn the_niri_events_carry_niris_field_names() {
+        // What a client written against niri's event stream reads: the fields of its
+        // `Window` and `Workspace`, in snake_case, inside wiri's {"type","data"} envelope.
+        let event = IpcEvent::WindowOpenedOrChanged {
+            window: sample_window(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "window_opened_or_changed");
+        let window = &value["data"]["window"];
+        for field in [
+            "id",
+            "title",
+            "app_id",
+            "pid",
+            "workspace_id",
+            "is_focused",
+            "is_floating",
+            "is_urgent",
+            "layout",
+        ] {
+            assert!(window.get(field).is_some(), "window.{} is missing: {}", field, window);
+        }
+        assert_eq!(window["layout"]["pos_in_scrolling_layout"], serde_json::json!([1, 1]));
+        let event = IpcEvent::WorkspacesChanged {
+            workspaces: vec![WorkspaceIpc {
+                id: 4_294_967_297,
+                idx: 2,
+                name: None,
+                output: None,
+                is_urgent: false,
+                is_active: false,
+                is_focused: false,
+                active_window_id: None,
+            }],
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        let workspace = &value["data"]["workspaces"][0];
+        for field in [
+            "id",
+            "idx",
+            "name",
+            "output",
+            "is_urgent",
+            "is_active",
+            "is_focused",
+            "active_window_id",
+        ] {
+            assert!(workspace.get(field).is_some(), "workspace.{} is missing: {}", field, workspace);
+        }
+        let event = IpcEvent::WindowClosed {
+            window_hwnd: 7,
+            id: 7,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["data"]["id"], 7);
+        assert_eq!(value["data"]["window_hwnd"], 7);
+    }
+
+    #[test]
+    fn an_old_window_closed_without_an_id_still_reads() {
+        let parsed: IpcEvent =
+            serde_json::from_str(r#"{"type":"window_closed","data":{"window_hwnd":5}}"#).unwrap();
+        match parsed {
+            IpcEvent::WindowClosed { window_hwnd, id } => assert_eq!((window_hwnd, id), (5, 0)),
+            other => panic!("unexpected {:?}", other),
         }
     }
 
@@ -236,7 +361,10 @@ mod tests {
 
     #[test]
     fn test_serialize_event_helper() {
-        let event = IpcEvent::WindowClosed { window_hwnd: 42 };
+        let event = IpcEvent::WindowClosed {
+            window_hwnd: 42,
+            id: 42,
+        };
         let bytes = serialize_event(&event).unwrap();
         let parsed = deserialize_event(&bytes).unwrap();
         let bytes2 = serialize_event(&parsed).unwrap();

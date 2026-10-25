@@ -17,6 +17,8 @@ use rules::NO_ALPHA;
 // Fullscreen, maximized to the edges, and keeping the place in the strip while a window is either.
 mod sizing;
 use sizing::DrawMode;
+// The windows and workspaces as the IPC event stream describes them (niri's `Window` and `Workspace`).
+mod ipcview;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache

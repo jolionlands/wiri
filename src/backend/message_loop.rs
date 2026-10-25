@@ -892,10 +892,33 @@ pub(crate) fn perform_action(
     backend: &BackendHandle,
     quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
+    perform_action_on(action, engine, backend, quit_tx, None);
+}
+
+/// [`perform_action`], on a window the caller names (niri's `--id`) instead of the one the OS
+/// says is in the foreground: the window is what the action acts on whatever the OS reports,
+/// so that the action does not depend on how fast an activation request was carried out.
+pub(crate) fn perform_action_on(
+    action: &Action,
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    window: Option<isize>,
+) {
+    // Event-stream clients are told what the action did to the windows and workspaces.
+    let _state_changed = crate::ipc::StateChangeGuard;
     // The window the action acts on is the one the user is looking at: the OS foreground window
     // (or the application window that owns it), a floating window as well as a tile.  The
     // engine's own focus is only the fallback.  `close-window` refuses to guess when an
     // unmanaged window (the Start menu, an elevated program) has the focus.
+    let foreground = match window {
+        Some(hwnd) => Some(crate::layout::ForegroundWindow {
+            hwnd,
+            root_owner: hwnd,
+            ignorable: false,
+        }),
+        None => crate::layout::query_foreground(),
+    };
     let target = match action {
         Action::Quit
         | Action::Spawn(_)
@@ -904,8 +927,12 @@ pub(crate) fn perform_action(
         | Action::WindowScreenshot
         | Action::ScreenshotWindow
         | Action::ShowKeyBindings => None,
-        Action::CloseWindow => engine.write().resolve_action_target_strict(backend),
-        _ => engine.write().resolve_action_target(backend),
+        Action::CloseWindow => engine
+            .write()
+            .resolve_action_target_for(foreground, true, backend),
+        _ => engine
+            .write()
+            .resolve_action_target_for(foreground, false, backend),
     };
 
     // niri-style interactive-resize mode: while engaged, the arrow-focus

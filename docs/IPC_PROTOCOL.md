@@ -1,7 +1,7 @@
 # wiri IPC Protocol — Integration Reference
 
-**Schema version: 1.0**  
-Last updated: 2026-05-21
+**Schema version: 1.1**  
+Last updated: 2026-10-25
 
 This document is the canonical reference for third-party integrations with wiri.
 Target audiences: aurora, crest, custom scripts, and any external tool that wants
@@ -122,6 +122,11 @@ For unit variants (no fields), the `"data"` key is omitted.
 {"type":"workspace_switched","data":{"workspace_id":2,"monitor_id":17629372411}}
 {"type":"window_focused","data":{"window_hwnd":328756}}
 ```
+
+Before any change the stream carries the **current state** as events (niri's event stream:
+`workspaces_changed`, `windows_changed`, `overview_opened_or_closed`, `config_loaded`; see
+[§6](#6-event-types)).  The filter applies to them too, so the example above, which names two
+other types, sees none of them; a subscription without a filter starts with all four.
 
 ---
 
@@ -437,10 +442,39 @@ Set the active workspace's layout mode.
 | `reload_config` | — | Hot-reload config.kdl |
 | `quit` | — | Gracefully shut down the wiri daemon |
 | `spawn_command` | `command: string`, `args?: string[]` | Spawn an external process; with `args` the arguments are passed intact, without it `command` is split like a Windows command line (quoted paths with spaces work) and the program is searched on PATH |
-| `run_action` | `name: string`, `args?: string[]` | Run any action by its niri name as if its key were pressed (`wiri-ctl action focus-column-left`, `wiri-ctl action set-column-width +10%`); `args` are the words after the action name in a `binds {}` line |
+| `run_action` (also `action`) | `name: string` (also `action`), `args?: (string \| number \| boolean)[]`, `quoted?: boolean[]` | Run any action by its niri name as if its key were pressed (`wiri-ctl action focus-column-left`, `wiri-ctl action set-column-width +10%`); `args` are the words after the action name in a `binds {}` line; see [§4.8](#48-running-actions) |
 | `list_bindings` | — | List all registered Win32 hotkey bindings (raw: id, modifiers, vk_code) |
 | `get_bindings` | — | List bindings as human-readable `chord + action` table |
 | `set_auto_tile_threshold` | `threshold: usize \| null` | Window count above which auto-tile activates; null = disabled |
+
+---
+
+### 4.8 Running actions
+
+`run_action` is niri's `Request::Action`: any action that can be bound to a key can be run over
+the pipe, with the arguments it takes in a `binds {}` line.  The message is also accepted as
+`{"type":"action","data":{"action":"..."}}`.
+
+```json
+{"type":"run_action","data":{"name":"focus-column-left"}}
+{"type":"run_action","data":{"name":"set-column-width","args":["+10%"]}}
+{"type":"action","data":{"action":"focus-workspace","args":[2]}}
+{"type":"run_action","data":{"name":"focus-workspace","args":["2"],"quoted":[true]}}
+{"type":"run_action","data":{"name":"fullscreen-window","args":["--id",328756]}}
+```
+
+| Part | Meaning |
+|---|---|
+| `name` | The niri name of the action (`focus-column-left`, `consume-or-expel-window-left`, `move-column-to-workspace`, ...), or one of wiri's older spellings.  An unknown name is `{"success":false,"error":"unknown action or bad arguments: ..."}` |
+| `args` | The words after the name in a `binds {}` line, in order.  A string is a word; a number or a boolean stands for its text (`2` is the same as `"2"`) so that a client in a typed language can send what niri's own arguments are |
+| `quoted` | `quoted[i]` is true when `args[i]` was written in double quotes: `focus-workspace 2` is the second workspace, `focus-workspace "2"` the workspace named "2".  Omitted: none |
+| `--id <hwnd>` (`--id=<hwnd>`; `--window-id` where niri spells it so) | niri's way to name the window to act on.  The window is the `id` of a window object (its HWND).  `focus-window --id <hwnd>` focuses it, `close-window --id <hwnd>` closes it and leaves the focus alone; **any other action focuses the window first** and then acts on it (niri leaves the focus where it is: an approximation).  An id that is not a managed window is an error |
+
+`wiri-ctl action <name> [args...]` sends the same request.  A word in literal double quotes is a
+`quoted` word (`wiri-ctl action focus-workspace '"2"'` in a shell that keeps the inner quotes).
+
+Success is `{"success":true}`: the action ran as if its key had been pressed.  Whatever it changed
+(the focus, the workspaces, the windows) reaches `subscribe_events` clients as events.
 
 ---
 
@@ -481,7 +515,7 @@ Sent immediately after `subscribe_events` before any event data:
 ```
 
 `subscription_id` is currently always `1`; reserved for future multiplexed
-subscriptions.
+subscriptions.  The state follows the ack ([§6.2](#62-the-state-first-niris-contract)).
 
 ---
 
@@ -490,9 +524,10 @@ subscriptions.
 Events are emitted by the daemon whenever the relevant state changes. They are
 broadcast to **all** connected `SubscribeEvents` subscribers simultaneously.
 
-The daemon keeps a 64-event in-memory broadcast buffer per subscriber. If a slow
-client falls 64 events behind, missed events are logged and the subscriber
-continues from the current position (no disconnect).
+The daemon keeps a 64-event in-memory broadcast buffer per subscriber. A client
+that falls 64 events behind is told the state again (the events of
+[§6.2](#62-the-state-first-niris-contract), as when it subscribed) and goes on from
+the current position, so what it knows is right again; it is not disconnected.
 
 ### 6.1 Filtering
 
@@ -504,19 +539,96 @@ An empty list (or `["*"]`) receives all events:
 {"type":"subscribe_events","data":{"event_types":["workspace_switched","window_focused"]}}
 ```
 
+The filter applies to the state events of §6.2 as well.
+
+### 6.2 The state first (niri's contract)
+
+wiri's event stream follows niri's: **a client that subscribes is told the whole state first and then
+what changes, so it never has to ask.**  Right after the ack the stream carries, in this order,
+
+1. `workspaces_changed` - every workspace of every monitor,
+2. `windows_changed` - every window wiri manages (`is_focused` says which one has the keyboard focus),
+3. `overview_opened_or_closed` - whether the overview is open,
+4. `config_loaded` - how the config loaded at startup or the last time it was reloaded,
+
+and then the deltas.  A client keeps its model by replacing the workspaces on `workspaces_changed`
+and the windows on `windows_changed`, and applying the other events to them:
+
+| Event | What the client does |
+|---|---|
+| `workspaces_changed` | replaces the list of workspaces (it carries the flags too) |
+| `workspace_activated` `{id, focused}` | the workspace is the active one of its monitor (the one before it on that monitor is not); when `focused`, it is the only focused workspace |
+| `workspace_active_window_changed` `{workspace_id, active_window_id}` | sets the workspace's `active_window_id` |
+| `workspace_urgency_changed` `{id, urgent}` | sets the workspace's `is_urgent` |
+| `windows_changed` | replaces the list of windows |
+| `window_opened_or_changed` `{window}` | adds the window or replaces it by `id`; if `window.is_focused`, no other window is focused |
+| `window_closed` `{id}` | removes the window |
+| `window_focus_changed` `{id}` | `id` is the only focused window (`null`: none) |
+| `window_urgency_changed` `{id, urgent}` | sets the window's `is_urgent` |
+| `window_layouts_changed` `{changes}` | sets `layout` of the windows named |
+| `overview_opened_or_closed` `{is_open}` | the overview is open or not |
+
+The events are derived from the state of the layout engine, not from what happened to produce it:
+whatever changes a window or workspace - a key, `wiri-ctl`, the mouse, an application, a config reload -
+produces the same events, once, after the change is complete.  Nothing is computed while nobody is
+subscribed.
+
+The window object and the workspace object are niri's `Window` and `Workspace`, in snake_case, with
+what wiri adds:
+
+**Window**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `u64` | The window handle (HWND) as a number; what `--id` takes in `run_action`.  A handle can be reused by Windows once the window is gone |
+| `title` | `string` or `null` | The title; `null` while the window has none |
+| `app_id` | `string` or `null` | File name of the window's program (`WindowsTerminal.exe`): the closest thing Windows has to a Wayland `app_id`, and what the `app-id` of a window rule matches first.  `null` when it cannot be read (an elevated program) |
+| `pid` | `u32` or `null` | Process id |
+| `workspace_id` | `u64` or `null` | The workspace the window is on (`Workspace.id`); a floating or minimized window is on the workspace it floats on or comes back to |
+| `is_focused` | `bool` | The window has the keyboard focus (wiri manages the window the OS says is in the foreground) |
+| `is_floating` | `bool` | |
+| `is_urgent` | `bool` | The window asked for attention |
+| `layout.pos_in_scrolling_layout` | `[column, tile]` or `null` | Both counted from 1; `null` for a floating or minimized window.  niri's sizes and offsets are not reported |
+| `class_name` | `string` | wiri: the Win32 window class |
+| `output` | `string` or `null` | wiri: device name of the monitor the window is on (`\\.\DISPLAY1`) |
+| `is_fullscreen`, `is_maximized`, `is_minimized` | `bool` | wiri: fullscreen; maximized to the edges of the work area (`maximize-window-to-edges`); minimized |
+
+**Workspace**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `u64` | Unique among all workspaces of all monitors and the same for as long as the workspace exists (the workspaces of an unplugged monitor get new ids on the monitor that takes them).  Always below 2^53, so a JavaScript number holds it |
+| `idx` | `u32` | The number of the workspace on its monitor, counted from 1 at the top: what `focus-workspace 2` means |
+| `name` | `string` or `null` | |
+| `output` | `string` or `null` | Device name of the monitor the workspace is on |
+| `is_urgent` | `bool` | A window of the workspace is urgent |
+| `is_active` | `bool` | The active workspace of its monitor |
+| `is_focused` | `bool` | The active workspace of the focused monitor |
+| `active_window_id` | `u64` or `null` | The window that is the active one of the workspace |
+
+Differences from niri: the envelope (`{"type","data"}`, not niri's externally tagged enum), the extra
+fields marked wiri above, no `WindowFocusTimestampChanged`, keyboard layout, screenshot, cast and touchpad
+events (they have no Windows counterpart yet), and ids that are window handles.  The events of wiri's own
+that predate this contract (`window_opened`, `window_focused`, `workspace_switched`, `column_focused`,
+`window_moved`, ...) are kept as they were.
+
 ---
 
 ### `workspaces_changed`
 
-Emitted when the set of workspaces changes (create, delete, or rename).
+niri's `WorkspacesChanged`: the workspaces were created, removed, renamed, moved to another monitor or
+reordered.  The full list replaces what the client knew.  Also part of the state a new subscriber is told
+first (§6.2).
 
 ```json
 {
   "type": "workspaces_changed",
   "data": {
     "workspaces": [
-      {"name": "workspace-1", "id": 1, "window_count": 3},
-      {"name": "dev",         "id": 2, "window_count": 1}
+      {"id": 4294967296, "idx": 1, "name": null,  "output": "\\\\.\\DISPLAY1", "is_urgent": false,
+       "is_active": true,  "is_focused": true,  "active_window_id": 328756},
+      {"id": 4294967297, "idx": 2, "name": "dev", "output": "\\\\.\\DISPLAY1", "is_urgent": false,
+       "is_active": false, "is_focused": false, "active_window_id": null}
     ]
   }
 }
@@ -524,9 +636,72 @@ Emitted when the set of workspaces changes (create, delete, or rename).
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `workspaces` | `WorkspaceInfo[]` | Full current list of workspaces |
+| `workspaces` | `Workspace[]` | Every workspace of every monitor, monitors in the order of their device names, the workspaces of each from the top |
 
-**When:** workspace is created, deleted, or renamed.
+**When:** a workspace is created, deleted (an empty one vanishes when it is left), renamed, moved or
+reordered; a monitor comes or goes.  Before 1.1 this event was declared with a different payload and
+never sent.
+
+---
+
+### `workspace_urgency_changed`
+
+niri's `WorkspaceUrgencyChanged`: `{"id": 4294967296, "urgent": true}`.  **When:** a window of the
+workspace asked for attention, or the last one that did stopped.
+
+---
+
+### `workspace_active_window_changed`
+
+niri's `WorkspaceActiveWindowChanged`: `{"workspace_id": 4294967296, "active_window_id": 328756}`
+(`null` when there is none).  **When:** the window that is the active one of a workspace changed.
+
+---
+
+### `windows_changed`
+
+niri's `WindowsChanged`: `{"windows": [Window, ...]}`, every window wiri manages by ascending `id`.
+Replaces what the client knew.  **When:** as part of the state a new subscriber is told first (§6.2).
+
+---
+
+### `window_opened_or_changed`
+
+niri's `WindowOpenedOrChanged`: `{"window": Window}`.
+
+**When:** a window appeared, or its `title`, `app_id`, `workspace_id`, `is_floating`, `is_fullscreen`,
+`is_maximized`, `is_minimized` changed.  Focus, urgency and the place in the strip have events of their
+own; the window object always shows their current value.  wiri's own `window_opened` is sent as well
+when a window is added.
+
+---
+
+### `window_focus_changed`
+
+niri's `WindowFocusChanged`: `{"id": 328756}`, or `{"id": null}` when no window that wiri manages has the
+keyboard focus (the Start menu, an elevated program).  **When:** the window that has the focus changed.
+
+---
+
+### `window_urgency_changed`
+
+niri's `WindowUrgencyChanged`: `{"id": 328756, "urgent": true}`.  **When:** the window's urgency changed.
+wiri's `window_urgent` is sent as well when Windows reports the attention request.
+
+---
+
+### `window_layouts_changed`
+
+niri's `WindowLayoutsChanged`: `{"changes": [[328756, {"pos_in_scrolling_layout": [2, 1]}], ...]}`.
+**When:** windows changed their column or their place in it (a column moved, a window was consumed into
+or expelled from a column, a column before them closed).
+
+---
+
+### `overview_opened_or_closed`
+
+niri's `OverviewOpenedOrClosed`: `{"is_open": true}`.  **When:** the overview was opened or closed.
+Also part of the state a new subscriber is told first (§6.2).
 
 ---
 
@@ -564,33 +739,39 @@ Emitted when a new window is tiled by the engine.
 
 ### `window_closed`
 
-Emitted when a tiled window is removed.
+niri's `WindowClosed`: a window that wiri managed is gone.
 
 ```json
-{"type":"window_closed","data":{"window_hwnd":328756}}
+{"type":"window_closed","data":{"window_hwnd":328756,"id":328756}}
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `window_hwnd` | `integer` | HWND of the closed window |
+| `id` | `u64` | The same number, under niri's name (new in 1.1) |
 
-**When:** the window is destroyed or explicitly removed from the layout.
+**When:** the window is destroyed or taken out of the layout.  Sent for the windows wiri managed (before
+1.1 it was sent for every window that was destroyed, managed or not).
 
 ---
 
 ### `workspace_activated`
 
-Emitted when a named workspace becomes active on any monitor.
+niri's `WorkspaceActivated`: a workspace became the active one of its monitor.
 
 ```json
-{"type":"workspace_activated","data":{"workspace":"dev"}}
+{"type":"workspace_activated","data":{"id":4294967297,"focused":true}}
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `workspace` | `string` | Name of the activated workspace |
+| `id` | `u64` | `Workspace.id` of the workspace |
+| `focused` | `bool` | The workspace is now the focused one (the active workspace of the focused monitor): no other workspace is focused any more, but each stays active on its own monitor |
 
-**When:** a named workspace is brought to the foreground on any monitor.
+**When:** a workspace is activated on any monitor (a key, `wiri-ctl`, the mouse wheel, a window that was
+asked for), and when the focus moves to another monitor (`focused: true` for the active workspace of that
+monitor).  Before 1.1 this event was declared with a different payload and never sent.  wiri's
+`workspace_switched` (below) goes on being sent for the focused monitor.
 
 ---
 
@@ -645,7 +826,9 @@ Emitted when the configuration file is reloaded (niri's `ConfigLoaded { failed }
 
 **When:** the file watcher saw the config (or a file it includes) change and 200 ms of quiet passed,
 the `reload_config` request was processed, or **Reload Config** was chosen in the tray menu.  A tray
-balloon with the same text is shown when `failed` is true.
+balloon with the same text is shown when `failed` is true.  Also the last thing of the state a new
+subscriber is told first (§6.2): how the config loaded at startup, or the last reload since.  After a
+config with errors at startup it is `failed: true` and wiri runs on its defaults.
 
 ---
 
@@ -981,7 +1164,13 @@ wiri-ctl events --stream | jq -r '.type + " " + (.data | tostring)'
 
 ## 8. Versioning Policy
 
-The schema is currently at **version 1.0**.
+The schema is currently at **version 1.1**.  1.1 (2026-10-25) adds niri's event stream (§6.2: the
+state first, then `windows_changed`, `window_opened_or_changed`, `window_focus_changed`,
+`window_urgency_changed`, `window_layouts_changed`, `workspace_urgency_changed`,
+`workspace_active_window_changed`, `overview_opened_or_closed`), the `id` of `window_closed`, the
+`action` spelling, typed arguments, `quoted` and `--id` of `run_action`, and the `fullscreen` and
+`maximized` fields of `window_list`.  The payloads of `workspaces_changed` and `workspace_activated`
+were replaced; both were declared before and never sent, so no client could have depended on them.
 
 Version strings follow `MAJOR.MINOR`:
 
@@ -1015,11 +1204,47 @@ if event.get("type") == "workspace_switched":
     subprocess.run(["my-script.exe", "--workspace", str(ws_id)])
 ```
 
+### Track the state from the event stream
+
+Subscribe with an empty filter and keep a model: the stream starts with the whole state
+(`workspaces_changed`, `windows_changed`, `overview_opened_or_closed`, `config_loaded`) and goes on with
+the changes (§6.2), so there is nothing to query first and nothing to poll.
+
+```python
+workspaces, windows = {}, {}
+for event in events():                      # one JSON object per line
+    kind, data = event["type"], event["data"]
+    if kind == "workspaces_changed":
+        workspaces = {w["id"]: w for w in data["workspaces"]}
+    elif kind == "windows_changed":
+        windows = {w["id"]: w for w in data["windows"]}
+    elif kind == "window_opened_or_changed":
+        w = data["window"]
+        if w["is_focused"]:
+            for other in windows.values():
+                other["is_focused"] = False
+        windows[w["id"]] = w
+    elif kind == "window_closed":
+        windows.pop(data["id"], None)
+    elif kind == "window_focus_changed":
+        for w in windows.values():
+            w["is_focused"] = (w["id"] == data["id"])
+    elif kind == "workspace_activated":
+        active = workspaces[data["id"]]
+        for w in workspaces.values():
+            if w["output"] == active["output"]:
+                w["is_active"] = (w["id"] == active["id"])
+            if data["focused"]:
+                w["is_focused"] = (w["id"] == active["id"])
+```
+
 ### Query current state at startup, then track deltas
 
 1. Send `get_state` to get the full current layout.
 2. Open a second connection with `subscribe_events` to track changes.
 3. Merge events into your local model.
+
+(With wiri 1.1 the first step is not needed: the subscription itself starts with the state.)
 
 ### Detect when a specific app opens
 

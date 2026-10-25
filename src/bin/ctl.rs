@@ -536,7 +536,10 @@ fn real_main() -> Result<()> {
         Commands::FocusWorkspaceNext => IpcMessage::FocusWorkspaceNext,
         Commands::FocusWorkspacePrevious => IpcMessage::FocusWorkspacePrevious,
         Commands::Spawn { command, args } => IpcMessage::SpawnCommand { command, args },
-        Commands::Action { name, args } => IpcMessage::RunAction { name, args },
+        Commands::Action { name, args } => {
+            let (args, quoted) = split_quoted_words(args);
+            IpcMessage::RunAction { name, args, quoted }
+        }
         Commands::FocusPrevious => IpcMessage::FocusPrevious,
         Commands::ToggleAlwaysOnTop => IpcMessage::ToggleAlwaysOnTop,
         Commands::FocusWorkspaceNamed { name } => IpcMessage::FocusWorkspaceNamed { name },
@@ -1489,9 +1492,47 @@ fn wall_clock_hms() -> String {
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
 
+/// The words after an action name as they are in a `binds {}` line: a word written in double
+/// quotes (`'"2"'` in a shell, which keeps the quotes) is a name, not a number
+/// (`focus-workspace "2"` is the workspace named "2", `focus-workspace 2` the second one).
+/// Returns the words without the quotes and which of them had them (empty when none had).
+fn split_quoted_words(words: Vec<String>) -> (Vec<String>, Vec<bool>) {
+    let mut quoted = Vec::with_capacity(words.len());
+    let words: Vec<String> = words
+        .into_iter()
+        .map(|word| {
+            if word.len() >= 2 && word.starts_with('"') && word.ends_with('"') {
+                quoted.push(true);
+                word[1..word.len() - 1].to_string()
+            } else {
+                quoted.push(false);
+                word
+            }
+        })
+        .collect();
+    if !quoted.iter().any(|q| *q) {
+        quoted.clear();
+    }
+    (words, quoted)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{fold_to_ascii, format_focus};
+    use super::{fold_to_ascii, format_focus, split_quoted_words};
+
+    #[test]
+    fn test_a_word_in_double_quotes_is_a_quoted_word() {
+        let words = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_quoted_words(words(&["\"2\"", "x"])),
+            (words(&["2", "x"]), vec![true, false])
+        );
+        // Nothing quoted: nothing to say about it.
+        assert_eq!(split_quoted_words(words(&["2", "+10%"])), (words(&["2", "+10%"]), vec![]));
+        // A lone quote or an empty pair are not what niri writes for a name.
+        assert_eq!(split_quoted_words(words(&["\""])), (words(&["\""]), vec![]));
+        assert_eq!(split_quoted_words(words(&["\"\""])), (words(&[""]), vec![true]));
+    }
 
     #[test]
     fn test_format_focus_names_the_window_and_the_workspace() {

@@ -34,6 +34,11 @@
 #          others are neither hidden nor in the way (focusing one scrolls the fullscreen window off), the taskbar goes and
 #          comes back, maximize-window-to-edges fills the work area, the title bar's maximize button and an application that
 #          goes fullscreen on its own are followed, open-maximized-to-edges.
+#          H15 IPC parity (Phase 2A item 4): a subscriber to `wiri-ctl events --stream` is told the state first
+#          (workspaces, windows, overview, config) and then every change as niri's events, once (a title, the focus, floating,
+#          fullscreen, a window moved to workspace 2, a workspace activated, the overview, a config reload, a window that opens
+#          and closes); `wiri-ctl action` takes niri's arguments, a quoted workspace word, a typed JSON request, and --id for the
+#          window to act on; bad actions say what is wrong; a late subscriber and a filtered one are told the right state.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -41,6 +46,16 @@
 param([string]$Bin = 'C:\wiri-dev\wiri\target\release')
 
 $ErrorActionPreference = 'Continue'
+# A live run drives the whole interactive desktop and shares one config, one IPC pipe and one evidence
+# directory: two at once (an official cycle and a scratch cycle, a manual run) spoil each other's results
+# without either noticing.  A machine-wide named mutex, held until this process ends (Windows frees it
+# even when the run is killed), makes the second run refuse at once.  The idea and the first version
+# of this lock: Codex Sol's commit ee41d27.
+$liveLock = New-Object System.Threading.Mutex($false, 'Global\wiri-live-test')
+$ownsLiveLock = $false
+try { $ownsLiveLock = $liveLock.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $ownsLiveLock = $true }
+if (-not $ownsLiveLock) { throw 'Another wiri live test is running on this machine; this run refuses to start (two runs would spoil each other).' }
 $D = 'C:\wiri-dev\live'
 if (Test-Path $D) { Remove-Item -Recurse -Force $D }
 New-Item -ItemType Directory -Force $D | Out-Null
@@ -2170,10 +2185,261 @@ $h14Values = [ordered]@{
 $h14Values | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'h14-values.json')
 foreach ($h in $h14All) { [TestForms]::CloseForm($h) }
 Start-Sleep -Milliseconds 2000
-Stop-WiriGracefully $w14 'h14b'
+
+# ---- H15: IPC parity (Phase 2A item 4): niri's event stream and actions with niri's arguments ---------------------------
+# A client that subscribes is told the state first (workspaces, windows, overview, config) and then what changes; every change
+# that a key, wiri-ctl, an application or a config reload makes is told once, as niri's events; wiri-ctl action (and the typed
+# JSON request behind it) takes niri's arguments, quoted words, and --id for the window to act on.
+$log15 = Join-Path $D 'wiri.stderr15.log'
+$h15Config = @'
+input {
+    mod-key "ctrl-alt"
+}
+workspace "chat"
+'@
+Stop-WiriGracefully $w14 'h15'
+$w15 = Start-WiriWithConfig $h15Config $log15
+$w = $w15
+$h15Issues = (LogLines $log15 ': error: ').Count + (LogLines $log15 ': warning: ').Count
+$h15All = @()
+$k1 = [TestForms]::Open('h15-1', 60, 120, 200);  Start-Sleep -Milliseconds 2200; $h15All += $k1
+$k2 = [TestForms]::Open('h15-2', 60, 180, 110);  Start-Sleep -Milliseconds 2200; $h15All += $k2
+$k3 = [TestForms]::Open('h15-3', 200, 120, 60);  Start-Sleep -Milliseconds 2200; $h15All += $k3
+
+# The events as objects, in the order they came; wiri-ctl events --stream writes one JSON object per line.
+function EvList([string]$file) {
+    $out = New-Object System.Collections.Generic.List[object]
+    if (Test-Path $file) {
+        foreach ($line in @(Get-Content $file -ErrorAction SilentlyContinue)) {
+            if ($line -and $line.TrimStart().StartsWith('{')) { try { $out.Add(($line | ConvertFrom-Json)) } catch { } }
+        }
+    }
+    return $out.ToArray()    # (@($out) fails in Windows PowerShell 5.1: "Argument types do not match")
+}
+function EvOf($events, [string]$type) { return @(@($events) | Where-Object { $_.type -eq $type }) }
+function EvWindow($events, [string]$type, $hwnd) {
+    return @(@($events) | Where-Object { $_.type -eq $type -and [int64]$_.data.window.id -eq [int64]$hwnd })
+}
+# What the events do after `act`: the new events (given a short settle time after it).
+$evAll = Join-Path $D 'h15-events-all.txt'
+function H15Step([scriptblock]$act, [int]$settleMs) {
+    $mark = @(EvList $evAll).Count
+    & $act | Out-Null
+    Start-Sleep -Milliseconds $settleMs
+    return @(@(EvList $evAll) | Select-Object -Skip $mark)
+}
+# A request written to the pipe as it is, the way a client in another language sends it.
+function PipeRequest([string]$json) {
+    $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'wiri_control', [System.IO.Pipes.PipeDirection]::InOut)
+    try {
+        $c.Connect(5000)
+        $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+        $c.Write($bytes, 0, $bytes.Length); $c.Flush()
+        $buf = New-Object byte[] 65536
+        $text = New-Object Text.StringBuilder
+        while ($true) {
+            $task = $c.ReadAsync($buf, 0, $buf.Length)
+            if (-not $task.Wait(5000)) { break }
+            if ($task.Result -le 0) { break }
+            [void]$text.Append([Text.Encoding]::UTF8.GetString($buf, 0, $task.Result))
+        }
+        return $text.ToString()
+    } catch { return "error: $_" } finally { $c.Dispose() }
+}
+
+# (a) the state first: a new subscriber is told the workspaces, the windows, the overview and the config, in that order
+$evProc = Start-Process -FilePath $ctl -ArgumentList @('events', '--stream') -RedirectStandardOutput $evAll -RedirectStandardError "$evAll.err" -WindowStyle Hidden -PassThru
+$null = WaitText $evAll '"type":"config_loaded"' 8
+Start-Sleep -Milliseconds 600
+$h15Replay = @(EvList $evAll)
+$h15FirstFour = (@($h15Replay | Select-Object -First 4 | ForEach-Object { $_.type }) -join ',')
+$h15StartsWithState = ($h15FirstFour -eq 'workspaces_changed,windows_changed,overview_opened_or_closed,config_loaded')
+$h15Fg = [int64][LT]::GetForegroundWindow()
+$h15WinList = WinList 'h15-windows-at-start'
+$h15Windows = @((EvOf $h15Replay 'windows_changed') | Select-Object -First 1 | ForEach-Object { $_.data.windows } | ForEach-Object { $_ })
+$h15Workspaces = @((EvOf $h15Replay 'workspaces_changed') | Select-Object -First 1 | ForEach-Object { $_.data.workspaces } | ForEach-Object { $_ })
+function H15Win($list, $h) { return (@($list | Where-Object { [int64]$_.id -eq [int64]$h }) | Select-Object -First 1) }
+$procName = (Get-Process -Id $PID).MainModule.ModuleName
+$h15Fields = $true
+foreach ($k in @($k1, $k2, $k3)) {
+    $e = H15Win $h15Windows $k
+    $own = WinOf $h15WinList $k
+    $h15Fields = $h15Fields -and ($null -ne $e) -and ($e.title -like 'h15-*') -and ([int]$e.pid -eq $PID) -and ($e.app_id -ieq $procName) -and
+        ($null -ne $e.workspace_id) -and ($e.is_floating -eq $false) -and ($e.is_urgent -eq $false) -and
+        ($null -ne $own) -and ((@($e.layout.pos_in_scrolling_layout) -join ',') -eq "$([int]$own.column + 1),$([int]$own.tile + 1)")
+}
+$h15FocusedWindows = @($h15Windows | Where-Object { $_.is_focused -eq $true })
+$h15OneFocused = ($h15FocusedWindows.Count -eq 1) -and ([int64]$h15FocusedWindows[0].id -eq $h15Fg)
+$h15FocusedWs = @($h15Workspaces | Where-Object { $_.is_focused -eq $true })
+$h15WsFields = ($h15Workspaces.Count -ge 2) -and ($h15FocusedWs.Count -eq 1) -and ($h15FocusedWs[0].name -eq 'chat') -and ($h15FocusedWs[0].idx -eq 1) -and
+    ($h15FocusedWs[0].is_active -eq $true) -and (-not [string]::IsNullOrEmpty($h15FocusedWs[0].output)) -and
+    ([int64]$h15FocusedWs[0].active_window_id -eq $h15Fg) -and (@($h15Workspaces | ForEach-Object { $_.id } | Select-Object -Unique).Count -eq $h15Workspaces.Count)
+$h15WsOfWindows = ([int64]$h15FocusedWindows[0].workspace_id -eq [int64]$h15FocusedWs[0].id)
+$h15ConfigReplayed = (@(EvOf $h15Replay 'config_loaded').Count -ge 1) -and ((EvOf $h15Replay 'config_loaded')[0].data.failed -eq $false)
+Shot 'h15-01-three-windows'
+
+# nothing changes, nothing is sent
+$h15Idle = @(H15Step { Start-Sleep -Milliseconds 3000 } 0)
+$niriTypes = @('workspaces_changed', 'workspace_urgency_changed', 'workspace_activated', 'workspace_active_window_changed', 'windows_changed',
+    'window_opened_or_changed', 'window_closed', 'window_focus_changed', 'window_urgency_changed', 'window_layouts_changed', 'overview_opened_or_closed', 'config_loaded')
+$h15IdleQuiet = (@($h15Idle | Where-Object { $niriTypes -contains $_.type }).Count -eq 0)
+
+# (b) a title that changes is a changed window, once, with the new title
+$new = @(H15Step { [TestForms]::SetTitle($k1, 'h15-renamed') } 1800)
+$h15Title = @(EvWindow $new 'window_opened_or_changed' $k1)
+$h15TitleChanged = ($h15Title.Count -eq 1) -and ($h15Title[0].data.window.title -eq 'h15-renamed')
+
+# (c) focus: told once, with the id; the workspace's active window follows
+$new = @(H15Step { FocusForm $k1 } 600)
+$h15Focus = @(EvOf $new 'window_focus_changed')
+$h15FocusTold = ($h15Focus.Count -eq 1) -and ([int64]$h15Focus[0].data.id -eq [int64]$k1) -and
+    (@(EvOf $new 'workspace_active_window_changed' | Where-Object { [int64]$_.data.active_window_id -eq [int64]$k1 }).Count -eq 1)
+
+# (d) floating: the window changes, the windows behind it move up a column (told as layouts, by id)
+$h15Pre = WinList 'h15-windows-before-float'
+$new = @(H15Step { $null = Ctl 'h15-float' @('action', 'toggle-window-floating') } 2200)
+$h15Float = @(EvWindow $new 'window_opened_or_changed' $k1)
+$h15FloatTold = ($h15Float.Count -eq 1) -and ($h15Float[0].data.window.is_floating -eq $true) -and ($null -eq $h15Float[0].data.window.layout.pos_in_scrolling_layout)
+$h15LayoutEvents = @(EvOf $new 'window_layouts_changed')
+$h15MovedIds = @($h15LayoutEvents | ForEach-Object { $_.data.changes } | ForEach-Object { [int64]$_[0] })
+$h15LayoutsTold = ($h15LayoutEvents.Count -ge 1) -and ($h15MovedIds -contains [int64]$k2) -and ($h15MovedIds -contains [int64]$k3) -and ($h15MovedIds -notcontains [int64]$k1)
+$new = @(H15Step { $null = Ctl 'h15-unfloat' @('action', 'toggle-window-floating') } 2200)
+$h15Unfloat = @(EvWindow $new 'window_opened_or_changed' $k1)
+$h15UnfloatTold = ($h15Unfloat.Count -eq 1) -and ($h15Unfloat[0].data.window.is_floating -eq $false) -and ($null -ne $h15Unfloat[0].data.window.layout.pos_in_scrolling_layout)
+
+# (e) fullscreen is a changed window
+$new = @(H15Step { $null = Ctl 'h15-fullscreen' @('action', 'fullscreen-window') } 2200)
+$h15Fs = @(EvWindow $new 'window_opened_or_changed' $k1)
+$h15FullscreenTold = ($h15Fs.Count -eq 1) -and ($h15Fs[0].data.window.is_fullscreen -eq $true)
+$new = @(H15Step { $null = Ctl 'h15-fullscreen-off' @('action', 'fullscreen-window') } 2200)
+$h15FsOff = @(EvWindow $new 'window_opened_or_changed' $k1)
+$h15FullscreenOffTold = ($h15FsOff.Count -eq 1) -and ($h15FsOff[0].data.window.is_fullscreen -eq $false)
+
+# (f) a window that goes to workspace 2: the list is sent (a workspace now has windows and the one below it is new), then
+# the window with its new workspace
+$new = @(H15Step { FocusForm $k2; $null = Ctl 'h15-move' @('action', 'move-to-workspace', '2') } 2200)
+$h15Lists = @(EvOf $new 'workspaces_changed')
+$h15Moved = @(EvWindow $new 'window_opened_or_changed' $k2)
+$h15ListIndex = -1; $h15MovedIndex = -1
+for ($i = 0; $i -lt $new.Count; $i++) {
+    if ($h15ListIndex -lt 0 -and $new[$i].type -eq 'workspaces_changed') { $h15ListIndex = $i }
+    if ($h15MovedIndex -lt 0 -and $new[$i].type -eq 'window_opened_or_changed' -and [int64]$new[$i].data.window.id -eq [int64]$k2) { $h15MovedIndex = $i }
+}
+$h15Ws2 = $null
+if ($h15Lists.Count -ge 1) { $h15Ws2 = @($h15Lists[$h15Lists.Count - 1].data.workspaces | Where-Object { $_.idx -eq 2 }) | Select-Object -First 1 }
+$h15MoveTold = ($h15Lists.Count -ge 1) -and ($h15Moved.Count -ge 1) -and ($h15ListIndex -ge 0) -and ($h15ListIndex -lt $h15MovedIndex) -and ($null -ne $h15Ws2)
+if ($h15MoveTold) {
+    $h15LastMoved = $h15Moved[$h15Moved.Count - 1].data.window
+    $h15MoveTold = ([int64]$h15LastMoved.workspace_id -eq [int64]$h15Ws2.id) -and ((@($h15LastMoved.layout.pos_in_scrolling_layout) -join ',') -eq '1,1')
+}
+
+# (g) the workspace is activated: told once, as the focused one; and back
+$h15Ws2Id = $(if ($null -ne $h15Ws2) { [int64]$h15Ws2.id } else { -1 })
+$h15Ws1Id = [int64]$h15FocusedWs[0].id
+$new = @(H15Step { $null = Ctl 'h15-ws2' @('action', 'focus-workspace', '2') } 2200)
+$h15Act = @(EvOf $new 'workspace_activated')
+$h15ActivationTold = ($h15Act.Count -eq 1) -and ([int64]$h15Act[0].data.id -eq $h15Ws2Id) -and ($h15Act[0].data.focused -eq $true)
+Shot 'h15-02-workspace-2'
+$new = @(H15Step { $null = Ctl 'h15-ws1' @('action', 'focus-workspace', '1') } 2200)
+$h15Back = @(EvOf $new 'workspace_activated')
+$h15ActivationBackTold = ($h15Back.Count -eq 1) -and ([int64]$h15Back[0].data.id -eq $h15Ws1Id) -and ($h15Back[0].data.focused -eq $true)
+
+# (h) a quoted word is a name, not an index: "2" names no workspace, so nothing is activated
+$new = @(H15Step { $null = Ctl 'h15-quoted' @('action', 'focus-workspace', (Q '"2"')) } 1800)
+$h15QuotedStep = @($steps | Where-Object { $_.step -eq 'h15-quoted' }) | Select-Object -First 1
+$h15QuotedIsAName = ($null -ne $h15QuotedStep) -and ($h15QuotedStep.rc -eq 0) -and (@(EvOf $new 'workspace_activated').Count -eq 0)
+
+# (i) the typed JSON request, as a client in another language writes it: type "action", the name under "action", a number
+$typedReply = ''
+$new = @(H15Step { $script:typedReply = PipeRequest '{"type":"action","data":{"action":"focus-workspace","args":[2]}}' } 2200)
+Set-Content (Join-Path $D 'h15-typed-reply.txt') $typedReply
+$h15TypedTold = @(EvOf $new 'workspace_activated' | Where-Object { [int64]$_.data.id -eq $h15Ws2Id })
+$h15TypedAccepted = ($typedReply -match '"success":\s*true') -and ($h15TypedTold.Count -eq 1)
+$null = Ctl 'h15-ws1-again' @('action', 'focus-workspace', '1'); Start-Sleep -Milliseconds 2000
+
+# (j) --id names the window to act on: fullscreen-window --id <a window that is not focused>.  The window is focused first
+# (niri leaves the focus; wiri's documented approximation), then it is fullscreen
+FocusForm $k1
+$new = @(H15Step { $null = Ctl 'h15-fullscreen-id' @('action', 'fullscreen-window', '--id', [string][int64]$k3) } 2400)
+$h15IdFs = @(EvWindow $new 'window_opened_or_changed' $k3)
+$h15IdFocus = @(EvOf $new 'window_focus_changed' | Where-Object { [int64]$_.data.id -eq [int64]$k3 })
+$h15IdActs = ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 1) -and ([int64][LT]::GetForegroundWindow() -eq [int64]$k3)
+$null = Ctl 'h15-fullscreen-id-off' @('action', 'fullscreen-window', '--id', [string][int64]$k3); Start-Sleep -Milliseconds 2200
+# close-window --id closes that window and leaves the focus where it is
+$h15FgBeforeClose = [int64][LT]::GetForegroundWindow()
+$new = @(H15Step { $null = Ctl 'h15-close-id' @('action', 'close-window', '--id', [string][int64]$k1) } 2400)
+$h15Closed = @(EvOf $new 'window_closed' | Where-Object { [int64]$_.data.id -eq [int64]$k1 })
+$h15CloseById = ($h15Closed.Count -eq 1) -and ([int64]$h15Closed[0].data.window_hwnd -eq [int64]$k1) -and (-not [LT]::IsWindow($k1)) -and
+    ([int64][LT]::GetForegroundWindow() -eq $h15FgBeforeClose) -and ($h15FgBeforeClose -eq [int64]$k3)
+
+# (k) what is wrong is said: an action that does not exist, a window that does not exist
+$bad1 = CtlRaw @('action', 'no-such-action')
+$bad2 = CtlRaw @('action', 'fullscreen-window', '--id', '1')
+$bad3 = CtlRaw @('action', 'fullscreen-window', '--id', 'abc')
+$h15BadSaid = ($bad1.rc -ne 0) -and ($bad1.text -match 'unknown action') -and ($bad2.rc -ne 0) -and ($bad2.text -match 'no window with id 1 ') -and
+    ($bad3.rc -ne 0) -and ($bad3.text -match 'not a window id')
+
+# (l) the overview opens and closes: told each time
+$new = @(H15Step { $null = Ctl 'h15-overview' @('action', 'toggle-overview') } 2200)
+$h15OvOpen = @(EvOf $new 'overview_opened_or_closed')
+$h15OverviewOpenTold = ($h15OvOpen.Count -eq 1) -and ($h15OvOpen[0].data.is_open -eq $true)
+Shot 'h15-03-overview'
+$new = @(H15Step { $null = Ctl 'h15-overview-off' @('action', 'toggle-overview') } 2200)
+$h15OvClose = @(EvOf $new 'overview_opened_or_closed')
+$h15OverviewCloseTold = ($h15OvClose.Count -eq 1) -and ($h15OvClose[0].data.is_open -eq $false)
+
+# (m) a config reload is told, and says it went well
+$new = @(H15Step { $null = Ctl 'h15-reload' @('reload-config') } 2200)
+$h15Reload = @(EvOf $new 'config_loaded')
+$h15ReloadTold = ($h15Reload.Count -ge 1) -and ($h15Reload[0].data.failed -eq $false)
+
+# (n) a window that opens and closes: announced with its fields (and by wiri's own window_opened), and closed by id and by handle
+$k4 = $null
+$new = @(H15Step { $script:k4 = [TestForms]::Open('h15-4', 160, 60, 160) } 2600)
+$h15All += $k4
+$h15Opened = @(EvWindow $new 'window_opened_or_changed' $k4)
+# (the window object is described the moment the window is added; the foreground report that follows is the focus event)
+$h15OpenTold = ($h15Opened.Count -ge 1) -and ($h15Opened[0].data.window.title -eq 'h15-4') -and ([int]$h15Opened[0].data.window.pid -eq $PID) -and
+    (@(EvOf $new 'window_opened' | Where-Object { [int64]$_.data.window.hwnd -eq [int64]$k4 }).Count -eq 1) -and
+    (@(EvOf $new 'window_focus_changed' | Where-Object { [int64]$_.data.id -eq [int64]$k4 }).Count -eq 1)
+$new = @(H15Step { [TestForms]::CloseForm($k4) } 2200)
+$h15Closed4 = @(EvOf $new 'window_closed' | Where-Object { [int64]$_.data.id -eq [int64]$k4 })
+$h15CloseTold = ($h15Closed4.Count -eq 1) -and ([int64]$h15Closed4[0].data.window_hwnd -eq [int64]$k4)
+
+# (o) a subscriber that comes late is told the state as it is now; a filter applies to that state too
+$evLate = Join-Path $D 'h15-events-late.txt'
+$evLateProc = Start-Process -FilePath $ctl -ArgumentList @('events', '--stream') -RedirectStandardOutput $evLate -RedirectStandardError "$evLate.err" -WindowStyle Hidden -PassThru
+$evFilter = Join-Path $D 'h15-events-filtered.txt'
+$evFilterProc = Start-Process -FilePath $ctl -ArgumentList @('events', '--stream', '--filter', 'window_closed') -RedirectStandardOutput $evFilter -RedirectStandardError "$evFilter.err" -WindowStyle Hidden -PassThru
+$null = WaitText $evLate '"type":"config_loaded"' 8
+Start-Sleep -Milliseconds 800
+$h15NowList = WinList 'h15-windows-now'
+$h15LateWindows = @((EvOf (EvList $evLate) 'windows_changed') | Select-Object -First 1 | ForEach-Object { $_.data.windows } | ForEach-Object { $_ })
+$h15NowIds = @($h15NowList | ForEach-Object { [int64]$_.hwnd } | Sort-Object)
+$h15LateIds = @($h15LateWindows | ForEach-Object { [int64]$_.id } | Sort-Object)
+$h15LateFocused = @($h15LateWindows | Where-Object { $_.is_focused -eq $true })
+$h15LateOk = ($h15NowIds.Count -ge 2) -and (SameList $h15NowIds $h15LateIds) -and (($h15LateFocused.Count -eq 0) -or ([int64]$h15LateFocused[0].id -eq [int64][LT]::GetForegroundWindow())) -and
+    ((@(EvList $evLate | Select-Object -First 4 | ForEach-Object { $_.type }) -join ',') -eq 'workspaces_changed,windows_changed,overview_opened_or_closed,config_loaded')
+$h15FilterQuietAtFirst = (@(EvList $evFilter).Count -eq 0)
+[TestForms]::CloseForm($k2); Start-Sleep -Milliseconds 2400
+$h15FilterEvents = @(EvList $evFilter)
+$h15FilterOk = $h15FilterQuietAtFirst -and ($h15FilterEvents.Count -ge 1) -and (@($h15FilterEvents | Where-Object { $_.type -ne 'window_closed' }).Count -eq 0) -and
+    ([int64]$h15FilterEvents[0].data.id -eq [int64]$k2)
+foreach ($p in @($evProc, $evLateProc, $evFilterProc)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+$h15Values = [ordered]@{
+    issues = $h15Issues; first_four = $h15FirstFour; focused_at_start = $h15Fg
+    workspaces_at_start = (@($h15Workspaces | ForEach-Object { "$($_.idx):$($_.name):$($_.id):active=$($_.is_active):focused=$($_.is_focused)" }) -join ' ')
+    process = $procName; windows_at_start = $h15Windows.Count; windows_late = $h15LateIds.Count
+    events_total = @(EvList $evAll).Count; typed_reply = $typedReply.Trim()
+    bad_action = $bad1.text.Trim(); bad_id = $bad2.text.Trim(); bad_id_text = $bad3.text.Trim()
+}
+$h15Values | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'h15-values.json')
+foreach ($h in $h15All) { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
+Start-Sleep -Milliseconds 2000
+Stop-WiriGracefully $w15 'h15b'
 Remove-Item $cfg -Force -ErrorAction SilentlyContinue
-$log14b = Join-Path $D 'wiri.stderr14b.log'
-$w = Start-Wiri $log14b ($log14b + '.out')
+$log15b = Join-Path $D 'wiri.stderr15b.log'
+$w = Start-Wiri $log15b ($log15b + '.out')
 Start-Sleep -Seconds 4
 
 # ---- Phase D: close one window, quit -----------------------------------------------------------
@@ -2510,6 +2776,37 @@ $summary = [ordered]@{
     h14_app_fullscreen_hides_the_taskbar = $h14AppTaskbarHidden
     h14_app_fullscreen_hides_nothing = $h14AppNothingHidden
     h14_app_leaving_fullscreen_is_followed = $h14AppLeft
+    # --- Phase 2A / H15: IPC parity: niri's event stream, actions with niri's arguments
+    h15_config_loads_without_issues = ($h15Issues -eq 0)
+    h15_the_stream_starts_with_the_state = $h15StartsWithState
+    h15_windows_changed_describes_the_windows = $h15Fields
+    h15_exactly_one_window_is_focused_the_foreground_one = $h15OneFocused
+    h15_workspaces_changed_describes_the_workspaces = $h15WsFields
+    h15_a_window_names_the_workspace_it_is_on = $h15WsOfWindows
+    h15_the_config_state_is_replayed = $h15ConfigReplayed
+    h15_an_idle_desktop_sends_no_events = $h15IdleQuiet
+    h15_a_new_title_is_a_changed_window = $h15TitleChanged
+    h15_focus_is_told_once_with_the_window_id = $h15FocusTold
+    h15_floating_is_a_changed_window = $h15FloatTold
+    h15_windows_that_moved_are_told_as_layouts = $h15LayoutsTold
+    h15_tiling_again_is_a_changed_window = $h15UnfloatTold
+    h15_fullscreen_is_a_changed_window = $h15FullscreenTold
+    h15_leaving_fullscreen_is_a_changed_window = $h15FullscreenOffTold
+    h15_moving_a_window_to_workspace_2_is_told_in_order = $h15MoveTold
+    h15_activating_a_workspace_is_told_once_as_the_focused_one = $h15ActivationTold
+    h15_activating_the_first_workspace_again_is_told = $h15ActivationBackTold
+    h15_a_quoted_workspace_word_is_a_name_not_an_index = $h15QuotedIsAName
+    h15_a_typed_json_action_is_accepted = $h15TypedAccepted
+    h15_an_action_can_name_its_window_with_id = $h15IdActs
+    h15_close_window_by_id_leaves_the_focus_alone = $h15CloseById
+    h15_bad_actions_say_what_is_wrong = $h15BadSaid
+    h15_the_overview_opening_is_told = $h15OverviewOpenTold
+    h15_the_overview_closing_is_told = $h15OverviewCloseTold
+    h15_a_config_reload_is_told = $h15ReloadTold
+    h15_a_window_that_opens_is_told = $h15OpenTold
+    h15_a_window_that_closes_is_told_by_id_and_handle = $h15CloseTold
+    h15_a_late_subscriber_is_told_the_state_as_it_is = $h15LateOk
+    h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

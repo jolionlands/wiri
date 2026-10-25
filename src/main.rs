@@ -254,8 +254,12 @@ async fn main() -> Result<()> {
     // and says why in a balloon as soon as the tray icon exists.
     let startup_decoded = wiri::config::loader::load_logged(&config_path);
     let mut pending_balloon: Option<(String, String, u32)> = None;
+    // What an event-stream client that connects later is told about this load.
+    let startup_warnings = startup_decoded.warning_count() as u32;
+    let mut startup_error: Option<String> = None;
     let config = if startup_decoded.has_errors() {
         let summary = wiri::config::failure_summary(&config_path, &startup_decoded.issues);
+        startup_error = Some(summary.clone());
         warn!("Using defaults (config error: {})", summary);
         pending_balloon = Some((
             "wiri: config error".to_string(),
@@ -524,6 +528,20 @@ async fn main() -> Result<()> {
         }
     });
     info!("IPC server started on {}", wiri::ipc::PIPE_PATH);
+    // A client that subscribes to the event stream is told how the config loaded at startup
+    // (nobody is subscribed yet: the server only keeps it for the replay).
+    ipc_server.broadcast_event(IpcEvent::ConfigLoaded {
+        config_path: config_path.display().to_string(),
+        failed: startup_error.is_some(),
+        error: startup_error.clone(),
+        warnings: startup_warnings,
+    });
+    // Tells event-stream subscribers what changed, once per burst of changes, and only while
+    // somebody is subscribed (no timer: it sleeps until `wiri::ipc::notify_state_changed`).
+    let ipc_state_task = ipc_server.clone();
+    tokio::spawn(async move {
+        ipc_state_task.run_state_task().await;
+    });
 
     // Take event receiver before spawning event handler
     let mut event_rx = backend.take_event_rx();
@@ -610,6 +628,7 @@ async fn main() -> Result<()> {
                                 m.focus_column = Some(col_idx);
                             }
                             tracker.record_focus_change();
+                            wiri::ipc::notify_state_changed();
                         }
                     }
                 }
@@ -1004,6 +1023,9 @@ impl<'a> ReloadCtx<'a> {
             error: None,
             warnings: warnings as u32,
         });
+        // The rules and the workspace names of the new config may have changed windows and
+        // workspaces.
+        wiri::ipc::notify_state_changed();
     }
 
     /// The file has errors: the last good config stays, the user is told where the first
@@ -1207,6 +1229,21 @@ fn handle_backend_event(
     engine: &Arc<RwLock<TilingEngine>>,
     ipc_server: &Arc<IpcServer>,
 ) {
+    // Whatever the event does to the windows and workspaces, the event-stream clients are told
+    // when it is done.  Not for the ones that cannot change what they are told: a window that
+    // moves (they come in streams while the layout animates or a window is dragged) and the
+    // CBT notices that are only logged.
+    let _state_changed = match &event {
+        BackendEvent::WindowMoved { .. }
+        | BackendEvent::WindowResized { .. }
+        | BackendEvent::WindowMoveResizeStart { .. }
+        | BackendEvent::CbtCreateWindow { .. }
+        | BackendEvent::CbtDestroyWindow { .. }
+        | BackendEvent::CbtActivate { .. }
+        | BackendEvent::CbtMoveSize { .. }
+        | BackendEvent::CbtSetFocus { .. } => None,
+        _ => Some(wiri::ipc::StateChangeGuard),
+    };
     match event {
         BackendEvent::WindowCreated { hwnd } => {
             // Most windows fail `should_tile_window` at CREATE time because the
@@ -1216,7 +1253,8 @@ fn handle_backend_event(
         }
         BackendEvent::WindowDestroyed { hwnd } => {
             info!("- Window {}", hwnd);
-            ipc_server.broadcast_event(IpcEvent::WindowClosed { window_hwnd: hwnd });
+            // `window_closed` is sent when the state shows that the window is gone (and only
+            // for a window wiri managed), not for every window that is destroyed.
             engine.write().remove_window(WindowId::new(hwnd), handle);
             engine.write().apply_all(handle);
         }
@@ -1450,6 +1488,8 @@ fn add_window_if_tileable(
         eng.apply_all(handle);
     }
     ipc_server.broadcast_event(IpcEvent::WindowOpened { window: opened });
+    // (The reconcile pass comes here too, not only the events.)
+    wiri::ipc::notify_state_changed();
     true
 }
 

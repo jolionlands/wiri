@@ -58,6 +58,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   states (its frame is not touched), and wiri tiles it again when it leaves them.  `wiri-ctl windows` shows
   `fullscreen` and `maximized`.  `wiri-ctl focus-window` (and the IPC requests that focus a window first)
   now scrolls the strip to show the window's column, as focusing it with the keyboard does.
+- **niri's event stream, and actions with niri's arguments (IPC 1.1).**  A client that subscribes to
+  `wiri-ctl events --stream` is told the state first - `workspaces_changed`, `windows_changed`,
+  `overview_opened_or_closed`, `config_loaded` - and then every change as niri's events:
+  `window_opened_or_changed`, `window_closed`, `window_focus_changed`, `window_urgency_changed`,
+  `window_layouts_changed`, `workspace_activated`, `workspace_active_window_changed`,
+  `workspace_urgency_changed`, `workspaces_changed`, `overview_opened_or_closed`.  The objects are niri's
+  `Window` and `Workspace` (`id`, `title`, `app_id`, `pid`, `workspace_id`, `is_focused`, `is_floating`,
+  `is_urgent`, `layout`; `id`, `idx`, `name`, `output`, `is_urgent`, `is_active`, `is_focused`,
+  `active_window_id`) plus wiri's `class_name`, `output`, `is_fullscreen`, `is_maximized`, `is_minimized`.
+  The events are worked out from the state of the layout once after whatever changed it (a key, the mouse,
+  an application, `wiri-ctl`, a config reload), only while somebody is subscribed, with no timer; a client
+  that falls behind is told the state again instead of silently missing events.  `workspaces_changed` and
+  `workspace_activated` were declared and never sent: they are sent now, with niri's payload.
+  `window_closed` is sent for the windows wiri managed (it was sent for every window that was destroyed) and
+  carries `id` as well as `window_hwnd`.  wiri's older events are unchanged.
+  `wiri-ctl action <name> [args]` (the `run_action` request, also spelled `action`) takes numbers and booleans
+  as arguments, `quoted` (`focus-workspace "2"` is a name, `focus-workspace 2` an index; in a shell
+  `wiri-ctl action focus-workspace '"2"'`) and niri's `--id <hwnd>` for the window to act on.  A live test
+  never runs twice at once on the test machine (a machine-wide lock; idea from Codex Sol's ee41d27).
 
 ### Phase 1 — safe to daily-drive (2026-10-24)
 Each item is verified on a spare Windows 11 laptop with `scripts/live-test.ps1` (real key

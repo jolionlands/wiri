@@ -611,10 +611,31 @@ All messages use a `type`+`data` discriminated union format:
 {"type":"close_window","data":{"window_hwnd":123456}}
 ```
 
+**Run any action (niri's `Request::Action`):**
+```json
+{"type":"run_action","data":{"name":"set-column-width","args":["+10%"]}}
+{"type":"action","data":{"action":"focus-workspace","args":[2]}}
+{"type":"run_action","data":{"name":"fullscreen-window","args":["--id",123456]}}
+```
+The name is a niri action name and the arguments are the words after it in a `binds {}` line (numbers and
+booleans stand for their text; `"quoted":[true]` marks a workspace name written in quotes: `focus-workspace "2"`
+is the workspace named "2", `focus-workspace 2` the second one).  `--id <hwnd>` names the window to act on
+(`close-window --id` closes it and leaves the focus alone; any other action focuses the window first).
+
 **Subscribe to events:**
 ```json
-{"type":"subscribe_events","data":{"event_types":["window_created","window_destroyed"]}}
+{"type":"subscribe_events","data":{"event_types":["window_focus_changed","workspace_activated"]}}
 ```
+
+The stream is niri's: **the state first, then what changes.**  Right after the ack a subscriber gets
+`workspaces_changed`, `windows_changed`, `overview_opened_or_closed` and `config_loaded` (the whole state: every
+workspace and window with niri's fields, which window has the focus, how the config loaded), then
+`window_opened_or_changed`, `window_closed`, `window_focus_changed`, `window_urgency_changed`,
+`window_layouts_changed`, `workspace_activated`, `workspace_active_window_changed`, `workspace_urgency_changed`,
+`workspaces_changed` and `overview_opened_or_closed` as things change.  A client that keeps a model from them
+never has to ask or to poll.  wiri's older events (`window_opened`, `window_focused`, `workspace_switched`,
+`column_focused`, ...) are still sent.  Everything is in [IPC_PROTOCOL.md](IPC_PROTOCOL.md) (§6.2) and
+[IPC_SCHEMA.json](IPC_SCHEMA.json).
 
 ### Using wiri-ctl
 
@@ -625,6 +646,12 @@ wiri-ctl list                 # List all windows
 wiri-ctl focus 123456         # Focus a window
 wiri-ctl close 123456         # Close a window
 wiri-ctl state                # Dump engine state
+wiri-ctl action focus-column-left
+wiri-ctl action set-column-width +10%
+wiri-ctl action fullscreen-window --id 123456
+wiri-ctl action focus-workspace '"2"'   # the workspace named 2 (words in literal double quotes are names)
+wiri-ctl events --stream                # the state, then every change, one JSON object per line
+wiri-ctl events --stream --filter window_focus_changed,workspace_activated
 ```
 
 ---
