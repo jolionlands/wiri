@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// After this many consecutive `set_window_position` failures, the engine
@@ -19,6 +20,8 @@ mod sizing;
 use sizing::DrawMode;
 // The windows and workspaces as the IPC event stream describes them (niri's `Window` and `Workspace`).
 mod ipcview;
+// What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
+mod decor;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
@@ -38,7 +41,16 @@ struct AppliedState {
     /// Last `DWMWA_SYSTEMBACKDROP_TYPE` value applied (0–4).
     /// 0xFFFF_FFFF = "never set" sentinel — triggers the first DWM call.
     backdrop: u32,
+    /// The `DWMWA_WINDOW_CORNER_PREFERENCE` last set (0 default, 1 square, 2 round, 3 small
+    /// round), `CORNER_UNSET` before anything was decided, `CORNER_NOT_ASKED` when the config
+    /// leaves the corners of windows alone.
+    corner: u32,
 }
+
+/// `AppliedState::corner` before anything was decided.
+const CORNER_UNSET: u32 = 0xFFFF_FFFF;
+/// `AppliedState::corner` when the config does not ask for a corner radius.
+const CORNER_NOT_ASKED: u32 = 0xFFFF_FFFE;
 
 impl AppliedState {
     fn unset() -> Self {
@@ -49,6 +61,7 @@ impl AppliedState {
             visible: false,
             focused: false,
             backdrop: 0xFFFF_FFFF,
+            corner: CORNER_UNSET,
         }
     }
 }
@@ -367,6 +380,9 @@ pub struct LayoutConfig {
     pub reserve_left: u32,
     /// Pixels reserved at the right of every monitor's tiling work area.
     pub reserve_right: u32,
+    /// What the overlay layer draws around the windows (niri's `focus-ring`, `border`,
+    /// `shadow`, `insert-hint` and `tab-indicator`).
+    pub effects: crate::config::Effects,
 }
 
 impl Default for LayoutConfig {
@@ -395,11 +411,18 @@ impl Default for LayoutConfig {
             reserve_bottom: 0,
             reserve_left: 0,
             reserve_right: 0,
+            effects: crate::config::Effects::default(),
         }
     }
 }
 
 impl LayoutConfig {
+    /// The space between the edge of a tile and its window: the width of the `border`, which
+    /// is 0 when the border is off.
+    pub fn border_inset(&self) -> i32 {
+        self.border_width.max(0)
+    }
+
     pub fn from_config(config: &crate::config::Config) -> Self {
         let mut lc = Self::default();
         // inner_gaps controls spacing between columns and between stacked tiles
@@ -410,9 +433,14 @@ impl LayoutConfig {
         // Always apply from config
         let og = config.layout.outer_gaps as i32;
         lc.outer_gaps = (og, og, og, og);
-        if config.layout.border_width > 0 {
-            lc.border_width = config.layout.border_width as i32;
-        }
+        // The border block says how much room every window leaves around itself: its width,
+        // none when the border is off.
+        lc.effects = config.layout.effects.clone();
+        lc.border_width = if lc.effects.border.off {
+            0
+        } else {
+            lc.effects.border.width as i32
+        };
         if !config.layout.border_color.is_empty() {
             lc.border_color = config.layout.border_color.clone();
         }
@@ -432,9 +460,11 @@ impl LayoutConfig {
                 lc.border_color_focused_mode = BorderColorMode::Fixed;
             }
         }
-        if config.layout.focus_ring_width > 0 {
-            lc.focus_ring_width = config.layout.focus_ring_width as i32;
-        }
+        lc.focus_ring_width = if lc.effects.focus_ring.off {
+            0
+        } else {
+            lc.effects.focus_ring.width as i32
+        };
         if !config.layout.focus_ring_color.is_empty() {
             lc.focus_ring_color = config.layout.focus_ring_color.clone();
         }
@@ -611,6 +641,9 @@ pub struct TilingEngine {
     /// Per-window cache of last-applied Win32 state. Used to skip redundant
     /// DwmSetWindowAttribute / SetLayeredWindowAttributes / SetWindowPos calls.
     applied_state: HashMap<WindowId, AppliedState>,
+    /// The overlay layer that draws the focus ring, the border and the shadow (and the tab
+    /// indicator and insert hint): `None` in tests and until the daemon installs one.
+    decor: Option<Arc<dyn crate::overlay::decor::DecorSink>>,
     /// Original window bounds at first registration. Used to restore windows
     /// when wiri exits so the user gets their layout back.
     original_bounds: HashMap<WindowId, Rect>,
@@ -722,6 +755,7 @@ impl TilingEngine {
             os_foreground: None,
             layout_request_tx: None,
             applied_state: HashMap::new(),
+            decor: None,
             original_bounds: HashMap::new(),
             window_min_widths: HashMap::new(),
             min_width_queries: HashMap::new(),
@@ -1807,12 +1841,12 @@ impl TilingEngine {
         let known = &self.window_min_widths;
         let limits = &self.rule_limits;
         let heights = &self.rule_heights;
-        let global_border = 2 * self.config.border_width.max(1) as u32;
+        let global_border = 2 * self.config.border_inset() as u32;
         let per_monitor = &self.config_per_monitor;
         for (output, monitor) in self.monitors.iter_mut() {
             let border = per_monitor
                 .get(output)
-                .map_or(global_border, |c| 2 * c.border_width.max(1) as u32);
+                .map_or(global_border, |c| 2 * c.border_inset() as u32);
             for workspace in monitor.workspaces.values_mut() {
                 for column in workspace.columns.iter_mut() {
                     for tile in column.tiles.iter_mut() {
@@ -2594,7 +2628,7 @@ impl TilingEngine {
         } else {
             None
         };
-        let border_w = eff_cfg.border_width.max(1);
+        let border_w = eff_cfg.border_inset();
 
         // Resolve the focused border colour for this pass.  When the user
         // opted into `border-color-focused "accent"` we read the live
@@ -2688,7 +2722,7 @@ impl TilingEngine {
             // 2. urgent windows get the urgent (red) colour regardless of focus.
             // 3. focused → focused colour; otherwise → normal colour.
             let is_urgent = self.urgent_windows.contains(&window_id);
-            let new_border_color = if smart_no_border {
+            let new_border_color = if smart_no_border || eff_cfg.effects.border.off {
                 SMART_BORDERS_SENTINEL
             } else if is_urgent {
                 border_color_urgent_u32
@@ -2729,6 +2763,15 @@ impl TilingEngine {
                 rect.size.h.saturating_sub(inset as u32 * 2),
             );
 
+            // The corner radius the config asks for, as the preference DWM understands (windows
+            // keep what they have when it asks for none, and on Windows 10 there is nothing to ask).
+            let new_corner: u32 = match eff_cfg.effects.corner_radius {
+                Some(n) if crate::backend::osversion::supports_rounded_corners() => {
+                    decor::dwm_corner_for(n).0 as u32
+                }
+                _ => CORNER_NOT_ASKED,
+            };
+
             // Check configure throttle intent — skip position if NotNeeded or Throttled.
             let intent = tile_intents
                 .get(&window_id)
@@ -2755,9 +2798,24 @@ impl TilingEngine {
                 && prior.opacity == new_opacity
                 && prior.focused == is_focused
                 && prior.backdrop == new_backdrop
+                && prior.corner == new_corner
                 && pos_identical
             {
                 continue;
+            }
+
+            // 0. Corner preference (once per change of the request).
+            if prior.corner != new_corner {
+                if new_corner != CORNER_NOT_ASKED {
+                    self.apply_corner_for_window(window_id.as_isize(), new_corner as i32);
+                } else if prior.corner != CORNER_UNSET {
+                    // The request went away: give the window DWM's own choice back.
+                    self.apply_corner_for_window(window_id.as_isize(), 0);
+                }
+                self.applied_state
+                    .entry(window_id)
+                    .or_insert_with(AppliedState::unset)
+                    .corner = new_corner;
             }
 
             // ---- Selective Win32 calls ----
@@ -3053,6 +3111,10 @@ impl TilingEngine {
         for &sticky_wid in &self.sticky_windows {
             let _ = backend.show_window(sticky_wid.as_isize(), true);
         }
+
+        // The overlay layer draws the focus ring, the border and the shadow around the tiles
+        // as they are now.
+        self.refresh_decorations(output_id, &position_map, &draw_modes, work_rect, overview_active);
 
         // Bring the focused window to the foreground if it changed since last layout.
         // Only the focused monitor's focus drives Win32 activation.  The attempt is
@@ -6578,7 +6640,7 @@ impl TilingEngine {
         let workspace = monitor.workspace()?;
         let column = workspace.columns.get(col_idx)?;
         let current = column.resolved_width(Self::workspace_default_width(workspace, view, cfg));
-        Some((col_idx, current, view, cfg.column_gap, 2 * cfg.border_width.max(1)))
+        Some((col_idx, current, view, cfg.column_gap, 2 * cfg.border_inset()))
     }
 
     /// niri `set-column-width` / `set-window-width`: change the width of the focused
@@ -6710,7 +6772,7 @@ impl TilingEngine {
                 - cfg.outer_gaps.2
                 - cfg.reserve_top as i32
                 - cfg.reserve_bottom as i32;
-            (view_h, cfg.window_gap, 2 * cfg.border_width.max(1))
+            (view_h, cfg.window_gap, 2 * cfg.border_inset())
         };
         let changed = {
             let Some(monitor) = self.monitors.get_mut(&output) else {
@@ -7717,6 +7779,18 @@ impl TilingEngine {
         // From here on no layout pass runs: it would hide the windows of the other
         // workspaces again before the process is gone.
         self.shut_down = true;
+
+        // The overlay windows go, and the windows get DWM's own corners back.
+        self.clear_decorations();
+        let rounded: Vec<WindowId> = self
+            .applied_state
+            .iter()
+            .filter(|(_, st)| st.corner != CORNER_UNSET && st.corner != CORNER_NOT_ASKED)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in rounded {
+            self.apply_corner_for_window(id.as_isize(), 0);
+        }
 
         // The shell must not go on believing that a window is fullscreen (and keep the
         // taskbar away) when wiri is gone.
@@ -13863,6 +13937,7 @@ mod tests {
                 visible: true,
                 focused: false,
                 backdrop: 0xFFFF_FFFF,
+                corner: CORNER_UNSET,
             },
         );
 
