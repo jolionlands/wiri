@@ -63,6 +63,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   manual shortcut inhibition (`allow-inhibiting=false` escape hatches), and the wiri extension
   `on-release=true` work without stealing unbound keys or faking modifier releases. RegisterHotKey
   remains a down-only fallback; the hook uses the existing hotkey thread instead of two extra threads.
+- Mouse button and vertical/horizontal wheel binds use niri trigger names, paired suppression,
+  per-bind cooldown and per-axis consumption. High-resolution Windows touchpad wheel reports
+  accumulate into ticks (TouchpadScroll names alias that stream). Configured Mod+left/right
+  gestures work over nested client HWNDs, and resizing persists into floating/column/tile state.
+  The old hard-coded Alt/wheel shortcuts and per-wheel worker threads are removed.
 
 ### Phase 2A — a real config parser, window rules, fullscreen, IPC (2026-10-25)
 - **A real KDL config parser with visible errors.**  The line scanner is gone.  `src/config/kdl.rs` reads

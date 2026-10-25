@@ -251,9 +251,39 @@ pub fn resize_edge_from_point(
     }
 }
 
+/// Borders preserve their precise edge; client interior selects its nearest corner.
+pub fn resize_edge_or_quadrant(point: Point, rect: Rect, border: i32) -> Option<ResizeEdge> {
+    if let Some(edge) = resize_edge_from_point(point, rect, border) {
+        return Some(edge);
+    }
+    if point.x < rect.loc.x || point.x > rect.right()
+        || point.y < rect.loc.y || point.y > rect.bottom()
+    {
+        return None;
+    }
+    Some(match (
+        point.x < rect.loc.x + rect.size.w as i32 / 2,
+        point.y < rect.loc.y + rect.size.h as i32 / 2,
+    ) {
+        (true, true) => ResizeEdge::TopLeft,
+        (false, true) => ResizeEdge::TopRight,
+        (true, false) => ResizeEdge::BottomLeft,
+        (false, false) => ResizeEdge::BottomRight,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_quadrants_choose_resize_corners_without_losing_edges() {
+        let rect = Rect::new(100,100,400,300);
+        assert_eq!(resize_edge_or_quadrant(Point::new(180,180),rect,4),Some(ResizeEdge::TopLeft));
+        assert_eq!(resize_edge_or_quadrant(Point::new(420,320),rect,4),Some(ResizeEdge::BottomRight));
+        assert_eq!(resize_edge_or_quadrant(Point::new(498,220),rect,4),Some(ResizeEdge::Right));
+        assert_eq!(resize_edge_or_quadrant(Point::new(99,180),rect,4),None);
+    }
 
     #[test]
     fn test_move_grab_delta() {

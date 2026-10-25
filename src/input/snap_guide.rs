@@ -215,6 +215,11 @@ pub fn guide() -> SnapGuide {
     g
 }
 
+/// Hide without allocating a guide window/thread for a drag that never snapped.
+pub fn hide_if_created() {
+    if let Some(guide) = GLOBAL_GUIDE.lock().as_ref() { guide.hide(); }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime snap config (read by the low-level hook on every WM_MOUSEMOVE).
 // ---------------------------------------------------------------------------

@@ -1063,10 +1063,15 @@ impl Decoder {
             "focus-follows-mouse" | "follows-mouse" => {
                 for p in &child.props {
                     if p.key == "max-scroll-amount" {
-                        self.warn(
-                            p.key_pos,
-                            "'max-scroll-amount' is not supported by wiri; ignored",
-                        );
+                        let percent = p.value.as_str()
+                            .and_then(|s| s.strip_suffix('%'))
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .filter(|p| p.is_finite() && *p >= 0.0);
+                        if let Some(percent) = percent {
+                            cfg.input.focus_max_scroll_percent = Some(percent);
+                        } else {
+                            self.error(p.value.pos, "'max-scroll-amount' expects a non-negative finite percentage, e.g. \"0%\"");
+                        }
                     } else {
                         self.error(
                             p.key_pos,
@@ -1097,7 +1102,11 @@ impl Decoder {
             {
                 for p in &child.props {
                     if p.key == "mode" {
-                        self.warn(p.key_pos, "'mode' is not supported by wiri; ignored");
+                        match p.value.as_str() {
+                            Some("center-xy") => cfg.input.warp_mode = WarpMode::CenterXy,
+                            Some("center-xy-always") => cfg.input.warp_mode = WarpMode::CenterXyAlways,
+                            _ => self.error(p.value.pos, "'mode' expects \"center-xy\" or \"center-xy-always\""),
+                        }
                     } else {
                         self.error(
                             p.key_pos,
@@ -2401,7 +2410,7 @@ impl Decoder {
         }
 
         // key
-        if bind.vk_code().is_none() {
+        if bind.vk_code().is_none() && crate::input::pointer::parse_trigger(&bind.key).is_none() {
             let lower = bind.key.to_ascii_lowercase();
             let niri_only = lower.starts_with("mouse")
                 || lower.starts_with("wheelscroll")
@@ -2825,18 +2834,18 @@ mod tests {
 
     #[test]
     fn bind_problems_that_cost_one_bind() {
-        // An unknown modifier, an AltGr modifier, a mouse trigger and a media key lose their
-        // bind with a warning; the rest of the config loads.
+        // Unknown/AltGr modifiers and an unsupported media key lose their binds;
+        // pointer triggers and the rest of the config load.
         let d = load("binds {\n    Hyper+F9 { close-window; }\n    Mod5+F8 { close-window; }\n    Mod+MouseLeft { close-window; }\n    XF86AudioMute { spawn \"x\"; }\n    Mod+F7 { refresh; }\n}\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
         let w = warnings(&d);
-        assert_eq!(w.len(), 4, "{:?}", w);
+        assert_eq!(w.len(), 3, "{:?}", w);
         assert!(w[0].contains("unknown modifier 'Hyper'"), "{}", w[0]);
         assert!(w[1].contains("cannot be bound on Windows"), "{}", w[1]);
-        assert!(w[2].contains("mouse"), "{}", w[2]);
-        assert!(w[3].contains("no Windows virtual key"), "{}", w[3]);
-        assert_eq!(d.config.binds.hotkeys.len(), 1);
-        assert_eq!(d.config.binds.hotkeys[0].key, "F7");
+        assert!(w[2].contains("no Windows virtual key"), "{}", w[2]);
+        assert_eq!(d.config.binds.hotkeys.len(), 2);
+        assert_eq!(d.config.binds.hotkeys[0].key, "MouseLeft");
+        assert_eq!(d.config.binds.hotkeys[1].key, "F7");
         // An action wiri lacks but niri has: a warning, not an error.
         let d = load("binds { Mod+X { swap-window-left; } }\n");
         assert!(errors(&d).is_empty());

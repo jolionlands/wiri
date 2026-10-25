@@ -272,6 +272,7 @@ fn build_hotkey_list(
 ) -> (Vec<(u32, u32, Action)>, HashMap<(u32, u32), BindOptions>) {
     let terminal = resolve_terminal_action(engine);
     let eng = engine.read();
+    if let Some(config) = eng.full_config() { crate::input::pointer::ENGINE.lock().configure(config); }
     let binds = eng.config_binds();
     let config_binds = &binds.hotkeys;
     let extend_defaults = binds.extend_defaults;
@@ -298,6 +299,7 @@ fn build_hotkey_list(
     let mut parsed_config: Vec<(u32, u32, Action)> = Vec::with_capacity(config_binds.len());
     let mut options: HashMap<(u32, u32), BindOptions> = HashMap::new();
     for bind in config_binds {
+        if crate::input::pointer::parse_trigger(&bind.key).is_some() { continue; }
         match bind_to_hotkey(bind, prefix) {
             Ok(row) => {
                 if !bind.repeat || bind.release || !bind.allow_inhibiting || bind.cooldown_ms.is_some() || bind.hotkey_overlay_title.is_some()

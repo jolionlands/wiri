@@ -46,3 +46,39 @@ record what was actually verified rather than treating unit coverage as desktop 
 
 No dependencies added. Keyboard changes remove the separate keyboard-hook and action-relay
 threads and use the existing message pump. No timer, polling loop, or new resting window.
+
+## 2. Mouse and wheel
+
+`Mod+MouseLeft/Right/Middle/Back/Forward` and `WheelScrollUp/Down/Left/Right` use niri syntax.
+An explicit button bind wins over a move/resize gesture and acts on the previously focused
+window, not the window clicked. Bound button down/up pairs survive modifier release and reload;
+release bindings and cooldown also work. Mod+left moves and Mod+right resizes when not explicitly
+bound. The root is found with `GetAncestor(GA_ROOT)` after `WindowFromPoint`, so nested client
+children no longer prevent a grab. Resize edges retain their precise edge hit-test; client
+interiors choose the nearest corner. Tile resize writes column width and height through existing
+engine setters; floating writeback uses a minimal absolute-rectangle wrapper around `place_float`
+to retain limits and floating memory without racing queued HWND updates. No other engine logic
+is changed. Layout/backend work runs off the LL callback on the existing hotkey thread.
+
+Wheel bindings consume both directions of a bound axis, including fractional packets, but pass
+an unbound axis unchanged. Signed deltas accumulate to Windows' 120-unit ticks, resetting on
+modifier/config change; natural-scroll and per-bind cooldown apply. TouchpadScroll names alias
+the same stream: WH_MOUSE_LL cannot distinguish precision touchpads from wheels, so separate
+hardware policies and native gestures are not claimed. Wheel shortcuts must be configured;
+there is no hard-coded Alt or Ctrl+Alt wheel action and no worker spawned per scroll event.
+
+```kdl
+binds {
+    Mod+MouseMiddle { toggle-window-floating; }
+    Mod+WheelScrollUp cooldown-ms=150 { focus-workspace-up; }
+    Mod+WheelScrollDown cooldown-ms=150 { focus-workspace-down; }
+    Mod+WheelScrollLeft { focus-column-left; }
+    Mod+WheelScrollRight { focus-column-right; }
+}
+```
+
+Pointer validation: release suite passed (893 library + 4 CLI tests, one ignored doc test),
+including seven pure pointer tests and client-quadrant geometry. Real nested-child move/resize,
+paired application-queue transitions and wheel-axis gates are in the lane-B desktop phase.
+No new dependency, idle timer, input thread, or resting window. The existing lazy snap guide
+is not created merely to hide it at drag completion.

@@ -4276,6 +4276,12 @@ impl TilingEngine {
         self.float_memory.insert(window_id, rect);
     }
 
+    /// Absolute pointer-grab writeback; shares floating memory, rule limits and work-area
+    /// clamping with keyboard moves instead of rereading a potentially queued HWND move.
+    pub(crate) fn place_float_from_pointer(&mut self, window: WindowId, rect: Rect, backend: &BackendHandle) {
+        self.place_float(window, rect, backend);
+    }
+
     /// Move a floating window by `(dx, dy)` pixels (niri nudges by 50).
     pub fn float_move_by(&mut self, window_id: WindowId, dx: i32, dy: i32, backend: &BackendHandle) {
         let Some(rect) = self.float_rect_of(window_id) else {

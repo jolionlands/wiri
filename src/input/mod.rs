@@ -1,5 +1,6 @@
 pub mod dispatch;
 pub mod keyboard;
+pub mod pointer;
 pub mod grab;
 pub mod hotkey;
 pub mod low_level_hook;

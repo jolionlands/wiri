@@ -80,9 +80,12 @@ pub struct InputConfig {
     /// Delay (ms) before focus-follows-mouse kicks in after the pointer
     /// settles on a new window. 0 = instant.
     pub focus_delay_ms: u32,
-    /// When focus changes programmatically, warp the mouse pointer to the
-    /// centre of the newly focused window.
+    /// Maximum reveal scroll as a percentage of the output working-area width.
+    /// None permits any minimal reveal; Some(0.0) forbids scrolling.
+    pub focus_max_scroll_percent: Option<f64>,
+    /// Warp the pointer when the foreground window changes.
     pub warp_on_focus: bool,
+    pub warp_mode: WarpMode,
     /// Whether to enable NumLock at startup. Mirrors `input.keyboard.numlock`.
     pub numlock: bool,
 
@@ -111,7 +114,9 @@ impl InputConfig {
             mod_key: "ctrl-alt".to_string(),
             workspace_auto_back_and_forth: false,
             focus_delay_ms: 0,
+            focus_max_scroll_percent: None,
             warp_on_focus: false,
+            warp_mode: WarpMode::default(),
             numlock: false,
             touch_enabled: false,
             touch_tap_to_click: true,
@@ -158,7 +163,9 @@ impl InputConfig {
         FocusSubConfig {
             follows_mouse: self.focus_follows_mouse,
             focus_delay_ms: self.focus_delay_ms,
+            max_scroll_percent: self.focus_max_scroll_percent,
             warp_on_focus: self.warp_on_focus,
+            warp_mode: self.warp_mode,
         }
     }
 }
@@ -197,14 +204,27 @@ pub struct TouchSubConfig {
     pub scroll_speed: f64,
 }
 
+/// Pointer placement when a window gains focus (niri `warp-mouse-to-focus`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WarpMode {
+    /// Center only axes on which the pointer lies outside the window.
+    #[default]
+    CenterOutsideAxes,
+    /// Center both axes, but only when outside the window.
+    CenterXy,
+    /// Center both axes even when already inside the window.
+    CenterXyAlways,
+}
+
 /// Nested focus-policy configuration view derived from `InputConfig` flat fields.
 #[derive(Debug, Clone, Default)]
 pub struct FocusSubConfig {
     pub follows_mouse: bool,
-    /// Focus delay in ms; no flat counterpart yet, defaults 0.
+    /// Delay in ms from entering a new target, not from the last motion.
     pub focus_delay_ms: u32,
-    /// Warp pointer to newly-focused window; no flat counterpart yet, defaults false.
+    pub max_scroll_percent: Option<f64>,
     pub warp_on_focus: bool,
+    pub warp_mode: WarpMode,
 }
 
 #[derive(Debug, Clone)]
