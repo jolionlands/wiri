@@ -276,6 +276,9 @@ pub struct LayoutConfigPartial {
     pub reserve_bottom: Option<u32>,
     pub reserve_left: Option<u32>,
     pub reserve_right: Option<u32>,
+    /// The `focus-ring`, `border`, `shadow`, `insert-hint` and `tab-indicator` blocks this
+    /// `layout {}` names; each replaces the block of the layout it is applied to.
+    pub effects: crate::config::effects::EffectsPartial,
 }
 
 impl LayoutConfigPartial {
@@ -399,6 +402,20 @@ impl LayoutConfigPartial {
         if let Some(v) = self.reserve_right {
             out.reserve_right = v;
         }
+        out.effects = self.effects.apply_to(&out.effects);
+        // The older flat spellings of the widths count when no block named them.
+        if self.effects.border.is_none() {
+            if let Some(v) = self.border_width {
+                out.effects.border.width = v;
+                out.effects.border.off = v == 0;
+            }
+        }
+        if self.effects.focus_ring.is_none() {
+            if let Some(v) = self.focus_ring_width {
+                out.effects.focus_ring.width = v;
+                out.effects.focus_ring.off = v == 0;
+            }
+        }
         out
     }
 }
@@ -498,6 +515,12 @@ pub struct LayoutConfig {
     /// Pixels to subtract from the right of each monitor's tiling work area.
     /// Set via `reserve-right N` inside `layout { }`.  Default 0.
     pub reserve_right: u32,
+
+    /// What the overlay layer draws around the windows: niri's `focus-ring`, `border`,
+    /// `shadow`, `insert-hint` and `tab-indicator` blocks, with their colours and gradients.
+    /// The flat `border_*` / `focus_ring_*` / `shadow_*` fields above are the older spelling
+    /// of some of the same keys; the decoder keeps both in step.
+    pub effects: crate::config::effects::Effects,
 }
 
 impl LayoutConfig {
@@ -539,6 +562,7 @@ impl LayoutConfig {
             reserve_bottom: 0,
             reserve_left: 0,
             reserve_right: 0,
+            effects: crate::config::effects::Effects::default(),
         }
     }
 

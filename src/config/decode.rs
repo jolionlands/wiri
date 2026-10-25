@@ -15,8 +15,12 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use super::effects::{EffectsPartial, PaintStyle, RingStyle, ShadowStyle};
 use super::kdl::{self, Node, Pos, Scalar, Value};
 use super::types::*;
+
+// The appearance blocks of `layout {}`: focus ring, border, shadow, insert hint, tab indicator.
+mod effects_decode;
 
 /// How many levels of `include` are followed.
 pub const MAX_INCLUDE_DEPTH: u8 = 8;
@@ -217,6 +221,24 @@ fn utf8(bytes: &[u8]) -> Result<String, String> {
 /// A key as it is matched: lower case, `_` and `-` interchangeable.
 fn norm(name: &str) -> String {
     name.replace('_', "-").to_ascii_lowercase()
+}
+
+/// The `border` block being built by a `layout {}` (started from its defaults when nothing
+/// named it yet).
+fn border_style(p: &mut LayoutConfigPartial) -> &mut RingStyle {
+    p.effects.border.get_or_insert_with(RingStyle::border_default)
+}
+
+/// The `focus-ring` block being built by a `layout {}`.
+fn focus_ring_style(p: &mut LayoutConfigPartial) -> &mut RingStyle {
+    p.effects
+        .focus_ring
+        .get_or_insert_with(RingStyle::focus_ring_default)
+}
+
+/// The `shadow` block being built by a `layout {}`.
+fn shadow_style(p: &mut LayoutConfigPartial) -> &mut ShadowStyle {
+    p.effects.shadow.get_or_insert_with(ShadowStyle::default)
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -447,23 +469,8 @@ fn normalize_color(text: &str) -> Option<String> {
     if t.is_empty() || t == "accent" || t == "windows-accent" {
         return Some(t.to_string());
     }
-    let hex = t.strip_prefix('#')?;
-    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    match hex.len() {
-        6 | 8 => Some(format!("#{}", hex.to_ascii_lowercase())),
-        3 | 4 => {
-            let mut out = String::from("#");
-            for c in hex.chars() {
-                let c = c.to_ascii_lowercase();
-                out.push(c);
-                out.push(c);
-            }
-            Some(out)
-        }
-        _ => None,
-    }
+    // `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, CSS names, `rgb()`, `rgba()`, `hsl()`, `hsla()`.
+    super::effects::parse_css_color(t).map(super::effects::color_text)
 }
 
 fn expand_user_path(raw: &str) -> String {
@@ -815,6 +822,8 @@ impl Decoder {
                 "layout" => {
                     self.section(node);
                     let mut partial = LayoutConfigPartial::default();
+                    // A second `layout {}` changes the keys it names and leaves the others.
+                    partial.effects = EffectsPartial::seeded_from(&cfg.layout.effects);
                     self.decode_layout_into(node, &mut partial);
                     cfg.layout = partial.apply_to(&cfg.layout);
                 }
@@ -1482,43 +1491,129 @@ impl Decoder {
                     // legacy `shadow true` (a flag) or a block
                     if child.children.is_none() && !child.args.is_empty() {
                         self.set_flag(child, &mut p.shadow_enable);
+                        if let Some(on) = p.shadow_enable {
+                            shadow_style(p).on = on;
+                        }
                     } else {
                         self.decode_shadow_block(child, p);
                     }
                 }
+                "insert-hint" => {
+                    let mut style = p.effects.insert_hint.take().unwrap_or_default();
+                    self.decode_insert_hint(child, &mut style);
+                    p.effects.insert_hint = Some(style);
+                }
+                "tab-indicator" => {
+                    let mut style = p.effects.tab_indicator.take().unwrap_or_default();
+                    self.decode_tab_indicator(child, &mut style);
+                    p.effects.tab_indicator = Some(style);
+                }
                 // wiri's flat keys
-                "border-width" | "width" => self.set_u32(child, 4096, &mut p.border_width),
+                "border-width" | "width" => {
+                    self.set_u32(child, 4096, &mut p.border_width);
+                    if let Some(w) = p.border_width {
+                        let b = border_style(p);
+                        b.width = w;
+                        b.off = w == 0;
+                    }
+                }
                 "border-color" | "color" | "border-color-inactive" => {
-                    self.set_color(child, &mut p.border_color)
+                    self.set_color(child, &mut p.border_color);
+                    if let Some(c) = p.border_color.clone() {
+                        border_style(p).inactive = PaintStyle::Color(c);
+                    }
                 }
                 "border-color-focused" | "color-focused" => {
-                    self.set_color(child, &mut p.border_color_focused)
+                    self.set_color(child, &mut p.border_color_focused);
+                    if let Some(c) = p.border_color_focused.clone() {
+                        border_style(p).active = PaintStyle::Color(c);
+                    }
                 }
                 "border-color-urgent" | "color-urgent" => {
-                    self.set_color(child, &mut p.border_color_urgent)
+                    self.set_color(child, &mut p.border_color_urgent);
+                    if let Some(c) = p.border_color_urgent.clone() {
+                        border_style(p).urgent = PaintStyle::Color(c);
+                    }
                 }
-                "border-radius" | "radius" => self.set_u32(child, 4096, &mut p.border_radius),
+                "border-radius" | "radius" => {
+                    self.set_u32(child, 4096, &mut p.border_radius);
+                    if let Some(r) = p.border_radius {
+                        p.effects.corner_radius = Some(r);
+                    }
+                }
                 "border-padding" | "padding" => self.set_u32(child, 4096, &mut p.border_padding),
-                "focus-ring-width" => self.set_u32(child, 4096, &mut p.focus_ring_width),
-                "focus-ring-color" => self.set_color(child, &mut p.focus_ring_color),
+                "focus-ring-width" => {
+                    self.set_u32(child, 4096, &mut p.focus_ring_width);
+                    if let Some(w) = p.focus_ring_width {
+                        let r = focus_ring_style(p);
+                        r.width = w;
+                        r.off = w == 0;
+                    }
+                }
+                "focus-ring-color" => {
+                    self.set_color(child, &mut p.focus_ring_color);
+                    if let Some(c) = p.focus_ring_color.clone() {
+                        focus_ring_style(p).active = PaintStyle::Color(c);
+                    }
+                }
                 "focus-ring-gap" | "gap" => self.set_u32(child, 4096, &mut p.focus_ring_gap),
                 "focus-ring-inactive-color" | "inactive-color" => {
-                    self.set_color(child, &mut p.focus_ring_inactive_color)
+                    self.set_color(child, &mut p.focus_ring_inactive_color);
+                    if let Some(c) = p.focus_ring_inactive_color.clone() {
+                        focus_ring_style(p).inactive = PaintStyle::Color(c);
+                    }
                 }
                 "dim-unfocused" => {
                     if let Some(v) = self.arg_number(child, 0.0, 1.0) {
                         p.dim_unfocused = Some((v as f32).clamp(0.1, 1.0));
                     }
                 }
-                "shadow-enable" | "shadows-enable" => self.set_flag(child, &mut p.shadow_enable),
-                "shadow-opacity" | "opacity" => {
-                    self.set_f64(child, 0.0, 1.0, &mut p.shadow_opacity)
+                "shadow-enable" | "shadows-enable" => {
+                    self.set_flag(child, &mut p.shadow_enable);
+                    if let Some(on) = p.shadow_enable {
+                        shadow_style(p).on = on;
+                    }
                 }
-                "shadow-offset-x" => self.set_i32(child, &mut p.shadow_offset_x),
-                "shadow-offset-y" => self.set_i32(child, &mut p.shadow_offset_y),
-                "shadow-blur" => self.set_u32(child, 4096, &mut p.shadow_blur),
-                "shadow-color" => self.set_color(child, &mut p.shadow_color),
-                "shadow-spread" | "spread" => self.set_u32(child, 4096, &mut p.shadow_spread),
+                "shadow-opacity" | "opacity" => {
+                    self.set_f64(child, 0.0, 1.0, &mut p.shadow_opacity);
+                    if let Some(o) = p.shadow_opacity {
+                        let st = shadow_style(p);
+                        if let Some(mut rgba) = super::effects::parse_css_color(&st.color) {
+                            rgba[3] = (o * 255.0).round() as u8;
+                            st.color = super::effects::color_text(rgba);
+                        }
+                    }
+                }
+                "shadow-offset-x" => {
+                    self.set_i32(child, &mut p.shadow_offset_x);
+                    if let Some(v) = p.shadow_offset_x {
+                        shadow_style(p).offset_x = v as f64;
+                    }
+                }
+                "shadow-offset-y" => {
+                    self.set_i32(child, &mut p.shadow_offset_y);
+                    if let Some(v) = p.shadow_offset_y {
+                        shadow_style(p).offset_y = v as f64;
+                    }
+                }
+                "shadow-blur" => {
+                    self.set_u32(child, 4096, &mut p.shadow_blur);
+                    if let Some(v) = p.shadow_blur {
+                        shadow_style(p).softness = v as f64;
+                    }
+                }
+                "shadow-color" => {
+                    self.set_color(child, &mut p.shadow_color);
+                    if let Some(c) = p.shadow_color.clone() {
+                        shadow_style(p).color = c;
+                    }
+                }
+                "shadow-spread" | "spread" => {
+                    self.set_u32(child, 4096, &mut p.shadow_spread);
+                    if let Some(v) = p.shadow_spread {
+                        shadow_style(p).spread = v as f64;
+                    }
+                }
                 "scroll-step" => self.set_u32(child, 100_000, &mut p.scroll_step),
                 "column-width" => self.set_u32(child, 100_000, &mut p.column_width),
                 "column-width-mode" => self.set_text(child, &mut p.column_width_mode),
@@ -1545,8 +1640,6 @@ impl Decoder {
                 | "preset-column-widths"
                 | "default-column-width"
                 | "preset-window-heights"
-                | "tab-indicator"
-                | "insert-hint"
                 | "background-color"
                 | "fullscreen-backdrop-color" => self.unsupported(child, "layout"),
                 _ => self.unknown(
@@ -1585,26 +1678,50 @@ impl Decoder {
 
     fn decode_border_block(&mut self, node: &Node, p: &mut LayoutConfigPartial) {
         self.section(node);
+        let mut style = p
+            .effects
+            .border
+            .take()
+            .unwrap_or_else(RingStyle::border_default);
         for c in node.kids() {
+            if self.ring_key(c, &mut style, true) {
+                // The older flat fields follow the block (the engine's DWM border colours and
+                // the per-output overrides read them).
+                match norm(&c.name).as_str() {
+                    "width" => p.border_width = Some(style.width),
+                    "off" | "on" => {
+                        if style.off {
+                            p.border_width = Some(0);
+                        }
+                    }
+                    "active-color" | "color-focused" => {
+                        if let PaintStyle::Color(v) = &style.active {
+                            p.border_color_focused = Some(v.clone());
+                        }
+                    }
+                    "inactive-color" | "color" => {
+                        if let PaintStyle::Color(v) = &style.inactive {
+                            p.border_color = Some(v.clone());
+                        }
+                    }
+                    "urgent-color" | "color-urgent" => {
+                        if let PaintStyle::Color(v) = &style.urgent {
+                            p.border_color_urgent = Some(v.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match norm(&c.name).as_str() {
-                "off" => {
-                    if self.flag(c) == Some(true) {
-                        p.border_width = Some(0);
+                "radius" => {
+                    self.set_u32(c, 4096, &mut p.border_radius);
+                    if let Some(r) = p.border_radius {
+                        p.effects.corner_radius = Some(r);
                     }
                 }
-                "on" => {
-                    self.flag(c);
-                }
-                "width" => self.set_u32(c, 4096, &mut p.border_width),
-                "color" | "inactive-color" => self.set_color(c, &mut p.border_color),
-                "color-focused" | "active-color" => self.set_color(c, &mut p.border_color_focused),
-                "color-urgent" | "urgent-color" => self.set_color(c, &mut p.border_color_urgent),
-                "radius" => self.set_u32(c, 4096, &mut p.border_radius),
                 "padding" => self.set_u32(c, 4096, &mut p.border_padding),
                 "smart" => self.set_flag(c, &mut p.smart_borders),
-                "active-gradient" | "inactive-gradient" | "urgent-gradient" => {
-                    self.unsupported(c, "gradients")
-                }
                 _ => self.unknown(
                     c,
                     "'border'",
@@ -1615,33 +1732,54 @@ impl Decoder {
                         "active-color",
                         "inactive-color",
                         "urgent-color",
+                        "active-gradient",
+                        "inactive-gradient",
+                        "urgent-gradient",
                         "radius",
                     ],
                 ),
             }
         }
+        p.effects.border = Some(style);
     }
 
     fn decode_focus_ring_block(&mut self, node: &Node, p: &mut LayoutConfigPartial) {
         self.section(node);
+        let mut style = p
+            .effects
+            .focus_ring
+            .take()
+            .unwrap_or_else(RingStyle::focus_ring_default);
         for c in node.kids() {
-            match norm(&c.name).as_str() {
-                "off" => {
-                    if self.flag(c) == Some(true) {
-                        p.focus_ring_width = Some(0);
+            if self.ring_key(c, &mut style, false) {
+                match norm(&c.name).as_str() {
+                    "width" => p.focus_ring_width = Some(style.width),
+                    "off" | "on" => {
+                        if style.off {
+                            p.focus_ring_width = Some(0);
+                        }
                     }
+                    "active-color" | "color" => {
+                        if let PaintStyle::Color(v) = &style.active {
+                            p.focus_ring_color = Some(v.clone());
+                        }
+                    }
+                    "inactive-color" => {
+                        if let PaintStyle::Color(v) = &style.inactive {
+                            p.focus_ring_inactive_color = Some(v.clone());
+                        }
+                    }
+                    "urgent-color" => {
+                        if let PaintStyle::Color(v) = &style.urgent {
+                            p.border_color_urgent = Some(v.clone());
+                        }
+                    }
+                    _ => {}
                 }
-                "on" => {
-                    self.flag(c);
-                }
-                "width" => self.set_u32(c, 4096, &mut p.focus_ring_width),
-                "color" | "active-color" => self.set_color(c, &mut p.focus_ring_color),
-                "inactive-color" => self.set_color(c, &mut p.focus_ring_inactive_color),
-                "urgent-color" => self.set_color(c, &mut p.border_color_urgent),
+                continue;
+            }
+            match norm(&c.name).as_str() {
                 "gap" => self.set_u32(c, 4096, &mut p.focus_ring_gap),
-                "active-gradient" | "inactive-gradient" | "urgent-gradient" => {
-                    self.unsupported(c, "gradients")
-                }
                 _ => self.unknown(
                     c,
                     "'focus-ring'",
@@ -1652,59 +1790,20 @@ impl Decoder {
                         "active-color",
                         "inactive-color",
                         "urgent-color",
-                        "gap",
+                        "active-gradient",
+                        "inactive-gradient",
+                        "urgent-gradient",
                     ],
                 ),
             }
         }
+        p.effects.focus_ring = Some(style);
     }
 
     fn decode_shadow_block(&mut self, node: &Node, p: &mut LayoutConfigPartial) {
-        self.section(node);
-        for c in node.kids() {
-            match norm(&c.name).as_str() {
-                "on" => {
-                    if let Some(v) = self.flag(c) {
-                        p.shadow_enable = Some(v);
-                    }
-                }
-                "off" => {
-                    if let Some(v) = self.flag(c) {
-                        p.shadow_enable = Some(!v);
-                    }
-                }
-                "enable" => self.set_flag(c, &mut p.shadow_enable),
-                "opacity" => self.set_f64(c, 0.0, 1.0, &mut p.shadow_opacity),
-                "offset-x" => self.set_i32(c, &mut p.shadow_offset_x),
-                "offset-y" => self.set_i32(c, &mut p.shadow_offset_y),
-                "offset" => {
-                    // niri: offset x=0 y=5
-                    self.no_args(c);
-                    self.no_children(c);
-                    for prop in &c.props {
-                        let n = self.value_number(c, &prop.value, -65535.0, 65535.0);
-                        match (prop.key.as_str(), n) {
-                            ("x", Some(v)) => p.shadow_offset_x = Some(v.round() as i32),
-                            ("y", Some(v)) => p.shadow_offset_y = Some(v.round() as i32),
-                            ("x", None) | ("y", None) => {}
-                            (other, _) => {
-                                let msg = format!("unexpected property '{}' on 'offset'", other);
-                                self.error(prop.key_pos, msg);
-                            }
-                        }
-                    }
-                }
-                "blur" | "softness" => self.set_u32(c, 4096, &mut p.shadow_blur),
-                "spread" => self.set_u32(c, 4096, &mut p.shadow_spread),
-                "color" => self.set_color(c, &mut p.shadow_color),
-                "inactive-color" | "draw-behind-window" => self.unsupported(c, "shadows"),
-                _ => self.unknown(
-                    c,
-                    "'shadow'",
-                    &["on", "off", "offset", "softness", "spread", "color", "blur"],
-                ),
-            }
-        }
+        let mut style = p.effects.shadow.take().unwrap_or_default();
+        self.decode_shadow_style(node, &mut style, p);
+        p.effects.shadow = Some(style);
     }
 
     // ---- animations ------------------------------------------------------------------

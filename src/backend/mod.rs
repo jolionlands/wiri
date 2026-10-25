@@ -6,6 +6,7 @@ pub mod hidden;
 pub mod hooks;
 pub mod hotkey_conflicts;
 pub mod message_loop;
+pub mod osversion;
 pub mod taskbar;
 
 use anyhow::{Context, Result};

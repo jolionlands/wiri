@@ -454,7 +454,7 @@ impl TilingEngine {
         let monitor = self.monitors.get(&output)?;
         let cfg = self.effective_config(output);
         let view = Self::view_width_for_monitor(monitor, cfg);
-        let border = 2 * cfg.border_width.max(1);
+        let border = 2 * cfg.border_inset();
         let px = match rules.default_column_width {
             Some(Some(spec)) => spec_px(spec, view, cfg.column_gap, border),
             // The empty block: the window picks its own width, that is the one it opened with.
@@ -473,7 +473,7 @@ impl TilingEngine {
         rules: &ResolvedWindowRules,
     ) -> Option<u32> {
         let cfg = self.effective_config(output);
-        let border = 2 * cfg.border_width.max(1);
+        let border = 2 * cfg.border_inset();
         let px = match rules.default_window_height {
             Some(Some(spec)) => spec_px(spec, self.view_height_for(output), cfg.window_gap, border),
             Some(None) => window.bounds.size.h as i32 + border,
