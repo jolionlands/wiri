@@ -113,6 +113,16 @@ The final unchanged H9 gate is **0 overlapping pairs**: visible x ranges are
 `[-88,378]`, `[402,868]`, `[892,1358]`, all 466px wide with **24px gaps**. Dynamic changes after a
 window has already answered, native minimum heights and maximum sizes remain outside this fix.
 
+## Small Phase 3 follow-through
+
+`hooks/startup.rs` always quotes the Run executable, even without spaces, preventing ambiguous
+command parsing. Four pure tests cover spaced/unspaced, Unicode and UNC paths; included in the
+918 passing unit tests. No actual Run registry value, logon, task or elevation was changed or
+tested live. `docs/ELEVATION.md` compares the normal-integrity default, an explicit same-user
+interactive highest-privileges scheduled task and signed uiAccess in a protected installation.
+It documents UIPI/secure-desktop limits and IPC/child-token risks; neither option is enabled.
+Per-user/session IPC names, elevation implementation and ARM64 release/live work remain.
+
 ## Live harness safety corrections
 
 The pre-existing harness killed every process named wiri and wrote the shared user's AppData.

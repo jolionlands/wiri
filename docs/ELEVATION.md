@@ -87,8 +87,10 @@ implemented or enabled here.
 
 The tests in `src/hooks/startup.rs` exercise only pure command-string construction
 for spaced, unspaced, Unicode and UNC executable paths. They do not open or write
-registry keys, create tasks, launch processes or test elevation. No build or test
-run was performed for this change; logon behaviour is not live-verified.
+registry keys, create tasks, launch processes or test elevation. All four formatting tests
+passed in the final Lane D release suite (918 unit tests total), with `RUSTFLAGS=-D warnings`
+for the required release check/test/build commands. Logon behaviour, a real Run-key write and
+elevated-window interaction are not live-verified.
 
 Before implementing elevation, use an isolated interactive test account to verify
 medium/high-integrity move, resize, focus, close and input behaviour; child token

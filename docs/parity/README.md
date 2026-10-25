@@ -64,7 +64,9 @@ on this laptop. Screenshot selection UI/action flags and output limitations rema
 the matrices/report. Other Phase 2 lanes are separate work.
 
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
-quoted autostart path, ARM64 release builds, docs and a demo.
+ARM64 release builds, docs and a demo. Lane D fixed always-quoted Run autostart command
+construction (four pure tests; no real registry/logon test) and documented elevation choices
+in [ELEVATION.md](../ELEVATION.md); it does not enable elevation.
 
 **Phase 4, super lightweight and fast (owner, 2026-10-24: "full parity and functionality,
 super lightweight performant after core functionality is done"):** once the core works,

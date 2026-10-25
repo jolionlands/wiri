@@ -50,6 +50,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   title becomes ready, still outside the engine lock and within the existing three-query cap.
   Native visible minima include wiri's border in tile units, just like rule minima. Two pure
   regressions and the unchanged live H9 gate verify three 466px terminals with no overlap.
+- **Safer autostart command and elevation guidance.** Run startup always quotes the executable,
+  including paths without spaces; four pure regressions cover spaced, unspaced, Unicode and UNC
+  paths without writing the registry. `docs/ELEVATION.md` compares normal integrity, an opt-in
+  interactive elevated task and signed uiAccess; no elevation mechanism is enabled.
 - **Shared-desktop live safety.** The harness refuses foreign daemons instead of killing them,
   isolates AppData/temp inside the worktree, and retains interrupted-run recovery state. The
   recovery metric checks this run's forms, not unrelated windows legitimately hidden again.
