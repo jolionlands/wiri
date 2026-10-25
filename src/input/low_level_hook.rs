@@ -15,8 +15,8 @@ use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_USER,
+    TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED,
+    MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_USER,
 };
 
 use crate::backend::BackendHandle;
@@ -114,6 +114,24 @@ static KB_HOOK_HANDLE: LazyLock<Mutex<Option<HookThread>>> = LazyLock::new(|| Mu
 static DOUBLE_ALT: Mutex<super::double_alt::DoubleAlt> =
     Mutex::new(super::double_alt::DoubleAlt::new());
 
+/// Register a pick while both hook slots are held so shutdown cannot race the
+/// availability check. The closure only installs the pick's small input state.
+pub(crate) fn with_pick_hooks<T>(
+    register: impl FnOnce(Arc<parking_lot::RwLock<TilingEngine>>) -> T,
+) -> Result<T, String> {
+    let mouse = HOOK_HANDLE.lock();
+    let keyboard = KB_HOOK_HANDLE.lock();
+    if mouse.is_none() || keyboard.is_none() {
+        return Err("picking requires the mouse and keyboard input hooks".into());
+    }
+    let engine = HOOK_STATE
+        .lock()
+        .engine
+        .clone()
+        .ok_or_else(|| "pick input engine is unavailable".to_string())?;
+    Ok(register(engine))
+}
+
 fn run_hook_message_loop(name: &str) {
     let mut msg = MSG::default();
     loop {
@@ -135,6 +153,7 @@ fn take_hook_for_thread(
 ) -> Option<HookThread> {
     let mut guard = hook_slot.lock();
     if guard.as_ref().map(|h| h.thread_id) == Some(thread_id) {
+        crate::ipc::pick::hooks_unavailable();
         guard.take()
     } else {
         None
@@ -208,6 +227,7 @@ pub fn start_mouse_hook(
 /// Stop the low-level mouse hook
 pub fn stop_mouse_hook() {
     if let Some(hook_thread) = HOOK_HANDLE.lock().take() {
+        crate::ipc::pick::hooks_unavailable();
         unsafe {
             let _ = UnhookWindowsHookEx(hook_thread.hook.0);
             let _ = PostThreadMessageW(
@@ -250,6 +270,7 @@ pub fn start_keyboard_hook() -> Result<(), String> {
 
 pub fn stop_keyboard_hook() {
     if let Some(h) = KB_HOOK_HANDLE.lock().take() {
+        crate::ipc::pick::hooks_unavailable();
         unsafe {
             let _ = UnhookWindowsHookEx(h.hook.0);
         }
@@ -304,6 +325,9 @@ unsafe extern "system" fn keyboard_hook_callback(
         let slot = (vk & 255) as usize;
         let old = KEY_IS_DOWN[slot].swap(pressed, Ordering::Relaxed);
         KEY_PRESS_WAS_REPEAT[slot].store(pressed && old, Ordering::Relaxed);
+    }
+    if crate::ipc::pick::keyboard_event(vk, pressed, kb.flags.0 & LLKHF_INJECTED.0 != 0) {
+        return LRESULT(1);
     }
     let now = Instant::now();
     if crate::overlay::bindings_cheatsheet::dismiss_on_key(vk, pressed) {
@@ -467,6 +491,9 @@ unsafe extern "system" fn mouse_hook_callback(
         }
     }
     let cursor = Point::new(event.pt.x, event.pt.y);
+    if crate::ipc::pick::mouse_event(msg, cursor, event.flags & LLMHF_INJECTED != 0) {
+        return LRESULT(1);
+    }
     if msg == WM_MOUSEMOVE {
         crate::input::focus::on_mouse_move(cursor);
     }
