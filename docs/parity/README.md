@@ -53,8 +53,12 @@ and `--id`).
 
 **Phase 2, niri feel (P1), still to do:** a low-level keyboard bind engine (Win-key chords, repeat); mouse and
 wheel binds; one overlay layer for focus ring, border, shadow, tab indicator and insert hint; the spring animation
-pipeline; tabs; an overview that zooms out the workspaces and a recent-windows switcher; hotkey overlay; PNG and
-clipboard screenshots.
+pipeline; tabs; an overview that zooms out the workspaces and a recent-windows switcher; hotkey overlay; interactive screenshot selection and pointer/action flags.
+
+**Phase 2C, Lane D ([report](phase2c-lane-d-report.md)):** focused-output and focused-window PNG
+screenshots, the clipboard, `screenshot-path` and capture events/notifications are implemented.
+H26-H28 verify both hotkeys, saved PNG content, clipboard and null-on-reload live; screenshot
+selection UI and action flags are not claimed as complete. Other Phase 2 lanes are separate work.
 
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
 quoted autostart path, ARM64 release builds, docs and a demo.

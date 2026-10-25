@@ -60,6 +60,7 @@ struct Mirror {
 impl IpcServer {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(64);
+        crate::screenshot::set_event_sender(event_tx.clone());
         Self {
             event_tx,
             engine: None,
@@ -1573,23 +1574,11 @@ impl IpcServer {
                         fg.0 as isize
                     }
                 };
-                // Resolve output path.
-                let dest = match path.as_ref().map(std::path::PathBuf::from) {
-                    Some(p) => p,
-                    None => match crate::hooks::spawner::default_window_capture_path(target_hwnd) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return serde_json::json!({
-                                "success": false,
-                                "error": format!("could not resolve default path: {}", e),
-                            })
-                        }
-                    },
-                };
-                match crate::hooks::spawner::capture_window_to_file(target_hwnd, &dest) {
-                    Ok(()) => serde_json::json!({
+                // Lane D: the same PNG/clipboard/template pipeline as screenshot-window.
+                match crate::screenshot::capture(Some(target_hwnd), path.as_deref().map(std::path::Path::new)) {
+                    Ok(saved) => serde_json::json!({
                         "success": true,
-                        "result": { "path": dest.to_string_lossy() },
+                        "result": { "path": saved },
                     }),
                     Err(e) => serde_json::json!({
                         "success": false,
@@ -1733,23 +1722,11 @@ impl IpcServer {
                         "error": format!("window {} is not tracked by wiri", window_hwnd),
                     });
                 }
-                // Resolve output path.
-                let dest = match path.as_ref().map(std::path::PathBuf::from) {
-                    Some(p) => p,
-                    None => match crate::hooks::spawner::default_window_capture_path(window_hwnd) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return serde_json::json!({
-                                "success": false,
-                                "error": format!("could not resolve default path: {}", e),
-                            })
-                        }
-                    },
-                };
-                match crate::hooks::spawner::capture_window_to_file(window_hwnd, &dest) {
-                    Ok(()) => serde_json::json!({
+                // Lane D: the same PNG/clipboard/template pipeline as screenshot-window.
+                match crate::screenshot::capture(Some(window_hwnd), path.as_deref().map(std::path::Path::new)) {
+                    Ok(saved) => serde_json::json!({
                         "success": true,
-                        "result": { "path": dest.to_string_lossy() },
+                        "result": { "path": saved },
                     }),
                     Err(e) => serde_json::json!({
                         "success": false,

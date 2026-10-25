@@ -363,6 +363,8 @@ async fn main() -> Result<()> {
 
     {
         let mut engine = engine.write();
+        // Lane D: screenshot settings are shared by hotkeys, tray and IPC captures.
+        wiri::screenshot::configure(&config);
         // Apply window rules from config
         engine.set_full_config(config.clone());
         engine.set_hide_method(hide_method);
@@ -1072,6 +1074,7 @@ fn apply_loaded_config(
     message_loop: &MessageLoop,
     mouse_tracker: &Arc<RwLock<MouseTracker>>,
 ) {
+    wiri::screenshot::configure(&new_config);
     let new_layout_config = LayoutConfig::from_config(&new_config);
     let mouse_config = MouseFocusConfig {
         focus_follows_mouse: new_config.input.focus_follows_mouse,

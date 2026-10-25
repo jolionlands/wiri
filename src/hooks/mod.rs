@@ -85,9 +85,6 @@ impl SystemIntegration {
                     match self::capture_screenshot_to_pictures() {
                         Ok(path) => {
                             tracing::info!("Tray: screenshot saved to {}", path);
-                            let _ = self
-                                .tray
-                                .show_balloon("wiri — screenshot", &format!("Saved to {}", path));
                         }
                         Err(e) => {
                             tracing::warn!("Tray: screenshot failed: {}", e);
@@ -116,10 +113,6 @@ impl SystemIntegration {
                     match capture_focused_window_to_pictures(hwnd_isize) {
                         Ok(path) => {
                             tracing::info!("Tray: window capture saved to {}", path);
-                            let _ = self.tray.show_balloon(
-                                "wiri — window capture",
-                                &format!("Saved to {}", path),
-                            );
                         }
                         Err(e) => {
                             tracing::warn!("Tray: window capture failed: {}", e);
@@ -157,46 +150,12 @@ impl SystemIntegration {
     }
 }
 
-/// Item 3: capture the full virtual desktop to a BMP file under
-/// `%USERPROFILE%\Pictures\wiri-<timestamp>.bmp`.  Falls back to the current
-/// working directory if Pictures is missing / not creatable.
-///
-/// Returns the full path (as a String) on success, or a propagated error.
-/// Shared between the `screenshot` hotkey action and the tray menu entry so
-/// both paths obey the same destination-resolution policy.
+/// Shared PNG/clipboard pipeline for the hotkey and tray paths.
+/// An empty result means screenshot-path null (clipboard only).
 pub fn capture_screenshot_to_pictures() -> anyhow::Result<String> {
-    use std::path::PathBuf;
-    use std::time::SystemTime;
-
-    let stamp = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let filename = format!("wiri-{}.bmp", stamp);
-
-    let dest = std::env::var("USERPROFILE")
-        .ok()
-        .map(|home| PathBuf::from(home).join("Pictures"))
-        .and_then(|dir| {
-            std::fs::create_dir_all(&dir)
-                .ok()
-                .map(|_| dir.join(&filename))
-        })
-        .or_else(|| std::env::current_dir().ok().map(|d| d.join(&filename)))
-        .ok_or_else(|| {
-            anyhow::anyhow!("no writable destination dir (Pictures and cwd both unavailable)")
-        })?;
-
-    Spawner::capture_screenshot_to_file(None, &dest)?;
-    Ok(dest.to_string_lossy().into_owned())
+    Ok(crate::screenshot::capture(None, None)?.unwrap_or_default())
 }
 
-/// Capture a single window by HWND to a BMP file under the same
-/// destination policy as `capture_screenshot_to_pictures` — Pictures
-/// folder when writable, otherwise the current working directory.
-/// Returns the full destination path (as a String) on success.
 pub fn capture_focused_window_to_pictures(hwnd: isize) -> anyhow::Result<String> {
-    let dest = spawner::default_window_capture_path(hwnd)?;
-    spawner::capture_window_to_file(hwnd, &dest)?;
-    Ok(dest.to_string_lossy().into_owned())
+    Ok(crate::screenshot::capture(Some(hwnd), None)?.unwrap_or_default())
 }

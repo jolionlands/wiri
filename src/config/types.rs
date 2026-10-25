@@ -7,6 +7,8 @@ pub struct Config {
     pub window_rules: Vec<WindowRule>,
     pub binds: BindsConfig,
     pub animations: AnimationsConfig,
+    /// niri screenshot-path: Pictures default, a strftime template, or null (clipboard only).
+    pub screenshot_path: crate::screenshot::path::ScreenshotPath,
     /// Programs to spawn at startup. Each entry is [program, arg1, arg2, …].
     /// Populated from `spawn-at-startup "prog" "arg"` top-level KDL lines.
     pub spawn_at_startup: Vec<Vec<String>>,
@@ -38,6 +40,7 @@ impl Default for Config {
             window_rules: Vec::new(),
             binds: BindsConfig::default(),
             animations: AnimationsConfig::default_config(),
+            screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
             spawn_sh_at_startup: Vec::new(),
         }

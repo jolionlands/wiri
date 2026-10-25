@@ -263,28 +263,30 @@ Move a specific window (by HWND) to a workspace.
 
 #### `screenshot_window`
 
-Capture a window to a BMP file.
+Capture a window to PNG and the clipboard. One-shot Windows.Graphics.Capture is tried first,
+with `PrintWindow(PW_RENDERFULLCONTENT)` fallback. A forced fallback and protected/GPU-specific
+surfaces have not been live-verified.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `hwnd` | `integer \| null` | no | HWND to capture; null = focused window |
-| `path` | `string \| null` | no | Output path; null = Pictures folder default |
+| `path` | `string \| null` | no | Output PNG path; null = `screenshot-path` setting |
 
-Response `result.path`: resolved file path.
+Response `result.path`: resolved file path, or null for clipboard-only (`screenshot-path null`).
 
 ---
 
 #### `capture_window`
 
-Capture a wiri-tracked window using `PrintWindow(PW_RENDERFULLCONTENT)`.
+Capture a wiri-tracked window with the same PNG/clipboard pipeline as `screenshot_window`.
 Only works for windows tracked by the engine (unlike `screenshot_window`).
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `window_hwnd` | `integer` | yes | Must be tracked by wiri |
-| `path` | `string \| null` | no | Output BMP path |
+| `path` | `string \| null` | no | Output PNG path; null = `screenshot-path` setting |
 
-Response `result.path`: resolved file path.
+Response `result.path`: resolved file path, or null for clipboard-only (`screenshot-path null`).
 
 ---
 
@@ -719,8 +721,14 @@ what wiri adds:
 | `is_focused` | `bool` | The active workspace of the focused monitor |
 | `active_window_id` | `u64` or `null` | The window that is the active one of the workspace |
 
+**Screenshot completion (Phase 2C Lane D):** after a successful clipboard transfer,
+`{"type":"screenshot_captured","data":{"path":"C:\\Shots\\image.png"}}` reports the saved PNG,
+or `path: null` for clipboard-only or a disk-save failure. It is a change event, not replayed
+initial state, and can be selected with `events --stream --filter screenshot_captured`.
+Hotkeys, tray and both window-capture requests share the event path.
+
 Differences from niri: the envelope (`{"type","data"}`, not niri's externally tagged enum), the extra
-fields marked wiri above, no `WindowFocusTimestampChanged`, keyboard layout, screenshot, cast and touchpad
+fields marked wiri above, no `WindowFocusTimestampChanged`, keyboard layout, cast and touchpad
 events (they have no Windows counterpart yet), and ids that are window handles.  The events of wiri's own
 that predate this contract (`window_opened`, `window_focused`, `workspace_switched`, `column_focused`,
 `window_moved`, ...) are kept as they were.

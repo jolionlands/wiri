@@ -14,7 +14,7 @@ use windows::core::{factory, IInspectable, Interface};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
-    GraphicsCaptureSession,
+    GraphicsCaptureSession, IDirect3D11CaptureFramePoolStatics2, IGraphicsCaptureSessionStatics,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -101,9 +101,17 @@ impl Drop for UnmapScope<'_> {
 pub fn capture(hwnd: HWND) -> Result<Image> {
     let started = Instant::now();
     ensure!(!hwnd.is_invalid(), "cannot capture an invalid window");
+    tracing::debug!("WGC: initializing request-local WinRT factories");
     let _winrt = WinRtScope::new()?;
-    ensure!(GraphicsCaptureSession::IsSupported().context("checking WGC support")?,
-        "Windows.Graphics.Capture is unsupported");
+    // Generated static helpers cache agile factories for the process lifetime. That
+    // outlives our request-local COM/WinRT apartment and can leave a stale factory on
+    // the next capture. Use uncached factories and release them before RoUninitialize.
+    let session_factory = factory::<GraphicsCaptureSession, IGraphicsCaptureSessionStatics>()
+        .context("getting capture session statics")?;
+    let mut supported = false;
+    unsafe { (session_factory.vtable().IsSupported)(session_factory.as_raw(), &mut supported) }
+        .ok().context("checking WGC support")?;
+    ensure!(supported, "Windows.Graphics.Capture is unsupported");
 
     let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
         .context("getting GraphicsCaptureItem interop")?;
@@ -117,9 +125,16 @@ pub fn capture(hwnd: HWND) -> Result<Image> {
     let direct3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
         .context("wrapping D3D11 device for WinRT")?
         .cast().context("getting WinRT Direct3D device")?;
-    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &direct3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, size,
-    ).context("creating free-threaded capture frame pool")?;
+    let pool_factory = factory::<Direct3D11CaptureFramePool, IDirect3D11CaptureFramePoolStatics2>()
+        .context("getting capture frame pool statics")?;
+    let mut raw_pool = std::ptr::null_mut();
+    unsafe {
+        (pool_factory.vtable().CreateFreeThreaded)(pool_factory.as_raw(), direct3d.as_raw(),
+            DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, size, &mut raw_pool)
+    }.ok().context("creating free-threaded capture frame pool")?;
+    ensure!(!raw_pool.is_null(), "WGC returned a null capture pool");
+    // Successful ABI result transfers one reference; scope closes/releases it below.
+    let pool = unsafe { Direct3D11CaptureFramePool::from_raw(raw_pool) };
     let mut scope = CaptureScope { pool, session: None, handler: None };
     scope.session = Some(scope.pool.CreateCaptureSession(&item)
         .context("creating capture session")?);

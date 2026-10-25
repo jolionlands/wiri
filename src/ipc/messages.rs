@@ -311,11 +311,9 @@ pub enum IpcMessage {
     #[serde(rename = "quit")]
     Quit,
 
-    /// Capture a single window's bounding rect to a BMP file using
-    /// `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`.  When `path` is
-    /// `None`, the server picks a default under
-    /// `%USERPROFILE%\Pictures\wiri-window-<hwnd>-<unix>.bmp`.  Server
-    /// response includes the resolved path under `result.path`.
+    /// Capture a tracked window to PNG and the clipboard (WGC, PrintWindow fallback).
+    /// When `path` is `None`, screenshot-path decides the destination, including
+    /// clipboard-only. Response result.path is the resolved path or null.
     #[serde(rename = "capture_window")]
     CaptureWindow {
         window_hwnd: isize,
@@ -383,7 +381,7 @@ pub enum IpcMessage {
 
     /// Screenshot a window (by optional HWND) to an optional output path.
     /// When `hwnd` is `None`, the focused window is captured.
-    /// When `path` is `None`, the file lands in the Pictures default folder.
+    /// When `path` is `None`, screenshot-path applies (Pictures default or clipboard-only).
     #[serde(rename = "screenshot_window")]
     ScreenshotWindow {
         #[serde(default)]
@@ -519,6 +517,10 @@ pub enum IpcEvent {
     /// niri `OverviewOpenedOrClosed`.
     #[serde(rename = "overview_opened_or_closed")]
     OverviewOpenedOrClosed { is_open: bool },
+
+    /// niri ScreenshotCaptured: path is null when the image was only copied to the clipboard.
+    #[serde(rename = "screenshot_captured")]
+    ScreenshotCaptured { path: Option<String> },
 
     // ---- wiri's own events (kept from before the niri ones; they carry the window handle) ----
     /// Fired when a new window is added to the tiling engine layout.

@@ -67,8 +67,21 @@ try { $ownsLiveLock = $liveLock.WaitOne([TimeSpan]::FromMinutes([Math]::Max(0, $
 catch [System.Threading.AbandonedMutexException] { $ownsLiveLock = $true }
 if (-not $ownsLiveLock) { throw 'Another wiri live test is running on this machine; this run refuses to start (two runs would spoil each other).' }
 $D = [System.IO.Path]::GetFullPath($Out)
+if (Get-Process wiri -ErrorAction SilentlyContinue) { throw 'A wiri process not started by this run exists. Leave it alone; the operator must stop it before live testing.' }
+# An interrupted run may have hidden real desktop windows. Preserve its recovery journal
+# while replacing evidence, so the first daemon restores them before enumerating windows.
+$previousRecoveryPath = Join-Path $D 'AppData\Local\wiri\hidden.json'
+$previousRecovery = $null
+if (Test-Path $previousRecoveryPath) { $previousRecovery = [IO.File]::ReadAllBytes($previousRecoveryPath) }
 if (Test-Path $D) { Remove-Item -Recurse -Force $D }
 New-Item -ItemType Directory -Force $D | Out-Null
+# Safety: every instance and its children write config/state only in this worktree's evidence.
+# Do not reset the real user's config or recovery journal on a shared developer desktop.
+$env:APPDATA = Join-Path $D 'AppData\Roaming'
+$env:LOCALAPPDATA = Join-Path $D 'AppData\Local'
+$env:TEMP = Join-Path $D 'Temp'
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Force $env:APPDATA, $env:LOCALAPPDATA, $env:TEMP | Out-Null
 $wiri = Join-Path $Bin 'wiri.exe'
 $ctl = Join-Path $Bin 'wiri-ctl.exe'
 $steps = New-Object System.Collections.Generic.List[object]
@@ -464,11 +477,15 @@ function Start-Wiri([string]$stderrLog, [string]$stdoutLog) {
 }
 
 # ---- clean slate -----------------------------------------------------------------------------
-Get-Process wiri -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+if (Get-Process wiri -ErrorAction SilentlyContinue) { throw 'A wiri process not started by this run exists. Leave it alone; the operator must stop it before live testing.' }
 $cfg = Join-Path $env:APPDATA 'wiri\config.kdl'
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.before') -Force; Remove-Item $cfg -Force }   # test the generated default config
 $wiriData = Join-Path $env:LOCALAPPDATA 'wiri'
-foreach ($f in 'wiri.log', 'wiri.log.1', 'hidden.json') { Remove-Item (Join-Path $wiriData $f) -Force -ErrorAction SilentlyContinue }
+foreach ($f in 'wiri.log', 'wiri.log.1') { Remove-Item (Join-Path $wiriData $f) -Force -ErrorAction SilentlyContinue }
+if ($null -ne $previousRecovery) {
+    New-Item -ItemType Directory -Force $wiriData | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $wiriData 'hidden.json'), [byte[]]$previousRecovery)
+}
 Shot '00-before'
 
 # Is wiri.exe a GUI-subsystem program (no console window of its own)?  PE optional header Subsystem: 2 = GUI, 3 = console.
@@ -573,11 +590,16 @@ $w2 = Start-Wiri $log2 (Join-Path $D 'wiri.stdout2.log')
 Start-Sleep -Seconds 5
 FormInfo $forms | ConvertTo-Json | Set-Content (Join-Path $D '09-forms-restarted.json')
 $visibleAfterRestart = VisibleCount $forms
-# The record also keeps where every window was before wiri moved it, so the file stays: what must be gone is
-# the list of hidden windows.
+# The new instance may legitimately hide other desktop windows outside the visible strip.
+# Check that recovery replaced the old journal and none of OUR restored forms remain hidden.
 $hiddenJsonAfterRestart = $false
 if (Test-Path $hiddenJson) {
-    try { $hiddenJsonAfterRestart = (@(((Get-Content $hiddenJson -Raw) | ConvertFrom-Json).windows).Count -gt 0) } catch { $hiddenJsonAfterRestart = $true }
+    Copy-Item $hiddenJson (Join-Path $D '09-hidden.json') -Force
+    try {
+        $restartedJournal = Get-Content $hiddenJson -Raw | ConvertFrom-Json
+        $formIds = @($forms | ForEach-Object { $_.ToInt64() })
+        $hiddenJsonAfterRestart = ($restartedJournal.wiri_pid -ne $w2.Id -or @($restartedJournal.windows | Where-Object { $formIds -contains $_.hwnd }).Count -gt 0)
+    } catch { $hiddenJsonAfterRestart = $true }
 }
 Shot '09-crash-restored'
 Ctl '09-windows-restarted' @('windows') | Out-Null
@@ -2833,6 +2855,7 @@ $summary = [ordered]@{
     h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
     steps = $steps
 }
+. (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

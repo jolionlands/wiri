@@ -6,6 +6,7 @@ pub mod ipc;
 pub mod layout;
 pub mod logging;
 pub mod overlay;
+pub mod screenshot;
 pub mod utils;
 pub mod window;
 

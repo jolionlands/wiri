@@ -268,7 +268,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "clipboard" => Some("Windows has no primary selection"),
         "hotkey-overlay" => Some("the key-bindings overlay has no options yet"),
         "config-notification" => Some("wiri always shows a balloon for a config error"),
-        "screenshot-path" => Some("screenshots go to the Pictures folder for now"),
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
         "gestures" => Some("not implemented yet"),
@@ -826,6 +825,17 @@ impl Decoder {
                 "spawn-sh-at-startup" => {
                     if let Some(cmd) = self.arg_text(node) {
                         cfg.spawn_sh_at_startup.push(cmd);
+                    }
+                }
+                "screenshot-path" => {
+                    if let Some(value) = self.one_arg(node) {
+                        use crate::screenshot::path::ScreenshotPath;
+                        if matches!(value.scalar, Scalar::Null) {
+                            cfg.screenshot_path = ScreenshotPath::ClipboardOnly;
+                        } else if let Some(text) = self.value_text(node, value) {
+                            if text.is_empty() { self.error(value.pos, "screenshot-path must not be empty"); }
+                            else { cfg.screenshot_path = ScreenshotPath::Template(text); }
+                        }
                     }
                 }
                 "include" => self.decode_include(node, cfg),
@@ -2492,6 +2502,17 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_path_is_a_template_or_null() {
+        use crate::screenshot::path::ScreenshotPath;
+        assert_eq!(clean("").screenshot_path, ScreenshotPath::Pictures);
+        assert_eq!(clean("screenshot-path null").screenshot_path, ScreenshotPath::ClipboardOnly);
+        assert_eq!(clean("screenshot-path \"~/Shots/%Y-%m-%d.png\"").screenshot_path,
+            ScreenshotPath::Template("~/Shots/%Y-%m-%d.png".into()));
+        assert!(load("screenshot-path \"\"").has_errors());
+        assert!(load("screenshot-path true").has_errors());
+    }
+
+    #[test]
     fn syntax_errors_carry_line_and_column() {
         let d = load("input {\n    repeat-delay 250\n    layout \"us\n}\n");
         assert!(d.has_errors());
@@ -2734,7 +2755,7 @@ mod tests {
     fn niri_only_sections_are_warnings() {
         let d = load("prefer-no-csd\nhotkey-overlay { skip-at-startup }\nscreenshot-path \"~/Pictures/x.png\"\ncursor { xcursor-size 24 }\nlayer-rule { match namespace=\"x\" }\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(warnings(&d).len(), 5);
+        assert_eq!(warnings(&d).len(), 4); // screenshot-path is implemented on Windows.
     }
 
     #[test]

@@ -794,7 +794,7 @@
         },
 
         {
-          "description": "Capture a wiri-tracked window to a BMP file using PrintWindow(PW_RENDERFULLCONTENT).",
+          "description": "Capture a wiri-tracked window to PNG and the clipboard using WGC with PrintWindow fallback.",
           "type": "object",
           "required": ["type", "data"],
           "properties": {
@@ -804,7 +804,7 @@
               "required": ["window_hwnd"],
               "properties": {
                 "window_hwnd": { "type": "integer", "description": "Must be tracked by wiri." },
-                "path": { "type": ["string", "null"], "description": "Output BMP path; null = Pictures folder default." }
+                "path": { "type": ["string", "null"], "description": "Output PNG path; null = screenshot-path setting (Pictures default or clipboard-only)." }
               }
             }
           }
@@ -933,7 +933,7 @@
         },
 
         {
-          "description": "Capture a window (or the focused window) to a BMP file. Less restricted than capture_window.",
+          "description": "Capture a window (or the focused window) to PNG and the clipboard, using WGC with PrintWindow fallback. Less restricted than capture_window.",
           "type": "object",
           "required": ["type"],
           "properties": {
@@ -1010,6 +1010,20 @@
     "IpcEvent": {
       "description": "Any event emitted by the wiri daemon to active subscribe_events subscribers. A new subscriber is first told the state: workspaces_changed, windows_changed, overview_opened_or_closed and config_loaded, in that order (niri's event stream), then what changes.",
       "oneOf": [
+
+        {
+          "description": "A screenshot was copied to the clipboard; path is null for clipboard-only or when saving failed.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "screenshot_captured" },
+            "data": {
+              "type": "object",
+              "required": ["path"],
+              "properties": { "path": { "type": ["string", "null"] } }
+            }
+          }
+        },
 
         {
           "description": "niri WorkspacesChanged: the workspaces were created, removed, renamed, moved or reordered. The full list replaces what the client knew.",

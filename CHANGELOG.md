@@ -31,6 +31,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Each of them prints a readable table (or a line), and `--json` prints the raw reply.
   `wiri-ctl windows` now answers with niri's shape; the older list (the class, the
   geometry, the place in the strip) is `wiri-ctl window-list` now.
+### Phase 2C — Lane D screenshots and outputs (2026-10-25)
+- **Focused-output and focused-window PNG screenshots.** Hotkeys, tray and window-capture IPC share
+  one on-demand WIC PNG / clipboard pipeline. Windows.Graphics.Capture is tried first for windows,
+  with PrintWindow fallback; captures use request-local WinRT factories so a second capture stays
+  safe after COM teardown. `screenshot-path` accepts a strftime template, leading `~`, or `null`
+  (clipboard only); the default is the redirected Pictures\\Screenshots folder. Saved/copied tray
+  balloons and `screenshot_captured { path }` events cover both actions. Live H26-H28 verify PNGs,
+  content, clipboard, reload and null events. Interactive selection and per-action pointer/disk flags
+  remain outstanding; see `docs/parity/phase2c-lane-d-report.md`.
+- **Shared-desktop live safety.** The harness refuses foreign daemons instead of killing them,
+  isolates AppData/temp inside the worktree, and retains interrupted-run recovery state. The
+  recovery metric checks this run's forms, not unrelated windows legitimately hidden again.
 
 ### Phase 2A — a real config parser, window rules, fullscreen, IPC (2026-10-25)
 - **A real KDL config parser with visible errors.**  The line scanner is gone.  `src/config/kdl.rs` reads
