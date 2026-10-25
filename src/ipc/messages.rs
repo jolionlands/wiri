@@ -455,6 +455,10 @@ pub enum IpcMessage {
     #[serde(rename = "overview_state", alias = "OverviewState")]
     OverviewState,
 
+    /// Deliberately return an error, for client error-path checks.
+    #[serde(rename = "return_error", alias = "ReturnError")]
+    ReturnError,
+
     /// The version of the running daemon.
     #[serde(rename = "version", alias = "Version")]
     Version,

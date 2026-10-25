@@ -1,6 +1,6 @@
 # wiri IPC Protocol — Integration Reference
 
-**Schema version: 1.2**  
+**Schema version: 1.3**  
 Last updated: 2026-10-25
 
 This document is the canonical reference for third-party integrations with wiri.
@@ -44,26 +44,22 @@ create its pipe, and its clients would have talked to the first user's daemon.
 That is what the tests use, and what a client that was told where the daemon
 listens uses.
 
-The protocol is simple:
+The protocol accepts **one UTF-8 JSON value per line**, with one compact JSON reply
+per line. Keep the connection open to send more requests, including after an error.
+A connection switched to `EventStream` / `subscribe_events` is dedicated to events.
 
-1. Open the pipe with read+write access.
-2. Write a single UTF-8 JSON object (the request) — no length prefix, no framing.
-3. Read the response: either a single JSON object (for one-shot requests) or a
-   stream of newline-delimited JSON objects (for `subscribe_events`).
-4. Close the pipe when done.
+For existing clients, a complete first JSON value **without a newline** is still a
+one-shot request: the daemon replies and closes, so old `read_to_end` clients work.
+Write the newline together with the JSON value when using the persistent protocol;
+without a delimiter a complete first value is indistinguishable from a legacy request.
+Partial JSON and multiple lines in one write are supported. Each request line is
+limited to 64 KiB; an oversized line is drained and answered with an error, after
+which the next line is usable. Unknown variants and invalid fields return an error;
+unknown future fields are ignored. No idle read timer is used.
 
-For one-shot requests the server closes its end of the pipe after sending the
-response, so a `read_to_end` / `ReadFile` loop will see EOF naturally.
-
-For `subscribe_events` the server keeps the pipe open and writes one event JSON
-object per line until the client disconnects or the daemon exits.
-
-### Wire summary
-
-| Mode               | Client writes | Server writes            | Pipe lifetime        |
-|--------------------|--------------|--------------------------|----------------------|
-| One-shot request   | 1 JSON object | 1 JSON object then EOF   | Single round-trip    |
-| `subscribe_events` | 1 JSON object | Ack + N newline-delimited JSON events | Until client disconnects |
+`WIRI_PIPE` is exported to spawned children. The event stream acknowledges the
+subscription, replays current state, then sends changes until disconnected. A silent
+disconnect releases the subscription immediately.
 
 ---
 
@@ -90,12 +86,12 @@ pipe security (inherited from the process token), logging a warning.
 ### 3.1 Encoding
 
 - UTF-8, no BOM.
-- No length prefix. The server reads until it can parse a complete JSON object.
-- Maximum incoming message size: 64 KiB (server-side read buffer).
+- No length prefix; newline-delimited UTF-8 values (CRLF is accepted).
+- Maximum incoming request line: 64 KiB. Legacy undelimited first values still work.
 
 ### 3.2 Serde tagging
 
-Both requests (`IpcMessage`) and events (`IpcEvent`) use serde's
+Wiri requests (`IpcMessage`) and events (`IpcEvent`) retain serde's
 **adjacent tagging** scheme:
 
 ```json
@@ -103,6 +99,25 @@ Both requests (`IpcMessage`) and events (`IpcEvent`) use serde's
 ```
 
 For unit variants (no fields), the `"data"` key is omitted.
+
+Niri's externally tagged spelling is also accepted. It selects niri replies and
+niri events on that connection, without changing wiri's existing envelopes:
+
+```json
+"Windows"
+{"Ok":{"Windows":[]}}
+{"Action":{"FocusColumnLeft":{}}}
+{"Ok":"Handled"}
+"ReturnError"
+{"Err":"example error requested by ReturnError"}
+```
+
+`"EventStream"` acknowledges with `{"Ok":"Handled"}` then streams external events
+such as `{"WindowFocusChanged":{"id":123}}`. Wiri-only events are omitted in that
+dialect. Niri's unit requests and typed supported actions use their PascalCase names;
+unsupported requests/actions/flags return a descriptive error rather than disconnecting.
+Wiri replies include additive `schema_version: "1.3"`; niri envelopes keep one key.
+`return_error` / `"ReturnError"` deliberately returns an error without altering state.
 
 ### 3.3 Example round-trip (one-shot)
 

@@ -3,7 +3,7 @@
   "$id": "https://github.com/jolionlands/wiri/raw/main/docs/IPC_SCHEMA.json",
   "title": "wiri IPC protocol",
   "description": "JSON Schema for every IpcMessage request and IpcEvent variant in the wiri window manager named-pipe IPC. Both types use serde adjacent tagging: {\"type\": \"<variant>\", \"data\": {...}}. The daemon serves on the pipe of one user in one session (\\\\.\\pipe\\wiri_control_<user>_<session>); WIRI_PIPE overrides the name.",
-  "version": "1.2",
+  "version": "1.3",
   "$defs": {
 
     "WindowInfoIpc": {
@@ -229,9 +229,24 @@
       "description": "Direction to an adjacent monitor."
     },
 
+    "NiriRequest": {
+      "description": "Externally tagged requests; supported typed Action and Output variants use PascalCase. Unknown requests receive Err without disconnecting.",
+      "oneOf": [
+        { "type": "string", "enum": ["Version", "Outputs", "Workspaces", "Windows", "KeyboardLayouts", "FocusedOutput", "FocusedWindow", "PickWindow", "PickColor", "EventStream", "ReturnError", "OverviewState"] },
+        { "type": "object", "minProperties": 1, "maxProperties": 1, "properties": { "Action": {"type": ["object", "string"]}, "Output": {"type": "object"} }, "additionalProperties": false }
+      ]
+    },
+    "NiriReply": {
+      "oneOf": [
+        { "type": "object", "required": ["Ok"], "properties": {"Ok": {}}, "additionalProperties": false },
+        { "type": "object", "required": ["Err"], "properties": {"Err": {"type": "string"}}, "additionalProperties": false }
+      ]
+    },
+
     "IpcMessage": {
       "description": "Any request sent from a client to the wiri daemon.",
       "oneOf": [
+        {"type":"object","required":["type"],"properties":{"type":{"const":"return_error"}}},
 
         {
           "description": "Force a window into the tiling layout. Un-floats it if floating. Optionally moves it to the named workspace.",

@@ -3,6 +3,7 @@ pub mod codec;
 pub mod messages;
 pub mod server;
 pub mod state;
+pub mod wire;
 
 pub use client::IpcClient;
 pub use messages::*;

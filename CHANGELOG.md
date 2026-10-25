@@ -36,6 +36,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Phase 2B integration — decoration foundation
 - Port the Phase 2B effects decoder, pure decoration model and passive layer foundation onto the integrated input/output base, retaining both backend module lists.
+### IPC 1.3 — transport compatibility (Lane H)
+- JSON-line connections accept repeated requests and one-line replies, including recoverable
+  unknown-request errors. Existing undelimited one-shot clients still receive EOF.
+- Niri's externally tagged requests, Ok/Err replies and event spelling coexist with wiri's
+  envelopes. ReturnError exercises client error handling; wiri replies name the IPC schema.
+- Spawned clients inherit WIRI_PIPE. Framing is bounded per line and subscriptions release on
+  disconnect without an idle timer.
 
 ### The pipe belongs to the user and the session (2026-10-25)
 - **A second user can run wiri.**  The pipe name was machine-global

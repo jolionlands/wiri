@@ -1,0 +1,427 @@
+//! The two IPC dialects and bounded, incremental JSON-line framing.
+//! A complete un-delimited first value remains the legacy one-shot protocol.
+use serde_json::{json, Value};
+
+use super::{IpcEvent, IpcMessage};
+
+pub const SCHEMA_VERSION: &str = "1.3";
+pub const MAX_REQUEST_BYTES: usize = 65_536;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Wiri,
+    Niri,
+}
+
+pub struct Request {
+    pub message: IpcMessage,
+    pub dialect: Dialect,
+    pub name: String,
+}
+
+pub fn dialect(value: &Value) -> Dialect {
+    if value.get("type").is_some() {
+        Dialect::Wiri
+    } else {
+        Dialect::Niri
+    }
+}
+
+/// Unknown fields are deliberately ignored by serde. Unknown variants and bad
+/// fields are errors of this request, not errors of the connection.
+pub fn decode(value: Value) -> Result<Request, String> {
+    let style = dialect(&value);
+    let adjacent = match style {
+        Dialect::Wiri => value,
+        Dialect::Niri => {
+            let (name, data) = match value {
+                Value::String(name) => (name, Value::Null),
+                Value::Object(object) if object.len() == 1 => object.into_iter().next().unwrap(),
+                _ => return Err("expected a request name or an externally tagged request".into()),
+            };
+            match name.as_str() {
+                "Action" => action(data)?,
+                "EventStream" => json!({"type":"subscribe_events","data":{"event_types":[]}}),
+                "Output" => json!({"type":"output","data":data}),
+                "Version" | "Outputs" | "Workspaces" | "Windows" | "KeyboardLayouts"
+                | "FocusedOutput" | "FocusedWindow" | "PickWindow" | "PickColor"
+                | "ReturnError" | "OverviewState" => json!({"type":snake_case(&name)}),
+                "Layers" | "Casts" => return Err(format!("{name} is not available on Windows")),
+                _ => {
+                    return Err(format!(
+                        "unknown IPC request '{name}' (schema {SCHEMA_VERSION})"
+                    ))
+                }
+            }
+        }
+    };
+    let message: IpcMessage = serde_json::from_value(adjacent).map_err(|e| e.to_string())?;
+    let name = serde_json::to_value(&message).map_err(|e| e.to_string())?["type"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Ok(Request {
+        message,
+        dialect: style,
+        name,
+    })
+}
+
+fn snake_case(name: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i != 0 {
+            result.push('_');
+        }
+        result.extend(c.to_lowercase());
+    }
+    result
+}
+
+fn pascal_case(name: &str) -> String {
+    name.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_default()
+                + chars.as_str()
+        })
+        .collect()
+}
+
+/// Convert niri's typed action vocabulary into the same validated parser used
+/// by binds. Never silently discard a known flag whose semantics we lack.
+fn action(value: Value) -> Result<Value, String> {
+    let (variant, fields) = match value {
+        Value::String(name) => (name, json!({})),
+        Value::Object(map) if map.len() == 1 => map.into_iter().next().unwrap(),
+        _ => return Err("Action needs one externally tagged action".into()),
+    };
+    let mut args = Vec::<Value>::new();
+    let mut quoted = Vec::<bool>::new();
+    let mut push = |value: String, quote: bool| {
+        args.push(Value::String(value));
+        quoted.push(quote);
+    };
+    let fields = if fields.is_null() { json!({}) } else { fields };
+    let fields = fields
+        .as_object()
+        .ok_or("an action's fields must be an object")?;
+    if fields.get("focus") == Some(&Value::Bool(false)) {
+        return Err("focus=false is not supported by this Windows action executor".into());
+    }
+    for key in ["id", "window_id"] {
+        if let Some(id) = fields.get(key).filter(|id| !id.is_null()) {
+            let id = id
+                .as_u64()
+                .ok_or("window id must be a non-negative integer")?;
+            push("--id".into(), false);
+            push(id.to_string(), false);
+        }
+    }
+    if let Some(command) = fields.get("command") {
+        for word in command
+            .as_array()
+            .ok_or("command must be an array of strings")?
+        {
+            push(
+                word.as_str()
+                    .ok_or("command arguments must be strings")?
+                    .into(),
+                true,
+            );
+        }
+    }
+    if let Some(reference) = fields.get("reference") {
+        let (value, quote) = if let Some(name) = reference.get("Name").and_then(Value::as_str) {
+            (name.to_string(), true)
+        } else if let Some(index) = reference.get("Index").and_then(Value::as_u64) {
+            (index.to_string(), false)
+        } else if let Some(id) = reference.get("Id").and_then(Value::as_u64) {
+            return Err(format!(
+                "workspace id reference {id} is unsupported; use Index or Name"
+            ));
+        } else {
+            return Err("workspace reference must be {\"Index\":n} or {\"Name\":\"name\"}".into());
+        };
+        push(value, quote);
+    }
+    if let Some(change) = fields.get("change") {
+        let map = change
+            .as_object()
+            .filter(|map| map.len() == 1)
+            .ok_or("change needs one size variant")?;
+        let (kind, number) = map.iter().next().unwrap();
+        let number = number
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or("size must be finite")?;
+        let (sign, percent) = match kind.as_str() {
+            "SetFixed" => ("", false),
+            "AdjustFixed" => (if number >= 0.0 { "+" } else { "" }, false),
+            "SetProportion" => ("", true),
+            "AdjustProportion" => (if number >= 0.0 { "+" } else { "" }, true),
+            _ => return Err(format!("unknown size change '{kind}'")),
+        };
+        push(
+            format!(
+                "{sign}{}{}",
+                if percent { number * 100.0 } else { number },
+                if percent { "%" } else { "" }
+            ),
+            false,
+        );
+    }
+    for key in ["output", "name", "index", "layout"] {
+        if let Some(value) = fields.get(key).filter(|v| !v.is_null()) {
+            let text = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            push(text, value.is_string());
+        }
+    }
+    // Unknown future fields are tolerated, as niri's compatibility contract requires.
+    // Known flags that affect behavior are never accepted as no-ops.
+    for key in [
+        "skip_empty",
+        "skip_empty_workspaces",
+        "write_to_disk",
+        "show_pointer",
+    ] {
+        if fields.get(key).is_some_and(|v| !v.is_null()) {
+            return Err(format!(
+                "action flag '{key}' is not supported on this executor"
+            ));
+        }
+    }
+    Ok(
+        json!({"type":"run_action","data":{"name":snake_case(&variant).replace('_',"-"),"args":args,"quoted":quoted}}),
+    )
+}
+
+pub fn error(dialect: Dialect, text: impl Into<String>) -> Value {
+    let text = text.into();
+    match dialect {
+        Dialect::Wiri => json!({"success":false,"error":text,"schema_version":SCHEMA_VERSION}),
+        Dialect::Niri => json!({"Err":text}),
+    }
+}
+
+/// Preserve wiri's payloads and adapt only the envelope for a niri client.
+pub fn reply(dialect: Dialect, name: &str, mut response: Value) -> Value {
+    if dialect == Dialect::Wiri {
+        response["schema_version"] = json!(SCHEMA_VERSION);
+        return response;
+    }
+    if response["success"] != true {
+        return error(
+            dialect,
+            response["error"].as_str().unwrap_or("request failed"),
+        );
+    }
+    let result = &response["result"];
+    let (variant, payload) = match name {
+        "version" => ("Version", result["version"].clone()),
+        "windows" => ("Windows", result["windows"].clone()),
+        "workspaces" => ("Workspaces", result["workspaces"].clone()),
+        "focused_window" => ("FocusedWindow", result["focused_window"].clone()),
+        "outputs" => ("Outputs", result["outputs"].clone()),
+        "focused_output" => ("FocusedOutput", result["focused_output"].clone()),
+        "keyboard_layouts" => ("KeyboardLayouts", result["keyboard_layouts"].clone()),
+        "overview_state" => ("OverviewState", result.clone()),
+        "pick_window" => ("PickedWindow", result["window"].clone()),
+        "pick_color" => ("PickedColor", result["color"].clone()),
+        _ => return json!({"Ok":"Handled"}),
+    };
+    let mut tagged = serde_json::Map::new();
+    tagged.insert(variant.into(), payload);
+    json!({"Ok":tagged})
+}
+
+/// Wiri-only events cannot be decoded by niri-ipc, so do not send those in its
+/// dialect. Niri events retain their exact externally tagged names and fields.
+pub fn event(dialect: Dialect, event: &IpcEvent) -> Option<Value> {
+    let value = serde_json::to_value(event).ok()?;
+    if dialect == Dialect::Wiri {
+        return Some(value);
+    }
+    let name = value["type"].as_str()?;
+    if !matches!(
+        name,
+        "workspaces_changed"
+            | "workspace_urgency_changed"
+            | "workspace_activated"
+            | "workspace_active_window_changed"
+            | "windows_changed"
+            | "window_opened_or_changed"
+            | "window_closed"
+            | "window_focus_changed"
+            | "window_focus_timestamp_changed"
+            | "window_urgency_changed"
+            | "window_layouts_changed"
+            | "keyboard_layouts_changed"
+            | "keyboard_layout_switched"
+            | "overview_opened_or_closed"
+            | "config_loaded"
+            | "screenshot_captured"
+    ) {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    map.insert(pascal_case(name), value["data"].clone());
+    Some(Value::Object(map))
+}
+
+/// A bounded incremental framer. Oversized lines are drained to the next
+/// newline so the following request is still usable, without unbounded memory.
+#[derive(Default)]
+pub struct Framer {
+    pending: Vec<u8>,
+    discarding: bool,
+    pub lined: bool,
+}
+
+impl Framer {
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Result<Value, String>> {
+        let mut frames = Vec::new();
+        for byte in bytes {
+            if *byte == b'\n' {
+                self.lined = true;
+                if self.discarding {
+                    frames.push(Err(format!("request exceeds {MAX_REQUEST_BYTES} bytes")));
+                } else if !self.pending.iter().all(u8::is_ascii_whitespace) {
+                    frames.push(
+                        serde_json::from_slice(&self.pending)
+                            .map_err(|e| format!("invalid JSON: {e}")),
+                    );
+                }
+                self.pending.clear();
+                self.discarding = false;
+            } else if !self.discarding {
+                if self.pending.len() == MAX_REQUEST_BYTES {
+                    self.pending.clear();
+                    self.discarding = true;
+                } else {
+                    self.pending.push(*byte);
+                }
+            }
+        }
+        frames
+    }
+
+    /// Old clients send one complete JSON value without a delimiter and await
+    /// EOF. This compatibility path is used only before any newline is seen.
+    pub fn legacy(&mut self) -> Option<Result<Value, String>> {
+        if self.lined || self.discarding || self.pending.is_empty() {
+            return None;
+        }
+        match serde_json::from_slice::<Value>(&self.pending) {
+            Ok(value) => {
+                self.pending.clear();
+                Some(Ok(value))
+            }
+            Err(error) if error.is_eof() => None,
+            Err(error) => {
+                self.pending.clear();
+                Some(Err(format!("invalid JSON: {error}")))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragmented_and_pipelined_lines_are_independent() {
+        let mut f = Framer::default();
+        assert!(f.feed(b"{\"type\":\"ver").is_empty());
+        assert!(f.legacy().is_none());
+        let frames = f.feed(b"sion\"}\r\n\"Windows\"\n{bad}\n\"Version\"\n");
+        assert_eq!(frames.len(), 4);
+        assert!(decode(frames[0].as_ref().unwrap().clone()).is_ok());
+        assert_eq!(frames[1].as_ref().unwrap(), "Windows");
+        assert!(frames[2].is_err());
+        assert_eq!(frames[3].as_ref().unwrap(), "Version");
+        assert!(f.legacy().is_none());
+    }
+
+    #[test]
+    fn oversized_line_recovers_at_the_next_delimiter() {
+        let mut f = Framer::default();
+        assert!(f.feed(&vec![b'x'; MAX_REQUEST_BYTES + 20]).is_empty());
+        assert!(f.pending.is_empty());
+        let frames = f.feed(b"\n\"Version\"\n");
+        assert!(frames[0].is_err());
+        assert_eq!(frames[1].as_ref().unwrap(), "Version");
+    }
+
+    #[test]
+    fn legacy_complete_value_needs_neither_newline_nor_eof() {
+        let mut f = Framer::default();
+        assert!(f.feed(b"{\"type\":\"get_state\"}").is_empty());
+        assert!(decode(f.legacy().unwrap().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn niri_and_wiri_spellings_select_the_reply_dialect() {
+        for (value, expected) in [
+            (json!("Windows"), Dialect::Niri),
+            (json!({"type":"windows","extra":3}), Dialect::Wiri),
+        ] {
+            let request = decode(value).unwrap();
+            assert_eq!(request.dialect, expected);
+            let reply = reply(
+                expected,
+                &request.name,
+                json!({"success":true,"result":{"windows":[]}}),
+            );
+            if expected == Dialect::Niri {
+                assert_eq!(reply, json!({"Ok":{"Windows":[]}}));
+            } else {
+                assert_eq!(reply["schema_version"], SCHEMA_VERSION);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_requests_and_bad_fields_have_useful_errors() {
+        assert!(decode(json!("NotARequest"))
+            .err()
+            .unwrap()
+            .contains("unknown IPC request"));
+        assert!(decode(json!({"type":"focus_window","data":{"window_hwnd":"bad"}})).is_err());
+        assert!(
+            decode(json!({"type":"focus_window","data":{"window_hwnd":1,"future":true}})).is_ok()
+        );
+        assert_eq!(error(Dialect::Niri, "test"), json!({"Err":"test"}));
+    }
+
+    #[test]
+    fn typed_niri_actions_preserve_references_sizes_and_ids() {
+        let a = decode(json!({"Action":{"FocusWorkspace":{"reference":{"Name":"2"}}}})).unwrap();
+        let json = serde_json::to_value(a.message).unwrap();
+        assert_eq!(json["data"]["args"], json!(["2"]));
+        assert_eq!(json["data"]["quoted"], json!([true]));
+        let a = decode(
+            json!({"Action":{"SetColumnWidth":{"change":{"AdjustProportion":0.1},"id":44}}}),
+        )
+        .unwrap();
+        let json = serde_json::to_value(a.message).unwrap();
+        assert_eq!(json["data"]["args"], json!(["--id", "44", "+10%"]));
+        assert!(decode(json!({"Action":{"MoveWindowToWorkspace":{"focus":false}}})).is_err());
+    }
+
+    #[test]
+    fn niri_events_are_external_and_wiri_only_events_are_suppressed() {
+        assert_eq!(
+            event(Dialect::Niri, &IpcEvent::WindowFocusChanged { id: Some(3) }),
+            Some(json!({"WindowFocusChanged":{"id":3}}))
+        );
+        assert!(event(Dialect::Niri, &IpcEvent::WindowFocused { window_hwnd: 3 }).is_none());
+    }
+}

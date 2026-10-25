@@ -236,6 +236,9 @@ impl IpcServer {
         // The pipe of this user in this session: another user logged in on the
         // same machine has a pipe of its own.
         let pipe = pipe_path();
+        // Children launched by binds/startup inherit the actual endpoint, including
+        // an explicit override, just as niri exports NIRI_SOCKET.
+        std::env::set_var(super::PIPE_ENV_VAR, &pipe);
         info!("IPC server starting on {} (ACL: Admins+Owner only)", pipe);
 
         // Another wiri of this user and session may already be running.  The
@@ -359,113 +362,107 @@ impl IpcServer {
     ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut buffer = vec![0u8; 65536];
-
+        let mut buffer = [0u8; 8192];
+        let mut framer = super::wire::Framer::default();
         loop {
             let n = match pipe.read(&mut buffer).await {
-                Ok(0) => {
-                    // Client disconnected
-                    info!("IPC client disconnected");
-                    return Ok(());
-                }
+                Ok(0) => return Ok(()),
                 Ok(n) => n,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        info!("IPC client disconnected (broken pipe)");
-                        return Ok(());
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut frames = framer.feed(&buffer[..n]);
+            let legacy = frames.is_empty() && !framer.lined;
+            if legacy {
+                if let Some(frame) = framer.legacy() {
+                    frames.push(frame);
+                }
+            }
+            for frame in frames {
+                let dialect = frame
+                    .as_ref()
+                    .map(super::wire::dialect)
+                    .unwrap_or(super::wire::Dialect::Wiri);
+                let request = frame.and_then(super::wire::decode);
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        write_line(&mut pipe, &super::wire::error(dialect, error)).await?;
+                        if legacy {
+                            let _ = pipe.shutdown().await;
+                            return Ok(());
+                        }
+                        continue;
                     }
-                    return Err(e.into());
-                }
-            };
-
-            // Parse the message
-            let message: IpcMessage = match serde_json::from_slice(&buffer[..n]) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    warn!("IPC: Failed to parse message: {}", e);
-                    let error_response = serde_json::json!({
-                        "success": false,
-                        "error": format!("Invalid message: {}", e)
-                    });
-                    let response_bytes = serde_json::to_vec(&error_response)?;
-                    let _ = pipe.write_all(&response_bytes).await;
-                    continue;
-                }
-            };
-
-            debug!("IPC received: {:?}", message);
-
-            // SubscribeEvents is handled inline: ack the subscription, then
-            // forward broadcast events to the client pipe until it disconnects.
-            if let IpcMessage::SubscribeEvents { ref event_types } = message {
-                info!("IPC: Subscribe to events: {:?}", event_types);
-                let mut ack = serde_json::to_vec(&serde_json::json!({
-                    "success": true,
-                    "subscription_id": 1
-                }))?;
-                ack.push(b'\n');
-                let _ = pipe.write_all(&ack).await;
-
-                // The state first (niri's contract), then what changes.  The broadcast channel
-                // keeps 64 events per subscriber.
-                let Some((mut event_rx, replay)) = self.subscribe_blocking().await else {
-                    return Ok(());
                 };
-                for event in &replay {
-                    if !write_event(&mut pipe, event_types, event).await {
-                        debug!("IPC event subscriber disconnected");
-                        return Ok(());
-                    }
+                debug!("IPC received: {:?}", request.message);
+                if let IpcMessage::SubscribeEvents { ref event_types } = request.message {
+                    let ack = super::wire::reply(
+                        request.dialect,
+                        &request.name,
+                        serde_json::json!({
+                            "success":true,"subscription_id":1
+                        }),
+                    );
+                    write_line(&mut pipe, &ack).await?;
+                    return self
+                        .stream_events(&mut pipe, event_types, request.dialect)
+                        .await;
                 }
-                loop {
-                    match event_rx.recv().await {
-                        Ok(event) => {
-                            if !write_event(&mut pipe, event_types, &event).await {
-                                debug!("IPC event subscriber disconnected");
-                                return Ok(());
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            // The client missed events, so what it knows is not what is.  Tell
-                            // it the state again (the lists replace what it had), as when it
-                            // subscribed.
-                            warn!(
-                                "IPC event subscriber lagged by {} events; sending the state again",
-                                n
-                            );
-                            let Some((rx, replay)) = self.subscribe_blocking().await else {
-                                return Ok(());
-                            };
-                            event_rx = rx;
-                            for event in &replay {
-                                if !write_event(&mut pipe, event_types, event).await {
-                                    debug!("IPC event subscriber disconnected");
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            debug!("IPC event broadcast channel closed");
+                let response = self.respond(request.message).await;
+                let response = super::wire::reply(request.dialect, &request.name, response);
+                write_line(&mut pipe, &response).await?;
+                if legacy {
+                    // Old read_to_end clients do not send a newline. New line
+                    // clients keep this same connection for their next request.
+                    let _ = pipe.shutdown().await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn stream_events(
+        self: &Arc<Self>,
+        pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
+        event_types: &[String],
+        dialect: super::wire::Dialect,
+    ) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let Some((mut receiver, replay)) = self.subscribe_blocking().await else {
+            return Ok(());
+        };
+        for event in &replay {
+            if !write_event(pipe, event_types, event, dialect).await {
+                return Ok(());
+            }
+        }
+        let mut disconnected = [0u8; 1];
+        loop {
+            tokio::select! {
+                // A silent subscriber that closes must release its subscription
+                // immediately, not only when the next desktop event happens.
+                _ = pipe.read(&mut disconnected) => return Ok(()),
+                received = receiver.recv() => match received {
+                    Ok(event) => {
+                        if !write_event(pipe, event_types, &event, dialect).await {
                             return Ok(());
                         }
                     }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some((rx, replay)) = self.subscribe_blocking().await else {
+                            return Ok(());
+                        };
+                        receiver = rx;
+                        for event in &replay {
+                            if !write_event(pipe, event_types, event, dialect).await {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-
-            // Process the message and send response.
-            //
-            // The handlers take the engine lock and make Win32 calls, which can
-            // wait on a busy or hung application.  Run them on a blocking thread
-            // (so they never pin a runtime worker) and answer within
-            // `IPC_RESPONSE_BUDGET` whatever happens: `wiri-ctl` must never hang.
-            let response = self.respond(message).await;
-            let response_bytes = serde_json::to_vec(&response)?;
-            let _ = pipe.write_all(&response_bytes).await;
-            // Flush + disconnect: ctl uses read_to_end which waits for EOF.
-            // Each ctl invocation opens a fresh pipe; one round-trip per connection.
-            let _ = pipe.flush().await;
-            let _ = pipe.shutdown().await;
-            return Ok(());
         }
     }
 
@@ -587,6 +584,9 @@ impl IpcServer {
                         .unwrap_or(false),
                 };
                 serde_json::json!({"success": true, "result": reply})
+            }
+            IpcMessage::ReturnError => {
+                serde_json::json!({"success":false,"error":"example error requested by ReturnError"})
             }
             IpcMessage::Version => {
                 let reply = VersionResponse {
@@ -1903,6 +1903,7 @@ fn is_query(message: &IpcMessage) -> bool {
             | IpcMessage::FocusedWindow
             | IpcMessage::OverviewState
             | IpcMessage::Version
+            | IpcMessage::ReturnError
     )
 }
 
@@ -1960,8 +1961,8 @@ async fn write_event(
     pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
     event_types: &[String],
     event: &IpcEvent,
+    dialect: super::wire::Dialect,
 ) -> bool {
-    use tokio::io::AsyncWriteExt;
     let value = match serde_json::to_value(event) {
         Ok(v) => v,
         Err(e) => {
@@ -1972,15 +1973,23 @@ async fn write_event(
     if !subscription_allows_event(event_types, &value) {
         return true;
     }
-    let mut bytes = match serde_json::to_vec(&value) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("IPC: Failed to serialize event: {}", e);
-            return true;
-        }
+    let Some(value) = super::wire::event(dialect, event) else {
+        return true;
     };
+    write_line(pipe, &value).await.is_ok()
+}
+
+async fn write_line(
+    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
+    value: &serde_json::Value,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    pipe.write_all(&bytes).await.is_ok()
+    // A stalled client cannot hold a subscription forever. No clock is armed
+    // until an actual write is pending.
+    tokio::time::timeout(IPC_RESPONSE_BUDGET, pipe.write_all(&bytes)).await??;
+    Ok(())
 }
 
 fn subscription_allows_event(event_types: &[String], event: &serde_json::Value) -> bool {
