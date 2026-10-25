@@ -1160,6 +1160,7 @@ fn handle_backend_event(
         BackendEvent::ForegroundChanged { hwnd } => {
             let window_id = WindowId::new(hwnd);
             let was_managed = engine.read().tiled_windows().contains_key(&window_id);
+            debug!("foreground: hwnd={} managed={}", hwnd, was_managed);
             add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
             // A window that was too busy to say how narrow it can be (it had just been
             // created) is asked again when it takes the focus, at most twice.  Not in the

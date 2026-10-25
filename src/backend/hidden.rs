@@ -455,15 +455,18 @@ pub fn restore_from_file(path: &Path) -> usize {
         let cloaked = entries.iter().any(|e| e.hwnd == *hwnd && e.cloaked);
         show_again(*hwnd, cloaked);
     }
-    // `ShowWindowAsync` only posts the request; give the owning threads a
-    // moment to act on it so the desktop enumeration that follows sees the
-    // windows as visible.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    // `ShowWindowAsync` only posts the request, and DWM drops a cloak a moment after the
+    // shell is asked to; give the owning threads and DWM a moment to act so that the desktop
+    // enumeration that follows sees the windows as visible and not cloaked (a cloaked window
+    // is left alone by the enumeration).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
     while std::time::Instant::now() < deadline {
-        let all_visible = restorable
-            .iter()
-            .all(|hwnd| probe_window(*hwnd).map_or(true, |p| p.visible));
-        if all_visible {
+        let all_shown = restorable.iter().all(|hwnd| {
+            let was_cloaked = entries.iter().any(|e| e.hwnd == *hwnd && e.cloaked);
+            probe_window(*hwnd).map_or(true, |p| p.visible)
+                && !(was_cloaked && super::cloak::is_cloaked(*hwnd))
+        });
+        if all_shown {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

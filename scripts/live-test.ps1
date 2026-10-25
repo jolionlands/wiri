@@ -116,6 +116,76 @@ public static class LT {
   }
 }
 
+// The shell's view of a window (IApplicationView): what Alt+Tab and the taskbar are made from.  The interface definitions
+// are the ones wiri uses for hide-method "cloak" (komorebi's, taken from AltTabAccessor, MIT); a method is only called when
+// this script needs it, the others are there for the vtable layout.
+public static class ShellViews {
+  [ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IServiceProviderX {
+    [PreserveSig] int QueryService(ref Guid service, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object obj);
+  }
+  [ComImport, Guid("1841C6D7-4F9D-42C0-AF41-8747538F10E5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IApplicationViewCollection {
+    [PreserveSig] int GetViews(out IntPtr views);
+    [PreserveSig] int GetViewsByZOrder(out IntPtr views);
+    [PreserveSig] int GetViewsByAppUserModelId([MarshalAs(UnmanagedType.LPWStr)] string id, out IntPtr views);
+    [PreserveSig] int GetViewForHwnd(IntPtr hwnd, [MarshalAs(UnmanagedType.Interface)] out IApplicationView view);
+  }
+  [ComImport, Guid("372E1D3B-38D3-42E4-A15B-8AB2B178F513"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IApplicationView {
+    [PreserveSig] int GetIids(out int count, out IntPtr iids);
+    [PreserveSig] int GetRuntimeClassName(out IntPtr name);
+    [PreserveSig] int GetTrustLevel(out int level);
+    [PreserveSig] int SetFocus();
+    [PreserveSig] int SwitchTo();
+    [PreserveSig] int TryInvokeBack(IntPtr callback);
+    [PreserveSig] int GetThumbnailWindow(out IntPtr hwnd);
+    [PreserveSig] int GetMonitor(out IntPtr monitor);
+    [PreserveSig] int GetVisibility(out int visibility);
+    [PreserveSig] int SetCloak(int cloakType, int flags);
+    [PreserveSig] int GetPosition(ref Guid iid, out IntPtr position);
+    [PreserveSig] int SetPosition(IntPtr position);
+    [PreserveSig] int InsertAfterWindow(IntPtr hwnd);
+    [PreserveSig] int GetExtendedFramePosition(out LT.RECT rect);
+    [PreserveSig] int GetAppUserModelId(out IntPtr id);
+    [PreserveSig] int SetAppUserModelId([MarshalAs(UnmanagedType.LPWStr)] string id);
+    [PreserveSig] int IsEqualByAppUserModelId([MarshalAs(UnmanagedType.LPWStr)] string id, out int result);
+    [PreserveSig] int GetViewState(out uint state);
+    [PreserveSig] int SetViewState(uint state);
+    [PreserveSig] int GetNeediness(out int neediness);
+    [PreserveSig] int GetLastActivationTimestamp(out ulong timestamp);
+    [PreserveSig] int SetLastActivationTimestamp(ulong timestamp);
+    [PreserveSig] int GetVirtualDesktopId(out Guid id);
+    [PreserveSig] int SetVirtualDesktopId(ref Guid id);
+    [PreserveSig] int GetShowInSwitchers(out int show);
+  }
+  static IApplicationView View(IntPtr hwnd) {
+    var shell = (IServiceProviderX)Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("C2F03A33-21F5-47FA-B4BB-156362A2F239")));
+    Guid service = new Guid("1841C6D7-4F9D-42C0-AF41-8747538F10E5");
+    Guid riid = service;
+    object collection;
+    if (shell.QueryService(ref service, ref riid, out collection) != 0) { return null; }
+    IApplicationView view;
+    if (((IApplicationViewCollection)collection).GetViewForHwnd(hwnd, out view) != 0) { return null; }
+    return view;
+  }
+  // The shell's call for "the user picked this window in Alt+Tab" (or on the taskbar).  0 = done, -1 = the shell has no
+  // view of the window, -3 = something threw.
+  public static int SwitchTo(IntPtr hwnd) {
+    try { var v = View(hwnd); return v == null ? -1 : v.SwitchTo(); } catch (Exception) { return -3; }
+  }
+  // 1 when the shell lists the window in Alt+Tab and on the taskbar, 0 when it does not; -1 = no view of the window,
+  // -2 = the call failed, -3 = something threw.
+  public static int InSwitchers(IntPtr hwnd) {
+    try {
+      var v = View(hwnd);
+      if (v == null) { return -1; }
+      int show;
+      return v.GetShowInSwitchers(out show) == 0 ? show : -2;
+    } catch (Exception) { return -3; }
+  }
+}
+
 // Plain test windows living in this process, one STA thread each.
 public static class TestForms {
   static readonly List<Form> forms = new List<Form>();
@@ -1358,7 +1428,9 @@ Start-Sleep -Seconds 4
 
 # ---- H11: hide-method "cloak" - the windows of another workspace stay visible to the system but are not drawn ---------
 # The default (hide) is what every phase above ran with; this one asks for the shell's cloak.  The windows are plain-coloured
-# forms, so "not drawn" is read off the screenshot: not one pixel of their colour is left.
+# forms, so "not drawn" is read off the screenshot: not one pixel of their colour is left.  "In Alt+Tab and on the taskbar" is
+# what the shell itself says (IApplicationView::GetShowInSwitchers), and "Alt+Tab to a window" is the shell's own call
+# (IApplicationView::SwitchTo) - the same interfaces wiri cloaks with, reached from this script through COM interop.
 $log11 = Join-Path $D 'wiri.stderr11.log'
 $h11Config = @"
 layout {
@@ -1383,28 +1455,19 @@ function H11Drawn([string]$shot) {
 }
 function H11Cloaked() { return @($cf11 | ForEach-Object { [int][LT]::Cloaked($_) }) }
 function H11Visible() { return @($cf11 | ForEach-Object { [LT]::IsWindowVisible($_) }) }
-function H11TaskbarNames() {
-    try {
-        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes -ErrorAction Stop
-        $root = [System.Windows.Automation.AutomationElement]::RootElement
-        $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ClassNameProperty, 'Shell_TrayWnd')
-        $tray = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
-        if ($null -eq $tray) { return @() }
-        $all = $tray.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-        return @($all | ForEach-Object { $_.Current.Name } | Where-Object { $_ })
-    } catch { return @() }
-}
+function H11InSwitchers() { return @($cf11 | ForEach-Object { [int][ShellViews]::InSwitchers($_) }) }
 $h11DrawnBefore = H11Drawn 'h11-01-three-forms'
-$h11TaskbarBefore = H11TaskbarNames
-Set-Content (Join-Path $D 'h11-taskbar-before.txt') $h11TaskbarBefore
+$h11InSwitchersBefore = H11InSwitchers
+# the first form was in front, then the third: the window Alt+Tab goes back to from the third one is the first
+FocusForm $cf11[0]
+FocusForm $cf11[2]
 
 # to the second workspace: the three forms leave the screen but not the system
-$null = Ctl 'h11-ws2' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2200
+$null = Ctl 'h11-ws2' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2500
 $h11Cloaked = H11Cloaked
 $h11Visible = H11Visible
+$h11InSwitchersAway = H11InSwitchers
 $h11DrawnAway = H11Drawn 'h11-02-forms-cloaked'
-$h11TaskbarAway = H11TaskbarNames
-Set-Content (Join-Path $D 'h11-taskbar-cloaked.txt') $h11TaskbarAway
 $hj11 = Join-Path $wiriData 'hidden.json'
 $h11RecordedCloaked = 0
 if (Test-Path $hj11) {
@@ -1415,35 +1478,55 @@ if (Test-Path $hj11) {
     } catch { $h11RecordedCloaked = -1 }
 }
 
-# the OS (Alt+Tab, a taskbar button) asks for the first form, which is cloaked: its workspace comes with it
-[void][LT]::SwitchToThisWindow($cf11[0], $true)
-Start-Sleep -Milliseconds 2200
+# Alt+Tab (the keys): the shell goes back to the first form, which is cloaked, and its workspace comes with it
+$h11ForegroundBefore = [int64][LT]::GetForegroundWindow()
+[LT]::Key(0x12, $false); Start-Sleep -Milliseconds 80
+[LT]::Key(0x09, $false); Start-Sleep -Milliseconds 80
+[LT]::Key(0x09, $true); Start-Sleep -Milliseconds 400
+[LT]::Key(0x12, $true)
+Start-Sleep -Milliseconds 2500
+$h11ForegroundNow = [int64][LT]::GetForegroundWindow()
 $h11CloakedAfterAltTab = H11Cloaked
 $h11VisibleAfterAltTab = H11Visible
-$h11ForegroundIsFirst = ([LT]::GetForegroundWindow() -eq $cf11[0])
 $h11DrawnAfterAltTab = H11Drawn 'h11-03-after-alt-tab'
+$null = Ctl 'h11-windows-after-alt-tab' @('--json', 'windows')
 
 # away again, then wiri dies: the windows stay cloaked (nobody is left to show them)
-$null = Ctl 'h11-ws2-again' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2200
+$null = Ctl 'h11-ws2-again' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2500
 $h11CloakedBeforeCrash = H11Cloaked
 Stop-Process -Id $w.Id -Force
 Start-Sleep -Seconds 2
 $h11CloakedWhileDead = H11Cloaked
 $h11DrawnWhileDead = H11Drawn 'h11-04-wiri-dead'
-# started again, wiri shows (uncloaks) what the dead one had hidden
+# started again, wiri shows (uncloaks) what the dead one had hidden; it tiles in its own order, so only the windows in view are drawn
 $log11b = Join-Path $D 'wiri.stderr11b.log'
 $w11b = Start-Wiri $log11b ($log11b + '.out')
 Start-Sleep -Seconds 5
 $h11CloakedAfterRestart = H11Cloaked
+$h11VisibleAfterRestart = H11Visible
 $h11DrawnAfterRestart = H11Drawn 'h11-05-after-restart'
 
 # and a quit with windows cloaked puts everything back
-$null = Ctl 'h11-ws2-third' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2200
+$null = Ctl 'h11-ws2-third' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2500
 $h11CloakedBeforeQuit = H11Cloaked
+$h11VisibleBeforeQuit = H11Visible
 Stop-WiriGracefully $w11b 'h11b'
-Start-Sleep -Milliseconds 1000
+Start-Sleep -Milliseconds 1500
 $h11CloakedAfterQuit = H11Cloaked
 $h11VisibleAfterQuit = H11Visible
+$h11DrawnAfterQuit = H11Drawn 'h11-06-after-quit'
+$h11Values = [ordered]@{
+    forms = @($cf11 | ForEach-Object { [int64]$_ })
+    drawn_before = $h11DrawnBefore; in_switchers_before = $h11InSwitchersBefore
+    cloaked_away = $h11Cloaked; visible_away = $h11Visible; in_switchers_away = $h11InSwitchersAway; drawn_away = $h11DrawnAway
+    foreground_before_alt_tab = $h11ForegroundBefore; foreground_now = $h11ForegroundNow
+    cloaked_after_alt_tab = $h11CloakedAfterAltTab; visible_after_alt_tab = $h11VisibleAfterAltTab; drawn_after_alt_tab = $h11DrawnAfterAltTab
+    cloaked_before_crash = $h11CloakedBeforeCrash; cloaked_while_dead = $h11CloakedWhileDead; drawn_while_dead = $h11DrawnWhileDead
+    cloaked_after_restart = $h11CloakedAfterRestart; visible_after_restart = $h11VisibleAfterRestart; drawn_after_restart = $h11DrawnAfterRestart
+    cloaked_before_quit = $h11CloakedBeforeQuit; visible_before_quit = $h11VisibleBeforeQuit
+    cloaked_after_quit = $h11CloakedAfterQuit; visible_after_quit = $h11VisibleAfterQuit; drawn_after_quit = $h11DrawnAfterQuit
+}
+$h11Values | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'h11-values.json')
 foreach ($f in $cf11) { [TestForms]::CloseForm($f) }
 Start-Sleep -Milliseconds 1500
 # the instance that is left running for the rest of the script: the default method again
@@ -1688,15 +1771,17 @@ $summary = [ordered]@{
     # --- Phase 1 / H11: hide-method "cloak"
     h11_config_accepted_without_warnings = ($h11Warnings -eq 0)
     h11_forms_drawn_before_hiding = (@($h11DrawnBefore | Where-Object { $_ -gt 1000 }).Count -eq 3)
+    h11_shell_lists_the_forms_in_alt_tab_before = (@($h11InSwitchersBefore | Where-Object { $_ -eq 1 }).Count -eq 3)
     h11_other_workspace_windows_are_cloaked_not_hidden = ((@($h11Cloaked | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11Visible | Where-Object { $_ }).Count -eq 3))
     h11_cloaked_windows_are_not_drawn = (@($h11DrawnAway | Where-Object { $_ -eq 0 }).Count -eq 3)
+    h11_cloaked_windows_stay_in_alt_tab_and_the_taskbar = (@($h11InSwitchersAway | Where-Object { $_ -eq 1 }).Count -eq 3)
     h11_hidden_json_marks_them_cloaked = ($h11RecordedCloaked -eq 3)
-    h11_alt_tab_to_a_cloaked_window_brings_its_workspace = ($h11ForegroundIsFirst -and (@($h11CloakedAfterAltTab | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11DrawnAfterAltTab | Where-Object { $_ -gt 1000 }).Count -eq 3))
+    h11_alt_tab_changed_the_foreground_window = ($h11ForegroundNow -ne $h11ForegroundBefore)
+    h11_alt_tab_to_a_cloaked_window_brings_its_workspace = ((@($h11CloakedAfterAltTab | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11DrawnAfterAltTab | Where-Object { $_ -gt 1000 }).Count -eq 3))
     h11_windows_stay_cloaked_when_wiri_dies = ((@($h11CloakedBeforeCrash | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11CloakedWhileDead | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11DrawnWhileDead | Where-Object { $_ -eq 0 }).Count -eq 3))
-    h11_restart_uncloaks_what_the_dead_wiri_hid = ((@($h11CloakedAfterRestart | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11DrawnAfterRestart | Where-Object { $_ -gt 1000 }).Count -eq 3))
-    h11_quit_uncloaks_everything = ((@($h11CloakedBeforeQuit | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11CloakedAfterQuit | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11VisibleAfterQuit | Where-Object { $_ }).Count -eq 3))
-    h11_taskbar_buttons_before = (($h11TaskbarBefore | Where-Object { $_ -match 'running window' }) -join ' | ')
-    h11_taskbar_buttons_while_cloaked = (($h11TaskbarAway | Where-Object { $_ -match 'running window' }) -join ' | ')
+    h11_restart_uncloaks_what_the_dead_wiri_hid = ((@($h11CloakedAfterRestart | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11VisibleAfterRestart | Where-Object { $_ }).Count -eq 3) -and (@($h11DrawnAfterRestart | Where-Object { $_ -gt 1000 }).Count -ge 1))
+    h11_windows_are_cloaked_again_before_the_quit = ((@($h11CloakedBeforeQuit | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11VisibleBeforeQuit | Where-Object { $_ }).Count -eq 3))
+    h11_quit_uncloaks_everything = ((@($h11CloakedAfterQuit | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11VisibleAfterQuit | Where-Object { $_ }).Count -eq 3))
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

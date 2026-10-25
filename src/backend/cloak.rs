@@ -280,6 +280,7 @@ pub fn cloak(hwnd: isize) -> bool {
     match set_cloak_through_the_shell(hwnd, CLOAK_ON) {
         Ok(()) => {
             CLOAKED.lock().insert(hwnd);
+            debug!("cloak: hwnd={} cloaked", hwnd);
             true
         }
         Err(CloakError::Unsupported) => {
@@ -298,12 +299,18 @@ pub fn cloak(hwnd: isize) -> bool {
     }
 }
 
-/// Uncloak `hwnd` if this run cloaked it.
+/// Uncloak `hwnd` if this run cloaked it.  A window the shell would not let go of stays on
+/// the list, so that the next show tries again instead of leaving it invisible for good.
 pub fn uncloak(hwnd: isize) {
-    if CLOAKED.lock().remove(&hwnd) {
-        if let Err(e) = set_cloak_through_the_shell(hwnd, CLOAK_OFF) {
-            debug!("uncloak: hwnd={} failed: {:?}", hwnd, e);
+    if !CLOAKED.lock().contains(&hwnd) {
+        return;
+    }
+    match set_cloak_through_the_shell(hwnd, CLOAK_OFF) {
+        Ok(()) => {
+            CLOAKED.lock().remove(&hwnd);
+            debug!("uncloak: hwnd={} uncloaked", hwnd);
         }
+        Err(e) => debug!("uncloak: hwnd={} failed: {:?} (tried again at the next show)", hwnd, e),
     }
 }
 
@@ -311,9 +318,15 @@ pub fn uncloak(hwnd: isize) {
 /// Used on start (from `hidden.json`), on quit and from the panic hook.
 pub fn uncloak_forced(hwnd: isize) {
     CLOAKED.lock().remove(&hwnd);
-    if let Err(e) = set_cloak_through_the_shell(hwnd, CLOAK_OFF) {
-        debug!("uncloak: hwnd={} failed: {:?}", hwnd, e);
+    match set_cloak_through_the_shell(hwnd, CLOAK_OFF) {
+        Ok(()) => debug!("uncloak: hwnd={} uncloaked (record from an earlier run)", hwnd),
+        Err(e) => debug!("uncloak: hwnd={} failed: {:?}", hwnd, e),
     }
+}
+
+/// The window is gone: forget that it was cloaked.
+pub fn forget(hwnd: isize) {
+    CLOAKED.lock().remove(&hwnd);
 }
 
 #[cfg(test)]

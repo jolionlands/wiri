@@ -538,6 +538,11 @@ pub struct TilingEngine {
     hide_method: crate::backend::cloak::HideMethod,
     /// When wiri hid each window of an inactive workspace.
     hidden_since: HashMap<WindowId, std::time::Instant>,
+    /// `restore_all` has put everything back: the process is on its way out, and no layout
+    /// pass may hide, move or cloak a window again (the 750 ms reconciler and the IPC server
+    /// run until the process ends, and a pass between the restore and the exit used to hide
+    /// the windows of the other workspaces once more).
+    shut_down: bool,
     window_sizing: HashMap<WindowId, SizingMode>,
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
@@ -675,6 +680,7 @@ impl TilingEngine {
             unplugged: HashMap::new(),
             hide_method: crate::backend::cloak::HideMethod::Hide,
             hidden_since: HashMap::new(),
+            shut_down: false,
             always_on_top: HashSet::new(),
             auto_tile_threshold: None,
             auto_tile_zoom: None,
@@ -1705,6 +1711,7 @@ impl TilingEngine {
         self.window_min_widths.remove(&window_id);
         self.min_width_queries.remove(&window_id);
         self.hidden_since.remove(&window_id);
+        crate::backend::cloak::forget(window_id.as_isize());
         crate::backend::hidden::forget(window_id.as_isize());
 
         if self.last_activated == Some(window_id) {
@@ -1763,6 +1770,20 @@ impl TilingEngine {
         }
         self.sync_min_widths();
         true
+    }
+
+    /// wiri has hidden `wid`: the layout cache now says it is not visible, and the moment is
+    /// remembered.  A foreground report for a window that was hidden a moment ago is the OS
+    /// picking a replacement for it, a later one is the user asking for the window (Alt+Tab
+    /// or the taskbar, with `hide-method "cloak"`): see `sync_os_foreground`.
+    fn note_hidden(&mut self, wid: WindowId) {
+        if self.applied_state.get(&wid).map_or(true, |s| s.visible) {
+            self.hidden_since.insert(wid, std::time::Instant::now());
+        }
+        self.applied_state
+            .entry(wid)
+            .or_insert_with(AppliedState::unset)
+            .visible = false;
     }
 
     /// Copy the known minimum widths onto the tiles (a tile is made anew when a window
@@ -2086,12 +2107,6 @@ impl TilingEngine {
             .collect();
 
         for wid in to_hide {
-            // Remember when it was hidden: a foreground report for a window that was hidden
-            // a moment ago is the OS picking a replacement, a later one is the user asking
-            // for it (see `sync_os_foreground`).
-            if self.applied_state.get(&wid).map_or(true, |s| s.visible) {
-                self.hidden_since.insert(wid, std::time::Instant::now());
-            }
             // Treat inactive-workspace visibility as authoritative rather than
             // trusting applied_state. The shell/taskbar can re-show hidden HWNDs
             // behind wiri's back, especially app-hosted terminal windows.
@@ -2100,10 +2115,7 @@ impl TilingEngine {
             {
                 self.win32_call_count += 1;
             }
-            self.applied_state
-                .entry(wid)
-                .or_insert_with(AppliedState::unset)
-                .visible = false;
+            self.note_hidden(wid);
         }
     }
 
@@ -2252,6 +2264,10 @@ impl TilingEngine {
     }
 
     pub fn apply_layout_for_monitor(&mut self, output_id: OutputId, backend: &BackendHandle) {
+        // After `restore_all` nothing is laid out any more (see `shut_down`).
+        if self.shut_down {
+            return;
+        }
         // -- Item 3: auto-tile threshold check (must run before borrowing monitor).
         // When threshold is set and the active workspace exceeds it, auto-engage
         // overview zoom so the user can see everything at a glance. We compute
@@ -2623,10 +2639,7 @@ impl TilingEngine {
                     {
                         self.win32_call_count += 1;
                     }
-                    self.applied_state
-                        .entry(window_id)
-                        .or_insert_with(AppliedState::unset)
-                        .visible = false;
+                    self.note_hidden(window_id);
                 }
                 continue;
             }
@@ -3042,6 +3055,15 @@ impl TilingEngine {
             .hidden_since
             .get(&window_id)
             .map_or(true, |t| t.elapsed() < Self::HIDE_GRACE);
+        if on_inactive_workspace && hidden_by_wiri {
+            debug!(
+                "foreground report for window {} of workspace {}: just hidden {}, method {:?}",
+                window_id.as_isize(),
+                workspace_id,
+                just_hidden,
+                self.hide_method
+            );
+        }
         if on_inactive_workspace
             && hidden_by_wiri
             && (self.hide_method != crate::backend::cloak::HideMethod::Cloak || just_hidden)
@@ -3613,11 +3635,8 @@ impl TilingEngine {
                 continue; // sticky windows stay visible at all times
             }
             let _ = backend.show_window(wid.as_isize(), false);
-            // Remember that wiri hid it: see `sync_os_foreground`.
-            self.applied_state
-                .entry(wid)
-                .or_insert_with(AppliedState::unset)
-                .visible = false;
+            // Remember that wiri hid it, and when: see `sync_os_foreground`.
+            self.note_hidden(wid);
         }
 
         let mut shown: Vec<WindowId> = Vec::new();
@@ -3966,10 +3985,7 @@ impl TilingEngine {
         for wid in to_hide {
             // Authoritative, like for tiles: the shell may re-show a hidden window.
             let _ = backend.show_window(wid.as_isize(), false);
-            self.applied_state
-                .entry(wid)
-                .or_insert_with(AppliedState::unset)
-                .visible = false;
+            self.note_hidden(wid);
         }
         let mut newly_shown = false;
         for wid in to_show {
@@ -5421,10 +5437,7 @@ impl TilingEngine {
             {
                 self.win32_call_count += 1;
             }
-            self.applied_state
-                .entry(wid)
-                .or_insert_with(AppliedState::unset)
-                .visible = false;
+            self.note_hidden(wid);
         }
 
         // Re-scroll to the focused column
@@ -7649,6 +7662,9 @@ impl TilingEngine {
             "Restoring {} windows to original positions/styles",
             self.original_bounds.len()
         );
+        // From here on no layout pass runs: it would hide the windows of the other
+        // workspaces again before the process is gone.
+        self.shut_down = true;
 
         // Show every window wiri hid (inactive workspaces, the fullscreen
         // cover-up, parked columns are merely moved).  Before this a quit with
@@ -14895,6 +14911,24 @@ mod tests {
         assert_eq!(engine.focused_output(), Some(a));
     }
 
+    #[test]
+    fn test_nothing_is_hidden_again_once_the_windows_have_been_restored() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.apply_layout_for_monitor(oid, &be);
+        assert!(engine.hidden_since.contains_key(&WindowId::new(101)));
+
+        engine.restore_all(&be);
+        // A pass that runs after the restore (the reconciler does, until the process is
+        // gone) must not hide the window of the other workspace again.
+        engine.hidden_since.clear();
+        let calls = engine.win32_call_count;
+        engine.apply_layout_for_monitor(oid, &be);
+        engine.apply_all(&be);
+        assert!(engine.hidden_since.is_empty(), "no window was hidden again");
+        assert_eq!(engine.win32_call_count, calls, "and no window was touched");
+    }
+
     // --- hide-method: a cloaked window can be reached through Alt+Tab or the taskbar ---
 
     #[test]
@@ -14935,6 +14969,24 @@ mod tests {
             engine.monitors().get(&oid).unwrap().focus_window,
             Some(hidden)
         );
+    }
+
+    #[test]
+    fn test_switching_workspace_notes_when_the_windows_were_hidden() {
+        // The pass that hides inactive windows is not the only way a window gets hidden:
+        // leaving a workspace hides its windows itself, and that must be noted too, or a
+        // report that such a window is the foreground window is taken for the OS picking a
+        // replacement however late it comes.
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.apply_layout_for_monitor(oid, &be); // window 100 is shown, 101 is hidden
+        engine.hidden_since.clear();
+        engine.switch_workspace(1, &be);
+        assert!(
+            engine.hidden_since.contains_key(&WindowId::new(100)),
+            "the window of the workspace that was left"
+        );
+        assert!(!engine.hidden_since.contains_key(&WindowId::new(101)));
     }
 
     #[test]

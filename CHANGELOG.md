@@ -151,6 +151,13 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   `hidden.json` marks cloaked windows, so a wiri that is killed while windows are cloaked is
   followed by one that uncloaks them (also a quit and a panic), and a window that is visible to the
   system but cloaked is restored.  The default stays `hide`.
+- **Quit leaves the windows shown.**  A layout pass that ran between the restore and the end of the
+  process (the 750 ms reconciler and the IPC server keep running until then) hid the windows of the
+  other workspaces once more, so a quit could leave them hidden (with `hide-method "cloak"`, whose
+  restore takes a few milliseconds per window, the live test hit it every time).  After the restore
+  the engine lays nothing out any more.  A restart that shows the windows a killed wiri cloaked now
+  also waits until DWM has dropped the cloak before it enumerates the desktop (a cloaked window is
+  not tiled), and a window the shell would not uncloak is tried again at the next show.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal
