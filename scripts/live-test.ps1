@@ -48,7 +48,9 @@
 param(
     [string]$Bin = 'C:\wiri-dev\wiri\target\release',
     [string]$Out = 'C:\wiri-dev\live',
-    [int]$LockWaitMinutes = 0
+    # WIRI_LIVE_LOCK_WAIT_MIN lets a caller that cannot pass arguments (the official cycle goes through
+    # record-live.ps1) queue for the desktop too.
+    [int]$LockWaitMinutes = $(if ($env:WIRI_LIVE_LOCK_WAIT_MIN) { [int]$env:WIRI_LIVE_LOCK_WAIT_MIN } else { 0 })
 )
 
 $ErrorActionPreference = 'Continue'
