@@ -110,7 +110,12 @@ wiri exposes a named pipe at `\\.\pipe\wiri_control`. The bundled `wiri-ctl` CLI
 
 ```pwsh
 wiri-ctl state                       # current engine state
-wiri-ctl windows                     # list managed windows
+wiri-ctl windows                     # the managed windows, in niri's shape
+wiri-ctl window-list                 # the managed windows, in wiri's older shape
+wiri-ctl workspaces                  # the workspaces, in niri's shape
+wiri-ctl focused-window              # the window that has the focus
+wiri-ctl overview-state              # whether the overview is open
+wiri-ctl version                     # the version of the daemon
 wiri-ctl switch-workspace 2
 wiri-ctl focus-window <hwnd>
 wiri-ctl close-window <hwnd>

@@ -3,7 +3,7 @@
   "$id": "https://github.com/jolionlands/wiri/raw/main/docs/IPC_SCHEMA.json",
   "title": "wiri IPC protocol",
   "description": "JSON Schema for every IpcMessage request and IpcEvent variant in the wiri window manager named-pipe IPC. Both types use serde adjacent tagging: {\"type\": \"<variant>\", \"data\": {...}}.",
-  "version": "1.1",
+  "version": "1.2",
   "$defs": {
 
     "WindowInfoIpc": {
@@ -140,6 +140,56 @@
       "properties": {
         "success": { "const": true },
         "result":  {}
+      }
+    },
+
+    "WorkspacesResponse": {
+      "type": "object",
+      "description": "The result of the workspaces request: the workspaces of every monitor, in niri's shape.",
+      "required": ["workspaces"],
+      "properties": {
+        "workspaces": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceIpc" } }
+      }
+    },
+
+    "WindowsResponse": {
+      "type": "object",
+      "description": "The result of the windows request: every window wiri manages, in niri's shape.",
+      "required": ["windows"],
+      "properties": {
+        "windows": { "type": "array", "items": { "$ref": "#/$defs/WindowIpc" } }
+      }
+    },
+
+    "FocusedWindowResponse": {
+      "type": "object",
+      "description": "The result of the focused_window request: the focused window, or null when no managed window has the focus.",
+      "required": ["focused_window"],
+      "properties": {
+        "focused_window": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/WindowIpc" }
+          ]
+        }
+      }
+    },
+
+    "OverviewStateResponse": {
+      "type": "object",
+      "description": "The result of the overview_state request.",
+      "required": ["is_open"],
+      "properties": {
+        "is_open": { "type": "boolean", "description": "True while the overview is open." }
+      }
+    },
+
+    "VersionResponse": {
+      "type": "object",
+      "description": "The result of the version request: the version of the running daemon.",
+      "required": ["version"],
+      "properties": {
+        "version": { "type": "string", "description": "The crate version, and the commit it was built from when there is one." }
       }
     },
 
@@ -917,6 +967,41 @@
           "type": "object",
           "required": ["type"],
           "properties": { "type": { "const": "get_bindings" } }
+        },
+
+        {
+          "description": "niri Workspaces: the workspaces of every monitor, in niri's shape. Answered from the engine's current state.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "workspaces" } }
+        },
+
+        {
+          "description": "niri Windows: the windows wiri manages, in niri's shape. Answered from the engine's current state.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "windows" } }
+        },
+
+        {
+          "description": "niri FocusedWindow: the window that has the keyboard focus, in niri's shape (null when no managed window has it).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "focused_window" } }
+        },
+
+        {
+          "description": "niri OverviewState: whether the overview is open.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "overview_state" } }
+        },
+
+        {
+          "description": "niri Version: the version of the running daemon.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "version" } }
         }
 
       ]

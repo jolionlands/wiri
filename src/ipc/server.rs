@@ -5,7 +5,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use super::messages::{BindingInfo, IpcEvent, IpcMessage, MonitorInfo, WorkspaceInfo};
+use super::messages::{
+    BindingInfo, FocusedWindowResponse, IpcEvent, IpcMessage, MonitorInfo, OverviewStateResponse,
+    VersionResponse, WorkspaceInfo, WindowsResponse, WorkspacesResponse,
+};
 use super::state::{self, IpcSnapshot};
 use super::PIPE_PATH;
 use crate::layout::TilingEngine;
@@ -133,6 +136,14 @@ impl IpcServer {
         // A process id can be given to another process once the first one has gone.
         mirror.app_ids.retain(|pid, _| live.contains(pid));
         Some(snapshot)
+    }
+
+    /// The state as it is now, in the shape the event stream describes it: the
+    /// same description a new subscriber is told first, built by the same code
+    /// ([`describe`]).  `None` before the engine is connected.
+    fn snapshot_now(&self) -> Option<IpcSnapshot> {
+        let mut mirror = self.mirror.lock();
+        self.describe(&mut mirror)
     }
 
     /// Send the subscribers what changed since they were last told.
@@ -502,6 +513,54 @@ impl IpcServer {
                 } else {
                     serde_json::json!({"success": true, "result": []})
                 }
+            }
+            // ---- niri's request/reply forms (IPC schema 1.2) ----
+            //
+            // They answer with the same description the event stream is built
+            // from: the windows and the workspaces as niri names them.
+            IpcMessage::Workspaces => {
+                let reply = WorkspacesResponse {
+                    workspaces: self
+                        .snapshot_now()
+                        .map(|snapshot| snapshot.workspaces)
+                        .unwrap_or_default(),
+                };
+                serde_json::json!({"success": true, "result": reply})
+            }
+            IpcMessage::Windows => {
+                let reply = WindowsResponse {
+                    windows: self
+                        .snapshot_now()
+                        .map(|snapshot| snapshot.windows)
+                        .unwrap_or_default(),
+                };
+                serde_json::json!({"success": true, "result": reply})
+            }
+            IpcMessage::FocusedWindow => {
+                let focused_window = self.snapshot_now().and_then(|snapshot| {
+                    let id = snapshot.focused_window()?;
+                    snapshot
+                        .windows
+                        .into_iter()
+                        .find(|window| window.id == id)
+                });
+                let reply = FocusedWindowResponse { focused_window };
+                serde_json::json!({"success": true, "result": reply})
+            }
+            IpcMessage::OverviewState => {
+                let reply = OverviewStateResponse {
+                    is_open: self
+                        .snapshot_now()
+                        .map(|snapshot| snapshot.overview_open)
+                        .unwrap_or(false),
+                };
+                serde_json::json!({"success": true, "result": reply})
+            }
+            IpcMessage::Version => {
+                let reply = VersionResponse {
+                    version: crate::version_string(),
+                };
+                serde_json::json!({"success": true, "result": reply})
             }
             IpcMessage::SwitchWorkspace { id } => {
                 info!("IPC: Switch to workspace {}", id);
@@ -1822,6 +1881,12 @@ fn is_query(message: &IpcMessage) -> bool {
             | IpcMessage::ListSnapshots
             | IpcMessage::LayoutExport
             | IpcMessage::SubscribeEvents { .. }
+            // The niri-shaped requests only read the state.
+            | IpcMessage::Workspaces
+            | IpcMessage::Windows
+            | IpcMessage::FocusedWindow
+            | IpcMessage::OverviewState
+            | IpcMessage::Version
     )
 }
 
@@ -2443,5 +2508,99 @@ mod tests {
             IpcEvent::OverviewOpenedOrClosed { is_open } => assert!(*is_open),
             other => panic!("unexpected {:?}", other),
         }
+    }
+
+    // ---- niri's request/reply forms (IPC schema 1.2) ----
+
+    #[test]
+    fn the_niri_requests_answer_with_the_state_the_stream_would_tell() {
+        let (server, engine) = server_with_windows(&[100, 101]);
+        let backend = BackendHandle::default_for_test();
+        engine.write().sync_os_foreground(WindowId::new(101), &backend);
+
+        // The workspaces, in niri's shape.
+        let reply = server.process_message(IpcMessage::Workspaces);
+        assert_eq!(reply["success"], true, "{}", reply);
+        let workspaces = reply["result"]["workspaces"]
+            .as_array()
+            .expect("the workspaces");
+        assert!(!workspaces.is_empty(), "{}", reply);
+        let workspace = &workspaces[0];
+        for field in [
+            "id",
+            "idx",
+            "name",
+            "output",
+            "is_active",
+            "is_focused",
+            "active_window_id",
+        ] {
+            assert!(
+                workspace.get(field).is_some(),
+                "workspace.{} is missing: {}",
+                field,
+                workspace
+            );
+        }
+
+        // The windows, in niri's shape: the same objects the stream tells.
+        let reply = server.process_message(IpcMessage::Windows);
+        assert_eq!(reply["success"], true, "{}", reply);
+        let windows = reply["result"]["windows"].as_array().expect("the windows");
+        assert_eq!(windows.len(), 2, "{}", reply);
+        assert_eq!(windows[0]["id"], serde_json::json!(100));
+        assert_eq!(windows[1]["id"], serde_json::json!(101));
+        assert_eq!(windows[1]["is_focused"], serde_json::json!(true));
+
+        // The focused window: the same object, on its own.
+        let reply = server.process_message(IpcMessage::FocusedWindow);
+        assert_eq!(reply["success"], true, "{}", reply);
+        assert_eq!(reply["result"]["focused_window"]["id"], serde_json::json!(101));
+
+        // The overview.
+        let reply = server.process_message(IpcMessage::OverviewState);
+        assert_eq!(reply["result"]["is_open"], serde_json::json!(false), "{}", reply);
+        engine.write().enter_overview(&backend);
+        let reply = server.process_message(IpcMessage::OverviewState);
+        assert_eq!(reply["result"]["is_open"], serde_json::json!(true), "{}", reply);
+
+        // The version of the daemon that answers.
+        let reply = server.process_message(IpcMessage::Version);
+        assert_eq!(reply["success"], true, "{}", reply);
+        let version = reply["result"]["version"].as_str().expect("a version");
+        assert!(
+            version.contains(env!("CARGO_PKG_VERSION")),
+            "the version names the crate: {}",
+            version
+        );
+    }
+
+    #[test]
+    fn the_niri_requests_answer_with_nothing_before_the_engine_is_there() {
+        let server = IpcServer::new();
+        assert_eq!(
+            server.process_message(IpcMessage::Workspaces)["result"]["workspaces"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            server.process_message(IpcMessage::Windows)["result"]["windows"],
+            serde_json::json!([])
+        );
+        assert!(
+            server.process_message(IpcMessage::FocusedWindow)["result"]["focused_window"].is_null()
+        );
+        assert_eq!(
+            server.process_message(IpcMessage::OverviewState)["result"]["is_open"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn the_niri_requests_only_read_the_state() {
+        assert!(is_query(&IpcMessage::Workspaces));
+        assert!(is_query(&IpcMessage::Windows));
+        assert!(is_query(&IpcMessage::FocusedWindow));
+        assert!(is_query(&IpcMessage::OverviewState));
+        assert!(is_query(&IpcMessage::Version));
     }
 }

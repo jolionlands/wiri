@@ -1,6 +1,6 @@
 # wiri IPC Protocol — Integration Reference
 
-**Schema version: 1.1**  
+**Schema version: 1.2**  
 Last updated: 2026-10-25
 
 This document is the canonical reference for third-party integrations with wiri.
@@ -475,6 +475,106 @@ the pipe, with the arguments it takes in a `binds {}` line.  The message is also
 
 Success is `{"success":true}`: the action ran as if its key had been pressed.  Whatever it changed
 (the focus, the workspaces, the windows) reaches `subscribe_events` clients as events.
+
+---
+
+### 4.9 niri's request/reply forms
+
+Five requests answer with **niri's** shapes, not wiri's own: the same objects the
+event stream describes (niri's `Workspace` and `Window`), so that a client written
+against niri reads them without knowing wiri.  They are answered from the engine's
+current state, with the same code that builds the state a new subscriber of the
+event stream is told first.
+
+Each of them takes no fields.
+
+| Request | Wire name | `result` |
+|---|---|---|
+| `Workspaces` | `workspaces` | `{"workspaces":[ ...WorkspaceIpc... ]}` |
+| `Windows` | `windows` | `{"windows":[ ...WindowIpc... ]}` |
+| `FocusedWindow` | `focused_window` | `{"focused_window": ...WindowIpc... \| null}` |
+| `OverviewState` | `overview_state` | `{"is_open":true\|false}` |
+| `Version` | `version` | `{"version":"0.1.0 (commit 1234567)"}` |
+
+niri's own spelling of the request (`"Workspaces"`, `"Windows"`,
+`"FocusedWindow"`, `"OverviewState"`, `"Version"`) is read as well.
+
+The workspace objects are niri's `Workspace`:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `integer` | Unique among the workspaces of all monitors, small enough for a JavaScript number.  The same number the event stream uses |
+| `idx` | `integer` | The number of the workspace on its monitor, counted from 1 at the top: what `focus-workspace 2` means |
+| `name` | `string \| null` | The name from the config; **null** when the workspace has none |
+| `output` | `string \| null` | The device name of the monitor (`\\.\DISPLAY1`); **null** when the engine was not told |
+| `is_active` | `boolean` | The workspace is the active one of its monitor |
+| `is_focused` | `boolean` | The workspace is the active one of the focused monitor |
+| `active_window_id` | `integer \| null` | The window that is the active one of the workspace; **null** when it has none |
+
+The window objects are niri's `Window`, plus what wiri adds:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `integer` | The window handle (HWND) as a number |
+| `title` | `string \| null` | The title; **null** while the window has none |
+| `app_id` | `string \| null` | The file name of the window's program (`WindowsTerminal.exe`): the closest thing Windows has to a Wayland `app_id`.  **null** when it cannot be read (an elevated program) |
+| `pid` | `integer \| null` | The process id; **null** when it is unknown |
+| `workspace_id` | `integer \| null` | The workspace the window is on; **null** for a floating window whose monitor is not connected |
+| `is_focused` | `boolean` | The window has the keyboard focus |
+| `is_floating` | `boolean` | The window floats instead of being tiled |
+| `is_urgent` | `boolean` | The window asks for attention |
+| `layout` | `object` | `{"pos_in_scrolling_layout":[column,tile]}` (both counted from 1), **null** for a floating or minimized window |
+| `class_name` | `string` | The Win32 window class (wiri's addition) |
+| `output` | `string \| null` | The device name of the monitor the window is on (wiri's addition) |
+| `is_fullscreen` | `boolean` | The window covers its monitor (wiri's addition) |
+| `is_maximized` | `boolean` | Maximized to the edges of the work area (wiri's addition) |
+| `is_minimized` | `boolean` | The window is minimized (wiri's addition) |
+
+Two niri fields have no Windows meaning and are therefore **not** reported:
+`focus_timestamp` (when the window was focused — Windows has no such stamp) and
+`focus_timestamp`-like timing of the overview.  Everything else that Windows
+cannot tell is `null`, never missing.
+
+**Examples**
+
+```json
+{"type":"workspaces"}
+```
+```json
+{"success":true,"result":{"workspaces":[{"id":4294967297,"idx":1,"name":null,"output":"\\\\.\\DISPLAY1","is_urgent":false,"is_active":true,"is_focused":true,"active_window_id":328756}]}}
+```
+
+```json
+{"type":"windows"}
+```
+```json
+{"success":true,"result":{"windows":[{"id":328756,"title":"Terminal","app_id":"WindowsTerminal.exe","pid":4242,"workspace_id":4294967297,"is_focused":true,"is_floating":false,"is_urgent":false,"layout":{"pos_in_scrolling_layout":[1,1]},"class_name":"CASCADIA_HOSTING_WINDOW_CLASS","output":"\\\\.\\DISPLAY1","is_fullscreen":false,"is_maximized":false,"is_minimized":false}]}}
+```
+
+```json
+{"type":"focused_window"}
+```
+```json
+{"success":true,"result":{"focused_window":{"id":328756,"title":"Terminal","app_id":"WindowsTerminal.exe","pid":4242,"workspace_id":4294967297,"is_focused":true,"is_floating":false,"is_urgent":false,"layout":{"pos_in_scrolling_layout":[1,1]},"class_name":"CASCADIA_HOSTING_WINDOW_CLASS","output":"\\\\.\\DISPLAY1","is_fullscreen":false,"is_maximized":false,"is_minimized":false}}}
+```
+
+```json
+{"type":"overview_state"}
+```
+```json
+{"success":true,"result":{"is_open":false}}
+```
+
+```json
+{"type":"version"}
+```
+```json
+{"success":true,"result":{"version":"0.1.0 (commit 1234567)"}}
+```
+
+The `wiri-ctl` subcommands are `wiri-ctl workspaces`, `wiri-ctl windows`,
+`wiri-ctl focused-window`, `wiri-ctl overview-state` and `wiri-ctl version`;
+each of them prints the readable form, and `--json` prints the raw reply.
 
 ---
 
@@ -1164,7 +1264,11 @@ wiri-ctl events --stream | jq -r '.type + " " + (.data | tostring)'
 
 ## 8. Versioning Policy
 
-The schema is currently at **version 1.1**.  1.1 (2026-10-25) adds niri's event stream (§6.2: the
+The schema is currently at **version 1.2**.  1.2 (2026-10-25) adds niri's request/reply forms
+(§4.9: `workspaces`, `windows`, `focused_window`, `overview_state` and `version`, each answering with
+niri's own shapes).
+
+1.1 (2026-10-25) adds niri's event stream (§6.2: the
 state first, then `windows_changed`, `window_opened_or_changed`, `window_focus_changed`,
 `window_urgency_changed`, `window_layouts_changed`, `workspace_urgency_changed`,
 `workspace_active_window_changed`, `overview_opened_or_closed`), the `id` of `window_closed`, the

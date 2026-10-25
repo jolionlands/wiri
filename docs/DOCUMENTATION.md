@@ -518,8 +518,8 @@ A fullscreen or maximized window stays a participant of the strip, like in niri:
   maximized to the edges instead; the button again gives the window its tile back.  A window that opens
   already maximized or as big as its monitor is treated the same.
 * The window rules `open-fullscreen`, `open-maximized` (the column as wide as the view) and
-  `open-maximized-to-edges` do the same when a window opens.  `wiri-ctl windows` reports `fullscreen` and
-  `maximized` for every window.
+  `open-maximized-to-edges` do the same when a window opens.  `wiri-ctl window-list` reports
+  `fullscreen` and `maximized` for every window.
 
 ### Workspaces
 
@@ -646,6 +646,12 @@ wiri-ctl list                 # List all windows
 wiri-ctl focus 123456         # Focus a window
 wiri-ctl close 123456         # Close a window
 wiri-ctl state                # Dump engine state
+wiri-ctl windows              # The managed windows, in niri's shape
+wiri-ctl window-list          # The managed windows, in wiri's older shape
+wiri-ctl workspaces           # The workspaces, in niri's shape
+wiri-ctl focused-window       # The window that has the keyboard focus
+wiri-ctl overview-state       # Whether the overview is open
+wiri-ctl version              # The version of the daemon
 wiri-ctl action focus-column-left
 wiri-ctl action set-column-width +10%
 wiri-ctl action fullscreen-window --id 123456

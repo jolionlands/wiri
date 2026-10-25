@@ -5,6 +5,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### IPC 1.2 — niri's request/reply forms (2026-10-25)
+- **Five requests answer with niri's shapes.**  `workspaces`, `windows`, `focused_window`,
+  `overview_state` and `version` are answered from the engine's current state, with the
+  same description the event stream is built from: niri's `Workspace` and `Window` objects
+  (`id`, `idx`, `name`, `output`, `is_active`, `is_focused`, `active_window_id`; `id`,
+  `title`, `app_id`, `pid`, `workspace_id`, `is_focused`, `is_floating`, plus the
+  `is_urgent` and `layout` the stream already sends).  What Windows cannot tell is
+  `null`, never missing: a workspace without a name, the program of an elevated window,
+  the process of a window wiri does not know, the workspace of a float whose monitor is
+  away.  niri's `focus_timestamp` has no Windows meaning and is therefore not reported.
+  niri's own spelling of the request (`"Workspaces"`, `"Windows"`, `"FocusedWindow"`,
+  `"OverviewState"`, `"Version"`) is read as well.  The IPC schema is 1.2.
+- **`wiri-ctl workspaces`, `windows`, `focused-window`, `overview-state` and `version`.**
+  Each of them prints a readable table (or a line), and `--json` prints the raw reply.
+  `wiri-ctl windows` now answers with niri's shape; the older list (the class, the
+  geometry, the place in the strip) is `wiri-ctl window-list` now.
+
 ### Phase 2A — a real config parser, window rules, fullscreen, IPC (2026-10-25)
 - **A real KDL config parser with visible errors.**  The line scanner is gone.  `src/config/kdl.rs` reads
   KDL (nested blocks, `/-` slashdash, `/* */`, raw strings `r#"..."#`, escapes, numbers, a BOM, UTF-16

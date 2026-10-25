@@ -173,8 +173,27 @@ enum Commands {
     /// Get the current window manager state
     State,
 
-    /// List all managed windows
+    /// List the windows wiri manages, in niri's shape: the id is the window
+    /// handle and the fields are the ones niri's `Windows` request answers.
     Windows,
+
+    /// List the managed windows in wiri's older shape: the handle, the class,
+    /// the program, the geometry and the place in the strip.
+    WindowList,
+
+    /// List the workspaces of every monitor, in niri's shape: the number on
+    /// the monitor, the name, the monitor and the flags.
+    Workspaces,
+
+    /// The window that has the keyboard focus, in niri's shape.
+    FocusedWindow,
+
+    /// Whether the overview is open.
+    OverviewState,
+
+    /// The version of the running wiri daemon (the daemon's, not this CLI's:
+    /// `wiri-ctl --version` is the CLI's).
+    Version,
 
     /// Switch to a workspace by ID (1-9)
     SwitchWorkspace { id: i32 },
@@ -489,9 +508,29 @@ fn real_main() -> Result<()> {
         return validate_config_subcommand(path.as_deref(), cli.json);
     }
 
-    let message = match cli.command {
+    let message = request_for(cli.command);
+
+    let response = send_ipc_message(&message, cli.timeout)?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+
+    print_human_response(&message, &response);
+    Ok(())
+}
+
+/// The request a subcommand sends to the daemon.
+fn request_for(command: Commands) -> IpcMessage {
+    match command {
         Commands::State => IpcMessage::GetState,
-        Commands::Windows => IpcMessage::WindowList,
+        Commands::Windows => IpcMessage::Windows,
+        Commands::WindowList => IpcMessage::WindowList,
+        Commands::Workspaces => IpcMessage::Workspaces,
+        Commands::FocusedWindow => IpcMessage::FocusedWindow,
+        Commands::OverviewState => IpcMessage::OverviewState,
+        Commands::Version => IpcMessage::Version,
         Commands::SwitchWorkspace { id } => IpcMessage::SwitchWorkspace { id },
         Commands::FocusWindow { hwnd } => IpcMessage::FocusWindow { window_hwnd: hwnd },
         Commands::CloseWindow { hwnd } => IpcMessage::CloseWindow { window_hwnd: hwnd },
@@ -598,17 +637,7 @@ fn real_main() -> Result<()> {
             pixels,
             monitor_id,
         },
-    };
-
-    let response = send_ipc_message(&message, cli.timeout)?;
-
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        return Ok(());
     }
-
-    print_human_response(&message, &response);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +753,12 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
     match req {
         IpcMessage::GetState => print_state(resp),
         IpcMessage::WindowList => print_window_list(resp),
+        // The niri-shaped requests.
+        IpcMessage::Workspaces => print_workspaces(resp),
+        IpcMessage::Windows => print_windows(resp),
+        IpcMessage::FocusedWindow => print_focused_window(resp),
+        IpcMessage::OverviewState => print_overview_state(resp),
+        IpcMessage::Version => print_version(resp),
         IpcMessage::ReloadConfig => outln!("Configuration reloaded."),
         IpcMessage::Quit => outln!("Shutdown request sent to wiri."),
         IpcMessage::SwitchWorkspace { id } => {
@@ -959,6 +994,181 @@ fn print_window_list(resp: &serde_json::Value) {
         result.len(),
         if result.len() == 1 { "" } else { "s" }
     );
+}
+
+/// "yes", "no" or "-" for a flag of a reply.
+fn yes_no(value: Option<&serde_json::Value>) -> &'static str {
+    match value.and_then(|v| v.as_bool()) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    }
+}
+
+/// Format the reply of the `workspaces` request: niri's workspaces.
+fn print_workspaces(resp: &serde_json::Value) {
+    let result = resp.get("result").cloned().unwrap_or(serde_json::json!({}));
+    let workspaces = result
+        .get("workspaces")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if workspaces.is_empty() {
+        outln!("No workspaces.");
+        return;
+    }
+
+    outln!(
+        "  {:<5}  {:<16}  {:<16}  {:<7}  {:<8}  {}",
+        "IDX", "NAME", "OUTPUT", "ACTIVE", "FOCUSED", "WINDOW"
+    );
+    outln!(
+        "  {:<5}  {:<16}  {:<16}  {:<7}  {:<8}  {}",
+        "─".repeat(5),
+        "─".repeat(16),
+        "─".repeat(16),
+        "─".repeat(7),
+        "─".repeat(8),
+        "─".repeat(10),
+    );
+
+    for workspace in &workspaces {
+        let idx = workspace.get("idx").and_then(|v| v.as_u64()).unwrap_or(0);
+        let name = workspace.get("name").and_then(|v| v.as_str()).unwrap_or("-");
+        let output = workspace.get("output").and_then(|v| v.as_str()).unwrap_or("-");
+        let window = match workspace.get("active_window_id").and_then(|v| v.as_u64()) {
+            Some(id) => id.to_string(),
+            None => "-".to_string(),
+        };
+        outln!(
+            "  {:<5}  {:<16}  {:<16}  {:<7}  {:<8}  {}",
+            idx,
+            truncate(name, 16),
+            truncate(output, 16),
+            yes_no(workspace.get("is_active")),
+            yes_no(workspace.get("is_focused")),
+            window
+        );
+    }
+    outln!();
+    outln!(
+        "  {} workspace{}",
+        workspaces.len(),
+        if workspaces.len() == 1 { "" } else { "s" }
+    );
+}
+
+/// Format the reply of the `windows` request: niri's windows.
+fn print_windows(resp: &serde_json::Value) {
+    let result = resp.get("result").cloned().unwrap_or(serde_json::json!({}));
+    let windows = result
+        .get("windows")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if windows.is_empty() {
+        outln!("No managed windows.");
+        return;
+    }
+
+    let term_cols = terminal_cols().unwrap_or(120) as usize;
+    let title_w = term_cols.saturating_sub(10 + 7 + 20 + 6 + 6).max(20);
+
+    outln!(
+        "  {:>10}  {:>6}  {:<20}  {:<6}  {:<5}  {}",
+        "ID", "PID", "APP", "WORKSPACE", "FLAGS", "TITLE"
+    );
+    outln!(
+        "  {:>10}  {:>6}  {:<20}  {:<6}  {:<5}  {}",
+        "─".repeat(10),
+        "─".repeat(6),
+        "─".repeat(20),
+        "─".repeat(6),
+        "─".repeat(5),
+        "─".repeat(title_w.min(40)),
+    );
+
+    for window in &windows {
+        let id = window.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let pid = window.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+        let app = window.get("app_id").and_then(|v| v.as_str()).unwrap_or("-");
+        let workspace = match window.get("workspace_id").and_then(|v| v.as_u64()) {
+            Some(id) => id.to_string(),
+            None => "-".to_string(),
+        };
+        let mut flags = Vec::new();
+        if window.get("is_focused").and_then(|v| v.as_bool()) == Some(true) {
+            flags.push("focus");
+        }
+        if window.get("is_floating").and_then(|v| v.as_bool()) == Some(true) {
+            flags.push("float");
+        }
+        if window.get("is_urgent").and_then(|v| v.as_bool()) == Some(true) {
+            flags.push("urgent");
+        }
+        let title = window.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        outln!(
+            "  {:>10}  {:>6}  {:<20}  {:<6}  {:<5}  {}",
+            id,
+            pid,
+            truncate(app, 20),
+            workspace,
+            if flags.is_empty() {
+                "-".to_string()
+            } else {
+                flags.join(",")
+            },
+            truncate(title, title_w)
+        );
+    }
+    outln!();
+    outln!(
+        "  {} window{}",
+        windows.len(),
+        if windows.len() == 1 { "" } else { "s" }
+    );
+}
+
+/// Format the reply of the `focused_window` request: the window that has the
+/// keyboard focus.
+fn print_focused_window(resp: &serde_json::Value) {
+    let result = resp.get("result").cloned().unwrap_or(serde_json::json!({}));
+    let Some(window) = result.get("focused_window").filter(|w| w.is_object()) else {
+        outln!("No window is focused.");
+        return;
+    };
+    let id = window.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let title = window.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let app = window.get("app_id").and_then(|v| v.as_str()).unwrap_or("-");
+    let pid = window.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+    let workspace = match window.get("workspace_id").and_then(|v| v.as_u64()) {
+        Some(id) => id.to_string(),
+        None => "-".to_string(),
+    };
+    outln!("Focused window {} (0x{:x}): {}", id, id, title);
+    outln!("  program   : {}", app);
+    outln!("  pid       : {}", pid);
+    outln!("  workspace : {}", workspace);
+}
+
+/// Format the reply of the `overview_state` request.
+fn print_overview_state(resp: &serde_json::Value) {
+    let is_open = resp
+        .get("result")
+        .and_then(|r| r.get("is_open"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    outln!("Overview: {}.", if is_open { "open" } else { "closed" });
+}
+
+/// Format the reply of the `version` request: the version of the daemon.
+fn print_version(resp: &serde_json::Value) {
+    let version = resp
+        .get("result")
+        .and_then(|r| r.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    outln!("wiri {}", version);
 }
 
 /// Format `MonitorList` as a human-readable table — bounds, work area, DPI
@@ -1258,6 +1468,7 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
         event_types: event_types.clone(),
     };
 
+    // The pipe of this user in this session (see `wiri::ipc::pipe_path`).
     let pipe_wide: Vec<u16> = OsStr::new(PIPE_PATH)
         .encode_wide()
         .chain(std::iter::once(0u16))
@@ -1518,7 +1729,76 @@ fn split_quoted_words(words: Vec<String>) -> (Vec<String>, Vec<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_to_ascii, format_focus, split_quoted_words};
+    use super::{fold_to_ascii, format_focus, request_for, split_quoted_words, Cli};
+    use clap::Parser;
+    use wiri::ipc::IpcMessage;
+
+    /// The request a command line sends to the daemon.
+    fn request_of(args: &[&str]) -> IpcMessage {
+        let cli = Cli::try_parse_from(args).expect("the command line parses");
+        request_for(cli.command)
+    }
+
+    #[test]
+    fn the_niri_subcommands_ask_for_the_niri_requests() {
+        assert!(matches!(
+            request_of(&["wiri-ctl", "workspaces"]),
+            IpcMessage::Workspaces
+        ));
+        assert!(matches!(
+            request_of(&["wiri-ctl", "windows"]),
+            IpcMessage::Windows
+        ));
+        assert!(matches!(
+            request_of(&["wiri-ctl", "focused-window"]),
+            IpcMessage::FocusedWindow
+        ));
+        assert!(matches!(
+            request_of(&["wiri-ctl", "overview-state"]),
+            IpcMessage::OverviewState
+        ));
+        assert!(matches!(
+            request_of(&["wiri-ctl", "version"]),
+            IpcMessage::Version
+        ));
+        // The older list of windows (with the class, the geometry and the place
+        // in the strip) has a subcommand of its own now.
+        assert!(matches!(
+            request_of(&["wiri-ctl", "window-list"]),
+            IpcMessage::WindowList
+        ));
+    }
+
+    #[test]
+    fn the_niri_subcommands_take_no_arguments() {
+        for name in [
+            "workspaces",
+            "windows",
+            "focused-window",
+            "overview-state",
+            "version",
+        ] {
+            assert!(Cli::try_parse_from(["wiri-ctl", name]).is_ok(), "{}", name);
+            assert!(
+                Cli::try_parse_from(["wiri-ctl", name, "something"]).is_err(),
+                "{} takes no arguments",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn the_json_flag_works_before_and_after_the_subcommand() {
+        for args in [
+            ["wiri-ctl", "--json", "workspaces"],
+            ["wiri-ctl", "workspaces", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("the command line parses");
+            assert!(cli.json, "{:?}", args);
+        }
+        let cli = Cli::try_parse_from(["wiri-ctl", "workspaces"]).expect("parses");
+        assert!(!cli.json, "the readable output is the default");
+    }
 
     #[test]
     fn test_a_word_in_double_quotes_is_a_quoted_word() {

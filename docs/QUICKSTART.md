@@ -95,7 +95,9 @@ for scripting.
 
 ```powershell
 wiri-ctl state                          # summary block
-wiri-ctl windows                        # aligned columns
+wiri-ctl windows                        # the managed windows, in niri's shape
+wiri-ctl window-list                    # the managed windows, in wiri's older shape
+wiri-ctl workspaces                     # the workspaces, in niri's shape
 wiri-ctl switch-workspace 3
 wiri-ctl spawn 'wt.exe'
 wiri-ctl set-column-width 1/2

@@ -433,6 +433,34 @@ pub enum IpcMessage {
         #[serde(default)]
         monitor_id: Option<u64>,
     },
+
+    // ---- niri's request/reply forms (IPC schema 1.2) ----
+    //
+    // The requests above answer with wiri's own shapes.  These five answer
+    // with niri's: the same objects the event stream describes (niri's
+    // `Workspace` and `Window`), so that a client written against niri reads
+    // them without knowing wiri.
+
+    /// The workspaces of every monitor, in niri's shape.
+    #[serde(rename = "workspaces", alias = "Workspaces")]
+    Workspaces,
+
+    /// The windows wiri manages, in niri's shape.
+    #[serde(rename = "windows", alias = "Windows")]
+    Windows,
+
+    /// The window that has the keyboard focus, in niri's shape (`null` when no
+    /// window wiri manages has it).
+    #[serde(rename = "focused_window", alias = "FocusedWindow")]
+    FocusedWindow,
+
+    /// Whether the overview is open.
+    #[serde(rename = "overview_state", alias = "OverviewState")]
+    OverviewState,
+
+    /// The version of the running daemon.
+    #[serde(rename = "version", alias = "Version")]
+    Version,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -706,6 +734,44 @@ pub struct StateResponse {
     pub active_workspace: Option<String>,
 }
 
+// ---- the replies of the niri-shaped requests (IPC schema 1.2) ----
+//
+// Each of them is what the request answers with under `result`.  The window and
+// workspace objects are the ones the event stream describes (niri's `Window` and
+// `Workspace`), so a client reads the same fields in the reply and in the
+// stream.
+
+/// The reply of the `workspaces` request: the workspaces of every monitor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacesResponse {
+    pub workspaces: Vec<WorkspaceIpc>,
+}
+
+/// The reply of the `windows` request: every window wiri manages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsResponse {
+    pub windows: Vec<WindowIpc>,
+}
+
+/// The reply of the `focused_window` request: the window that has the keyboard
+/// focus, or `null` when no window wiri manages has it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusedWindowResponse {
+    pub focused_window: Option<WindowIpc>,
+}
+
+/// The reply of the `overview_state` request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverviewStateResponse {
+    pub is_open: bool,
+}
+
+/// The reply of the `version` request: the version of the running daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionResponse {
+    pub version: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +908,197 @@ mod tests {
             }
             other => panic!("unexpected variant: {:?}", other),
         }
+    }
+
+    // ---- the niri-shaped requests and their replies (IPC schema 1.2) ----
+
+    /// A window as the event stream describes it: everything wiri knows about it.
+    fn sample_window() -> WindowIpc {
+        WindowIpc {
+            id: 42,
+            title: Some("A window".into()),
+            app_id: Some("wt.exe".into()),
+            pid: Some(1234),
+            workspace_id: Some(7),
+            is_focused: true,
+            is_floating: false,
+            is_urgent: false,
+            layout: WindowLayoutIpc {
+                pos_in_scrolling_layout: Some((1, 1)),
+            },
+            class_name: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
+            output: Some("\\\\.\\DISPLAY1".into()),
+            is_fullscreen: false,
+            is_maximized: false,
+            is_minimized: false,
+        }
+    }
+
+    /// A workspace as the event stream describes it.
+    fn sample_workspace() -> WorkspaceIpc {
+        WorkspaceIpc {
+            id: 7,
+            idx: 1,
+            name: None,
+            output: Some("\\\\.\\DISPLAY1".into()),
+            is_urgent: false,
+            is_active: true,
+            is_focused: true,
+            active_window_id: Some(42),
+        }
+    }
+
+    #[test]
+    fn the_niri_requests_are_named_the_way_wiri_names_them() {
+        let cases = [
+            (IpcMessage::Workspaces, "workspaces"),
+            (IpcMessage::Windows, "windows"),
+            (IpcMessage::FocusedWindow, "focused_window"),
+            (IpcMessage::OverviewState, "overview_state"),
+            (IpcMessage::Version, "version"),
+        ];
+        for (message, name) in cases {
+            let json = serde_json::to_string(&message).expect("serialize");
+            assert_eq!(json, format!("{{\"type\":\"{}\"}}", name));
+            let back: IpcMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(json, serde_json::to_string(&back).expect("serialize"));
+        }
+    }
+
+    #[test]
+    fn the_niri_requests_are_read_in_niris_spelling_too() {
+        // niri writes the request as `"Workspaces"`; wiri writes `"workspaces"`.
+        for (raw, name) in [
+            (r#"{"type":"Workspaces"}"#, "workspaces"),
+            (r#"{"type":"Windows"}"#, "windows"),
+            (r#"{"type":"FocusedWindow"}"#, "focused_window"),
+            (r#"{"type":"OverviewState"}"#, "overview_state"),
+            (r#"{"type":"Version"}"#, "version"),
+        ] {
+            let parsed: IpcMessage = serde_json::from_str(raw).expect("deserialize");
+            assert_eq!(
+                serde_json::to_string(&parsed).expect("serialize"),
+                format!("{{\"type\":\"{}\"}}", name)
+            );
+        }
+    }
+
+    #[test]
+    fn the_workspaces_reply_has_the_fields_niri_has() {
+        let reply = WorkspacesResponse {
+            workspaces: vec![sample_workspace()],
+        };
+        let json = serde_json::to_value(&reply).expect("serialize");
+        let workspace = &json["workspaces"][0];
+        for field in [
+            "id",
+            "idx",
+            "name",
+            "output",
+            "is_active",
+            "is_focused",
+            "active_window_id",
+        ] {
+            assert!(
+                workspace.get(field).is_some(),
+                "workspace.{} is missing: {}",
+                field,
+                workspace
+            );
+        }
+        // A workspace without a name says so with null; the key is not left out.
+        assert!(workspace["name"].is_null());
+        assert_eq!(workspace["active_window_id"], serde_json::json!(42));
+        let back: WorkspacesResponse = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, reply);
+    }
+
+    #[test]
+    fn the_windows_reply_has_the_fields_niri_has() {
+        let reply = WindowsResponse {
+            windows: vec![sample_window()],
+        };
+        let json = serde_json::to_value(&reply).expect("serialize");
+        let window = &json["windows"][0];
+        for field in [
+            "id",
+            "title",
+            "app_id",
+            "pid",
+            "workspace_id",
+            "is_focused",
+            "is_floating",
+        ] {
+            assert!(
+                window.get(field).is_some(),
+                "window.{} is missing: {}",
+                field,
+                window
+            );
+        }
+        assert_eq!(window["id"], serde_json::json!(42));
+        assert_eq!(window["workspace_id"], serde_json::json!(7));
+        let back: WindowsResponse = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, reply);
+    }
+
+    #[test]
+    fn what_windows_cannot_tell_is_null_and_not_missing() {
+        // A program whose name cannot be read (an elevated one), a window whose
+        // process is unknown, a floating window on a monitor that is away: the
+        // field is there and says "unknown".
+        let mut window = sample_window();
+        window.app_id = None;
+        window.pid = None;
+        window.workspace_id = None;
+        window.title = None;
+        let json = serde_json::to_value(WindowsResponse {
+            windows: vec![window],
+        })
+        .expect("serialize");
+        let window = &json["windows"][0];
+        for field in ["title", "app_id", "pid", "workspace_id"] {
+            assert!(
+                window.get(field).is_some(),
+                "window.{} is missing: {}",
+                field,
+                window
+            );
+            assert!(window[field].is_null(), "window.{} should be null", field);
+        }
+    }
+
+    #[test]
+    fn the_focused_window_reply_is_null_when_no_window_is_focused() {
+        let reply = FocusedWindowResponse { focused_window: None };
+        let json = serde_json::to_value(&reply).expect("serialize");
+        assert!(json.get("focused_window").is_some(), "{}", json);
+        assert!(json["focused_window"].is_null());
+        let back: FocusedWindowResponse = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, reply);
+
+        let reply = FocusedWindowResponse {
+            focused_window: Some(sample_window()),
+        };
+        let json = serde_json::to_value(&reply).expect("serialize");
+        assert_eq!(json["focused_window"]["id"], serde_json::json!(42));
+        let back: FocusedWindowResponse = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, reply);
+    }
+
+    #[test]
+    fn the_overview_and_the_version_say_what_they_are() {
+        let json = serde_json::to_value(OverviewStateResponse { is_open: true }).expect("serialize");
+        assert_eq!(json["is_open"], serde_json::json!(true));
+        let back: OverviewStateResponse = serde_json::from_value(json).expect("deserialize");
+        assert!(back.is_open);
+
+        let json = serde_json::to_value(VersionResponse {
+            version: "0.1.0 (commit 1234567)".into(),
+        })
+        .expect("serialize");
+        assert_eq!(json["version"], serde_json::json!("0.1.0 (commit 1234567)"));
+        let back: VersionResponse = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.version, "0.1.0 (commit 1234567)");
     }
 }
