@@ -1,4 +1,5 @@
 pub mod error;
+pub mod kdl;
 pub mod loader;
 pub mod parse;
 pub mod types;

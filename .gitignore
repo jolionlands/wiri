@@ -32,3 +32,6 @@ empty.in
 
 # Unused local build helper (hardcodes one user's Windows SDK path)
 link.bat
+
+# Local scratch helpers (sync to the test laptop, evidence); never committed
+/.scratch/
