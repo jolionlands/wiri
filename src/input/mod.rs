@@ -1,21 +1,20 @@
 pub mod dispatch;
 pub mod focus;
-pub mod keyboard;
-pub mod pointer;
 pub mod grab;
 pub mod hotkey;
+pub mod keyboard;
 pub mod low_level_hook;
 pub mod mouse;
+pub mod pointer;
 pub mod snap_guide;
 pub mod touch;
 
 pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
 pub use hotkey::{HotkeyBinding, HotkeyId};
 pub use low_level_hook::{
-    begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab,
-    current_grab, is_grab_active, last_press_was_repeat,
-    start_keyboard_hook, start_mouse_hook, stop_keyboard_hook,
-    stop_mouse_hook, GrabState,
+    begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab, current_grab,
+    is_grab_active, last_press_was_repeat, start_keyboard_hook, start_mouse_hook,
+    stop_keyboard_hook, stop_mouse_hook, GrabState,
 };
 pub use mouse::{MouseFocusConfig, MouseTracker};
 pub use touch::{
@@ -452,7 +451,9 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         "center-column" => Some(Action::CenterColumn),
         // niri: `set-column-width "50%"`, `"+10%"`, `"1200"`; the wiri spellings
         // `"1/3"`, `"full"`, `"cycle"` keep working.
-        "set-column-width" | "set-window-width" => args.first().and_then(|a| parse_column_width_arg(a)),
+        "set-column-width" | "set-window-width" => {
+            args.first().and_then(|a| parse_column_width_arg(a))
+        }
         "set-window-height" => args
             .first()
             .and_then(|a| a.parse::<SizeChange>().ok())
@@ -557,7 +558,9 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
 pub fn parse_column_width_arg(arg: &str) -> Option<Action> {
     let a = arg.trim().to_lowercase();
     let proportion = |milli_percent: i32| {
-        Some(Action::SetColumnWidth(SizeChange::SetProportion(milli_percent)))
+        Some(Action::SetColumnWidth(SizeChange::SetProportion(
+            milli_percent,
+        )))
     };
     match a.as_str() {
         "cycle" | "preset" | "next" => return Some(Action::ColumnWidthPresetCycle),
@@ -741,9 +744,7 @@ pub fn mod_key_flags(name: &str) -> Option<u32> {
             Some(MOD_WIN | MOD_ALT)
         }
         "ctrlshift" | "shiftctrl" | "controlshift" | "shiftcontrol" => Some(MOD_CTRL | MOD_SHIFT),
-        "winctrl" | "superctrl" | "metactrl" | "ctrlwin" | "ctrlsuper" => {
-            Some(MOD_WIN | MOD_CTRL)
-        }
+        "winctrl" | "superctrl" | "metactrl" | "ctrlwin" | "ctrlsuper" => Some(MOD_WIN | MOD_CTRL),
         _ => None,
     }
 }
@@ -988,9 +989,18 @@ mod tests {
             ("move-column-to-last", Action::MoveColumnToLast),
             ("move-window-up", Action::MoveWindowUp),
             ("move-window-down", Action::MoveWindowDown),
-            ("consume-or-expel-window-left", Action::ConsumeOrExpelWindowLeft),
-            ("consume-or-expel-window-right", Action::ConsumeOrExpelWindowRight),
-            ("consume-window-into-column", Action::ConsumeWindowIntoColumn),
+            (
+                "consume-or-expel-window-left",
+                Action::ConsumeOrExpelWindowLeft,
+            ),
+            (
+                "consume-or-expel-window-right",
+                Action::ConsumeOrExpelWindowRight,
+            ),
+            (
+                "consume-window-into-column",
+                Action::ConsumeWindowIntoColumn,
+            ),
             ("expel-window-from-column", Action::ExpelWindowFromColumn),
             ("maximize-column", Action::MaximizeColumn),
             ("maximize-window-to-edges", Action::MaximizeWindowToEdges),
@@ -1303,8 +1313,13 @@ mod tests {
         ] {
             assert_eq!(text.parse::<SizeChange>(), Ok(expected), "{text:?}");
         }
-        for text in ["", "%", "+%", "50%%", "abc", "12.5", "50%x", "1/3", "inf%", "nan%"] {
-            assert!(text.parse::<SizeChange>().is_err(), "{text:?} must not parse");
+        for text in [
+            "", "%", "+%", "50%%", "abc", "12.5", "50%x", "1/3", "inf%", "nan%",
+        ] {
+            assert!(
+                text.parse::<SizeChange>().is_err(),
+                "{text:?} must not parse"
+            );
         }
         assert_eq!("".parse::<SizeChange>(), Err("value is missing"));
         assert_eq!("%".parse::<SizeChange>(), Err("value is missing"));
@@ -1327,7 +1342,11 @@ mod tests {
         assert_eq!(half, 667);
         assert_eq!(2 * half + gap, view);
         let third = px(SizeChange::SetProportion(33_333), 0);
-        assert_eq!(3 * third + 2 * gap, view - 1, "within one pixel of the view");
+        assert_eq!(
+            3 * third + 2 * gap,
+            view - 1,
+            "within one pixel of the view"
+        );
         assert_eq!(px(SizeChange::SetProportion(100_000), 0), view);
         // +10 % of the view (and the gap), -10 % back.
         assert_eq!(px(SizeChange::AdjustProportion(10_000), half), 804);
@@ -1337,14 +1356,26 @@ mod tests {
         assert_eq!(px(SizeChange::AdjustFixed(100), half), 767);
         assert_eq!(px(SizeChange::AdjustFixed(-100), half), 567);
         // Without a gap or border the proportions are plain fractions of the view.
-        assert_eq!(SizeChange::SetProportion(25_000).resolve(0, 1920, 0, 0), 480);
-        assert_eq!(SizeChange::AdjustProportion(5_000).resolve(960, 1920, 0, 0), 1056);
+        assert_eq!(
+            SizeChange::SetProportion(25_000).resolve(0, 1920, 0, 0),
+            480
+        );
+        assert_eq!(
+            SizeChange::AdjustProportion(5_000).resolve(960, 1920, 0, 0),
+            1056
+        );
     }
 
     #[test]
     fn test_workspace_reference_number_is_an_index_and_quotes_make_a_name() {
-        assert_eq!(WorkspaceRef::from_word("2", false), Some(WorkspaceRef::Index(2)));
-        assert_eq!(WorkspaceRef::from_word("0", false), Some(WorkspaceRef::Index(1)));
+        assert_eq!(
+            WorkspaceRef::from_word("2", false),
+            Some(WorkspaceRef::Index(2))
+        );
+        assert_eq!(
+            WorkspaceRef::from_word("0", false),
+            Some(WorkspaceRef::Index(1))
+        );
         assert_eq!(
             WorkspaceRef::from_word("2", true),
             Some(WorkspaceRef::Name("2".to_string()))
@@ -1394,8 +1425,14 @@ mod tests {
         assert_eq!(parse_column_width_arg("2/3"), set(66_667));
         assert_eq!(parse_column_width_arg("3/4"), set(75_000));
         assert_eq!(parse_column_width_arg("Full"), set(100_000));
-        assert_eq!(parse_column_width_arg("cycle"), Some(Action::ColumnWidthPresetCycle));
-        assert_eq!(parse_column_width_arg("back"), Some(Action::ColumnWidthPresetCycleBack));
+        assert_eq!(
+            parse_column_width_arg("cycle"),
+            Some(Action::ColumnWidthPresetCycle)
+        );
+        assert_eq!(
+            parse_column_width_arg("back"),
+            Some(Action::ColumnWidthPresetCycleBack)
+        );
         // niri's grammar: any percentage, adjustments, pixels.
         assert_eq!(parse_column_width_arg("50%"), set(50_000));
         assert_eq!(parse_column_width_arg("42%"), set(42_000));
@@ -1435,7 +1472,10 @@ mod tests {
             parse_action_name("set-window-height", &words(&["50%"])),
             Some(Action::SetWindowHeight(SetProportion(50_000)))
         );
-        assert_eq!(parse_action_name("set-window-height", &words(&["tall"])), None);
+        assert_eq!(
+            parse_action_name("set-window-height", &words(&["tall"])),
+            None
+        );
         assert_eq!(
             parse_action_name("reset-window-height", &[]),
             Some(Action::ResetWindowHeight)
@@ -1454,14 +1494,26 @@ mod tests {
             ("close-overview", Action::OverviewExit),
             ("toggle-column-tabbed-display", Action::ColumnToggleTabbed),
             ("switch-preset-column-width", Action::ColumnWidthPresetCycle),
-            ("switch-preset-column-width-back", Action::ColumnWidthPresetCycleBack),
-            ("expand-column-to-available-width", Action::ExpandColumnToAvailable),
+            (
+                "switch-preset-column-width-back",
+                Action::ColumnWidthPresetCycleBack,
+            ),
+            (
+                "expand-column-to-available-width",
+                Action::ExpandColumnToAvailable,
+            ),
             ("focus-monitor-left", Action::FocusMonitorLeft),
             ("focus-monitor-right", Action::FocusMonitorRight),
             ("move-window-to-monitor-left", Action::MoveToMonitorLeft),
             ("move-window-to-monitor-right", Action::MoveToMonitorRight),
-            ("move-column-to-monitor-left", Action::MoveColumnToMonitorLeft),
-            ("move-column-to-monitor-right", Action::MoveColumnToMonitorRight),
+            (
+                "move-column-to-monitor-left",
+                Action::MoveColumnToMonitorLeft,
+            ),
+            (
+                "move-column-to-monitor-right",
+                Action::MoveColumnToMonitorRight,
+            ),
             ("focus-window-previous", Action::FocusPrevious),
             ("focus-workspace-down", Action::FocusWorkspaceNext),
             ("focus-workspace-up", Action::FocusWorkspacePrevious),
@@ -1474,8 +1526,14 @@ mod tests {
             ("quit", Action::Quit),
             ("move-workspace-up", Action::MoveWorkspaceUp),
             ("move-workspace-down", Action::MoveWorkspaceDown),
-            ("move-column-to-workspace-up", Action::MoveColumnToWorkspaceUp),
-            ("move-column-to-workspace-down", Action::MoveColumnToWorkspaceDown),
+            (
+                "move-column-to-workspace-up",
+                Action::MoveColumnToWorkspaceUp,
+            ),
+            (
+                "move-column-to-workspace-down",
+                Action::MoveColumnToWorkspaceDown,
+            ),
         ] {
             assert_eq!(parse_action_name(name, &[]), Some(action), "{name}");
         }

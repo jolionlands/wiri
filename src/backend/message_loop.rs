@@ -16,10 +16,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::BackendHandle;
-use crate::input::{Action, SizeChange};
-use crate::input::keyboard::{self, BindOptions};
 #[cfg(test)]
 use crate::input::keyboard::bind_may_fire;
+use crate::input::keyboard::{self, BindOptions};
+use crate::input::{Action, SizeChange};
 use crate::layout::{ScrollDirection, TilingEngine};
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
@@ -67,16 +67,14 @@ fn bind_to_hotkey(
     let vk = bind
         .vk_code()
         .ok_or_else(|| format!("{}: unknown key '{}'", bind.chord_text(), bind.key))?;
-    let action = bind
-        .parse_action()
-        .ok_or_else(|| {
-            format!(
-                "{}: unknown action or bad arguments '{} {}'",
-                bind.chord_text(),
-                bind.command,
-                bind.args.join(" ")
-            )
-        })?;
+    let action = bind.parse_action().ok_or_else(|| {
+        format!(
+            "{}: unknown action or bad arguments '{} {}'",
+            bind.chord_text(),
+            bind.command,
+            bind.args.join(" ")
+        )
+    })?;
     Ok((mods, vk, action))
 }
 
@@ -92,19 +90,19 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32
         (prefix, 0x28, Action::FocusDown),        // Down
         (shift_prefix, 0x25, Action::MoveColumnLeft),
         (shift_prefix, 0x27, Action::MoveColumnRight),
-        (prefix, 0x51, Action::CloseWindow), // Q
-        (prefix, 0x0D, terminal), // Enter
-        (prefix, 0x46, Action::ToggleFullscreen), // F
-        (prefix, 0x54, Action::ToggleFloating), // T
-        (prefix, 0x48, Action::ScrollLeft),  // H
-        (prefix, 0x4C, Action::ScrollRight), // L
-        (shift_prefix, 0x51, Action::Quit),  // Shift+Q
-        (prefix, 0x20, Action::OverviewToggle), // Space
-        (prefix, 0x4F, Action::OverviewSelect), // O
+        (prefix, 0x51, Action::CloseWindow),        // Q
+        (prefix, 0x0D, terminal),                   // Enter
+        (prefix, 0x46, Action::ToggleFullscreen),   // F
+        (prefix, 0x54, Action::ToggleFloating),     // T
+        (prefix, 0x48, Action::ScrollLeft),         // H
+        (prefix, 0x4C, Action::ScrollRight),        // L
+        (shift_prefix, 0x51, Action::Quit),         // Shift+Q
+        (prefix, 0x20, Action::OverviewToggle),     // Space
+        (prefix, 0x4F, Action::OverviewSelect),     // O
         (prefix, 0xDC, Action::ColumnToggleTabbed), // \
-        (prefix, 0xDD, Action::TabNext),     // ]
-        (prefix, 0xDB, Action::TabPrev),     // [
-        (prefix, 0x31, Action::FocusWorkspace(1)), // 1
+        (prefix, 0xDD, Action::TabNext),            // ]
+        (prefix, 0xDB, Action::TabPrev),            // [
+        (prefix, 0x31, Action::FocusWorkspace(1)),  // 1
         (prefix, 0x32, Action::FocusWorkspace(2)),
         (prefix, 0x33, Action::FocusWorkspace(3)),
         (prefix, 0x34, Action::FocusWorkspace(4)),
@@ -139,8 +137,8 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32
         // niri's own chord is Mod+Tab, but with the default Ctrl+Alt prefix that is
         // Windows' task switcher: RegisterHotKey refuses it ("already registered") and
         // used to log a warning at every start.  The key above Tab stands in for it.
-        (prefix, 0xC0, Action::FocusPrevious),     // ` (grave), the key above Tab
-        (prefix, 0x50, Action::Screenshot),        // P (capture desktop to file)
+        (prefix, 0xC0, Action::FocusPrevious), // ` (grave), the key above Tab
+        (prefix, 0x50, Action::Screenshot),    // P (capture desktop to file)
         (prefix, 0x41, Action::ToggleAlwaysOnTop), // A (always-on-top)
         // niri-parity Round 4: rearrange / sizing actions.
         //   Ctrl+Alt+Comma   → consume-window-into-column: the first window of the
@@ -184,14 +182,14 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32
         (shift_prefix, 0xBF, Action::ShowKeyBindings),
         // niri keymap: first / last column, column moves to the ends of the strip,
         // consume-or-expel and the window moves inside a column.
-        (prefix, 0x24, Action::FocusColumnFirst),        // Home
-        (prefix, 0x23, Action::FocusColumnLast),         // End
+        (prefix, 0x24, Action::FocusColumnFirst), // Home
+        (prefix, 0x23, Action::FocusColumnLast),  // End
         (shift_prefix, 0x24, Action::MoveColumnToFirst), // Shift+Home
-        (shift_prefix, 0x23, Action::MoveColumnToLast),  // Shift+End
+        (shift_prefix, 0x23, Action::MoveColumnToLast), // Shift+End
         (shift_prefix, 0xDB, Action::ConsumeOrExpelWindowLeft), // Shift+[
         (shift_prefix, 0xDD, Action::ConsumeOrExpelWindowRight), // Shift+]
-        (prefix, 0x4B, Action::MoveWindowUp),            // K
-        (prefix, 0x4A, Action::MoveWindowDown),          // J
+        (prefix, 0x4B, Action::MoveWindowUp),     // K
+        (prefix, 0x4A, Action::MoveWindowDown),   // J
     ]
 }
 
@@ -272,7 +270,9 @@ fn build_hotkey_list(
 ) -> (Vec<(u32, u32, Action)>, HashMap<(u32, u32), BindOptions>) {
     let terminal = resolve_terminal_action(engine);
     let eng = engine.read();
-    if let Some(config) = eng.full_config() { crate::input::pointer::ENGINE.lock().configure(config); }
+    if let Some(config) = eng.full_config() {
+        crate::input::pointer::ENGINE.lock().configure(config);
+    }
     let binds = eng.config_binds();
     let config_binds = &binds.hotkeys;
     let extend_defaults = binds.extend_defaults;
@@ -299,10 +299,16 @@ fn build_hotkey_list(
     let mut parsed_config: Vec<(u32, u32, Action)> = Vec::with_capacity(config_binds.len());
     let mut options: HashMap<(u32, u32), BindOptions> = HashMap::new();
     for bind in config_binds {
-        if crate::input::pointer::parse_trigger(&bind.key).is_some() { continue; }
+        if crate::input::pointer::parse_trigger(&bind.key).is_some() {
+            continue;
+        }
         match bind_to_hotkey(bind, prefix) {
             Ok(row) => {
-                if !bind.repeat || bind.release || !bind.allow_inhibiting || bind.cooldown_ms.is_some() || bind.hotkey_overlay_title.is_some()
+                if !bind.repeat
+                    || bind.release
+                    || !bind.allow_inhibiting
+                    || bind.cooldown_ms.is_some()
+                    || bind.hotkey_overlay_title.is_some()
                 {
                     options.insert(
                         (row.0, row.1),
@@ -340,7 +346,10 @@ fn build_hotkey_list(
     }
     if merged.is_empty() {
         warn!("Hotkey table empty after merge; defaults reinstated");
-        return (default_hotkeys(prefix, shift_prefix, terminal), HashMap::new());
+        return (
+            default_hotkeys(prefix, shift_prefix, terminal),
+            HashMap::new(),
+        );
     }
     (merged, options)
 }
@@ -380,7 +389,10 @@ fn is_overview_escape_binding(mods: u32, vk: u32, action: &Action) -> bool {
 
 /// Register a list of hotkeys with Windows, returning the IDs and the action map
 /// of the ones that Windows accepted.
-fn register_hotkeys(hwnd: HWND, hotkeys: &[(u32, u32, Action)]) -> (Vec<i32>, HashMap<i32, Action>) {
+fn register_hotkeys(
+    hwnd: HWND,
+    hotkeys: &[(u32, u32, Action)],
+) -> (Vec<i32>, HashMap<i32, Action>) {
     let base_id = 32768i32;
     let mut registered_ids: Vec<i32> = Vec::new();
 
@@ -405,7 +417,9 @@ fn register_hotkeys(hwnd: HWND, hotkeys: &[(u32, u32, Action)]) -> (Vec<i32>, Ha
             );
             continue;
         }
-        if !keyboard::ENGINE.lock().fallback_allowed((*mods, *vk)) { continue; }
+        if !keyboard::ENGINE.lock().fallback_allowed((*mods, *vk)) {
+            continue;
+        }
         let result = unsafe { RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(*mods), *vk) };
         if result.is_ok() {
             registered_ids.push(id);
@@ -437,11 +451,21 @@ fn register_hotkeys(hwnd: HWND, hotkeys: &[(u32, u32, Action)]) -> (Vec<i32>, Ha
     (registered_ids, action_map)
 }
 
-fn visible_binding_ids(hotkeys: &[(u32, u32, Action)], fallback: &[i32], hook_active: bool) -> Vec<i32> {
-    if !hook_active { return fallback.to_vec(); }
+fn visible_binding_ids(
+    hotkeys: &[(u32, u32, Action)],
+    fallback: &[i32],
+    hook_active: bool,
+) -> Vec<i32> {
+    if !hook_active {
+        return fallback.to_vec();
+    }
     let engine = keyboard::ENGINE.lock();
-    hotkeys.iter().enumerate().filter(|(_, (m,v,a))| engine.active((*m,*v)) && !is_overview_escape_binding(*m,*v,a))
-        .map(|(i,_)| 32768 + i as i32).collect()
+    hotkeys
+        .iter()
+        .enumerate()
+        .filter(|(_, (m, v, a))| engine.active((*m, *v)) && !is_overview_escape_binding(*m, *v, a))
+        .map(|(i, _)| 32768 + i as i32)
+        .collect()
 }
 
 /// Unregister all hotkeys by ID
@@ -637,13 +661,22 @@ impl MessageLoop {
         let mut hook_active = false;
         match crate::input::start_keyboard_hook() {
             Ok(()) => hook_active = true,
-            Err(e) => warn!("Keyboard bind hook disabled; RegisterHotKey fallback only: {}", e),
+            Err(e) => warn!(
+                "Keyboard bind hook disabled; RegisterHotKey fallback only: {}",
+                e
+            ),
         }
         let (mut current_hotkeys, bind_options) = build_hotkey_list(&engine);
-        keyboard::ENGINE.lock().configure(&current_hotkeys, &bind_options);
+        keyboard::ENGINE
+            .lock()
+            .configure(&current_hotkeys, &bind_options);
         let (mut registered_ids, _) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
-        update_current_bindings_snapshot(&current_hotkeys, &visible_binding_ids(&current_hotkeys, &registered_ids, hook_active), &bind_options);
+        update_current_bindings_snapshot(
+            &current_hotkeys,
+            &visible_binding_ids(&current_hotkeys, &registered_ids, hook_active),
+            &bind_options,
+        );
 
         *running.lock() = true;
         info!(
@@ -671,10 +704,16 @@ impl MessageLoop {
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
                     let (new_hotkeys, new_options) = build_hotkey_list(&engine);
-                    keyboard::ENGINE.lock().configure(&new_hotkeys, &new_options);
+                    keyboard::ENGINE
+                        .lock()
+                        .configure(&new_hotkeys, &new_options);
                     let (new_ids, _) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
-                    update_current_bindings_snapshot(&new_hotkeys, &visible_binding_ids(&new_hotkeys, &registered_ids, hook_active), &new_options);
+                    update_current_bindings_snapshot(
+                        &new_hotkeys,
+                        &visible_binding_ids(&new_hotkeys, &registered_ids, hook_active),
+                        &new_options,
+                    );
                     current_hotkeys = new_hotkeys;
                     info!("Hotkey reload complete");
                     continue;
@@ -694,7 +733,11 @@ impl MessageLoop {
                     // never generates it, so normal keys cannot double-fire.
                     let index = (msg.wParam.0 as i32 - 32768) as usize;
                     if let Some((mods, vk, _)) = current_hotkeys.get(index) {
-                        let action = keyboard::ENGINE.lock().fallback((*mods, *vk), crate::input::last_press_was_repeat(*vk), std::time::Instant::now());
+                        let action = keyboard::ENGINE.lock().fallback(
+                            (*mods, *vk),
+                            crate::input::last_press_was_repeat(*vk),
+                            std::time::Instant::now(),
+                        );
                         if let Some(action) = action {
                             info!("HOTKEY id={} -> {:?}", msg.wParam.0, action);
                             execute_action(&action, &engine, &backend_handle, &quit_tx);
@@ -922,9 +965,19 @@ pub(crate) fn perform_action_on(
     match action {
         Action::ToggleKeyboardShortcutsInhibit => {
             keyboard::ENGINE.lock().toggle_inhibit();
-            info!("Keyboard shortcuts inhibited: {}", keyboard::ENGINE.lock().inhibited());
+            info!(
+                "Keyboard shortcuts inhibited: {}",
+                keyboard::ENGINE.lock().inhibited()
+            );
             if let Some(thread) = HOTKEY_THREAD.lock().as_ref() {
-                unsafe { let _ = PostThreadMessageW(thread.thread_id, WM_RELOAD_HOTKEYS, WPARAM(0), LPARAM(0)); }
+                unsafe {
+                    let _ = PostThreadMessageW(
+                        thread.thread_id,
+                        WM_RELOAD_HOTKEYS,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
             }
         }
         Action::FocusColumnLeft => {
@@ -940,16 +993,22 @@ pub(crate) fn perform_action_on(
             engine.write().focus_down(backend);
         }
         Action::MoveColumnLeft => match float_of(target) {
-            Some(window) => engine.write().float_move_by(window, -FLOAT_STEP_PX, 0, backend),
+            Some(window) => engine
+                .write()
+                .float_move_by(window, -FLOAT_STEP_PX, 0, backend),
             None => engine.write().move_column(ScrollDirection::Left, backend),
         },
         Action::MoveColumnRight => match float_of(target) {
-            Some(window) => engine.write().float_move_by(window, FLOAT_STEP_PX, 0, backend),
+            Some(window) => engine
+                .write()
+                .float_move_by(window, FLOAT_STEP_PX, 0, backend),
             None => engine.write().move_column(ScrollDirection::Right, backend),
         },
         Action::CloseWindow => match target {
             Some(t) => engine.write().close_target(t),
-            None => info!("close-window: the focused window is not managed by wiri; nothing closed"),
+            None => {
+                info!("close-window: the focused window is not managed by wiri; nothing closed")
+            }
         },
         Action::Spawn(argv) => {
             spawn_process(argv);
@@ -1022,7 +1081,9 @@ pub(crate) fn perform_action_on(
             // maximized-to-edges state now (the window keeps its place in its column), not
             // the native one that the layout pass used to fight.
             match target {
-                Some(t) if !t.floating => engine.write().set_maximized_to_edges(t.window, true, backend),
+                Some(t) if !t.floating => engine
+                    .write()
+                    .set_maximized_to_edges(t.window, true, backend),
                 Some(_) => info!("Maximize: a floating window stays a floating window"),
                 None => warn!("Maximize: no window to maximize"),
             }
@@ -1088,7 +1149,9 @@ pub(crate) fn perform_action_on(
             // Move the focused window to workspace number `target_number` (no switch).
             let workspace = engine.read().workspace_id_for_number(*target_number);
             match float_of(target) {
-                Some(window) => engine.write().float_move_to_workspace(window, workspace, backend),
+                Some(window) => engine
+                    .write()
+                    .float_move_to_workspace(window, workspace, backend),
                 None => engine.write().move_window_to_workspace(workspace, backend),
             }
             engine.write().apply_all(backend);
@@ -1111,7 +1174,9 @@ pub(crate) fn perform_action_on(
         Action::MoveToWorkspace(number) => {
             let workspace = engine.read().workspace_id_for_number(*number);
             match float_of(target) {
-                Some(window) => engine.write().float_move_to_workspace(window, workspace, backend),
+                Some(window) => engine
+                    .write()
+                    .float_move_to_workspace(window, workspace, backend),
                 None => engine.write().move_window_to_workspace(workspace, backend),
             }
             engine.write().apply_all(backend);
@@ -1167,10 +1232,22 @@ pub(crate) fn perform_action_on(
             );
         }
         Action::SetColumnWidth(change) => {
-            change_size(engine, backend, target, crate::layout::SizeAxis::Width, *change);
+            change_size(
+                engine,
+                backend,
+                target,
+                crate::layout::SizeAxis::Width,
+                *change,
+            );
         }
         Action::SetWindowHeight(change) => {
-            change_size(engine, backend, target, crate::layout::SizeAxis::Height, *change);
+            change_size(
+                engine,
+                backend,
+                target,
+                crate::layout::SizeAxis::Height,
+                *change,
+            );
         }
         Action::ResetWindowHeight => {
             if float_of(target).is_none() {
@@ -1264,11 +1341,15 @@ pub(crate) fn perform_action_on(
             }
         }
         Action::MoveWindowUp => match float_of(target) {
-            Some(window) => engine.write().float_move_by(window, 0, -FLOAT_STEP_PX, backend),
+            Some(window) => engine
+                .write()
+                .float_move_by(window, 0, -FLOAT_STEP_PX, backend),
             None => engine.write().move_window_in_column(-1, backend),
         },
         Action::MoveWindowDown => match float_of(target) {
-            Some(window) => engine.write().float_move_by(window, 0, FLOAT_STEP_PX, backend),
+            Some(window) => engine
+                .write()
+                .float_move_by(window, 0, FLOAT_STEP_PX, backend),
             None => engine.write().move_window_in_column(1, backend),
         },
         Action::FocusColumnFirst => {
@@ -1436,12 +1517,12 @@ fn change_size(
     change: SizeChange,
 ) {
     match (float_of(target), axis) {
-        (Some(window), axis) => {
-            engine
-                .write()
-                .float_apply_size_change(window, axis, change, backend)
+        (Some(window), axis) => engine
+            .write()
+            .float_apply_size_change(window, axis, change, backend),
+        (None, crate::layout::SizeAxis::Width) => {
+            engine.write().set_column_width_by(change, backend)
         }
-        (None, crate::layout::SizeAxis::Width) => engine.write().set_column_width_by(change, backend),
         (None, crate::layout::SizeAxis::Height) => {
             engine.write().set_window_height_by(change, backend)
         }
@@ -1667,11 +1748,19 @@ mod tests {
         assert!(is_overview_escape_binding(0, 0x1B, &Action::OverviewToggle));
         assert!(is_overview_escape_binding(0, 0x1B, &Action::OverviewExit));
         // A modified Escape (Ctrl+Alt+Escape) does not steal the plain key.
-        assert!(!is_overview_escape_binding(MOD_CTRL | MOD_ALT, 0x1B, &Action::OverviewToggle));
+        assert!(!is_overview_escape_binding(
+            MOD_CTRL | MOD_ALT,
+            0x1B,
+            &Action::OverviewToggle
+        ));
         // Other actions on a bare Escape are the user's explicit choice.
         assert!(!is_overview_escape_binding(0, 0x1B, &Action::CloseWindow));
         // Another bare key bound to the overview toggle is not Escape.
-        assert!(!is_overview_escape_binding(0, 0x20, &Action::OverviewToggle));
+        assert!(!is_overview_escape_binding(
+            0,
+            0x20,
+            &Action::OverviewToggle
+        ));
     }
 
     /// Chords Windows keeps for itself.  `RegisterHotKey` refuses them (os error 1409) or the
@@ -1711,11 +1800,8 @@ mod tests {
     fn the_default_hotkeys_do_not_share_a_chord() {
         // Two binds on one chord: the second registration fails at every start.
         let terminal = Action::SpawnCmd("t".to_string());
-        let defaults = default_hotkeys(
-            MOD_CTRL | MOD_ALT,
-            MOD_CTRL | MOD_ALT | MOD_SHIFT,
-            terminal,
-        );
+        let defaults =
+            default_hotkeys(MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT, terminal);
         let mut seen = std::collections::HashSet::new();
         for (mods, vk, action) in &defaults {
             assert!(
@@ -1733,11 +1819,8 @@ mod tests {
         // niri's Mod+Tab is Windows' own task switcher with the Ctrl+Alt prefix: the default
         // is the key above Tab (grave), and every other prefix gets it as well.
         let terminal = Action::SpawnCmd("t".to_string());
-        let defaults = default_hotkeys(
-            MOD_CTRL | MOD_ALT,
-            MOD_CTRL | MOD_ALT | MOD_SHIFT,
-            terminal,
-        );
+        let defaults =
+            default_hotkeys(MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT, terminal);
         let chords: Vec<(u32, u32)> = defaults
             .iter()
             .filter(|(_, _, a)| *a == Action::FocusPrevious)
@@ -1766,17 +1849,36 @@ mod tests {
             no_repeat: true,
             ..BindOptions::default()
         };
-        assert!(bind_may_fire(&no_repeat, false, None, t0), "the first press fires");
-        assert!(!bind_may_fire(&no_repeat, true, Some(t0), t0), "auto-repeat does not");
+        assert!(
+            bind_may_fire(&no_repeat, false, None, t0),
+            "the first press fires"
+        );
+        assert!(
+            !bind_may_fire(&no_repeat, true, Some(t0), t0),
+            "auto-repeat does not"
+        );
         let repeating = BindOptions::default();
-        assert!(bind_may_fire(&repeating, true, Some(t0), t0), "binds repeat by default");
+        assert!(
+            bind_may_fire(&repeating, true, Some(t0), t0),
+            "binds repeat by default"
+        );
         let cooldown = BindOptions {
             cooldown: Some(Duration::from_millis(150)),
             ..BindOptions::default()
         };
         assert!(bind_may_fire(&cooldown, false, None, t0));
-        assert!(!bind_may_fire(&cooldown, false, Some(t0), t0 + Duration::from_millis(100)));
-        assert!(bind_may_fire(&cooldown, false, Some(t0), t0 + Duration::from_millis(150)));
+        assert!(!bind_may_fire(
+            &cooldown,
+            false,
+            Some(t0),
+            t0 + Duration::from_millis(100)
+        ));
+        assert!(bind_may_fire(
+            &cooldown,
+            false,
+            Some(t0),
+            t0 + Duration::from_millis(150)
+        ));
         // The options of a config bind are found again by the hotkey id.
         let hotkeys = vec![
             (MOD_CTRL | MOD_ALT, 0x54u32, Action::ToggleFloating),
@@ -1790,7 +1892,10 @@ mod tests {
         assert_eq!(keys.fallback(chord, false, t0), Some(Action::CloseWindow));
         assert!(keys.fallback(chord, false, t0).is_none());
         // Different binds do not share their cooldown, even for the same action.
-        assert_eq!(keys.fallback((MOD_CTRL | MOD_ALT, 0x54), false, t0), Some(Action::ToggleFloating));
+        assert_eq!(
+            keys.fallback((MOD_CTRL | MOD_ALT, 0x54), false, t0),
+            Some(Action::ToggleFloating)
+        );
     }
 
     #[test]
@@ -1850,9 +1955,11 @@ mod tests {
             Action::SpawnCmd(DEFAULT_TERMINAL_COMMAND.to_string())
         );
         // A `spawn` bind with arguments is used as the terminal, arguments intact.
-        cfg.binds
-            .hotkeys
-            .push(bind("Ctrl+Alt+Return", "spawn", &["wt.exe", "-d", "C:\\My Projects"]));
+        cfg.binds.hotkeys.push(bind(
+            "Ctrl+Alt+Return",
+            "spawn",
+            &["wt.exe", "-d", "C:\\My Projects"],
+        ));
         assert_eq!(
             terminal_action_from_config(Some(&cfg)),
             Action::Spawn(vec![

@@ -723,7 +723,9 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
             }
             outln!(
                 "{}: {} error(s), {} warning(s)",
-                path_str, error_count, warning_count
+                path_str,
+                error_count,
+                warning_count
             );
         }
     }
@@ -771,7 +773,8 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
         IpcMessage::CloseWindow { window_hwnd } => {
             outln!(
                 "Close request sent to window {} (0x{:x}).",
-                window_hwnd, *window_hwnd
+                window_hwnd,
+                *window_hwnd
             );
         }
         IpcMessage::SpawnCommand { command, args } => {
@@ -801,7 +804,8 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
         } => {
             outln!(
                 "Moved window {} to workspace {}.",
-                window_hwnd, workspace_id
+                window_hwnd,
+                workspace_id
             );
         }
         IpcMessage::MonitorList => print_monitor_list(resp),
@@ -958,7 +962,11 @@ fn print_window_list(resp: &serde_json::Value) {
 
     outln!(
         "  {:>10}  {:>6}  {:<20}  {:<3}  {}",
-        "HWND", "PID", "CLASS", "WS", "TITLE"
+        "HWND",
+        "PID",
+        "CLASS",
+        "WS",
+        "TITLE"
     );
     outln!(
         "  {:>10}  {:>6}  {:<20}  {:<3}  {}",
@@ -1021,7 +1029,12 @@ fn print_workspaces(resp: &serde_json::Value) {
 
     outln!(
         "  {:<5}  {:<16}  {:<16}  {:<7}  {:<8}  {}",
-        "IDX", "NAME", "OUTPUT", "ACTIVE", "FOCUSED", "WINDOW"
+        "IDX",
+        "NAME",
+        "OUTPUT",
+        "ACTIVE",
+        "FOCUSED",
+        "WINDOW"
     );
     outln!(
         "  {:<5}  {:<16}  {:<16}  {:<7}  {:<8}  {}",
@@ -1035,8 +1048,14 @@ fn print_workspaces(resp: &serde_json::Value) {
 
     for workspace in &workspaces {
         let idx = workspace.get("idx").and_then(|v| v.as_u64()).unwrap_or(0);
-        let name = workspace.get("name").and_then(|v| v.as_str()).unwrap_or("-");
-        let output = workspace.get("output").and_then(|v| v.as_str()).unwrap_or("-");
+        let name = workspace
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let output = workspace
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
         let window = match workspace.get("active_window_id").and_then(|v| v.as_u64()) {
             Some(id) => id.to_string(),
             None => "-".to_string(),
@@ -1077,7 +1096,12 @@ fn print_windows(resp: &serde_json::Value) {
 
     outln!(
         "  {:>10}  {:>6}  {:<20}  {:<6}  {:<5}  {}",
-        "ID", "PID", "APP", "WORKSPACE", "FLAGS", "TITLE"
+        "ID",
+        "PID",
+        "APP",
+        "WORKSPACE",
+        "FLAGS",
+        "TITLE"
     );
     outln!(
         "  {:>10}  {:>6}  {:<20}  {:<6}  {:<5}  {}",
@@ -1187,7 +1211,14 @@ fn print_monitor_list(resp: &serde_json::Value) {
 
     outln!(
         "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {:<20}  {}",
-        "F", "BOUNDS (x,y wxh)", "DPI", "WS", "WIN", "ID", "WORK AREA (x,y wxh)", "NAME"
+        "F",
+        "BOUNDS (x,y wxh)",
+        "DPI",
+        "WS",
+        "WIN",
+        "ID",
+        "WORK AREA (x,y wxh)",
+        "NAME"
     );
     outln!(
         "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {:<20}  {}",
@@ -1269,7 +1300,11 @@ fn print_bindings(resp: &serde_json::Value) {
 
     outln!(
         "  {:<5}  {:<28}  {:<7}  {:<5}  {}",
-        "ID", "CHORD", "MODS", "VK", "ACTION"
+        "ID",
+        "CHORD",
+        "MODS",
+        "VK",
+        "ACTION"
     );
     outln!(
         "  {:<5}  {:<28}  {:<7}  {:<5}  {}",
@@ -1515,7 +1550,8 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
     };
     errln!(
         "Subscribed to events ({}) [{}]. Press Ctrl+C to exit.",
-        filter_desc, mode_desc
+        filter_desc,
+        mode_desc
     );
 
     // The server streams length-implicit JSON objects back-to-back; serde_json
@@ -1812,10 +1848,16 @@ mod tests {
             (words(&["2", "x"]), vec![true, false])
         );
         // Nothing quoted: nothing to say about it.
-        assert_eq!(split_quoted_words(words(&["2", "+10%"])), (words(&["2", "+10%"]), vec![]));
+        assert_eq!(
+            split_quoted_words(words(&["2", "+10%"])),
+            (words(&["2", "+10%"]), vec![])
+        );
         // A lone quote or an empty pair are not what niri writes for a name.
         assert_eq!(split_quoted_words(words(&["\""])), (words(&["\""]), vec![]));
-        assert_eq!(split_quoted_words(words(&["\"\""])), (words(&[""]), vec![true]));
+        assert_eq!(
+            split_quoted_words(words(&["\"\""])),
+            (words(&[""]), vec![true])
+        );
     }
 
     #[test]
@@ -1837,10 +1879,19 @@ mod tests {
 
     #[test]
     fn test_fold_to_ascii_replaces_table_decoration() {
-        assert_eq!(fold_to_ascii("wiri state\n──────────"), "wiri state\n----------");
+        assert_eq!(
+            fold_to_ascii("wiri state\n──────────"),
+            "wiri state\n----------"
+        );
         assert_eq!(fold_to_ascii("  ID  │ CHORD"), "  ID  | CHORD");
-        assert_eq!(fold_to_ascii("SpawnCmd(\"start wt.exe…\")"), "SpawnCmd(\"start wt.exe...\")");
-        assert_eq!(fold_to_ascii("Captured window 5 → C:\\x.bmp"), "Captured window 5 -> C:\\x.bmp");
+        assert_eq!(
+            fold_to_ascii("SpawnCmd(\"start wt.exe…\")"),
+            "SpawnCmd(\"start wt.exe...\")"
+        );
+        assert_eq!(
+            fold_to_ascii("Captured window 5 → C:\\x.bmp"),
+            "Captured window 5 -> C:\\x.bmp"
+        );
         assert_eq!(
             fold_to_ascii("Could not find the pipe — is wiri running?"),
             "Could not find the pipe - is wiri running?"

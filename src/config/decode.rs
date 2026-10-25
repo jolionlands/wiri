@@ -173,8 +173,7 @@ fn run(text: &str, file: &str, base_dir: Option<&Path>, root: Option<PathBuf>) -
 /// (what Windows PowerShell's `Out-File` writes).
 pub fn read_config_text(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
-    decode_config_bytes(&bytes)
-        .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))
+    decode_config_bytes(&bytes).map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))
 }
 
 /// See [`read_config_text`].
@@ -194,8 +193,7 @@ pub fn decode_config_bytes(bytes: &[u8]) -> Result<String, String> {
                 }
             })
             .collect();
-        return String::from_utf16(&units)
-            .map_err(|_| "the file is not valid UTF-16".to_string());
+        return String::from_utf16(&units).map_err(|_| "the file is not valid UTF-16".to_string());
     }
     utf8(bytes)
 }
@@ -610,11 +608,7 @@ impl Decoder {
             _ => {
                 self.error(
                     node.args[1].pos,
-                    format!(
-                        "'{}' takes one value, not {}",
-                        node.name,
-                        node.args.len()
-                    ),
+                    format!("'{}' takes one value, not {}", node.name, node.args.len()),
                 );
                 None
             }
@@ -833,8 +827,11 @@ impl Decoder {
                         if matches!(value.scalar, Scalar::Null) {
                             cfg.screenshot_path = ScreenshotPath::ClipboardOnly;
                         } else if let Some(text) = self.value_text(node, value) {
-                            if text.is_empty() { self.error(value.pos, "screenshot-path must not be empty"); }
-                            else { cfg.screenshot_path = ScreenshotPath::Template(text); }
+                            if text.is_empty() {
+                                self.error(value.pos, "screenshot-path must not be empty");
+                            } else {
+                                cfg.screenshot_path = ScreenshotPath::Template(text);
+                            }
                         }
                     }
                 }
@@ -856,10 +853,9 @@ impl Decoder {
                         ]);
                         let hint = suggestion(other, &known);
                         let message = match hint {
-                            Some(h) => format!(
-                                "unknown section '{}' (did you mean '{}'?)",
-                                node.name, h
-                            ),
+                            Some(h) => {
+                                format!("unknown section '{}' (did you mean '{}'?)", node.name, h)
+                            }
                             None => format!(
                                 "unknown section '{}' (known: {})",
                                 node.name,
@@ -946,10 +942,8 @@ impl Decoder {
         match read_config_text(&path) {
             Ok(text) => {
                 let saved_file = std::mem::replace(&mut self.file, path.display().to_string());
-                let saved_base = std::mem::replace(
-                    &mut self.base_dir,
-                    path.parent().map(|p| p.to_path_buf()),
-                );
+                let saved_base =
+                    std::mem::replace(&mut self.base_dir, path.parent().map(|p| p.to_path_buf()));
                 self.stack.push(canon);
                 self.depth += 1;
                 self.decode_source(&text, cfg);
@@ -1036,7 +1030,9 @@ impl Decoder {
                 self.unsupported(child, "Windows has one pointer setup for all devices")
             }
             // keyboard
-            "layout" | "keyboard-layout" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
+            "layout" | "keyboard-layout"
+                if matches!(scope, InputScope::Input | InputScope::Keyboard) =>
+            {
                 if let Some(v) = self.arg_text(child) {
                     cfg.input.keyboard_layout = v;
                 }
@@ -1057,13 +1053,18 @@ impl Decoder {
                 }
             }
             "xkb" | "track-layout" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
-                self.unsupported(child, "Windows has no XKB; the keyboard layout is the system's")
+                self.unsupported(
+                    child,
+                    "Windows has no XKB; the keyboard layout is the system's",
+                )
             }
             // focus
             "focus-follows-mouse" | "follows-mouse" => {
                 for p in &child.props {
                     if p.key == "max-scroll-amount" {
-                        let percent = p.value.as_str()
+                        let percent = p
+                            .value
+                            .as_str()
                             .and_then(|s| s.strip_suffix('%'))
                             .and_then(|s| s.parse::<f64>().ok())
                             .filter(|p| p.is_finite() && *p >= 0.0);
@@ -1092,20 +1093,33 @@ impl Decoder {
                     cfg.input.focus_follows_mouse = v;
                 }
             }
-            "focus-delay-ms" if matches!(scope, InputScope::Input | InputScope::Keyboard | InputScope::Focus) => {
+            "focus-delay-ms"
+                if matches!(
+                    scope,
+                    InputScope::Input | InputScope::Keyboard | InputScope::Focus
+                ) =>
+            {
                 if let Some(v) = self.arg_u32(child, 60000) {
                     cfg.input.focus_delay_ms = v;
                 }
             }
             "warp-on-focus" | "warp-mouse-to-focus"
-                if matches!(scope, InputScope::Input | InputScope::Keyboard | InputScope::Focus) =>
+                if matches!(
+                    scope,
+                    InputScope::Input | InputScope::Keyboard | InputScope::Focus
+                ) =>
             {
                 for p in &child.props {
                     if p.key == "mode" {
                         match p.value.as_str() {
                             Some("center-xy") => cfg.input.warp_mode = WarpMode::CenterXy,
-                            Some("center-xy-always") => cfg.input.warp_mode = WarpMode::CenterXyAlways,
-                            _ => self.error(p.value.pos, "'mode' expects \"center-xy\" or \"center-xy-always\""),
+                            Some("center-xy-always") => {
+                                cfg.input.warp_mode = WarpMode::CenterXyAlways
+                            }
+                            _ => self.error(
+                                p.value.pos,
+                                "'mode' expects \"center-xy\" or \"center-xy-always\"",
+                            ),
                         }
                     } else {
                         self.error(
@@ -1127,7 +1141,9 @@ impl Decoder {
                     cfg.input.warp_on_focus = v;
                 }
             }
-            "workspace-auto-back-and-forth" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
+            "workspace-auto-back-and-forth"
+                if matches!(scope, InputScope::Input | InputScope::Keyboard) =>
+            {
                 if let Some(v) = self.flag(child) {
                     cfg.input.workspace_auto_back_and_forth = v;
                 }
@@ -1146,17 +1162,23 @@ impl Decoder {
                     cfg.input.natural_scroll = v;
                 }
             }
-            "scroll-speed" | "mouse-speed" if matches!(scope, InputScope::Input | InputScope::Mouse) => {
+            "scroll-speed" | "mouse-speed"
+                if matches!(scope, InputScope::Input | InputScope::Mouse) =>
+            {
                 if let Some(v) = self.arg_number(child, 0.0, 1000.0) {
                     cfg.input.mouse_speed = v;
                 }
             }
-            "acceleration" | "mouse-acceleration" if matches!(scope, InputScope::Input | InputScope::Mouse) => {
+            "acceleration" | "mouse-acceleration"
+                if matches!(scope, InputScope::Input | InputScope::Mouse) =>
+            {
                 if let Some(v) = self.arg_number(child, -1000.0, 1000.0) {
                     cfg.input.mouse_acceleration = v;
                 }
             }
-            "sensitivity" | "mouse-sensitivity" if matches!(scope, InputScope::Input | InputScope::Mouse) => {
+            "sensitivity" | "mouse-sensitivity"
+                if matches!(scope, InputScope::Input | InputScope::Mouse) =>
+            {
                 if let Some(v) = self.arg_number(child, 0.0, 1000.0) {
                     cfg.input.mouse_sensitivity = v;
                 }
@@ -1247,12 +1269,14 @@ impl Decoder {
                         "tap-to-click",
                         "scroll-factor",
                     ],
-                    InputScope::Focus => {
-                        &["follows-mouse", "focus-delay-ms", "warp-on-focus"]
-                    }
-                    InputScope::Touch => {
-                        &["enable", "off", "tap-to-click", "scroll-speed", "map-to-output"]
-                    }
+                    InputScope::Focus => &["follows-mouse", "focus-delay-ms", "warp-on-focus"],
+                    InputScope::Touch => &[
+                        "enable",
+                        "off",
+                        "tap-to-click",
+                        "scroll-speed",
+                        "map-to-output",
+                    ],
                 };
                 self.unknown(child, parent, known);
             }
@@ -1374,7 +1398,10 @@ impl Decoder {
                     for p in &child.props {
                         self.warn(
                             p.key_pos,
-                            format!("'mode' property '{}' is not supported by wiri; ignored", p.key),
+                            format!(
+                                "'mode' property '{}' is not supported by wiri; ignored",
+                                p.key
+                            ),
                         );
                     }
                     self.no_children(child);
@@ -1440,9 +1467,21 @@ impl Decoder {
                     child,
                     "'output'",
                     &[
-                        "off", "scale", "transform", "position", "mode", "x", "y", "width",
-                        "height", "enable", "primary", "layout", "mod-key",
-                        "variable-refresh-rate", "focus-at-startup",
+                        "off",
+                        "scale",
+                        "transform",
+                        "position",
+                        "mode",
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "enable",
+                        "primary",
+                        "layout",
+                        "mod-key",
+                        "variable-refresh-rate",
+                        "focus-at-startup",
                     ],
                 ),
             }
@@ -1804,7 +1843,15 @@ impl Decoder {
                 _ => self.unknown(
                     child,
                     "'animations'",
-                    &["off", "on", "enabled", "duration", "easing", "slowdown", "window-open"],
+                    &[
+                        "off",
+                        "on",
+                        "enabled",
+                        "duration",
+                        "easing",
+                        "slowdown",
+                        "window-open",
+                    ],
                 ),
             }
         }
@@ -1960,7 +2007,9 @@ impl Decoder {
                 "open-fullscreen" => self.set_flag(child, &mut rule.open_fullscreen),
                 "open-floating" => self.set_flag(child, &mut rule.open_floating),
                 "open-maximized" => self.set_flag(child, &mut rule.open_maximized),
-                "open-maximized-to-edges" => self.set_flag(child, &mut rule.open_maximized_to_edges),
+                "open-maximized-to-edges" => {
+                    self.set_flag(child, &mut rule.open_maximized_to_edges)
+                }
                 "open-focused" => self.set_flag(child, &mut rule.open_focused),
                 "min-width" => self.set_u32(child, 100_000, &mut rule.min_width),
                 "min-height" => self.set_u32(child, 100_000, &mut rule.min_height),
@@ -2031,7 +2080,10 @@ impl Decoder {
             return Some(None);
         }
         if kids.len() > 1 {
-            self.error(kids[1].pos, "only one of 'proportion' or 'fixed' is allowed");
+            self.error(
+                kids[1].pos,
+                "only one of 'proportion' or 'fixed' is allowed",
+            );
         }
         let first = &kids[0];
         match norm(&first.name).as_str() {
@@ -2093,8 +2145,12 @@ impl Decoder {
                         }
                     }
                 }
-                "is-active" | "is-focused" | "is-active-in-column" | "is-floating"
-                | "is-urgent" | "at-startup" => {
+                "is-active"
+                | "is-focused"
+                | "is-active-in-column"
+                | "is-floating"
+                | "is-urgent"
+                | "at-startup" => {
                     let wanted = match self.value_bool(node, value) {
                         Some(b) => b,
                         None => {
@@ -2172,7 +2228,10 @@ impl Decoder {
                                 let at = child.args.first().map(|a| a.pos).unwrap_or(child.pos);
                                 self.error(
                                     at,
-                                    format!("invalid regular expression for '{}': {}", child.name, e),
+                                    format!(
+                                        "invalid regular expression for '{}': {}",
+                                        child.name, e
+                                    ),
                                 );
                                 ok = false;
                             }
@@ -2199,7 +2258,13 @@ impl Decoder {
                     self.unknown(
                         child,
                         &format!("'{}'", node.name),
-                        &["class-name", "title", "process-name", "is-active", "is-floating"],
+                        &[
+                            "class-name",
+                            "title",
+                            "process-name",
+                            "is-active",
+                            "is-floating",
+                        ],
                     );
                     ok = false;
                 }
@@ -2376,12 +2441,11 @@ impl Decoder {
                 }
                 "hotkey-overlay-title" => match &p.value.scalar {
                     Scalar::Null => bind.hotkey_overlay_title = Some(None),
-                    Scalar::Str { text, .. } => bind.hotkey_overlay_title = Some(Some(text.clone())),
+                    Scalar::Str { text, .. } => {
+                        bind.hotkey_overlay_title = Some(Some(text.clone()))
+                    }
                     _ => {
-                        self.error(
-                            p.value.pos,
-                            "'hotkey-overlay-title' expects text or null",
-                        );
+                        self.error(p.value.pos, "'hotkey-overlay-title' expects text or null");
                         ok = false;
                     }
                 },
@@ -2405,7 +2469,10 @@ impl Decoder {
 
         // modifiers
         if let Err(e) = bind.resolve_modifiers(crate::input::DEFAULT_MOD_KEY) {
-            self.warn(node.pos, format!("bind {}: {}; the bind is ignored", chord, e));
+            self.warn(
+                node.pos,
+                format!("bind {}: {}; the bind is ignored", chord, e),
+            );
             return None;
         }
 
@@ -2485,7 +2552,11 @@ impl Decoder {
 
 /// A chord as a comparable string: modifiers (sorted, lower case) and key.
 fn chord_key(bind: &HotkeyBinding) -> String {
-    let mut mods: Vec<String> = bind.modifiers.iter().map(|m| m.to_ascii_lowercase()).collect();
+    let mut mods: Vec<String> = bind
+        .modifiers
+        .iter()
+        .map(|m| m.to_ascii_lowercase())
+        .collect();
     mods.sort();
     format!("{}+{}", mods.join("+"), bind.key.to_ascii_lowercase())
 }
@@ -2532,9 +2603,14 @@ mod tests {
     fn screenshot_path_is_a_template_or_null() {
         use crate::screenshot::path::ScreenshotPath;
         assert_eq!(clean("").screenshot_path, ScreenshotPath::Pictures);
-        assert_eq!(clean("screenshot-path null").screenshot_path, ScreenshotPath::ClipboardOnly);
-        assert_eq!(clean("screenshot-path \"~/Shots/%Y-%m-%d.png\"").screenshot_path,
-            ScreenshotPath::Template("~/Shots/%Y-%m-%d.png".into()));
+        assert_eq!(
+            clean("screenshot-path null").screenshot_path,
+            ScreenshotPath::ClipboardOnly
+        );
+        assert_eq!(
+            clean("screenshot-path \"~/Shots/%Y-%m-%d.png\"").screenshot_path,
+            ScreenshotPath::Template("~/Shots/%Y-%m-%d.png".into())
+        );
         assert!(load("screenshot-path \"\"").has_errors());
         assert!(load("screenshot-path true").has_errors());
     }
@@ -2553,27 +2629,49 @@ mod tests {
         let d = load("layout {\n    gaps 8\n    boarder { width 2 }\n}\ninput {\n    repeat-delay 300\n    repeat-rat 25\n}\n");
         let errs = errors(&d);
         assert_eq!(errs.len(), 2, "{:?}", errs);
-        assert!(errs[0].starts_with("3:5: error: unknown option 'boarder' in 'layout'"), "{}", errs[0]);
+        assert!(
+            errs[0].starts_with("3:5: error: unknown option 'boarder' in 'layout'"),
+            "{}",
+            errs[0]
+        );
         assert!(errs[0].contains("did you mean 'border'"), "{}", errs[0]);
-        assert!(errs[1].starts_with("7:5: error: unknown option 'repeat-rat'"), "{}", errs[1]);
+        assert!(
+            errs[1].starts_with("7:5: error: unknown option 'repeat-rat'"),
+            "{}",
+            errs[1]
+        );
         assert!(errs[1].contains("repeat-rate"), "{}", errs[1]);
         let d = load("telemetry { on }\n");
         assert_eq!(errors(&d).len(), 1);
         assert!(errors(&d)[0].contains("unknown section 'telemetry'"));
         let d = load("layuot { gaps 8 }\n");
-        assert!(errors(&d)[0].contains("did you mean 'layout'"), "{:?}", errors(&d));
+        assert!(
+            errors(&d)[0].contains("did you mean 'layout'"),
+            "{:?}",
+            errors(&d)
+        );
     }
 
     #[test]
     fn bad_values_are_errors_at_the_value() {
-        let d = load("layout {\n    inner-gaps \"eight\"\n    border-color \"red\"\n    scroll-step -5\n}\n");
+        let d = load(
+            "layout {\n    inner-gaps \"eight\"\n    border-color \"red\"\n    scroll-step -5\n}\n",
+        );
         let errs = errors(&d);
         assert_eq!(errs.len(), 3, "{:?}", errs);
-        assert!(errs[0].starts_with("2:16: error: 'inner-gaps' expects a number"), "{}", errs[0]);
+        assert!(
+            errs[0].starts_with("2:16: error: 'inner-gaps' expects a number"),
+            "{}",
+            errs[0]
+        );
         assert!(errs[1].contains("not a color"), "{}", errs[1]);
         assert!(errs[2].contains("must be between"), "{}", errs[2]);
         let d = load("input { repeat-delay true }\n");
-        assert!(errors(&d)[0].contains("expects a number, found a boolean"), "{:?}", errors(&d));
+        assert!(
+            errors(&d)[0].contains("expects a number, found a boolean"),
+            "{:?}",
+            errors(&d)
+        );
     }
 
     #[test]
@@ -2608,7 +2706,10 @@ mod tests {
         let cfg = clean(
             "input {\n    layout \"de\"\n    repeat_delay=600\n    keyboard { layout \"us\"; repeat-rate 30 }\n    mouse {\n        natural-scroll false\n        scroll-speed 2.0\n        acceleration 0.5\n        sensitivity 1.5\n        tap-to-click true\n    }\n    focus {\n        follows-mouse true\n        focus-delay-ms 999\n        warp-on-focus true\n    }\n    touch {\n        enable true\n        tap-to-click false\n        scroll-speed 1.75\n    }\n    numlock true\n}\n",
         );
-        assert_eq!(cfg.input.keyboard_layout, "us", "the keyboard block runs after the flat key");
+        assert_eq!(
+            cfg.input.keyboard_layout, "us",
+            "the keyboard block runs after the flat key"
+        );
         assert_eq!(cfg.input.repeat_delay, 600);
         assert_eq!(cfg.input.repeat_rate, 30);
         assert!(!cfg.input.natural_scroll);
@@ -2637,7 +2738,12 @@ mod tests {
         assert_eq!(cfg.layout.inner_gaps, 12);
         assert_eq!(cfg.layout.outer_gaps, 12);
         assert_eq!(
-            (cfg.layout.reserve_left, cfg.layout.reserve_right, cfg.layout.reserve_top, cfg.layout.reserve_bottom),
+            (
+                cfg.layout.reserve_left,
+                cfg.layout.reserve_right,
+                cfg.layout.reserve_top,
+                cfg.layout.reserve_bottom
+            ),
             (4, 5, 6, 7)
         );
         assert_eq!(cfg.layout.border_width, 3);
@@ -2650,7 +2756,10 @@ mod tests {
         assert!(cfg.layout.shadow_enable);
         assert_eq!(cfg.layout.shadow_blur, 20);
         assert_eq!(cfg.layout.shadow_spread, 4);
-        assert_eq!((cfg.layout.shadow_offset_x, cfg.layout.shadow_offset_y), (2, 6));
+        assert_eq!(
+            (cfg.layout.shadow_offset_x, cfg.layout.shadow_offset_y),
+            (2, 6)
+        );
         assert_eq!(cfg.layout.shadow_color, "#00000077", "#rgba is expanded");
     }
 
@@ -2685,7 +2794,10 @@ mod tests {
         assert_eq!(cfg.layout.focus_ring_inactive_color, "#404040");
         assert!(cfg.layout.shadow_enable);
         assert!((cfg.layout.shadow_opacity - 0.75).abs() < 1e-9);
-        assert_eq!((cfg.layout.shadow_offset_x, cfg.layout.shadow_offset_y), (5, 5));
+        assert_eq!(
+            (cfg.layout.shadow_offset_x, cfg.layout.shadow_offset_y),
+            (5, 5)
+        );
         assert_eq!(cfg.layout.shadow_blur, 15);
         assert_eq!(cfg.layout.shadow_spread, 5);
         assert_eq!(cfg.layout.column_width_mode, "proportional");
@@ -2734,7 +2846,11 @@ mod tests {
         assert_eq!(clean("").output.len(), 1);
         let d = load("output \"DP-1\" { scale 8.0 }\n");
         assert!(errors(&d).is_empty());
-        assert_eq!(warnings(&d).len(), 1, "an out-of-range scale warns but is kept");
+        assert_eq!(
+            warnings(&d).len(),
+            1,
+            "an out-of-range scale warns but is kept"
+        );
         assert!((d.config.output[0].scale - 8.0).abs() < 1e-9);
     }
 
@@ -2742,7 +2858,11 @@ mod tests {
     fn workspaces_with_and_without_a_block() {
         let cfg = clean("workspace \"mail\"\nworkspace \"web\" {\n}\nworkspace \"chat\"\nworkspace \"Main\" {\n    layout \"tile\"\n    monitor \"DP-1\"\n    follow-on-focus true\n}\nworkspace \"dev\" { open-on-output \"HDMI-1\" }\n");
         let names: Vec<&str> = cfg.workspace.iter().map(|w| w.name.as_str()).collect();
-        assert_eq!(names, vec!["mail", "web", "chat", "Main", "dev"], "in the order they are declared");
+        assert_eq!(
+            names,
+            vec!["mail", "web", "chat", "Main", "dev"],
+            "in the order they are declared"
+        );
         assert_eq!(cfg.workspace[3].monitor, "DP-1");
         assert_eq!(cfg.workspace[4].monitor, "HDMI-1");
         let d = load("workspace { }\n");
@@ -2769,11 +2889,18 @@ mod tests {
         assert_eq!(
             cfg.spawn_at_startup,
             vec![
-                vec!["wt.exe".to_string(), "-d".to_string(), "C:\\My Projects".to_string()],
+                vec![
+                    "wt.exe".to_string(),
+                    "-d".to_string(),
+                    "C:\\My Projects".to_string()
+                ],
                 vec!["notepad.exe".to_string()],
             ]
         );
-        assert_eq!(cfg.spawn_sh_at_startup, vec!["echo hi > %TEMP%\\x.txt".to_string()]);
+        assert_eq!(
+            cfg.spawn_sh_at_startup,
+            vec!["echo hi > %TEMP%\\x.txt".to_string()]
+        );
         let d = load("spawn-at-startup\n");
         assert!(errors(&d)[0].contains("needs a program"));
     }
@@ -2796,18 +2923,36 @@ mod tests {
         assert_eq!(b[0].key, "T");
         assert_eq!(b[0].command, "spawn");
         assert_eq!(b[0].args, vec!["wt.exe"]);
-        assert_eq!(b[0].hotkey_overlay_title, Some(Some("Open a Terminal: wt".to_string())));
+        assert_eq!(
+            b[0].hotkey_overlay_title,
+            Some(Some("Open a Terminal: wt".to_string()))
+        );
         assert!(b[0].repeat);
         assert!(!b[1].repeat);
         assert_eq!(b[1].cooldown_ms, Some(150));
         assert_eq!(b[2].args, vec!["1"]);
-        assert_eq!(b[2].args_quoted, vec![false], "focus-workspace 1 is an index");
-        assert_eq!(b[3].args_quoted, vec![true], "focus-workspace \"2\" is a name");
+        assert_eq!(
+            b[2].args_quoted,
+            vec![false],
+            "focus-workspace 1 is an index"
+        );
+        assert_eq!(
+            b[3].args_quoted,
+            vec![true],
+            "focus-workspace \"2\" is a name"
+        );
         assert_eq!(b[4].args, vec!["+10%"]);
         assert_eq!(b[6].hotkey_overlay_title, Some(None));
-        assert_eq!(b[6].action_props, vec![("skip-confirmation".to_string(), "true".to_string())]);
+        assert_eq!(
+            b[6].action_props,
+            vec![("skip-confirmation".to_string(), "true".to_string())]
+        );
         for bind in b {
-            assert!(bind.parse_action().is_some(), "{} does not resolve", bind.chord_text());
+            assert!(
+                bind.parse_action().is_some(),
+                "{} does not resolve",
+                bind.chord_text()
+            );
         }
     }
 
@@ -2849,7 +2994,11 @@ mod tests {
         // An action wiri lacks but niri has: a warning, not an error.
         let d = load("binds { Mod+X { swap-window-left; } }\n");
         assert!(errors(&d).is_empty());
-        assert!(warnings(&d)[0].contains("not implemented by wiri yet"), "{:?}", warnings(&d));
+        assert!(
+            warnings(&d)[0].contains("not implemented by wiri yet"),
+            "{:?}",
+            warnings(&d)
+        );
         assert!(d.config.binds.hotkeys.is_empty());
     }
 
@@ -2858,8 +3007,16 @@ mod tests {
         let d = load("binds {\n    Mod+Retrun { close-window; }\n    Mod+T { clsoe-window; }\n    Mod+Y { spawn; }\n    Mod+U { close-window; quit; }\n    Mod+I\n    Mod+O repeat=maybe { close-window; }\n    Mod+P bogus=1 { close-window; }\n    Mod+L { close-window now=1; }\n}\n");
         let e = errors(&d);
         assert_eq!(e.len(), 8, "{:?}", e);
-        assert!(e[0].starts_with("2:5:") && e[0].contains("unknown key 'Retrun'"), "{}", e[0]);
-        assert!(e[1].contains("unknown action 'clsoe-window'") && e[1].contains("close-window"), "{}", e[1]);
+        assert!(
+            e[0].starts_with("2:5:") && e[0].contains("unknown key 'Retrun'"),
+            "{}",
+            e[0]
+        );
+        assert!(
+            e[1].contains("unknown action 'clsoe-window'") && e[1].contains("close-window"),
+            "{}",
+            e[1]
+        );
         assert!(e[2].contains("bad arguments for 'spawn'"), "{}", e[2]);
         assert!(e[3].contains("only one action"), "{}", e[3]);
         assert!(e[4].contains("has no action"), "{}", e[4]);
@@ -2894,11 +3051,21 @@ mod tests {
         assert_eq!(r.open_fullscreen, Some(false));
         assert_eq!(r.open_maximized, Some(true));
         assert_eq!(r.open_focused, Some(false));
-        assert_eq!(r.default_column_width, Some(Some(SizeSpec::Proportion(0.5))));
+        assert_eq!(
+            r.default_column_width,
+            Some(Some(SizeSpec::Proportion(0.5)))
+        );
         assert_eq!(r.default_window_height, Some(Some(SizeSpec::Fixed(400))));
-        assert_eq!((r.min_width, r.max_height, r.opacity), (Some(300), Some(900), Some(0.9)));
+        assert_eq!(
+            (r.min_width, r.max_height, r.opacity),
+            (Some(300), Some(900), Some(0.9))
+        );
         let r2 = &cfg.window_rules[1];
-        assert_eq!(r2.default_column_width, Some(None), "an empty block: the window picks");
+        assert_eq!(
+            r2.default_column_width,
+            Some(None),
+            "an empty block: the window picks"
+        );
         assert!(matches!(&r2.match_groups[0].conds[0], Matcher::Not(_)));
     }
 
@@ -2920,9 +3087,18 @@ mod tests {
             is_active_in_column: false,
         };
         assert!(rule.matches(&ctx("firefox.exe", "Picture-in-Picture")));
-        assert!(!rule.matches(&ctx("firefox.exe", "Mozilla")), "one match line is an AND of its properties");
-        assert!(rule.matches(&ctx("notepad.exe", "anything")), "the second match line is an alternative");
-        assert!(!rule.matches(&ctx("notepad.exe", "Private notes")), "exclude wins");
+        assert!(
+            !rule.matches(&ctx("firefox.exe", "Mozilla")),
+            "one match line is an AND of its properties"
+        );
+        assert!(
+            rule.matches(&ctx("notepad.exe", "anything")),
+            "the second match line is an alternative"
+        );
+        assert!(
+            !rule.matches(&ctx("notepad.exe", "Private notes")),
+            "exclude wins"
+        );
         assert!(!rule.matches(&ctx("code.exe", "Picture")));
         // A rule with no match line matches everything that is not excluded.
         let cfg = clean("window-rule { exclude app-id=\"^x$\" }\n");
@@ -2983,11 +3159,29 @@ mod tests {
     fn window_rule_problems() {
         let d = load("window-rule {\n    match app-id=\"(\"\n    open-floating maybe\n    default-column-width { proportion 0.5; fixed 3 }\n    mach app-id=\"x\"\n    match bogus=\"x\"\n    match \"positional\"\n}\n");
         let e = errors(&d);
-        assert!(e.iter().any(|m| m.contains("invalid regular expression")), "{:?}", e);
-        assert!(e.iter().any(|m| m.contains("expects true or false")), "{:?}", e);
+        assert!(
+            e.iter().any(|m| m.contains("invalid regular expression")),
+            "{:?}",
+            e
+        );
+        assert!(
+            e.iter().any(|m| m.contains("expects true or false")),
+            "{:?}",
+            e
+        );
         assert!(e.iter().any(|m| m.contains("only one of")), "{:?}", e);
-        assert!(e.iter().any(|m| m.contains("unknown option 'mach'") && m.contains("match")), "{:?}", e);
-        assert!(e.iter().any(|m| m.contains("unknown match property 'bogus'")), "{:?}", e);
+        assert!(
+            e.iter()
+                .any(|m| m.contains("unknown option 'mach'") && m.contains("match")),
+            "{:?}",
+            e
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("unknown match property 'bogus'")),
+            "{:?}",
+            e
+        );
         assert!(e.iter().any(|m| m.contains("takes properties")), "{:?}", e);
         let d = load("window-rule { match is-window-cast-target=true\n focus-ring { off }\n geometry-corner-radius 8 }\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
@@ -2998,21 +3192,45 @@ mod tests {
     fn includes_are_resolved_against_the_including_file() {
         let dir = std::env::temp_dir().join(format!("wiri_decode_inc_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("binds.kdl"), "binds {\n    Mod+Z { spawn \"notepad.exe\"; }\n    Mod+T { quit; }\n}\n").unwrap();
+        std::fs::write(
+            dir.join("binds.kdl"),
+            "binds {\n    Mod+Z { spawn \"notepad.exe\"; }\n    Mod+T { quit; }\n}\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("sub").join("deep.kdl"), "layout { gaps 3 }\n").unwrap();
-        std::fs::write(dir.join("sub").join("mid.kdl"), "include \"deep.kdl\"\ninput { repeat-delay 123 }\n").unwrap();
+        std::fs::write(
+            dir.join("sub").join("mid.kdl"),
+            "include \"deep.kdl\"\ninput { repeat-delay 123 }\n",
+        )
+        .unwrap();
         let main = "binds {\n    Mod+T { close-window; }\n}\ninclude \"binds.kdl\"\ninclude \"sub/mid.kdl\"\ninclude \"missing.kdl\" optional=true\n";
         let d = decode_text(main, "main.kdl", Some(&dir));
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(warnings(&d).len(), 1, "only the optional include warns: {:?}", warnings(&d));
+        assert_eq!(
+            warnings(&d).len(),
+            1,
+            "only the optional include warns: {:?}",
+            warnings(&d)
+        );
         assert_eq!(d.config.input.repeat_delay, 123);
         assert_eq!(d.config.layout.inner_gaps, 3);
         // A later bind on the same chord replaces the earlier one.
-        let t: Vec<&HotkeyBinding> = d.config.binds.hotkeys.iter().filter(|b| b.key == "T").collect();
+        let t: Vec<&HotkeyBinding> = d
+            .config
+            .binds
+            .hotkeys
+            .iter()
+            .filter(|b| b.key == "T")
+            .collect();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].command, "quit");
         assert!(d.config.binds.hotkeys.iter().any(|b| b.key == "Z"));
-        assert_eq!(d.includes.len(), 4, "every include is recorded for the watcher: {:?}", d.includes);
+        assert_eq!(
+            d.includes.len(),
+            4,
+            "every include is recorded for the watcher: {:?}",
+            d.includes
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3025,14 +3243,24 @@ mod tests {
         let first = d.first_error().expect("an error");
         assert_eq!((first.line, first.column), (3, 5));
         assert!(first.file.ends_with("bad.kdl"), "{}", first.file);
-        assert!(first.located("main.kdl").contains("bad.kdl:3:5: error"), "{}", first.located("main.kdl"));
+        assert!(
+            first.located("main.kdl").contains("bad.kdl:3:5: error"),
+            "{}",
+            first.located("main.kdl")
+        );
         // Missing files, cycles and the depth limit.
         let d = decode_text("include \"nope.kdl\"\n", "", Some(&dir));
         assert!(errors(&d)[0].contains("file not found"), "{:?}", errors(&d));
         std::fs::write(dir.join("a.kdl"), "include \"b.kdl\"\n").unwrap();
         std::fs::write(dir.join("b.kdl"), "include \"a.kdl\"\n").unwrap();
         let d = decode_text("include \"a.kdl\"\n", "", Some(&dir));
-        assert!(errors(&d).iter().any(|m| m.contains("cyclic include") || m.contains("depth exceeds")), "{:?}", errors(&d));
+        assert!(
+            errors(&d)
+                .iter()
+                .any(|m| m.contains("cyclic include") || m.contains("depth exceeds")),
+            "{:?}",
+            errors(&d)
+        );
         for i in 0..(MAX_INCLUDE_DEPTH as usize + 2) {
             let body = if i + 1 < MAX_INCLUDE_DEPTH as usize + 2 {
                 format!("include \"f{}.kdl\"\n", i + 1)
@@ -3042,7 +3270,11 @@ mod tests {
             std::fs::write(dir.join(format!("f{}.kdl", i)), body).unwrap();
         }
         let d = decode_text("include \"f0.kdl\"\n", "", Some(&dir));
-        assert!(errors(&d).iter().any(|m| m.contains("depth exceeds")), "{:?}", errors(&d));
+        assert!(
+            errors(&d).iter().any(|m| m.contains("depth exceeds")),
+            "{:?}",
+            errors(&d)
+        );
         // Without a directory an include cannot be followed.
         let d = decode_text("include \"x.kdl\"\n", "", None);
         assert!(errors(&d).is_empty());
@@ -3058,7 +3290,10 @@ mod tests {
             "C:\\Users\\someone\\conf\\x.kdl"
         );
         // An unknown variable is left as it is; a lone percent sign is not a variable.
-        assert_eq!(expand_user_path("%WIRI_NO_SUCH_VARIABLE%\\x"), "%WIRI_NO_SUCH_VARIABLE%\\x");
+        assert_eq!(
+            expand_user_path("%WIRI_NO_SUCH_VARIABLE%\\x"),
+            "%WIRI_NO_SUCH_VARIABLE%\\x"
+        );
         assert_eq!(expand_user_path("100%"), "100%");
         assert_eq!(expand_user_path("plain/path.kdl"), "plain/path.kdl");
         if let Ok(home) = std::env::var("USERPROFILE") {
@@ -3083,13 +3318,20 @@ mod tests {
     #[test]
     fn include_is_a_top_level_node_only() {
         let d = load("layout {\n    include \"x.kdl\"\n}\n");
-        assert!(errors(&d)[0].contains("unknown option 'include'"), "{:?}", errors(&d));
+        assert!(
+            errors(&d)[0].contains("unknown option 'include'"),
+            "{:?}",
+            errors(&d)
+        );
     }
 
     #[test]
     fn config_bytes_in_the_encodings_windows_tools_write() {
         assert_eq!(decode_config_bytes(b"layout { }").unwrap(), "layout { }");
-        assert_eq!(decode_config_bytes(b"\xEF\xBB\xBFlayout { }").unwrap(), "layout { }");
+        assert_eq!(
+            decode_config_bytes(b"\xEF\xBB\xBFlayout { }").unwrap(),
+            "layout { }"
+        );
         let mut utf16 = vec![0xFF, 0xFE];
         for u in "layout { gaps 8 }".encode_utf16() {
             utf16.extend_from_slice(&u.to_le_bytes());
@@ -3123,8 +3365,14 @@ mod tests {
     fn issues_print_like_compiler_output() {
         let d = load("layout {\n    nope 1\n}\n");
         let i = &d.issues[0];
-        assert_eq!(i.to_string(), "2:5: error: unknown option 'nope' in 'layout'");
-        assert_eq!(i.located("C:\\cfg.kdl"), "C:\\cfg.kdl:2:5: error: unknown option 'nope' in 'layout'");
+        assert_eq!(
+            i.to_string(),
+            "2:5: error: unknown option 'nope' in 'layout'"
+        );
+        assert_eq!(
+            i.located("C:\\cfg.kdl"),
+            "C:\\cfg.kdl:2:5: error: unknown option 'nope' in 'layout'"
+        );
         assert_eq!(d.error_count(), 1);
         assert_eq!(d.warning_count(), 0);
     }
@@ -3133,7 +3381,10 @@ mod tests {
     fn edit_distance_and_suggestions() {
         assert_eq!(edit_distance("kitten", "sitting"), 3);
         assert_eq!(edit_distance("", "abc"), 3);
-        assert_eq!(suggestion("gapz", &["gaps", "struts"]).as_deref(), Some("gaps"));
+        assert_eq!(
+            suggestion("gapz", &["gaps", "struts"]).as_deref(),
+            Some("gaps")
+        );
         assert_eq!(suggestion("zzzzzz", &["gaps", "struts"]), None);
     }
 }

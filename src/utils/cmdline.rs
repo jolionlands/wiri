@@ -144,9 +144,17 @@ mod tests {
     fn split_keeps_quoted_paths_with_spaces_together() {
         assert_eq!(
             split_command_line(r#""C:\Program Files\Tool\tool.exe" -d "C:\My Projects" --flag"#),
-            v(&[r"C:\Program Files\Tool\tool.exe", "-d", r"C:\My Projects", "--flag"])
+            v(&[
+                r"C:\Program Files\Tool\tool.exe",
+                "-d",
+                r"C:\My Projects",
+                "--flag"
+            ])
         );
-        assert_eq!(split_command_line("  wt.exe   -d   .  "), v(&["wt.exe", "-d", "."]));
+        assert_eq!(
+            split_command_line("  wt.exe   -d   .  "),
+            v(&["wt.exe", "-d", "."])
+        );
         assert_eq!(split_command_line(""), Vec::<String>::new());
         assert_eq!(split_command_line("   "), Vec::<String>::new());
     }
@@ -155,16 +163,25 @@ mod tests {
     fn split_follows_the_msvc_quote_and_backslash_rules() {
         // Backslashes that do not precede a quote are literal.
         assert_eq!(split_command_line(r"a\b\c"), v(&[r"a\b\c"]));
-        assert_eq!(split_command_line(r#""\\server\share\dir""#), v(&[r"\\server\share\dir"]));
+        assert_eq!(
+            split_command_line(r#""\\server\share\dir""#),
+            v(&[r"\\server\share\dir"])
+        );
         // 2n backslashes + quote: n backslashes, the quote toggles.
         assert_eq!(split_command_line(r#""a\\" b"#), v(&[r"a\", "b"]));
         // 2n+1 backslashes + quote: n backslashes and a literal quote.
         assert_eq!(split_command_line(r#"a\"b"#), v(&[r#"a"b"#]));
-        assert_eq!(split_command_line(r#""a \"quoted\" b""#), v(&[r#"a "quoted" b"#]));
+        assert_eq!(
+            split_command_line(r#""a \"quoted\" b""#),
+            v(&[r#"a "quoted" b"#])
+        );
         // An empty quoted string is an argument.
         assert_eq!(split_command_line(r#"x "" y"#), v(&["x", "", "y"]));
         // Adjacent quoted and unquoted text is one word.
-        assert_eq!(split_command_line(r#"pre"fix suf"fix"#), v(&["prefix suffix"]));
+        assert_eq!(
+            split_command_line(r#"pre"fix suf"fix"#),
+            v(&["prefix suffix"])
+        );
         // An unbalanced quote runs to the end of the line.
         assert_eq!(split_command_line(r#"a "b c"#), v(&["a", "b c"]));
     }
@@ -173,11 +190,17 @@ mod tests {
     fn the_quoted_flag_tells_2_from_a_quoted_2() {
         assert_eq!(
             split_command_line_flagged(r#"focus-workspace 2"#),
-            vec![("focus-workspace".to_string(), false), ("2".to_string(), false)]
+            vec![
+                ("focus-workspace".to_string(), false),
+                ("2".to_string(), false)
+            ]
         );
         assert_eq!(
             split_command_line_flagged(r#"focus-workspace "2""#),
-            vec![("focus-workspace".to_string(), false), ("2".to_string(), true)]
+            vec![
+                ("focus-workspace".to_string(), false),
+                ("2".to_string(), true)
+            ]
         );
         assert_eq!(
             split_command_line_flagged(r#"spawn "wt.exe" -d "a b""#),
@@ -206,9 +229,22 @@ mod tests {
         ];
         for s in samples {
             let quoted = quote_arg(s);
-            assert_eq!(split_command_line(&quoted), v(&[s]), "{:?} -> {:?}", s, quoted);
+            assert_eq!(
+                split_command_line(&quoted),
+                v(&[s]),
+                "{:?} -> {:?}",
+                s,
+                quoted
+            );
         }
-        let argv = v(&["wt.exe", "-d", r"C:\My Projects", "--title", r#"a "b" c"#, ""]);
+        let argv = v(&[
+            "wt.exe",
+            "-d",
+            r"C:\My Projects",
+            "--title",
+            r#"a "b" c"#,
+            "",
+        ]);
         assert_eq!(split_command_line(&build_command_line(&argv)), argv);
     }
 

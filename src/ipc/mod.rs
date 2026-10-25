@@ -208,10 +208,7 @@ mod tests {
             r"\\.\pipe\wiri_control_j_rg_1"
         );
         // A name that is empty (or all spaces) still gives a name.
-        assert_eq!(
-            pipe_path_with(None, "", 1),
-            r"\\.\pipe\wiri_control_user_1"
-        );
+        assert_eq!(pipe_path_with(None, "", 1), r"\\.\pipe\wiri_control_user_1");
     }
 
     #[test]

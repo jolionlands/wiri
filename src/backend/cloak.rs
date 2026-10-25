@@ -114,7 +114,8 @@ const REGDB_E_CLASSNOTREG: i32 = 0x8004_0154_u32 as i32;
 #[repr(C)]
 #[allow(dead_code)]
 struct UnknownVtbl {
-    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    query_interface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     add_ref: usize,
     release: unsafe extern "system" fn(*mut c_void) -> u32,
 }
@@ -189,17 +190,17 @@ fn set_cloak_through_the_shell(hwnd: isize, flags: i32) -> Result<(), CloakError
     ensure_com();
     let window = HWND(hwnd as *mut c_void);
     unsafe {
-        let provider: IServiceProvider = match CoCreateInstance(&CLSID_IMMERSIVE_SHELL, None, CLSCTX_ALL)
-        {
-            Ok(provider) => provider,
-            Err(e) => {
-                return Err(if permanent(e.code()) {
-                    CloakError::Unsupported
-                } else {
-                    CloakError::Failed(e.code().0)
-                })
-            }
-        };
+        let provider: IServiceProvider =
+            match CoCreateInstance(&CLSID_IMMERSIVE_SHELL, None, CLSCTX_ALL) {
+                Ok(provider) => provider,
+                Err(e) => {
+                    return Err(if permanent(e.code()) {
+                        CloakError::Unsupported
+                    } else {
+                        CloakError::Failed(e.code().0)
+                    })
+                }
+            };
         let mut collection: *mut c_void = std::ptr::null_mut();
         let hr = (provider.vtable().QueryService)(
             provider.as_raw(),
@@ -310,7 +311,10 @@ pub fn uncloak(hwnd: isize) {
             CLOAKED.lock().remove(&hwnd);
             debug!("uncloak: hwnd={} uncloaked", hwnd);
         }
-        Err(e) => debug!("uncloak: hwnd={} failed: {:?} (tried again at the next show)", hwnd, e),
+        Err(e) => debug!(
+            "uncloak: hwnd={} failed: {:?} (tried again at the next show)",
+            hwnd, e
+        ),
     }
 }
 
@@ -319,7 +323,10 @@ pub fn uncloak(hwnd: isize) {
 pub fn uncloak_forced(hwnd: isize) {
     CLOAKED.lock().remove(&hwnd);
     match set_cloak_through_the_shell(hwnd, CLOAK_OFF) {
-        Ok(()) => debug!("uncloak: hwnd={} uncloaked (record from an earlier run)", hwnd),
+        Ok(()) => debug!(
+            "uncloak: hwnd={} uncloaked (record from an earlier run)",
+            hwnd
+        ),
         Err(e) => debug!("uncloak: hwnd={} failed: {:?}", hwnd, e),
     }
 }
@@ -361,7 +368,10 @@ mod tests {
         // IInspectable, then SetFocus, SwitchTo, TryInvokeBack, GetThumbnailWindow,
         // GetMonitor and GetVisibility.
         let word = std::mem::size_of::<usize>();
-        assert_eq!(std::mem::offset_of!(ApplicationViewVtbl, set_cloak), 12 * word);
+        assert_eq!(
+            std::mem::offset_of!(ApplicationViewVtbl, set_cloak),
+            12 * word
+        );
         // IApplicationViewCollection::GetViewForHwnd is index 6.
         assert_eq!(
             std::mem::offset_of!(ApplicationViewCollectionVtbl, get_view_for_hwnd),

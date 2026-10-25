@@ -300,12 +300,22 @@ mod tests {
         assert!(w.is_focused);
         assert!(!window_of(&snapshot, 100).is_focused);
         assert!(
-            !w.is_floating && !w.is_urgent && !w.is_fullscreen && !w.is_maximized && !w.is_minimized
+            !w.is_floating
+                && !w.is_urgent
+                && !w.is_fullscreen
+                && !w.is_maximized
+                && !w.is_minimized
         );
         // One column each, counted from 1.
         assert_eq!(w.layout.pos_in_scrolling_layout, Some((2, 1)));
-        assert_eq!(window_of(&snapshot, 100).layout.pos_in_scrolling_layout, Some((1, 1)));
-        assert_eq!(window_of(&snapshot, 102).layout.pos_in_scrolling_layout, Some((3, 1)));
+        assert_eq!(
+            window_of(&snapshot, 100).layout.pos_in_scrolling_layout,
+            Some((1, 1))
+        );
+        assert_eq!(
+            window_of(&snapshot, 102).layout.pos_in_scrolling_layout,
+            Some((3, 1))
+        );
         // All on the same workspace, which exists in the list.
         let workspace = window_of(&snapshot, 100).workspace_id.expect("a workspace");
         assert_eq!(w.workspace_id, Some(workspace));
@@ -315,7 +325,11 @@ mod tests {
     #[test]
     fn the_keyboard_focus_is_the_os_foreground_window_when_wiri_manages_it() {
         let (mut engine, backend) = engine_with(&[100, 101]);
-        assert_eq!(engine.ipc_snapshot().focused_window(), None, "no report yet");
+        assert_eq!(
+            engine.ipc_snapshot().focused_window(),
+            None,
+            "no report yet"
+        );
         engine.sync_os_foreground(WindowId::new(100), &backend);
         assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
         // A window wiri does not manage (the Start menu) has the focus: no managed window has.
@@ -323,7 +337,11 @@ mod tests {
         assert_eq!(engine.ipc_snapshot().focused_window(), None);
         engine.sync_os_foreground(WindowId::new(101), &backend);
         engine.remove_window(WindowId::new(101), &backend);
-        assert_eq!(engine.ipc_snapshot().focused_window(), None, "its window is gone");
+        assert_eq!(
+            engine.ipc_snapshot().focused_window(),
+            None,
+            "its window is gone"
+        );
     }
 
     #[test]
@@ -367,14 +385,26 @@ mod tests {
         let snapshot = engine.ipc_snapshot();
         let mut ids: Vec<u64> = snapshot.workspaces.iter().map(|w| w.id).collect();
         let count = ids.len();
-        assert!(count >= 3, "two monitors, one with two workspaces: {:?}", ids);
+        assert!(
+            count >= 3,
+            "two monitors, one with two workspaces: {:?}",
+            ids
+        );
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), count, "no two workspaces share an id: {:?}", snapshot.workspaces);
+        assert_eq!(
+            ids.len(),
+            count,
+            "no two workspaces share an id: {:?}",
+            snapshot.workspaces
+        );
         assert!(ids.iter().all(|id| *id < (1u64 << 53)), "{:?}", ids);
         // Only the workspace that is active on the focused monitor is focused; the other
         // monitor's active workspace is active but not focused.
-        assert_eq!(snapshot.workspaces.iter().filter(|w| w.is_focused).count(), 1);
+        assert_eq!(
+            snapshot.workspaces.iter().filter(|w| w.is_focused).count(),
+            1
+        );
         assert!(snapshot.workspaces.iter().filter(|w| w.is_active).count() >= 2);
     }
 
@@ -423,10 +453,16 @@ mod tests {
         assert!(window_of(&snapshot, 100).is_fullscreen);
         assert!(window_of(&snapshot, 101).is_maximized);
         assert!(window_of(&snapshot, 102).is_urgent);
-        assert!(snapshot.workspaces[0].is_urgent, "a window of the workspace is urgent");
+        assert!(
+            snapshot.workspaces[0].is_urgent,
+            "a window of the workspace is urgent"
+        );
         assert!(!snapshot.overview_open);
         // The fullscreen window keeps its column.
-        assert_eq!(window_of(&snapshot, 100).layout.pos_in_scrolling_layout, Some((1, 1)));
+        assert_eq!(
+            window_of(&snapshot, 100).layout.pos_in_scrolling_layout,
+            Some((1, 1))
+        );
         engine.enter_overview(&backend);
         assert!(engine.ipc_snapshot().overview_open);
         engine.exit_overview(&backend);
@@ -441,7 +477,10 @@ mod tests {
         let first_workspace = window_of(&before, 101).workspace_id.unwrap();
         engine.move_window_to_workspace(1, &backend);
         let after = engine.ipc_snapshot();
-        assert_ne!(window_of(&after, 101).workspace_id.unwrap(), first_workspace);
+        assert_ne!(
+            window_of(&after, 101).workspace_id.unwrap(),
+            first_workspace
+        );
         assert_eq!(window_of(&after, 100).workspace_id, Some(first_workspace));
         assert!(
             after.workspaces.len() > before.workspaces.len(),

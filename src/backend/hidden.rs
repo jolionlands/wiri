@@ -273,7 +273,11 @@ impl Registry {
         }
         let text = to_json_with_originals(&self.windows, &self.originals, std::process::id());
         if let Err(e) = write_atomic(path, &text) {
-            warn!("could not record hidden windows in {}: {}", path.display(), e);
+            warn!(
+                "could not record hidden windows in {}: {}",
+                path.display(),
+                e
+            );
         }
     }
 }
@@ -537,7 +541,10 @@ mod tests {
 
     #[test]
     fn test_json_round_trip() {
-        let windows = vec![win(100, 7, "Notepad"), win(200, 8, "CASCADIA_HOSTING_WINDOW_CLASS")];
+        let windows = vec![
+            win(100, 7, "Notepad"),
+            win(200, 8, "CASCADIA_HOSTING_WINDOW_CLASS"),
+        ];
         let text = to_json(&windows, 4242);
         assert!(text.contains("\"wiri_pid\": 4242"));
         assert_eq!(from_json(&text), windows);
@@ -641,11 +648,11 @@ mod tests {
     #[test]
     fn test_select_originals_keeps_only_windows_that_are_still_the_same_window() {
         let entries = vec![
-            orig(1, 10, "A", 0, 0, 100, 100),  // same window, visible: keep
-            orig(2, 10, "A", 0, 0, 100, 100),  // same window, hidden: keep (it is shown again)
-            orig(3, 10, "A", 0, 0, 100, 100),  // handle recycled by another process: drop
-            orig(4, 10, "A", 0, 0, 100, 100),  // handle now has another class: drop
-            orig(5, 10, "A", 0, 0, 100, 100),  // window is gone: drop
+            orig(1, 10, "A", 0, 0, 100, 100), // same window, visible: keep
+            orig(2, 10, "A", 0, 0, 100, 100), // same window, hidden: keep (it is shown again)
+            orig(3, 10, "A", 0, 0, 100, 100), // handle recycled by another process: drop
+            orig(4, 10, "A", 0, 0, 100, 100), // handle now has another class: drop
+            orig(5, 10, "A", 0, 0, 100, 100), // window is gone: drop
         ];
         let probe = |hwnd: isize| match hwnd {
             1 | 2 => Some(WindowProbe {
@@ -665,7 +672,10 @@ mod tests {
             }),
             _ => None,
         };
-        let kept: Vec<isize> = select_originals(&entries, probe).iter().map(|o| o.hwnd).collect();
+        let kept: Vec<isize> = select_originals(&entries, probe)
+            .iter()
+            .map(|o| o.hwnd)
+            .collect();
         assert_eq!(kept, vec![1, 2]);
     }
 
@@ -746,7 +756,11 @@ mod tests {
         assert_eq!(registry.record_original(7, 10, "B", here).0, here);
         // Another handle altogether.
         assert_eq!(registry.record_original(8, 10, "A", here).0, here);
-        assert_eq!(registry.seeds.len(), 1, "the record is still waiting for its window");
+        assert_eq!(
+            registry.seeds.len(),
+            1,
+            "the record is still waiting for its window"
+        );
     }
 
     #[test]
@@ -757,7 +771,10 @@ mod tests {
         assert!(registry.remove_original(9));
         assert!(!registry.remove_original(9), "nothing left to forget");
         // A window that was destroyed before the engine met it leaves no record behind.
-        assert!(!registry.remove_original(7), "an unclaimed seed is not a change of the record");
+        assert!(
+            !registry.remove_original(7),
+            "an unclaimed seed is not a change of the record"
+        );
         assert_eq!(registry.seeds, vec![orig(8, 10, "A", 1, 2, 3, 4)]);
     }
 
@@ -772,7 +789,10 @@ mod tests {
         // No window is hidden, but the originals are what a restarted wiri needs.
         let text = std::fs::read_to_string(&path).expect("record written");
         assert!(from_json(&text).is_empty());
-        assert_eq!(originals_from_json(&text), vec![orig(1, 10, "A", 5, 6, 700, 500)]);
+        assert_eq!(
+            originals_from_json(&text),
+            vec![orig(1, 10, "A", 5, 6, 700, 500)]
+        );
         registry.remove_original(1);
         registry.persist();
         assert!(!path.exists(), "an empty record is deleted");

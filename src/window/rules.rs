@@ -810,9 +810,18 @@ mod tests {
             resolve_window_rules(&rules, &facts(title, Some(process), None, false)).float
         };
         assert!(floats("Mozilla", "firefox.exe"), "the first match line");
-        assert!(floats("Picture-in-Picture", "chrome.exe"), "the second one: both its conditions");
-        assert!(!floats("Docs", "chrome.exe"), "the second line needs its title as well");
-        assert!(!floats("Private Browsing", "firefox.exe"), "an exclude line vetoes");
+        assert!(
+            floats("Picture-in-Picture", "chrome.exe"),
+            "the second one: both its conditions"
+        );
+        assert!(
+            !floats("Docs", "chrome.exe"),
+            "the second line needs its title as well"
+        );
+        assert!(
+            !floats("Private Browsing", "firefox.exe"),
+            "an exclude line vetoes"
+        );
         assert!(!floats("Mozilla", "notepad.exe"), "no line matches");
     }
 
@@ -828,8 +837,16 @@ mod tests {
             resolve_window_rules(&rules, &facts("t", Some(process), None, false)).opacity
         };
         assert_eq!(opacity("notepad.exe"), Some(0.8));
-        assert_eq!(opacity("code.exe"), None, "the name without .exe is excluded");
-        assert_eq!(opacity("Code.exe"), Some(0.8), "a regex is case sensitive, like niri's");
+        assert_eq!(
+            opacity("code.exe"),
+            None,
+            "the name without .exe is excluded"
+        );
+        assert_eq!(
+            opacity("Code.exe"),
+            Some(0.8),
+            "a regex is case sensitive, like niri's"
+        );
     }
 
     #[test]
@@ -842,13 +859,22 @@ mod tests {
         let floats = |process: Option<&str>, aumid: Option<&str>| {
             resolve_window_rules(&rules, &facts("t", process, aumid, false)).float
         };
-        assert!(floats(Some("WindowsTerminal.exe"), None), "anywhere in the file name");
         assert!(
-            floats(Some("explorer.exe"), Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App")),
+            floats(Some("WindowsTerminal.exe"), None),
+            "anywhere in the file name"
+        );
+        assert!(
+            floats(
+                Some("explorer.exe"),
+                Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App")
+            ),
             "the AppUserModelID of a packaged app"
         );
         assert!(!floats(Some("explorer.exe"), None));
-        assert!(!floats(None, None), "a window whose process is not known has no app-id");
+        assert!(
+            !floats(None, None),
+            "a window whose process is not known has no app-id"
+        );
 
         // The anchors see the name without `.exe` as well as the file name.
         let anchored = vec![WindowRule {
@@ -856,13 +882,18 @@ mod tests {
             floating: true,
             ..WindowRule::default()
         }];
-        assert!(resolve_window_rules(&anchored, &facts("t", Some("firefox.exe"), None, false)).float);
+        assert!(
+            resolve_window_rules(&anchored, &facts("t", Some("firefox.exe"), None, false)).float
+        );
         let by_file_name = vec![WindowRule {
             match_groups: vec![group(vec![Matcher::AppId(pat(r"^firefox\.exe$"))])],
             floating: true,
             ..WindowRule::default()
         }];
-        assert!(resolve_window_rules(&by_file_name, &facts("t", Some("firefox.exe"), None, false)).float);
+        assert!(
+            resolve_window_rules(&by_file_name, &facts("t", Some("firefox.exe"), None, false))
+                .float
+        );
     }
 
     #[test]
@@ -876,7 +907,10 @@ mod tests {
             resolve_window_rules(&rules, &ctx_with_process("c", "t", "Notepad.exe")).float
         };
         assert!(by(Matcher::ProcessName("notepad.exe".to_string())));
-        assert!(by(Matcher::ProcessName("NOTEPAD".to_string())), "a stem, any case");
+        assert!(
+            by(Matcher::ProcessName("NOTEPAD".to_string())),
+            "a stem, any case"
+        );
         assert!(!by(Matcher::ProcessName("note".to_string())));
         assert!(by(Matcher::ProcessNameRegex("^Notepad$".to_string())));
         assert!(by(Matcher::ProcessSearch(pat(r"pad\.exe$"))));
@@ -933,7 +967,11 @@ mod tests {
             ..WindowRule::default()
         };
         let r = resolve_window_rules(&[first, second], &facts("t", Some("a.exe"), None, false));
-        assert_eq!(r.opacity, Some(0.9), "the first rule's, the second sets none");
+        assert_eq!(
+            r.opacity,
+            Some(0.9),
+            "the first rule's, the second sets none"
+        );
         assert_eq!(r.min_width, Some(300));
         assert_eq!(r.max_width, Some(700), "the second rule's");
         assert_eq!(r.min_height, Some(200));
@@ -1008,7 +1046,10 @@ mod tests {
             ],
             &ctx("c", "t"),
         );
-        assert_eq!((r.open_in_workspace, r.open_on_workspace.as_deref()), (None, Some("web")));
+        assert_eq!(
+            (r.open_in_workspace, r.open_on_workspace.as_deref()),
+            (None, Some("web"))
+        );
     }
 
     #[test]
@@ -1024,11 +1065,24 @@ mod tests {
             ..WindowRule::default()
         };
         let r = resolve_window_rules(&[niri.clone(), older.clone()], &ctx("c", "t"));
-        assert_eq!((r.default_width_px, r.default_column_width), (Some(640), None));
-        assert_eq!((r.default_height_px, r.default_window_height), (Some(480), None));
+        assert_eq!(
+            (r.default_width_px, r.default_column_width),
+            (Some(640), None)
+        );
+        assert_eq!(
+            (r.default_height_px, r.default_window_height),
+            (Some(480), None)
+        );
         let r = resolve_window_rules(&[older, niri], &ctx("c", "t"));
         assert_eq!(r.default_width_px, None);
-        assert_eq!(r.default_column_width, Some(Some(SizeSpec::Proportion(0.5))));
-        assert_eq!(r.default_window_height, Some(None), "the empty block: the window's own height");
+        assert_eq!(
+            r.default_column_width,
+            Some(Some(SizeSpec::Proportion(0.5)))
+        );
+        assert_eq!(
+            r.default_window_height,
+            Some(None),
+            "the empty block: the window's own height"
+        );
     }
 }

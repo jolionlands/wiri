@@ -226,17 +226,31 @@ pub fn stop_mouse_hook() {
 /// Install WH_KEYBOARD_LL on the existing hotkey message thread. The callback only
 /// evaluates a small state machine and posts actions; no new input thread is created.
 pub fn start_keyboard_hook() -> Result<(), String> {
-    if KB_HOOK_HANDLE.lock().is_some() { return Ok(()); }
-    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_callback), windows::Win32::Foundation::HMODULE::default(), 0) }
-        .map_err(|e| format!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {e}"))?;
-    *KB_HOOK_HANDLE.lock() = Some(HookThread { hook: SendHook(hook), thread_id: unsafe { GetCurrentThreadId() } });
+    if KB_HOOK_HANDLE.lock().is_some() {
+        return Ok(());
+    }
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(keyboard_hook_callback),
+            windows::Win32::Foundation::HMODULE::default(),
+            0,
+        )
+    }
+    .map_err(|e| format!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {e}"))?;
+    *KB_HOOK_HANDLE.lock() = Some(HookThread {
+        hook: SendHook(hook),
+        thread_id: unsafe { GetCurrentThreadId() },
+    });
     info!("Low-level keyboard bind hook installed on hotkey thread");
     Ok(())
 }
 
 pub fn stop_keyboard_hook() {
     if let Some(h) = KB_HOOK_HANDLE.lock().take() {
-        unsafe { let _ = UnhookWindowsHookEx(h.hook.0); }
+        unsafe {
+            let _ = UnhookWindowsHookEx(h.hook.0);
+        }
     }
 }
 
@@ -244,18 +258,44 @@ pub fn stop_keyboard_hook() {
 // Win/Alt tap, without faking a modifier up (which would break a physically held key).
 const MENU_MASK_TAG: usize = 0x57495249;
 fn mask_shell_menu() {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY};
-    let event = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xE8), dwFlags: flags, dwExtraInfo: MENU_MASK_TAG, ..Default::default() } } };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    let event = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0xE8),
+                dwFlags: flags,
+                dwExtraInfo: MENU_MASK_TAG,
+                ..Default::default()
+            },
+        },
+    };
     let events = [event(Default::default()), event(KEYEVENTF_KEYUP)];
-    unsafe { let _ = SendInput(&events, std::mem::size_of::<INPUT>() as i32); }
+    unsafe {
+        let _ = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
-unsafe extern "system" fn keyboard_hook_callback(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-    if n_code < 0 { return CallNextHookEx(None, n_code, w_param, l_param); }
+unsafe extern "system" fn keyboard_hook_callback(
+    n_code: i32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if n_code < 0 {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
     let kb = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
-    if kb.dwExtraInfo == MENU_MASK_TAG { return CallNextHookEx(None, n_code, w_param, l_param); }
+    if kb.dwExtraInfo == MENU_MASK_TAG {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
     let msg = w_param.0 as u32;
-    let pressed = match msg { WM_KEYDOWN | WM_SYSKEYDOWN => true, WM_KEYUP | WM_SYSKEYUP => false, _ => return CallNextHookEx(None,n_code,w_param,l_param) };
+    let pressed = match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN => true,
+        WM_KEYUP | WM_SYSKEYUP => false,
+        _ => return CallNextHookEx(None, n_code, w_param, l_param),
+    };
     let vk = kb.vkCode;
     {
         use std::sync::atomic::Ordering;
@@ -263,12 +303,24 @@ unsafe extern "system" fn keyboard_hook_callback(n_code: i32, w_param: WPARAM, l
         let old = KEY_IS_DOWN[slot].swap(pressed, Ordering::Relaxed);
         KEY_PRESS_WAS_REPEAT[slot].store(pressed && old, Ordering::Relaxed);
     }
-    let decision = crate::input::keyboard::ENGINE.lock().event(vk, pressed, Instant::now());
-    if decision.mask_menu { mask_shell_menu(); }
-    if let Some(action) = decision.action { crate::input::dispatch::send(action); }
+    let decision = crate::input::keyboard::ENGINE
+        .lock()
+        .event(vk, pressed, Instant::now());
+    if decision.mask_menu {
+        mask_shell_menu();
+    }
+    if let Some(action) = decision.action {
+        crate::input::dispatch::send(action);
+    }
     // Escape remains available to applications, but also exits the manager's modes.
-    if pressed && vk == VK_ESCAPE && !decision.consume { crate::input::dispatch::send(crate::input::Action::OverviewExit); }
-    if decision.consume { LRESULT(1) } else { CallNextHookEx(None, n_code, w_param, l_param) }
+    if pressed && vk == VK_ESCAPE && !decision.consume {
+        crate::input::dispatch::send(crate::input::Action::OverviewExit);
+    }
+    if decision.consume {
+        LRESULT(1)
+    } else {
+        CallNextHookEx(None, n_code, w_param, l_param)
+    }
 }
 
 /// Start a move grab (called when Alt+LButton is pressed on a tiled window)
@@ -316,9 +368,15 @@ pub fn current_grab() -> GrabState {
 /// Read modifiers from the OS as well when the keyboard hook is unavailable.
 fn pointer_modifiers() -> u32 {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    [(0x12,1),(0x11,2),(0x10,4),(0x5B,8),(0x5C,8)].iter().fold(0, |mods,(vk,flag)| {
-        if unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0 { mods | flag } else { mods }
-    })
+    [(0x12, 1), (0x11, 2), (0x10, 4), (0x5B, 8), (0x5C, 8)]
+        .iter()
+        .fold(0, |mods, (vk, flag)| {
+            if unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0 {
+                mods | flag
+            } else {
+                mods
+            }
+        })
 }
 
 /// Some(false): observe motion without stopping the system cursor; Some(true):
@@ -333,156 +391,307 @@ fn grab_message(grab: &GrabState, message: u32) -> Option<bool> {
     }
 }
 
-unsafe extern "system" fn mouse_hook_callback(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-    if n_code < 0 { return CallNextHookEx(None,n_code,w_param,l_param); }
+unsafe extern "system" fn mouse_hook_callback(
+    n_code: i32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if n_code < 0 {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
     let msg = w_param.0 as u32;
     let event = &*(l_param.0 as *const MSLLHOOKSTRUCT);
-    let cursor = Point::new(event.pt.x,event.pt.y);
-    if msg == WM_MOUSEMOVE { crate::input::focus::on_mouse_move(cursor); }
+    let cursor = Point::new(event.pt.x, event.pt.y);
+    if msg == WM_MOUSEMOVE {
+        crate::input::focus::on_mouse_move(cursor);
+    }
     // This mutex protects only a snapshot; no layout work holds it. Do not let
     // contention leak the release of a button whose down was consumed.
     let grab = HOOK_STATE.lock().grab.clone();
     if !matches!(grab, GrabState::None) {
         if let Some(consume) = grab_message(&grab, msg) {
-            let (engine,backend) = { let s=HOOK_STATE.lock(); (s.engine.clone(),s.backend.clone()) };
+            let (engine, backend) = {
+                let s = HOOK_STATE.lock();
+                (s.engine.clone(), s.backend.clone())
+            };
             if msg != WM_MOUSEMOVE {
                 HOOK_STATE.lock().grab = GrabState::None;
-                crate::input::pointer::ENGINE.lock().button(0,if msg==WM_LBUTTONUP {0} else {1},false,Instant::now());
+                crate::input::pointer::ENGINE.lock().button(
+                    0,
+                    if msg == WM_LBUTTONUP { 0 } else { 1 },
+                    false,
+                    Instant::now(),
+                );
             }
-            if let (Some(engine),Some(backend)) = (engine,backend) {
-                crate::input::dispatch::send_work(Box::new(move || process_grab(grab,msg,cursor,&engine,&backend)));
+            if let (Some(engine), Some(backend)) = (engine, backend) {
+                crate::input::dispatch::send_work(Box::new(move || {
+                    process_grab(grab, msg, cursor, &engine, &backend)
+                }));
             }
             // LL motion runs before Windows updates the cursor. Consuming it
             // freezes the real pointer and makes button-up report the drag's
             // starting point, undoing the preview. Only capture button edges.
-            return if consume { LRESULT(1) } else { CallNextHookEx(None,n_code,w_param,l_param) };
+            return if consume {
+                LRESULT(1)
+            } else {
+                CallNextHookEx(None, n_code, w_param, l_param)
+            };
         }
     }
     if msg == WM_MOUSEMOVE {
         // Focus motion was published above, even during grabs so a dwell is cancelled.
-        return CallNextHookEx(None,n_code,w_param,l_param);
+        return CallNextHookEx(None, n_code, w_param, l_param);
     }
-    let mods=pointer_modifiers();
-    let button = match msg { 0x201|0x202 => Some((0,msg==0x201)), 0x204|0x205 => Some((1,msg==0x204)), 0x207|0x208 => Some((2,msg==0x207)), 0x20B|0x20C => Some((if event.mouseData >> 16 == 1 {3} else {4},msg==0x20B)), _=>None };
-    let (consume,actions) = if let Some((b,down))=button {
-        crate::input::pointer::ENGINE.lock().button(mods,b,down,Instant::now())
-    } else if msg==WM_MOUSEWHEEL || msg==0x20E {
-        crate::input::pointer::ENGINE.lock().wheel(mods,msg==0x20E,(event.mouseData >> 16) as i16 as i32,Instant::now())
-    } else { return CallNextHookEx(None,n_code,w_param,l_param); };
+    let mods = pointer_modifiers();
+    let button = match msg {
+        0x201 | 0x202 => Some((0, msg == 0x201)),
+        0x204 | 0x205 => Some((1, msg == 0x204)),
+        0x207 | 0x208 => Some((2, msg == 0x207)),
+        0x20B | 0x20C => Some((if event.mouseData >> 16 == 1 { 3 } else { 4 }, msg == 0x20B)),
+        _ => None,
+    };
+    let (consume, actions) = if let Some((b, down)) = button {
+        crate::input::pointer::ENGINE
+            .lock()
+            .button(mods, b, down, Instant::now())
+    } else if msg == WM_MOUSEWHEEL || msg == 0x20E {
+        crate::input::pointer::ENGINE.lock().wheel(
+            mods,
+            msg == 0x20E,
+            (event.mouseData >> 16) as i16 as i32,
+            Instant::now(),
+        )
+    } else {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    };
     if consume {
-        for a in actions { crate::input::dispatch::send(a); }
-        if mods & (1|8) != 0 { mask_shell_menu(); }
+        for a in actions {
+            crate::input::dispatch::send(a);
+        }
+        if mods & (1 | 8) != 0 {
+            mask_shell_menu();
+        }
         return LRESULT(1);
     }
     // An explicit click bind wins over the corresponding built-in gesture.
-    if matches!(button,Some((0|1,true))) {
-        let mod_key=crate::input::pointer::ENGINE.lock().mod_key;
-        let reorder=mods==mod_key|2 && mod_key&2==0;
-        if mods==mod_key || reorder {
-            let child=windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT {x:cursor.x,y:cursor.y});
-            let root=windows::Win32::UI::WindowsAndMessaging::GetAncestor(child,windows::Win32::UI::WindowsAndMessaging::GA_ROOT);
-            let wid=WindowId::new(root.0 as isize);
-            let (engine,backend)={ let s=HOOK_STATE.lock(); (s.engine.clone(),s.backend.clone()) };
-            if let (Some(engine),Some(backend))=(engine,backend) {
-                if let Some(eng)=engine.try_read() {
-                    if let Some(info)=eng.tiled_windows().get(&wid) {
-                        if eng.is_fullscreen(wid) { return CallNextHookEx(None,n_code,w_param,l_param); }
-                        let bounds=backend.get_window(wid.as_isize()).and_then(|w| w.get_dwm_bounds()).unwrap_or(info.bounds);
-                        let col=eng.monitors().values().find_map(|m| m.workspace().and_then(|w| w.find_window_column(wid))).unwrap_or(0);
-                        let next=if msg==WM_LBUTTONDOWN {
-                            if reorder && !eng.is_floating(wid) && cursor.y-bounds.loc.y <= COLUMN_REORDER_HIT_ZONE_PX {
-                                GrabState::ColumnReorder(ColumnReorderGrab::new(wid,col,cursor))
-                            } else { GrabState::Move(MoveGrab::new(wid,cursor,bounds.loc,bounds.size,col)) }
-                        } else if let Some(edge)=crate::input::grab::resize_edge_or_quadrant(cursor,bounds,eng.config().border_width) {
-                            GrabState::Resize(ResizeGrab::new(wid,edge,cursor,bounds))
-                        } else { return CallNextHookEx(None,n_code,w_param,l_param); };
-                        drop(eng); HOOK_STATE.lock().grab=next;
-                        crate::input::pointer::ENGINE.lock().capture_gesture(if msg==WM_LBUTTONDOWN {0} else {1});
-                        if mods & (1|8) != 0 { mask_shell_menu(); }
+    if matches!(button, Some((0 | 1, true))) {
+        let mod_key = crate::input::pointer::ENGINE.lock().mod_key;
+        let reorder = mods == mod_key | 2 && mod_key & 2 == 0;
+        if mods == mod_key || reorder {
+            let child = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT {
+                x: cursor.x,
+                y: cursor.y,
+            });
+            let root = windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+                child,
+                windows::Win32::UI::WindowsAndMessaging::GA_ROOT,
+            );
+            let wid = WindowId::new(root.0 as isize);
+            let (engine, backend) = {
+                let s = HOOK_STATE.lock();
+                (s.engine.clone(), s.backend.clone())
+            };
+            if let (Some(engine), Some(backend)) = (engine, backend) {
+                if let Some(eng) = engine.try_read() {
+                    if let Some(info) = eng.tiled_windows().get(&wid) {
+                        if eng.is_fullscreen(wid) {
+                            return CallNextHookEx(None, n_code, w_param, l_param);
+                        }
+                        let bounds = backend
+                            .get_window(wid.as_isize())
+                            .and_then(|w| w.get_dwm_bounds())
+                            .unwrap_or(info.bounds);
+                        let col = eng
+                            .monitors()
+                            .values()
+                            .find_map(|m| m.workspace().and_then(|w| w.find_window_column(wid)))
+                            .unwrap_or(0);
+                        let next = if msg == WM_LBUTTONDOWN {
+                            if reorder
+                                && !eng.is_floating(wid)
+                                && cursor.y - bounds.loc.y <= COLUMN_REORDER_HIT_ZONE_PX
+                            {
+                                GrabState::ColumnReorder(ColumnReorderGrab::new(wid, col, cursor))
+                            } else {
+                                GrabState::Move(MoveGrab::new(
+                                    wid,
+                                    cursor,
+                                    bounds.loc,
+                                    bounds.size,
+                                    col,
+                                ))
+                            }
+                        } else if let Some(edge) = crate::input::grab::resize_edge_or_quadrant(
+                            cursor,
+                            bounds,
+                            eng.config().border_width,
+                        ) {
+                            GrabState::Resize(ResizeGrab::new(wid, edge, cursor, bounds))
+                        } else {
+                            return CallNextHookEx(None, n_code, w_param, l_param);
+                        };
+                        drop(eng);
+                        HOOK_STATE.lock().grab = next;
+                        crate::input::pointer::ENGINE
+                            .lock()
+                            .capture_gesture(if msg == WM_LBUTTONDOWN { 0 } else { 1 });
+                        if mods & (1 | 8) != 0 {
+                            mask_shell_menu();
+                        }
                         return LRESULT(1);
                     }
                 }
             }
         }
     }
-    CallNextHookEx(None,n_code,w_param,l_param)
+    CallNextHookEx(None, n_code, w_param, l_param)
 }
 
 fn preview_rect(wid: WindowId, rect: Rect, backend: &BackendHandle) {
-    let _=backend.set_window_position(wid.as_isize(),rect,windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE);
+    let _ = backend.set_window_position(
+        wid.as_isize(),
+        rect,
+        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+            | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+    );
 }
 
 /// Slow layout/backend work never runs inside the global low-level callback.
-fn process_grab(grab: GrabState, msg: u32, cursor: Point, engine: &Arc<parking_lot::RwLock<TilingEngine>>, backend: &BackendHandle) {
+fn process_grab(
+    grab: GrabState,
+    msg: u32,
+    cursor: Point,
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+) {
     match grab {
         GrabState::Move(g) => {
-            let mut pos=g.new_position(cursor);
-            if msg==WM_MOUSEMOVE {
-                let cfg=crate::input::snap_guide::snap_config();
-                let mut overlay=None;
+            let mut pos = g.new_position(cursor);
+            if msg == WM_MOUSEMOVE {
+                let cfg = crate::input::snap_guide::snap_config();
+                let mut overlay = None;
                 if cfg.enabled {
-                    let eng=engine.read();
-                    if let Some(m)=eng.focused_output().and_then(|o| eng.monitors().get(&o)) {
-                        let mut lefts=vec![]; let mut rights=vec![];
-                        if let Some(w)=m.workspace() { for col in &w.columns {
-                            if col.tiles.iter().any(|t| t.window_id==g.window_id) { continue; }
-                            for t in &col.tiles { if let Some(i)=eng.tiled_windows().get(&t.window_id) { lefts.push(i.bounds.loc.x); rights.push(i.bounds.right()); } }
-                        } }
-                        let wa=m.work_area; let candidates=build_candidates(&lefts,&rights,wa.loc.x,wa.size.w as i32);
-                        if let Some(SnapTarget {x,..})=find_snap(pos.x,&candidates,cfg.threshold_px) { pos.x=x; overlay=Some((x,wa.loc.y,wa.size.h as i32)); }
+                    let eng = engine.read();
+                    if let Some(m) = eng.focused_output().and_then(|o| eng.monitors().get(&o)) {
+                        let mut lefts = vec![];
+                        let mut rights = vec![];
+                        if let Some(w) = m.workspace() {
+                            for col in &w.columns {
+                                if col.tiles.iter().any(|t| t.window_id == g.window_id) {
+                                    continue;
+                                }
+                                for t in &col.tiles {
+                                    if let Some(i) = eng.tiled_windows().get(&t.window_id) {
+                                        lefts.push(i.bounds.loc.x);
+                                        rights.push(i.bounds.right());
+                                    }
+                                }
+                            }
+                        }
+                        let wa = m.work_area;
+                        let candidates =
+                            build_candidates(&lefts, &rights, wa.loc.x, wa.size.w as i32);
+                        if let Some(SnapTarget { x, .. }) =
+                            find_snap(pos.x, &candidates, cfg.threshold_px)
+                        {
+                            pos.x = x;
+                            overlay = Some((x, wa.loc.y, wa.size.h as i32));
+                        }
                     }
                 }
-                preview_rect(g.window_id,Rect::new(pos.x,pos.y,g.initial_size.w,g.initial_size.h),backend);
-                if crate::input::snap_guide::note_snap_x(overlay.map(|(x,_,_)| x)) {
-                    match overlay { Some((x,y,h))=>crate::input::snap_guide::guide().show_at(x,y,h), None=>crate::input::snap_guide::guide().hide() }
+                preview_rect(
+                    g.window_id,
+                    Rect::new(pos.x, pos.y, g.initial_size.w, g.initial_size.h),
+                    backend,
+                );
+                if crate::input::snap_guide::note_snap_x(overlay.map(|(x, _, _)| x)) {
+                    match overlay {
+                        Some((x, y, h)) => crate::input::snap_guide::guide().show_at(x, y, h),
+                        None => crate::input::snap_guide::guide().hide(),
+                    }
                 }
             } else {
                 crate::input::snap_guide::note_snap_x(None);
                 // Do not create the guide just to hide it on a drag with no snap.
                 crate::input::snap_guide::hide_if_created();
-                let mut eng=engine.write();
+                let mut eng = engine.write();
                 if eng.is_floating(g.window_id) {
-                    eng.place_float_from_pointer(g.window_id,Rect::new(pos.x,pos.y,g.initial_size.w,g.initial_size.h),backend);
+                    eng.place_float_from_pointer(
+                        g.window_id,
+                        Rect::new(pos.x, pos.y, g.initial_size.w, g.initial_size.h),
+                        backend,
+                    );
                 } else {
-                    let oid=eng.monitors().iter().find_map(|(o,m)| m.workspace().and_then(|w| w.find_window_column(g.window_id)).map(|_| *o));
-                    if let Some(o)=oid {
-                        let gap=eng.config().column_gap;
-                        if let Some(w)=eng.monitors_mut().get_mut(&o).and_then(|m| m.workspace_mut()) {
-                            let target=g.target_column(cursor,g.initial_size.w as i32,gap,w.columns.len().max(1));
-                            let _=w.move_window(g.window_id,target,0);
+                    let oid = eng.monitors().iter().find_map(|(o, m)| {
+                        m.workspace()
+                            .and_then(|w| w.find_window_column(g.window_id))
+                            .map(|_| *o)
+                    });
+                    if let Some(o) = oid {
+                        let gap = eng.config().column_gap;
+                        if let Some(w) = eng
+                            .monitors_mut()
+                            .get_mut(&o)
+                            .and_then(|m| m.workspace_mut())
+                        {
+                            let target = g.target_column(
+                                cursor,
+                                g.initial_size.w as i32,
+                                gap,
+                                w.columns.len().max(1),
+                            );
+                            let _ = w.move_window(g.window_id, target, 0);
                         }
-                        eng.apply_layout_for_monitor(o,backend);
+                        eng.apply_layout_for_monitor(o, backend);
                     }
                 }
                 crate::ipc::notify_state_changed();
             }
         }
         GrabState::Resize(g) => {
-            let rect=g.new_rect(cursor,(100,100));
-            if msg==WM_MOUSEMOVE { preview_rect(g.window_id,rect,backend); }
-            else {
-                let mut eng=engine.write();
+            let rect = g.new_rect(cursor, (100, 100));
+            if msg == WM_MOUSEMOVE {
+                preview_rect(g.window_id, rect, backend);
+            } else {
+                let mut eng = engine.write();
                 if eng.is_floating(g.window_id) {
-                    eng.place_float_from_pointer(g.window_id,rect,backend);
+                    eng.place_float_from_pointer(g.window_id, rect, backend);
                 } else {
-                    let target=eng.monitors().iter().find_map(|(o,m)| m.workspace().and_then(|w| w.find_window_column(g.window_id)).map(|c| (*o,c)));
-                    if let Some((o,c))=target {
+                    let target = eng.monitors().iter().find_map(|(o, m)| {
+                        m.workspace()
+                            .and_then(|w| w.find_window_column(g.window_id))
+                            .map(|c| (*o, c))
+                    });
+                    if let Some((o, c)) = target {
                         eng.set_focused_output(o);
-                        if let Some(m)=eng.monitors_mut().get_mut(&o) { m.focus_column=Some(c); m.focus_window=Some(g.window_id); }
+                        if let Some(m) = eng.monitors_mut().get_mut(&o) {
+                            m.focus_column = Some(c);
+                            m.focus_window = Some(g.window_id);
+                        }
                         // Use the engine's existing setters: the width/height becomes layout
                         // state (and observes its limits), not a transient SetWindowPos.
-                        eng.set_column_width_by(crate::input::SizeChange::SetFixed(rect.size.w as i32),backend);
-                        eng.set_window_height_by(crate::input::SizeChange::SetFixed(rect.size.h as i32),backend);
+                        eng.set_column_width_by(
+                            crate::input::SizeChange::SetFixed(rect.size.w as i32),
+                            backend,
+                        );
+                        eng.set_window_height_by(
+                            crate::input::SizeChange::SetFixed(rect.size.h as i32),
+                            backend,
+                        );
                     }
                 }
                 crate::ipc::notify_state_changed();
             }
         }
-        GrabState::ColumnReorder(g) => if msg==WM_LBUTTONUP {
-            let mut eng=engine.write();
-            if let Some(dst)=eng.column_at_x(cursor.x) { eng.swap_columns(g.source_col,dst,backend); }
-            crate::ipc::notify_state_changed();
-        },
+        GrabState::ColumnReorder(g) => {
+            if msg == WM_LBUTTONUP {
+                let mut eng = engine.write();
+                if let Some(dst) = eng.column_at_x(cursor.x) {
+                    eng.swap_columns(g.source_col, dst, backend);
+                }
+                crate::ipc::notify_state_changed();
+            }
+        }
         GrabState::None => {}
     }
 }
@@ -498,7 +707,12 @@ mod motion_tests {
         let window = WindowId::new(1);
         let grabs = [
             GrabState::Move(MoveGrab::new(window, cursor, rect.loc, rect.size, 0)),
-            GrabState::Resize(ResizeGrab::new(window, crate::input::grab::ResizeEdge::Right, cursor, rect)),
+            GrabState::Resize(ResizeGrab::new(
+                window,
+                crate::input::grab::ResizeEdge::Right,
+                cursor,
+                rect,
+            )),
             GrabState::ColumnReorder(ColumnReorderGrab::new(window, 0, cursor)),
         ];
         for grab in grabs {
@@ -514,7 +728,12 @@ mod motion_tests {
         let rect = Rect::new(100, 100, 400, 300);
         let window = WindowId::new(1);
         let move_grab = GrabState::Move(MoveGrab::new(window, cursor, rect.loc, rect.size, 0));
-        let resize = GrabState::Resize(ResizeGrab::new(window, crate::input::grab::ResizeEdge::Right, cursor, rect));
+        let resize = GrabState::Resize(ResizeGrab::new(
+            window,
+            crate::input::grab::ResizeEdge::Right,
+            cursor,
+            rect,
+        ));
         let reorder = GrabState::ColumnReorder(ColumnReorderGrab::new(window, 0, cursor));
         assert_eq!(grab_message(&move_grab, WM_LBUTTONUP), Some(true));
         assert_eq!(grab_message(&move_grab, WM_RBUTTONUP), None);

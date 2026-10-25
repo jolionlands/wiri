@@ -798,7 +798,12 @@ impl MatchGroup {
 /// app-id: the process's file name, that name without its extension and the
 /// AppUserModelID of a packaged app stand in for it.
 pub fn app_id_matches(pat: &RegexPat, ctx: &MatcherContext<'_>) -> bool {
-    if ctx.process_names().iter().flatten().any(|n| pat.is_match(n)) {
+    if ctx
+        .process_names()
+        .iter()
+        .flatten()
+        .any(|n| pat.is_match(n))
+    {
         return true;
     }
     if let Some(aumid) = ctx.aumid {
@@ -866,9 +871,11 @@ impl Matcher {
             Matcher::AppId(pat) => app_id_matches(pat, ctx),
             Matcher::TitleSearch(pat) => pat.is_match(ctx.title),
             Matcher::ClassSearch(pat) => pat.is_match(ctx.class_name),
-            Matcher::ProcessSearch(pat) => {
-                ctx.process_names().iter().flatten().any(|p| pat.is_match(p))
-            }
+            Matcher::ProcessSearch(pat) => ctx
+                .process_names()
+                .iter()
+                .flatten()
+                .any(|p| pat.is_match(p)),
             Matcher::IsFocused => ctx.is_focused,
             Matcher::IsActiveInColumn => ctx.is_active_in_column,
             Matcher::Not(inner) => !inner.matches(ctx),

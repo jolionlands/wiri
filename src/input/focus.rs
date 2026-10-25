@@ -53,7 +53,10 @@ fn pack(point: Point) -> u64 {
 }
 
 fn unpack(value: u64) -> Point {
-    Point { x: (value >> 32) as i32, y: value as i32 }
+    Point {
+        x: (value >> 32) as i32,
+        y: value as i32,
+    }
 }
 
 fn post(message: u32) -> bool {
@@ -69,9 +72,7 @@ fn post(message: u32) -> bool {
 /// Must never lock the engine, acquire that mutex, or call into the layout.
 pub fn on_mouse_move(point: Point) {
     let packed = pack(point);
-    if WARP_PENDING.swap(false, Ordering::AcqRel)
-        && WARP_POINT.load(Ordering::Acquire) == packed
-    {
+    if WARP_PENDING.swap(false, Ordering::AcqRel) && WARP_POINT.load(Ordering::Acquire) == packed {
         return;
     }
     if !FOLLOWS_MOUSE.load(Ordering::Acquire) {
@@ -129,7 +130,9 @@ pub fn shutdown() {
 pub fn handle_message(message: &MSG) -> bool {
     STATE.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(state) = slot.as_mut() else { return false };
+        let Some(state) = slot.as_mut() else {
+            return false;
+        };
         match message.message {
             WM_POINTER_FOCUS if message.hwnd.is_invalid() => {
                 if MOTION_PENDING.swap(false, Ordering::AcqRel) {
@@ -180,7 +183,9 @@ struct ForegroundState {
 
 impl ForegroundState {
     fn observe(&mut self, window: isize, warp: bool) -> bool {
-        if window == 0 || window == self.last { return false }
+        if window == 0 || window == self.last {
+            return false;
+        }
         self.last = window;
         self.pending = warp.then_some(window);
         true
@@ -195,11 +200,20 @@ impl ForegroundState {
 impl FocusState {
     fn reload(&mut self) {
         self.cancel();
-        self.policy = self.engine.read().full_config().as_ref()
-            .map(|config| config.input.focus()).unwrap_or_default();
+        self.policy = self
+            .engine
+            .read()
+            .full_config()
+            .as_ref()
+            .map(|config| config.input.focus())
+            .unwrap_or_default();
         self.policy.focus_delay_ms = self.policy.focus_delay_ms.min(60_000);
-        info!(follows_mouse = self.policy.follows_mouse, delay_ms = self.policy.focus_delay_ms,
-            warp = self.policy.warp_on_focus, "Pointer focus policy updated");
+        info!(
+            follows_mouse = self.policy.follows_mouse,
+            delay_ms = self.policy.focus_delay_ms,
+            warp = self.policy.warp_on_focus,
+            "Pointer focus policy updated"
+        );
         FOLLOWS_MOUSE.store(self.policy.follows_mouse, Ordering::Release);
         MOTION_PENDING.store(false, Ordering::Release);
         WARP_PENDING.store(false, Ordering::Release);
@@ -209,8 +223,12 @@ impl FocusState {
             // thread. The callback only publishes an HWND, never borrowed state.
             let hook = unsafe {
                 SetWinEventHook(
-                    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-                    HMODULE::default(), Some(foreground_event), 0, 0,
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    HMODULE::default(),
+                    Some(foreground_event),
+                    0,
+                    0,
                     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
                 )
             };
@@ -226,9 +244,15 @@ impl FocusState {
             // Focus and location are completion notifications, not a frame clock.
             // Intermediate events in this small range are ignored by the callback.
             let hook = unsafe {
-                SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_LOCATIONCHANGE,
-                    HMODULE::default(), Some(foreground_event), 0, 0,
-                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+                SetWinEventHook(
+                    EVENT_OBJECT_FOCUS,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    HMODULE::default(),
+                    Some(foreground_event),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
             };
             if hook.is_invalid() {
                 warn!("Unable to install pointer-warp completion hook");
@@ -240,7 +264,8 @@ impl FocusState {
         }
         // Reload/startup itself is not a foreground change and must not warp.
         // SAFETY: querying the current foreground window has no preconditions.
-        self.foreground.suppress(unsafe { GetForegroundWindow() }.0 as isize);
+        self.foreground
+            .suppress(unsafe { GetForegroundWindow() }.0 as isize);
     }
 
     fn remove_geometry_hook(&mut self) {
@@ -294,7 +319,9 @@ impl FocusState {
             }
         }
         let previous = self.dwell.pending.map(|pending| pending.target);
-        let decision = self.dwell.observe(target, Instant::now(), self.policy.focus_delay_ms);
+        let decision = self
+            .dwell
+            .observe(target, Instant::now(), self.policy.focus_delay_ms);
         debug!(?point, ?target, ?decision, "Pointer focus motion");
         // A move within the same target must NOT restart the one-shot timer.
         if previous != self.dwell.pending.map(|pending| pending.target) {
@@ -310,7 +337,8 @@ impl FocusState {
                 if !self.timer_armed {
                     let ms = remaining.as_millis().clamp(1, 60_000) as u32;
                     // SAFETY: the owner HWND is live and this ID is module-local.
-                    self.timer_armed = unsafe { SetTimer(self.hwnd, FOCUS_TIMER_ID, ms, None) } != 0;
+                    self.timer_armed =
+                        unsafe { SetTimer(self.hwnd, FOCUS_TIMER_ID, ms, None) } != 0;
                     if !self.timer_armed {
                         self.cancel();
                         warn!("Unable to arm focus-follows-mouse delay timer");
@@ -327,18 +355,25 @@ impl FocusState {
     fn expired(&mut self) {
         // Win32 timers repeat by default; remove it BEFORE processing expiry.
         self.stop_timer();
-        let Some(pending) = self.dwell.pending else { return };
+        let Some(pending) = self.dwell.pending else {
+            return;
+        };
         if !self.policy.follows_mouse || super::low_level_hook::is_grab_active() {
             self.cancel();
             return;
         }
-        let Some(point) = cursor_position() else { self.cancel(); return };
+        let Some(point) = cursor_position() else {
+            self.cancel();
+            return;
+        };
         let target = target_at(&self.engine.read(), point);
         if target != Some(pending.target) {
             self.cancel();
             return;
         }
-        let decision = self.dwell.observe(target, Instant::now(), self.policy.focus_delay_ms);
+        let decision = self
+            .dwell
+            .observe(target, Instant::now(), self.policy.focus_delay_ms);
         self.perform(decision, point);
     }
 
@@ -362,7 +397,8 @@ impl FocusState {
         // SAFETY: these are value-only HWND queries; no application memory is read.
         let foreground = unsafe { GetForegroundWindow() };
         let owner = root_owner(foreground);
-        if engine.managed_window_for(foreground.0 as isize, owner.0 as isize) == Some(target.window) {
+        if engine.managed_window_for(foreground.0 as isize, owner.0 as isize) == Some(target.window)
+        {
             return;
         }
         if target.column.is_none() {
@@ -383,7 +419,9 @@ impl FocusState {
         };
         debug!(?target, scroll, "Pointer focus activation");
         let already_selected = engine.focused_output() == Some(target.output)
-            && engine.monitors().get(&target.output)
+            && engine
+                .monitors()
+                .get(&target.output)
                 .is_some_and(|monitor| monitor.focus_window == Some(target.window));
         if let Some(monitor) = engine.monitors_mut().get_mut(&target.output) {
             monitor.focus_window = Some(target.window);
@@ -409,8 +447,15 @@ impl FocusState {
     }
 
     fn foreground(&mut self, event_hwnd: isize) {
-        debug!(event_hwnd, last = self.foreground.last, "Pointer foreground notification");
-        if self.foreground.observe(event_hwnd, self.policy.warp_on_focus) {
+        debug!(
+            event_hwnd,
+            last = self.foreground.last,
+            "Pointer foreground notification"
+        );
+        if self
+            .foreground
+            .observe(event_hwnd, self.policy.warp_on_focus)
+        {
             // Keyboard/IPC focus changes cancel hover even with warp disabled.
             self.cancel();
         }
@@ -419,47 +464,78 @@ impl FocusState {
             self.foreground.pending = None;
             return;
         }
-        if self.foreground.pending != Some(event_hwnd) { return }
+        if self.foreground.pending != Some(event_hwnd) {
+            return;
+        }
         // A queued foreground event can precede actual activation. Keep the
         // pending request; object-focus/location notifications revalidate it.
         let foreground = unsafe { GetForegroundWindow() };
-        if foreground.0 as isize != event_hwnd { return }
+        if foreground.0 as isize != event_hwnd {
+            return;
+        }
         let root = unsafe { GetAncestor(foreground, GA_ROOT) };
         let owner = root_owner(foreground);
         let expected = {
             let engine = self.engine.read();
-            if engine.managed_window_for(root.0 as isize, owner.0 as isize).is_none() {
+            if engine
+                .managed_window_for(root.0 as isize, owner.0 as isize)
+                .is_none()
+            {
                 self.foreground.pending = None;
                 return;
             }
-            if engine.is_overview() { self.foreground.pending = None; return }
+            if engine.is_overview() {
+                self.foreground.pending = None;
+                return;
+            }
             // Owned dialogs have their own geometry, not the owner's tile.
             engine.pointer_warp_target(WindowId::new(root.0 as isize))
         };
-        if !visible_window(root) { return }
-        let Some(rect) = self.backend.get_window(root.0 as isize)
-            .and_then(|info| info.get_dwm_bounds()).or_else(|| window_rect(root)) else { return };
+        if !visible_window(root) {
+            return;
+        }
+        let Some(rect) = self
+            .backend
+            .get_window(root.0 as isize)
+            .and_then(|info| info.get_dwm_bounds())
+            .or_else(|| window_rect(root))
+        else {
+            return;
+        };
         // Native positioning is asynchronous. Never warp to a parking rectangle
         // or to old on-screen geometry while a layout move is still in flight.
         let ready = expected.is_none_or(|expected| warp_geometry_ready(rect, expected))
-            && self.engine.read().monitors().values()
+            && self
+                .engine
+                .read()
+                .monitors()
+                .values()
                 .any(|monitor| monitor.bounds.contains_point(rect.center()));
-        if !ready { return }
+        if !ready {
+            return;
+        }
         self.foreground.pending = None;
         let mut cursor = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
         };
         // SAFETY: cursor is correctly sized, writable stack storage.
-        if unsafe { GetCursorInfo(&mut cursor) }.is_err()
-            || cursor.flags.0 & CURSOR_SHOWING.0 == 0
+        if unsafe { GetCursorInfo(&mut cursor) }.is_err() || cursor.flags.0 & CURSOR_SHOWING.0 == 0
         {
             // In particular, never call ShowCursor to reveal a hidden pointer.
-            debug!(flags = cursor.flags.0, "Pointer warp skipped for hidden or unavailable cursor");
+            debug!(
+                flags = cursor.flags.0,
+                "Pointer warp skipped for hidden or unavailable cursor"
+            );
             return;
         }
-        let point = Point { x: cursor.ptScreenPos.x, y: cursor.ptScreenPos.y };
-        let Some(destination) = warp_destination(rect, point, self.policy.warp_mode) else { return };
+        let point = Point {
+            x: cursor.ptScreenPos.x,
+            y: cursor.ptScreenPos.y,
+        };
+        let Some(destination) = warp_destination(rect, point, self.policy.warp_mode) else {
+            return;
+        };
         debug!(?point, ?destination, "Warping pointer to foreground window");
         WARP_POINT.store(pack(destination), Ordering::Release);
         WARP_PENDING.store(true, Ordering::Release);
@@ -479,14 +555,18 @@ unsafe extern "system" fn foreground_event(
     _event_thread: u32,
     _time: u32,
 ) {
-    if hwnd.is_invalid() { return }
+    if hwnd.is_invalid() {
+        return;
+    }
     if event == EVENT_SYSTEM_FOREGROUND {
         FOREGROUND_HWND.store(hwnd.0 as isize, Ordering::Release);
     } else if event == EVENT_OBJECT_FOCUS
         || (event == EVENT_OBJECT_LOCATIONCHANGE && _object == 0 && _child == 0)
     {
         let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        if root.0 as isize != FOREGROUND_HWND.load(Ordering::Acquire) { return }
+        if root.0 as isize != FOREGROUND_HWND.load(Ordering::Acquire) {
+            return;
+        }
     } else {
         return;
     }
@@ -499,7 +579,10 @@ fn cursor_position() -> Option<Point> {
     let mut point = POINT::default();
     // SAFETY: point is writable stack storage of the required size.
     unsafe { GetCursorPos(&mut point) }.ok()?;
-    Some(Point { x: point.x, y: point.y })
+    Some(Point {
+        x: point.x,
+        y: point.y,
+    })
 }
 
 fn root_owner(hwnd: HWND) -> HWND {
@@ -509,8 +592,9 @@ fn root_owner(hwnd: HWND) -> HWND {
 
 fn visible_window(hwnd: HWND) -> bool {
     // SAFETY: these APIs validate HWND values and do not dereference Rust memory.
-    (unsafe { IsWindow(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() })
-        && !cloak::is_cloaked(hwnd.0 as isize)
+    (unsafe {
+        IsWindow(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool()
+    }) && !cloak::is_cloaked(hwnd.0 as isize)
 }
 
 fn window_rect(hwnd: HWND) -> Option<Rect> {
@@ -519,13 +603,20 @@ fn window_rect(hwnd: HWND) -> Option<Rect> {
     unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
     let width = rect.right.checked_sub(rect.left)?;
     let height = rect.bottom.checked_sub(rect.top)?;
-    if width <= 0 || height <= 0 { return None }
+    if width <= 0 || height <= 0 {
+        return None;
+    }
     Some(Rect::new(rect.left, rect.top, width as u32, height as u32))
 }
 
 fn target_at(engine: &TilingEngine, point: Point) -> Option<FocusTarget> {
     // SAFETY: screen-space hit testing returns HWND values, not borrowed memory.
-    let hit = unsafe { WindowFromPoint(POINT { x: point.x, y: point.y }) };
+    let hit = unsafe {
+        WindowFromPoint(POINT {
+            x: point.x,
+            y: point.y,
+        })
+    };
     let root = unsafe { GetAncestor(hit, GA_ROOT) };
     if !visible_window(root) {
         return None;
@@ -544,8 +635,12 @@ struct FocusTarget {
 }
 
 fn pointer_output(engine: &TilingEngine, point: Point) -> Option<OutputId> {
-    if engine.is_overview() { return None }
-    engine.monitors().iter()
+    if engine.is_overview() {
+        return None;
+    }
+    engine
+        .monitors()
+        .iter()
         .find(|(_, monitor)| monitor.bounds.contains_point(point))
         .map(|(output, _)| *output)
 }
@@ -556,17 +651,29 @@ fn resolve_target(engine: &TilingEngine, point: Point, roots: [isize; 2]) -> Opt
     let output = pointer_output(engine, point)?;
     let monitor = engine.monitors().get(&output)?;
     for root in roots {
-        if root == 0 { continue }
+        if root == 0 {
+            continue;
+        }
         let window = WindowId::new(root);
         if let Some((home, workspace, column)) = engine.locate_window(window) {
             if home == output && workspace == monitor.active_workspace {
-                return Some(FocusTarget { window, output: home, workspace, column: Some(column) });
+                return Some(FocusTarget {
+                    window,
+                    output: home,
+                    workspace,
+                    column: Some(column),
+                });
             }
         } else if engine.is_floating(window)
             && (engine.is_sticky(window)
                 || engine.float_workspace(window) == Some(monitor.active_workspace))
         {
-            return Some(FocusTarget { window, output, workspace: monitor.active_workspace, column: None });
+            return Some(FocusTarget {
+                window,
+                output,
+                workspace: monitor.active_workspace,
+                column: None,
+            });
         }
     }
     None
@@ -582,16 +689,42 @@ fn reveal_scroll(engine: &TilingEngine, target: FocusTarget, percent: Option<f64
         return Some(before);
     }
     let config = engine.effective_config(target.output);
-    let view_width = monitor.work_area.size.w as i32 - config.outer_gaps.1 - config.outer_gaps.3
-        - config.reserve_left as i32 - config.reserve_right as i32;
-    if view_width <= 0 { return None }
-    let explicit: Vec<_> = workspace.columns.iter().map(|column| {
-        if column.maximized { Some(view_width as u32) } else { column.width }
-    }).collect();
-    let mins: Vec<_> = workspace.columns.iter().map(|column| column.min_width()).collect();
-    let maxs: Vec<_> = workspace.columns.iter().map(|column| column.max_width()).collect();
+    let view_width = monitor.work_area.size.w as i32
+        - config.outer_gaps.1
+        - config.outer_gaps.3
+        - config.reserve_left as i32
+        - config.reserve_right as i32;
+    if view_width <= 0 {
+        return None;
+    }
+    let explicit: Vec<_> = workspace
+        .columns
+        .iter()
+        .map(|column| {
+            if column.maximized {
+                Some(view_width as u32)
+            } else {
+                column.width
+            }
+        })
+        .collect();
+    let mins: Vec<_> = workspace
+        .columns
+        .iter()
+        .map(|column| column.min_width())
+        .collect();
+    let maxs: Vec<_> = workspace
+        .columns
+        .iter()
+        .map(|column| column.max_width())
+        .collect();
     let (widths, default_width) = TilingEngine::column_widths_with_limits(
-        &explicit, &mins, &maxs, view_width, config.column_gap, config,
+        &explicit,
+        &mins,
+        &maxs,
+        view_width,
+        config.column_gap,
+        config,
     );
     let mut candidate = workspace.clone();
     for (column, width) in candidate.columns.iter_mut().zip(widths) {
@@ -613,13 +746,16 @@ fn scroll_allowed(before: i32, after: i32, work_width: u32, percent: Option<f64>
 fn warp_geometry_ready(actual: Rect, expected: Rect) -> bool {
     // DWM frame coordinates allow rounding, not a stale on-screen/parked move.
     // App minimum sizes may differ from the request: compare position, not size.
-    actual.size.w > 0 && actual.size.h > 0
+    actual.size.w > 0
+        && actual.size.h > 0
         && (i64::from(actual.loc.x) - i64::from(expected.loc.x)).abs() <= 2
         && (i64::from(actual.loc.y) - i64::from(expected.loc.y)).abs() <= 2
 }
 
 fn warp_destination(rect: Rect, point: Point, mode: WarpMode) -> Option<Point> {
-    if rect.size.w == 0 || rect.size.h == 0 { return None }
+    if rect.size.w == 0 || rect.size.h == 0 {
+        return None;
+    }
     let inside_x = point.x >= rect.loc.x && point.x < rect.right();
     let inside_y = point.y >= rect.loc.y && point.y < rect.bottom();
     let center = rect.center();
@@ -658,15 +794,25 @@ impl Dwell {
         *self = Self::default();
     }
 
-    fn observe(&mut self, target: Option<FocusTarget>, now: Instant, delay_ms: u32) -> DwellDecision {
+    fn observe(
+        &mut self,
+        target: Option<FocusTarget>,
+        now: Instant,
+        delay_ms: u32,
+    ) -> DwellDecision {
         let Some(target) = target else {
             *self = Self::default();
             return DwellDecision::Idle;
         };
-        if self.settled == Some(target) { return DwellDecision::Idle }
+        if self.settled == Some(target) {
+            return DwellDecision::Idle;
+        }
         if self.pending.is_none_or(|pending| pending.target != target) {
             self.settled = None;
-            self.pending = Some(Pending { target, entered: now });
+            self.pending = Some(Pending {
+                target,
+                entered: now,
+            });
         }
         let elapsed = now.saturating_duration_since(self.pending.expect("set above").entered);
         let delay = Duration::from_millis(u64::from(delay_ms.min(60_000)));
@@ -697,19 +843,31 @@ mod tests {
     fn dwell_zero_delay_focuses_once_per_entry() {
         let mut dwell = Dwell::default();
         let now = Instant::now();
-        assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Focus(target(1)));
+        assert_eq!(
+            dwell.observe(Some(target(1)), now, 0),
+            DwellDecision::Focus(target(1))
+        );
         assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Idle);
         assert_eq!(dwell.observe(None, now, 0), DwellDecision::Idle);
-        assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Focus(target(1)));
+        assert_eq!(
+            dwell.observe(Some(target(1)), now, 0),
+            DwellDecision::Focus(target(1))
+        );
     }
 
     #[test]
     fn dwell_invalidated_focus_can_retry_without_pointer_reentry() {
         let mut dwell = Dwell::default();
         let now = Instant::now();
-        assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Focus(target(1)));
+        assert_eq!(
+            dwell.observe(Some(target(1)), now, 0),
+            DwellDecision::Focus(target(1))
+        );
         dwell.invalidate(); // hit/membership changed during engine-lock acquisition
-        assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Focus(target(1)));
+        assert_eq!(
+            dwell.observe(Some(target(1)), now, 0),
+            DwellDecision::Focus(target(1))
+        );
         assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Idle);
     }
 
@@ -717,10 +875,22 @@ mod tests {
     fn dwell_motion_within_target_preserves_entry_deadline() {
         let mut dwell = Dwell::default();
         let now = Instant::now();
-        assert_eq!(dwell.observe(Some(target(1)), now, 100), DwellDecision::Wait(Duration::from_millis(100)));
-        assert_eq!(dwell.observe(Some(target(1)), now + Duration::from_millis(80), 100), DwellDecision::Wait(Duration::from_millis(20)));
-        assert_eq!(dwell.observe(Some(target(1)), now + Duration::from_millis(100), 100), DwellDecision::Focus(target(1)));
-        assert_eq!(dwell.observe(Some(target(1)), now + Duration::from_millis(200), 100), DwellDecision::Idle);
+        assert_eq!(
+            dwell.observe(Some(target(1)), now, 100),
+            DwellDecision::Wait(Duration::from_millis(100))
+        );
+        assert_eq!(
+            dwell.observe(Some(target(1)), now + Duration::from_millis(80), 100),
+            DwellDecision::Wait(Duration::from_millis(20))
+        );
+        assert_eq!(
+            dwell.observe(Some(target(1)), now + Duration::from_millis(100), 100),
+            DwellDecision::Focus(target(1))
+        );
+        assert_eq!(
+            dwell.observe(Some(target(1)), now + Duration::from_millis(200), 100),
+            DwellDecision::Idle
+        );
     }
 
     #[test]
@@ -728,8 +898,14 @@ mod tests {
         let mut dwell = Dwell::default();
         let now = Instant::now();
         dwell.observe(Some(target(1)), now, 100);
-        assert_eq!(dwell.observe(Some(target(2)), now + Duration::from_millis(90), 100), DwellDecision::Wait(Duration::from_millis(100)));
-        assert_eq!(dwell.observe(Some(target(2)), now + Duration::from_millis(100), 100), DwellDecision::Wait(Duration::from_millis(90)));
+        assert_eq!(
+            dwell.observe(Some(target(2)), now + Duration::from_millis(90), 100),
+            DwellDecision::Wait(Duration::from_millis(100))
+        );
+        assert_eq!(
+            dwell.observe(Some(target(2)), now + Duration::from_millis(100), 100),
+            DwellDecision::Wait(Duration::from_millis(90))
+        );
     }
 
     #[test]
@@ -739,7 +915,10 @@ mod tests {
         dwell.observe(Some(target(1)), now, 100);
         dwell.observe(None, now + Duration::from_millis(90), 100);
         assert!(dwell.pending.is_none());
-        assert_eq!(dwell.observe(Some(target(1)), now + Duration::from_millis(100), 100), DwellDecision::Wait(Duration::from_millis(100)));
+        assert_eq!(
+            dwell.observe(Some(target(1)), now + Duration::from_millis(100), 100),
+            DwellDecision::Wait(Duration::from_millis(100))
+        );
     }
 
     #[test]
@@ -747,17 +926,35 @@ mod tests {
         let mut dwell = Dwell::default();
         let now = Instant::now();
         let first = target(1);
-        let other_output = FocusTarget { output: OutputId::from_name("secondary"), ..first };
-        let other_workspace = FocusTarget { workspace: 1, ..first };
-        assert_eq!(dwell.observe(Some(first), now, 0), DwellDecision::Focus(first));
-        assert_eq!(dwell.observe(Some(other_output), now, 0), DwellDecision::Focus(other_output));
-        assert_eq!(dwell.observe(Some(other_workspace), now, 0), DwellDecision::Focus(other_workspace));
+        let other_output = FocusTarget {
+            output: OutputId::from_name("secondary"),
+            ..first
+        };
+        let other_workspace = FocusTarget {
+            workspace: 1,
+            ..first
+        };
+        assert_eq!(
+            dwell.observe(Some(first), now, 0),
+            DwellDecision::Focus(first)
+        );
+        assert_eq!(
+            dwell.observe(Some(other_output), now, 0),
+            DwellDecision::Focus(other_output)
+        );
+        assert_eq!(
+            dwell.observe(Some(other_workspace), now, 0),
+            DwellDecision::Focus(other_workspace)
+        );
     }
 
     #[test]
     fn dwell_delay_is_defensively_bounded() {
         let mut dwell = Dwell::default();
-        assert_eq!(dwell.observe(Some(target(1)), Instant::now(), u32::MAX), DwellDecision::Wait(Duration::from_secs(60)));
+        assert_eq!(
+            dwell.observe(Some(target(1)), Instant::now(), u32::MAX),
+            DwellDecision::Wait(Duration::from_secs(60))
+        );
     }
 
     #[test]
@@ -823,16 +1020,31 @@ mod tests {
     fn warp_geometry_handles_negative_output_coordinates_without_overflow() {
         let expected = Rect::new(-1500, -700, 400, 300);
         assert!(warp_geometry_ready(expected, expected));
-        assert!(!warp_geometry_ready(Rect::new(i32::MAX, 0, 1, 1), Rect::new(i32::MIN, 0, 1, 1)));
+        assert!(!warp_geometry_ready(
+            Rect::new(i32::MAX, 0, 1, 1),
+            Rect::new(i32::MIN, 0, 1, 1)
+        ));
     }
 
     #[test]
     fn warp_default_centers_only_outside_axes() {
         let rect = Rect::new(-200, 100, 200, 100);
-        assert_eq!(warp_destination(rect, Point { x: -150, y: 99 }, WarpMode::default()), Some(Point { x: -150, y: 150 }));
-        assert_eq!(warp_destination(rect, Point { x: 0, y: 125 }, WarpMode::default()), Some(Point { x: -100, y: 125 }));
-        assert_eq!(warp_destination(rect, Point { x: 20, y: 90 }, WarpMode::default()), Some(Point { x: -100, y: 150 }));
-        assert_eq!(warp_destination(rect, Point { x: -200, y: 100 }, WarpMode::default()), None);
+        assert_eq!(
+            warp_destination(rect, Point { x: -150, y: 99 }, WarpMode::default()),
+            Some(Point { x: -150, y: 150 })
+        );
+        assert_eq!(
+            warp_destination(rect, Point { x: 0, y: 125 }, WarpMode::default()),
+            Some(Point { x: -100, y: 125 })
+        );
+        assert_eq!(
+            warp_destination(rect, Point { x: 20, y: 90 }, WarpMode::default()),
+            Some(Point { x: -100, y: 150 })
+        );
+        assert_eq!(
+            warp_destination(rect, Point { x: -200, y: 100 }, WarpMode::default()),
+            None
+        );
     }
 
     #[test]
@@ -842,10 +1054,22 @@ mod tests {
         let outside = Point { x: 110, y: 300 };
         let center = Point { x: 200, y: 250 };
         assert_eq!(warp_destination(rect, inside, WarpMode::CenterXy), None);
-        assert_eq!(warp_destination(rect, inside, WarpMode::CenterXyAlways), Some(center));
-        assert_eq!(warp_destination(rect, outside, WarpMode::CenterXy), Some(center));
-        assert_eq!(warp_destination(rect, center, WarpMode::CenterXyAlways), None);
-        assert_eq!(warp_destination(Rect::new(0, 0, 0, 10), outside, WarpMode::CenterXyAlways), None);
+        assert_eq!(
+            warp_destination(rect, inside, WarpMode::CenterXyAlways),
+            Some(center)
+        );
+        assert_eq!(
+            warp_destination(rect, outside, WarpMode::CenterXy),
+            Some(center)
+        );
+        assert_eq!(
+            warp_destination(rect, center, WarpMode::CenterXyAlways),
+            None
+        );
+        assert_eq!(
+            warp_destination(Rect::new(0, 0, 0, 10), outside, WarpMode::CenterXyAlways),
+            None
+        );
     }
 
     fn strip() -> (TilingEngine, OutputId) {
@@ -855,8 +1079,17 @@ mod tests {
             ..Default::default()
         });
         let output = OutputId::from_name("pointer-test");
-        engine.register_monitor(output, Rect::new(0, 0, 1000, 800), Rect::new(0, 0, 1000, 760));
-        let workspace = engine.monitors_mut().get_mut(&output).unwrap().workspace_mut().unwrap();
+        engine.register_monitor(
+            output,
+            Rect::new(0, 0, 1000, 800),
+            Rect::new(0, 0, 1000, 760),
+        );
+        let workspace = engine
+            .monitors_mut()
+            .get_mut(&output)
+            .unwrap()
+            .workspace_mut()
+            .unwrap();
         workspace.add_window_to_new_column_with_width(WindowId::new(10), Some(500));
         workspace.add_window_to_new_column_with_width(WindowId::new(20), Some(500));
         (engine, output)
@@ -867,7 +1100,10 @@ mod tests {
         let (engine, output) = strip();
         let point = Point::new(100, 100);
         let hit = resolve_target(&engine, point, [999, 10]).unwrap();
-        assert_eq!((hit.window, hit.output, hit.column), (WindowId::new(10), output, Some(0)));
+        assert_eq!(
+            (hit.window, hit.output, hit.column),
+            (WindowId::new(10), output, Some(0))
+        );
         assert_eq!(resolve_target(&engine, point, [999, 998]), None);
         assert_eq!(resolve_target(&engine, Point::new(-1, 100), [10, 0]), None);
     }
@@ -876,9 +1112,16 @@ mod tests {
     fn output_entry_does_not_require_a_managed_window() {
         let (mut engine, primary) = strip();
         let empty = OutputId::from_name("empty-left");
-        engine.register_monitor(empty, Rect::new(-1000, 0, 1000, 800), Rect::new(-1000, 0, 1000, 760));
+        engine.register_monitor(
+            empty,
+            Rect::new(-1000, 0, 1000, 800),
+            Rect::new(-1000, 0, 1000, 760),
+        );
         assert_eq!(pointer_output(&engine, Point::new(-500, 100)), Some(empty));
-        assert_eq!(resolve_target(&engine, Point::new(-500, 100), [999, 0]), None);
+        assert_eq!(
+            resolve_target(&engine, Point::new(-500, 100), [999, 0]),
+            None
+        );
         assert_eq!(pointer_output(&engine, Point::new(100, 100)), Some(primary));
         assert_eq!(pointer_output(&engine, Point::new(2000, 100)), None);
     }
@@ -903,9 +1146,20 @@ mod tests {
     fn target_resolution_refuses_inactive_workspaces_and_wrong_outputs() {
         let (mut engine, output) = strip();
         let other = OutputId::from_name("pointer-other");
-        engine.register_monitor(other, Rect::new(1000, 0, 1000, 800), Rect::new(1000, 0, 1000, 760));
-        assert_eq!(resolve_target(&engine, Point::new(1100, 100), [10, 0]), None);
-        engine.monitors_mut().get_mut(&output).unwrap().active_workspace += 1;
+        engine.register_monitor(
+            other,
+            Rect::new(1000, 0, 1000, 800),
+            Rect::new(1000, 0, 1000, 760),
+        );
+        assert_eq!(
+            resolve_target(&engine, Point::new(1100, 100), [10, 0]),
+            None
+        );
+        engine
+            .monitors_mut()
+            .get_mut(&output)
+            .unwrap()
+            .active_workspace += 1;
         assert_eq!(resolve_target(&engine, Point::new(100, 100), [10, 0]), None);
     }
 
@@ -917,7 +1171,17 @@ mod tests {
         assert_eq!(reveal_scroll(&engine, target, Some(0.999)), None);
         assert_eq!(reveal_scroll(&engine, target, Some(1.0)), Some(10));
         assert_eq!(reveal_scroll(&engine, target, None), Some(10));
-        assert_eq!(engine.monitors().get(&output).unwrap().workspace().unwrap().scroll_offset.x, 0);
+        assert_eq!(
+            engine
+                .monitors()
+                .get(&output)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .scroll_offset
+                .x,
+            0
+        );
     }
 
     #[test]
@@ -929,7 +1193,13 @@ mod tests {
 
     #[test]
     fn motion_coordinate_packing_preserves_negative_and_extreme_points() {
-        for point in [Point { x: -1920, y: -1080 }, Point { x: i32::MIN, y: i32::MAX }] {
+        for point in [
+            Point { x: -1920, y: -1080 },
+            Point {
+                x: i32::MIN,
+                y: i32::MAX,
+            },
+        ] {
             assert_eq!(unpack(pack(point)), point);
         }
     }
@@ -948,7 +1218,10 @@ mod tests {
 
     #[test]
     fn focus_decoder_accepts_percentages_modes_and_nested_delay() {
-        for (mode, expected) in [("center-xy", WarpMode::CenterXy), ("center-xy-always", WarpMode::CenterXyAlways)] {
+        for (mode, expected) in [
+            ("center-xy", WarpMode::CenterXy),
+            ("center-xy-always", WarpMode::CenterXyAlways),
+        ] {
             let text = format!("input {{\n focus-follows-mouse max-scroll-amount=\"150.5%\"\n warp-mouse-to-focus mode=\"{mode}\"\n focus {{ focus-delay-ms 125; }}\n}}\n");
             let decoded = crate::config::decode::decode_text(&text, "", None);
             assert!(decoded.issues.is_empty(), "{:?}", decoded.issues);
@@ -962,7 +1235,14 @@ mod tests {
 
     #[test]
     fn focus_decoder_rejects_bad_percentages() {
-        for value in ["10", "\"10\"", "\"-1%\"", "\"NaN%\"", "\"inf%\"", "\"hello%\""] {
+        for value in [
+            "10",
+            "\"10\"",
+            "\"-1%\"",
+            "\"NaN%\"",
+            "\"inf%\"",
+            "\"hello%\"",
+        ] {
             let text = format!("input {{ focus-follows-mouse max-scroll-amount={value}; }}\n");
             let decoded = crate::config::decode::decode_text(&text, "", None);
             assert!(decoded.has_errors(), "accepted {value}");
@@ -971,7 +1251,10 @@ mod tests {
 
     #[test]
     fn focus_decoder_rejects_unknown_modes_and_out_of_range_delay() {
-        for text in ["input { warp-mouse-to-focus mode=\"unknown\"; }", "input { focus-delay-ms 60001; }"] {
+        for text in [
+            "input { warp-mouse-to-focus mode=\"unknown\"; }",
+            "input { focus-delay-ms 60001; }",
+        ] {
             let decoded = crate::config::decode::decode_text(text, "", None);
             assert!(decoded.has_errors(), "accepted {text}");
         }

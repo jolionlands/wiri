@@ -7,10 +7,10 @@ use tracing::{debug, error, info, warn};
 
 use super::messages::{
     BindingInfo, FocusedWindowResponse, IpcEvent, IpcMessage, MonitorInfo, OverviewStateResponse,
-    VersionResponse, WorkspaceInfo, WindowsResponse, WorkspacesResponse,
+    VersionResponse, WindowsResponse, WorkspaceInfo, WorkspacesResponse,
 };
-use super::state::{self, IpcSnapshot};
 use super::pipe_path;
+use super::state::{self, IpcSnapshot};
 use crate::layout::TilingEngine;
 use crate::utils::{Rect, WindowId};
 
@@ -429,7 +429,10 @@ impl IpcServer {
                             // The client missed events, so what it knows is not what is.  Tell
                             // it the state again (the lists replace what it had), as when it
                             // subscribed.
-                            warn!("IPC event subscriber lagged by {} events; sending the state again", n);
+                            warn!(
+                                "IPC event subscriber lagged by {} events; sending the state again",
+                                n
+                            );
                             let Some((rx, replay)) = self.subscribe_blocking().await else {
                                 return Ok(());
                             };
@@ -571,10 +574,7 @@ impl IpcServer {
             IpcMessage::FocusedWindow => {
                 let focused_window = self.snapshot_now().and_then(|snapshot| {
                     let id = snapshot.focused_window()?;
-                    snapshot
-                        .windows
-                        .into_iter()
-                        .find(|window| window.id == id)
+                    snapshot.windows.into_iter().find(|window| window.id == id)
                 });
                 let reply = FocusedWindowResponse { focused_window };
                 serde_json::json!({"success": true, "result": reply})
@@ -895,7 +895,9 @@ impl IpcServer {
                         let wid = crate::utils::WindowId::new(window_hwnd);
                         let workspace = engine.read().workspace_id_for_number(workspace_id);
                         if engine.read().is_floating(wid) {
-                            engine.write().float_move_to_workspace(wid, workspace, backend);
+                            engine
+                                .write()
+                                .float_move_to_workspace(wid, workspace, backend);
                         } else {
                             engine.write().move_window_to_workspace(workspace, backend);
                         }
@@ -1575,7 +1577,10 @@ impl IpcServer {
                     }
                 };
                 // Lane D: the same PNG/clipboard/template pipeline as screenshot-window.
-                match crate::screenshot::capture(Some(target_hwnd), path.as_deref().map(std::path::Path::new)) {
+                match crate::screenshot::capture(
+                    Some(target_hwnd),
+                    path.as_deref().map(std::path::Path::new),
+                ) {
                     Ok(saved) => serde_json::json!({
                         "success": true,
                         "result": { "path": saved },
@@ -1723,7 +1728,10 @@ impl IpcServer {
                     });
                 }
                 // Lane D: the same PNG/clipboard/template pipeline as screenshot-window.
-                match crate::screenshot::capture(Some(window_hwnd), path.as_deref().map(std::path::Path::new)) {
+                match crate::screenshot::capture(
+                    Some(window_hwnd),
+                    path.as_deref().map(std::path::Path::new),
+                ) {
                     Ok(saved) => serde_json::json!({
                         "success": true,
                         "result": { "path": saved },
@@ -2251,7 +2259,9 @@ mod tests {
 
     #[test]
     fn a_window_flag_without_a_window_is_an_error_that_says_so() {
-        assert!(split_window_target(&words(&["--id"]), &[]).unwrap_err().contains("needs a window id"));
+        assert!(split_window_target(&words(&["--id"]), &[])
+            .unwrap_err()
+            .contains("needs a window id"));
         let error = split_window_target(&words(&["--id", "abc"]), &[]).unwrap_err();
         assert!(error.contains("`abc` is not a window id"), "{}", error);
     }
@@ -2259,11 +2269,8 @@ mod tests {
     #[test]
     fn quoting_stays_with_the_argument_it_was_written_on() {
         // `focus-workspace "2"` after the window flag was taken out of the middle.
-        let (args, quoted, target) = split_window_target(
-            &words(&["--id", "5", "2"]),
-            &[false, false, true],
-        )
-        .unwrap();
+        let (args, quoted, target) =
+            split_window_target(&words(&["--id", "5", "2"]), &[false, false, true]).unwrap();
         assert_eq!(args, words(&["2"]));
         assert_eq!(quoted, vec![true]);
         assert_eq!(target, Some(5));
@@ -2304,7 +2311,10 @@ mod tests {
         // The same with niri's other spelling.
         let reply = server.process_message(action("fullscreen-window", &["--id=100"]));
         assert_eq!(reply["success"], true, "{}", reply);
-        assert!(!engine.read().is_fullscreen(WindowId::new(100)), "toggled back");
+        assert!(
+            !engine.read().is_fullscreen(WindowId::new(100)),
+            "toggled back"
+        );
     }
 
     #[test]
@@ -2315,25 +2325,52 @@ mod tests {
             let reply = server.process_message(action(name, &["--id", "4242"]));
             assert_eq!(reply["success"], false, "{}: {}", name, reply);
             let error = reply["error"].as_str().unwrap_or_default();
-            assert!(error.contains("no window with id 4242"), "{}: {}", name, error);
+            assert!(
+                error.contains("no window with id 4242"),
+                "{}: {}",
+                name,
+                error
+            );
         }
         assert!(!engine.read().is_fullscreen(WindowId::new(100)));
         // focus-window without a window says what it needs; a bad number says so too.
         let reply = server.process_message(action("focus-window", &[]));
-        assert!(reply["error"].as_str().unwrap_or_default().contains("needs --id"), "{}", reply);
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("needs --id"),
+            "{}",
+            reply
+        );
         let reply = server.process_message(action("fullscreen-window", &["--id", "abc"]));
-        assert!(reply["error"].as_str().unwrap_or_default().contains("not a window id"), "{}", reply);
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a window id"),
+            "{}",
+            reply
+        );
     }
 
     #[test]
     fn a_quoted_workspace_word_reaches_the_action_as_a_name() {
         let (mut server, engine) = server_with_windows(&[100]);
         server.set_backend(BackendHandle::default_for_test());
-        let before = engine.read().monitors().focused().map(|m| m.active_workspace);
+        let before = engine
+            .read()
+            .monitors()
+            .focused()
+            .map(|m| m.active_workspace);
         // `focus-workspace 2` is the second workspace...
         let reply = server.process_message(action("focus-workspace", &["2"]));
         assert_eq!(reply["success"], true, "{}", reply);
-        let second = engine.read().monitors().focused().map(|m| m.active_workspace);
+        let second = engine
+            .read()
+            .monitors()
+            .focused()
+            .map(|m| m.active_workspace);
         assert_ne!(before, second, "the second workspace");
         // ...and `focus-workspace "1"` is the workspace named 1, which there is none of.
         let reply = server.process_message(IpcMessage::RunAction {
@@ -2343,7 +2380,11 @@ mod tests {
         });
         assert_eq!(reply["success"], true, "{}", reply);
         assert_eq!(
-            engine.read().monitors().focused().map(|m| m.active_workspace),
+            engine
+                .read()
+                .monitors()
+                .focused()
+                .map(|m| m.active_workspace),
             second,
             "a name that no workspace has does not switch anything"
         );
@@ -2391,7 +2432,12 @@ mod tests {
     fn types(events: &[IpcEvent]) -> Vec<String> {
         events
             .iter()
-            .map(|e| serde_json::to_value(e).unwrap()["type"].as_str().unwrap().to_string())
+            .map(|e| {
+                serde_json::to_value(e).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect()
     }
 
@@ -2416,7 +2462,10 @@ mod tests {
         );
         match &replay[1] {
             IpcEvent::WindowsChanged { windows } => {
-                assert_eq!(windows.iter().map(|w| w.id).collect::<Vec<_>>(), vec![100, 101]);
+                assert_eq!(
+                    windows.iter().map(|w| w.id).collect::<Vec<_>>(),
+                    vec![100, 101]
+                );
             }
             other => panic!("unexpected {:?}", other),
         }
@@ -2434,9 +2483,14 @@ mod tests {
         // Nobody listened while the windows came: nothing was described (the work is done
         // only for subscribers), yet the first subscriber is told all of them.
         let (server, engine) = server_with_windows(&[100]);
-        engine.write().add_window(window(101), &BackendHandle::default_for_test());
+        engine
+            .write()
+            .add_window(window(101), &BackendHandle::default_for_test());
         server.sync_state();
-        assert!(server.mirror.lock().last.windows.is_empty(), "nobody is listening");
+        assert!(
+            server.mirror.lock().last.windows.is_empty(),
+            "nobody is listening"
+        );
         let (_rx, replay) = server.subscribe_with_replay();
         match &replay[1] {
             IpcEvent::WindowsChanged { windows } => assert_eq!(windows.len(), 2),
@@ -2459,7 +2513,10 @@ mod tests {
         // The new window is the active one of its workspace (niri tells the workspace first).
         assert_eq!(
             types(&events),
-            ["workspace_active_window_changed", "window_opened_or_changed"]
+            [
+                "workspace_active_window_changed",
+                "window_opened_or_changed"
+            ]
         );
         // The same state again: nothing more.
         server.sync_state();
@@ -2477,7 +2534,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no window_closed in {:?}", types(&events)));
         assert_eq!(closed, (101, 101));
         assert_eq!(
-            types(&events).iter().filter(|t| *t == "window_closed").count(),
+            types(&events)
+                .iter()
+                .filter(|t| *t == "window_closed")
+                .count(),
             1,
             "{:?}",
             types(&events)
@@ -2490,12 +2550,17 @@ mod tests {
         let (mut rx, replay) = server.subscribe_with_replay();
         match &replay[1] {
             IpcEvent::WindowsChanged { windows } => {
-                assert!(windows.iter().all(|w| !w.is_focused), "no foreground report yet");
+                assert!(
+                    windows.iter().all(|w| !w.is_focused),
+                    "no foreground report yet"
+                );
             }
             other => panic!("unexpected {:?}", other),
         }
         let backend = BackendHandle::default_for_test();
-        engine.write().sync_os_foreground(WindowId::new(101), &backend);
+        engine
+            .write()
+            .sync_os_foreground(WindowId::new(101), &backend);
         server.sync_state();
         let events = drain(&mut rx);
         assert_eq!(types(&events), ["window_focus_changed"]);
@@ -2509,10 +2574,16 @@ mod tests {
     fn an_overview_that_opens_is_reported() {
         let (server, engine) = server_with_windows(&[100]);
         let (mut rx, _replay) = server.subscribe_with_replay();
-        engine.write().enter_overview(&BackendHandle::default_for_test());
+        engine
+            .write()
+            .enter_overview(&BackendHandle::default_for_test());
         server.sync_state();
         let events = drain(&mut rx);
-        assert!(types(&events).contains(&"overview_opened_or_closed".to_string()), "{:?}", types(&events));
+        assert!(
+            types(&events).contains(&"overview_opened_or_closed".to_string()),
+            "{:?}",
+            types(&events)
+        );
         match events.last().unwrap() {
             IpcEvent::OverviewOpenedOrClosed { is_open } => assert!(*is_open),
             other => panic!("unexpected {:?}", other),
@@ -2525,7 +2596,9 @@ mod tests {
     fn the_niri_requests_answer_with_the_state_the_stream_would_tell() {
         let (server, engine) = server_with_windows(&[100, 101]);
         let backend = BackendHandle::default_for_test();
-        engine.write().sync_os_foreground(WindowId::new(101), &backend);
+        engine
+            .write()
+            .sync_os_foreground(WindowId::new(101), &backend);
 
         // The workspaces, in niri's shape.
         let reply = server.process_message(IpcMessage::Workspaces);
@@ -2564,14 +2637,27 @@ mod tests {
         // The focused window: the same object, on its own.
         let reply = server.process_message(IpcMessage::FocusedWindow);
         assert_eq!(reply["success"], true, "{}", reply);
-        assert_eq!(reply["result"]["focused_window"]["id"], serde_json::json!(101));
+        assert_eq!(
+            reply["result"]["focused_window"]["id"],
+            serde_json::json!(101)
+        );
 
         // The overview.
         let reply = server.process_message(IpcMessage::OverviewState);
-        assert_eq!(reply["result"]["is_open"], serde_json::json!(false), "{}", reply);
+        assert_eq!(
+            reply["result"]["is_open"],
+            serde_json::json!(false),
+            "{}",
+            reply
+        );
         engine.write().enter_overview(&backend);
         let reply = server.process_message(IpcMessage::OverviewState);
-        assert_eq!(reply["result"]["is_open"], serde_json::json!(true), "{}", reply);
+        assert_eq!(
+            reply["result"]["is_open"],
+            serde_json::json!(true),
+            "{}",
+            reply
+        );
 
         // The version of the daemon that answers.
         let reply = server.process_message(IpcMessage::Version);

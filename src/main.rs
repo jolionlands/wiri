@@ -119,8 +119,8 @@ async fn main() -> Result<()> {
     };
     // stdout stays clean for any future machine-consumable output, so the log
     // goes to stderr (`wiri.exe 2>wiri.log` captures everything that matters).
-    let stderr_layer = wiri::logging::stderr_is_usable()
-        .then(|| fmt::layer().with_writer(std::io::stderr));
+    let stderr_layer =
+        wiri::logging::stderr_is_usable().then(|| fmt::layer().with_writer(std::io::stderr));
     let file_layer = wiri::logging::default_log_path()
         .and_then(|path| wiri::logging::RotatingFile::open(path, wiri::logging::LOG_MAX_BYTES).ok())
         .map(|file| {
@@ -437,7 +437,8 @@ async fn main() -> Result<()> {
             let mut eng = engine.write();
             // Focus follows what the user is looking at, not whichever window
             // the enumeration happened to list last.
-            let foreground = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            let foreground =
+                unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
             if !foreground.0.is_null() {
                 eng.sync_os_foreground(WindowId::new(foreground.0 as isize), &backend_handle);
             }
@@ -916,7 +917,10 @@ impl<'a> ReloadCtx<'a> {
     fn outcome(&self, outcome: ReloadOutcome, system: &SystemIntegration) {
         match outcome {
             ReloadOutcome::Applied { config, warnings } => {
-                info!("Config file changed — reloaded ({} warnings)", warnings.len());
+                info!(
+                    "Config file changed — reloaded ({} warnings)",
+                    warnings.len()
+                );
                 self.apply(*config, warnings.len());
             }
             ReloadOutcome::Failed { issues, .. } => self.report_failure(&issues, system),

@@ -2,7 +2,9 @@ use crate::config::decode::{self, Decoded, ValidationIssue, ValidationSeverity};
 use crate::config::error::{ConfigError, Result};
 use crate::config::parse::into_result;
 use crate::config::types::Config;
-use notify::{Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -175,9 +177,10 @@ impl ConfigLoader {
                     }
                     let hit = {
                         let st = state.lock().unwrap();
-                        event.paths.iter().any(|p| {
-                            name_key(p).map_or(false, |name| st.names.contains(&name))
-                        })
+                        event
+                            .paths
+                            .iter()
+                            .any(|p| name_key(p).map_or(false, |name| st.names.contains(&name)))
                     };
                     if hit {
                         let _ = tx.send(());
@@ -559,8 +562,7 @@ mod include_tests {
     fn the_watcher_applies_only_the_finished_file_and_reports_a_broken_one() {
         let dir = fresh_temp_dir("watch");
         let p = write_temp(&dir, "config.kdl", "input { repeat-delay 100 }\n");
-        let mut loader =
-            ConfigLoader::new(p.clone()).with_quiet_period(Duration::from_millis(60));
+        let mut loader = ConfigLoader::new(p.clone()).with_quiet_period(Duration::from_millis(60));
         assert_eq!(loader.get_config().input.repeat_delay, 100);
         let mut rx = loader.subscribe();
         loader.start_watching().expect("watch");
@@ -571,7 +573,9 @@ mod include_tests {
         std::fs::write(&p, "input { repeat-delay 250 }\n").unwrap();
         let first = wait_for(&mut rx, Duration::from_secs(5));
         match first {
-            Some(ReloadOutcome::Applied { config, .. }) => assert_eq!(config.input.repeat_delay, 250),
+            Some(ReloadOutcome::Applied { config, .. }) => {
+                assert_eq!(config.input.repeat_delay, 250)
+            }
             other => panic!("expected the finished file to be applied, got {:?}", other),
         }
         assert_eq!(loader.get_config().input.repeat_delay, 250);
@@ -592,7 +596,9 @@ mod include_tests {
         // Fixing it applies again.
         std::fs::write(&p, "input { repeat-delay 300 }\n").unwrap();
         match wait_for(&mut rx, Duration::from_secs(5)) {
-            Some(ReloadOutcome::Applied { config, .. }) => assert_eq!(config.input.repeat_delay, 300),
+            Some(ReloadOutcome::Applied { config, .. }) => {
+                assert_eq!(config.input.repeat_delay, 300)
+            }
             other => panic!("expected the fix to be applied, got {:?}", other),
         }
         loader.stop_watching();

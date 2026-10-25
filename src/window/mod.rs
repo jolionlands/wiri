@@ -643,10 +643,8 @@ pub fn gather_skip_facts(hwnd: HWND) -> SkipFacts {
     let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
 
     let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
-    let owned_popup = owner
-        .map(|owner| !owner.0.is_null())
-        .unwrap_or(false)
-        && ex_style & WS_EX_APPWINDOW.0 == 0;
+    let owned_popup =
+        owner.map(|owner| !owner.0.is_null()).unwrap_or(false) && ex_style & WS_EX_APPWINDOW.0 == 0;
 
     let child = style & WS_CHILD.0 != 0 || {
         let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };

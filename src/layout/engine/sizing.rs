@@ -88,7 +88,9 @@ pub(super) enum SizeReaction {
     Nothing,
     /// The application maximized itself (its title bar button): take the native state away
     /// and, when the window reports it is gone, set maximized-to-edges to `wants_maximized`.
-    RestoreNatively { wants_maximized: bool },
+    RestoreNatively {
+        wants_maximized: bool,
+    },
     /// The native state is gone: set maximized-to-edges to this.
     SetMaximized(bool),
     /// The window covers its monitor on its own: it is fullscreen.
@@ -98,7 +100,11 @@ pub(super) enum SizeReaction {
 }
 
 /// The decision, apart from the Win32 calls it leads to.
-pub(super) fn size_reaction(zoomed: bool, covers_monitor: bool, state: SizingState) -> SizeReaction {
+pub(super) fn size_reaction(
+    zoomed: bool,
+    covers_monitor: bool,
+    state: SizingState,
+) -> SizeReaction {
     if zoomed {
         // niri: an application that maximizes itself is maximized to the edges (and asked
         // again, a window that is maximized to the edges gets back to its tile).
@@ -159,7 +165,10 @@ impl TilingEngine {
             .into_iter()
             .map(|(window_id, slot)| {
                 let mode = modes.get(&window_id).copied().unwrap_or(DrawMode::Inset);
-                (window_id, state_rect(mode, slot, work_rect, work_area, monitor))
+                (
+                    window_id,
+                    state_rect(mode, slot, work_rect, work_area, monitor),
+                )
             })
             .collect()
     }
@@ -521,10 +530,9 @@ impl TilingEngine {
             backend.restore_window_async(hwnd);
             return;
         }
-        let covers = self
-            .monitors
-            .get(&output)
-            .map_or(false, |m| crate::backend::hooks::covers_monitor(frame, m.bounds));
+        let covers = self.monitors.get(&output).map_or(false, |m| {
+            crate::backend::hooks::covers_monitor(frame, m.bounds)
+        });
         if covers && !self.fullscreen_windows.contains(&window_id) {
             self.set_fullscreen(window_id, true, true, backend);
         }
@@ -555,7 +563,10 @@ mod tests {
         let monitor = rect(0, 0, 1366, 768);
         // Aligned with the start of the view: the monitor.
         let slot = rect(8, 8, 1350, 712);
-        assert_eq!(state_rect(DrawMode::Exact, slot, work_rect, work_area, monitor), monitor);
+        assert_eq!(
+            state_rect(DrawMode::Exact, slot, work_rect, work_area, monitor),
+            monitor
+        );
         // The strip scrolled by a view: the slot is a view to the left of the view's start, and
         // so is the window (by the same distance).
         let scrolled = rect(8 - 1366, 8, 1350, 712);
@@ -565,7 +576,10 @@ mod tests {
         );
         // Whatever row of its column the tile is in, the window covers the monitor.
         let lower = rect(8, 300, 1350, 400);
-        assert_eq!(state_rect(DrawMode::Exact, lower, work_rect, work_area, monitor), monitor);
+        assert_eq!(
+            state_rect(DrawMode::Exact, lower, work_rect, work_area, monitor),
+            monitor
+        );
     }
 
     #[test]
@@ -574,17 +588,32 @@ mod tests {
         let work_area = rect(0, 0, 1366, 728);
         let monitor = rect(0, 0, 1366, 768);
         assert_eq!(
-            state_rect(DrawMode::Edges, rect(8, 8, 1350, 712), work_rect, work_area, monitor),
+            state_rect(
+                DrawMode::Edges,
+                rect(8, 8, 1350, 712),
+                work_rect,
+                work_area,
+                monitor
+            ),
             work_area,
             "no gap and no border: the whole work area, the taskbar stays visible"
         );
         assert_eq!(
-            state_rect(DrawMode::Edges, rect(1374, 8, 1350, 712), work_rect, work_area, monitor),
+            state_rect(
+                DrawMode::Edges,
+                rect(1374, 8, 1350, 712),
+                work_rect,
+                work_area,
+                monitor
+            ),
             rect(1366, 0, 1366, 728),
             "the neighbour to the right is a view away"
         );
         let slot = rect(40, 40, 100, 100);
-        assert_eq!(state_rect(DrawMode::Inset, slot, work_rect, work_area, monitor), slot);
+        assert_eq!(
+            state_rect(DrawMode::Inset, slot, work_rect, work_area, monitor),
+            slot
+        );
     }
 
     #[test]
@@ -592,7 +621,9 @@ mod tests {
         let state = SizingState::default();
         assert_eq!(
             size_reaction(true, false, state),
-            SizeReaction::RestoreNatively { wants_maximized: true }
+            SizeReaction::RestoreNatively {
+                wants_maximized: true
+            }
         );
         // Its button pressed again while it is maximized to the edges: back to its tile.
         let state = SizingState {
@@ -601,12 +632,16 @@ mod tests {
         };
         assert_eq!(
             size_reaction(true, false, state),
-            SizeReaction::RestoreNatively { wants_maximized: false }
+            SizeReaction::RestoreNatively {
+                wants_maximized: false
+            }
         );
         // A window maximized on a monitor without a taskbar covers it too: maximized wins.
         assert_eq!(
             size_reaction(true, true, SizingState::default()),
-            SizeReaction::RestoreNatively { wants_maximized: true }
+            SizeReaction::RestoreNatively {
+                wants_maximized: true
+            }
         );
     }
 
@@ -616,13 +651,19 @@ mod tests {
             unzoom_pending: Some(true),
             ..SizingState::default()
         };
-        assert_eq!(size_reaction(false, false, state), SizeReaction::SetMaximized(true));
+        assert_eq!(
+            size_reaction(false, false, state),
+            SizeReaction::SetMaximized(true)
+        );
         let state = SizingState {
             unzoom_pending: Some(false),
             maximized_edges: true,
             ..SizingState::default()
         };
-        assert_eq!(size_reaction(false, false, state), SizeReaction::SetMaximized(false));
+        assert_eq!(
+            size_reaction(false, false, state),
+            SizeReaction::SetMaximized(false)
+        );
     }
 
     #[test]
@@ -637,9 +678,15 @@ mod tests {
             fullscreen_settled: true,
             ..SizingState::default()
         };
-        assert_eq!(size_reaction(false, true, fullscreen), SizeReaction::Nothing);
+        assert_eq!(
+            size_reaction(false, true, fullscreen),
+            SizeReaction::Nothing
+        );
         // It stops covering the monitor: it left fullscreen...
-        assert_eq!(size_reaction(false, false, fullscreen), SizeReaction::LeaveFullscreen);
+        assert_eq!(
+            size_reaction(false, false, fullscreen),
+            SizeReaction::LeaveFullscreen
+        );
         // ...unless it has only just been made fullscreen, when the frame going away makes noise.
         let fresh = SizingState {
             fullscreen_settled: false,
@@ -659,7 +706,10 @@ mod tests {
 
     #[test]
     fn nothing_special_is_nothing() {
-        assert_eq!(size_reaction(false, false, SizingState::default()), SizeReaction::Nothing);
+        assert_eq!(
+            size_reaction(false, false, SizingState::default()),
+            SizeReaction::Nothing
+        );
     }
 
     // ---- the engine ----------------------------------------------------------------------------
@@ -715,7 +765,11 @@ mod tests {
         let width_before = column_of(&engine, 2).width;
         engine.toggle_fullscreen_for(two, &be());
         assert!(engine.is_fullscreen(two));
-        assert_eq!(engine.locate_window(two), Some(before), "the same place in the strip");
+        assert_eq!(
+            engine.locate_window(two),
+            Some(before),
+            "the same place in the strip"
+        );
         // The column is as wide as the view for as long as it is fullscreen...
         let column = column_of(&engine, 2);
         assert!(column.maximized);
@@ -725,7 +779,11 @@ mod tests {
         assert_eq!(engine.tiled_windows().len(), 3);
         for other in [1, 3] {
             let applied = engine.applied_state.get(&WindowId::new(other));
-            assert!(applied.map_or(true, |a| a.visible), "window {} is not hidden", other);
+            assert!(
+                applied.map_or(true, |a| a.visible),
+                "window {} is not hidden",
+                other
+            );
         }
         // Leaving fullscreen gives the column its width back.
         engine.toggle_fullscreen_for(two, &be());
@@ -775,13 +833,22 @@ mod tests {
             monitor.work_area,
             monitor.bounds,
         );
-        let at = |hwnd: isize| drawn.iter().find(|(w, _)| *w == WindowId::new(hwnd)).unwrap().1;
+        let at = |hwnd: isize| {
+            drawn
+                .iter()
+                .find(|(w, _)| *w == WindowId::new(hwnd))
+                .unwrap()
+                .1
+        };
         // The strip is not scrolled in this test: column 2 starts at column 1's end.
         let second = at(2);
         assert_eq!((second.size.w, second.size.h), (1920, 1080));
         assert_eq!(second.loc.y, 0);
         // The third column starts after the fullscreen one's whole slot, a gap beyond.
-        assert!(at(3).loc.x >= second.loc.x + 1904, "the neighbour is out of the way");
+        assert!(
+            at(3).loc.x >= second.loc.x + 1904,
+            "the neighbour is out of the way"
+        );
     }
 
     #[test]
@@ -812,7 +879,10 @@ mod tests {
         assert_eq!(engine.sizing_draw_modes(&ids)[&two], DrawMode::Exact);
         engine.toggle_fullscreen_for(two, &be());
         assert_eq!(engine.sizing_draw_modes(&ids)[&two], DrawMode::Edges);
-        assert!(column_of(&engine, 2).maximized, "still maximized to the edges");
+        assert!(
+            column_of(&engine, 2).maximized,
+            "still maximized to the edges"
+        );
         engine.toggle_maximize_window_to_edges_for(two, &be());
         assert!(!column_of(&engine, 2).maximized);
     }
@@ -842,7 +912,10 @@ mod tests {
         let before = engine.locate_window(two).unwrap();
         engine.window_size_class_changed(two, false, true, &be());
         assert!(engine.is_fullscreen(two));
-        assert!(engine.app_fullscreen.contains(&two), "its own doing: its frame is not touched");
+        assert!(
+            engine.app_fullscreen.contains(&two),
+            "its own doing: its frame is not touched"
+        );
         assert_eq!(engine.locate_window(two), Some(before));
         assert!(column_of(&engine, 2).maximized);
         // Just after: the noise of the frame going away is not "leaving".
@@ -902,7 +975,8 @@ mod tests {
     }
 
     #[test]
-    fn minimizing_a_fullscreen_window_gives_the_column_back_and_restoring_makes_it_fullscreen_again() {
+    fn minimizing_a_fullscreen_window_gives_the_column_back_and_restoring_makes_it_fullscreen_again(
+    ) {
         let mut engine = with_three_windows();
         let two = WindowId::new(2);
         let width_before = column_of(&engine, 2).width;
@@ -933,17 +1007,15 @@ mod tests {
     #[test]
     fn the_open_rules_maximize_to_the_edges_and_fullscreen() {
         let mut engine = engine();
-        engine.set_window_rules(vec![
-            crate::config::WindowRule {
-                match_groups: vec![crate::config::types::MatchGroup {
-                    conds: vec![crate::config::types::Matcher::TitleSearch(
-                        crate::config::types::RegexPat::new("^Window 5").unwrap(),
-                    )],
-                }],
-                open_maximized_to_edges: Some(true),
-                ..crate::config::WindowRule::default()
-            },
-        ]);
+        engine.set_window_rules(vec![crate::config::WindowRule {
+            match_groups: vec![crate::config::types::MatchGroup {
+                conds: vec![crate::config::types::Matcher::TitleSearch(
+                    crate::config::types::RegexPat::new("^Window 5").unwrap(),
+                )],
+            }],
+            open_maximized_to_edges: Some(true),
+            ..crate::config::WindowRule::default()
+        }]);
         engine.add_window(window(5), &be());
         assert!(engine.is_maximized_to_edges(WindowId::new(5)));
         engine.add_window(window(6), &be());

@@ -269,7 +269,9 @@ pub(super) fn wanted_alpha(
     } else {
         1.0
     };
-    (dim * rule.unwrap_or(1.0) * 255.0).round().clamp(0.0, 255.0) as u32
+    (dim * rule.unwrap_or(1.0) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u32
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -295,7 +297,9 @@ impl TilingEngine {
     /// has.
     pub(super) fn find_output_by_name(&self, name: &str) -> Option<OutputId> {
         fn short(name: &str) -> String {
-            name.trim().trim_start_matches("\\\\.\\").to_ascii_lowercase()
+            name.trim()
+                .trim_start_matches("\\\\.\\")
+                .to_ascii_lowercase()
         }
         let wanted = short(name);
         if wanted.is_empty() {
@@ -357,7 +361,10 @@ impl TilingEngine {
             .find(|w| column.index_of(*w).is_some())
         {
             Some(last_focused) => last_focused == window_id,
-            None => column.tiles.first().map_or(false, |t| t.window_id == window_id),
+            None => column
+                .tiles
+                .first()
+                .map_or(false, |t| t.window_id == window_id),
         }
     }
 
@@ -423,7 +430,10 @@ impl TilingEngine {
         let named = rules.open_on_output.as_deref().and_then(|name| {
             let found = self.find_output_by_name(name);
             if found.is_none() {
-                debug!("window rule: no monitor is named {:?}; the rule is ignored", name);
+                debug!(
+                    "window rule: no monitor is named {:?}; the rule is ignored",
+                    name
+                );
             }
             found
         });
@@ -431,7 +441,10 @@ impl TilingEngine {
         let workspace = if let Some(name) = rules.open_on_workspace.as_deref() {
             let found = self.workspace_id_by_name(name);
             if found.is_none() {
-                debug!("window rule: no workspace is named {:?}; the rule is ignored", name);
+                debug!(
+                    "window rule: no workspace is named {:?}; the rule is ignored",
+                    name
+                );
             }
             found
         } else if let Some(number) = rules.open_in_workspace {
@@ -623,9 +636,11 @@ impl TilingEngine {
         let Some((output, workspace, column)) = self.locate_window(window_id) else {
             return;
         };
-        let Some(view) = self.monitors.get(&output).map(|m| {
-            Self::view_width_for_monitor(m, self.effective_config(output)).max(50) as u32
-        }) else {
+        let Some(view) = self
+            .monitors
+            .get(&output)
+            .map(|m| Self::view_width_for_monitor(m, self.effective_config(output)).max(50) as u32)
+        else {
             return;
         };
         if let Some(column) = self
@@ -654,7 +669,8 @@ impl TilingEngine {
         };
         if let Some((output, workspace, _)) = self.locate_window(window_id) {
             if let Some(monitor) = self.monitors.get_mut(&output) {
-                if monitor.active_workspace == workspace && monitor.focus_window == Some(window_id) {
+                if monitor.active_workspace == workspace && monitor.focus_window == Some(window_id)
+                {
                     let column = monitor
                         .workspace()
                         .and_then(|w| w.find_window_column(previous));
@@ -725,7 +741,11 @@ impl TilingEngine {
     /// Look at the rules again for one window.  The `open-*` and `default-*` properties are
     /// not applied again; opacity and the size limits are, when they changed.  Returns true
     /// when something changed.
-    pub fn reevaluate_window_rules(&mut self, window_id: WindowId, backend: &BackendHandle) -> bool {
+    pub fn reevaluate_window_rules(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) -> bool {
         let resolved = {
             let (Some(info), Some(state)) = (
                 self.tiled_windows.get(&window_id),
@@ -776,7 +796,11 @@ impl TilingEngine {
             return;
         };
         let limits = RuleLimits::of(&resolved);
-        let known = self.rule_limits.get(&window_id).copied().unwrap_or_default();
+        let known = self
+            .rule_limits
+            .get(&window_id)
+            .copied()
+            .unwrap_or_default();
         if limits != known {
             if limits.is_none() {
                 self.rule_limits.remove(&window_id);
@@ -801,11 +825,7 @@ impl TilingEngine {
     /// tile also gets it in every layout pass; this is for a change that is not followed by
     /// one, and for floating windows, which are not laid out.
     pub(super) fn sync_window_opacity(&mut self, window_id: WindowId) {
-        let Some(rule) = self
-            .rule_state
-            .get(&window_id)
-            .map(|s| s.resolved.opacity)
-        else {
+        let Some(rule) = self.rule_state.get(&window_id).map(|s| s.resolved.opacity) else {
             return;
         };
         let output = self
@@ -835,7 +855,12 @@ impl TilingEngine {
 
     /// The title of a managed window changed.  The new title is kept, and the rules that look
     /// at titles are evaluated again for the window.
-    pub fn window_title_changed(&mut self, window_id: WindowId, title: &str, backend: &BackendHandle) {
+    pub fn window_title_changed(
+        &mut self,
+        window_id: WindowId,
+        title: &str,
+        backend: &BackendHandle,
+    ) {
         let Some(info) = self.tiled_windows.get_mut(&window_id) else {
             return;
         };
@@ -887,7 +912,11 @@ impl TilingEngine {
     }
 
     /// A window floated or tiled again: the rules that depend on `is-floating` look again.
-    pub(super) fn rules_after_float_change(&mut self, window_id: WindowId, backend: &BackendHandle) {
+    pub(super) fn rules_after_float_change(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) {
         if self.rule_flags.floating {
             self.reevaluate_window_rules(window_id, backend);
         }
@@ -957,15 +986,27 @@ mod tests {
 
     #[test]
     fn three_equal_tiles_share_the_column_and_the_last_takes_the_rounding() {
-        assert_eq!(distribute_heights(1000, &[auto(), auto(), auto()]), vec![333, 333, 334]);
+        assert_eq!(
+            distribute_heights(1000, &[auto(), auto(), auto()]),
+            vec![333, 333, 334]
+        );
     }
 
     #[test]
     fn a_column_of_one_fills_the_view_within_its_limits() {
         assert_eq!(distribute_heights(900, &[auto()]), vec![900]);
-        assert_eq!(distribute_heights(900, &[spec(Some(300), 1.0, 0, 0)]), vec![900]);
-        assert_eq!(distribute_heights(900, &[spec(None, 1.0, 0, 500)]), vec![500]);
-        assert_eq!(distribute_heights(900, &[spec(None, 1.0, 1200, 0)]), vec![1200]);
+        assert_eq!(
+            distribute_heights(900, &[spec(Some(300), 1.0, 0, 0)]),
+            vec![900]
+        );
+        assert_eq!(
+            distribute_heights(900, &[spec(None, 1.0, 0, 500)]),
+            vec![500]
+        );
+        assert_eq!(
+            distribute_heights(900, &[spec(None, 1.0, 1200, 0)]),
+            vec![1200]
+        );
         assert!(distribute_heights(900, &[]).is_empty());
     }
 
@@ -981,7 +1022,14 @@ mod tests {
         );
         // Weights still divide what is left.
         assert_eq!(
-            distribute_heights(1000, &[spec(Some(400), 1.0, 0, 0), spec(None, 1.0, 0, 0), spec(None, 2.0, 0, 0)]),
+            distribute_heights(
+                1000,
+                &[
+                    spec(Some(400), 1.0, 0, 0),
+                    spec(None, 1.0, 0, 0),
+                    spec(None, 2.0, 0, 0)
+                ]
+            ),
             vec![400, 200, 400]
         );
     }
@@ -989,7 +1037,10 @@ mod tests {
     #[test]
     fn when_every_tile_asks_for_a_height_the_last_one_takes_what_is_left() {
         assert_eq!(
-            distribute_heights(1000, &[spec(Some(300), 1.0, 0, 0), spec(Some(300), 1.0, 0, 0)]),
+            distribute_heights(
+                1000,
+                &[spec(Some(300), 1.0, 0, 0), spec(Some(300), 1.0, 0, 0)]
+            ),
             vec![300, 700]
         );
     }
@@ -1036,7 +1087,10 @@ mod tests {
             vec![700, 700]
         );
         // A minimum above the maximum: the minimum wins.
-        assert_eq!(distribute_heights(1000, &[spec(None, 1.0, 400, 300), auto()]), vec![400, 600]);
+        assert_eq!(
+            distribute_heights(1000, &[spec(None, 1.0, 400, 300), auto()]),
+            vec![400, 600]
+        );
     }
 
     // ---- sizes ------------------------------------------------------------------------------
@@ -1079,7 +1133,11 @@ mod tests {
         // The rule alone.
         assert_eq!(wanted_alpha(1.0, true, Some(0.5), NO_ALPHA), 128);
         assert_eq!(wanted_alpha(1.0, false, Some(0.5), NO_ALPHA), 128);
-        assert_eq!(wanted_alpha(1.0, true, Some(0.0), NO_ALPHA), 0, "fully transparent is a value");
+        assert_eq!(
+            wanted_alpha(1.0, true, Some(0.0), NO_ALPHA),
+            0,
+            "fully transparent is a value"
+        );
         // Dimming alone: what the config always did.
         assert_eq!(wanted_alpha(0.8, true, None, NO_ALPHA), 255);
         assert_eq!(wanted_alpha(0.8, false, None, NO_ALPHA), 204);
@@ -1090,8 +1148,16 @@ mod tests {
 
     #[test]
     fn a_rule_that_stops_asking_gives_the_alpha_back_once() {
-        assert_eq!(wanted_alpha(1.0, true, None, 128), 255, "it was made transparent: opaque again");
-        assert_eq!(wanted_alpha(1.0, true, None, 255), 255, "and then nothing more to do");
+        assert_eq!(
+            wanted_alpha(1.0, true, None, 128),
+            255,
+            "it was made transparent: opaque again"
+        );
+        assert_eq!(
+            wanted_alpha(1.0, true, None, 255),
+            255,
+            "and then nothing more to do"
+        );
     }
 
     // ---- the engine ---------------------------------------------------------------------------
@@ -1144,7 +1210,17 @@ mod tests {
 
     fn tile_of(engine: &TilingEngine, wid: isize) -> crate::layout::Tile {
         let oid = OutputId::from_name("M");
-        engine.monitors.get(&oid).unwrap().workspaces.values().flat_map(|w| w.columns.iter()).flat_map(|c| c.tiles.iter()).find(|t| t.window_id == WindowId::new(wid)).cloned().expect("a tile")
+        engine
+            .monitors
+            .get(&oid)
+            .unwrap()
+            .workspaces
+            .values()
+            .flat_map(|w| w.columns.iter())
+            .flat_map(|c| c.tiles.iter())
+            .find(|t| t.window_id == WindowId::new(wid))
+            .cloned()
+            .expect("a tile")
     }
 
     #[test]
@@ -1193,7 +1269,11 @@ mod tests {
         engine.add_window(window(12, "plain"), &be());
         let on = |wid: isize| engine.locate_window(WindowId::new(wid)).map(|(o, _, _)| o);
         assert_eq!(on(10), Some(second), "the rule names the second monitor");
-        assert_eq!(on(11), Some(OutputId::from_name("M")), "a monitor that is not there: ignored");
+        assert_eq!(
+            on(11),
+            Some(OutputId::from_name("M")),
+            "a monitor that is not there: ignored"
+        );
         assert_eq!(on(12), Some(OutputId::from_name("M")));
     }
 
@@ -1202,7 +1282,12 @@ mod tests {
         let mut engine = engine();
         let oid = OutputId::from_name("M");
         engine.add_window(window(1, "first"), &be());
-        engine.monitors.get_mut(&oid).unwrap().workspaces.insert(1, crate::layout::Workspace::new());
+        engine
+            .monitors
+            .get_mut(&oid)
+            .unwrap()
+            .workspaces
+            .insert(1, crate::layout::Workspace::new());
         engine.rename_workspace(1, "chat").unwrap();
         engine.set_window_rules(vec![
             title_rule(
@@ -1221,10 +1306,18 @@ mod tests {
             ),
         ]);
         engine.add_window(window(2, "slack"), &be());
-        assert_eq!(place_of(&engine, 2), Some((1, 0)), "on the workspace named chat");
+        assert_eq!(
+            place_of(&engine, 2),
+            Some((1, 0)),
+            "on the workspace named chat"
+        );
         let monitor = engine.monitors.get(&oid).unwrap();
         assert_eq!(monitor.active_workspace, 0, "the user stays where they are");
-        assert_eq!(monitor.focus_window, Some(WindowId::new(1)), "and so does the focus");
+        assert_eq!(
+            monitor.focus_window,
+            Some(WindowId::new(1)),
+            "and so does the focus"
+        );
         assert_eq!(monitor.focus_column, Some(0));
         assert_eq!(
             monitor.focus_ring.current(),
@@ -1240,8 +1333,18 @@ mod tests {
     fn open_in_workspace_is_a_position_from_the_top() {
         let mut engine = engine();
         let oid = OutputId::from_name("M");
-        engine.monitors.get_mut(&oid).unwrap().workspaces.insert(1, crate::layout::Workspace::new());
-        engine.monitors.get_mut(&oid).unwrap().workspaces.insert(2, crate::layout::Workspace::new());
+        engine
+            .monitors
+            .get_mut(&oid)
+            .unwrap()
+            .workspaces
+            .insert(1, crate::layout::Workspace::new());
+        engine
+            .monitors
+            .get_mut(&oid)
+            .unwrap()
+            .workspaces
+            .insert(2, crate::layout::Workspace::new());
         engine.set_window_rules(vec![
             title_rule(
                 "^two",
@@ -1259,9 +1362,17 @@ mod tests {
             ),
         ]);
         engine.add_window(window(1, "two"), &be());
-        assert_eq!(place_of(&engine, 1).map(|(ws, _)| ws), Some(1), "the second workspace has id 1");
+        assert_eq!(
+            place_of(&engine, 1).map(|(ws, _)| ws),
+            Some(1),
+            "the second workspace has id 1"
+        );
         engine.add_window(window(2, "older style"), &be());
-        assert_eq!(place_of(&engine, 2).map(|(ws, _)| ws), Some(2), "workspace \"3\" is the third");
+        assert_eq!(
+            place_of(&engine, 2).map(|(ws, _)| ws),
+            Some(2),
+            "workspace \"3\" is the third"
+        );
     }
 
     #[test]
@@ -1306,11 +1417,23 @@ mod tests {
         // The view is 1920 wide, the gap 16: (1920 + 16) / 2 - 16.
         assert_eq!(width_of(&engine, 1), Some(952));
         engine.add_window(window(2, "fixed"), &be());
-        assert_eq!(width_of(&engine, 2), Some(808), "800 for the window and 4 px of border on each side");
+        assert_eq!(
+            width_of(&engine, 2),
+            Some(808),
+            "800 for the window and 4 px of border on each side"
+        );
         engine.add_window(window(3, "own"), &be());
-        assert_eq!(width_of(&engine, 3), Some(708), "the 700 px it opened with, and its border");
+        assert_eq!(
+            width_of(&engine, 3),
+            Some(708),
+            "the 700 px it opened with, and its border"
+        );
         engine.add_window(window(4, "older style"), &be());
-        assert_eq!(width_of(&engine, 4), Some(650), "the pixels of the column, as before");
+        assert_eq!(
+            width_of(&engine, 4),
+            Some(650),
+            "the pixels of the column, as before"
+        );
         engine.add_window(window(5, "plain"), &be());
         assert_eq!(width_of(&engine, 5), Some(500), "the configured width");
     }
@@ -1401,7 +1524,14 @@ mod tests {
         assert_eq!((tile.min_height, tile.max_height), (208, 708));
         // The column is 500 wide by default; it is held to the maximum when it is asked for more.
         let oid = OutputId::from_name("M");
-        engine.monitors.get_mut(&oid).unwrap().workspace_mut().unwrap().columns[0].set_width(Some(900));
+        engine
+            .monitors
+            .get_mut(&oid)
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .columns[0]
+            .set_width(Some(900));
         let cfg = engine.config.clone();
         let positions = engine.calculate_positions(
             engine.monitors.get(&oid).unwrap().workspace().unwrap(),
@@ -1409,8 +1539,18 @@ mod tests {
             &cfg,
         );
         assert_eq!(positions[0].1.size.w, 608, "held to the maximum width");
-        assert_eq!(positions[0].1.size.h, 708, "a lone tile fills the view but the maximum height holds it");
-        engine.monitors.get_mut(&oid).unwrap().workspace_mut().unwrap().columns[0].set_width(Some(100));
+        assert_eq!(
+            positions[0].1.size.h, 708,
+            "a lone tile fills the view but the maximum height holds it"
+        );
+        engine
+            .monitors
+            .get_mut(&oid)
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .columns[0]
+            .set_width(Some(100));
         let positions = engine.calculate_positions(
             engine.monitors.get(&oid).unwrap().workspace().unwrap(),
             Rect::new(0, 0, 1920, 1040),
@@ -1527,7 +1667,10 @@ mod tests {
         assert!(place_of(&engine, 2).is_some(), "it is in the strip");
         // A window that opens normally takes the focus.
         engine.add_window(window(3, "loud"), &be());
-        assert_eq!(engine.monitors.get(&oid).unwrap().focus_window, Some(WindowId::new(3)));
+        assert_eq!(
+            engine.monitors.get(&oid).unwrap().focus_window,
+            Some(WindowId::new(3))
+        );
     }
 
     #[test]
@@ -1583,7 +1726,11 @@ mod tests {
         assert_eq!(engine.rule_opacity(wid), Some(0.5));
         assert_eq!(engine.tiled_windows[&wid].title, "video - player");
         engine.window_title_changed(wid, "Inbox again", &be());
-        assert_eq!(engine.rule_opacity(wid), None, "back to opaque when the title stops matching");
+        assert_eq!(
+            engine.rule_opacity(wid),
+            None,
+            "back to opaque when the title stops matching"
+        );
     }
 
     #[test]
@@ -1615,7 +1762,11 @@ mod tests {
         engine.add_window(window(1, "a"), &be());
         assert!(!engine.rule_flags.title);
         engine.window_title_changed(WindowId::new(1), "b", &be());
-        assert_eq!(engine.tiled_windows[&WindowId::new(1)].title, "b", "the title is kept anyway");
+        assert_eq!(
+            engine.tiled_windows[&WindowId::new(1)].title,
+            "b",
+            "the title is kept anyway"
+        );
         assert_eq!(engine.rule_opacity(WindowId::new(1)), Some(0.9));
     }
 
@@ -1635,7 +1786,11 @@ mod tests {
         assert!(engine.rule_flags.focus);
         let (one, two) = (WindowId::new(1), WindowId::new(2));
         engine.sync_os_foreground(one, &be());
-        assert_eq!(engine.rule_opacity(one), None, "the focused window stays opaque");
+        assert_eq!(
+            engine.rule_opacity(one),
+            None,
+            "the focused window stays opaque"
+        );
         assert_eq!(engine.rule_opacity(two), Some(0.6));
         engine.sync_os_foreground(two, &be());
         assert_eq!(engine.rule_opacity(one), Some(0.6));
@@ -1708,19 +1863,17 @@ mod tests {
         assert_eq!(none, RuleFlags::default());
         let title = RuleFlags::of(&[title_rule("a", WindowRule::default())]);
         assert!(title.title && !title.focus && !title.aumid);
-        let all = RuleFlags::of(&[
-            WindowRule {
-                match_groups: vec![MatchGroup {
-                    conds: vec![
-                        Matcher::AppId(RegexPat::new("x").unwrap()),
-                        Matcher::Not(Box::new(Matcher::IsActive)),
-                        Matcher::IsFloating,
-                        Matcher::IsUrgent,
-                    ],
-                }],
-                ..WindowRule::default()
-            },
-        ]);
+        let all = RuleFlags::of(&[WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![
+                    Matcher::AppId(RegexPat::new("x").unwrap()),
+                    Matcher::Not(Box::new(Matcher::IsActive)),
+                    Matcher::IsFloating,
+                    Matcher::IsUrgent,
+                ],
+            }],
+            ..WindowRule::default()
+        }]);
         assert!(all.aumid && all.focus && all.floating && all.urgency && !all.title);
     }
 }

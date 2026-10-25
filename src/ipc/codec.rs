@@ -205,7 +205,10 @@ mod tests {
             },
             IpcEvent::WindowFocusChanged { id: Some(1) },
             IpcEvent::WindowFocusChanged { id: None },
-            IpcEvent::WindowUrgencyChanged { id: 1, urgent: true },
+            IpcEvent::WindowUrgencyChanged {
+                id: 1,
+                urgent: true,
+            },
             IpcEvent::WindowLayoutsChanged {
                 changes: vec![(
                     1,
@@ -265,9 +268,17 @@ mod tests {
             "is_urgent",
             "layout",
         ] {
-            assert!(window.get(field).is_some(), "window.{} is missing: {}", field, window);
+            assert!(
+                window.get(field).is_some(),
+                "window.{} is missing: {}",
+                field,
+                window
+            );
         }
-        assert_eq!(window["layout"]["pos_in_scrolling_layout"], serde_json::json!([1, 1]));
+        assert_eq!(
+            window["layout"]["pos_in_scrolling_layout"],
+            serde_json::json!([1, 1])
+        );
         let event = IpcEvent::WorkspacesChanged {
             workspaces: vec![WorkspaceIpc {
                 id: 4_294_967_297,
@@ -292,7 +303,12 @@ mod tests {
             "is_focused",
             "active_window_id",
         ] {
-            assert!(workspace.get(field).is_some(), "workspace.{} is missing: {}", field, workspace);
+            assert!(
+                workspace.get(field).is_some(),
+                "workspace.{} is missing: {}",
+                field,
+                workspace
+            );
         }
         let event = IpcEvent::WindowClosed {
             window_hwnd: 7,

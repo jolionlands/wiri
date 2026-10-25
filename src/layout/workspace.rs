@@ -466,9 +466,17 @@ impl Workspace {
             column_display: col.display.clone(),
             column_maximized: col.maximized,
             column_pre_max_width: col.pre_max_width,
-            above: col.tiles[..index].iter().rev().map(|t| t.window_id).collect(),
+            above: col.tiles[..index]
+                .iter()
+                .rev()
+                .map(|t| t.window_id)
+                .collect(),
             below: col.tiles[index + 1..].iter().map(|t| t.window_id).collect(),
-            left_of: self.columns[..column].iter().rev().flat_map(ids_of).collect(),
+            left_of: self.columns[..column]
+                .iter()
+                .rev()
+                .flat_map(ids_of)
+                .collect(),
             right_of: self.columns[column + 1..].iter().flat_map(ids_of).collect(),
         })
     }
@@ -502,9 +510,8 @@ impl Workspace {
             .find_map(|w| self.find_window_column(*w))
         {
             let tiles = &mut self.columns[col].tiles;
-            let position_of = |tiles: &Vec<Tile>, w: &WindowId| {
-                tiles.iter().position(|t| t.window_id == *w)
-            };
+            let position_of =
+                |tiles: &Vec<Tile>, w: &WindowId| tiles.iter().position(|t| t.window_id == *w);
             let at = above
                 .iter()
                 .find_map(|w| position_of(tiles, w))
@@ -1543,7 +1550,10 @@ mod tests {
         ws.columns[0].add_tile(Tile::new(WindowId::new(9)));
         assert_eq!(ws.put_back(slot), 2);
         assert_eq!(ids(&ws), vec![vec![9], vec![1], vec![2, 3, 4], vec![5]]);
-        assert_eq!(ws.columns[2].tiles[1].height_weight, 2.5, "the tile keeps its height");
+        assert_eq!(
+            ws.columns[2].tiles[1].height_weight, 2.5,
+            "the tile keeps its height"
+        );
     }
 
     #[test]
@@ -1579,7 +1589,14 @@ mod tests {
     #[test]
     fn test_a_whole_desktop_comes_back_in_order_whichever_window_is_restored_first() {
         // Win+D: the windows are minimized one after the other.
-        let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
         for restore_order in orders {
             let mut ws = ws_with(&[&[1], &[2], &[3]]);
             let mut slots: Vec<Option<WindowSlot>> = Vec::new();
@@ -1606,7 +1623,14 @@ mod tests {
 
     #[test]
     fn test_a_whole_column_comes_back_in_order_whichever_window_is_restored_first() {
-        let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
         for restore_order in orders {
             let mut ws = ws_with(&[&[1, 2, 3]]);
             ws.columns[0].width = Some(500);
@@ -1622,7 +1646,12 @@ mod tests {
             for i in restore_order {
                 ws.put_back(slots[i].take().unwrap());
             }
-            assert_eq!(ids(&ws), vec![vec![1, 2, 3]], "restore order {:?}", restore_order);
+            assert_eq!(
+                ids(&ws),
+                vec![vec![1, 2, 3]],
+                "restore order {:?}",
+                restore_order
+            );
             assert_eq!(ws.columns[0].width, Some(500), "the column width came back");
         }
     }
@@ -1645,7 +1674,11 @@ mod tests {
         assert_eq!(ws.consume_or_expel_left(WindowId::new(3)), Some(1));
         // At the source column's place: the expelled window ends up on its left.
         assert_eq!(ids(&ws), vec![vec![1], vec![3], vec![2, 4], vec![5]]);
-        assert_eq!(ws.columns[1].width, Some(640), "same width as the column it left");
+        assert_eq!(
+            ws.columns[1].width,
+            Some(640),
+            "same width as the column it left"
+        );
         assert_eq!(ws.columns[2].width, Some(640));
     }
 
@@ -1662,7 +1695,11 @@ mod tests {
         let mut ws = ws_with(&[&[1], &[2], &[3]]);
         assert_eq!(ws.consume_or_expel_right(WindowId::new(1)), Some(0));
         assert_eq!(ids(&ws), vec![vec![2, 1], vec![3]]);
-        assert_eq!(ws.consume_or_expel_right(WindowId::new(1)), Some(1), "now it shares a column: it is expelled to the right");
+        assert_eq!(
+            ws.consume_or_expel_right(WindowId::new(1)),
+            Some(1),
+            "now it shares a column: it is expelled to the right"
+        );
         assert_eq!(ids(&ws), vec![vec![2], vec![1], vec![3]]);
     }
 
@@ -1686,8 +1723,16 @@ mod tests {
         assert_eq!(ws.consume_into_column(0), Some(WindowId::new(2)));
         assert_eq!(ids(&ws), vec![vec![1, 2], vec![3], vec![4]]);
         assert_eq!(ws.consume_into_column(1), Some(WindowId::new(4)));
-        assert_eq!(ids(&ws), vec![vec![1, 2], vec![3, 4]], "the emptied column vanishes");
-        assert_eq!(ws.consume_into_column(1), None, "nothing on the right of the last column");
+        assert_eq!(
+            ids(&ws),
+            vec![vec![1, 2], vec![3, 4]],
+            "the emptied column vanishes"
+        );
+        assert_eq!(
+            ws.consume_into_column(1),
+            None,
+            "nothing on the right of the last column"
+        );
     }
 
     #[test]
@@ -1697,7 +1742,11 @@ mod tests {
         assert_eq!(ids(&ws), vec![vec![1, 2], vec![3], vec![4]]);
         assert_eq!(ws.expel_from_column(0), Some(WindowId::new(2)));
         assert_eq!(ids(&ws), vec![vec![1], vec![2], vec![3], vec![4]]);
-        assert_eq!(ws.expel_from_column(0), None, "a single window has nothing to expel");
+        assert_eq!(
+            ws.expel_from_column(0),
+            None,
+            "a single window has nothing to expel"
+        );
         assert_eq!(ws.expel_from_column(9), None);
     }
 
@@ -1719,11 +1768,17 @@ mod tests {
         let mut ws = ws_with(&[&[1, 2, 3]]);
         assert!(ws.move_tile_within_column(WindowId::new(2), -1));
         assert_eq!(ids(&ws), vec![vec![2, 1, 3]]);
-        assert!(!ws.move_tile_within_column(WindowId::new(2), -1), "already at the top");
+        assert!(
+            !ws.move_tile_within_column(WindowId::new(2), -1),
+            "already at the top"
+        );
         assert!(ws.move_tile_within_column(WindowId::new(2), 1));
         assert!(ws.move_tile_within_column(WindowId::new(2), 1));
         assert_eq!(ids(&ws), vec![vec![1, 3, 2]]);
-        assert!(!ws.move_tile_within_column(WindowId::new(2), 1), "already at the bottom");
+        assert!(
+            !ws.move_tile_within_column(WindowId::new(2), 1),
+            "already at the bottom"
+        );
         assert!(!ws.move_tile_within_column(WindowId::new(9), 1));
     }
 
@@ -1732,7 +1787,10 @@ mod tests {
         let mut ws = ws_with(&[&[1, 2, 3]]);
         ws.columns[0].display = ColumnDisplay::Tabbed { active_tab: 1 };
         assert!(ws.move_tile_within_column(WindowId::new(2), 1));
-        assert_eq!(ws.columns[0].display, ColumnDisplay::Tabbed { active_tab: 2 });
+        assert_eq!(
+            ws.columns[0].display,
+            ColumnDisplay::Tabbed { active_tab: 2 }
+        );
         assert_eq!(ids(&ws), vec![vec![1, 3, 2]]);
     }
 
@@ -1756,7 +1814,11 @@ mod tests {
         col.add_tile(Tile::new(WindowId::new(1)));
         col.toggle_maximized(900);
         assert!(col.maximized);
-        assert_eq!(col.width, Some(900), "even a column of one window gets as wide as the view");
+        assert_eq!(
+            col.width,
+            Some(900),
+            "even a column of one window gets as wide as the view"
+        );
         col.toggle_maximized(900);
         assert!(!col.maximized);
         assert_eq!(col.width, None, "back to the default width");
@@ -1802,8 +1864,16 @@ mod tests {
         assert_eq!(ws.column_x_and_width(2, 440, 16), (934, 440));
         assert_eq!(ws.total_width(440, 16), 440 + 16 + 462 + 16 + 440);
         // Hit-testing and window rectangles use the same widths.
-        assert_eq!(ws.column_at_x(900, 440, 16), Some(1), "the wider column is under 900");
-        assert_eq!(ws.column_at_x(925, 440, 16), None, "and 925 is in the gap after it");
+        assert_eq!(
+            ws.column_at_x(900, 440, 16),
+            Some(1),
+            "the wider column is under 900"
+        );
+        assert_eq!(
+            ws.column_at_x(925, 440, 16),
+            None,
+            "and 925 is in the gap after it"
+        );
         assert_eq!(ws.column_at_x(940, 440, 16), Some(2));
         let rect = ws.current_position_for(WindowId::new(3), 440, 16).unwrap();
         assert_eq!(rect.loc.x, 934);

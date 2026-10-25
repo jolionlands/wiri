@@ -63,9 +63,14 @@ mod tests {
 
     #[test]
     fn a_config_with_errors_fails_with_the_first_one_and_a_count() {
-        let err = parse_kdl_config("layout {\n    gapz 8\n    border-colour \"x\"\n}\n").unwrap_err();
+        let err =
+            parse_kdl_config("layout {\n    gapz 8\n    border-colour \"x\"\n}\n").unwrap_err();
         let text = err.to_string();
-        assert!(text.starts_with("2:5: error: unknown option 'gapz'"), "{}", text);
+        assert!(
+            text.starts_with("2:5: error: unknown option 'gapz'"),
+            "{}",
+            text
+        );
         assert!(text.ends_with("(and 1 more error)"), "{}", text);
         // Warnings alone do not fail the load.
         assert!(parse_kdl_config("prefer-no-csd\n").is_ok());
@@ -79,7 +84,8 @@ mod tests {
 
     #[test]
     fn validate_reports_errors_and_warnings_with_positions() {
-        let issues = validate_kdl_config("telemetry {\n}\nbinds {\n    Hyper+F9 { close-window; }\n}\n");
+        let issues =
+            validate_kdl_config("telemetry {\n}\nbinds {\n    Hyper+F9 { close-window; }\n}\n");
         let errors: Vec<_> = issues
             .iter()
             .filter(|i| i.severity == ValidationSeverity::Error)
@@ -200,13 +206,22 @@ mod tests {
             })
         };
         let left = find(&["Mod"], "Left").expect("Mod+Left");
-        assert_eq!(left.parse_action(), Some(crate::input::Action::FocusColumnLeft));
+        assert_eq!(
+            left.parse_action(),
+            Some(crate::input::Action::FocusColumnLeft)
+        );
         let q = find(&["Mod"], "Q").expect("Mod+Q");
         assert_eq!(q.parse_action(), Some(crate::input::Action::CloseWindow));
         let esc = find(&[], "Escape").expect("Escape");
-        assert_eq!(esc.parse_action(), Some(crate::input::Action::OverviewToggle));
+        assert_eq!(
+            esc.parse_action(),
+            Some(crate::input::Action::OverviewToggle)
+        );
         let ws3 = find(&["Mod"], "3").expect("Mod+3");
-        assert_eq!(ws3.parse_action(), Some(crate::input::Action::FocusWorkspace(3)));
+        assert_eq!(
+            ws3.parse_action(),
+            Some(crate::input::Action::FocusWorkspace(3))
+        );
         let quit = find(&["Mod", "Shift"], "Q").expect("Mod+Shift+Q");
         assert_eq!(quit.parse_action(), Some(crate::input::Action::Quit));
         let term = find(&["Mod"], "Return").expect("Mod+Return");
@@ -246,7 +261,8 @@ mod tests {
     #[test]
     fn test_bind_with_unknown_modifier_is_dropped_at_parse_time() {
         // `Hyper+F9` used to register a bare global F9.
-        let input = "binds {\n  Hyper+F9 close-window\n  Ctrl+Alt+Q close-window\n  Mod5+T quit\n}\n";
+        let input =
+            "binds {\n  Hyper+F9 close-window\n  Ctrl+Alt+Q close-window\n  Mod5+T quit\n}\n";
         let config = parse_kdl_config(input).unwrap();
         assert_eq!(config.binds.hotkeys.len(), 1, "{:?}", config.binds.hotkeys);
         assert_eq!(config.binds.hotkeys[0].key, "Q");
@@ -282,7 +298,10 @@ mod tests {
         let b = &config.binds.hotkeys[0];
         assert_eq!(b.vk_code(), Some(0x25)); // VK_LEFT
         assert_eq!(b.mod_flags(), 0x0002 | 0x0001); // MOD_CTRL | MOD_ALT
-        assert_eq!(b.parse_action(), Some(crate::input::Action::FocusColumnLeft));
+        assert_eq!(
+            b.parse_action(),
+            Some(crate::input::Action::FocusColumnLeft)
+        );
     }
 
     #[test]
@@ -319,7 +338,8 @@ mod tests {
                 v
             );
         }
-        let err = parse_kdl_config("window-rule {\n  class-name \"X\"\n  open-max-bounds \"1600\"\n}");
+        let err =
+            parse_kdl_config("window-rule {\n  class-name \"X\"\n  open-max-bounds \"1600\"\n}");
         assert!(err.is_err(), "a single dimension is an error now");
     }
 }

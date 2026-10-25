@@ -50,7 +50,10 @@ pub fn replay(snapshot: &IpcSnapshot) -> Vec<IpcEvent> {
 fn workspaces_restructured(prev: &[WorkspaceIpc], next: &[WorkspaceIpc]) -> bool {
     prev.len() != next.len()
         || prev.iter().zip(next).any(|(old, new)| {
-            old.id != new.id || old.idx != new.idx || old.name != new.name || old.output != new.output
+            old.id != new.id
+                || old.idx != new.idx
+                || old.name != new.name
+                || old.output != new.output
         })
 }
 
@@ -241,7 +244,11 @@ mod tests {
         let events = replay(&s);
         assert_eq!(
             types(&events),
-            ["workspaces_changed", "windows_changed", "overview_opened_or_closed"]
+            [
+                "workspaces_changed",
+                "windows_changed",
+                "overview_opened_or_closed"
+            ]
         );
         match &events[1] {
             IpcEvent::WindowsChanged { windows } => assert_eq!(windows.len(), 2),
@@ -261,9 +268,15 @@ mod tests {
         let prev = snapshot(vec![window(1)], vec![workspace(10, 1, true)]);
         let mut opened = window(2);
         opened.is_focused = true;
-        let next = snapshot(vec![window(1), opened.clone()], vec![workspace(10, 1, true)]);
+        let next = snapshot(
+            vec![window(1), opened.clone()],
+            vec![workspace(10, 1, true)],
+        );
         let events = diff(&prev, &next);
-        assert_eq!(types(&events), ["window_opened_or_changed", "window_focus_changed"]);
+        assert_eq!(
+            types(&events),
+            ["window_opened_or_changed", "window_focus_changed"]
+        );
         match &events[0] {
             IpcEvent::WindowOpenedOrChanged { window } => assert_eq!(*window, opened),
             other => panic!("unexpected {:?}", other),
@@ -346,7 +359,10 @@ mod tests {
         let mut moved = window(2);
         moved.layout.pos_in_scrolling_layout = Some((1, 2));
         let events = diff(&prev, &snapshot(vec![urgent, moved.clone()], vec![]));
-        assert_eq!(types(&events), ["window_urgency_changed", "window_layouts_changed"]);
+        assert_eq!(
+            types(&events),
+            ["window_urgency_changed", "window_layouts_changed"]
+        );
         match &events[0] {
             IpcEvent::WindowUrgencyChanged { id, urgent } => assert_eq!((*id, *urgent), (1, true)),
             other => panic!("unexpected {:?}", other),
@@ -372,7 +388,10 @@ mod tests {
         moved_up.layout.pos_in_scrolling_layout = Some((1, 1));
         let events = diff(&prev, &snapshot(vec![changed, moved_up], vec![]));
         // The window that changed carries its urgency and its place; the other one moved.
-        assert_eq!(types(&events), ["window_opened_or_changed", "window_layouts_changed"]);
+        assert_eq!(
+            types(&events),
+            ["window_opened_or_changed", "window_layouts_changed"]
+        );
         match &events[1] {
             IpcEvent::WindowLayoutsChanged { changes } => {
                 assert_eq!(changes.iter().map(|c| c.0).collect::<Vec<_>>(), vec![2]);
@@ -384,7 +403,10 @@ mod tests {
     #[test]
     fn a_new_workspace_sends_the_whole_list_once() {
         let prev = snapshot(vec![], vec![workspace(10, 1, true)]);
-        let next = snapshot(vec![], vec![workspace(10, 1, true), workspace(11, 2, false)]);
+        let next = snapshot(
+            vec![],
+            vec![workspace(10, 1, true), workspace(11, 2, false)],
+        );
         let events = diff(&prev, &next);
         assert_eq!(types(&events), ["workspaces_changed"]);
         match &events[0] {
@@ -395,7 +417,10 @@ mod tests {
 
     #[test]
     fn a_renamed_or_renumbered_workspace_sends_the_whole_list() {
-        let prev = snapshot(vec![], vec![workspace(10, 1, true), workspace(11, 2, false)]);
+        let prev = snapshot(
+            vec![],
+            vec![workspace(10, 1, true), workspace(11, 2, false)],
+        );
         let mut renamed = prev.clone();
         renamed.workspaces[1].name = Some("web".into());
         assert_eq!(types(&diff(&prev, &renamed)), ["workspaces_changed"]);
@@ -409,8 +434,14 @@ mod tests {
 
     #[test]
     fn switching_workspace_activates_the_new_one_as_the_focused() {
-        let prev = snapshot(vec![], vec![workspace(10, 1, true), workspace(11, 2, false)]);
-        let next = snapshot(vec![], vec![workspace(10, 1, false), workspace(11, 2, true)]);
+        let prev = snapshot(
+            vec![],
+            vec![workspace(10, 1, true), workspace(11, 2, false)],
+        );
+        let next = snapshot(
+            vec![],
+            vec![workspace(10, 1, false), workspace(11, 2, true)],
+        );
         let events = diff(&prev, &next);
         assert_eq!(types(&events), ["workspace_activated"]);
         match &events[0] {
@@ -456,7 +487,9 @@ mod tests {
         let events = diff(&prev, &next);
         assert_eq!(types(&events), ["workspace_activated"]);
         match &events[0] {
-            IpcEvent::WorkspaceActivated { id, focused } => assert_eq!((*id, *focused), (21, false)),
+            IpcEvent::WorkspaceActivated { id, focused } => {
+                assert_eq!((*id, *focused), (21, false))
+            }
             other => panic!("unexpected {:?}", other),
         }
     }
@@ -470,7 +503,10 @@ mod tests {
         let events = diff(&prev, &next);
         assert_eq!(
             types(&events),
-            ["workspace_active_window_changed", "workspace_urgency_changed"]
+            [
+                "workspace_active_window_changed",
+                "workspace_urgency_changed"
+            ]
         );
         match &events[0] {
             IpcEvent::WorkspaceActiveWindowChanged {
@@ -480,7 +516,9 @@ mod tests {
             other => panic!("unexpected {:?}", other),
         }
         match &events[1] {
-            IpcEvent::WorkspaceUrgencyChanged { id, urgent } => assert_eq!((*id, *urgent), (10, true)),
+            IpcEvent::WorkspaceUrgencyChanged { id, urgent } => {
+                assert_eq!((*id, *urgent), (10, true))
+            }
             other => panic!("unexpected {:?}", other),
         }
     }
@@ -509,12 +547,19 @@ mod tests {
         let mut w = window(5);
         w.is_focused = true;
         w.workspace_id = Some(11);
-        let next = snapshot(vec![w], vec![workspace(10, 1, false), workspace(11, 2, true)]);
+        let next = snapshot(
+            vec![w],
+            vec![workspace(10, 1, false), workspace(11, 2, true)],
+        );
         let events = diff(&prev, &next);
         // The list carries the new workspace and who is active: no event of its own for it.
         assert_eq!(
             types(&events),
-            ["workspaces_changed", "window_opened_or_changed", "window_focus_changed"],
+            [
+                "workspaces_changed",
+                "window_opened_or_changed",
+                "window_focus_changed"
+            ],
             "a window names a workspace that the client must know by then"
         );
     }
@@ -529,7 +574,6 @@ mod tests {
         let next = snapshot(vec![], vec![a, workspace(11, 2, false)]);
         assert_eq!(types(&diff(&prev, &next)), ["workspaces_changed"]);
     }
-
 
     #[test]
     fn replaying_the_state_and_applying_the_deltas_gives_the_same_state_as_the_snapshot() {

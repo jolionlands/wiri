@@ -438,7 +438,6 @@ pub enum IpcMessage {
     // with niri's: the same objects the event stream describes (niri's
     // `Workspace` and `Window`), so that a client written against niri reads
     // them without knowing wiri.
-
     /// The workspaces of every monitor, in niri's shape.
     #[serde(rename = "workspaces", alias = "Workspaces")]
     Workspaces,
@@ -512,7 +511,9 @@ pub enum IpcEvent {
 
     /// niri `WindowLayoutsChanged`: the windows' places in their strips changed.
     #[serde(rename = "window_layouts_changed")]
-    WindowLayoutsChanged { changes: Vec<(u64, WindowLayoutIpc)> },
+    WindowLayoutsChanged {
+        changes: Vec<(u64, WindowLayoutIpc)>,
+    },
 
     /// niri `OverviewOpenedOrClosed`.
     #[serde(rename = "overview_opened_or_closed")]
@@ -848,7 +849,11 @@ mod tests {
         };
         let raw = serde_json::to_string(&with_args).expect("serialize");
         assert!(raw.contains("\"run_action\""), "{}", raw);
-        assert!(!raw.contains("quoted"), "an empty `quoted` is not written: {}", raw);
+        assert!(
+            !raw.contains("quoted"),
+            "an empty `quoted` is not written: {}",
+            raw
+        );
         let back: IpcMessage = serde_json::from_str(&raw).expect("deserialize");
         match back {
             IpcMessage::RunAction { name, args, .. } => {
@@ -895,7 +900,11 @@ mod tests {
         );
         assert_eq!(name, "focus-workspace");
         assert_eq!(args, vec!["2".to_string()]);
-        assert_eq!(quoted, vec![true], "the workspace named \"2\", not the second one");
+        assert_eq!(
+            quoted,
+            vec![true],
+            "the workspace named \"2\", not the second one"
+        );
     }
 
     #[test]
@@ -1072,7 +1081,9 @@ mod tests {
 
     #[test]
     fn the_focused_window_reply_is_null_when_no_window_is_focused() {
-        let reply = FocusedWindowResponse { focused_window: None };
+        let reply = FocusedWindowResponse {
+            focused_window: None,
+        };
         let json = serde_json::to_value(&reply).expect("serialize");
         assert!(json.get("focused_window").is_some(), "{}", json);
         assert!(json["focused_window"].is_null());
@@ -1090,7 +1101,8 @@ mod tests {
 
     #[test]
     fn the_overview_and_the_version_say_what_they_are() {
-        let json = serde_json::to_value(OverviewStateResponse { is_open: true }).expect("serialize");
+        let json =
+            serde_json::to_value(OverviewStateResponse { is_open: true }).expect("serialize");
         assert_eq!(json["is_open"], serde_json::json!(true));
         let back: OverviewStateResponse = serde_json::from_value(json).expect("deserialize");
         assert!(back.is_open);

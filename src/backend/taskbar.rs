@@ -59,12 +59,19 @@ pub fn mark_fullscreen(hwnd: isize, fullscreen: bool) -> bool {
                 debug!(
                     "taskbar: window {} marked {}",
                     hwnd,
-                    if fullscreen { "fullscreen" } else { "not fullscreen" }
+                    if fullscreen {
+                        "fullscreen"
+                    } else {
+                        "not fullscreen"
+                    }
                 );
                 true
             }
             Err(e) => {
-                warn!("taskbar: MarkFullscreenWindow({}, {}) failed: {}", hwnd, fullscreen, e);
+                warn!(
+                    "taskbar: MarkFullscreenWindow({}, {}) failed: {}",
+                    hwnd, fullscreen, e
+                );
                 false
             }
         }

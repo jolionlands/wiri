@@ -1262,7 +1262,9 @@ impl TilingEngine {
                                 .monitors
                                 .get(&host)
                                 .and_then(|m| m.workspaces.get(to))
-                                .map_or(false, |ws| ws.find_window_column(tile.window_id).is_some());
+                                .map_or(false, |ws| {
+                                    ws.find_window_column(tile.window_id).is_some()
+                                });
                             if !still_there {
                                 continue;
                             }
@@ -1286,7 +1288,8 @@ impl TilingEngine {
                 // were moved to go back as well, to where they floated.
                 let to_of = |from: &i32| moved.iter().find(|(f, _)| f == from).map(|(_, t)| *t);
                 for (window, (from, rect)) in &floats {
-                    if let (Some(to), Some(home)) = (to_of(from), self.float_homes.get_mut(window)) {
+                    if let (Some(to), Some(home)) = (to_of(from), self.float_homes.get_mut(window))
+                    {
                         if home.output == host && home.workspace == to {
                             home.output = output;
                             home.workspace = *from;
@@ -1738,7 +1741,9 @@ impl TilingEngine {
         if self.tiled_windows.remove(&window_id).is_some() {
             // Look on every workspace, not just the active one: a window can
             // close while it is parked on an inactive workspace.
-            let found_output = self.locate_window(window_id).map(|(output_id, _, _)| output_id);
+            let found_output = self
+                .locate_window(window_id)
+                .map(|(output_id, _, _)| output_id);
             if let Some(output_id) = found_output {
                 if let Some(monitor) = self.monitors.get_mut(&output_id) {
                     monitor.remove_window(window_id);
@@ -1820,7 +1825,8 @@ impl TilingEngine {
                         let rule = limits.get(&tile.window_id).copied().unwrap_or_default();
                         // Both native and rule minima describe the visible window; a tile
                         // also contains wiri's border, which placement subtracts again.
-                        tile.min_width = rules::RuleLimits::for_tile(window_min.max(rule.min_width), border);
+                        tile.min_width =
+                            rules::RuleLimits::for_tile(window_min.max(rule.min_width), border);
                         tile.max_width = rules::RuleLimits::for_tile(rule.max_width, border);
                         tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
                         tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
@@ -1877,8 +1883,7 @@ impl TilingEngine {
     /// remembered for [`Self::restore_window`].  A floating window keeps its float
     /// state and is just left alone until it comes back.
     pub fn minimize_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
-        if !self.tiled_windows.contains_key(&window_id) || self.minimized.contains_key(&window_id)
-        {
+        if !self.tiled_windows.contains_key(&window_id) || self.minimized.contains_key(&window_id) {
             return;
         }
         let was_fullscreen = self.fullscreen_windows.contains(&window_id);
@@ -3138,7 +3143,10 @@ impl TilingEngine {
             .monitors
             .get(&output_id)
             .map_or(false, |m| m.active_workspace != workspace_id);
-        let hidden_by_wiri = !self.applied_state.get(&window_id).map_or(true, |s| s.visible);
+        let hidden_by_wiri = !self
+            .applied_state
+            .get(&window_id)
+            .map_or(true, |s| s.visible);
         // A cloaked window is still in Alt+Tab and on the taskbar: once it has been hidden for
         // a moment, a report that it is the foreground window is the user asking for it, and
         // its workspace comes with it.  (A window hidden with SW_HIDE cannot be asked for.)
@@ -4169,7 +4177,10 @@ impl TilingEngine {
         // The layout cache must forget the tile rectangle it holds: when the window is tiled
         // again the layout pass would find that rectangle "already applied" and leave the window
         // where it floats.
-        let was_visible = self.applied_state.get(&window_id).map_or(false, |s| s.visible);
+        let was_visible = self
+            .applied_state
+            .get(&window_id)
+            .map_or(false, |s| s.visible);
         let mut cached = AppliedState::unset();
         cached.visible = on_active_workspace || was_visible;
         self.applied_state.insert(window_id, cached);
@@ -4278,12 +4289,23 @@ impl TilingEngine {
 
     /// Absolute pointer-grab writeback; shares floating memory, rule limits and work-area
     /// clamping with keyboard moves instead of rereading a potentially queued HWND move.
-    pub(crate) fn place_float_from_pointer(&mut self, window: WindowId, rect: Rect, backend: &BackendHandle) {
+    pub(crate) fn place_float_from_pointer(
+        &mut self,
+        window: WindowId,
+        rect: Rect,
+        backend: &BackendHandle,
+    ) {
         self.place_float(window, rect, backend);
     }
 
     /// Move a floating window by `(dx, dy)` pixels (niri nudges by 50).
-    pub fn float_move_by(&mut self, window_id: WindowId, dx: i32, dy: i32, backend: &BackendHandle) {
+    pub fn float_move_by(
+        &mut self,
+        window_id: WindowId,
+        dx: i32,
+        dy: i32,
+        backend: &BackendHandle,
+    ) {
         let Some(rect) = self.float_rect_of(window_id) else {
             return;
         };
@@ -4349,7 +4371,11 @@ impl TilingEngine {
             return;
         };
         let w = ((work.size.w as f64 * fraction).round() as u32).max(120);
-        self.place_float(window_id, Rect::new(rect.loc.x, rect.loc.y, w, rect.size.h), backend);
+        self.place_float(
+            window_id,
+            Rect::new(rect.loc.x, rect.loc.y, w, rect.size.h),
+            backend,
+        );
     }
 
     /// Give a floating window the keyboard focus (switching to its workspace first
@@ -4904,7 +4930,8 @@ impl TilingEngine {
         if !self.floating_windows.contains(&window_id) {
             return None;
         }
-        self.float_location(window_id).map(|(_, workspace)| workspace)
+        self.float_location(window_id)
+            .map(|(_, workspace)| workspace)
     }
 
     /// Get all tiled windows (for IPC queries)
@@ -6357,7 +6384,9 @@ impl TilingEngine {
     /// asynchronous Win32 positioning completes. Input uses this only to avoid
     /// warping to a parked or superseded rectangle; owned dialogs have no entry.
     pub(crate) fn pointer_warp_target(&self, window: WindowId) -> Option<Rect> {
-        self.applied_state.get(&window).map(|state| state.rect)
+        self.applied_state
+            .get(&window)
+            .map(|state| state.rect)
             .filter(|rect| rect.size.w > 0 && rect.size.h > 0)
     }
 
@@ -6595,7 +6624,13 @@ impl TilingEngine {
         let workspace = monitor.workspace()?;
         let column = workspace.columns.get(col_idx)?;
         let current = column.resolved_width(Self::workspace_default_width(workspace, view, cfg));
-        Some((col_idx, current, view, cfg.column_gap, 2 * cfg.border_width.max(1)))
+        Some((
+            col_idx,
+            current,
+            view,
+            cfg.column_gap,
+            2 * cfg.border_width.max(1),
+        ))
     }
 
     /// niri `set-column-width` / `set-window-width`: change the width of the focused
@@ -6605,8 +6640,7 @@ impl TilingEngine {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        let Some((col_idx, current, view, gap, extra)) = self.focused_column_metrics(output)
-        else {
+        let Some((col_idx, current, view, gap, extra)) = self.focused_column_metrics(output) else {
             return;
         };
         let width = change
@@ -6742,7 +6776,12 @@ impl TilingEngine {
             else {
                 return;
             };
-            if column.tiles.len() < 2 || matches!(column.display, crate::layout::workspace::ColumnDisplay::Tabbed { .. }) {
+            if column.tiles.len() < 2
+                || matches!(
+                    column.display,
+                    crate::layout::workspace::ColumnDisplay::Tabbed { .. }
+                )
+            {
                 return;
             }
             let Some(idx) = column.index_of(window) else {
@@ -6782,7 +6821,13 @@ impl TilingEngine {
             .get_mut(&output)
             .and_then(|monitor| {
                 let (col_idx, window) = (monitor.focus_column?, monitor.focus_window?);
-                monitor.workspace_mut()?.columns.get_mut(col_idx)?.tiles.iter_mut().find(|t| t.window_id == window)
+                monitor
+                    .workspace_mut()?
+                    .columns
+                    .get_mut(col_idx)?
+                    .tiles
+                    .iter_mut()
+                    .find(|t| t.window_id == window)
             })
             .map(|tile| {
                 tile.height_weight = 1.0;
@@ -7183,10 +7228,16 @@ impl TilingEngine {
             )
         };
 
-        if let Some(workspace) = self.monitors.get_mut(&output).and_then(|m| m.workspace_mut()) {
+        if let Some(workspace) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+        {
             if let Some(column) = workspace.columns.get_mut(active) {
                 if others {
-                    column.set_width(Some((active_width + available).max(Self::MIN_COLUMN_PX) as u32));
+                    column.set_width(Some(
+                        (active_width + available).max(Self::MIN_COLUMN_PX) as u32
+                    ));
                     // Keep the columns that were in view in view: the leftmost stays at the
                     // left edge, the focused column grows to the right.
                     workspace.scroll_offset.x = leftmost_x.max(0);
@@ -7208,8 +7259,10 @@ impl TilingEngine {
             return;
         };
         let view_width = match self.monitors.get(&focused_output) {
-            Some(monitor) => Self::view_width_for_monitor(monitor, self.effective_config(focused_output))
-                .max(50) as u32,
+            Some(monitor) => {
+                Self::view_width_for_monitor(monitor, self.effective_config(focused_output)).max(50)
+                    as u32
+            }
             None => return,
         };
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
@@ -7228,11 +7281,9 @@ impl TilingEngine {
     /// A maximized column is as wide as the view, and the view can change (another
     /// monitor, other gaps or reserved edges): follow it.
     fn refresh_maximized_widths(&mut self, output_id: OutputId) {
-        let Some(view_width) = self
-            .monitors
-            .get(&output_id)
-            .map(|m| Self::view_width_for_monitor(m, self.effective_config(output_id)).max(50) as u32)
-        else {
+        let Some(view_width) = self.monitors.get(&output_id).map(|m| {
+            Self::view_width_for_monitor(m, self.effective_config(output_id)).max(50) as u32
+        }) else {
             return;
         };
         if let Some(monitor) = self.monitors.get_mut(&output_id) {
@@ -8145,7 +8196,9 @@ fn restorable_bounds(original: Rect, work_areas: &[Rect], nth: usize) -> Rect {
     const MIN_VISIBLE: i32 = 64;
     const CASCADE_PX: i32 = 32;
     const CASCADE_STEPS: usize = 8;
-    let overlap = |a_start: i32, a_end: i32, b_start: i32, b_end: i32| a_end.min(b_end) - a_start.max(b_start);
+    let overlap = |a_start: i32, a_end: i32, b_start: i32, b_end: i32| {
+        a_end.min(b_end) - a_start.max(b_start)
+    };
     let usable = work_areas.iter().any(|wa| {
         overlap(original.loc.x, original.right(), wa.loc.x, wa.right()) >= MIN_VISIBLE
             && overlap(original.loc.y, original.bottom(), wa.loc.y, wa.bottom()) >= MIN_VISIBLE
@@ -8712,7 +8765,10 @@ mod tests {
         let target = Rect::new(923, 12, 431, 704);
         engine.applied_state.get_mut(&window).unwrap().rect = target;
         assert_eq!(engine.pointer_warp_target(window), Some(target));
-        assert_eq!(engine.tiled_windows.get(&window).unwrap().bounds, stale_bounds);
+        assert_eq!(
+            engine.tiled_windows.get(&window).unwrap().bounds,
+            stale_bounds
+        );
         assert_ne!(stale_bounds, target);
         assert_eq!(engine.pointer_warp_target(WindowId::new(101)), None);
     }
@@ -9095,13 +9151,19 @@ mod tests {
         // 101 pulls 102 (the first window of the column on its right) under itself; focus stays on 101.
         engine.focus_left(&BackendHandle::default_for_test());
         engine.consume_window_into_column(&BackendHandle::default_for_test());
-        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101, 102]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101, 102]]
+        );
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_column, Some(1));
         assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
 
         engine.move_column(ScrollDirection::Left, &BackendHandle::default_for_test());
-        assert_eq!(column_windows(&engine, oid), vec![vec![101, 102], vec![100]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101, 102], vec![100]]
+        );
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_column, Some(0));
         assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
@@ -9382,8 +9444,14 @@ mod tests {
         // The OS still says: the floating window is what the user is looking at.
         engine.sync_os_foreground(WindowId::new(101), &be);
         engine.toggle_floating(&be);
-        assert!(!engine.is_floating(WindowId::new(101)), "back in the layout");
-        assert!(!engine.is_floating(WindowId::new(100)), "the other tile is untouched");
+        assert!(
+            !engine.is_floating(WindowId::new(101)),
+            "back in the layout"
+        );
+        assert!(
+            !engine.is_floating(WindowId::new(100)),
+            "the other tile is untouched"
+        );
         assert_eq!(column_windows(&engine, oid).len(), 2);
     }
 
@@ -9395,11 +9463,17 @@ mod tests {
         engine.add_window(make_window(101, 500, 400), &be);
         engine.sync_os_foreground(WindowId::new(101), &be);
         engine.toggle_floating(&be); // 101 floats, focus moves to 100
-        // The user clicks the tile 100 and presses toggle-floating again.
+                                     // The user clicks the tile 100 and presses toggle-floating again.
         engine.sync_os_foreground(WindowId::new(100), &be);
         engine.toggle_floating(&be);
-        assert!(engine.is_floating(WindowId::new(100)), "the foreground tile floats");
-        assert!(engine.is_floating(WindowId::new(101)), "the first floating window stays floating");
+        assert!(
+            engine.is_floating(WindowId::new(100)),
+            "the foreground tile floats"
+        );
+        assert!(
+            engine.is_floating(WindowId::new(101)),
+            "the first floating window stays floating"
+        );
     }
 
     // --- Which window does an action act on? ---
@@ -9430,9 +9504,15 @@ mod tests {
     #[test]
     fn test_managed_window_for_maps_a_dialog_to_the_window_that_owns_it() {
         let engine = engine_with_two_tiles();
-        assert_eq!(engine.managed_window_for(100, 100), Some(WindowId::new(100)));
+        assert_eq!(
+            engine.managed_window_for(100, 100),
+            Some(WindowId::new(100))
+        );
         // A dialog (999) owned by the application window 101.
-        assert_eq!(engine.managed_window_for(999, 101), Some(WindowId::new(101)));
+        assert_eq!(
+            engine.managed_window_for(999, 101),
+            Some(WindowId::new(101))
+        );
         // Neither the window nor its owner is managed.
         assert_eq!(engine.managed_window_for(998, 997), None);
     }
@@ -9636,12 +9716,20 @@ mod tests {
 
         engine.toggle_floating_for(wid, &be);
         let cached = engine.applied_state.get(&wid).unwrap();
-        assert_eq!(cached.rect, Rect::new(0, 0, 0, 0), "the float is not at the tile rect");
+        assert_eq!(
+            cached.rect,
+            Rect::new(0, 0, 0, 0),
+            "the float is not at the tile rect"
+        );
         assert!(cached.visible);
 
         engine.toggle_floating_for(wid, &be);
         let cached = engine.applied_state.get(&wid).unwrap();
-        assert_ne!(cached.rect, Rect::new(0, 0, 0, 0), "the layout placed the tile again");
+        assert_ne!(
+            cached.rect,
+            Rect::new(0, 0, 0, 0),
+            "the layout placed the tile again"
+        );
         assert!(cached.visible);
     }
 
@@ -9698,7 +9786,9 @@ mod tests {
         let mut engine = engine_with_two_tiles();
         let wid = WindowId::new(100);
         // Remembered on a bigger desktop that is gone.
-        engine.float_memory.insert(wid, Rect::new(3000, 2000, 800, 600));
+        engine
+            .float_memory
+            .insert(wid, Rect::new(3000, 2000, 800, 600));
         engine.toggle_floating_for(wid, &be);
         let rect = engine.float_homes.get(&wid).unwrap().rect;
         assert!(rect.loc.x >= 0 && rect.loc.y >= 0);
@@ -9760,7 +9850,13 @@ mod tests {
             !engine.applied_state.get(&float).unwrap().visible,
             "left behind on screen when its workspace was left"
         );
-        assert!(!engine.applied_state.get(&WindowId::new(100)).unwrap().visible);
+        assert!(
+            !engine
+                .applied_state
+                .get(&WindowId::new(100))
+                .unwrap()
+                .visible
+        );
 
         engine.switch_workspace(crate::layout::workspace_id_from_number(1), &be);
         assert!(
@@ -9838,7 +9934,12 @@ mod tests {
         assert!(engine.applied_state.get(&float).unwrap().visible);
         engine.switch_workspace(0, &be);
         assert!(!engine.applied_state.get(&float).unwrap().visible);
-        assert!(engine.monitors().get(&oid).unwrap().workspaces.contains_key(&2));
+        assert!(engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspaces
+            .contains_key(&2));
     }
 
     #[test]
@@ -9854,7 +9955,10 @@ mod tests {
         assert!(!engine.is_floating(float));
         assert!(!engine.float_homes.contains_key(&float));
         assert!(!engine.float_memory.contains_key(&float));
-        assert_eq!(engine.state_target().map(|t| t.window), Some(WindowId::new(100)));
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100))
+        );
     }
 
     #[test]
@@ -9963,7 +10067,11 @@ mod tests {
         );
         assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
         assert!(
-            engine.applied_state.get(&WindowId::new(101)).unwrap().visible,
+            engine
+                .applied_state
+                .get(&WindowId::new(101))
+                .unwrap()
+                .visible,
             "the layout placed it again"
         );
     }
@@ -10007,7 +10115,14 @@ mod tests {
         assert_eq!(column_windows(&engine, oid), vec![vec![100]]);
         engine.restore_window(WindowId::new(101), &be);
         assert_eq!(
-            engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[1].width,
+            engine
+                .monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[1]
+                .width,
             Some(640),
             "the column it lived in is rebuilt with its width"
         );
@@ -10016,7 +10131,12 @@ mod tests {
     #[test]
     fn test_several_minimized_windows_come_back_in_their_old_order() {
         // Win+D minimizes everything; the restore order is up to the shell.
-        let orders = [[100, 101, 102], [102, 101, 100], [101, 100, 102], [101, 102, 100]];
+        let orders = [
+            [100, 101, 102],
+            [102, 101, 100],
+            [101, 100, 102],
+            [101, 102, 100],
+        ];
         for restore_order in orders {
             let be = BackendHandle::default_for_test();
             let mut engine = engine_with_tiles(&[100, 101, 102]);
@@ -10084,7 +10204,11 @@ mod tests {
         assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
         assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
         let monitor = engine.monitors().get(&oid).unwrap();
-        assert_eq!(monitor.workspaces.get(&0).unwrap().columns.len(), 1, "100 stays on workspace 1");
+        assert_eq!(
+            monitor.workspaces.get(&0).unwrap().columns.len(),
+            1,
+            "100 stays on workspace 1"
+        );
     }
 
     #[test]
@@ -10096,9 +10220,15 @@ mod tests {
         assert!(engine.is_fullscreen(wid));
 
         engine.minimize_window(wid, &be);
-        assert!(!engine.is_fullscreen(wid), "it no longer hides the other tile");
+        assert!(
+            !engine.is_fullscreen(wid),
+            "it no longer hides the other tile"
+        );
         engine.restore_window(wid, &be);
-        assert!(engine.is_fullscreen(wid), "and covers the monitor again when restored");
+        assert!(
+            engine.is_fullscreen(wid),
+            "and covers the monitor again when restored"
+        );
     }
 
     #[test]
@@ -10108,14 +10238,23 @@ mod tests {
         let float = WindowId::new(101);
         engine.toggle_floating_for(float, &be);
         engine.os_foreground = None;
-        assert_eq!(engine.state_target().map(|t| t.window), Some(WindowId::new(100)));
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100))
+        );
         engine.toggle_floating_for(WindowId::new(100), &be);
         engine.os_foreground = None;
-        assert_eq!(engine.state_target().map(|t| t.window), Some(WindowId::new(100)));
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100))
+        );
 
         engine.minimize_window(WindowId::new(100), &be);
         assert!(engine.is_minimized(WindowId::new(100)));
-        assert!(engine.is_floating(WindowId::new(100)), "still a floating window");
+        assert!(
+            engine.is_floating(WindowId::new(100)),
+            "still a floating window"
+        );
         // The topmost float that is not minimized is what an action acts on.
         assert_eq!(engine.state_target().map(|t| t.window), Some(float));
 
@@ -10147,11 +10286,23 @@ mod tests {
         // its old entry, leaving fullscreen finds the tile rect "already applied" and
         // never moves the window back: it stays as big as the screen.
         let mut engine = make_engine();
-        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
-        engine.add_window(make_window(101, 500, 400), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(100, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
+        engine.add_window(
+            make_window(101, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
         engine.apply_all(&BackendHandle::default_for_test());
         let wid = WindowId::new(101);
-        assert!(engine.applied_state.get(&wid).expect("tiled and applied").visible);
+        assert!(
+            engine
+                .applied_state
+                .get(&wid)
+                .expect("tiled and applied")
+                .visible
+        );
         let tile_rect = engine.applied_state.get(&wid).expect("applied").rect;
 
         engine.toggle_fullscreen(&BackendHandle::default_for_test());
@@ -11155,7 +11306,14 @@ mod tests {
 
     fn column_width_of(engine: &TilingEngine, col: usize) -> Option<u32> {
         let oid = engine.focused_output().unwrap();
-        engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[col].width
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[col]
+            .width
     }
 
     #[test]
@@ -11176,7 +11334,11 @@ mod tests {
         }
         assert_eq!(column_width_of(&engine, 0), Some(952));
         assert_eq!(column_width_of(&engine, 1), Some(952));
-        assert_eq!(952 + 16 + 952, 1920, "two halves and the gap fill the view exactly");
+        assert_eq!(
+            952 + 16 + 952,
+            1920,
+            "two halves and the gap fill the view exactly"
+        );
         // A third and two thirds fill it too (within the rounding of a pixel).
         engine.set_column_width_by(SizeChange::SetProportion(33_333), &be);
         focus_window(&mut engine, 102);
@@ -11207,7 +11369,11 @@ mod tests {
         engine.set_column_width_by(SizeChange::AdjustFixed(100), &be);
         assert_eq!(column_width_of(&engine, 0), Some(708));
         engine.set_column_width_by(SizeChange::AdjustFixed(-5000), &be);
-        assert_eq!(column_width_of(&engine, 0), Some(50), "never narrower than 50 px");
+        assert_eq!(
+            column_width_of(&engine, 0),
+            Some(50),
+            "never narrower than 50 px"
+        );
         // The window really gets the width (the layout insets the column by the border).
         std::thread::sleep(std::time::Duration::from_millis(25));
         engine.set_column_width_by(SizeChange::SetFixed(600), &be);
@@ -11223,7 +11389,13 @@ mod tests {
         engine.toggle_maximize_focused_column(&be);
         engine.set_column_width_by(SizeChange::AdjustProportion(-50_000), &be);
         let oid = engine.focused_output().unwrap();
-        let col = &engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0];
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
         assert!(!col.maximized);
         // From a column as wide as the view (1920), minus half of it: 1920 / 2 - 8.
         assert_eq!(col.width, Some(952));
@@ -11272,17 +11444,54 @@ mod tests {
     #[test]
     fn test_next_preset_index() {
         let presets = [629, 952, 1275];
-        assert_eq!(TilingEngine::next_preset_index(None, 500, &presets, true), 0);
-        assert_eq!(TilingEngine::next_preset_index(None, 629, &presets, true), 1, "equal is not wider");
-        assert_eq!(TilingEngine::next_preset_index(None, 700, &presets, true), 1);
-        assert_eq!(TilingEngine::next_preset_index(None, 1275, &presets, true), 0, "wraps");
-        assert_eq!(TilingEngine::next_preset_index(None, 2000, &presets, true), 0);
-        assert_eq!(TilingEngine::next_preset_index(None, 700, &presets, false), 0);
-        assert_eq!(TilingEngine::next_preset_index(None, 629, &presets, false), 2, "wraps");
-        assert_eq!(TilingEngine::next_preset_index(None, 2000, &presets, false), 2);
-        assert_eq!(TilingEngine::next_preset_index(Some(2), 1275, &presets, true), 0);
-        assert_eq!(TilingEngine::next_preset_index(Some(0), 629, &presets, false), 2);
-        assert_eq!(TilingEngine::next_preset_index(Some(1), 5, &presets, true), 2, "remembered wins");
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 500, &presets, true),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 629, &presets, true),
+            1,
+            "equal is not wider"
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 700, &presets, true),
+            1
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 1275, &presets, true),
+            0,
+            "wraps"
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 2000, &presets, true),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 700, &presets, false),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 629, &presets, false),
+            2,
+            "wraps"
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 2000, &presets, false),
+            2
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(Some(2), 1275, &presets, true),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(Some(0), 629, &presets, false),
+            2
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(Some(1), 5, &presets, true),
+            2,
+            "remembered wins"
+        );
     }
 
     /// A column of two tiles on an engine with one monitor; the first tile is focused.
@@ -11304,7 +11513,13 @@ mod tests {
 
     fn tile_weights(engine: &TilingEngine) -> Vec<f32> {
         let oid = engine.focused_output().unwrap();
-        engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0]
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
             .tiles
             .iter()
             .map(|t| t.height_weight)
@@ -11326,12 +11541,20 @@ mod tests {
         // A fixed height is the window's (the 4 px borders come on top): 300 + 8 px.
         engine.set_window_height_by(SizeChange::SetFixed(300), &be);
         let w = tile_weights(&engine);
-        assert!((w[0] / (w[0] + w[1]) - 308.0 / 1068.0).abs() < 0.002, "{:?}", w);
+        assert!(
+            (w[0] / (w[0] + w[1]) - 308.0 / 1068.0).abs() < 0.002,
+            "{:?}",
+            w
+        );
 
         // +100 px from there, and -10 % of the view.
         engine.set_window_height_by(SizeChange::AdjustFixed(100), &be);
         let w = tile_weights(&engine);
-        assert!((w[0] / (w[0] + w[1]) - 408.0 / 1068.0).abs() < 0.002, "{:?}", w);
+        assert!(
+            (w[0] / (w[0] + w[1]) - 408.0 / 1068.0).abs() < 0.002,
+            "{:?}",
+            w
+        );
         engine.set_window_height_by(SizeChange::AdjustProportion(-10_000), &be);
         let w = tile_weights(&engine);
         assert!(
@@ -11367,13 +11590,28 @@ mod tests {
         let wid = WindowId::new(100);
         engine.toggle_floating_for(wid, &be); // 800 x 600, in the middle of 1920 x 1040
         let rect = |e: &TilingEngine| e.float_homes.get(&wid).unwrap().rect;
-        engine.float_apply_size_change(wid, SizeAxis::Width, SizeChange::SetProportion(50_000), &be);
+        engine.float_apply_size_change(
+            wid,
+            SizeAxis::Width,
+            SizeChange::SetProportion(50_000),
+            &be,
+        );
         assert_eq!(rect(&engine).size.w, 960);
-        engine.float_apply_size_change(wid, SizeAxis::Width, SizeChange::AdjustProportion(10_000), &be);
+        engine.float_apply_size_change(
+            wid,
+            SizeAxis::Width,
+            SizeChange::AdjustProportion(10_000),
+            &be,
+        );
         assert_eq!(rect(&engine).size.w, 1152);
         engine.float_apply_size_change(wid, SizeAxis::Width, SizeChange::SetFixed(700), &be);
         assert_eq!(rect(&engine).size.w, 700);
-        engine.float_apply_size_change(wid, SizeAxis::Height, SizeChange::SetProportion(50_000), &be);
+        engine.float_apply_size_change(
+            wid,
+            SizeAxis::Height,
+            SizeChange::SetProportion(50_000),
+            &be,
+        );
         assert_eq!(rect(&engine).size.h, 520);
         engine.float_apply_size_change(wid, SizeAxis::Height, SizeChange::AdjustFixed(-100), &be);
         assert_eq!(rect(&engine).size.h, 420);
@@ -11388,11 +11626,18 @@ mod tests {
         assert!(!engine.is_floating(wid), "already tiled: nothing happens");
         engine.set_window_floating(wid, true, &be);
         engine.set_window_floating(wid, true, &be);
-        assert!(engine.is_floating(wid), "a second `to floating` does not tile it again");
+        assert!(
+            engine.is_floating(wid),
+            "a second `to floating` does not tile it again"
+        );
         engine.set_window_floating(wid, false, &be);
         engine.set_window_floating(wid, false, &be);
         assert!(!engine.is_floating(wid));
-        assert_eq!(engine.locate_window(wid).map(|l| l.2), Some(1), "back in a column of its own");
+        assert_eq!(
+            engine.locate_window(wid).map(|l| l.2),
+            Some(1),
+            "back in a column of its own"
+        );
     }
 
     #[test]
@@ -11405,18 +11650,32 @@ mod tests {
             OutputId::from_name("C"),
         );
         // Registered out of order: the monitors are ordered by their position.
-        engine.register_monitor(b, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            b,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
         engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
-        engine.register_monitor(c, Rect::new(3840, 0, 1920, 1080), Rect::new(3840, 0, 1920, 1040));
+        engine.register_monitor(
+            c,
+            Rect::new(3840, 0, 1920, 1080),
+            Rect::new(3840, 0, 1920, 1040),
+        );
         engine.set_focused_output(b);
         assert!(engine.focus_monitor_toward(ScrollDirection::Right, &be));
         assert_eq!(engine.focused_output(), Some(c));
-        assert!(!engine.focus_monitor_toward(ScrollDirection::Right, &be), "no monitor further right");
+        assert!(
+            !engine.focus_monitor_toward(ScrollDirection::Right, &be),
+            "no monitor further right"
+        );
         assert_eq!(engine.focused_output(), Some(c));
         assert!(engine.focus_monitor_toward(ScrollDirection::Left, &be));
         assert!(engine.focus_monitor_toward(ScrollDirection::Left, &be));
         assert_eq!(engine.focused_output(), Some(a));
-        assert!(!engine.focus_monitor_toward(ScrollDirection::Left, &be), "no wrapping around");
+        assert!(
+            !engine.focus_monitor_toward(ScrollDirection::Left, &be),
+            "no wrapping around"
+        );
         assert_eq!(engine.focused_output(), Some(a));
     }
 
@@ -11548,13 +11807,21 @@ mod tests {
         let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
         assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2]);
         engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
-        assert_eq!(active_workspace_of(&engine, oid), 0, "nothing above the first (no wrapping)");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            0,
+            "nothing above the first (no wrapping)"
+        );
         engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
         assert_eq!(active_workspace_of(&engine, oid), 1);
         engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
         assert_eq!(active_workspace_of(&engine, oid), 2);
         engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
-        assert_eq!(active_workspace_of(&engine, oid), 2, "nothing below the empty one at the bottom");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "nothing below the empty one at the bottom"
+        );
         engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
         assert_eq!(active_workspace_of(&engine, oid), 1);
     }
@@ -11584,7 +11851,11 @@ mod tests {
         assert_eq!(engine.workspace_number_on(oid, 3), 3);
         assert_eq!(engine.workspace_id_for_number(2), 2);
         engine.focus_workspace_number(2, &be);
-        assert_eq!(active_workspace_of(&engine, oid), 2, "workspace 2 is the second one, not id 1");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "workspace 2 is the second one, not id 1"
+        );
         engine.focus_workspace_number(3, &be);
         assert_eq!(active_workspace_of(&engine, oid), 3);
         engine.focus_workspace_number(1, &be);
@@ -11603,7 +11874,11 @@ mod tests {
         engine.switch_workspace(1, &be); // an empty one in the middle, now active
         assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2, 3]);
         engine.focus_workspace_number(1, &be);
-        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3], "it vanished as the user left it");
+        assert_eq!(
+            workspace_ids_of(&engine, oid),
+            vec![0, 2, 3],
+            "it vanished as the user left it"
+        );
     }
 
     #[test]
@@ -11611,13 +11886,21 @@ mod tests {
         let be = BackendHandle::default_for_test();
         let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
         engine.focus_workspace_last_visited(&be);
-        assert_eq!(active_workspace_of(&engine, oid), 0, "nothing visited yet: nothing happens");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            0,
+            "nothing visited yet: nothing happens"
+        );
         engine.focus_workspace_number(2, &be);
         engine.focus_workspace_number(3, &be);
         engine.focus_workspace_last_visited(&be);
         assert_eq!(active_workspace_of(&engine, oid), 1);
         engine.focus_workspace_last_visited(&be);
-        assert_eq!(active_workspace_of(&engine, oid), 2, "back and forth between the last two");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "back and forth between the last two"
+        );
         engine.focus_workspace_last_visited(&be);
         assert_eq!(active_workspace_of(&engine, oid), 1);
     }
@@ -11635,9 +11918,17 @@ mod tests {
         config.input.workspace_auto_back_and_forth = true;
         engine.set_full_config(config);
         engine.focus_workspace_number(2, &be);
-        assert_eq!(active_workspace_of(&engine, oid), 0, "the second workspace again: back to the first");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            0,
+            "the second workspace again: back to the first"
+        );
         engine.focus_workspace_number(1, &be);
-        assert_eq!(active_workspace_of(&engine, oid), 1, "the first workspace again: back to the second");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            1,
+            "the first workspace again: back to the second"
+        );
         // Nothing to go back to: stays.
         let (mut fresh, foid) = engine_with_workspaces(&[0, 1]);
         let mut config = crate::config::Config::default();
@@ -11668,7 +11959,11 @@ mod tests {
         let mut engine = TilingEngine::new(LayoutConfig::default());
         engine.set_full_config(named_workspaces_config(&["web", "chat"]));
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
         assert_eq!(
             workspace_ids_of(&engine, oid),
             vec![0, 1, 2],
@@ -11701,7 +11996,11 @@ mod tests {
         engine.set_full_config(named_workspaces_config(&["web"]));
         assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1]);
         let second = OutputId::from_name("Second");
-        engine.register_monitor(second, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            second,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
         assert_eq!(workspace_ids_of(&engine, second), vec![0, 1]);
     }
 
@@ -11716,9 +12015,21 @@ mod tests {
         assert_eq!(engine.workspace_name(0).as_deref(), Some("web"));
 
         engine.move_active_workspace(1, &be);
-        assert_eq!(active_workspace_of(&engine, oid), 1, "the user stays on the workspace that moved");
-        assert_eq!(engine.float_workspace(float), Some(1), "the float went along");
-        assert_eq!(engine.workspace_name(1).as_deref(), Some("web"), "the name went along");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            1,
+            "the user stays on the workspace that moved"
+        );
+        assert_eq!(
+            engine.float_workspace(float),
+            Some(1),
+            "the float went along"
+        );
+        assert_eq!(
+            engine.workspace_name(1).as_deref(),
+            Some("web"),
+            "the name went along"
+        );
         assert_eq!(engine.workspace_name(0), None);
         assert_eq!(engine.workspace_id_by_name("web"), Some(1));
         // The window that was on the second workspace is on the first now.
@@ -11729,13 +12040,24 @@ mod tests {
         );
         // It is the second workspace now.  Moved into the empty one at the bottom it is
         // still the second: the empty one it traded places with goes away (niri).
-        assert_eq!(engine.workspace_number_on(oid, active_workspace_of(&engine, oid)), 2);
+        assert_eq!(
+            engine.workspace_number_on(oid, active_workspace_of(&engine, oid)),
+            2
+        );
         engine.move_active_workspace(1, &be);
         let active = active_workspace_of(&engine, oid);
         assert_eq!(engine.workspace_number_on(oid, active), 2);
-        assert_eq!(engine.float_workspace(float), Some(active), "the float still goes along");
+        assert_eq!(
+            engine.float_workspace(float),
+            Some(active),
+            "the float still goes along"
+        );
         assert_eq!(engine.workspace_id_by_name("web"), Some(active));
-        assert_eq!(workspace_ids_of(&engine, oid).len(), 3, "one empty workspace below the last");
+        assert_eq!(
+            workspace_ids_of(&engine, oid).len(),
+            3,
+            "one empty workspace below the last"
+        );
     }
 
     #[test]
@@ -11744,9 +12066,17 @@ mod tests {
         let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
         focus_window(&mut engine, 100);
         engine.move_focused_column_to_workspace(-1, &be);
-        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3], "nothing above the first workspace");
+        assert_eq!(
+            workspace_ids_of(&engine, oid),
+            vec![0, 2, 3],
+            "nothing above the first workspace"
+        );
         engine.move_focused_column_to_workspace(1, &be);
-        assert_eq!(active_workspace_of(&engine, oid), 2, "the next workspace below is id 2");
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "the next workspace below is id 2"
+        );
         let monitor = engine.monitors().get(&oid).unwrap();
         let on_two: Vec<isize> = monitor
             .workspaces
@@ -12194,7 +12524,10 @@ mod tests {
         let oid = engine.focused_output().unwrap();
         let m = engine.monitors().get(&oid).unwrap();
         // niri: the first window of the column on the RIGHT (101) goes under the focused one.
-        assert_eq!(column_windows(&engine, oid), vec![vec![100, 101], vec![102]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100, 101], vec![102]]
+        );
         // The focus stays where it was.
         assert_eq!(m.focus_window, Some(WindowId::new(100)));
         assert_eq!(m.focus_column, Some(0));
@@ -12268,9 +12601,16 @@ mod tests {
         }
         focus_window(&mut engine, 100);
         engine.expel_window_from_column(&BackendHandle::default_for_test());
-        assert_eq!(column_windows(&engine, oid), vec![vec![100, 101], vec![102]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100, 101], vec![102]]
+        );
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!(m.focus_window, Some(WindowId::new(100)), "the focus did not move");
+        assert_eq!(
+            m.focus_window,
+            Some(WindowId::new(100)),
+            "the focus did not move"
+        );
     }
 
     #[test]
@@ -12306,9 +12646,15 @@ mod tests {
         focus_window(&mut engine, 101);
 
         engine.consume_or_expel_window_left(&be);
-        assert_eq!(column_windows(&engine, oid), vec![vec![100, 101], vec![102]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100, 101], vec![102]]
+        );
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!((m.focus_column, m.focus_window), (Some(0), Some(WindowId::new(101))));
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(0), Some(WindowId::new(101)))
+        );
 
         // Now it shares a column: it is expelled again, to the right this time.
         engine.consume_or_expel_window_right(&be);
@@ -12317,18 +12663,33 @@ mod tests {
             vec![vec![100], vec![101], vec![102]]
         );
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!((m.focus_column, m.focus_window), (Some(1), Some(WindowId::new(101))));
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(1), Some(WindowId::new(101)))
+        );
 
         // Right into the last column, and no further.
         focus_window(&mut engine, 101);
         engine.consume_or_expel_window_right(&be);
-        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102, 101]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102, 101]]
+        );
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!((m.focus_column, m.focus_window), (Some(1), Some(WindowId::new(101))));
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(1), Some(WindowId::new(101)))
+        );
         engine.consume_or_expel_window_right(&be); // shares a column: expelled to the right
-        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102], vec![101]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![101]]
+        );
         engine.consume_or_expel_window_right(&be); // alone in the last column: nothing
-        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102], vec![101]]);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![101]]
+        );
     }
 
     #[test]
@@ -12360,7 +12721,11 @@ mod tests {
         engine.move_window_in_column(-1, &be);
         assert_eq!(column_windows(&engine, oid), vec![vec![101, 100, 102]]);
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!(m.focus_window, Some(WindowId::new(101)), "the moved window keeps the focus");
+        assert_eq!(
+            m.focus_window,
+            Some(WindowId::new(101)),
+            "the moved window keeps the focus"
+        );
         engine.move_window_in_column(-1, &be); // at the top already
         assert_eq!(column_windows(&engine, oid), vec![vec![101, 100, 102]]);
         engine.move_window_in_column(1, &be);
@@ -12379,10 +12744,16 @@ mod tests {
 
         assert_eq!(engine.focus_column_first(&be), Some(WindowId::new(100)));
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!((m.focus_column, m.focus_window), (Some(0), Some(WindowId::new(100))));
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(0), Some(WindowId::new(100)))
+        );
         assert_eq!(engine.focus_column_last(&be), Some(WindowId::new(103)));
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!((m.focus_column, m.focus_window), (Some(3), Some(WindowId::new(103))));
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(3), Some(WindowId::new(103)))
+        );
 
         focus_window(&mut engine, 101);
         engine.move_column_to_edge(true, &be);
@@ -12391,14 +12762,20 @@ mod tests {
             vec![vec![100], vec![102], vec![103], vec![101]]
         );
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!((m.focus_column, m.focus_window), (Some(3), Some(WindowId::new(101))));
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(3), Some(WindowId::new(101)))
+        );
         engine.move_column_to_edge(false, &be);
         assert_eq!(
             column_windows(&engine, oid),
             vec![vec![101], vec![100], vec![102], vec![103]]
         );
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!((m.focus_column, m.focus_window), (Some(0), Some(WindowId::new(101))));
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(0), Some(WindowId::new(101)))
+        );
         engine.move_column_to_edge(false, &be); // already first
         assert_eq!(
             column_windows(&engine, oid),
@@ -12439,7 +12816,14 @@ mod tests {
 
     fn strip_scroll(engine: &TilingEngine) -> i32 {
         let oid = engine.focused_output().unwrap();
-        engine.monitors().get(&oid).unwrap().workspace().unwrap().scroll_offset.x
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .scroll_offset
+            .x
     }
 
     #[test]
@@ -12454,7 +12838,11 @@ mod tests {
         // 1920 + 16 - 3 * (500 + 16) = 388 more: the three columns that are off screen
         // do not take room away (they used to: the width came out as the 50 px minimum).
         assert_eq!(column_width_of(&engine, 1), Some(888));
-        assert_eq!(column_width_of(&engine, 0), Some(500), "the others are not resized");
+        assert_eq!(
+            column_width_of(&engine, 0),
+            Some(500),
+            "the others are not resized"
+        );
         assert_eq!(strip_scroll(&engine), 0);
 
         // Scrolled by 300 px the first column is cut off; the next three are in view and
@@ -12484,16 +12872,32 @@ mod tests {
         focus_window(&mut engine, 100);
         engine.expand_column_to_available(&be);
         let oid = engine.focused_output().unwrap();
-        let col = &engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0];
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
         assert!(col.maximized, "like niri: only this column is in view");
         assert_eq!(col.width, Some(1920));
         // Pressed again nothing happens (maximize-column is the way back).
         engine.expand_column_to_available(&be);
-        let col = &engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0];
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
         assert!(col.maximized);
         assert_eq!(col.width, Some(1920));
         engine.toggle_maximize_focused_column(&be);
-        assert_eq!(column_width_of(&engine, 0), Some(500), "back to the width it had");
+        assert_eq!(
+            column_width_of(&engine, 0),
+            Some(500),
+            "back to the width it had"
+        );
     }
 
     // ---- Maximize column ----
@@ -12565,15 +12969,27 @@ mod tests {
         // previous one too closely.
         std::thread::sleep(std::time::Duration::from_millis(25));
         engine.toggle_maximize_focused_column(&be);
-        assert_eq!(width_of(&engine, 1), Some(1920), "as wide as the view (1920 px, no gaps)");
-        assert_eq!(width_of(&engine, 0), other_before, "the other column is untouched");
+        assert_eq!(
+            width_of(&engine, 1),
+            Some(1920),
+            "as wide as the view (1920 px, no gaps)"
+        );
+        assert_eq!(
+            width_of(&engine, 0),
+            other_before,
+            "the other column is untouched"
+        );
         let rect = engine.applied_state.get(&WindowId::new(101)).unwrap().rect;
         assert!(rect.size.w >= 1900, "the window got the width: {:?}", rect);
 
         // The configure throttle (16 ms) would hide the second layout pass.
         std::thread::sleep(std::time::Duration::from_millis(25));
         engine.toggle_maximize_focused_column(&be);
-        assert_eq!(width_of(&engine, 1), before, "toggling again restores the width");
+        assert_eq!(
+            width_of(&engine, 1),
+            before,
+            "toggling again restores the width"
+        );
         let rect = engine.applied_state.get(&WindowId::new(101)).unwrap().rect;
         assert!(rect.size.w < 600, "{:?}", rect);
     }
@@ -13333,7 +13749,10 @@ mod tests {
         engine.move_focused_column_to_workspace(-1, &BackendHandle::default_for_test());
 
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!(m.active_workspace, 0, "focus relocates to the workspace above");
+        assert_eq!(
+            m.active_workspace, 0,
+            "focus relocates to the workspace above"
+        );
         let dst = m.workspaces.get(&0).expect("ws 0 exists");
         assert_eq!(dst.columns.len(), 2);
         assert_eq!(dst.columns[1].tiles[0].window_id, WindowId::new(200));
@@ -14462,8 +14881,16 @@ mod tests {
         let rescued = restorable_bounds(parked, &work, 0);
         assert_eq!(rescued.size.w, 445);
         assert_eq!(rescued.size.h, 509); // capped at 70% of the 728 px work area
-        assert!(rescued.loc.y >= 0 && rescued.bottom() <= 728, "{:?}", rescued);
-        assert!(rescued.loc.x >= 0 && rescued.right() <= 1366, "{:?}", rescued);
+        assert!(
+            rescued.loc.y >= 0 && rescued.bottom() <= 728,
+            "{:?}",
+            rescued
+        );
+        assert!(
+            rescued.loc.x >= 0 && rescued.right() <= 1366,
+            "{:?}",
+            rescued
+        );
         // A sliver of a few pixels does not count as visible.
         let sliver = Rect::new(-510, 100, 520, 380);
         assert_ne!(restorable_bounds(sliver, &work, 0), sliver);
@@ -14478,9 +14905,19 @@ mod tests {
         let first = restorable_bounds(parked, &work, 0);
         let second = restorable_bounds(parked, &work, 1);
         let third = restorable_bounds(parked, &work, 2);
-        assert_eq!(first.loc.x, (1366 - first.size.w as i32) / 2, "the first one is centred");
-        assert_eq!((second.loc.x - first.loc.x, second.loc.y - first.loc.y), (32, 32));
-        assert_eq!((third.loc.x - second.loc.x, third.loc.y - second.loc.y), (32, 32));
+        assert_eq!(
+            first.loc.x,
+            (1366 - first.size.w as i32) / 2,
+            "the first one is centred"
+        );
+        assert_eq!(
+            (second.loc.x - first.loc.x, second.loc.y - first.loc.y),
+            (32, 32)
+        );
+        assert_eq!(
+            (third.loc.x - second.loc.x, third.loc.y - second.loc.y),
+            (32, 32)
+        );
         assert_eq!(second.size, first.size, "they keep their size");
         // However many there are, every one stays on the work area.
         for nth in 0..40 {
@@ -14607,7 +15044,10 @@ mod tests {
         );
         assert_eq!(widths[1], 600);
         assert_eq!(widths[2], 300);
-        assert!(widths[0] >= 100, "the rest is not squeezed out of existence");
+        assert!(
+            widths[0] >= 100,
+            "the rest is not squeezed out of existence"
+        );
     }
 
     #[test]
@@ -14620,7 +15060,11 @@ mod tests {
         let work = Rect::new(8, 8, 1904, 1024);
         let rects = |engine: &TilingEngine| -> HashMap<isize, Rect> {
             let out = engine.monitors.focused_id().unwrap();
-            let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
+            let ws = engine
+                .monitors
+                .get(&out)
+                .and_then(|m| m.workspace())
+                .unwrap();
             engine
                 .calculate_positions(ws, work, &engine.config)
                 .into_iter()
@@ -14633,8 +15077,15 @@ mod tests {
         assert!(engine.note_window_min_width(WindowId::new(5002), 700));
         let after = rects(&engine);
         let border = 2 * engine.config.border_width.max(1);
-        assert_eq!(after[&5001], before[&5001], "the column before it does not move");
-        assert_eq!(after[&5002].size.w, (700 + border) as u32, "the window plus its border");
+        assert_eq!(
+            after[&5001], before[&5001],
+            "the column before it does not move"
+        );
+        assert_eq!(
+            after[&5002].size.w,
+            (700 + border) as u32,
+            "the window plus its border"
+        );
         assert_eq!(
             after[&5003].loc.x,
             before[&5003].loc.x + 200 + border,
@@ -14648,7 +15099,10 @@ mod tests {
         );
 
         // The limit goes away again.
-        assert!(!engine.note_window_min_width(WindowId::new(5002), 700), "no change");
+        assert!(
+            !engine.note_window_min_width(WindowId::new(5002), 700),
+            "no change"
+        );
         assert!(engine.note_window_min_width(WindowId::new(5002), 0));
         assert_eq!(rects(&engine), before);
         assert!(!engine.note_window_min_width(WindowId::new(5002), 0));
@@ -14671,14 +15125,22 @@ mod tests {
             .columns[0]
             .set_width(Some(400));
         engine.note_window_min_width(WindowId::new(5031), 650);
-        let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
+        let ws = engine
+            .monitors
+            .get(&out)
+            .and_then(|m| m.workspace())
+            .unwrap();
         assert_eq!(ws.columns[0].width, Some(400));
         let tile_width = 650 + 2 * engine.config.border_width.max(1);
         assert_eq!(ws.columns[0].resolved_width(500), tile_width);
         let positions = engine.calculate_positions(ws, Rect::new(8, 8, 1904, 1024), &engine.config);
         assert_eq!(positions[0].1.size.w, tile_width as u32);
         engine.note_window_min_width(WindowId::new(5031), 0);
-        let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
+        let ws = engine
+            .monitors
+            .get(&out)
+            .and_then(|m| m.workspace())
+            .unwrap();
         assert_eq!(ws.columns[0].resolved_width(500), 400);
     }
 
@@ -14706,7 +15168,11 @@ mod tests {
         assert_eq!(tile_min(&engine, 5011), Some(minimum));
         // Floated (no tile) and tiled again.
         engine.toggle_floating_for(WindowId::new(5011), &be);
-        assert_eq!(tile_min(&engine, 5011), None, "a floating window has no tile");
+        assert_eq!(
+            tile_min(&engine, 5011),
+            None,
+            "a floating window has no tile"
+        );
         engine.toggle_floating_for(WindowId::new(5011), &be);
         assert_eq!(tile_min(&engine, 5011), Some(minimum));
     }
@@ -14721,7 +15187,10 @@ mod tests {
         engine.remove_window(WindowId::new(5021), &be);
         engine.add_window(make_window(5021, 10, 10), &be);
         assert_eq!(tile_min(&engine, 5021), Some(0));
-        assert!(engine.min_width_query_wanted(WindowId::new(5021)), "asked afresh");
+        assert!(
+            engine.min_width_query_wanted(WindowId::new(5021)),
+            "asked afresh"
+        );
     }
 
     #[test]
@@ -14729,7 +15198,10 @@ mod tests {
         let mut engine = make_engine();
         let be = BackendHandle::default_for_test();
         let id = WindowId::new(5041);
-        assert!(!engine.min_width_query_wanted(id), "not managed: nothing to ask");
+        assert!(
+            !engine.min_width_query_wanted(id),
+            "not managed: nothing to ask"
+        );
         engine.add_window(make_window(5041, 10, 10), &be);
         assert!(engine.min_width_query_wanted(id));
         // Asked once when it opened, and again twice when it took the focus: no answer.
@@ -14737,7 +15209,10 @@ mod tests {
             assert!(engine.min_width_query_wanted(id));
             assert!(!engine.note_min_width_answer(id, None));
         }
-        assert!(!engine.min_width_query_wanted(id), "three tries are all it gets");
+        assert!(
+            !engine.min_width_query_wanted(id),
+            "three tries are all it gets"
+        );
         // An answer ends the asking, and a limit above the layout's own changes the layout.
         engine.add_window(make_window(5042, 10, 10), &be);
         let other = WindowId::new(5042);
@@ -14766,21 +15241,44 @@ mod tests {
         for hwnd in [5051, 5052, 5053] {
             let id = WindowId::new(hwnd);
             engine.add_window(make_window(hwnd, 0, 0), &be);
-            assert!(!engine.note_min_width_answer(id, None), "not ready on admission");
-            assert!(engine.min_width_query_wanted(id), "a native readiness hint may retry");
+            assert!(
+                !engine.note_min_width_answer(id, None),
+                "not ready on admission"
+            );
+            assert!(
+                engine.min_width_query_wanted(id),
+                "a native readiness hint may retry"
+            );
             assert!(engine.note_min_width_answer(id, Some(466)));
-            assert!(!engine.note_min_width_answer(id, Some(466)), "no duplicate relayout");
-            assert!(!engine.min_width_query_wanted(id), "a successful answer ends retries");
+            assert!(
+                !engine.note_min_width_answer(id, Some(466)),
+                "no duplicate relayout"
+            );
+            assert!(
+                !engine.min_width_query_wanted(id),
+                "a successful answer ends retries"
+            );
             assert_eq!(tile_min(&engine, hwnd), Some(474));
         }
-        let ws = engine.monitors.get(&output).and_then(|m| m.workspace()).unwrap();
+        let ws = engine
+            .monitors
+            .get(&output)
+            .and_then(|m| m.workspace())
+            .unwrap();
         let positions = engine.calculate_positions(ws, work, &engine.config);
         assert_eq!(positions.len(), 3);
         for (_, rect) in &positions {
-            assert_eq!(rect.size.w - 8, 466, "placement leaves the native visible minimum");
+            assert_eq!(
+                rect.size.w - 8,
+                466,
+                "placement leaves the native visible minimum"
+            );
         }
         for pair in positions.windows(2) {
-            assert!(pair[0].1.right() + 24 <= pair[1].1.loc.x, "tiles scroll, never overlap");
+            assert!(
+                pair[0].1.right() + 24 <= pair[1].1.loc.x,
+                "tiles scroll, never overlap"
+            );
         }
         assert!(positions[2].1.right() - positions[0].1.loc.x > work.size.w as i32);
     }
@@ -14791,7 +15289,13 @@ mod tests {
         let be = BackendHandle::default_for_test();
         let id = WindowId::new(5061);
         engine.add_window(make_window(5061, 0, 0), &be);
-        engine.rule_limits.insert(id, rules::RuleLimits { min_width: 800, ..Default::default() });
+        engine.rule_limits.insert(
+            id,
+            rules::RuleLimits {
+                min_width: 800,
+                ..Default::default()
+            },
+        );
         engine.note_window_min_width(id, 650);
         let border = 2 * engine.config.border_width.max(1) as u32;
         assert_eq!(tile_min(&engine, 5061), Some(800 + border));
@@ -14855,7 +15359,12 @@ mod tests {
         // that is left.
         for hwnd in [101, 201, 202] {
             assert!(engine.tiled_windows().contains_key(&WindowId::new(hwnd)));
-            assert_eq!(where_is(&engine, hwnd).map(|w| w.0), Some(a), "window {}", hwnd);
+            assert_eq!(
+                where_is(&engine, hwnd).map(|w| w.0),
+                Some(a),
+                "window {}",
+                hwnd
+            );
         }
         // Its own window did not move.  The unplugged monitor's windows have a workspace of
         // their own below it, in their old order, and the empty workspace is below that.
@@ -14866,8 +15375,15 @@ mod tests {
         assert!(ws_first > ws_own);
         assert_eq!(ws_first, ws_second, "they stay together");
         assert_eq!((col_first, col_second), (0, 1), "in their old order");
-        assert_eq!(workspace_ids_of(&engine, a), vec![0, ws_first, ws_first + 1]);
-        assert_eq!(active_workspace_of(&engine, a), 0, "the user's workspace did not change");
+        assert_eq!(
+            workspace_ids_of(&engine, a),
+            vec![0, ws_first, ws_first + 1]
+        );
+        assert_eq!(
+            active_workspace_of(&engine, a),
+            0,
+            "the user's workspace did not change"
+        );
     }
 
     #[test]
@@ -14891,7 +15407,11 @@ mod tests {
         assert_eq!(where_is(&engine, 201), Some((b, 0, 0)));
         assert_eq!(where_is(&engine, 202), Some((b, 0, 1)));
         let restored = engine.monitors().get(&b).unwrap();
-        assert_eq!(restored.work_area, Rect::new(1920, 0, 2560, 1400), "the new screen");
+        assert_eq!(
+            restored.work_area,
+            Rect::new(1920, 0, 2560, 1400),
+            "the new screen"
+        );
         assert_eq!(
             restored.workspace().unwrap().columns[1].width,
             Some(700),
@@ -14926,7 +15446,11 @@ mod tests {
 
         plug_b_in_again(&mut engine, b);
 
-        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)), "still where it was put: back");
+        assert_eq!(
+            where_is(&engine, 201),
+            Some((b, 0, 0)),
+            "still where it was put: back"
+        );
         assert_eq!(where_is(&engine, 202), None, "closed: gone");
         assert!(!engine.tiled_windows().contains_key(&WindowId::new(202)));
         assert_eq!(
@@ -14951,7 +15475,10 @@ mod tests {
         engine.unregister_monitor(&b);
         let (home_output, home_workspace) = engine.float_location(float).unwrap();
         assert_eq!(home_output, a, "it floats on the monitor that is left");
-        assert_ne!(home_workspace, 0, "on the workspace the unplugged monitor's windows went to");
+        assert_ne!(
+            home_workspace, 0,
+            "on the workspace the unplugged monitor's windows went to"
+        );
         let on_a = engine.float_rect_of(float).unwrap();
         let work_a = engine.monitors().get(&a).unwrap().work_area;
         assert!(
@@ -14967,10 +15494,18 @@ mod tests {
         );
 
         plug_b_in_again(&mut engine, b);
-        assert_eq!(engine.float_location(float), Some((b, 0)), "back on its own monitor");
+        assert_eq!(
+            engine.float_location(float),
+            Some((b, 0)),
+            "back on its own monitor"
+        );
         let back = engine.float_rect_of(float).unwrap();
         let work_b = engine.monitors().get(&b).unwrap().work_area;
-        assert!(back.loc.x >= work_b.loc.x && back.right() <= work_b.right(), "{:?}", back);
+        assert!(
+            back.loc.x >= work_b.loc.x && back.right() <= work_b.right(),
+            "{:?}",
+            back
+        );
         assert_eq!(back.size, on_b.size, "its size is what it was");
     }
 
@@ -14988,7 +15523,10 @@ mod tests {
         let moved = engine.minimized.get(&window).unwrap();
         assert_eq!(moved.output, a);
         let (_, workspace_of_402, _) = where_is(&engine, 402).unwrap();
-        assert_eq!(moved.workspace, workspace_of_402, "next to the window it shared a strip with");
+        assert_eq!(
+            moved.workspace, workspace_of_402,
+            "next to the window it shared a strip with"
+        );
 
         plug_b_in_again(&mut engine, b);
         let back = engine.minimized.get(&window).unwrap();
@@ -15017,10 +15555,18 @@ mod tests {
         // Both windows are on A's "mail" workspace now, B's after A's.
         assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
         assert_eq!(where_is(&engine, 201), Some((a, 0, 1)));
-        assert_eq!(workspace_ids_of(&engine, a), vec![0, 1], "no workspace was added");
+        assert_eq!(
+            workspace_ids_of(&engine, a),
+            vec![0, 1],
+            "no workspace was added"
+        );
 
         plug_b_in_again(&mut engine, b);
-        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)), "back on B's own \"mail\"");
+        assert_eq!(
+            where_is(&engine, 201),
+            Some((b, 0, 0)),
+            "back on B's own \"mail\""
+        );
         assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
         assert_eq!(workspace_ids_of(&engine, a), vec![0, 1]);
         assert_eq!(workspace_ids_of(&engine, b), vec![0, 1]);
@@ -15030,7 +15576,10 @@ mod tests {
     fn test_the_last_monitor_going_loses_nothing() {
         let mut engine = make_engine();
         let a = engine.focused_output().unwrap();
-        engine.add_window(make_window(101, 100, 100), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(101, 100, 100),
+            &BackendHandle::default_for_test(),
+        );
 
         engine.unregister_monitor(&a);
         assert!(engine.monitors().is_empty());
@@ -15044,12 +15593,23 @@ mod tests {
         engine.register_monitor(c, Rect::new(0, 0, 1280, 800), Rect::new(0, 0, 1280, 760));
         let (output, workspace, _) = where_is(&engine, 101).expect("adopted by the new monitor");
         assert_eq!(output, c);
-        assert_ne!(workspace, 0, "on a workspace of its own below the new monitor's");
+        assert_ne!(
+            workspace, 0,
+            "on a workspace of its own below the new monitor's"
+        );
 
         // The old one comes back: the window goes back to it.
-        engine.register_monitor(a, Rect::new(1280, 0, 1920, 1080), Rect::new(1280, 0, 1920, 1040));
+        engine.register_monitor(
+            a,
+            Rect::new(1280, 0, 1920, 1080),
+            Rect::new(1280, 0, 1920, 1040),
+        );
         assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
-        assert_eq!(workspace_ids_of(&engine, c), vec![0], "the new monitor is as it was: one empty workspace");
+        assert_eq!(
+            workspace_ids_of(&engine, c),
+            vec![0],
+            "the new monitor is as it was: one empty workspace"
+        );
     }
 
     #[test]
@@ -15058,8 +15618,14 @@ mod tests {
         // display that blinks off and on again).
         let mut engine = make_engine();
         let a = engine.focused_output().unwrap();
-        engine.add_window(make_window(101, 100, 100), &BackendHandle::default_for_test());
-        engine.add_window(make_window(102, 100, 100), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(101, 100, 100),
+            &BackendHandle::default_for_test(),
+        );
+        engine.add_window(
+            make_window(102, 100, 100),
+            &BackendHandle::default_for_test(),
+        );
         engine.unregister_monitor(&a);
         engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
         assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
@@ -15272,7 +15838,10 @@ mod tests {
         );
 
         // Windows wiri does not manage are ignored.
-        assert_eq!(engine.sync_os_foreground(WindowId::new(555), &backend), None);
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(555), &backend),
+            None
+        );
         assert_eq!(engine.last_activated, Some(WindowId::new(100)));
     }
 
@@ -15288,9 +15857,15 @@ mod tests {
         let oid = engine.focused_output().unwrap();
 
         engine.switch_workspace(1, &backend);
-        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 1);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            1
+        );
 
-        assert_eq!(engine.sync_os_foreground(WindowId::new(101), &backend), None);
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(101), &backend),
+            None
+        );
         assert_eq!(
             engine.monitors().get(&oid).unwrap().active_workspace_id(),
             1,
@@ -15299,7 +15874,10 @@ mod tests {
 
         // Coming back shows the windows again; now their reports are welcome.
         engine.switch_workspace(0, &backend);
-        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 0);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            0
+        );
         assert_eq!(
             engine.sync_os_foreground(WindowId::new(100), &backend),
             Some((0, 0))
@@ -15317,14 +15895,24 @@ mod tests {
         let oid = engine.focused_output().unwrap();
         engine.apply_all(&backend);
         // Move the engine to workspace 1 without wiri hiding anything.
-        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(1);
-        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 1);
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .switch_workspace(1);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            1
+        );
 
         assert_eq!(
             engine.sync_os_foreground(WindowId::new(100), &backend),
             Some((0, 0))
         );
-        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace_id(), 0);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            0
+        );
     }
 
     #[test]

@@ -868,7 +868,10 @@ impl BackendHandle {
             // 3. Injected input lifts the foreground lock for this process.
             nudge_foreground_lock();
             if SetForegroundWindow(hwnd_win).as_bool() {
-                debug!("activate_window: input nudge + SetForegroundWindow OK hwnd={}", hwnd);
+                debug!(
+                    "activate_window: input nudge + SetForegroundWindow OK hwnd={}",
+                    hwnd
+                );
                 return Ok(());
             }
 

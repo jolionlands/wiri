@@ -217,7 +217,9 @@ pub fn guide() -> SnapGuide {
 
 /// Hide without allocating a guide window/thread for a drag that never snapped.
 pub fn hide_if_created() {
-    if let Some(guide) = GLOBAL_GUIDE.lock().as_ref() { guide.hide(); }
+    if let Some(guide) = GLOBAL_GUIDE.lock().as_ref() {
+        guide.hide();
+    }
 }
 
 // ---------------------------------------------------------------------------

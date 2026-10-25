@@ -211,9 +211,9 @@ mod win {
     };
     use windows::Win32::Graphics::Gdi::CreateSolidBrush;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, MSG,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
         RegisterClassExW, SetLayeredWindowAttributes, SetWindowPos, ShowWindowAsync,
-        TranslateMessage, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, LWA_ALPHA, SM_CXSCREEN,
+        TranslateMessage, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, LWA_ALPHA, MSG, SM_CXSCREEN,
         SM_CYSCREEN, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSEXW,
         WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
         WS_POPUP,
@@ -428,11 +428,8 @@ mod win {
         };
         // Topmost layered host.  WS_EX_TRANSPARENT lets mouse events pass through so the
         // engine's own overview hit-testing keeps working.
-        let ex_style = WS_EX_LAYERED
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_TRANSPARENT;
+        let ex_style =
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
         let hwnd = match CreateWindowExW(
             ex_style,
             PCWSTR(class_name.as_ptr()),

@@ -56,8 +56,7 @@ fn non_empty(text: &str) -> Option<String> {
 pub fn of_window(hwnd: isize) -> Option<String> {
     ensure_com();
     unsafe {
-        let store: IPropertyStore =
-            SHGetPropertyStoreForWindow(HWND(hwnd as *mut c_void)).ok()?;
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(HWND(hwnd as *mut c_void)).ok()?;
         let value = store.GetValue(&PKEY_APP_USER_MODEL_ID).ok()?;
         non_empty(&value.to_string())
     }
@@ -76,5 +75,4 @@ mod tests {
             Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string())
         );
     }
-
 }

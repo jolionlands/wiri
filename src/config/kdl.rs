@@ -51,7 +51,10 @@ impl fmt::Display for Pos {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
     /// A string.  `quoted` is false for a bare word (`hide-method hide`).
-    Str { text: String, quoted: bool },
+    Str {
+        text: String,
+        quoted: bool,
+    },
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -207,15 +210,8 @@ fn is_newline(c: char) -> bool {
 fn is_ws(c: char) -> bool {
     matches!(
         c,
-        '\t' | ' '
-            | '\u{000B}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
+        '\t' | ' ' | '\u{000B}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
     )
 }
 
@@ -225,7 +221,10 @@ fn is_ws(c: char) -> bool {
 fn is_word_char(c: char) -> bool {
     !is_ws(c)
         && !is_newline(c)
-        && !matches!(c, '\\' | '(' | ')' | '{' | '}' | ';' | '[' | ']' | '"' | '=')
+        && !matches!(
+            c,
+            '\\' | '(' | ')' | '{' | '}' | ';' | '[' | ']' | '"' | '='
+        )
 }
 
 enum ArgOrProp {
@@ -975,7 +974,10 @@ impl Parser {
                     let esc = match self.bump() {
                         Some(e) => e,
                         None => {
-                            return Self::err_at(start, "this string is never closed (missing '\"')")
+                            return Self::err_at(
+                                start,
+                                "this string is never closed (missing '\"')",
+                            )
                         }
                     };
                     match esc {
@@ -1033,9 +1035,7 @@ impl Parser {
             match self.bump() {
                 Some('}') => break,
                 Some(c) if c.is_ascii_hexdigit() && digits.len() < 6 => digits.push(c),
-                _ => {
-                    return Self::err_at(at, "\\u{...} takes one to six hexadecimal digits")
-                }
+                _ => return Self::err_at(at, "\\u{...} takes one to six hexadecimal digits"),
             }
         }
         if digits.is_empty() {
@@ -1060,9 +1060,15 @@ fn word_to_value(word: Word, ty: Option<String>, pos: Pos) -> Value {
 
 fn unexpected_message(c: char, wanted: &str) -> String {
     match c {
-        '{' => format!("expected {}, found '{{' (a children block needs a node before it)", wanted),
+        '{' => format!(
+            "expected {}, found '{{' (a children block needs a node before it)",
+            wanted
+        ),
         '}' => format!("expected {}, found '}}'", wanted),
-        '=' => format!("expected {}, found '=' (a property needs a name before the '=')", wanted),
+        '=' => format!(
+            "expected {}, found '=' (a property needs a name before the '=')",
+            wanted
+        ),
         ')' | '(' | '[' | ']' => format!("expected {}, found '{}'", wanted, c),
         '\\' => format!(
             "expected {}, found '\\' (use a quoted string with \\\\ or a raw string r\"...\")",
@@ -1209,7 +1215,8 @@ mod tests {
 
     #[test]
     fn quoted_string_escapes() {
-        let d = doc(r#"a "tab\there" "nl\nx" "q\"q" "bs\\" "slash\/" "sp\s" "u\u{1F600}" "bf\b\f" "#);
+        let d =
+            doc(r#"a "tab\there" "nl\nx" "q\"q" "bs\\" "slash\/" "sp\s" "u\u{1F600}" "bf\b\f" "#);
         let a = &d.nodes[0];
         assert_eq!(a.args[0].as_str(), Some("tab\there"));
         assert_eq!(a.args[1].as_str(), Some("nl\nx"));
@@ -1335,7 +1342,13 @@ mod tests {
         let names: Vec<&str> = d.nodes.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["Ctrl+Alt+Left", "Mod+Shift+Bracket_Left", "Ctrl+Alt+,", "Mod+1", "F5"]
+            vec![
+                "Ctrl+Alt+Left",
+                "Mod+Shift+Bracket_Left",
+                "Ctrl+Alt+,",
+                "Mod+1",
+                "F5"
+            ]
         );
         assert_eq!(d.nodes[0].args[0].scalar, bare("focus-column-left"));
         // A slash is part of a word unless it starts a comment.
@@ -1364,13 +1377,24 @@ mod tests {
         assert_eq!(kids.len(), 3);
         assert_eq!(kids[0].name, "Mod+T");
         assert_eq!(
-            kids[0].prop("hotkey-overlay-title").and_then(|v| v.as_str()),
+            kids[0]
+                .prop("hotkey-overlay-title")
+                .and_then(|v| v.as_str()),
             Some("Open a Terminal: alacritty")
         );
         assert_eq!(kids[0].kids()[0].name, "spawn");
-        assert_eq!(kids[1].prop("repeat").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(kids[1].prop("cooldown-ms").and_then(|v| v.as_i64()), Some(150));
-        assert_eq!(kids[2].kids()[0].args[0].as_str(), Some("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"));
+        assert_eq!(
+            kids[1].prop("repeat").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            kids[1].prop("cooldown-ms").and_then(|v| v.as_i64()),
+            Some(150)
+        );
+        assert_eq!(
+            kids[2].kids()[0].args[0].as_str(),
+            Some("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
+        );
     }
 
     #[test]
@@ -1381,9 +1405,15 @@ mod tests {
         let rule = &d.nodes[0];
         let kids = rule.kids();
         assert_eq!(kids[0].name, "match");
-        assert_eq!(kids[0].prop("app-id").and_then(|v| v.as_str()), Some("firefox$"));
+        assert_eq!(
+            kids[0].prop("app-id").and_then(|v| v.as_str()),
+            Some("firefox$")
+        );
         assert_eq!(kids[1].name, "exclude");
-        assert_eq!(kids[1].prop("is-active").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            kids[1].prop("is-active").and_then(|v| v.as_bool()),
+            Some(false)
+        );
         assert_eq!(kids[3].kids()[0].args[0].as_f64(), Some(0.5));
     }
 
@@ -1442,7 +1472,11 @@ mod tests {
         assert_eq!(e.pos, Pos { line: 1, col: 3 });
         assert!(e.message.contains("never closed"), "{}", e);
         let e = err("a { b } c");
-        assert!(e.message.contains("nothing can follow") || e.message.contains("expected"), "{}", e);
+        assert!(
+            e.message.contains("nothing can follow") || e.message.contains("expected"),
+            "{}",
+            e
+        );
         let e = err("a =");
         assert!(e.message.contains("expected a value"), "{}", e);
         let e = err("a b=");
@@ -1496,7 +1530,16 @@ mod tests {
         let text = "version \"1.0\"\ninput {\n    keyboard {\n        layout \"us\"\n        repeat-delay 250        // ms\n    }\n    focus-follows-mouse\n}\nlayout {\n    gaps 16\n    border { width 4; active-color \"#ffc87f\"; }\n    preset-column-widths {\n        proportion 0.33333\n        fixed 1920\n    }\n}\nspawn-at-startup \"wt.exe\" \"-d\" \"C:\\Users\\me\"\nworkspace \"web\"\n";
         let d = doc(text);
         let names: Vec<&str> = d.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert_eq!(names, vec!["version", "input", "layout", "spawn-at-startup", "workspace"]);
+        assert_eq!(
+            names,
+            vec![
+                "version",
+                "input",
+                "layout",
+                "spawn-at-startup",
+                "workspace"
+            ]
+        );
         assert_eq!(d.nodes[3].args[2].as_str(), Some(r"C:\Users\me"));
     }
 }
