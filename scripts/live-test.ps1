@@ -185,6 +185,12 @@ public static class LT {
     SetWindowPos(h, IntPtr.Zero, r.L, r.T, r.R - r.L, r.B - r.T, 0x0020 | 0x0004 | 0x0010);
   }
   [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetLongValue(IntPtr h, int index);
+  // Intentional click-through frame hosts are not accidental application windows.
+  // A matching class alone is insufficient: a focusable or opaque host still fails.
+  public static bool IsPassiveDecoration(IntPtr h) {
+    int style = GetLongValue(h, -20);
+    return Class(h) == "WiriDecor" && (style & 0x080800A0) == 0x080800A0 && (style & 0x00040000) == 0;
+  }
   [DllImport("user32.dll")] static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
   // The alpha (0 to 255) the window is drawn with: 255 for a window that is not layered, -1 when it cannot be read.
   public static int Alpha(IntPtr h) {
@@ -534,7 +540,7 @@ $topBefore = [LT]::TopLevel()
 $w = Start-Wiri $log1 (Join-Path $D 'wiri.stdout.log')
 Start-Sleep -Seconds 4
 $steps.Add([pscustomobject]@{ step = 'start'; args = "pid $($w.Id)"; rc = $(if ($w.HasExited) { $w.ExitCode } else { 'running' }); bytes = 0 })
-$wiriNewWindows = @(NewTopLevel $topBefore | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Pid($_) -eq $w.Id) }).Count
+$wiriNewWindows = @(NewTopLevel $topBefore | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Pid($_) -eq $w.Id) -and (-not [LT]::IsPassiveDecoration($_)) }).Count
 # A console-subsystem wiri.exe opens a console window (a Windows Terminal window here) the moment it starts.
 $wiriNewConsole = @(NewTopLevel $topBefore | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindowClass') }).Count
 Ctl '01-state' @('state') | Out-Null
@@ -2910,6 +2916,7 @@ $summary = [ordered]@{
     h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
     steps = $steps
 }
+. (Join-Path $PSScriptRoot 'live-phases\lane-a.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.

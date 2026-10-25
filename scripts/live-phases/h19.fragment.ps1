@@ -78,10 +78,10 @@ binds {
     H19Toggle 'h19-open'
     $h19Host = H19Wait $true
     $h19Rect = H19Rect $h19Host
-    $summary.h19_zoomed_multiple_workspaces = ($h19Host -ne [IntPtr]::Zero -and (H19Prop $h19Host 'WorkspaceCount') -ge 2 -and (H19Prop $h19Host 'ThumbnailCount') -ge 3 -and $h19Rect[2] -gt 0 -and $h19Rect[2] -lt ($h19Before.Right-$h19Before.Left))
+    $summary.h19_zoomed_multiple_workspaces = ($h19Host -ne [IntPtr]::Zero -and (H19Prop $h19Host 'WorkspaceCount') -ge 2 -and (H19Prop $h19Host 'ThumbnailCount') -ge 3 -and $h19Rect[2] -gt 0 -and $h19Rect[2] -lt ($h19Before.R-$h19Before.L))
     $h19During = New-Object LT+RECT
     $null = [LT]::GetWindowRect($h19A,[ref]$h19During)
-    $summary.h19_source_sizes_preserved = (($h19Before.Right-$h19Before.Left) -eq ($h19During.Right-$h19During.Left) -and ($h19Before.Bottom-$h19Before.Top) -eq ($h19During.Bottom-$h19During.Top))
+    $summary.h19_source_sizes_preserved = (($h19Before.R-$h19Before.L) -eq ($h19During.R-$h19During.L) -and ($h19Before.B-$h19Before.T) -eq ($h19During.B-$h19During.T))
     Shot 'h19-live-before'
     [H19Native]::Paint($h19A,65,210,101)
     Start-Sleep -Milliseconds 1000
@@ -103,8 +103,8 @@ binds {
     $h19HostRect = New-Object LT+RECT
     $null = [LT]::GetWindowRect($h19Host,[ref]$h19HostRect)
     $h19Selected = H19Prop $h19Host 'FocusedWindow'
-    $h19X = [int]($h19Next[0]+$h19Next[2]/2-$h19HostRect.Left)
-    $h19Y = [int]($h19Next[1]+$h19Next[3]/2-$h19HostRect.Top)
+    $h19X = [int]($h19Next[0]+$h19Next[2]/2-$h19HostRect.L)
+    $h19Y = [int]($h19Next[1]+$h19Next[3]/2-$h19HostRect.T)
     $h19Point = [IntPtr](($h19Y -shl 16) -bor ($h19X -band 0xffff))
     $null = [H19Native]::PostMessage($h19Host,0x201,[IntPtr]1,$h19Point)
     $null = [H19Native]::PostMessage($h19Host,0x202,[IntPtr]0,$h19Point)

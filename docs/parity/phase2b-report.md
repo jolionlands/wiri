@@ -12,7 +12,11 @@ output/screenshot setup are retained. Modal input advances physical keyboard sta
 firing ordinary/release actions. No dependency changes or new idle resources.
 
 Release build of the first five integration parts passes with `RUSTFLAGS=-D warnings`.
-Integrated unit/all-target/live results will be recorded after the test-harness part lands.
+The source lane's 102 H16–H21 checks are now included before the unchanged Lane B/D/perf
+phases. The only older harness change is a real classification bug: an intentional `WiriDecor`
+counts as passive only with every required extended style and no APPWINDOW flag. H16
+independently tests those properties. No existing assertion or threshold is weakened.
+Integrated unit/all-target/live results will be recorded after the complete locked run.
 Everything below is the **source lane's historical report**, not a claim that its desktop
 run was performed on this integrated branch.
 
@@ -22,6 +26,16 @@ Branch `meylin/sa-c6e38-6b646`, based on the unfinished decoration work in `1158
 This is the look-and-feel lane, not a claim that every Phase 2/niri compositor feature is done.
 The two matrices record remaining partial rows. Their headline counts remain historical Phase 2A counts.
 Reference: niri `main` e19df12cf8 (v26.04-era docs).
+
+## Commit organization
+
+- Overview implementation: `6b52f47` (item 4).
+- Recent-window implementation: `696c62e`; diagnostic live-harness corrections: `5daa01d` (item 5).
+- `16f332f`: the remaining decoration, animation, tab and hotkey implementations (items 1/2/3/6),
+  plus shared config/input/layout lifecycle wiring for all six items. These shared integrations
+  could not be cleanly isolated by whole-file staging. The requested item order was not preserved
+  by the implementation workers; this is recorded rather than implying six independent deliveries.
+- The final live-harness commit adds the single Lane A entry point and desktop evidence checks.
 
 ## Environment and verification
 

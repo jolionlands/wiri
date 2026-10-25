@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — desktop acceptance checks
+- Add the source lane's 102 H16–H21 checks through one Lane A entry point, retaining H22–H29, IPC and performance phases unchanged. Classify an intentional decoration host as passive only when both its class and all required extended styles match; H16 separately checks styles, shell exclusion and cleanup. No older assertion is weakened.
+
 ### Phase 2B integration — look and feel on the shared input pump
 - Land configured spring/easing motion, unified passive decorations, active-only tabs, live overview/recent previews and Important Hotkeys from lane A. Preserve lane B's primary keyboard engine, pointer/focus handling, fallback bindings and message-thread dispatcher: no legacy keyboard relay thread/channel.
 - Modal dismissal and recent events keep physical modifier state and captured down/up pairs synchronized; tagged activation input cannot promote MRU. Keep lane D screenshots/output handling unchanged. See the Phase 2B report for source-run evidence and pending integrated validation.
