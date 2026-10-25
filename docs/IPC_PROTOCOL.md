@@ -176,7 +176,9 @@ Response `result`: array of window objects with `hwnd`, `title`, `class_name`,
 `process_id`, `x`, `y`, `width`, `height`, `workspace` (the 1-based number; for a
 floating window the workspace it floats on, for a minimized one the workspace it
 returns to), `column` and `tile` (0-based position in the strip, `null` for a floating
-or minimized window), `floating` and `minimized`.
+or minimized window), `floating`, `minimized`, `fullscreen` (the window covers its
+monitor; it keeps its column while it does) and `maximized` (maximized to the edges of
+the work area, niri's `maximize-window-to-edges`).
 
 ---
 

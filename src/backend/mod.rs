@@ -6,6 +6,7 @@ pub mod hidden;
 pub mod hooks;
 pub mod hotkey_conflicts;
 pub mod message_loop;
+pub mod taskbar;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -115,6 +116,14 @@ pub enum BackendEvent {
     },
     WindowTitleChanged {
         hwnd: isize,
+    },
+    /// A window the engine tracks became (or stopped being) natively maximized, or as big
+    /// as its monitor, on its own (not through wiri): an application going fullscreen (a
+    /// video player, F11 in a browser) or its title bar's maximize button.
+    WindowSizeClassChanged {
+        hwnd: isize,
+        zoomed: bool,
+        covers_monitor: bool,
     },
     // CBT Hook events (fire BEFORE window operations)
     CbtCreateWindow {
@@ -1110,6 +1119,14 @@ impl BackendHandle {
             let _ = ShowWindow(HWND(hwnd as *mut std::ffi::c_void), SW_RESTORE);
         }
         Ok(())
+    }
+
+    /// Take the native maximized state away from a window without waiting for it
+    /// (`ShowWindowAsync`): an application that does not answer must not hold wiri up.
+    pub fn restore_window_async(&self, hwnd: isize) {
+        unsafe {
+            let _ = ShowWindowAsync(HWND(hwnd as *mut std::ffi::c_void), SW_RESTORE);
+        }
     }
 }
 

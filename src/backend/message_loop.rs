@@ -11,8 +11,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
     GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, ShowWindow, TranslateMessage,
-    SW_MAXIMIZE, SW_MINIMIZE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE, WM_USER,
-    WNDCLASSW, WNDCLASS_STYLES,
+    SW_MINIMIZE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE, WM_USER, WNDCLASSW,
+    WNDCLASS_STYLES,
 };
 
 use super::BackendHandle;
@@ -1046,17 +1046,22 @@ pub(crate) fn perform_action(
             engine.write().overview_select(backend);
         }
         Action::Maximize => {
-            // Maximize the currently focused window
-            let fg = unsafe { GetForegroundWindow() };
-            if !fg.0.is_null() {
-                unsafe {
-                    let _ = ShowWindow(fg, SW_MAXIMIZE);
-                }
-                info!("Maximize: hwnd={:?}", fg);
-            } else {
-                warn!("Maximize: no foreground window");
+            // wiri's older `maximize`: the window fills the work area.  It is the engine's
+            // maximized-to-edges state now (the window keeps its place in its column), not
+            // the native one that the layout pass used to fight.
+            match target {
+                Some(t) if !t.floating => engine.write().set_maximized_to_edges(t.window, true, backend),
+                Some(_) => info!("Maximize: a floating window stays a floating window"),
+                None => warn!("Maximize: no window to maximize"),
             }
         }
+        Action::MaximizeWindowToEdges => match target {
+            Some(t) if !t.floating => engine
+                .write()
+                .toggle_maximize_window_to_edges_for(t.window, backend),
+            Some(_) => info!("maximize-window-to-edges: a floating window stays a floating window"),
+            None => info!("maximize-window-to-edges: no window to maximize"),
+        },
         Action::Minimize => {
             // Minimize the currently focused window
             let fg = unsafe { GetForegroundWindow() };

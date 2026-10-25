@@ -1622,6 +1622,10 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
             "tile": place_of.get(wid).map(|p| p.1),
             "floating": eng.is_floating(*wid),
             "minimized": eng.is_minimized(*wid),
+            // Fullscreen, and maximized to the edges (niri `maximize-window-to-edges`); a window
+            // keeps its column while it is either.
+            "fullscreen": eng.is_fullscreen(*wid),
+            "maximized": eng.is_maximized_to_edges(*wid),
         }));
     }
     // Stable order: hwnd ascending so `wiri-ctl windows` is deterministic.
@@ -1710,6 +1714,10 @@ fn focus_window_by_hwnd(
             monitor.focus_window = Some(wid);
             monitor.focus_ring.push(wid);
         }
+        // The column of the window is brought into view: it may be scrolled out of it (the
+        // OS focus report that follows finds the engine's focus already there and scrolls
+        // nothing).
+        eng.reveal_focused();
     }
 
     // Best-effort: bring the Win32 window to the foreground (don't fail on err).

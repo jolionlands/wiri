@@ -344,6 +344,7 @@ When several rules match, a later rule wins for each property it sets.
 | `open-floating true` / `false` | opens floating, centred; `false` takes back a `float true` of an earlier rule |
 | `open-fullscreen true` | opens fullscreen |
 | `open-maximized true` | the column opens as wide as the view |
+| `open-maximized-to-edges true` | opens maximized to the edges of the work area, keeping its column (see "Fullscreen and maximize") |
 | `open-focused false` | the window that has the focus keeps it: when Windows hands the new window the focus, wiri gives it back (within 2.5 s of the window opening) |
 | `default-column-width { proportion 0.5; }` or `{ fixed 800; }` or `{}` | the width of the new column; a fixed size is the window's, the border comes on top; `{}` keeps the width the window opened with.  A floating window opens at that width |
 | `default-window-height { fixed 400; }` | the height of the tile in a column of several windows (a column of one always fills the view); a floating window opens at that height |
@@ -399,6 +400,7 @@ All default bindings use the `Ctrl+Alt` prefix:
 | Home / End | `focus-column-first` / `focus-column-last` | Focus the first / last column |
 | Shift+Home / Shift+End | `move-column-to-first` / `move-column-to-last` | Move the focused column to the start / end of the strip |
 | Shift+F | `maximize-column` | niri: the column is as wide as the view (toggle, also for a column of one window) |
+| M | `maximize-window-to-edges` | niri: the window fills the work area, no gap, no border, and keeps its column (toggle) |
 
 ### Mouse Bindings
 
@@ -452,8 +454,9 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 | `switch-preset-column-width` | `column-width-preset`, `column-width-cycle` | — | niri: the column takes the next width of a third, a half, two thirds of the view (the first one wider than it is; it goes on from there when it was switched last) |
 | `switch-preset-column-width-back` | — | — | The same backwards |
 | `expand-column-to-available-width` | `expand-column-to-available`, `expand-column` | — | niri: the column takes the room that the other columns fully in view leave |
+| `maximize-window-to-edges` | — | — | niri 25.11: the window fills the work area of its monitor (no gap, no border) and keeps its place in its column; toggles (see "Fullscreen and maximize") |
 | `close-window` | `close` | — | Close focused window |
-| `toggle-fullscreen` | `fullscreen`, `fullscreen-window` | — | Toggle fullscreen |
+| `toggle-fullscreen` | `fullscreen`, `fullscreen-window` | — | Toggle fullscreen: the window covers the monitor and the taskbar goes; it keeps its column (see "Fullscreen and maximize") |
 | `toggle-floating` | `float`, `toggle-window-floating` | — | Toggle floating |
 | `move-window-to-floating` | — | — | Float the window (nothing happens when it floats already) |
 | `move-window-to-tiling` | — | — | Put a floating window back into a column (nothing happens when it is tiled) |
@@ -467,7 +470,7 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 | `focus-workspace` | — | `N` or `"name"` | niri: a number is the index of the workspace on the monitor, a quoted string is the name of a workspace (`focus-workspace 2` is the second workspace, `focus-workspace "2"` the one named 2) |
 | `move-workspace` | — | `n` | Move window to workspace `n` |
 | `spawn` | `exec` | `"cmd"` | Launch a program |
-| `maximize` | — | — | Maximize window |
+| `maximize` | — | — | wiri's older name: maximize the window to the edges (it is `maximize-window-to-edges` that only sets, not toggles) |
 | `minimize` | — | — | Minimize window |
 | `center-window` | — | — | Center window |
 | `switch-monitor` | — | — | Focus next monitor |
@@ -486,6 +489,37 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 | `overview-select` | `overview-accept` | — | Select window, exit overview |
 
 ---
+
+### Fullscreen and maximize
+
+A fullscreen or maximized window stays a participant of the strip, like in niri:
+
+* **Its column stays.**  The window keeps its column and its place in it; the column is made as wide
+  as the view while the window is fullscreen or maximized (the state `maximize-column` toggles) and gets
+  its old width back afterwards.  A column that was maximized with `maximize-column` before stays
+  maximized.
+* **It is drawn over the monitor or the work area** instead of its tile: `fullscreen-window` covers the
+  whole monitor (the frame is taken away, the window is placed exactly, the shell is told with
+  `ITaskbarList2::MarkFullscreenWindow` so the taskbar goes while it is the foreground window and comes
+  back afterwards); `maximize-window-to-edges` fills the work area (the taskbar stays) with no gap and no
+  border.  The window is drawn where its slot is: focusing another column scrolls the strip by the least
+  that shows it (as in niri), the fullscreen window moves with its slot (it stays as wide as the monitor,
+  beside the neighbour, and goes off screen as the strip scrolls on) and covers the monitor again when it is
+  focused again.
+* **Nothing else is hidden.**  The other windows are not hidden, they stay in the taskbar and in
+  Alt+Tab; they are out of the way (a view away, parked like every column that is out of view).
+* Fullscreen wins over maximized; leaving fullscreen goes back to maximized when the window was.  A
+  floating window can be fullscreen (it covers the monitor and gets its rectangle back) but not maximized;
+  floating a fullscreen or maximized tile ends both.  A minimized window comes back as it was.
+* **Applications are followed, not fought.**  A window that covers its monitor on its own (a video player,
+  F11 in a browser, a game that goes borderless) is fullscreen for wiri too: its frame is not touched, the
+  taskbar goes, and when it shrinks again wiri tiles it.  When the maximize button of a title bar is pressed
+  (or the caption double-clicked), wiri takes the native maximized state away at once and keeps the window
+  maximized to the edges instead; the button again gives the window its tile back.  A window that opens
+  already maximized or as big as its monitor is treated the same.
+* The window rules `open-fullscreen`, `open-maximized` (the column as wide as the view) and
+  `open-maximized-to-edges` do the same when a window opens.  `wiri-ctl windows` reports `fullscreen` and
+  `maximized` for every window.
 
 ### Workspaces
 

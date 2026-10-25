@@ -30,6 +30,10 @@
 #          that is not there), open-focused false, min/max size limits, opacity, `app-id` regexes (process name), several
 #          `match` lines and an `exclude` line, rules that follow the title and the focus of a window while it lives, and a
 #          config reload that reaches the windows that are open.
+#          H14 fullscreen and maximize (Phase 2A item 3): a fullscreen window keeps its column and covers the monitor, the
+#          others are neither hidden nor in the way (focusing one scrolls the fullscreen window off), the taskbar goes and
+#          comes back, maximize-window-to-edges fills the work area, the title bar's maximize button and an application that
+#          goes fullscreen on its own are followed, open-maximized-to-edges.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -118,6 +122,28 @@ public static class LT {
   // Visible bounds (what the user sees, without the invisible resize border).
   public static RECT Visible(IntPtr h) { RECT r; if (DwmGetWindowAttribute(h, 9, out r, 16) != 0) { GetWindowRect(h, out r); } return r; }
   public static void Close(IntPtr h) { PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+  [DllImport("user32.dll", EntryPoint = "SetWindowLongW")] static extern int SetLongValue(IntPtr h, int index, int value);
+  [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  static readonly Dictionary<IntPtr, RECT> savedRect = new Dictionary<IntPtr, RECT>();
+  static readonly Dictionary<IntPtr, int> savedStyle = new Dictionary<IntPtr, int>();
+  // What a video player or F11 in a browser does on its own: the window drops its caption and border and covers the
+  // monitor it is on.  (Called from any thread of this process; the window answers on its own.)
+  public static void GoFullscreen(IntPtr h) {
+    RECT r; GetWindowRect(h, out r);
+    int style = GetLongValue(h, -16);
+    lock (savedRect) { savedRect[h] = r; savedStyle[h] = style; }
+    SetLongValue(h, -16, style & ~0x00C00000 & ~0x00040000);     // WS_CAPTION, WS_THICKFRAME
+    Rectangle b = Screen.FromHandle(h).Bounds;
+    SetWindowPos(h, IntPtr.Zero, b.Left, b.Top, b.Width, b.Height, 0x0020 | 0x0004 | 0x0010);   // FRAMECHANGED, NOZORDER, NOACTIVATE
+  }
+  // ... and what it does when it leaves fullscreen again: its frame and the rectangle it had.
+  public static void LeaveFullscreen(IntPtr h) {
+    RECT r; int style;
+    lock (savedRect) { if (!savedRect.TryGetValue(h, out r) || !savedStyle.TryGetValue(h, out style)) { return; } }
+    SetLongValue(h, -16, style);
+    SetWindowPos(h, IntPtr.Zero, r.L, r.T, r.R - r.L, r.B - r.T, 0x0020 | 0x0004 | 0x0010);
+  }
   [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetLongValue(IntPtr h, int index);
   [DllImport("user32.dll")] static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
   // The alpha (0 to 255) the window is drawn with: 255 for a window that is not layered, -1 when it cannot be read.
@@ -1181,11 +1207,14 @@ Press 'ctrl+alt+f6'
 $h7AdjustPixels = (Near (WinW $sf[1]) 700 10)
 Shot 'h7-03-plus-100-pixels'
 
-# two columns at 50 % fill the view exactly: the window edges meet the outer gap (8 px) and border (4 px)
+# two columns at 50 % fill the view exactly: the window edges meet the outer gap (8 px) and border (4 px).
+# The middle column (700 px wide at this point) is made a half first, while it has the focus: a focus move through
+# IPC scrolls the strip to show the column (as niri does), and a column that shrinks keeps its left edge, so a
+# 700 px column that was scrolled into view would leave the strip shifted by the 41 px it had needed.
+Press 'ctrl+alt+f1'
 FocusForm $sf[0]
 Press 'ctrl+alt+f1'
 FocusForm $sf[1]
-Press 'ctrl+alt+f1'
 $a = Rc $sf[0]; $b = Rc $sf[1]
 $h7HalvesFillTheView = (Near $a.L 12 8) -and (Near $b.R ($sb.Width - 12) 8) -and (Near ($b.L - $a.R) 24 8)
 Shot 'h7-04-two-halves'
@@ -2020,6 +2049,133 @@ $log13b = Join-Path $D 'wiri.stderr13b.log'
 $w = Start-Wiri $log13b ($log13b + '.out')
 Start-Sleep -Seconds 4
 
+# ---- H14: fullscreen and maximize: the window keeps its place in the strip -------------------------------------------
+# A fullscreen or maximized window stays a participant of the strip (niri): its column stays, the neighbours are not hidden
+# (they stay in Alt+Tab) but out of the way, focusing one of them scrolls the fullscreen window away, the shell is told
+# (the taskbar goes), and an application that goes fullscreen or maximizes itself is followed instead of fought.
+$log14 = Join-Path $D 'wiri.stderr14.log'
+$h14Config = @'
+input {
+    mod-key "ctrl-alt"
+}
+layout {
+    gaps 10
+    border {
+        width 4
+    }
+}
+window-rule {
+    match title="^h14-edges-open"
+    open-maximized-to-edges true
+}
+'@
+Stop-WiriGracefully $w 'h14'
+$w14 = Start-WiriWithConfig $h14Config $log14
+$w = $w14
+$h14Issues = (LogLines $log14 ': error: ').Count + (LogLines $log14 ': warning: ').Count
+$h14All = @()
+$g1 = [TestForms]::Open('h14-1', 70, 110, 190);   Start-Sleep -Milliseconds 2200; $h14All += $g1
+$g2 = [TestForms]::Open('h14-2', 70, 170, 120);   Start-Sleep -Milliseconds 2200; $h14All += $g2
+$g3 = [TestForms]::Open('h14-3', 190, 110, 70);   Start-Sleep -Milliseconds 2200; $h14All += $g3
+$tbX = [int]($sb.Left + $sb.Width / 2)
+$tbY = [int]($sb.Bottom - 10)         # where the taskbar is (the work area is shorter than the screen)
+$h14TaskbarBefore = [LT]::Class([LT]::TopWindowAt($tbX, $tbY))
+
+# (a) fullscreen-window: the window covers the monitor, keeps its column, nothing else is hidden
+FocusForm $g2
+$h14Cols0 = WinList 'h14-windows-before'
+$h14Col2 = ColOf $h14Cols0 $g2
+$null = Ctl 'h14-fullscreen' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 2200
+$rf = Rc $g2
+$h14FullscreenCovers = ($rf.L -eq $sb.Left) -and ($rf.T -eq $sb.Top) -and ($rf.W -eq $sb.Width) -and ($rf.H -eq $sb.Height)
+$h14ColsFs = WinList 'h14-windows-fullscreen'
+$h14KeepsColumn = ((ColOf $h14ColsFs $g2) -eq $h14Col2) -and ($h14Col2 -ge 0)
+$h14ReportsFullscreen = ((WinOf $h14ColsFs $g2).fullscreen -eq $true)
+$h14NotHidden = [LT]::IsWindowVisible($g1) -and [LT]::IsWindowVisible($g3)
+$h14InAltTab = ([ShellViews]::InSwitchers($g1) -eq 1) -and ([ShellViews]::InSwitchers($g3) -eq 1)
+$h14NeighboursAside = (-not (OnScreen $g1)) -and (-not (OnScreen $g3))
+$h14TaskbarHidden = ([LT]::TopWindowAt($tbX, $tbY) -eq $g2)
+$h14ShellTold = (@(LogLines $log14 "taskbar: window $([int64]$g2) marked fullscreen").Count -ge 1)
+Shot 'h14-01-fullscreen-keeps-its-slot'
+# focusing the neighbour scrolls the strip by the least that shows it (niri): the fullscreen window moves with its slot, to
+# the left of the neighbour, as wide as the monitor, and is no longer in front of it
+FocusForm $g3
+$h14ColsNb = WinList 'h14-windows-neighbour'
+$rn2 = Rc $g2
+$rn3 = Rc $g3
+$h14NeighbourScrollsIn = (OnScreen $g3) -and ($rn2.L -lt $sb.Left) -and ($rn2.W -eq $sb.Width) -and ($rn2.R -le ($rn3.L + 2)) -and ([LT]::GetForegroundWindow() -eq $g3) -and ((WinOf $h14ColsNb $g2).fullscreen -eq $true)
+Shot 'h14-02-neighbour-focused'
+FocusForm $g2
+$rb = Rc $g2
+$h14FullscreenComesBack = ($rb.L -eq $sb.Left) -and ($rb.T -eq $sb.Top) -and ($rb.W -eq $sb.Width) -and ($rb.H -eq $sb.Height)
+$null = Ctl 'h14-fullscreen-off' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 2200
+$rt = Rc $g2
+$h14ColsOff = WinList 'h14-windows-fullscreen-off'
+$h14TileBack = ($rt.W -lt ($sb.Width - 100)) -and ($rt.H -lt $sb.Height) -and ((ColOf $h14ColsOff $g2) -eq $h14Col2) -and ((WinOf $h14ColsOff $g2).fullscreen -eq $false)
+$h14TaskbarBack = ([LT]::Class([LT]::TopWindowAt($tbX, $tbY)) -eq $h14TaskbarBefore)
+$h14NeighboursBack = (OnScreen $g1) -or (OnScreen $g3)
+
+# (b) maximize-window-to-edges: the work area, no gap, no border; the column stays; toggles
+FocusForm $g1
+$h14Col1 = ColOf (WinList 'h14-windows-before-max') $g1
+$null = Ctl 'h14-maximize' @('action', 'maximize-window-to-edges'); Start-Sleep -Milliseconds 2200
+$rm = Rc $g1
+$h14MaxFillsWorkArea = (Near $rm.L $swa.Left 3) -and (Near $rm.T $swa.Top 3) -and (Near $rm.W $swa.Width 4) -and (Near $rm.H $swa.Height 4)
+$h14ColsMax = WinList 'h14-windows-maximized'
+$h14MaxKeepsColumn = ((ColOf $h14ColsMax $g1) -eq $h14Col1) -and ((WinOf $h14ColsMax $g1).maximized -eq $true) -and ((WinOf $h14ColsMax $g1).fullscreen -eq $false)
+Shot 'h14-03-maximized-to-the-edges'
+$null = Ctl 'h14-maximize-off' @('action', 'maximize-window-to-edges'); Start-Sleep -Milliseconds 2200
+$rm2 = Rc $g1
+$h14MaxToggles = ($rm2.W -lt ($swa.Width - 100)) -and ((WinOf (WinList 'h14-windows-unmaximized') $g1).maximized -eq $false)
+
+# (c) the maximize button of the title bar (SC_MAXIMIZE): wiri takes the native state away and keeps the window maximized
+# to the edges; the button again gives the window its tile back
+function MaximizeButton($h) { [void][LT]::PostMessage($h, 0x0112, [IntPtr]0xF030, [IntPtr]::Zero) }
+FocusForm $g3
+MaximizeButton $g3; Start-Sleep -Milliseconds 2800
+$rb1 = Rc $g3
+$h14ButtonMaximizes = (Near $rb1.W $swa.Width 4) -and (Near $rb1.H $swa.Height 4) -and (-not [LT]::IsZoomed($g3)) -and ((WinOf (WinList 'h14-windows-button') $g3).maximized -eq $true)
+Shot 'h14-04-title-bar-maximize'
+MaximizeButton $g3; Start-Sleep -Milliseconds 2800
+$rb2 = Rc $g3
+$h14ButtonAgainGoesBack = ($rb2.W -lt ($swa.Width - 100)) -and (-not [LT]::IsZoomed($g3)) -and ((WinOf (WinList 'h14-windows-button-again') $g3).maximized -eq $false)
+
+# (d) open-maximized-to-edges in a window rule
+$ge = [TestForms]::Open('h14-edges-open', 130, 130, 130); Start-Sleep -Milliseconds 2400; $h14All += $ge
+$re = Rc $ge
+$h14RuleMaximizes = (Near $re.W $swa.Width 4) -and (Near $re.H $swa.Height 4) -and ((WinOf (WinList 'h14-windows-edges-open') $ge).maximized -eq $true)
+[TestForms]::CloseForm($ge); Start-Sleep -Milliseconds 1800
+
+# (e) an application that goes fullscreen on its own (a video player, F11) is followed, not fought
+FocusForm $g2
+[LT]::GoFullscreen($g2); Start-Sleep -Milliseconds 2600
+$ra = Rc $g2
+$h14AppColumns = WinList 'h14-windows-app-fullscreen'
+$h14AppFullscreenFollowed = ($ra.L -eq $sb.Left) -and ($ra.T -eq $sb.Top) -and ($ra.W -eq $sb.Width) -and ($ra.H -eq $sb.Height) -and ((WinOf $h14AppColumns $g2).fullscreen -eq $true) -and ((ColOf $h14AppColumns $g2) -eq $h14Col2)
+$h14AppTaskbarHidden = ([LT]::TopWindowAt($tbX, $tbY) -eq $g2)
+$h14AppNothingHidden = [LT]::IsWindowVisible($g1) -and [LT]::IsWindowVisible($g3)
+Shot 'h14-05-app-fullscreen'
+[LT]::LeaveFullscreen($g2); Start-Sleep -Milliseconds 2600
+$rl = Rc $g2
+$h14AppLeft = ($rl.W -lt ($sb.Width - 100)) -and ((WinOf (WinList 'h14-windows-app-left') $g2).fullscreen -eq $false) -and ([LT]::Class([LT]::TopWindowAt($tbX, $tbY)) -eq $h14TaskbarBefore)
+Shot 'h14-06-app-left-fullscreen'
+$h14Values = [ordered]@{
+    issues = $h14Issues; taskbar_before = $h14TaskbarBefore; column_of_g2 = $h14Col2
+    fullscreen = "$($rf.L),$($rf.T),$($rf.R),$($rf.B)"; neighbour_scrolled = "fullscreen window $($rn2.L),$($rn2.T),$($rn2.R),$($rn2.B); neighbour $($rn3.L),$($rn3.T),$($rn3.R),$($rn3.B)"
+    back_in_view = "$($rb.L),$($rb.T),$($rb.R),$($rb.B)"; tile_after = "$($rt.W)x$($rt.H)"
+    maximized = "$($rm.L),$($rm.T),$($rm.R),$($rm.B)"; work_area = "$($swa.Left),$($swa.Top),$($swa.Right),$($swa.Bottom)"; unmaximized_w = $rm2.W
+    button = "$($rb1.W)x$($rb1.H)"; button_again_w = $rb2.W; rule = "$($re.W)x$($re.H)"
+    app_fullscreen = "$($ra.L),$($ra.T),$($ra.R),$($ra.B)"; app_left = "$($rl.W)x$($rl.H)"
+}
+$h14Values | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'h14-values.json')
+foreach ($h in $h14All) { [TestForms]::CloseForm($h) }
+Start-Sleep -Milliseconds 2000
+Stop-WiriGracefully $w14 'h14b'
+Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+$log14b = Join-Path $D 'wiri.stderr14b.log'
+$w = Start-Wiri $log14b ($log14b + '.out')
+Start-Sleep -Seconds 4
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -2329,6 +2485,31 @@ $summary = [ordered]@{
     h13_open_on_output_with_a_real_name = $h13OutputPlaces
     h13_open_on_output_with_an_unknown_name_is_ignored = $h13OutputUnknownIgnored
     h13_reload_changes_the_opacity_of_open_windows = $h13ReloadUpdatesOpenWindows
+    # --- Phase 2A / H14: fullscreen and maximize keep the place in the strip
+    h14_config_loads_without_issues = ($h14Issues -eq 0)
+    h14_fullscreen_covers_the_monitor = $h14FullscreenCovers
+    h14_fullscreen_window_keeps_its_column = $h14KeepsColumn
+    h14_fullscreen_is_reported_by_ipc = $h14ReportsFullscreen
+    h14_other_windows_are_not_hidden = $h14NotHidden
+    h14_other_windows_stay_in_alt_tab = $h14InAltTab
+    h14_neighbours_are_out_of_the_way = $h14NeighboursAside
+    h14_taskbar_is_hidden_during_fullscreen = $h14TaskbarHidden
+    h14_shell_was_told_about_the_fullscreen_window = $h14ShellTold
+    h14_focusing_a_neighbour_scrolls_the_fullscreen_window_with_its_slot = $h14NeighbourScrollsIn
+    h14_fullscreen_window_comes_back_when_focused_again = $h14FullscreenComesBack
+    h14_leaving_fullscreen_gives_the_tile_back = $h14TileBack
+    h14_taskbar_is_back_after_fullscreen = $h14TaskbarBack
+    h14_neighbours_are_back_after_fullscreen = $h14NeighboursBack
+    h14_maximize_to_edges_fills_the_work_area = $h14MaxFillsWorkArea
+    h14_maximize_to_edges_keeps_the_column_and_is_reported = $h14MaxKeepsColumn
+    h14_maximize_to_edges_toggles_back = $h14MaxToggles
+    h14_title_bar_maximize_is_followed = $h14ButtonMaximizes
+    h14_title_bar_maximize_again_gives_the_tile_back = $h14ButtonAgainGoesBack
+    h14_open_maximized_to_edges_rule = $h14RuleMaximizes
+    h14_app_fullscreen_is_followed = $h14AppFullscreenFollowed
+    h14_app_fullscreen_hides_the_taskbar = $h14AppTaskbarHidden
+    h14_app_fullscreen_hides_nothing = $h14AppNothingHidden
+    h14_app_leaving_fullscreen_is_followed = $h14AppLeft
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

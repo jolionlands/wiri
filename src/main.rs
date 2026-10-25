@@ -1314,6 +1314,21 @@ fn handle_backend_event(
             }
         }
 
+        BackendEvent::WindowSizeClassChanged {
+            hwnd,
+            zoomed,
+            covers_monitor,
+        } => {
+            // An application went fullscreen on its own (a video player, F11), or its maximize
+            // button was pressed: the engine follows it instead of fighting it.
+            engine.write().window_size_class_changed(
+                WindowId::new(hwnd),
+                zoomed,
+                covers_monitor,
+                handle,
+            );
+        }
+
         BackendEvent::WindowMoveResizeStart { hwnd } => {
             debug!("User started manual move/resize on hwnd {}", hwnd);
             ipc_server.broadcast_event(IpcEvent::WindowMoveResizeStart { window_hwnd: hwnd });

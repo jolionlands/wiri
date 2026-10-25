@@ -45,6 +45,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and when the config is reloaded - nothing polls, and only windows that a rule depends on are looked
   at.  `wiri-ctl list-monitors` shows the device name of each monitor.  The process name the rules see is
   the file name (`firefox.exe`; `process-name "firefox"` still matches).
+- **Fullscreen and maximize keep the window in the strip (niri).**  A fullscreen window used to hide every
+  other tile of its monitor (they left the taskbar and Alt+Tab).  Now it keeps its column and its place in
+  it, its column is made as wide as the view meanwhile (and gets its width back), the window is drawn
+  over the monitor in its slot and the other windows are neither hidden nor moved but out of the way:
+  focusing a neighbour scrolls the strip and the fullscreen window goes off screen with its slot.  The shell
+  is told (`ITaskbarList2::MarkFullscreenWindow`) so that the taskbar goes and comes back.  New niri action
+  `maximize-window-to-edges` (default bind `Mod+M`, rule `open-maximized-to-edges`): the window fills the
+  work area with no gap and no border and keeps its column; wiri's older `maximize` is the same state
+  instead of a native maximize that the layout fought.  An application that goes fullscreen on its own
+  (a video player, F11) or whose maximize button is pressed is followed: it is adopted into the same
+  states (its frame is not touched), and wiri tiles it again when it leaves them.  `wiri-ctl windows` shows
+  `fullscreen` and `maximized`.  `wiri-ctl focus-window` (and the IPC requests that focus a window first)
+  now scrolls the strip to show the window's column, as focusing it with the keyboard does.
 
 ### Phase 1 — safe to daily-drive (2026-10-24)
 Each item is verified on a spare Windows 11 laptop with `scripts/live-test.ps1` (real key

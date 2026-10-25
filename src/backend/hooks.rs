@@ -245,6 +245,7 @@ unsafe extern "system" fn winevent_proc(
             let hwnd_isize = hwnd.0 as isize;
             // Prune LAST_LOCATION entry for closed windows (Bug #6)
             LAST_LOCATION.lock().remove(&hwnd_isize);
+            SIZE_CLASS.lock().remove(&hwnd_isize);
             // Also drop urgent flag — destroyed windows can't be flashing.
             URGENT_WINDOWS.lock().remove(&hwnd_isize);
             backend.send_event(BackendEvent::WindowDestroyed { hwnd: hwnd_isize });
@@ -306,6 +307,11 @@ unsafe extern "system" fn winevent_proc(
             if backend.is_self_applied_recent(hwnd_isize) {
                 return;
             }
+
+            // A window that became maximized or as big as its monitor (or stopped being) on
+            // its own is reported at once: the throttle below drops events, and the one that
+            // is dropped can be the last of the burst.
+            detect_size_class_change(&backend, hwnd);
 
             // Throttle: skip if we processed a location change for this
             // window in the last 200ms. These fire 100s of times per second
@@ -394,6 +400,70 @@ use std::sync::LazyLock;
 /// Per-window location throttle state: (last_processed_time, last_known_rect)
 static LAST_LOCATION: LazyLock<Mutex<HashMap<isize, (std::time::Instant, UtilRect)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What the size of a window amounts to for the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SizeClass {
+    /// The window has the native maximized state (title bar button, double click).
+    zoomed: bool,
+    /// The window is as big as the monitor it is on (a video player, F11 in a browser).
+    covers_monitor: bool,
+}
+
+/// The size class last seen of each window the engine tracks.
+static SIZE_CLASS: LazyLock<Mutex<HashMap<isize, SizeClass>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How far (in pixels) the edges of a window may be from the edges of its monitor for the window
+/// to count as covering it: the frames of some applications are a pixel off.
+const COVER_TOLERANCE_PX: i32 = 3;
+
+/// True when the visible frame `frame` is the size and place of `monitor` (within a few pixels).
+/// A window that is bigger than its monitor, or only most of it, does not cover it.
+pub fn covers_monitor(frame: UtilRect, monitor: UtilRect) -> bool {
+    let near = |a: i32, b: i32| (a - b).abs() <= COVER_TOLERANCE_PX;
+    near(frame.loc.x, monitor.loc.x)
+        && near(frame.loc.y, monitor.loc.y)
+        && near(frame.right(), monitor.right())
+        && near(frame.bottom(), monitor.bottom())
+}
+
+/// Look at a window the engine tracks after a location change and send
+/// `BackendEvent::WindowSizeClassChanged` when its size class differs from the one seen last.
+/// A window seen for the first time that is nothing special sends nothing.
+fn detect_size_class_change(backend: &BackendHandle, hwnd: HWND) {
+    let hwnd_isize = hwnd.0 as isize;
+    let Some(info) = backend.get_window(hwnd_isize) else {
+        return; // not a window wiri tracks
+    };
+    let zoomed = unsafe { windows::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd).as_bool() };
+    let covers = match info.get_dwm_bounds() {
+        Some(frame) => backend
+            .monitor_for_window(hwnd_isize)
+            .and_then(|id| backend.get_monitor(id))
+            .map_or(false, |monitor| covers_monitor(frame, monitor.bounds)),
+        None => false,
+    };
+    let now = SizeClass {
+        zoomed,
+        covers_monitor: covers,
+    };
+    let changed = {
+        let mut seen = SIZE_CLASS.lock();
+        let previous = seen.insert(hwnd_isize, now);
+        match previous {
+            Some(previous) => previous != now,
+            None => zoomed || covers,
+        }
+    };
+    if changed {
+        backend.send_event(BackendEvent::WindowSizeClassChanged {
+            hwnd: hwnd_isize,
+            zoomed,
+            covers_monitor: covers,
+        });
+    }
+}
 
 /// HWNDs currently in the urgent/flashing state. Populated by the
 /// EVENT_SYSTEM_ALERT WinEvent callback, cleared on EVENT_SYSTEM_FOREGROUND

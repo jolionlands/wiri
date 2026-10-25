@@ -14,6 +14,9 @@ use crate::utils::{OutputId, Point, Rect, WindowId};
 // What the window rules do to a window: where it opens, how big, what keeps being true of it.
 mod rules;
 use rules::NO_ALPHA;
+// Fullscreen, maximized to the edges, and keeping the place in the strip while a window is either.
+mod sizing;
+use sizing::DrawMode;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
@@ -566,6 +569,19 @@ pub struct TilingEngine {
     unfocused_opens: HashMap<WindowId, rules::UnfocusedOpen>,
     /// The device name of each monitor (`\\.\DISPLAY1`), as told by `set_output_name`.
     output_names: HashMap<OutputId, String>,
+    /// Windows maximized to the edges of the work area (niri `maximize-window-to-edges`).
+    maximized_edges: HashSet<WindowId>,
+    /// The windows of `fullscreen_windows` that went fullscreen on their own (a video player,
+    /// F11): their frame is not touched, and wiri follows them out of fullscreen.
+    app_fullscreen: HashSet<WindowId>,
+    /// Windows whose column was made as wide as the view when they went fullscreen or were
+    /// maximized (their column is given its old width back afterwards).
+    slot_forced: HashSet<WindowId>,
+    /// A window that maximized itself was asked to give up the native state; the value is
+    /// whether it is to be maximized to the edges once it has.
+    unzoom_pending: HashMap<WindowId, bool>,
+    /// When each fullscreen window went fullscreen.
+    fullscreen_since: HashMap<WindowId, std::time::Instant>,
     full_config: Option<crate::config::Config>,
     animation: crate::layout::AnimationManager,
     /// Overview mode: None = normal, Some(state) = zoomed out (all workspaces stacked).
@@ -691,6 +707,11 @@ impl TilingEngine {
             rule_heights: HashMap::new(),
             unfocused_opens: HashMap::new(),
             output_names: HashMap::new(),
+            maximized_edges: HashSet::new(),
+            app_fullscreen: HashSet::new(),
+            slot_forced: HashSet::new(),
+            unzoom_pending: HashMap::new(),
+            fullscreen_since: HashMap::new(),
             full_config: None,
             animation: crate::layout::AnimationManager::disabled(),
             overview: None,
@@ -1358,6 +1379,7 @@ impl TilingEngine {
     ) {
         let window_id = WindowId::new(window.hwnd);
         let hwnd = window.hwnd; // Capture before move
+        let opened_frame = window.bounds;
 
         // A window is managed once.  Two events (created, shown, foreground) and the
         // reconcile pass can all find the same new window at the same moment; a second
@@ -1659,6 +1681,11 @@ impl TilingEngine {
             }
         }
 
+        // A window that opens maximized or as big as its monitor (it was like that when wiri
+        // started, or its application restores that state) is followed like one that does it
+        // later.
+        self.adopt_app_sizing_at_open(window_id, opened_frame, backend);
+
         // What the rules ask once the window is in its place: its column as wide as the view,
         // no focus for it, fullscreen.
         self.act_on_open_rules(window_id, &rules, focus_before, at_startup, backend);
@@ -1666,6 +1693,7 @@ impl TilingEngine {
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
         self.forget_rule_state(window_id);
+        self.forget_sizing(window_id);
         self.fullscreen_windows.remove(&window_id);
         self.minimized.remove(&window_id);
         self.floating_windows.remove(&window_id);
@@ -1850,15 +1878,10 @@ impl TilingEngine {
             return;
         }
         let was_fullscreen = self.fullscreen_windows.contains(&window_id);
-        if was_fullscreen {
-            // A minimized fullscreen window must not keep every other tile hidden, and it
-            // comes back with the frame the application gave it.
-            self.fullscreen_windows.remove(&window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
-            if let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) {
-                self.restore_window_style(hwnd);
-            }
-        }
+        // A minimized window is not fullscreen (the taskbar must come back), does not hold its
+        // column as wide as the view and comes back with the frame the application gave it;
+        // it is fullscreen (or maximized to the edges) again when it is restored.
+        self.leave_sizing_states(window_id, true);
 
         if self.floating_windows.contains(&window_id) {
             let Some((output, workspace)) = self.float_location(window_id) else {
@@ -1952,7 +1975,7 @@ impl TilingEngine {
                 self.raise_floats(float_output);
             }
             if was_fullscreen {
-                self.toggle_fullscreen_for(window_id, backend);
+                self.set_fullscreen(window_id, true, false, backend);
             }
             return;
         };
@@ -1988,8 +2011,14 @@ impl TilingEngine {
         self.maintain_empty_workspace(output);
         self.reveal_focused_column(output);
         self.apply_layout_for_monitor(output, backend);
+        if self.maximized_edges.contains(&window_id) {
+            // It comes back maximized to the edges: its column is as wide as the view again.
+            self.hold_slot(window_id);
+            self.applied_state.remove(&window_id);
+            self.apply_layout_for_monitor(output, backend);
+        }
         if was_fullscreen {
-            self.toggle_fullscreen_for(window_id, backend);
+            self.set_fullscreen(window_id, true, false, backend);
         }
     }
 
@@ -2414,31 +2443,15 @@ impl TilingEngine {
                 .collect()
         };
 
-        for window_id in &self.fullscreen_windows {
-            // Only position fullscreen windows that belong to this monitor
-            if !monitor_window_ids.contains(window_id) {
-                continue;
-            }
-            let fullscreen_rect = Rect::new(
-                monitor.bounds.loc.x,
-                monitor.bounds.loc.y,
-                monitor.bounds.size.w,
-                monitor.bounds.size.h,
-            );
-            // Exactly the monitor: a fullscreen window has no frame, so there is no
-            // invisible border to compensate for.
-            let _ = backend.set_window_position_exact(
-                window_id.as_isize(),
-                fullscreen_rect,
-                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-            );
-        }
-        let fullscreen_on_monitor = self
-            .fullscreen_windows
-            .iter()
-            .find(|wid| monitor_window_ids.contains(wid))
-            .copied();
+        // Fullscreen and maximized tiles keep their slot in the strip: it is laid out like any
+        // other, and the window is drawn over the monitor (fullscreen) or the work area
+        // (maximized to the edges) in its place, shifted by whatever the strip is scrolled by
+        // (see `sizing.rs`).  Nothing else is hidden or moved for them.
+        let draw_modes: HashMap<WindowId, DrawMode> = if overview_active {
+            HashMap::new()
+        } else {
+            self.sizing_draw_modes(&monitor_window_ids)
+        };
 
         // Snapshot the per-tile ConfigureThrottle intents before positioning.
         // We need an immutable borrow of the workspace to get tile intents, then a
@@ -2517,6 +2530,19 @@ impl TilingEngine {
                 }
             }
         };
+
+        let positions: Vec<(WindowId, Rect)> =
+            if draw_modes.is_empty() || self.effective_zoom() < 1.0 {
+                positions
+            } else {
+                Self::apply_sizing_states(
+                    positions,
+                    &draw_modes,
+                    work_rect,
+                    monitor.work_area,
+                    monitor.bounds,
+                )
+            };
 
         // Workspace-slide animation bias (niri parity).  While a workspace
         // switch is in flight the engine reads `workspace_slide_offset(oid)`
@@ -2644,36 +2670,13 @@ impl TilingEngine {
                 }
                 continue;
             }
-            if let Some(fullscreen_wid) = fullscreen_on_monitor {
-                if window_id == fullscreen_wid {
-                    let prior = self.applied_state.get(&window_id);
-                    let was_visible = prior.map(|p| p.visible).unwrap_or(true);
-                    if !was_visible {
-                        let _ = backend.show_window(window_id.as_isize(), true);
-                        self.applied_state
-                            .entry(window_id)
-                            .or_insert_with(AppliedState::unset)
-                            .visible = true;
-                    }
-                    continue;
-                }
-
-                // Hide tiled windows when another window on this monitor is fullscreen.
-                let prior = self.applied_state.get(&window_id);
-                let was_visible = prior.map(|p| p.visible).unwrap_or(true);
-                if was_visible {
-                    let _ = backend.show_window(window_id.as_isize(), false);
-                    #[cfg(test)]
-                    {
-                        self.win32_call_count += 1;
-                    }
-                    self.note_hidden(window_id);
-                }
-                continue;
-            }
             if self.floating_windows.contains(&window_id) {
                 continue;
             }
+            let draw_mode = draw_modes
+                .get(&window_id)
+                .copied()
+                .unwrap_or(DrawMode::Inset);
 
             let is_focused = focused == Some(window_id);
             let should_be_visible = true;
@@ -2711,7 +2714,12 @@ impl TilingEngine {
             // (terminals re-wrap their text, browsers re-layout) and lets a
             // focus flap turn into an endless SetWindowPos storm.  Focus is
             // shown with the DWM border colour instead of with geometry.
-            let inset = border_w;
+            // A tile that is fullscreen or maximized to the edges has no border around it.
+            let inset = if draw_mode == DrawMode::Inset {
+                border_w
+            } else {
+                0
+            };
             let inset_rect = Rect::new(
                 rect.loc.x + inset,
                 rect.loc.y + inset,
@@ -2816,6 +2824,37 @@ impl TilingEngine {
                     inset_rect.size.w,
                     inset_rect.size.h
                 );
+
+                if draw_mode == DrawMode::Exact {
+                    // The frame of a fullscreen window is gone: it is placed exactly, at once
+                    // (an animation frame would be placed with the invisible border of the old
+                    // frame added), and its z-order is left alone.
+                    let placed = backend
+                        .set_window_position_exact(
+                            window_id.as_isize(),
+                            inset_rect,
+                            windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                                | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                        )
+                        .is_ok();
+                    #[cfg(test)]
+                    {
+                        self.win32_call_count += 1;
+                    }
+                    self.animating_rects.remove(&window_id);
+                    if placed {
+                        self.applied_state
+                            .entry(window_id)
+                            .or_insert_with(AppliedState::unset)
+                            .rect = inset_rect;
+                    }
+                    applied_windows.insert(window_id);
+                    self.applied_state
+                        .entry(window_id)
+                        .or_insert_with(AppliedState::unset)
+                        .focused = is_focused;
+                    continue;
+                }
 
                 // Item 1: when animations are enabled and the window already has
                 // a known position (i.e. this is not a first-ever placement),
@@ -4092,6 +4131,9 @@ impl TilingEngine {
         let Some((output, workspace, _)) = self.locate_window(window_id) else {
             return;
         };
+        // A fullscreen or maximized tile that floats is neither any more (niri: they cannot be
+        // floating), and its column gets its width back.
+        self.leave_sizing_states(window_id, false);
         let work = self.monitors.get(&output).map(|m| m.work_area);
         let rect = match (self.float_memory.get(&window_id).copied(), work) {
             (Some(remembered), Some(work)) => Self::fit_rect_into(remembered, work),
@@ -4457,64 +4499,6 @@ impl TilingEngine {
         if let Some(target) = self.state_target() {
             self.toggle_fullscreen_for(target.window, backend);
         }
-    }
-
-    /// Toggle fullscreen for `window_id`, a tile or a floating window: it covers
-    /// the monitor it lives on.  A floating window gets its rectangle back when it
-    /// leaves fullscreen.
-    pub fn toggle_fullscreen_for(&mut self, window_id: WindowId, backend: &BackendHandle) {
-        let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) else {
-            return;
-        };
-        let is_float = self.floating_windows.contains(&window_id);
-        let output = if is_float {
-            self.float_location(window_id).map(|(o, _)| o)
-        } else {
-            self.locate_window(window_id).map(|(o, _, _)| o)
-        };
-        let Some(output) = output.or_else(|| self.monitors.focused_id()) else {
-            return;
-        };
-        let Some(monitor_bounds) = self.monitors.get(&output).map(|m| m.bounds) else {
-            return;
-        };
-
-        if self.fullscreen_windows.contains(&window_id) {
-            // Exit fullscreen
-            self.fullscreen_windows.remove(&window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
-            self.restore_window_style(hwnd);
-            if is_float {
-                if let Some(rect) = self.float_memory.get(&window_id).copied() {
-                    self.place_float(window_id, rect, backend);
-                }
-            }
-            info!("Exiting fullscreen for window {}", hwnd);
-        } else {
-            // Enter fullscreen
-            if is_float {
-                if let Some(rect) = self.float_rect_of(window_id) {
-                    self.float_memory.insert(window_id, rect);
-                }
-            }
-            self.fullscreen_windows.insert(window_id);
-            self.window_sizing.insert(window_id, SizingMode::Fullscreen);
-            let fullscreen_rect = Rect::new(
-                monitor_bounds.loc.x,
-                monitor_bounds.loc.y,
-                monitor_bounds.size.w,
-                monitor_bounds.size.h,
-            );
-            self.make_fullscreen(hwnd, fullscreen_rect, backend);
-            info!("Entering fullscreen for window {}", hwnd);
-        }
-
-        // The fullscreen rect is applied behind the applied-state cache's back.  Forget
-        // what the cache knows about this window, or leaving fullscreen finds its old
-        // tile rect "already applied" and the window stays as big as the screen.
-        self.applied_state.remove(&window_id);
-
-        self.apply_layout_for_monitor(output, backend);
     }
 
     /// Apply the configured DWM drop-shadow state to a single window.
@@ -7732,6 +7716,12 @@ impl TilingEngine {
         // workspaces again before the process is gone.
         self.shut_down = true;
 
+        // The shell must not go on believing that a window is fullscreen (and keep the
+        // taskbar away) when wiri is gone.
+        for window_id in &self.fullscreen_windows {
+            crate::backend::taskbar::mark_fullscreen(window_id.as_isize(), false);
+        }
+
         // Show every window wiri hid (inactive workspaces, the fullscreen
         // cover-up, parked columns are merely moved).  Before this a quit with
         // another workspace active left those windows hidden for good.
@@ -10125,12 +10115,16 @@ mod tests {
         engine.apply_all(&BackendHandle::default_for_test());
         let wid = WindowId::new(101);
         assert!(engine.applied_state.get(&wid).expect("tiled and applied").visible);
+        let tile_rect = engine.applied_state.get(&wid).expect("applied").rect;
 
         engine.toggle_fullscreen(&BackendHandle::default_for_test());
         assert!(engine.is_fullscreen(wid));
         assert!(
-            !engine.applied_state.contains_key(&wid),
-            "entering fullscreen must drop the cached tile state"
+            engine
+                .applied_state
+                .get(&wid)
+                .map_or(true, |state| state.rect != tile_rect),
+            "entering fullscreen must drop the cached tile rectangle"
         );
 
         engine.toggle_fullscreen(&BackendHandle::default_for_test());

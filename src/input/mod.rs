@@ -159,6 +159,9 @@ pub enum Action {
     /// Toggle per-column maximize (full work-area height). Distinct from
     /// `ToggleFullscreen`, which covers the entire monitor.
     MaximizeColumn,
+    /// niri `maximize-window-to-edges`: the window fills the work area (no gaps, no border) and
+    /// keeps its place in its column; toggles.  wiri's older `maximize` only sets it.
+    MaximizeWindowToEdges,
     /// Grow the focused column's width by 5% of the work area (clamped).
     GrowColumnWidth,
     /// Shrink the focused column's width by 5% of the work area (clamped).
@@ -471,6 +474,7 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         "maximize-column" | "column-maximize" | "toggle-column-maximize" => {
             Some(Action::MaximizeColumn)
         }
+        "maximize-window-to-edges" => Some(Action::MaximizeWindowToEdges),
         // Percentage-based column resize (Ctrl+Alt+Shift+L/H). Distinct from
         // `resize-column-left/right` (pixel-based) further down — different
         // resolution + different clamping, so we keep both spellings live.
@@ -981,6 +985,7 @@ mod tests {
             ("consume-window-into-column", Action::ConsumeWindowIntoColumn),
             ("expel-window-from-column", Action::ExpelWindowFromColumn),
             ("maximize-column", Action::MaximizeColumn),
+            ("maximize-window-to-edges", Action::MaximizeWindowToEdges),
         ] {
             assert_eq!(parse_action_name(name, &[]), Some(action), "{name}");
         }

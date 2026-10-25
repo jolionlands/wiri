@@ -189,12 +189,16 @@ binds {
     //               a column of its own on the right
     //   Mod+E       the column takes the width the others leave free
     //   Mod+Shift+F maximize-column: the column is as wide as the view (toggle; also for one window)
+    //   Mod+M       maximize-window-to-edges: the window fills the work area (no gaps, no border)
+    //               and keeps its place in its column (toggle).  Mod+F is fullscreen, which also
+    //               hides the taskbar; the other windows are not hidden for either
     //   Mod+Shift+L / H  grow / shrink the column width by 5%
     //   Mod+Shift+K / J  grow / shrink the tile height by 5% (columns with several windows)
     Mod+Comma        { consume-window-into-column; }
     Mod+Period       { expel-window-from-column; }
     Mod+E            { expand-column-to-available-width; }
     Mod+Shift+F      { maximize-column; }
+    Mod+M            { maximize-window-to-edges; }
     Mod+Shift+L      { grow-column-width; }
     Mod+Shift+H      { shrink-column-width; }
     Mod+Shift+K      { grow-tile-height; }
