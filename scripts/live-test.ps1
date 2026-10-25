@@ -816,9 +816,10 @@ $scr = [System.Windows.Forms.Screen]::PrimaryScreen
 $sb = $scr.Bounds
 $swa = $scr.WorkingArea
 
-# The windows wiri manages, as `wiri-ctl --json windows` reports them (hwnd, workspace, floating).
+# The windows wiri manages, as `wiri-ctl --json window-list` reports them (hwnd, column, workspace,
+# floating).  `wiri-ctl windows` prints niri's shape since schema 1.2 (no column, `id` not `hwnd`).
 function WinList([string]$tag) {
-    $raw = Ctl $tag @('--json', 'windows')
+    $raw = Ctl $tag @('--json', 'window-list')
     try { return @(($raw | ConvertFrom-Json).result) } catch { return @() }
 }
 function WinOf($list, $hwnd) { return (@($list | Where-Object { [int64]$_.hwnd -eq [int64]$hwnd }) | Select-Object -First 1) }
@@ -1568,7 +1569,7 @@ $h11ForegroundNow = [int64][LT]::GetForegroundWindow()
 $h11CloakedAfterAltTab = H11Cloaked
 $h11VisibleAfterAltTab = H11Visible
 $h11DrawnAfterAltTab = H11Drawn 'h11-03-after-alt-tab'
-$null = Ctl 'h11-windows-after-alt-tab' @('--json', 'windows')
+$null = Ctl 'h11-windows-after-alt-tab' @('--json', 'window-list')
 
 # away again, then wiri dies: the windows stay cloaked (nobody is left to show them)
 $null = Ctl 'h11-ws2-again' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2500
