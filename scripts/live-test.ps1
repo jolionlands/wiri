@@ -474,16 +474,33 @@ function OnScreen($h) {
 function OnScreenCount($hwnds) { @($hwnds | Where-Object { [LT]::IsWindow($_) -and [LT]::IsWindowVisible($_) -and -not [LT]::IsIconic($_) -and (OnScreen $_) }).Count }
 function NewTopLevel($before) { @([LT]::TopLevel() | Where-Object { $before -notcontains $_ }) }
 
+# The pipe of this user in this session (WIRI_PIPE overrides the name).
+function WiriPipeName {
+    if ($env:WIRI_PIPE) { return ($env:WIRI_PIPE -replace '^\\\\\.\\pipe\\', '') }
+    $user = ($env:USERNAME -replace '[^A-Za-z0-9._-]', '_')
+    return "wiri_control_${user}_$((Get-Process -Id $PID).SessionId)"
+}
 function Start-Wiri([string]$stderrLog, [string]$stdoutLog) {
     # Isolate wiri's files, not the environment of unrelated test applications
     # (in particular Windows Terminal's font/minimum-size profile).
     $savedRoaming = $env:APPDATA; $savedLocal = $env:LOCALAPPDATA
     try {
         $env:APPDATA = $testRoaming; $env:LOCALAPPDATA = $testLocal
-        return Start-Process -FilePath $wiri -ArgumentList '-v' -RedirectStandardError $stderrLog -RedirectStandardOutput $stdoutLog -PassThru
+        $p = Start-Process -FilePath $wiri -ArgumentList '-v' -RedirectStandardError $stderrLog -RedirectStandardOutput $stdoutLog -PassThru
     } finally {
         $env:APPDATA = $savedRoaming; $env:LOCALAPPDATA = $savedLocal
     }
+    # Return once wiri serves its pipe (or has exited): a start took 4.3 s on the hosted ARM64 runner, longer than
+    # the fixed waits after it, against 20-50 ms on x64.
+    # Listing \\.\pipe\ can throw on Windows PowerShell when another program's pipe name is not a valid path; the
+    # callers' fixed waits then apply as before.
+    $pipe = "\\.\pipe\$(WiriPipeName)"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 20000 -and -not $p.HasExited) {
+        try { if ([IO.Directory]::GetFiles('\\.\pipe\') -contains $pipe) { break } } catch { break }
+        Start-Sleep -Milliseconds 50
+    }
+    return $p
 }
 
 # ---- clean slate -----------------------------------------------------------------------------
@@ -1295,9 +1312,15 @@ Press 'ctrl+alt+f7'
 $pC = WinW $sf[1]
 Press 'ctrl+alt+f9'
 $pD = WinW $sf[1]
-# presets: a third, a half, two thirds (on a 1366 px screen 431, 659 and 887 px windows)
-$h7PresetCycle = (Near $pA (H7Width 0.5) 14) -and (Near $pB (H7Width (2 / 3)) 14) -and (Near $pC (H7Width (1 / 3)) 14) -and
-    (Near $pD (H7Width (2 / 3)) 14)
+# presets: a third, a half, two thirds (on a 1366 px screen 431, 659 and 887 px windows).  From 600 px the first press
+# picks the first preset wider than that (a half at 1366 px, two thirds at 1024 px), then the next ones in a cycle.
+$h7Presets = @((H7Width (1 / 3)), (H7Width 0.5), (H7Width (2 / 3)))
+$h7First = 0
+while ($h7First -lt 3 -and $h7Presets[$h7First] -le 600) { $h7First++ }
+if ($h7First -ge 3) { $h7First = 0 }
+$h7Pick = { param($i) $h7Presets[(($h7First + $i) % 3 + 3) % 3] }
+$h7PresetCycle = (Near $pA (& $h7Pick 0) 14) -and (Near $pB (& $h7Pick 1) 14) -and (Near $pC (& $h7Pick 2) 14) -and
+    (Near $pD (& $h7Pick 1) 14)
 Shot 'h7-05-presets'
 
 # --- focus-workspace 2 is the second workspace, focus-workspace "2" the workspace named "2" (there is none)
@@ -2281,14 +2304,7 @@ function H15Step([scriptblock]$act, [int]$settleMs) {
 }
 # A request written to the pipe as it is, the way a client in another language sends it.
 function PipeRequest([string]$json) {
-    # The pipe of this user in this session (WIRI_PIPE overrides the name).
-    $pipeName = if ($env:WIRI_PIPE) {
-        $env:WIRI_PIPE -replace '^\\\\\.\\pipe\\', ''
-    } else {
-        $user = ($env:USERNAME -replace '[^A-Za-z0-9._-]', '_')
-        $session = (Get-Process -Id $PID).SessionId
-        "wiri_control_${user}_${session}"
-    }
+    $pipeName = WiriPipeName
     $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
     try {
         $c.Connect(5000)
