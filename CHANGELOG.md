@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — overview host
+- Port the session-local DWM overview host, hit testing and H19 desktop fragment; resources are created only for an overview session.
+
 ### Phase 2B integration — decoration foundation
 - Port the Phase 2B effects decoder, pure decoration model and passive layer foundation onto the integrated input/output base, retaining both backend module lists.
 
