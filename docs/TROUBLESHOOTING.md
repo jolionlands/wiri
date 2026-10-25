@@ -45,6 +45,13 @@ after a kill or a crash puts them back in their real places.  A window whose
 place is not known and that an earlier killed wiri left off-screen is moved back
 onto the work area (several of them cascaded, not stacked).
 
+With `layout { hide-method "cloak" }` the windows of other workspaces are not hidden
+but cloaked (still in the taskbar and Alt+Tab, not drawn).  If wiri is killed meanwhile
+they stay cloaked; `hidden.json` marks them, and starting wiri again uncloaks them
+before it enumerates the desktop.  If Windows does not offer the shell interfaces
+cloaking needs, the log says "does not offer the shell interfaces" once and the
+windows are hidden the plain way.
+
 ### Known hotkey conflicts on Windows
 
 Windows reserves a handful of chords for the OS itself or its GPU/accessibility

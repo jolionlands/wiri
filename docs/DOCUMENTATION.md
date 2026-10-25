@@ -318,6 +318,7 @@ output "\\\\.\\DISPLAY2" {
 | `scroll-step` | u32 | `200` | Pixels scrolled per scroll action |
 | `split-ratio` | f64 | `0.5` | Default split ratio for new columns |
 | `auto-balance` | bool | `false` | Auto-balance column widths |
+| `hide-method` | string | `"hide"` | How the windows of other workspaces are hidden: `"hide"` (`SW_HIDE`: they leave the taskbar and Alt+Tab) or `"cloak"` (the shell cloaks them: they stay in the taskbar and Alt+Tab but are not drawn; Alt+Tab to one brings its workspace along).  Cloaking uses undocumented shell interfaces; where Windows does not offer them wiri says so in its log and hides the plain way |
 
 ### Config `animations {}` Block
 

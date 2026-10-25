@@ -637,6 +637,9 @@ fn apply_layout_property(key: &str, value: &str, config: &mut Config) {
         "status_bar" | "status-bar" => {
             config.layout.status_bar = value == "true" || value == "1";
         }
+        "hide_method" | "hide-method" => {
+            config.layout.hide_method = value.to_string();
+        }
         "reserve_top" | "reserve-top" => {
             if let Ok(v) = value.parse() {
                 config.layout.reserve_top = v;
@@ -2607,6 +2610,20 @@ output "HDMI-1" {
         assert_eq!(cfg.layout.inner_gaps, 16);
         assert_eq!(cfg.layout.outer_gaps, 8);
         assert!(!cfg.layout.shadow_enable);
+    }
+
+    #[test]
+    fn test_hide_method_parses_and_defaults_to_hide() {
+        let cfg = parse_kdl_config("layout {\n    inner-gaps 8\n}\n").unwrap();
+        assert_eq!(cfg.layout.hide_method, "hide");
+        let cfg = parse_kdl_config("layout {\n    hide-method \"cloak\"\n}\n").unwrap();
+        assert_eq!(cfg.layout.hide_method, "cloak");
+        assert_eq!(
+            crate::backend::cloak::HideMethod::parse(&cfg.layout.hide_method),
+            Some(crate::backend::cloak::HideMethod::Cloak)
+        );
+        let cfg = parse_kdl_config("layout {\n    hide-method hide\n}\n").unwrap();
+        assert_eq!(cfg.layout.hide_method, "hide");
     }
 
     #[test]

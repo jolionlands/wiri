@@ -439,6 +439,11 @@ pub struct LayoutConfig {
     /// local time (right).  Opt-in via `status-bar true` inside `layout { }`.
     /// Default `false`.
     pub status_bar: bool,
+    /// How the windows of inactive workspaces are hidden: `"hide"` (`SW_HIDE`, the
+    /// default: they leave the taskbar and Alt+Tab) or `"cloak"` (shell cloaking: they stay
+    /// in the taskbar and Alt+Tab but are not drawn; off by default because it relies on
+    /// undocumented shell interfaces).  Set via `hide-method` inside `layout { }`.
+    pub hide_method: String,
 
     // ---- screen-area reservation for external bars / panels ----
     /// Pixels to subtract from the top of each monitor's tiling work area.
@@ -489,6 +494,7 @@ impl LayoutConfig {
             snap_threshold_px: 20,
             smart_borders: false,
             status_bar: false,
+            hide_method: "hide".to_string(),
             reserve_top: 0,
             reserve_bottom: 0,
             reserve_left: 0,

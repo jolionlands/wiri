@@ -16,7 +16,10 @@
 #          "50%" / "+10%" / "600", presets, focus-workspace 2 against focus-workspace "2", set-window-height),
 #          H8 the workspace model (named workspaces, index addressing, previous, back and forth, no wrap),
 #          H9 the Phase 0 leftovers (default hotkeys that register, an exact fullscreen, a terminal's minimum width,
-#          windows put back where they were after a crash).
+#          windows put back where they were after a crash), H11 hide-method "cloak" (the windows of another
+#          workspace stay visible to the system but are not drawn; Alt+Tab to one brings its workspace; a crash,
+#          a restart and a quit leave nothing cloaked).  (H10, monitor unplug, needs a second display: engine unit
+#          tests only.)
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -57,6 +60,31 @@ public static class LT {
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
+  [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")] static extern int DwmGetUInt(IntPtr h, int attr, out uint value, int size);
+  // DWMWA_CLOAKED: nonzero while something (the application, the shell, the owner) keeps DWM from drawing the window;
+  // -1 when DWM does not answer.
+  public static int Cloaked(IntPtr h) { uint v; int hr = DwmGetUInt(h, 14, out v, 4); return hr == 0 ? (int)v : -1; }
+  // How many pixels of a screenshot have exactly this colour (a window of a plain colour that is on the screen).
+  public static int CountColor(string path, int r, int g, int b) {
+    using (var bmp = new System.Drawing.Bitmap(path)) {
+      var rect = new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height);
+      var data = bmp.LockBits(rect, System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+      int count = 0;
+      try {
+        int stride = data.Stride;
+        byte[] row = new byte[stride];
+        for (int y = 0; y < bmp.Height; y++) {
+          Marshal.Copy(IntPtr.Add(data.Scan0, y * stride), row, 0, stride);
+          for (int x = 0; x < bmp.Width; x++) {
+            int i = x * 4;
+            if (row[i] == b && row[i + 1] == g && row[i + 2] == r) { count++; }
+          }
+        }
+      } finally { bmp.UnlockBits(data); }
+      return count;
+    }
+  }
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
@@ -1328,6 +1356,102 @@ $log9c = Join-Path $D 'wiri.stderr9c.log'
 $w = Start-Wiri $log9c ($log9c + '.out')
 Start-Sleep -Seconds 4
 
+# ---- H11: hide-method "cloak" - the windows of another workspace stay visible to the system but are not drawn ---------
+# The default (hide) is what every phase above ran with; this one asks for the shell's cloak.  The windows are plain-coloured
+# forms, so "not drawn" is read off the screenshot: not one pixel of their colour is left.
+$log11 = Join-Path $D 'wiri.stderr11.log'
+$h11Config = @"
+layout {
+    hide-method "cloak"
+}
+"@
+Stop-WiriGracefully $w 'h11'
+$w11 = Start-WiriWithConfig $h11Config $log11
+$w = $w11
+$h11Warnings = (LogLines $log11 'hide-method').Count + (LogLines $log11 'does not offer the shell').Count
+$h11Colors = @(@(255, 0, 255), @(0, 255, 255), @(255, 255, 0))
+$cf11 = @()
+foreach ($i in 0..2) {
+    $cf11 += [TestForms]::Open("wiri-h11-$($i + 1)", $h11Colors[$i][0], $h11Colors[$i][1], $h11Colors[$i][2])
+    Start-Sleep -Milliseconds 1500
+}
+Start-Sleep -Seconds 2
+function H11Drawn([string]$shot) {
+    Shot $shot
+    $p = Join-Path $D "$shot.png"
+    return @(0, 1, 2 | ForEach-Object { [LT]::CountColor($p, $h11Colors[$_][0], $h11Colors[$_][1], $h11Colors[$_][2]) })
+}
+function H11Cloaked() { return @($cf11 | ForEach-Object { [int][LT]::Cloaked($_) }) }
+function H11Visible() { return @($cf11 | ForEach-Object { [LT]::IsWindowVisible($_) }) }
+function H11TaskbarNames() {
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes -ErrorAction Stop
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ClassNameProperty, 'Shell_TrayWnd')
+        $tray = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
+        if ($null -eq $tray) { return @() }
+        $all = $tray.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        return @($all | ForEach-Object { $_.Current.Name } | Where-Object { $_ })
+    } catch { return @() }
+}
+$h11DrawnBefore = H11Drawn 'h11-01-three-forms'
+$h11TaskbarBefore = H11TaskbarNames
+Set-Content (Join-Path $D 'h11-taskbar-before.txt') $h11TaskbarBefore
+
+# to the second workspace: the three forms leave the screen but not the system
+$null = Ctl 'h11-ws2' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2200
+$h11Cloaked = H11Cloaked
+$h11Visible = H11Visible
+$h11DrawnAway = H11Drawn 'h11-02-forms-cloaked'
+$h11TaskbarAway = H11TaskbarNames
+Set-Content (Join-Path $D 'h11-taskbar-cloaked.txt') $h11TaskbarAway
+$hj11 = Join-Path $wiriData 'hidden.json'
+$h11RecordedCloaked = 0
+if (Test-Path $hj11) {
+    try {
+        $mine = @($cf11 | ForEach-Object { [int64]$_ })
+        $h11RecordedCloaked = @(((Get-Content $hj11 -Raw) | ConvertFrom-Json).windows | Where-Object { $mine -contains [int64]$_.hwnd -and $_.cloaked }).Count
+        Copy-Item $hj11 (Join-Path $D 'h11-hidden-while-cloaked.json') -Force
+    } catch { $h11RecordedCloaked = -1 }
+}
+
+# the OS (Alt+Tab, a taskbar button) asks for the first form, which is cloaked: its workspace comes with it
+[void][LT]::SwitchToThisWindow($cf11[0], $true)
+Start-Sleep -Milliseconds 2200
+$h11CloakedAfterAltTab = H11Cloaked
+$h11VisibleAfterAltTab = H11Visible
+$h11ForegroundIsFirst = ([LT]::GetForegroundWindow() -eq $cf11[0])
+$h11DrawnAfterAltTab = H11Drawn 'h11-03-after-alt-tab'
+
+# away again, then wiri dies: the windows stay cloaked (nobody is left to show them)
+$null = Ctl 'h11-ws2-again' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2200
+$h11CloakedBeforeCrash = H11Cloaked
+Stop-Process -Id $w.Id -Force
+Start-Sleep -Seconds 2
+$h11CloakedWhileDead = H11Cloaked
+$h11DrawnWhileDead = H11Drawn 'h11-04-wiri-dead'
+# started again, wiri shows (uncloaks) what the dead one had hidden
+$log11b = Join-Path $D 'wiri.stderr11b.log'
+$w11b = Start-Wiri $log11b ($log11b + '.out')
+Start-Sleep -Seconds 5
+$h11CloakedAfterRestart = H11Cloaked
+$h11DrawnAfterRestart = H11Drawn 'h11-05-after-restart'
+
+# and a quit with windows cloaked puts everything back
+$null = Ctl 'h11-ws2-third' @('switch-workspace', '2'); Start-Sleep -Milliseconds 2200
+$h11CloakedBeforeQuit = H11Cloaked
+Stop-WiriGracefully $w11b 'h11b'
+Start-Sleep -Milliseconds 1000
+$h11CloakedAfterQuit = H11Cloaked
+$h11VisibleAfterQuit = H11Visible
+foreach ($f in $cf11) { [TestForms]::CloseForm($f) }
+Start-Sleep -Milliseconds 1500
+# the instance that is left running for the rest of the script: the default method again
+Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+$log11c = Join-Path $D 'wiri.stderr11c.log'
+$w = Start-Wiri $log11c ($log11c + '.out')
+Start-Sleep -Seconds 4
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -1561,6 +1685,18 @@ $summary = [ordered]@{
     h9_originals_survive_the_restart = ($h9OriginalsAfterRestart -eq $cf.Count)
     h9_every_window_back_where_it_was_after_crash_and_quit = ($h9Restored -eq $cf.Count)
     h9_record_gone_after_a_graceful_quit = $h9RecordGoneAfterQuit
+    # --- Phase 1 / H11: hide-method "cloak"
+    h11_config_accepted_without_warnings = ($h11Warnings -eq 0)
+    h11_forms_drawn_before_hiding = (@($h11DrawnBefore | Where-Object { $_ -gt 1000 }).Count -eq 3)
+    h11_other_workspace_windows_are_cloaked_not_hidden = ((@($h11Cloaked | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11Visible | Where-Object { $_ }).Count -eq 3))
+    h11_cloaked_windows_are_not_drawn = (@($h11DrawnAway | Where-Object { $_ -eq 0 }).Count -eq 3)
+    h11_hidden_json_marks_them_cloaked = ($h11RecordedCloaked -eq 3)
+    h11_alt_tab_to_a_cloaked_window_brings_its_workspace = ($h11ForegroundIsFirst -and (@($h11CloakedAfterAltTab | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11DrawnAfterAltTab | Where-Object { $_ -gt 1000 }).Count -eq 3))
+    h11_windows_stay_cloaked_when_wiri_dies = ((@($h11CloakedBeforeCrash | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11CloakedWhileDead | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11DrawnWhileDead | Where-Object { $_ -eq 0 }).Count -eq 3))
+    h11_restart_uncloaks_what_the_dead_wiri_hid = ((@($h11CloakedAfterRestart | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11DrawnAfterRestart | Where-Object { $_ -gt 1000 }).Count -eq 3))
+    h11_quit_uncloaks_everything = ((@($h11CloakedBeforeQuit | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11CloakedAfterQuit | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11VisibleAfterQuit | Where-Object { $_ }).Count -eq 3))
+    h11_taskbar_buttons_before = (($h11TaskbarBefore | Where-Object { $_ -match 'running window' }) -join ' | ')
+    h11_taskbar_buttons_while_cloaked = (($h11TaskbarAway | Where-Object { $_ -match 'running window' }) -join ' | ')
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

@@ -92,6 +92,14 @@ layout {
     column-width 500
     // Pixels scrolled per scroll-left / scroll-right action.
     scroll-step 200
+    // How the windows of the other workspaces are hidden: "hide" (the default;
+    // they leave the taskbar and Alt+Tab) or "cloak" (the shell cloaks them: they
+    // stay in the taskbar and Alt+Tab but are not drawn, and Alt+Tab to one brings
+    // its workspace along).  Cloaking relies on undocumented shell interfaces: if
+    // Windows does not offer them wiri logs that and hides the plain way.  If wiri
+    // is killed while windows are cloaked, start it again and it shows them.
+    // hide-method "cloak"
+
     // Dim unfocused windows (0.1-1.0, 1.0 = no dimming).  Dimming makes wiri
     // turn every managed window into a layered window, which some apps (Windows
     // Terminal, Chromium) do not like - opt in with e.g. 0.92.

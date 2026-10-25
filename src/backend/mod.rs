@@ -1,5 +1,6 @@
 pub mod accent;
 pub mod cbt_hook;
+pub mod cloak;
 pub mod hidden;
 pub mod hooks;
 pub mod hotkey_conflicts;
@@ -766,13 +767,34 @@ impl BackendHandle {
     /// `ShowWindowAsync`, which posts to the window's own thread: a hung
     /// application can no longer freeze wiri (and, through the engine lock, its
     /// IPC server) inside a synchronous `ShowWindow`.
+    ///
+    /// Hiding is `SW_HIDE`, or - with `hide-method "cloak"` - shell cloaking, which keeps
+    /// the window in the taskbar and in Alt+Tab (see `cloak`); a window that cannot be
+    /// cloaked is hidden the plain way.  Showing undoes whichever was done.
     pub fn show_window(&self, hwnd: isize, show: bool) -> Result<()> {
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        if show {
+            hidden::note_hidden(hwnd, false, false);
+            // A no-op unless this run cloaked the window.
+            cloak::uncloak(hwnd);
+            unsafe {
+                let _ = ShowWindowAsync(hwnd_win, SW_SHOWNA);
+            }
+            return Ok(());
+        }
         // Record the hide first: if wiri dies right after the call, the next
-        // start still knows this window must be shown again.
-        hidden::note_hidden(hwnd, !show);
+        // start still knows this window must be shown again (and uncloaked).
+        if cloak::wanted() {
+            hidden::note_hidden(hwnd, true, true);
+            if cloak::cloak(hwnd) {
+                return Ok(());
+            }
+        }
+        hidden::note_hidden(hwnd, true, false);
+        // The method may have been changed while the window was cloaked.
+        cloak::uncloak(hwnd);
         unsafe {
-            let _ = ShowWindowAsync(hwnd_win, if show { SW_SHOWNA } else { SW_HIDE });
+            let _ = ShowWindowAsync(hwnd_win, SW_HIDE);
         }
         Ok(())
     }

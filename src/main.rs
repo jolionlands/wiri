@@ -296,6 +296,8 @@ async fn main() -> Result<()> {
 
     // Convert config to layout config
     let layout_config = LayoutConfig::from_config(&config);
+    let hide_method = hide_method_of(&config);
+    wiri::backend::cloak::set_hide_method(hide_method);
 
     // Initialize backend
     let mut backend = Backend::new()?;
@@ -341,6 +343,7 @@ async fn main() -> Result<()> {
         let mut engine = engine.write();
         // Apply window rules from config
         engine.set_full_config(config.clone());
+        engine.set_hide_method(hide_method);
         engine.set_layout_request_channel(layout_req_tx);
 
         // Opt into DWM thumbnail-based overview: shrunken live previews of
@@ -968,13 +971,32 @@ fn apply_loaded_config(
 
     apply_mouse_config(&new_config.input);
     mouse_tracker.write().set_config(mouse_config);
+    let hide_method = hide_method_of(&new_config);
+    wiri::backend::cloak::set_hide_method(hide_method);
     {
         let mut engine = engine.write();
         engine.update_config(new_layout_config);
         engine.set_full_config(new_config);
+        engine.set_hide_method(hide_method);
         engine.apply_all(handle);
     }
     message_loop.reload_hotkeys();
+}
+
+/// `layout { hide-method }`: `hide` (the default) or `cloak`.  A value that is neither is
+/// reported and ignored.
+fn hide_method_of(config: &Config) -> wiri::backend::cloak::HideMethod {
+    use wiri::backend::cloak::HideMethod;
+    match HideMethod::parse(&config.layout.hide_method) {
+        Some(method) => method,
+        None => {
+            warn!(
+                "layout hide-method {:?} is not one of \"hide\", \"cloak\"; using \"hide\"",
+                config.layout.hide_method
+            );
+            HideMethod::Hide
+        }
+    }
 }
 
 fn configured_monitor_scale(

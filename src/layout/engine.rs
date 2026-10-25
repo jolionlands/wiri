@@ -533,6 +533,11 @@ pub struct TilingEngine {
     /// The monitors that were unplugged, until they come back (or for good: the windows
     /// they held are on another monitor meanwhile).
     unplugged: HashMap<OutputId, UnpluggedMonitor>,
+    /// How the windows of inactive workspaces are hidden (from the config; the backend has
+    /// its own copy of the setting).
+    hide_method: crate::backend::cloak::HideMethod,
+    /// When wiri hid each window of an inactive workspace.
+    hidden_since: HashMap<WindowId, std::time::Instant>,
     window_sizing: HashMap<WindowId, SizingMode>,
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
@@ -668,6 +673,8 @@ impl TilingEngine {
             window_min_widths: HashMap::new(),
             min_width_queries: HashMap::new(),
             unplugged: HashMap::new(),
+            hide_method: crate::backend::cloak::HideMethod::Hide,
+            hidden_since: HashMap::new(),
             always_on_top: HashSet::new(),
             auto_tile_threshold: None,
             auto_tile_zoom: None,
@@ -985,6 +992,14 @@ impl TilingEngine {
             Some(tx) => tx.send(req).is_ok(),
             None => false,
         }
+    }
+
+    /// How the windows of inactive workspaces are hidden: `SW_HIDE` (they leave the taskbar
+    /// and Alt+Tab) or shell cloaking (they stay).  With cloaking, a window of another
+    /// workspace that takes the OS focus (Alt+Tab, a taskbar click) brings its workspace
+    /// along instead of being ignored.
+    pub fn set_hide_method(&mut self, method: crate::backend::cloak::HideMethod) {
+        self.hide_method = method;
     }
 
     pub fn register_monitor(&mut self, output_id: OutputId, bounds: Rect, work_area: Rect) {
@@ -1689,6 +1704,7 @@ impl TilingEngine {
         self.original_bounds.remove(&window_id);
         self.window_min_widths.remove(&window_id);
         self.min_width_queries.remove(&window_id);
+        self.hidden_since.remove(&window_id);
         crate::backend::hidden::forget(window_id.as_isize());
 
         if self.last_activated == Some(window_id) {
@@ -1722,6 +1738,9 @@ impl TilingEngine {
     /// The widest minimum a window may claim: anything above is not a minimum width but
     /// garbage (`WM_GETMINMAXINFO` answers are made by the applications).
     const MAX_MIN_WIDTH_PX: u32 = 16_384;
+    /// How long a report that a window of another workspace became the foreground window is
+    /// taken for the OS picking a replacement for what wiri just hid.
+    const HIDE_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
     /// How often a window is asked for its minimum width in all (it may not answer in time
     /// when it has just been created; it is asked again when it takes the focus).
     const MAX_MIN_WIDTH_QUERIES: u8 = 3;
@@ -2067,6 +2086,12 @@ impl TilingEngine {
             .collect();
 
         for wid in to_hide {
+            // Remember when it was hidden: a foreground report for a window that was hidden
+            // a moment ago is the OS picking a replacement, a later one is the user asking
+            // for it (see `sync_os_foreground`).
+            if self.applied_state.get(&wid).map_or(true, |s| s.visible) {
+                self.hidden_since.insert(wid, std::time::Instant::now());
+            }
             // Treat inactive-workspace visibility as authoritative rather than
             // trusting applied_state. The shell/taskbar can re-show hidden HWNDs
             // behind wiri's back, especially app-hosted terminal windows.
@@ -3010,7 +3035,17 @@ impl TilingEngine {
             .get(&output_id)
             .map_or(false, |m| m.active_workspace != workspace_id);
         let hidden_by_wiri = !self.applied_state.get(&window_id).map_or(true, |s| s.visible);
-        if on_inactive_workspace && hidden_by_wiri {
+        // A cloaked window is still in Alt+Tab and on the taskbar: once it has been hidden for
+        // a moment, a report that it is the foreground window is the user asking for it, and
+        // its workspace comes with it.  (A window hidden with SW_HIDE cannot be asked for.)
+        let just_hidden = self
+            .hidden_since
+            .get(&window_id)
+            .map_or(true, |t| t.elapsed() < Self::HIDE_GRACE);
+        if on_inactive_workspace
+            && hidden_by_wiri
+            && (self.hide_method != crate::backend::cloak::HideMethod::Cloak || just_hidden)
+        {
             return None;
         }
 
@@ -14858,6 +14893,58 @@ mod tests {
         assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
         assert_eq!(where_is(&engine, 102), Some((a, 0, 1)));
         assert_eq!(engine.focused_output(), Some(a));
+    }
+
+    // --- hide-method: a cloaked window can be reached through Alt+Tab or the taskbar ---
+
+    #[test]
+    fn test_with_cloaking_a_foreground_report_for_a_hidden_window_brings_its_workspace_along() {
+        use crate::backend::cloak::HideMethod;
+        use std::time::{Duration, Instant};
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        let hidden = WindowId::new(101); // on workspace 1; workspace 0 is the active one
+        engine.apply_layout_for_monitor(oid, &be);
+        assert!(
+            engine.hidden_since.contains_key(&hidden),
+            "the pass that hides a window notes when it did"
+        );
+
+        // The plain way (SW_HIDE): a window that cannot be reached is no report to follow,
+        // however long ago it was hidden - Windows picks a replacement for what was hidden.
+        engine
+            .hidden_since
+            .insert(hidden, Instant::now() - Duration::from_secs(5));
+        assert!(engine.sync_os_foreground(hidden, &be).is_none());
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+
+        // Cloaked: a report right after the hide is still the OS picking a replacement...
+        engine.set_hide_method(HideMethod::Cloak);
+        engine.hidden_since.insert(hidden, Instant::now());
+        assert!(engine.sync_os_foreground(hidden, &be).is_none());
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+
+        // ...a later one is the user asking for the window (Alt+Tab, the taskbar): its
+        // workspace comes along.
+        engine
+            .hidden_since
+            .insert(hidden, Instant::now() - Duration::from_secs(5));
+        assert!(engine.sync_os_foreground(hidden, &be).is_some());
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().focus_window,
+            Some(hidden)
+        );
+    }
+
+    #[test]
+    fn test_a_window_that_closes_forgets_when_it_was_hidden() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.apply_layout_for_monitor(oid, &be);
+        assert!(engine.hidden_since.contains_key(&WindowId::new(101)));
+        engine.remove_window(WindowId::new(101), &be);
+        assert!(!engine.hidden_since.contains_key(&WindowId::new(101)));
     }
 
     #[test]

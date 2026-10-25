@@ -139,6 +139,18 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   moved by the user meanwhile is left alone.  The display-change handler registers the monitors that
   are there before it removes the ones that went.  **Tested with engine unit tests only: the laptop
   these changes are verified on has a single display, so no real unplug has been tried.**
+- **`layout { hide-method "cloak" }` (optional, off by default).**  The windows of the other
+  workspaces are hidden with `SW_HIDE`, which takes them out of the taskbar and out of Alt+Tab.  With
+  `hide-method "cloak"` the shell cloaks them instead (the way komorebi does, through the
+  undocumented `IApplicationView::SetCloak`): they stay visible to the system, keep their taskbar
+  button and their place in Alt+Tab, and are not drawn.  Alt+Tab (or a taskbar click) to a cloaked
+  window brings its workspace along, once the window has been hidden for a moment (a report right after
+  the hide is still Windows picking a replacement).  The shell interfaces are private and change
+  between builds of Windows: the view of a window is asked for by the IID wiri knows before its vtable
+  is used, the first refusal turns cloaking off for the run and the window is hidden the plain way.
+  `hidden.json` marks cloaked windows, so a wiri that is killed while windows are cloaked is
+  followed by one that uncloaks them (also a quit and a panic), and a window that is visible to the
+  system but cloaked is restored.  The default stays `hide`.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal

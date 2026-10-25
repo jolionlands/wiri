@@ -30,6 +30,11 @@ pub struct HiddenWindow {
     pub hwnd: isize,
     pub pid: u32,
     pub class: String,
+    /// The window is hidden by cloaking (`hide-method "cloak"`): it is still visible to the
+    /// system, so showing it again means uncloaking it.  Files from before this existed
+    /// have `false`.
+    #[serde(default)]
+    pub cloaked: bool,
 }
 
 /// Where one managed window was before wiri first moved it (`GetWindowRect`).
@@ -120,7 +125,8 @@ pub fn originals_from_json(text: &str) -> Vec<OriginalWindow> {
 ///
 /// An entry qualifies when the handle still refers to a window, that window
 /// belongs to the same process and has the same class as when it was hidden
-/// (guards against recycled handles), and it is currently not visible.
+/// (guards against recycled handles), and it is currently not visible - or it was
+/// cloaked, which leaves a window visible.
 pub fn select_restorable(
     entries: &[HiddenWindow],
     probe: impl Fn(isize) -> Option<WindowProbe>,
@@ -128,7 +134,9 @@ pub fn select_restorable(
     entries
         .iter()
         .filter(|entry| match probe(entry.hwnd) {
-            Some(p) => !p.visible && p.pid == entry.pid && p.class == entry.class,
+            Some(p) => {
+                (!p.visible || entry.cloaked) && p.pid == entry.pid && p.class == entry.class
+            }
             None => false,
         })
         .map(|entry| entry.hwnd)
@@ -315,12 +323,18 @@ pub fn enable_persistence(path: PathBuf) {
     REGISTRY.lock().path = Some(path);
 }
 
-/// Note that wiri hid (`hidden = true`) or showed (`false`) `hwnd`.
-pub fn note_hidden(hwnd: isize, hidden: bool) {
+/// Note that wiri hid (`hidden = true`) or showed (`false`) `hwnd`; `cloaked` says that the
+/// window is hidden by cloaking, not by `SW_HIDE`.
+pub fn note_hidden(hwnd: isize, hidden: bool, cloaked: bool) {
     let mut registry = REGISTRY.lock();
     // The layout pass re-hides inactive-workspace windows every few hundred
     // milliseconds; a window that is already recorded needs no Win32 lookup.
-    if hidden && registry.windows.iter().any(|w| w.hwnd == hwnd) {
+    if hidden
+        && registry
+            .windows
+            .iter()
+            .any(|w| w.hwnd == hwnd && w.cloaked == cloaked)
+    {
         return;
     }
     let changed = if hidden {
@@ -329,11 +343,13 @@ pub fn note_hidden(hwnd: isize, hidden: bool) {
                 hwnd,
                 pid: 0,
                 class: String::new(),
+                cloaked,
             },
             |p| HiddenWindow {
                 hwnd,
                 pid: p.pid,
                 class: p.class,
+                cloaked,
             },
         ))
     } else {
@@ -407,10 +423,14 @@ pub fn probe_window(hwnd: isize) -> Option<WindowProbe> {
     }
 }
 
-/// Show `hwnd` again without activating it.
-fn show_again(hwnd: isize) {
+/// Show `hwnd` again without activating it (and uncloak it when it was hidden by cloaking:
+/// the wiri that cloaked it may have died, so this does not go by what this run knows).
+fn show_again(hwnd: isize, cloaked: bool) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_SHOWNA};
+    if cloaked {
+        super::cloak::uncloak_forced(hwnd);
+    }
     unsafe {
         let _ = ShowWindowAsync(HWND(hwnd as *mut std::ffi::c_void), SW_SHOWNA);
     }
@@ -432,7 +452,8 @@ pub fn restore_from_file(path: &Path) -> usize {
     let entries = file.windows;
     let restorable = select_restorable(&entries, probe_window);
     for hwnd in &restorable {
-        show_again(*hwnd);
+        let cloaked = entries.iter().any(|e| e.hwnd == *hwnd && e.cloaked);
+        show_again(*hwnd, cloaked);
     }
     // `ShowWindowAsync` only posts the request; give the owning threads a
     // moment to act on it so the desktop enumeration that follows sees the
@@ -482,7 +503,7 @@ pub fn restore_all_hidden() -> usize {
         windows
     };
     for window in &windows {
-        show_again(window.hwnd);
+        show_again(window.hwnd, window.cloaked);
     }
     windows.len()
 }
@@ -496,6 +517,14 @@ mod tests {
             hwnd,
             pid,
             class: class.to_string(),
+            cloaked: false,
+        }
+    }
+
+    fn cloaked_win(hwnd: isize, pid: u32, class: &str) -> HiddenWindow {
+        HiddenWindow {
+            cloaked: true,
+            ..win(hwnd, pid, class)
         }
     }
 
@@ -576,6 +605,34 @@ mod tests {
             _ => None,
         };
         assert_eq!(select_restorable(&entries, probe), vec![1]);
+    }
+
+    #[test]
+    fn test_a_cloaked_window_is_restored_although_it_is_visible() {
+        // Cloaking leaves a window visible to the system, so "not visible" cannot be the test.
+        let entries = vec![
+            cloaked_win(1, 10, "A"), // cloaked by a wiri that died: uncloak it
+            win(2, 10, "A"),         // hidden the plain way and visible again: leave it
+            cloaked_win(3, 10, "A"), // cloaked, but the handle is now another process's window
+        ];
+        let probe = |hwnd: isize| {
+            Some(WindowProbe {
+                pid: if hwnd == 3 { 99 } else { 10 },
+                class: "A".into(),
+                visible: true,
+            })
+        };
+        assert_eq!(select_restorable(&entries, probe), vec![1]);
+    }
+
+    #[test]
+    fn test_the_cloaked_flag_survives_the_file_and_is_absent_in_old_files() {
+        let windows = vec![cloaked_win(1, 2, "X"), win(3, 4, "Y")];
+        let back = from_json(&to_json(&windows, 5));
+        assert_eq!(back, windows);
+        assert!(back[0].cloaked && !back[1].cloaked);
+        let old = r#"{ "wiri_pid": 5, "windows": [ { "hwnd": 1, "pid": 2, "class": "X" } ] }"#;
+        assert!(!from_json(old)[0].cloaked);
     }
 
     #[test]
