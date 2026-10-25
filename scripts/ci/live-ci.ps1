@@ -1,4 +1,5 @@
 # Experimental hosted-runner adapter. Never schedules a task, unlocks a session, or installs GUI software.
+# On a disposable runner it may close Windows' first-run privacy screen when that screen holds the foreground.
 [CmdletBinding()]
 param(
     [string]$Bin = 'target\release',
@@ -20,6 +21,8 @@ $preflight = [ordered]@{
     input_desktop = $null
     thread_desktop = $null
     interactive_desktop = $false
+    foreground_process = $null
+    first_run_screen_dismissed = $false
     reason = ''
 }
 $summary = [pscustomobject]@{ status = 'skipped'; ci = $preflight }
@@ -51,8 +54,25 @@ public static class WiriCiDesktop {
         if (desktop == IntPtr.Zero) return "";
         try { return Name(desktop); } finally { CloseDesktop(desktop); }
     }
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    public static uint ForegroundPid() {
+        uint pid = 0;
+        IntPtr hwnd = GetForegroundWindow();
+        if (hwnd != IntPtr.Zero) GetWindowThreadProcessId(hwnd, out pid);
+        return pid;
+    }
 }
 '@
+    # The hosted windows-11-arm image (2026-10) boots into Windows' first-run privacy screen, which holds the
+    # foreground: every SetForegroundWindow, from wiri or the harness, is refused and about 60 focus gates fail.
+    function Get-ForegroundProcessName {
+        $fgPid = [WiriCiDesktop]::ForegroundPid()
+        if ($fgPid -eq 0) { return '' }
+        $p = Get-Process -Id $fgPid -ErrorAction SilentlyContinue
+        if ($p) { $p.ProcessName } else { '' }
+    }
+    $firstRunProcesses = @('WWAHost', 'CloudExperienceHostBroker', 'UserOOBEBroker', 'msoobe')
     $preflight.input_desktop = [WiriCiDesktop]::InputName()
     $preflight.thread_desktop = [WiriCiDesktop]::ThreadName()
     if (-not $preflight.user_interactive -or $preflight.session_id -eq 0 -or
@@ -73,6 +93,23 @@ public static class WiriCiDesktop {
             $preflight.interactive_desktop = $true
         } catch {
             $preflight.reason = "Desktop capture unavailable: $($_.Exception.Message). No live phases ran (this is not a pass)."
+        }
+        $preflight.foreground_process = Get-ForegroundProcessName
+        if ($preflight.interactive_desktop -and -not $ProbeOnly -and $firstRunProcesses -contains $preflight.foreground_process) {
+            # Disposable runner only (checked above): turn the privacy experience off and close the screen by PID.
+            try {
+                New-Item -Force 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' | Out-Null
+                Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Name DisablePrivacyExperience -Value 1 -Type DWord
+            } catch { Write-Warning "Could not set DisablePrivacyExperience: $($_.Exception.Message)" }
+            Stop-Process -Id ([WiriCiDesktop]::ForegroundPid()) -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            $after = Get-ForegroundProcessName
+            $preflight.first_run_screen_dismissed = -not ($firstRunProcesses -contains $after)
+            $preflight.foreground_process = "$($preflight.foreground_process) -> $after"
+            if (-not $preflight.first_run_screen_dismissed) {
+                $preflight.interactive_desktop = $false
+                $preflight.reason = "Windows' first-run privacy screen ($after) holds the foreground and could not be closed. No live phases ran (this is not a pass)."
+            }
         }
     }
     if ($ProbeOnly) {
