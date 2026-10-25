@@ -1,4 +1,5 @@
 pub mod dispatch;
+pub mod focus;
 pub mod keyboard;
 pub mod pointer;
 pub mod grab;

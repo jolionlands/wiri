@@ -66,22 +66,24 @@ $ownsLiveLock = $false
 try { $ownsLiveLock = $liveLock.WaitOne([TimeSpan]::FromMinutes([Math]::Max(0, $LockWaitMinutes))) }
 catch [System.Threading.AbandonedMutexException] { $ownsLiveLock = $true }
 if (-not $ownsLiveLock) { throw 'Another wiri live test is running on this machine; this run refuses to start (two runs would spoil each other).' }
+# A lock protects cooperating runs, not an independently started user daemon.
+# Never stop someone else's process or overwrite their real profile/config.
+if (@(Get-Process -Name wiri -ErrorAction SilentlyContinue).Count -ne 0) {
+    throw 'An existing wiri instance is running; refusing to stop an unowned process.'
+}
 $D = [System.IO.Path]::GetFullPath($Out)
-if (Get-Process wiri -ErrorAction SilentlyContinue) { throw 'A wiri process not started by this run exists. Leave it alone; the operator must stop it before live testing.' }
+# Every wiri this run starts keeps its config and state in this run's evidence (Start-Wiri), so the
+# real user's config and recovery journal on a shared developer desktop are never reset.
+$testRoaming = Join-Path $D 'profile\roaming'
+$testLocal = Join-Path $D 'profile\local'
 # An interrupted run may have hidden real desktop windows. Preserve its recovery journal
 # while replacing evidence, so the first daemon restores them before enumerating windows.
-$previousRecoveryPath = Join-Path $D 'AppData\Local\wiri\hidden.json'
+$previousRecoveryPath = Join-Path $testLocal 'wiri\hidden.json'
 $previousRecovery = $null
 if (Test-Path $previousRecoveryPath) { $previousRecovery = [IO.File]::ReadAllBytes($previousRecoveryPath) }
 if (Test-Path $D) { Remove-Item -Recurse -Force $D }
 New-Item -ItemType Directory -Force $D | Out-Null
-# Safety: every instance and its children write config/state only in this worktree's evidence.
-# Do not reset the real user's config or recovery journal on a shared developer desktop.
-$env:APPDATA = Join-Path $D 'AppData\Roaming'
-$env:LOCALAPPDATA = Join-Path $D 'AppData\Local'
-$env:TEMP = Join-Path $D 'Temp'
-$env:TMP = $env:TEMP
-New-Item -ItemType Directory -Force $env:APPDATA, $env:LOCALAPPDATA, $env:TEMP | Out-Null
+New-Item -ItemType Directory -Force $testRoaming, $testLocal | Out-Null
 $wiri = Join-Path $Bin 'wiri.exe'
 $ctl = Join-Path $Bin 'wiri-ctl.exe'
 $steps = New-Object System.Collections.Generic.List[object]
@@ -473,15 +475,23 @@ function OnScreenCount($hwnds) { @($hwnds | Where-Object { [LT]::IsWindow($_) -a
 function NewTopLevel($before) { @([LT]::TopLevel() | Where-Object { $before -notcontains $_ }) }
 
 function Start-Wiri([string]$stderrLog, [string]$stdoutLog) {
-    return Start-Process -FilePath $wiri -ArgumentList '-v' -RedirectStandardError $stderrLog -RedirectStandardOutput $stdoutLog -PassThru
+    # Isolate wiri's files, not the environment of unrelated test applications
+    # (in particular Windows Terminal's font/minimum-size profile).
+    $savedRoaming = $env:APPDATA; $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:APPDATA = $testRoaming; $env:LOCALAPPDATA = $testLocal
+        return Start-Process -FilePath $wiri -ArgumentList '-v' -RedirectStandardError $stderrLog -RedirectStandardOutput $stdoutLog -PassThru
+    } finally {
+        $env:APPDATA = $savedRoaming; $env:LOCALAPPDATA = $savedLocal
+    }
 }
 
 # ---- clean slate -----------------------------------------------------------------------------
-if (Get-Process wiri -ErrorAction SilentlyContinue) { throw 'A wiri process not started by this run exists. Leave it alone; the operator must stop it before live testing.' }
-$cfg = Join-Path $env:APPDATA 'wiri\config.kdl'
+# Existing daemons were refused before initialization; only owned PIDs are stopped below.
+$cfg = Join-Path $testRoaming 'wiri\config.kdl'
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.before') -Force; Remove-Item $cfg -Force }   # test the generated default config
-$wiriData = Join-Path $env:LOCALAPPDATA 'wiri'
-foreach ($f in 'wiri.log', 'wiri.log.1') { Remove-Item (Join-Path $wiriData $f) -Force -ErrorAction SilentlyContinue }
+$wiriData = Join-Path $testLocal 'wiri'
+foreach ($f in 'wiri.log', 'wiri.log.1', 'hidden.json') { Remove-Item (Join-Path $wiriData $f) -Force -ErrorAction SilentlyContinue }
 if ($null -ne $previousRecovery) {
     New-Item -ItemType Directory -Force $wiriData | Out-Null
     [IO.File]::WriteAllBytes((Join-Path $wiriData 'hidden.json'), [byte[]]$previousRecovery)
@@ -2855,6 +2865,7 @@ $summary = [ordered]@{
     h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
     steps = $steps
 }
+. (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {

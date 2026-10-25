@@ -38,3 +38,4 @@ link.bat
 
 # Live-test output written inside a worktree (scripts/live-test.ps1 -Out .live)
 /.live/
+/.live[0-9]*/

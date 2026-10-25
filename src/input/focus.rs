@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tracing::warn;
+use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -30,6 +30,8 @@ const WM_FOREGROUND_WARP: u32 = WM_USER + 311;
 const WM_RELOAD_FOCUS: u32 = WM_USER + 312;
 const FOCUS_TIMER_ID: usize = (WM_USER + 313) as usize;
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+const EVENT_OBJECT_FOCUS: u32 = 0x8005;
+const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 const WINEVENT_OUTOFCONTEXT: u32 = 0;
 const WINEVENT_SKIPOWNPROCESS: u32 = 2;
 
@@ -94,7 +96,8 @@ pub fn initialize(engine: Arc<RwLock<TilingEngine>>, backend: BackendHandle, hwn
         dwell: Dwell::default(),
         timer_armed: false,
         foreground_hook: None,
-        last_foreground: 0,
+        geometry_hook: None,
+        foreground: ForegroundState::default(),
     };
     state.reload();
     STATE.with(|slot| *slot.borrow_mut() = Some(state));
@@ -162,7 +165,31 @@ struct FocusState {
     dwell: Dwell,
     timer_armed: bool,
     foreground_hook: Option<HWINEVENTHOOK>,
-    last_foreground: isize,
+    geometry_hook: Option<HWINEVENTHOOK>,
+    foreground: ForegroundState,
+}
+
+/// Foreground events may precede both actual Win32 activation and asynchronous
+/// SetWindowPos completion. Remember the request until focus/location confirms
+/// it, rather than deduplicating an unfinished warp as if it had succeeded.
+#[derive(Default)]
+struct ForegroundState {
+    last: isize,
+    pending: Option<isize>,
+}
+
+impl ForegroundState {
+    fn observe(&mut self, window: isize, warp: bool) -> bool {
+        if window == 0 || window == self.last { return false }
+        self.last = window;
+        self.pending = warp.then_some(window);
+        true
+    }
+
+    fn suppress(&mut self, window: isize) {
+        self.last = window;
+        self.pending = None;
+    }
 }
 
 impl FocusState {
@@ -171,10 +198,13 @@ impl FocusState {
         self.policy = self.engine.read().full_config().as_ref()
             .map(|config| config.input.focus()).unwrap_or_default();
         self.policy.focus_delay_ms = self.policy.focus_delay_ms.min(60_000);
+        info!(follows_mouse = self.policy.follows_mouse, delay_ms = self.policy.focus_delay_ms,
+            warp = self.policy.warp_on_focus, "Pointer focus policy updated");
         FOLLOWS_MOUSE.store(self.policy.follows_mouse, Ordering::Release);
         MOTION_PENDING.store(false, Ordering::Release);
         WARP_PENDING.store(false, Ordering::Release);
-        if self.policy.warp_on_focus && self.foreground_hook.is_none() {
+        let observe_foreground = self.policy.warp_on_focus || self.policy.follows_mouse;
+        if observe_foreground && self.foreground_hook.is_none() {
             // SAFETY: out-of-context callbacks are delivered on this pumping
             // thread. The callback only publishes an HWND, never borrowed state.
             let hook = unsafe {
@@ -189,15 +219,39 @@ impl FocusState {
             } else {
                 self.foreground_hook = Some(hook);
             }
-        } else if !self.policy.warp_on_focus {
+        } else if !observe_foreground {
             self.remove_foreground_hook();
+        }
+        if self.policy.warp_on_focus && self.geometry_hook.is_none() {
+            // Focus and location are completion notifications, not a frame clock.
+            // Intermediate events in this small range are ignored by the callback.
+            let hook = unsafe {
+                SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_LOCATIONCHANGE,
+                    HMODULE::default(), Some(foreground_event), 0, 0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+            };
+            if hook.is_invalid() {
+                warn!("Unable to install pointer-warp completion hook");
+            } else {
+                self.geometry_hook = Some(hook);
+            }
+        } else if !self.policy.warp_on_focus {
+            self.remove_geometry_hook();
         }
         // Reload/startup itself is not a foreground change and must not warp.
         // SAFETY: querying the current foreground window has no preconditions.
-        self.last_foreground = unsafe { GetForegroundWindow() }.0 as isize;
+        self.foreground.suppress(unsafe { GetForegroundWindow() }.0 as isize);
+    }
+
+    fn remove_geometry_hook(&mut self) {
+        if let Some(hook) = self.geometry_hook.take() {
+            // SAFETY: this thread owns the successfully installed hook.
+            let _ = unsafe { UnhookWinEvent(hook) };
+        }
     }
 
     fn remove_foreground_hook(&mut self) {
+        self.remove_geometry_hook();
         if let Some(hook) = self.foreground_hook.take() {
             // SAFETY: this thread owns the successfully installed hook.
             let _ = unsafe { UnhookWinEvent(hook) };
@@ -215,7 +269,7 @@ impl FocusState {
 
     fn cancel(&mut self) {
         self.stop_timer();
-        self.dwell = Dwell::default();
+        self.dwell.invalidate();
     }
 
     fn motion(&mut self, point: Point) {
@@ -223,17 +277,33 @@ impl FocusState {
             self.cancel();
             return;
         }
-        let target = target_at(&self.engine.read(), point);
+        let (target, output_change) = {
+            let engine = self.engine.read();
+            let output_change = pointer_output(&engine, point)
+                .filter(|output| Some(*output) != engine.focused_output());
+            (target_at(&engine, point), output_change)
+        };
+        // Output focus follows entry even over an empty workspace or an
+        // unmanaged window. It must not activate the output's selected window
+        // through an overlay, nor depend on finding a managed tile under it.
+        if let Some(output) = output_change {
+            let mut engine = self.engine.write();
+            if engine.monitors().get(&output).is_some() {
+                engine.set_focused_output(output);
+                crate::ipc::notify_state_changed();
+            }
+        }
         let previous = self.dwell.pending.map(|pending| pending.target);
         let decision = self.dwell.observe(target, Instant::now(), self.policy.focus_delay_ms);
+        debug!(?point, ?target, ?decision, "Pointer focus motion");
         // A move within the same target must NOT restart the one-shot timer.
         if previous != self.dwell.pending.map(|pending| pending.target) {
             self.stop_timer();
         }
-        self.perform(decision);
+        self.perform(decision, point);
     }
 
-    fn perform(&mut self, decision: DwellDecision) {
+    fn perform(&mut self, decision: DwellDecision, point: Point) {
         match decision {
             DwellDecision::Idle => self.stop_timer(),
             DwellDecision::Wait(remaining) => {
@@ -249,7 +319,7 @@ impl FocusState {
             }
             DwellDecision::Focus(target) => {
                 self.stop_timer();
-                self.focus(target);
+                self.focus(target, point);
             }
         }
     }
@@ -262,25 +332,31 @@ impl FocusState {
             self.cancel();
             return;
         }
-        let target = cursor_position().and_then(|point| target_at(&self.engine.read(), point));
+        let Some(point) = cursor_position() else { self.cancel(); return };
+        let target = target_at(&self.engine.read(), point);
         if target != Some(pending.target) {
             self.cancel();
             return;
         }
         let decision = self.dwell.observe(target, Instant::now(), self.policy.focus_delay_ms);
-        self.perform(decision);
+        self.perform(decision, point);
     }
 
-    fn focus(&mut self, target: FocusTarget) {
-        // Revalidate even zero-delay requests: a queued move may be stale, and
-        // windows, workspaces or outputs may have disappeared while waiting.
+    fn focus(&mut self, target: FocusTarget, point: Point) {
+        // Zero-delay motion uses the hook's logical point: WH_MOUSE_LL posts
+        // BEFORE Windows updates GetCursorPos, so querying it here can see the
+        // previous location and permanently settle a target without focusing.
+        // Timer expiry instead supplies its freshly queried native point above.
+        // Revalidate window/workspace membership at that point in either case.
         if super::low_level_hook::is_grab_active() {
             self.cancel();
             return;
         }
-        let Some(point) = cursor_position() else { return };
         let mut engine = self.engine.write();
         if target_at(&engine, point) != Some(target) {
+            // Discard settlement too, so a later motion within a still-valid
+            // target can retry after windows/output membership changed.
+            self.dwell.invalidate();
             return;
         }
         // SAFETY: these are value-only HWND queries; no application memory is read.
@@ -290,6 +366,8 @@ impl FocusState {
             return;
         }
         if target.column.is_none() {
+            engine.set_focused_output(target.output);
+            self.foreground.suppress(target.window.as_isize());
             // focus_float can switch the float's home workspace. Hover must not
             // switch workspaces: visible sticky floats may live elsewhere, and
             // workspace IDs alone do not identify an output. Let the existing
@@ -300,8 +378,10 @@ impl FocusState {
             return;
         }
         let Some(scroll) = reveal_scroll(&engine, target, self.policy.max_scroll_percent) else {
+            debug!(?target, "Pointer focus reveal exceeds configured limit");
             return;
         };
+        debug!(?target, scroll, "Pointer focus activation");
         let already_selected = engine.focused_output() == Some(target.output)
             && engine.monitors().get(&target.output)
                 .is_some_and(|monitor| monitor.focus_window == Some(target.window));
@@ -314,6 +394,8 @@ impl FocusState {
             }
         }
         engine.set_focused_output(target.output);
+        // Pointer-induced focus must never warp, even in center-xy-always mode.
+        self.foreground.suppress(target.window.as_isize());
         // One layout/activation attempt on target transition, never per motion.
         // If an unmanaged foreground left the internal selection unchanged,
         // apply_layout's activation dedup deliberately does not reactivate it.
@@ -327,27 +409,43 @@ impl FocusState {
     }
 
     fn foreground(&mut self, event_hwnd: isize) {
-        if !self.policy.warp_on_focus || super::low_level_hook::is_grab_active() {
+        debug!(event_hwnd, last = self.foreground.last, "Pointer foreground notification");
+        if self.foreground.observe(event_hwnd, self.policy.warp_on_focus) {
+            // Keyboard/IPC focus changes cancel hover even with warp disabled.
+            self.cancel();
+        }
+        if super::low_level_hook::is_grab_active() {
+            self.cancel();
+            self.foreground.pending = None;
             return;
         }
-        // SAFETY: querying the foreground HWND has no preconditions.
+        if self.foreground.pending != Some(event_hwnd) { return }
+        // A queued foreground event can precede actual activation. Keep the
+        // pending request; object-focus/location notifications revalidate it.
         let foreground = unsafe { GetForegroundWindow() };
-        if foreground.0 as isize != event_hwnd || event_hwnd == self.last_foreground {
-            return;
-        }
-        self.last_foreground = event_hwnd;
-        // Focus changes must not leave a delayed hover waiting to steal focus.
-        self.cancel();
-        // SAFETY: GetAncestor accepts an HWND and returns a value, not a pointer to memory.
+        if foreground.0 as isize != event_hwnd { return }
         let root = unsafe { GetAncestor(foreground, GA_ROOT) };
         let owner = root_owner(foreground);
-        if self.engine.read().managed_window_for(root.0 as isize, owner.0 as isize).is_none() {
-            return;
-        }
-        if !visible_window(root) {
-            return;
-        }
-        let Some(rect) = window_rect(root) else { return };
+        let expected = {
+            let engine = self.engine.read();
+            if engine.managed_window_for(root.0 as isize, owner.0 as isize).is_none() {
+                self.foreground.pending = None;
+                return;
+            }
+            if engine.is_overview() { self.foreground.pending = None; return }
+            // Owned dialogs have their own geometry, not the owner's tile.
+            engine.pointer_warp_target(WindowId::new(root.0 as isize))
+        };
+        if !visible_window(root) { return }
+        let Some(rect) = self.backend.get_window(root.0 as isize)
+            .and_then(|info| info.get_dwm_bounds()).or_else(|| window_rect(root)) else { return };
+        // Native positioning is asynchronous. Never warp to a parking rectangle
+        // or to old on-screen geometry while a layout move is still in flight.
+        let ready = expected.is_none_or(|expected| warp_geometry_ready(rect, expected))
+            && self.engine.read().monitors().values()
+                .any(|monitor| monitor.bounds.contains_point(rect.center()));
+        if !ready { return }
+        self.foreground.pending = None;
         let mut cursor = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
@@ -357,10 +455,12 @@ impl FocusState {
             || cursor.flags.0 & CURSOR_SHOWING.0 == 0
         {
             // In particular, never call ShowCursor to reveal a hidden pointer.
+            debug!(flags = cursor.flags.0, "Pointer warp skipped for hidden or unavailable cursor");
             return;
         }
         let point = Point { x: cursor.ptScreenPos.x, y: cursor.ptScreenPos.y };
         let Some(destination) = warp_destination(rect, point, self.policy.warp_mode) else { return };
+        debug!(?point, ?destination, "Warping pointer to foreground window");
         WARP_POINT.store(pack(destination), Ordering::Release);
         WARP_PENDING.store(true, Ordering::Release);
         // SAFETY: destination is a validated screen-space point inside the window.
@@ -379,10 +479,17 @@ unsafe extern "system" fn foreground_event(
     _event_thread: u32,
     _time: u32,
 ) {
-    if event != EVENT_SYSTEM_FOREGROUND || hwnd.is_invalid() {
+    if hwnd.is_invalid() { return }
+    if event == EVENT_SYSTEM_FOREGROUND {
+        FOREGROUND_HWND.store(hwnd.0 as isize, Ordering::Release);
+    } else if event == EVENT_OBJECT_FOCUS
+        || (event == EVENT_OBJECT_LOCATIONCHANGE && _object == 0 && _child == 0)
+    {
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        if root.0 as isize != FOREGROUND_HWND.load(Ordering::Acquire) { return }
+    } else {
         return;
     }
-    FOREGROUND_HWND.store(hwnd.0 as isize, Ordering::Release);
     if !FOREGROUND_PENDING.swap(true, Ordering::AcqRel) && !post(WM_FOREGROUND_WARP) {
         FOREGROUND_PENDING.store(false, Ordering::Release);
     }
@@ -436,24 +543,30 @@ struct FocusTarget {
     column: Option<usize>,
 }
 
+fn pointer_output(engine: &TilingEngine, point: Point) -> Option<OutputId> {
+    if engine.is_overview() { return None }
+    engine.monitors().iter()
+        .find(|(_, monitor)| monitor.bounds.contains_point(point))
+        .map(|(output, _)| *output)
+}
+
 /// Pure half of hit testing: root/owned-dialog normalization, output membership
 /// and active-workspace checks. Never fall through an unmanaged overlay to a tile.
 fn resolve_target(engine: &TilingEngine, point: Point, roots: [isize; 2]) -> Option<FocusTarget> {
-    if engine.is_overview() { return None }
-    let (output, monitor) = engine.monitors().iter()
-        .find(|(_, monitor)| monitor.bounds.contains_point(point))?;
+    let output = pointer_output(engine, point)?;
+    let monitor = engine.monitors().get(&output)?;
     for root in roots {
         if root == 0 { continue }
         let window = WindowId::new(root);
         if let Some((home, workspace, column)) = engine.locate_window(window) {
-            if home == *output && workspace == monitor.active_workspace {
+            if home == output && workspace == monitor.active_workspace {
                 return Some(FocusTarget { window, output: home, workspace, column: Some(column) });
             }
         } else if engine.is_floating(window)
             && (engine.is_sticky(window)
                 || engine.float_workspace(window) == Some(monitor.active_workspace))
         {
-            return Some(FocusTarget { window, output: *output, workspace: monitor.active_workspace, column: None });
+            return Some(FocusTarget { window, output, workspace: monitor.active_workspace, column: None });
         }
     }
     None
@@ -497,6 +610,14 @@ fn scroll_allowed(before: i32, after: i32, work_width: u32, percent: Option<f64>
     })
 }
 
+fn warp_geometry_ready(actual: Rect, expected: Rect) -> bool {
+    // DWM frame coordinates allow rounding, not a stale on-screen/parked move.
+    // App minimum sizes may differ from the request: compare position, not size.
+    actual.size.w > 0 && actual.size.h > 0
+        && (i64::from(actual.loc.x) - i64::from(expected.loc.x)).abs() <= 2
+        && (i64::from(actual.loc.y) - i64::from(expected.loc.y)).abs() <= 2
+}
+
 fn warp_destination(rect: Rect, point: Point, mode: WarpMode) -> Option<Point> {
     if rect.size.w == 0 || rect.size.h == 0 { return None }
     let inside_x = point.x >= rect.loc.x && point.x < rect.right();
@@ -533,6 +654,10 @@ enum DwellDecision {
 }
 
 impl Dwell {
+    fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+
     fn observe(&mut self, target: Option<FocusTarget>, now: Instant, delay_ms: u32) -> DwellDecision {
         let Some(target) = target else {
             *self = Self::default();
@@ -560,7 +685,12 @@ mod tests {
     use super::*;
 
     fn target(window: isize) -> FocusTarget {
-        FocusTarget { window: WindowId::new(window), output: 1, workspace: 0, column: Some(0) }
+        FocusTarget {
+            window: WindowId::new(window),
+            output: OutputId::from_name("primary"),
+            workspace: 0,
+            column: Some(0),
+        }
     }
 
     #[test]
@@ -571,6 +701,16 @@ mod tests {
         assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Idle);
         assert_eq!(dwell.observe(None, now, 0), DwellDecision::Idle);
         assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Focus(target(1)));
+    }
+
+    #[test]
+    fn dwell_invalidated_focus_can_retry_without_pointer_reentry() {
+        let mut dwell = Dwell::default();
+        let now = Instant::now();
+        assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Focus(target(1)));
+        dwell.invalidate(); // hit/membership changed during engine-lock acquisition
+        assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Focus(target(1)));
+        assert_eq!(dwell.observe(Some(target(1)), now, 0), DwellDecision::Idle);
     }
 
     #[test]
@@ -607,7 +747,7 @@ mod tests {
         let mut dwell = Dwell::default();
         let now = Instant::now();
         let first = target(1);
-        let other_output = FocusTarget { output: 2, ..first };
+        let other_output = FocusTarget { output: OutputId::from_name("secondary"), ..first };
         let other_workspace = FocusTarget { workspace: 1, ..first };
         assert_eq!(dwell.observe(Some(first), now, 0), DwellDecision::Focus(first));
         assert_eq!(dwell.observe(Some(other_output), now, 0), DwellDecision::Focus(other_output));
@@ -645,6 +785,48 @@ mod tests {
     }
 
     #[test]
+    fn foreground_request_survives_early_duplicate_until_completion() {
+        let mut state = ForegroundState::default();
+        assert!(state.observe(10, true));
+        // Early foreground/native-geometry guards leave the pending request.
+        assert!(!state.observe(10, true));
+        assert_eq!(state.pending, Some(10));
+        state.pending = None;
+        assert!(!state.observe(10, true));
+        assert_eq!(state.pending, None);
+    }
+
+    #[test]
+    fn foreground_request_is_replaced_or_suppressed_not_replayed() {
+        let mut state = ForegroundState::default();
+        state.observe(10, true);
+        assert!(state.observe(20, true));
+        assert_eq!(state.pending, Some(20));
+        state.suppress(30); // pointer focus / startup / config reload
+        assert!(!state.observe(30, true));
+        assert_eq!(state.pending, None);
+        assert!(state.observe(40, false));
+        assert_eq!(state.pending, None);
+    }
+
+    #[test]
+    fn warp_waits_for_native_layout_including_old_on_screen_geometry() {
+        let expected = Rect::new(923, 12, 431, 704);
+        assert!(!warp_geometry_ready(Rect::new(4, 836, 431, 704), expected));
+        assert!(!warp_geometry_ready(Rect::new(12, 12, 431, 704), expected));
+        assert!(warp_geometry_ready(expected, expected));
+        assert!(warp_geometry_ready(Rect::new(924, 13, 466, 704), expected));
+        assert!(!warp_geometry_ready(Rect::new(923, 12, 0, 704), expected));
+    }
+
+    #[test]
+    fn warp_geometry_handles_negative_output_coordinates_without_overflow() {
+        let expected = Rect::new(-1500, -700, 400, 300);
+        assert!(warp_geometry_ready(expected, expected));
+        assert!(!warp_geometry_ready(Rect::new(i32::MAX, 0, 1, 1), Rect::new(i32::MIN, 0, 1, 1)));
+    }
+
+    #[test]
     fn warp_default_centers_only_outside_axes() {
         let rect = Rect::new(-200, 100, 200, 100);
         assert_eq!(warp_destination(rect, Point { x: -150, y: 99 }, WarpMode::default()), Some(Point { x: -150, y: 150 }));
@@ -664,6 +846,85 @@ mod tests {
         assert_eq!(warp_destination(rect, outside, WarpMode::CenterXy), Some(center));
         assert_eq!(warp_destination(rect, center, WarpMode::CenterXyAlways), None);
         assert_eq!(warp_destination(Rect::new(0, 0, 0, 10), outside, WarpMode::CenterXyAlways), None);
+    }
+
+    fn strip() -> (TilingEngine, OutputId) {
+        let mut engine = TilingEngine::new(crate::layout::LayoutConfig {
+            outer_gaps: (0, 0, 0, 0),
+            column_gap: 10,
+            ..Default::default()
+        });
+        let output = OutputId::from_name("pointer-test");
+        engine.register_monitor(output, Rect::new(0, 0, 1000, 800), Rect::new(0, 0, 1000, 760));
+        let workspace = engine.monitors_mut().get_mut(&output).unwrap().workspace_mut().unwrap();
+        workspace.add_window_to_new_column_with_width(WindowId::new(10), Some(500));
+        workspace.add_window_to_new_column_with_width(WindowId::new(20), Some(500));
+        (engine, output)
+    }
+
+    #[test]
+    fn target_resolution_promotes_owned_roots_but_not_unmanaged_overlays() {
+        let (engine, output) = strip();
+        let point = Point::new(100, 100);
+        let hit = resolve_target(&engine, point, [999, 10]).unwrap();
+        assert_eq!((hit.window, hit.output, hit.column), (WindowId::new(10), output, Some(0)));
+        assert_eq!(resolve_target(&engine, point, [999, 998]), None);
+        assert_eq!(resolve_target(&engine, Point::new(-1, 100), [10, 0]), None);
+    }
+
+    #[test]
+    fn output_entry_does_not_require_a_managed_window() {
+        let (mut engine, primary) = strip();
+        let empty = OutputId::from_name("empty-left");
+        engine.register_monitor(empty, Rect::new(-1000, 0, 1000, 800), Rect::new(-1000, 0, 1000, 760));
+        assert_eq!(pointer_output(&engine, Point::new(-500, 100)), Some(empty));
+        assert_eq!(resolve_target(&engine, Point::new(-500, 100), [999, 0]), None);
+        assert_eq!(pointer_output(&engine, Point::new(100, 100)), Some(primary));
+        assert_eq!(pointer_output(&engine, Point::new(2000, 100)), None);
+    }
+
+    #[test]
+    fn decoded_focus_policy_survives_engine_publication() {
+        let decoded = crate::config::decode::decode_text(
+            "input { focus-follows-mouse max-scroll-amount=\"0%\"; focus-delay-ms 1000; warp-mouse-to-focus mode=\"center-xy-always\"; }",
+            "", None,
+        );
+        assert!(decoded.issues.is_empty(), "{:?}", decoded.issues);
+        let (mut engine, _) = strip();
+        engine.set_full_config(decoded.config);
+        let policy = engine.full_config().unwrap().input.focus();
+        assert!(policy.follows_mouse && policy.warp_on_focus);
+        assert_eq!(policy.focus_delay_ms, 1000);
+        assert_eq!(policy.max_scroll_percent, Some(0.0));
+        assert_eq!(policy.warp_mode, WarpMode::CenterXyAlways);
+    }
+
+    #[test]
+    fn target_resolution_refuses_inactive_workspaces_and_wrong_outputs() {
+        let (mut engine, output) = strip();
+        let other = OutputId::from_name("pointer-other");
+        engine.register_monitor(other, Rect::new(1000, 0, 1000, 800), Rect::new(1000, 0, 1000, 760));
+        assert_eq!(resolve_target(&engine, Point::new(1100, 100), [10, 0]), None);
+        engine.monitors_mut().get_mut(&output).unwrap().active_workspace += 1;
+        assert_eq!(resolve_target(&engine, Point::new(100, 100), [10, 0]), None);
+    }
+
+    #[test]
+    fn reveal_limit_uses_real_column_widths_without_mutating_the_strip() {
+        let (engine, output) = strip();
+        let target = resolve_target(&engine, Point::new(100, 100), [20, 0]).unwrap();
+        assert_eq!(reveal_scroll(&engine, target, Some(0.0)), None);
+        assert_eq!(reveal_scroll(&engine, target, Some(0.999)), None);
+        assert_eq!(reveal_scroll(&engine, target, Some(1.0)), Some(10));
+        assert_eq!(reveal_scroll(&engine, target, None), Some(10));
+        assert_eq!(engine.monitors().get(&output).unwrap().workspace().unwrap().scroll_offset.x, 0);
+    }
+
+    #[test]
+    fn zero_scroll_limit_allows_an_already_visible_column() {
+        let (engine, _) = strip();
+        let target = resolve_target(&engine, Point::new(100, 100), [10, 0]).unwrap();
+        assert_eq!(reveal_scroll(&engine, target, Some(0.0)), Some(0));
     }
 
     #[test]

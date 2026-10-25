@@ -6352,6 +6352,15 @@ impl TilingEngine {
         self.apply_layout_for_monitor(focused_output, backend);
     }
 
+    /// The latest visible-frame placement submitted by layout (including an
+    /// animation's target). Observed WindowInfo bounds can still be stale while
+    /// asynchronous Win32 positioning completes. Input uses this only to avoid
+    /// warping to a parked or superseded rectangle; owned dialogs have no entry.
+    pub(crate) fn pointer_warp_target(&self, window: WindowId) -> Option<Rect> {
+        self.applied_state.get(&window).map(|state| state.rect)
+            .filter(|rect| rect.size.w > 0 && rect.size.h > 0)
+    }
+
     /// Returns true if the applied_state cache is non-empty.
     /// The cache is always consulted inside `apply_layout_for_monitor`, so this
     /// method is primarily useful for determining whether the engine has ever
@@ -8688,6 +8697,24 @@ mod tests {
         engine.focus_right(&BackendHandle::default_for_test());
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_column, Some(3));
+    }
+
+    #[test]
+    fn pointer_warp_uses_submitted_frame_not_stale_observation() {
+        let mut engine = make_engine();
+        let window = WindowId::new(100);
+        let observed = make_window(100, 500, 400);
+        let stale_bounds = observed.bounds;
+        engine.tiled_windows.insert(window, observed);
+        assert_eq!(engine.pointer_warp_target(window), None);
+        engine.applied_state.insert(window, AppliedState::unset());
+        assert_eq!(engine.pointer_warp_target(window), None);
+        let target = Rect::new(923, 12, 431, 704);
+        engine.applied_state.get_mut(&window).unwrap().rect = target;
+        assert_eq!(engine.pointer_warp_target(window), Some(target));
+        assert_eq!(engine.tiled_windows.get(&window).unwrap().bounds, stale_bounds);
+        assert_ne!(stale_bounds, target);
+        assert_eq!(engine.pointer_warp_target(WindowId::new(101)), None);
     }
 
     #[test]

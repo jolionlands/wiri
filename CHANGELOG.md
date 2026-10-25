@@ -68,6 +68,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   accumulate into ticks (TouchpadScroll names alias that stream). Configured Mod+left/right
   gestures work over nested client HWNDs, and resizing persists into floating/column/tile state.
   The old hard-coded Alt/wheel shortcuts and per-wheel worker threads are removed.
+- Pointer focus is event-driven on the existing input pump: nested-window hit testing, a cancellable
+  one-shot dwell, `max-scroll-amount="N%"`, output entry and configured warp modes replace the
+  500 ms polling task. Foreground events cancel stale hover requests; pointer-driven focus never
+  warps and a hidden cursor stays hidden. Warp completion waits for asynchronous native geometry
+  against the submitted layout frame, not stale observed bounds. Zero-delay hover uses the hook's
+  logical point instead of the not-yet-updated native cursor position. Drag motion keeps the system
+  cursor moving while paired button edges stay captured. No new dependency, idle timer, thread
+  or resting HWND.
 
 ### Phase 2A — a real config parser, window rules, fullscreen, IPC (2026-10-25)
 - **A real KDL config parser with visible errors.**  The line scanner is gone.  `src/config/kdl.rs` reads

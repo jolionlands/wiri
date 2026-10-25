@@ -321,17 +321,29 @@ fn pointer_modifiers() -> u32 {
     })
 }
 
+/// Some(false): observe motion without stopping the system cursor; Some(true):
+/// consume our paired release. Other messages continue through normal binding.
+fn grab_message(grab: &GrabState, message: u32) -> Option<bool> {
+    match (grab, message) {
+        (GrabState::None, _) => None,
+        (_, WM_MOUSEMOVE) => Some(false),
+        (GrabState::Move(_) | GrabState::ColumnReorder(_), WM_LBUTTONUP)
+        | (GrabState::Resize(_), WM_RBUTTONUP) => Some(true),
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn mouse_hook_callback(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if n_code < 0 { return CallNextHookEx(None,n_code,w_param,l_param); }
     let msg = w_param.0 as u32;
     let event = &*(l_param.0 as *const MSLLHOOKSTRUCT);
     let cursor = Point::new(event.pt.x,event.pt.y);
+    if msg == WM_MOUSEMOVE { crate::input::focus::on_mouse_move(cursor); }
     // This mutex protects only a snapshot; no layout work holds it. Do not let
     // contention leak the release of a button whose down was consumed.
     let grab = HOOK_STATE.lock().grab.clone();
     if !matches!(grab, GrabState::None) {
-        let handled = match grab { GrabState::Move(_) | GrabState::ColumnReorder(_) => matches!(msg, WM_MOUSEMOVE | WM_LBUTTONUP), GrabState::Resize(_) => matches!(msg, WM_MOUSEMOVE | WM_RBUTTONUP), GrabState::None => false };
-        if handled {
+        if let Some(consume) = grab_message(&grab, msg) {
             let (engine,backend) = { let s=HOOK_STATE.lock(); (s.engine.clone(),s.backend.clone()) };
             if msg != WM_MOUSEMOVE {
                 HOOK_STATE.lock().grab = GrabState::None;
@@ -340,11 +352,14 @@ unsafe extern "system" fn mouse_hook_callback(n_code: i32, w_param: WPARAM, l_pa
             if let (Some(engine),Some(backend)) = (engine,backend) {
                 crate::input::dispatch::send_work(Box::new(move || process_grab(grab,msg,cursor,&engine,&backend)));
             }
-            return LRESULT(1);
+            // LL motion runs before Windows updates the cursor. Consuming it
+            // freezes the real pointer and makes button-up report the drag's
+            // starting point, undoing the preview. Only capture button edges.
+            return if consume { LRESULT(1) } else { CallNextHookEx(None,n_code,w_param,l_param) };
         }
     }
     if msg == WM_MOUSEMOVE {
-        // Focus tracking is event-driven; the integration below adds its notification.
+        // Focus motion was published above, even during grabs so a dwell is cancelled.
         return CallNextHookEx(None,n_code,w_param,l_param);
     }
     let mods=pointer_modifiers();
@@ -469,5 +484,43 @@ fn process_grab(grab: GrabState, msg: u32, cursor: Point, engine: &Arc<parking_l
             crate::ipc::notify_state_changed();
         },
         GrabState::None => {}
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn grab_motion_never_consumes_the_system_cursor_update() {
+        let cursor = Point::new(200, 200);
+        let rect = Rect::new(100, 100, 400, 300);
+        let window = WindowId::new(1);
+        let grabs = [
+            GrabState::Move(MoveGrab::new(window, cursor, rect.loc, rect.size, 0)),
+            GrabState::Resize(ResizeGrab::new(window, crate::input::grab::ResizeEdge::Right, cursor, rect)),
+            GrabState::ColumnReorder(ColumnReorderGrab::new(window, 0, cursor)),
+        ];
+        for grab in grabs {
+            assert_eq!(grab_message(&grab, WM_MOUSEMOVE), Some(false));
+            assert_eq!(grab_message(&grab, WM_MOUSEWHEEL), None);
+        }
+        assert_eq!(grab_message(&GrabState::None, WM_MOUSEMOVE), None);
+    }
+
+    #[test]
+    fn grab_consumes_only_its_paired_button_release() {
+        let cursor = Point::new(200, 200);
+        let rect = Rect::new(100, 100, 400, 300);
+        let window = WindowId::new(1);
+        let move_grab = GrabState::Move(MoveGrab::new(window, cursor, rect.loc, rect.size, 0));
+        let resize = GrabState::Resize(ResizeGrab::new(window, crate::input::grab::ResizeEdge::Right, cursor, rect));
+        let reorder = GrabState::ColumnReorder(ColumnReorderGrab::new(window, 0, cursor));
+        assert_eq!(grab_message(&move_grab, WM_LBUTTONUP), Some(true));
+        assert_eq!(grab_message(&move_grab, WM_RBUTTONUP), None);
+        assert_eq!(grab_message(&resize, WM_RBUTTONUP), Some(true));
+        assert_eq!(grab_message(&resize, WM_LBUTTONUP), None);
+        assert_eq!(grab_message(&reorder, WM_LBUTTONUP), Some(true));
+        assert_eq!(grab_message(&GrabState::None, WM_LBUTTONUP), None);
     }
 }
