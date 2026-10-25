@@ -1021,10 +1021,9 @@ fn sync_monitors_from_backend(
             .copied()
             .collect();
 
-        for oid in to_remove {
-            engine.unregister_monitor(&oid);
-        }
-
+        // The monitors that are there come first (a new one is registered, a known one
+        // updated; one that was unplugged gets its windows back), then the ones that went
+        // are removed: their windows move to a monitor that is there, not into the void.
         for (idx, monitor) in backend_monitors.iter().enumerate() {
             match configured_monitor_scale(config.as_ref(), monitor, idx) {
                 Some(scale) => engine.sync_monitor_with_scale(
@@ -1039,6 +1038,10 @@ fn sync_monitors_from_backend(
                     }
                 }
             }
+        }
+
+        for oid in to_remove {
+            engine.unregister_monitor(&oid);
         }
 
         engine.apply_all(handle);

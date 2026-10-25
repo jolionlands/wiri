@@ -69,6 +69,25 @@ struct MinimizedWindow {
     was_fullscreen: bool,
 }
 
+/// A monitor that was unplugged, kept until it comes back so that its windows go back to it.
+///
+/// While it is away its workspaces live on `host` (niri does the same): the windows keep their
+/// columns and their workspace, the empty unnamed workspaces are dropped.  `monitor` is what it
+/// looked like when it went, so a window that is still where it was put goes back into the
+/// same column of the same workspace.
+struct UnpluggedMonitor {
+    monitor: Monitor,
+    /// The monitor that took the workspaces; `None` when there was none (the last monitor
+    /// went): the workspaces wait in `monitor` until another one appears.
+    host: Option<OutputId>,
+    /// Where each workspace went on the host: (id on the unplugged monitor, id on the host).
+    moved: Vec<(i32, i32)>,
+    /// The floating windows of the monitor: their workspace and rectangle there.
+    floats: HashMap<WindowId, (i32, Rect)>,
+    /// The minimized windows of the monitor: their workspace there.
+    minimized: HashMap<WindowId, i32>,
+}
+
 /// What the window that has the keyboard focus looks like to the engine.
 ///
 /// Built from `GetForegroundWindow()`: the window itself and the root of its
@@ -511,6 +530,9 @@ pub struct TilingEngine {
     /// Windows the user minimized, with the place they come back to.  They stay in
     /// `tiled_windows` (wiri still knows them) but are in no column.
     minimized: HashMap<WindowId, MinimizedWindow>,
+    /// The monitors that were unplugged, until they come back (or for good: the windows
+    /// they held are on another monitor meanwhile).
+    unplugged: HashMap<OutputId, UnpluggedMonitor>,
     window_sizing: HashMap<WindowId, SizingMode>,
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
@@ -645,6 +667,7 @@ impl TilingEngine {
             original_bounds: HashMap::new(),
             window_min_widths: HashMap::new(),
             min_width_queries: HashMap::new(),
+            unplugged: HashMap::new(),
             always_on_top: HashSet::new(),
             auto_tile_threshold: None,
             auto_tile_zoom: None,
@@ -985,6 +1008,12 @@ impl TilingEngine {
         if self.monitors.focused_id().is_none() {
             self.monitors.set_focused(output_id);
         }
+        // A monitor that was unplugged gets its windows back; a monitor that went when
+        // there was none to take its windows hands them to this one.
+        if let Some(kept) = self.unplugged.remove(&output_id) {
+            self.take_back_workspaces(kept, output_id);
+        }
+        self.adopt_homeless_workspaces(output_id);
         // The workspaces the config names exist on every monitor.
         self.ensure_named_workspaces();
     }
@@ -1014,16 +1043,251 @@ impl TilingEngine {
         }
     }
 
+    /// A monitor went away (unplugged, switched off, disabled in the config).  Its windows
+    /// stay: its workspaces move to a monitor that is left (the focused one), below the ones
+    /// it has, and come back when the monitor does.  Workspaces with nothing in them are
+    /// dropped; a named one joins the workspace of that name on the host.
     pub fn unregister_monitor(&mut self, output_id: &OutputId) {
         info!("Unregistering monitor {}", output_id);
         // MonitorSet.remove() already clears focused if this was the focused id.
-        let was_focused = self.monitors.focused_id().as_ref() == Some(output_id);
-        self.monitors.remove(output_id);
-        if was_focused {
+        let Some(gone) = self.monitors.remove(output_id) else {
+            return;
+        };
+        if self.monitors.focused_id().is_none() {
             // Re-focus the next available monitor (first in insertion order).
             let next_id = self.monitors.keys().next().copied();
             if let Some(next_id) = next_id {
                 self.monitors.set_focused(next_id);
+            }
+        }
+        let host = self.monitors.focused_id();
+        let mut kept = UnpluggedMonitor {
+            monitor: gone,
+            host: None,
+            moved: Vec::new(),
+            floats: HashMap::new(),
+            minimized: HashMap::new(),
+        };
+        match host {
+            Some(host) => self.move_workspaces_to(&mut kept, host),
+            None => tracing::warn!(
+                "Monitor {} went and no monitor is left: its windows wait for the next one",
+                output_id
+            ),
+        }
+        self.unplugged.insert(*output_id, kept);
+    }
+
+    /// Move what an unplugged monitor held to `host`: every workspace with a window, a
+    /// floating or a minimized window in it.  A named workspace joins the host's workspace of
+    /// that name (the columns are appended); the others are appended below the host's
+    /// workspaces, in their order.
+    fn move_workspaces_to(&mut self, kept: &mut UnpluggedMonitor, host: OutputId) {
+        let gone = kept.monitor.output_id;
+        let Some(host_work) = self.monitors.get(&host).map(|m| m.work_area) else {
+            return;
+        };
+        kept.host = Some(host);
+        for from in kept.monitor.workspace_ids() {
+            let floats: Vec<(WindowId, Rect)> = self
+                .float_homes
+                .iter()
+                .filter(|(_, home)| home.output == gone && home.workspace == from)
+                .map(|(window, home)| (*window, home.rect))
+                .collect();
+            let minimized: Vec<WindowId> = self
+                .minimized
+                .iter()
+                .filter(|(_, m)| m.output == gone && m.workspace == from)
+                .map(|(window, _)| *window)
+                .collect();
+            let named = self.workspace_name(from).is_some();
+            let Some(workspace) = kept.monitor.workspaces.get(&from) else {
+                continue;
+            };
+            if workspace.columns.is_empty() && floats.is_empty() && minimized.is_empty() {
+                // Nothing to keep (a named workspace exists on the host anyway).
+                continue;
+            }
+            let Some(target) = self.monitors.get_mut(&host) else {
+                return;
+            };
+            let to = if named {
+                let dest = target
+                    .workspaces
+                    .entry(from)
+                    .or_insert_with(crate::layout::Workspace::new);
+                dest.columns.extend(workspace.columns.iter().cloned());
+                from
+            } else {
+                let id = target.workspaces.keys().copied().max().map_or(0, |m| m + 1);
+                target.workspaces.insert(id, workspace.clone());
+                id
+            };
+            kept.moved.push((from, to));
+            for (window, rect) in floats {
+                if let Some(home) = self.float_homes.get_mut(&window) {
+                    home.output = host;
+                    home.workspace = to;
+                    home.rect = Self::fit_rect_into(home.rect, host_work);
+                }
+                kept.floats.insert(window, (from, rect));
+            }
+            for window in minimized {
+                if let Some(m) = self.minimized.get_mut(&window) {
+                    m.output = host;
+                    m.workspace = to;
+                }
+                kept.minimized.insert(window, from);
+            }
+        }
+        // A float or a minimized window whose workspace is not on the monitor any more still
+        // has to live somewhere: on the host's active workspace.
+        let active = self.monitors.get(&host).map_or(0, |m| m.active_workspace);
+        for home in self.float_homes.values_mut().filter(|h| h.output == gone) {
+            home.output = host;
+            home.workspace = active;
+            home.rect = Self::fit_rect_into(home.rect, host_work);
+        }
+        for m in self.minimized.values_mut().filter(|m| m.output == gone) {
+            m.output = host;
+            m.workspace = active;
+        }
+        self.maintain_empty_workspace(host);
+    }
+
+    /// The monitor `output` is plugged in again: the windows of its workspaces that are still
+    /// where they were put on the host (not closed, not moved by the user meanwhile) go back
+    /// into the columns they came from, and so do the floating and minimized ones.
+    fn take_back_workspaces(&mut self, kept: UnpluggedMonitor, output: OutputId) {
+        let UnpluggedMonitor {
+            monitor: mut old,
+            host,
+            moved,
+            floats,
+            minimized,
+        } = kept;
+        let Some((bounds, work_area, scale_factor)) = self
+            .monitors
+            .get(&output)
+            .map(|m| (m.bounds, m.work_area, m.scale_factor))
+        else {
+            return;
+        };
+
+        let workspaces: HashMap<i32, crate::layout::Workspace> = match host {
+            // It went when no monitor was left to take its windows: nothing moved.
+            None => old.workspaces.clone(),
+            Some(host) => {
+                let mut restored = HashMap::new();
+                for (from, to) in &moved {
+                    let Some(old_ws) = old.workspaces.get(from) else {
+                        continue;
+                    };
+                    let mut columns = Vec::new();
+                    for col in &old_ws.columns {
+                        let mut back = col.clone();
+                        back.tiles.clear();
+                        for tile in &col.tiles {
+                            let still_there = self
+                                .monitors
+                                .get(&host)
+                                .and_then(|m| m.workspaces.get(to))
+                                .map_or(false, |ws| ws.find_window_column(tile.window_id).is_some());
+                            if !still_there {
+                                continue;
+                            }
+                            if let Some(host_monitor) = self.monitors.get_mut(&host) {
+                                host_monitor.remove_window(tile.window_id);
+                            }
+                            let mut tile = tile.clone();
+                            tile.cached_bounds = Rect::default();
+                            back.tiles.push(tile);
+                        }
+                        if !back.tiles.is_empty() {
+                            back.clamp_active_tab();
+                            columns.push(back);
+                        }
+                    }
+                    let mut workspace = old_ws.clone();
+                    workspace.columns = columns;
+                    restored.insert(*from, workspace);
+                }
+                // The floating and minimized windows that are still on the workspace they
+                // were moved to go back as well, to where they floated.
+                let to_of = |from: &i32| moved.iter().find(|(f, _)| f == from).map(|(_, t)| *t);
+                for (window, (from, rect)) in &floats {
+                    if let (Some(to), Some(home)) = (to_of(from), self.float_homes.get_mut(window)) {
+                        if home.output == host && home.workspace == to {
+                            home.output = output;
+                            home.workspace = *from;
+                            home.rect = Self::fit_rect_into(*rect, work_area);
+                        }
+                    }
+                }
+                for (window, from) in &minimized {
+                    if let (Some(to), Some(m)) = (to_of(from), self.minimized.get_mut(window)) {
+                        if m.output == host && m.workspace == to {
+                            m.output = output;
+                            m.workspace = *from;
+                        }
+                    }
+                }
+                restored
+            }
+        };
+
+        old.bounds = bounds;
+        old.work_area = work_area;
+        old.scale_factor = scale_factor;
+        old.workspaces = workspaces;
+        if old.workspaces.is_empty() {
+            old.workspaces.insert(0, crate::layout::Workspace::new());
+        }
+        if !old.workspaces.contains_key(&old.active_workspace) {
+            old.active_workspace = old.workspace_ids().first().copied().unwrap_or(0);
+        }
+        old.previous_workspace = old
+            .previous_workspace
+            .filter(|id| old.workspaces.contains_key(id));
+        // The window that had the focus may not have come back.
+        let focus = {
+            let workspace = old.workspace();
+            let kept_focus = old.focus_window.and_then(|window| {
+                workspace
+                    .and_then(|ws| ws.find_window_column(window))
+                    .map(|column| (window, column))
+            });
+            kept_focus.or_else(|| {
+                workspace
+                    .and_then(|ws| ws.columns.first())
+                    .and_then(|column| column.tiles.first())
+                    .map(|tile| (tile.window_id, 0))
+            })
+        };
+        old.focus_window = focus.map(|(window, _)| window);
+        old.focus_column = focus.map(|(_, column)| column);
+        self.monitors.insert(output, old);
+        self.maintain_empty_workspace(output);
+        if let Some(host) = host {
+            self.maintain_empty_workspace(host);
+        }
+        self.sync_min_widths();
+    }
+
+    /// A monitor that went when no monitor was left (so its windows had nowhere to go) hands
+    /// them to the monitor `host` that has just appeared.
+    fn adopt_homeless_workspaces(&mut self, host: OutputId) {
+        let homeless: Vec<OutputId> = self
+            .unplugged
+            .iter()
+            .filter(|(id, kept)| kept.host.is_none() && **id != host)
+            .map(|(id, _)| *id)
+            .collect();
+        for gone in homeless {
+            if let Some(mut kept) = self.unplugged.remove(&gone) {
+                self.move_workspaces_to(&mut kept, host);
+                self.unplugged.insert(gone, kept);
             }
         }
     }
@@ -14326,6 +14590,274 @@ mod tests {
         // An absurd answer is capped, not trusted.
         assert!(engine.note_window_min_width(other, 1_000_000));
         assert_eq!(tile_min(&engine, 5042), Some(16_384));
+    }
+
+    // --- A monitor is unplugged: its windows stay, and go back when it comes back ---
+    //
+    // Engine only.  The laptop these tests are run live on has one display, so unplugging a
+    // second monitor has never been done on a real desktop; what is tested is the
+    // engine's answer to `unregister_monitor` / `register_monitor` (what the display-change
+    // handler in main.rs calls), with fabricated monitors and windows.
+
+    fn two_monitors() -> (TilingEngine, OutputId, OutputId) {
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        let a = OutputId::from_name("A");
+        let b = OutputId::from_name("B");
+        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(
+            b,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
+        (engine, a, b)
+    }
+
+    fn plug_b_in_again(engine: &mut TilingEngine, b: OutputId) {
+        engine.register_monitor(
+            b,
+            Rect::new(1920, 0, 2560, 1440),
+            Rect::new(1920, 0, 2560, 1400),
+        );
+    }
+
+    fn put_on(engine: &mut TilingEngine, hwnd: isize, output: OutputId) {
+        engine.add_window_with_target(
+            make_window(hwnd, 0, 0),
+            AddWindowTarget::Output(output),
+            &BackendHandle::default_for_test(),
+            false,
+        );
+    }
+
+    fn where_is(engine: &TilingEngine, hwnd: isize) -> Option<(OutputId, i32, usize)> {
+        engine.locate_window(WindowId::new(hwnd))
+    }
+
+    #[test]
+    fn test_unplugging_a_monitor_keeps_its_windows_on_the_one_that_is_left() {
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 101, a);
+        put_on(&mut engine, 201, b);
+        put_on(&mut engine, 202, b);
+
+        engine.unregister_monitor(&b);
+
+        assert_eq!(engine.monitors().len(), 1);
+        assert_eq!(engine.focused_output(), Some(a));
+        // Nothing was lost: every window is still managed and sits in a column of the monitor
+        // that is left.
+        for hwnd in [101, 201, 202] {
+            assert!(engine.tiled_windows().contains_key(&WindowId::new(hwnd)));
+            assert_eq!(where_is(&engine, hwnd).map(|w| w.0), Some(a), "window {}", hwnd);
+        }
+        // Its own window did not move.  The unplugged monitor's windows have a workspace of
+        // their own below it, in their old order, and the empty workspace is below that.
+        let (_, ws_own, _) = where_is(&engine, 101).unwrap();
+        let (_, ws_first, col_first) = where_is(&engine, 201).unwrap();
+        let (_, ws_second, col_second) = where_is(&engine, 202).unwrap();
+        assert_eq!(ws_own, 0);
+        assert!(ws_first > ws_own);
+        assert_eq!(ws_first, ws_second, "they stay together");
+        assert_eq!((col_first, col_second), (0, 1), "in their old order");
+        assert_eq!(workspace_ids_of(&engine, a), vec![0, ws_first, ws_first + 1]);
+        assert_eq!(active_workspace_of(&engine, a), 0, "the user's workspace did not change");
+    }
+
+    #[test]
+    fn test_a_monitor_that_comes_back_gets_its_windows_back_as_they_were() {
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 101, a);
+        put_on(&mut engine, 201, b);
+        put_on(&mut engine, 202, b);
+        engine
+            .monitors
+            .get_mut(&b)
+            .and_then(|m| m.workspace_mut())
+            .unwrap()
+            .columns[1]
+            .set_width(Some(700));
+
+        engine.unregister_monitor(&b);
+        plug_b_in_again(&mut engine, b);
+
+        assert_eq!(engine.monitors().len(), 2);
+        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)));
+        assert_eq!(where_is(&engine, 202), Some((b, 0, 1)));
+        let restored = engine.monitors().get(&b).unwrap();
+        assert_eq!(restored.work_area, Rect::new(1920, 0, 2560, 1400), "the new screen");
+        assert_eq!(
+            restored.workspace().unwrap().columns[1].width,
+            Some(700),
+            "the column kept its width"
+        );
+        assert_eq!(workspace_ids_of(&engine, b), vec![0, 1]);
+        // A is as it was: its own window and the empty workspace below it.
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(workspace_ids_of(&engine, a), vec![0, 1]);
+        // And the monitor that came back is not the focused one.
+        assert_eq!(engine.focused_output(), Some(a));
+    }
+
+    #[test]
+    fn test_windows_closed_or_moved_while_the_monitor_was_away_do_not_come_back() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        for hwnd in [201, 202, 203] {
+            put_on(&mut engine, hwnd, b);
+        }
+        engine.unregister_monitor(&b);
+        // One window is closed; the user moves another to the workspace they work on.
+        engine.remove_window(WindowId::new(202), &be);
+        {
+            let host = engine.monitors.get_mut(&a).unwrap();
+            host.remove_window(WindowId::new(203));
+            host.workspaces
+                .get_mut(&0)
+                .unwrap()
+                .add_window_to_new_column(WindowId::new(203));
+        }
+
+        plug_b_in_again(&mut engine, b);
+
+        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)), "still where it was put: back");
+        assert_eq!(where_is(&engine, 202), None, "closed: gone");
+        assert!(!engine.tiled_windows().contains_key(&WindowId::new(202)));
+        assert_eq!(
+            where_is(&engine, 203).map(|w| (w.0, w.1)),
+            Some((a, 0)),
+            "moved by the user: stays where they put it"
+        );
+        assert_eq!(workspace_ids_of(&engine, b), vec![0, 1], "no ghost columns");
+    }
+
+    #[test]
+    fn test_a_floating_window_of_the_unplugged_monitor_follows_it_and_comes_back() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 301, b);
+        put_on(&mut engine, 302, b);
+        let float = WindowId::new(301);
+        engine.toggle_floating_for(float, &be);
+        let on_b = engine.float_rect_of(float).unwrap();
+        assert_eq!(engine.float_location(float), Some((b, 0)));
+
+        engine.unregister_monitor(&b);
+        let (home_output, home_workspace) = engine.float_location(float).unwrap();
+        assert_eq!(home_output, a, "it floats on the monitor that is left");
+        assert_ne!(home_workspace, 0, "on the workspace the unplugged monitor's windows went to");
+        let on_a = engine.float_rect_of(float).unwrap();
+        let work_a = engine.monitors().get(&a).unwrap().work_area;
+        assert!(
+            on_a.loc.x >= work_a.loc.x && on_a.right() <= work_a.right(),
+            "kept on screen: {:?} in {:?}",
+            on_a,
+            work_a
+        );
+        assert_eq!(
+            where_is(&engine, 302).map(|w| (w.0, w.1)),
+            Some((a, home_workspace)),
+            "the tile that shared the workspace is there too"
+        );
+
+        plug_b_in_again(&mut engine, b);
+        assert_eq!(engine.float_location(float), Some((b, 0)), "back on its own monitor");
+        let back = engine.float_rect_of(float).unwrap();
+        let work_b = engine.monitors().get(&b).unwrap().work_area;
+        assert!(back.loc.x >= work_b.loc.x && back.right() <= work_b.right(), "{:?}", back);
+        assert_eq!(back.size, on_b.size, "its size is what it was");
+    }
+
+    #[test]
+    fn test_a_minimized_window_of_the_unplugged_monitor_follows_it_and_comes_back() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 401, b);
+        put_on(&mut engine, 402, b);
+        let window = WindowId::new(401);
+        engine.minimize_window(window, &be);
+        assert_eq!(engine.minimized.get(&window).map(|m| m.output), Some(b));
+
+        engine.unregister_monitor(&b);
+        let moved = engine.minimized.get(&window).unwrap();
+        assert_eq!(moved.output, a);
+        let (_, workspace_of_402, _) = where_is(&engine, 402).unwrap();
+        assert_eq!(moved.workspace, workspace_of_402, "next to the window it shared a strip with");
+
+        plug_b_in_again(&mut engine, b);
+        let back = engine.minimized.get(&window).unwrap();
+        assert_eq!((back.output, back.workspace), (b, 0));
+        // Restored, it goes into the strip of its own monitor again.
+        engine.restore_window(window, &be);
+        assert_eq!(where_is(&engine, 401).map(|w| w.0), Some(b));
+    }
+
+    #[test]
+    fn test_a_named_workspace_of_the_unplugged_monitor_joins_the_one_of_that_name() {
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        engine.set_full_config(named_workspaces_config(&["mail"]));
+        let a = OutputId::from_name("A");
+        let b = OutputId::from_name("B");
+        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(
+            b,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
+        put_on(&mut engine, 101, a);
+        put_on(&mut engine, 201, b);
+
+        engine.unregister_monitor(&b);
+        // Both windows are on A's "mail" workspace now, B's after A's.
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(where_is(&engine, 201), Some((a, 0, 1)));
+        assert_eq!(workspace_ids_of(&engine, a), vec![0, 1], "no workspace was added");
+
+        plug_b_in_again(&mut engine, b);
+        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)), "back on B's own \"mail\"");
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(workspace_ids_of(&engine, a), vec![0, 1]);
+        assert_eq!(workspace_ids_of(&engine, b), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_the_last_monitor_going_loses_nothing() {
+        let mut engine = make_engine();
+        let a = engine.focused_output().unwrap();
+        engine.add_window(make_window(101, 100, 100), &BackendHandle::default_for_test());
+
+        engine.unregister_monitor(&a);
+        assert!(engine.monitors().is_empty());
+        assert!(
+            engine.tiled_windows().contains_key(&WindowId::new(101)),
+            "the window is still known"
+        );
+
+        // A different monitor appears: it takes the windows.
+        let c = OutputId::from_name("C");
+        engine.register_monitor(c, Rect::new(0, 0, 1280, 800), Rect::new(0, 0, 1280, 760));
+        let (output, workspace, _) = where_is(&engine, 101).expect("adopted by the new monitor");
+        assert_eq!(output, c);
+        assert_ne!(workspace, 0, "on a workspace of its own below the new monitor's");
+
+        // The old one comes back: the window goes back to it.
+        engine.register_monitor(a, Rect::new(1280, 0, 1920, 1080), Rect::new(1280, 0, 1920, 1040));
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(workspace_ids_of(&engine, c), vec![0], "the new monitor is as it was: one empty workspace");
+    }
+
+    #[test]
+    fn test_the_same_monitor_coming_straight_back_gets_everything_back() {
+        // No other monitor at all: nothing moved, the monitor is restored as it was (a
+        // display that blinks off and on again).
+        let mut engine = make_engine();
+        let a = engine.focused_output().unwrap();
+        engine.add_window(make_window(101, 100, 100), &BackendHandle::default_for_test());
+        engine.add_window(make_window(102, 100, 100), &BackendHandle::default_for_test());
+        engine.unregister_monitor(&a);
+        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(where_is(&engine, 102), Some((a, 0, 1)));
+        assert_eq!(engine.focused_output(), Some(a));
     }
 
     #[test]

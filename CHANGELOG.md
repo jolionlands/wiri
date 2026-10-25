@@ -129,6 +129,16 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   wiri had parked below the screen into the middle of it (what is not known is still rescued, now
   cascaded 32 px apart instead of stacked).  The record is written once for the startup pass, once
   per new or closed window, and deleted by a graceful quit.
+- **A monitor that is unplugged keeps its windows.**  `unregister_monitor` used to throw the monitor
+  and its workspaces away: its windows stayed in `tiled_windows`, so nothing ever tiled them again
+  and they were orphaned until wiri was restarted.  Now the workspaces that hold something move to the
+  monitor that is left (niri does the same): below its own workspaces, a named one joining the
+  workspace of the same name, floating and minimized windows with them, empty ones dropped.  When the
+  monitor comes back (or another monitor appears after the last one went) the windows that are still
+  where they were put go back into the same columns with the same widths; a window that was closed or
+  moved by the user meanwhile is left alone.  The display-change handler registers the monitors that
+  are there before it removes the ones that went.  **Tested with engine unit tests only: the laptop
+  these changes are verified on has a single display, so no real unplug has been tried.**
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal
