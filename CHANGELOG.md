@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — recent-window service
+- Import the isolated recent-window session/config/preview model and desktop checks, ahead of re-hosting its keyboard events on lane B's input pump.
+
 ### Phase 2B integration — overview host
 - Port the session-local DWM overview host, hit testing and H19 desktop fragment; resources are created only for an overview session.
 
