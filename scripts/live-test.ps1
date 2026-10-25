@@ -41,9 +41,15 @@
 #          window to act on; bad actions say what is wrong; a late subscriber and a filtered one are told the right state.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
-# Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
-# wiri.stderr.log (+ wiri.stderr2.log for the restarted instance).
-param([string]$Bin = 'C:\wiri-dev\wiri\target\release')
+# Outputs (all in -Out, default C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png
+# screenshots, wiri.stderr.log (+ wiri.stderr2.log for the restarted instance).  Parallel workers pass
+# their own -Out inside their worktree (.live\ is git-ignored) and -LockWaitMinutes to queue for the
+# desktop instead of failing while another run holds it.
+param(
+    [string]$Bin = 'C:\wiri-dev\wiri\target\release',
+    [string]$Out = 'C:\wiri-dev\live',
+    [int]$LockWaitMinutes = 0
+)
 
 $ErrorActionPreference = 'Continue'
 # A live run drives the whole interactive desktop and shares one config, one IPC pipe and one evidence
@@ -53,10 +59,10 @@ $ErrorActionPreference = 'Continue'
 # of this lock: Codex Sol's commit ee41d27.
 $liveLock = New-Object System.Threading.Mutex($false, 'Global\wiri-live-test')
 $ownsLiveLock = $false
-try { $ownsLiveLock = $liveLock.WaitOne(0) }
+try { $ownsLiveLock = $liveLock.WaitOne([TimeSpan]::FromMinutes([Math]::Max(0, $LockWaitMinutes))) }
 catch [System.Threading.AbandonedMutexException] { $ownsLiveLock = $true }
 if (-not $ownsLiveLock) { throw 'Another wiri live test is running on this machine; this run refuses to start (two runs would spoil each other).' }
-$D = 'C:\wiri-dev\live'
+$D = [System.IO.Path]::GetFullPath($Out)
 if (Test-Path $D) { Remove-Item -Recurse -Force $D }
 New-Item -ItemType Directory -Force $D | Out-Null
 $wiri = Join-Path $Bin 'wiri.exe'
