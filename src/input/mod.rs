@@ -9,8 +9,9 @@ pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORD
 pub use hotkey::{HotkeyBinding, HotkeyId};
 pub use low_level_hook::{
     begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab,
-    clear_keyboard_action_sender, current_grab, is_grab_active, set_keyboard_action_sender,
-    start_keyboard_hook, start_mouse_hook, stop_keyboard_hook, stop_mouse_hook, GrabState,
+    clear_keyboard_action_sender, current_grab, is_grab_active, last_press_was_repeat,
+    set_keyboard_action_sender, start_keyboard_hook, start_mouse_hook, stop_keyboard_hook,
+    stop_mouse_hook, GrabState,
 };
 pub use mouse::{MouseFocusConfig, MouseTracker};
 pub use touch::{
@@ -343,6 +344,17 @@ impl WorkspaceRef {
 /// which arguments were written in double quotes.
 pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
     parse_action_flagged(name, args, &[])
+}
+
+/// True when `name` is an action wiri implements, whatever its arguments: the name is tried
+/// with a few typical argument lists (none, a number, a size, a word, two words).  Used to
+/// tell "bad arguments" from "wiri does not have this action" when a config is read.
+pub fn action_name_known(name: &str) -> bool {
+    const PROBES: [&[&str]; 5] = [&[], &["1"], &["50%"], &["a"], &["a", "b"]];
+    PROBES.iter().any(|args| {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_action_flagged(name, &args, &[]).is_some()
+    })
 }
 
 /// [`parse_action_name`] for the words of a `binds {}` line.  `quoted[i]` says whether

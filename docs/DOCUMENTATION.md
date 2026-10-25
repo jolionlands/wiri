@@ -167,7 +167,7 @@ wiri --no-tray                  # disable system tray icon
 
 ### Hot-reload
 
-Edit `config.kdl` while wiri is running and changes take effect automatically via the file watcher. Configured hotkeys also reload without restarting.
+Edit `config.kdl` while wiri is running and changes take effect automatically via the file watcher, about 200 ms after the last change to the file or to a file it includes; configured hotkeys also reload without restarting.  A mistake in the file is reported (tray balloon, log, `config_loaded` event) and the last good config stays.  See [Errors](#errors).
 
 ### Logging
 
@@ -186,203 +186,161 @@ RUST_LOG=wiri::layout=trace wiri
 
 ## 4. Configuration Guide
 
-wiri uses the **KDL** document format (`.kdl` file). The config file path defaults to `config.kdl` in the current directory and can be overridden with `-c <path>`.
+wiri's config is a **KDL** file, the syntax niri uses.  A niri `binds {}` block, `window-rule`s,
+`include` and `spawn-at-startup` lines paste in as they are.  The default location is
+`%APPDATA%\wiri\config.kdl` (wiri writes `resources/default_config.kdl` there on its first start);
+`-c <path>` and `$WIRI_CONFIG` override it.  The shipped `resources/default_config.kdl` and
+`examples/` show every option wiri reads.
 
-### Full Default Config (Conceptual)
+### The syntax
 
 ```kdl
-// ── Input ──
-input {
-    keyboard-layout "us"
-    repeat-delay 250
-    repeat-rate 25
-    mouse-speed 1.0
-    mouse-acceleration 0.0
-    natural-scroll false
-    tap-to-click false
+// a comment            /* a block comment, /* nested */ */
+/-binds { ... }         // slashdash comments out the next node, argument, property or block
+layout {                // a section: nodes in braces, one per line or separated by ;
+    gaps 16             // a node with an argument
+    focus-follows-mouse // a flag: written means on, `false` turns it off
 }
-
-// ── Layout ──
-layout {
-    column-width 500
-    column-width-mode "proportional"   // "proportional" or "fixed"
-    max-visible-columns 3              // proportional: at most this many columns share the screen
-    inner-gaps 16
-    outer-gaps 8
-    border-width 4
-    border-color "#333333"
-    border-color-focused "#0066cc"
-    focus-ring-width 3
-    focus-ring-color "#00aaff"
-    dim-unfocused 1.0
-    scroll-step 200
-    split-ratio 0.5
-    auto-balance false
+output "DP-1" {         // a section with a name
+    position x=1280 y=0 // properties are key=value
 }
-
-// ── Animations ──
-animations {
-    enabled false
-    duration 200
-    easing "cubic-bezier"
-    focus-transition true
-    workspace-transition true
-    window-move true
-    window-resize true
-}
-
-// ── Key Bindings ──
-binds {
-    Ctrl+Alt+Left focus-column-left
-    Ctrl+Alt+Right focus-column-right
-    Ctrl+Alt+Up focus-up
-    Ctrl+Alt+Down focus-down
-    Ctrl+Alt+Shift+Left move-column-left
-    Ctrl+Alt+Shift+Right move-column-right
-    Ctrl+Alt+Q close-window
-    Ctrl+Alt+Enter spawn "cmd.exe"
-    Ctrl+Alt+F toggle-fullscreen
-    Ctrl+Alt+T toggle-floating
-    Ctrl+Alt+H scroll-left
-    Ctrl+Alt+L scroll-right
-    Ctrl+Alt+Space overview
-    Ctrl+Alt+Grave focus-previous
-    Ctrl+Alt+O overview-select
-    Ctrl+Alt+Shift+Q quit
-    Ctrl+Alt+1 switch-workspace 1
-    Ctrl+Alt+2 switch-workspace 2
-    Ctrl+Alt+3 switch-workspace 3
-    Ctrl+Alt+4 switch-workspace 4
-    Ctrl+Alt+5 switch-workspace 5
-    Ctrl+Alt+6 switch-workspace 6
-    Ctrl+Alt+7 switch-workspace 7
-    Ctrl+Alt+8 switch-workspace 8
-    Ctrl+Alt+9 switch-workspace 9
-}
-
-// ── Window Rules ──
-window-rules {
-    class "CalcFrame" {
-        float true
-    }
-    class "CASCADIA_HOSTING_WINDOW_CLASS" {
-        workspace "2"
-    }
-    title "MyApp" {
-        opacity 0.85
-    }
-}
-
-// ── Outputs (Monitors) ──
-output "\\\\.\\DISPLAY1" {
-    mode "1920x1080@60"
-    scale 1.0
-    position 0 0
-    primary true
-}
-
-output "\\\\.\\DISPLAY2" {
-    mode "1920x1080@60"
-    scale 1.0
-    position 1920 0
+window-rule {
+    match app-id=r#"firefox$"#   // r#"..."# is a raw string: no escapes
 }
 ```
 
-### Config `input {}` Block
+Strings are in double quotes with KDL's escapes (`\n \t \\ \" \u{1F600}`) or raw (`r"..."`, `r#"..."#`).
+A bad escape is an error that says how to fix it.  For Windows paths, wiri keeps the old format's
+convenience: **a string that starts like a path (`C:\...` or `\\server`) keeps its backslashes as
+written** (`"C:\Program Files\x"` works); in any other string write `\\` or use a raw string.  Numbers
+may use `_`, `0x`, `0o`, `0b`.  A byte-order mark, CRLF and UTF-16 files (what PowerShell's `Out-File`
+writes) are fine.  wiri also still reads its older spellings: bare words as values (`hide-method hide`),
+`key=value` as a whole line (`repeat_delay=600`), and the flat keys of `layout`.
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `keyboard-layout` | string | `"us"` | Keyboard layout identifier |
-| `repeat-delay` | u32 | `250` | Key repeat initial delay (ms) |
-| `repeat-rate` | u32 | `25` | Key repeat rate (repeats/sec) |
-| `mouse-speed` | f64 | `1.0` | Mouse sensitivity multiplier |
-| `mouse-acceleration` | f64 | `0.0` | Mouse acceleration factor |
-| `natural-scroll` | bool | `false` | Reverse scroll direction |
-| `tap-to-click` | bool | `false` | Enable tap-to-click |
+### Errors
 
-### Config `layout {}` Block
+A config with a mistake does not load; niri does the same.
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `column-width` | u32 | `500` | Default column width (px) |
-| `column-width-mode` | string | `"proportional"` | `"proportional"` (fill screen) or `"fixed"` (per-column width) |
-| `max-visible-columns` | u32 | `3` | Proportional mode: the screen is shared by at most this many columns (1 window = full screen, 2 = halves, 3 = thirds, more windows scroll in at a third); `0` = no limit (down to `column-width / 2`) |
-| `inner-gaps` | u32 | `16` | Gap between columns and stacked tiles (px) |
-| `outer-gaps` | u32 | `8` | Margin around the monitor edges (px) |
-| `border-width` | u32 | `4` | Window border thickness (px) |
-| `border-color` | string | `"#333333"` | Unfocused window border color (hex) |
-| `border-color-focused` | string | `"#0066cc"` | Focused window border color (hex) |
-| `focus-ring-width` | u32 | `3` | Extra inset for focused windows (px) |
-| `focus-ring-color` | string | `"#00aaff"` | Focus ring color (hex) |
-| `dim-unfocused` | f32 | `1.0` | Opacity multiplier for unfocused windows (0.0–1.0) |
-| `scroll-step` | u32 | `200` | Pixels scrolled per scroll action |
-| `split-ratio` | f64 | `0.5` | Default split ratio for new columns |
-| `auto-balance` | bool | `false` | Auto-balance column widths |
-| `hide-method` | string | `"hide"` | How the windows of other workspaces are hidden: `"hide"` (`SW_HIDE`: they leave the taskbar and Alt+Tab) or `"cloak"` (the shell cloaks them: they stay in the taskbar and Alt+Tab but are not drawn; Alt+Tab to one brings its workspace along).  Cloaking uses undocumented shell interfaces; where Windows does not offer them wiri says so in its log and hides the plain way |
+* **Errors** reject the file: a syntax error, an unknown section or key (with a "did you mean"), a
+  value of the wrong type or out of range, a bad color, an unknown bind action, a bad regular
+  expression, a missing `include`.  Each one names `file:line:column`.
+* **Warnings** load the file and say what is ignored: a niri option wiri does not have (`touchpad {}`,
+  `animations { workspace-switch {...} }`, `prefer-no-csd`), a bind that cannot work on Windows (an AltGr
+  modifier, a mouse or media-key trigger, a niri action wiri lacks), a duplicate bind.
+* At startup an erroneous config is not used: wiri starts with its defaults and shows a tray balloon
+  with the first error.  On a **reload** the last good config stays in use, a balloon names the file
+  and line, the log has every error, and the IPC event stream gets `config_loaded` with `failed: true`.
+* `wiri-ctl validate-config [path]` runs the same parser without starting anything (exit code 1 when
+  there are errors); `wiri-ctl reload-config` answers with the first error when the file is bad.
+* The file is re-read about 200 ms after the last change to it or to a file it includes, so an editor
+  that saves in steps never gets half a file applied.
 
-### Config `animations {}` Block
+### `include`
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | bool | `false` | Master animation toggle |
-| `duration` | u32 | `200` | Animation duration (ms) |
-| `easing` | string | `"cubic-bezier"` | Easing function: `none`, `linear`, `ease-in`, `ease-out`, `ease-in-out`, `cubic-bezier` |
-| `focus-transition` | bool | `true` | Animate focus changes |
-| `workspace-transition` | bool | `true` | Animate workspace switches |
-| `window-move` | bool | `true` | Animate window moves |
-| `window-resize` | bool | `true` | Animate window resizes |
+`include "other.kdl"` is read where it stands; the path is relative to the including file, absolute,
+`~/...` or starts with an environment variable (`%USERPROFILE%\...`).  `include optional=true "x.kdl"`
+only warns when the file is missing.  A later `binds {}` replaces earlier binds on the same keys.  The
+depth is limited to 8, a file that includes itself is an error, and the included files are watched.
 
-### Config `window-rules {}` Block
+### `input {}`
 
-Each rule has **matchers** (criteria to match a window) and **properties** (applied on match).
+| Option | Meaning |
+|---|---|
+| `mod-key "ctrl-alt"` | what `Mod` means in binds: `ctrl-alt` (default), `alt`, `ctrl`, `super`, `win-alt`, `ctrl-shift` |
+| `keyboard { repeat-delay N; repeat-rate N; numlock }` | `repeat-rate` also paces held-key binds |
+| `mouse { natural-scroll; scroll-speed N; acceleration N; sensitivity N; tap-to-click }` | wiri's own wheel binds; `scroll-factor N` is niri's name for `scroll-speed` |
+| `focus-follows-mouse` / `warp-mouse-to-focus` / `focus-delay-ms N` | flags (or `true`/`false`) |
+| `workspace-auto-back-and-forth` | asking for the workspace you are on goes back to the previous one |
+| `touch { enable; tap-to-click; scroll-speed N }` | |
 
-**Matchers:**
+niri's `touchpad`, `trackpoint`, `trackball`, `tablet`, `xkb`, `track-layout`, `mod-key-nested` and
+`disable-power-key-handling` are accepted with a warning: Windows has one pointer setup for all devices.
 
-| Property | Type | Description |
-|---|---|---|
-| `class` | string | Match window class name |
-| `title` | string | Match window title |
-| `instance` | string | Match window instance name |
-| `pid` | u32 | Match process ID |
+### `layout {}`
 
-**Properties:**
+| Option | Meaning |
+|---|---|
+| `gaps N` | niri's one number: between windows and around the screen. `gaps { inner N; outer N }` tells them apart (default 16 and 8) |
+| `struts { left N; right N; top N; bottom N }` | room kept free for a bar, in pixels (negative values count as 0) |
+| `border { width N; active-color "#rrggbb"; inactive-color; urgent-color; off; radius N }` | `width 0` or `off` turns it off; `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `accent` |
+| `focus-ring { width N; active-color; inactive-color; gap N; off }` | |
+| `shadow { on; softness N; spread N; offset x= y=; color }` | DWM draws the shadow |
+| `column-width N`, `column-width-mode "proportional"` or `"fixed"`, `max-visible-columns N`, `scroll-step N` | wiri's column sizing |
+| `dim-unfocused 0.92`, `strip-frame`, `snap-on-drag`, `snap-threshold-px N`, `smart-borders`, `status-bar` | |
+| `hide-method "hide"` or `"cloak"` | how the windows of other workspaces are hidden |
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `float` | bool | `false` | Start window as floating |
-| `workspace` | string | — | Assign to specific workspace |
-| `opacity` | f64 | `1.0` | Window opacity (0.0–1.0) |
-| `blur` | bool | `false` | Enable background blur |
-| `sticky` | bool | `false` | Appear on all workspaces |
-| `scale` | f64 | — | Custom scale factor |
+niri's `center-focused-column`, `preset-column-widths`, `default-column-width`, `tab-indicator`,
+`insert-hint`, gradients and the rest are accepted with a warning.  The older flat keys
+(`inner-gaps`, `border-width`, `border-color-focused`, `focus-ring-width`, `shadow-enable`, ...) and
+the nested `gaps { }`, `borders { }`, `shadows { }` blocks still work.
 
-### Config `binds {}` Block
+### `output "name" {}`
 
-Each line: `<Modifiers>+<Key> <Action> [args...]`
+`off`, `scale N`, `transform "90"`, `position x= y=` (or `x N` / `y N`), `mode "1920x1080@60"`,
+`variable-refresh-rate`, `focus-at-startup`, and a `layout { }` block that overrides the layout for
+that monitor.  The name is the Windows device name (`wiri-ctl list-monitors`).
 
-**Modifiers:** `Ctrl`, `Alt`, `Shift`, `Win` (case-insensitive, any order)
+### `workspace "name" {}`
 
-**Syntax examples:**
+Named workspaces exist from the start, in the order declared, even when empty.  `open-on-output "name"`
+and wiri's `monitor`, `layout`, `follow-on-focus` are read.
+
+### `binds {}`
+
 ```kdl
 binds {
-    Ctrl+Alt+Left focus-column-left
-    Ctrl+Alt+F toggle-fullscreen
-    Ctrl+Alt+Enter spawn "cmd.exe"
-    Ctrl+Alt+1 switch-workspace 1
+    Mod+T hotkey-overlay-title="Open a Terminal" { spawn "wt.exe"; }
+    Mod+Left { focus-column-left; }
+    Mod+1 { focus-workspace 1; }                  // an index
+    Mod+Shift+W { focus-workspace "web"; }        // a name (a quoted word)
+    Mod+R repeat=false cooldown-ms=300 { set-column-width "+10%"; }
+    /-Mod+X { quit; }                             // commented out
 }
 ```
 
-A `binds {}` section is merged with the built-in defaults: a bind in the config wins when it uses the
-same chord as a default, the other defaults stay.  `binds { extend-defaults false }` drops the defaults.
+A bind is the key combination (`Mod`, `Ctrl`, `Shift`, `Alt`, `Super`/`Win`, then a key name:
+xkb names such as `Bracket_Left`, `Page_Up`, `Return`, `Grave`, or letters, digits, `F1`...`F24`) and
+exactly one action in braces.  Properties: `repeat=false` (holding the key fires the action once),
+`cooldown-ms=` (ignore the bind for that long after it fired), `hotkey-overlay-title=`
+(accepted; `null` hides it), `allow-when-locked=` and `allow-inhibiting=` (accepted: Windows never
+delivers hotkeys to a locked session, and wiri has no shortcut inhibition).  Action properties of
+niri (`focus=false`, `show-pointer=false`, `skip-confirmation=true`) are accepted.
 
-### Config `output {}` Blocks
+The older line form still works: `Ctrl+Alt+Left focus-column-left`, `Ctrl+Alt+1 switch-workspace 1`,
+`Mod+Shift+T spawn "wt.exe"`.  A `binds {}` section is merged with the built-in defaults: a bind in the
+config wins when it uses the same keys as a default, the other defaults stay; `extend-defaults false`
+inside `binds {}` drops the defaults.  The same keys twice in one block keep the first (warning).
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `mode` | string | — | Display mode (e.g. `"1920x1080@60"`) |
-| `scale` | f64 | `1.0` | DPI scale factor |
-| `position` | i32 i32 | `0 0` | Monitor position (x y) |
-| `primary` | bool | `false` | Set as primary monitor |
+### `window-rule {}`
+
+```kdl
+window-rule {
+    match app-id=r#"^firefox"# title="^Picture-in-Picture$"   // one line: all properties must match
+    match app-id="^mpv"                                      // another line: either line may match
+    exclude title="Private"                                  // none of the exclude lines may match
+    open-floating true
+    open-on-workspace "chat"
+    opacity 0.9
+}
+```
+
+`app-id` is a regular expression searched in the program's file name (`firefox.exe`, and `firefox`
+without the extension) and, for Store apps, in the AppUserModelID; `title` is searched in the window
+title; `is-active`, `is-focused`, `is-floating`, `is-urgent`, `at-startup` take `true` or `false`.
+Properties: `open-on-output`, `open-on-workspace "name"`, `open-fullscreen`, `open-floating`,
+`open-maximized`, `open-focused`, `default-column-width { proportion 0.5; }` (or `{ fixed 800; }`),
+`default-window-height`, `min-width`, `max-width`, `min-height`, `max-height`, `opacity`, and wiri's
+`float`, `workspace`, `blur`, `sticky`.  The older forms work too: `class-name "x"` directly in the rule
+and `match { class-name "x"; process-name-regex "..."; is-active }` blocks.
+
+### `animations {}`
+
+`off` / `on`, `duration N`, `easing "ease-out-cubic"`; niri's per-animation blocks and `slowdown` are
+accepted with a warning.
+
+### Programs to start
+
+`spawn-at-startup "prog" "arg" ...` (every argument its own string) and `spawn-sh-at-startup "command"`.
 
 ---
 
@@ -528,11 +486,13 @@ set-column-width 50%` and `wiri-ctl action set-window-height 70%` take the same 
 
 ### Porting a niri `binds {}` block
 
-wiri's `binds {}` is a line per bind (`Mod+Shift+T spawn "wt.exe"`), not niri's KDL children, but the
-words after the chord are niri's: the action names above (plus wiri's older spellings), `Mod` for
-the `input { mod-key }` modifier, the quoted/unquoted difference of `focus-workspace`, and the size
-argument.  Actions that need a feature wiri does not have yet are reported as unknown when the
-config is loaded (`wiri-ctl validate-config` lists them).
+A niri `binds {}` block loads as written: `Mod+T { spawn "alacritty"; }`, with niri's properties
+(`repeat=false`, `cooldown-ms=`, `hotkey-overlay-title=`, `allow-when-locked=`).  `Mod` is the
+`input { mod-key }` modifier (Ctrl+Alt unless set), `focus-workspace 2` is an index and
+`focus-workspace "2"` a name, and the size argument is niri's.  What wiri cannot do is reported when the
+config is loaded, with its line (`wiri-ctl validate-config` lists it): a niri action wiri lacks, a mouse
+or wheel trigger, an AltGr modifier and a media key are warnings and only that bind is dropped; a
+misspelled action or key is an error.  wiri's older line form (`Mod+Shift+T spawn "wt.exe"`) still works.
 
 ---
 
@@ -1055,34 +1015,39 @@ KDL configuration system with file watching.
 
 **Utility:** `parse_color(color_str)` → `Option<[u8; 4]>` RGBA — parses `#RRGGBB` and `#RRGGBBAA`.
 
-#### `parse.rs` — KDL Parser
+#### `kdl.rs` — KDL reader
 
-Parses KDL config text into `Config` struct.
+A dependency-free KDL reader (nodes, arguments, properties, children, `/-`, comments, raw strings,
+escapes, numbers, a BOM) that returns `Document { nodes }` with the `line:column` of every node,
+argument and property, or the first `SyntaxError`.  It reads niri's KDL v1 and the v2 spellings where
+they agree, plus wiri's older bare words and `key=value` lines.  Why not the `kdl` crate: niri's syntax
+is v1 while the crate reads v2 (and pulls `miette` and `winnow`), and Phase 4 counts binary weight.
 
-**Supported syntax:**
-- `key "value"` — Quoted string value
-- `key=value` — Equals syntax
-- `section { ... }` — Nested sections
-- `// comment` — Line comments
-- `key "value" // inline comment` — Inline comments (parsed correctly inside strings)
+#### `decode.rs` — document → `Config`
 
-**Section handling:**
-- `input { }` → `InputConfig`
-- `layout { }` → `LayoutConfig` (also handles sub-sections `gaps { }`, `borders { }`, `focus-ring { }`, `shadows { }`)
-- `animations { }` → `AnimationsConfig`
-- `binds { }` → Each line parsed as `HotkeyBinding`
-- `window-rules { }` → Each rule block parsed as `WindowRule`
-- `output "NAME" { }` → `OutputConfig`
+`decode_text(text, file, base_dir)` / `decode_file(path)` map the nodes onto `Config` and return
+`Decoded { config, issues, includes }`.  Every issue is a `ValidationIssue { severity, file, line,
+column, message }`: an *error* means the file is rejected, a *warning* means part of it is ignored.
+It knows niri's sections and keys (so an unsupported one is a warning and a typo is an error with a
+"did you mean"), wiri's older spellings, the `include` resolution (relative to the including file,
+cycle and depth checks, the include list for the watcher) and the bind grammar.
+
+#### `parse.rs` — entry points
+
+`parse_kdl_config(text)`, `validate_kdl_config(text)` and `validate_config_file(path)` — the names the
+rest of the code and `wiri-ctl validate-config` use, all over `decode.rs`.
 
 #### `loader.rs` — Config Loader
 
 File-based config loading with hot-reload:
-- `ConfigLoader::new(path)` — Load on construction, start watcher
-- `load()` / `reload()` — Read and parse config file
-- `get_config()` — Return current config (thread-safe via `Arc<RwLock<>>`)
-- `start_watching()` — Use `notify` crate to watch config file for changes
-- **Debounce**: 300ms debounce between reloads
-- **Error handling**: Falls back to `Config::default()` on parse errors
+- `Config::load(path)` — read and decode; the first error as `file:line:column: error: message`
+- `load_logged` / `load_quiet(path)` — the decoded config with all its issues (logged or not)
+- `ConfigLoader::new(path)` — the config as it is now (the defaults when it has errors)
+- `start_watching()` — `notify` watches the directory of the config and of every included file;
+  a trailing-edge debounce (`RELOAD_QUIET_MS` = 200 ms of quiet) reads the file once after the
+  last change, retries once when it has errors, then publishes a `ReloadOutcome` on `subscribe()`:
+  `Applied { config, warnings }` or `Failed { issues, summary }`
+- **Error handling**: a failed reload never touches the config in use
 
 ### 7.6 IPC (`src/ipc/`)
 
@@ -1280,17 +1245,20 @@ WH_MOUSE_LL hook → MSLLHOOKSTRUCT
 ### Config Reload
 
 ```
-notify file watcher detects change
-  → ConfigLoader::reload()
-    → read file → parse KDL → new Config
-    → store in Arc<RwLock<Config>>
-    → send via reload_tx channel
-  → main loop receives new config
-    → engine.write().set_full_config()
-    → message_loop.reload_hotkeys()
+notify file watcher: a change to the config or to a file it includes
+  → the reload thread waits until the files have been quiet for 200 ms (trailing edge)
+    → read file(s) → decode → Decoded { config, issues, includes }
+    → errors: look once more after another quiet period, then
+        send ReloadOutcome::Failed { issues, summary } — the last good config stays
+    → no errors: store in Arc<RwLock<Config>>, send ReloadOutcome::Applied { config, warnings }
+  → main loop (ReloadCtx) receives the outcome
+    → Applied: engine.write().set_full_config(); message_loop.reload_hotkeys();
+        broadcast IpcEvent::ConfigLoaded { failed: false }
       → PostThreadMessage(WM_RELOAD_HOTKEYS)
         → message loop: UnregisterHotKey all → read config binds → RegisterHotKey all
-    → apply_layout_for_monitor()
+      → apply_layout_for_monitor()
+    → Failed: log every issue, tray balloon "file:line:column: error: message",
+        broadcast IpcEvent::ConfigLoaded { failed: true, error }
 ```
 
 ---

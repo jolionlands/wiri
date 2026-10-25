@@ -640,15 +640,14 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
         }
     };
 
-    let content = match std::fs::read_to_string(&resolved) {
-        Ok(c) => c,
-        Err(e) => {
-            errln!("error: could not read {}: {}", resolved.display(), e);
-            std::process::exit(1);
-        }
-    };
+    if let Err(e) = std::fs::metadata(&resolved) {
+        errln!("error: could not read {}: {}", resolved.display(), e);
+        std::process::exit(1);
+    }
 
-    let issues = wiri::config::validate_kdl_config(&content);
+    // The same parser the daemon loads the config with: syntax, unknown keys, values, binds,
+    // window rules and the files it includes.
+    let issues = wiri::config::validate_config_file(&resolved);
     let error_count = issues
         .iter()
         .filter(|i| i.severity == wiri::config::ValidationSeverity::Error)
@@ -659,11 +658,13 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
         .count();
 
     if json {
+        let root = resolved.display().to_string();
         let json_issues: Vec<serde_json::Value> = issues
             .iter()
             .map(|i| {
                 serde_json::json!({
                     "severity": i.severity.to_string(),
+                    "file": if i.file.is_empty() { root.clone() } else { i.file.clone() },
                     "line": i.line,
                     "column": i.column,
                     "message": i.message,
@@ -678,13 +679,14 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        let path_str = resolved.display();
+        let path_str = resolved.display().to_string();
         if issues.is_empty() {
             outln!("{}: ok (no issues)", path_str);
         } else {
             for issue in &issues {
-                // Format mirrors common compiler output: `path:line:col: sev: msg`.
-                outln!("{}:{}", path_str, issue);
+                // Format mirrors common compiler output: `path:line:col: sev: msg`; an issue
+                // in an included file names that file.
+                outln!("{}", issue.located(&path_str));
             }
             outln!(
                 "{}: {} error(s), {} warning(s)",

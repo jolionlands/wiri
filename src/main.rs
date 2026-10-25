@@ -21,7 +21,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use wiri::backend::message_loop::MessageLoop;
 use wiri::backend::{Backend, BackendEvent, BackendHandle, MonitorInfo as BackendMonitorInfo};
-use wiri::config::{loader::ConfigLoader, Config};
+use wiri::config::{loader::ConfigLoader, Config, ReloadOutcome, ValidationIssue};
 use wiri::hooks::{SystemIntegration, TrayAction};
 use wiri::input::{
     apply_mouse_config, start_mouse_hook, stop_mouse_hook, MouseFocusConfig, MouseTracker,
@@ -250,20 +250,31 @@ async fn main() -> Result<()> {
             }
         });
 
-    let config = match Config::load(&config_path) {
-        Ok(cfg) => {
-            info!("Config: {}", config_path.display());
-            cfg
-        }
-        Err(e) => {
-            warn!("Using defaults (config error: {})", e);
-            Config::default_config()
-        }
+    // A config with errors is not loaded (niri does the same): wiri starts with its defaults
+    // and says why in a balloon as soon as the tray icon exists.
+    let startup_decoded = wiri::config::loader::load_logged(&config_path);
+    let mut pending_balloon: Option<(String, String, u32)> = None;
+    let config = if startup_decoded.has_errors() {
+        let summary = wiri::config::failure_summary(&config_path, &startup_decoded.issues);
+        warn!("Using defaults (config error: {})", summary);
+        pending_balloon = Some((
+            "wiri: config error".to_string(),
+            format!("{} - using the defaults.", summary),
+            0,
+        ));
+        Config::default_config()
+    } else {
+        info!(
+            "Config: {} ({} warnings)",
+            config_path.display(),
+            startup_decoded.warning_count()
+        );
+        startup_decoded.config
     };
 
-    // Start config file watcher for live-reload support. The watcher publishes
-    // new `Config` instances on the broadcast channel returned by
-    // `subscribe()`; the main loop pulls from that channel and re-applies.
+    // Start config file watcher for live-reload support. The watcher publishes the result of
+    // each reload (the new `Config`, or what is wrong with the file) on the broadcast channel
+    // returned by `subscribe()`; the main loop pulls from that channel and acts on it.
     let mut config_loader = ConfigLoader::new(config_path.clone());
     let mut config_reload_rx = config_loader.subscribe();
     if let Err(e) = config_loader.start_watching() {
@@ -286,6 +297,13 @@ async fn main() -> Result<()> {
             match wiri::hooks::spawner::spawn_argv(entry) {
                 Ok(pid) => info!("spawn-at-startup: started {:?} (pid {})", entry, pid),
                 Err(e) => warn!("spawn-at-startup failed for {:?}: {}", entry, e),
+            }
+        }
+        for command in &config.spawn_sh_at_startup {
+            info!("spawn-sh-at-startup: {:?}", command);
+            match wiri::hooks::spawner::spawn_shell(command) {
+                Ok(pid) => info!("spawn-sh-at-startup: started {:?} (pid {})", command, pid),
+                Err(e) => warn!("spawn-sh-at-startup failed for {:?}: {}", command, e),
             }
         }
     }
@@ -495,6 +513,7 @@ async fn main() -> Result<()> {
     ipc_server.set_shutdown_sender(ipc_shutdown_tx);
     let (ipc_reload_tx, mut ipc_reload_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     ipc_server.set_reload_sender(ipc_reload_tx);
+    ipc_server.set_config_path(config_path.clone());
     let ipc_server = Arc::new(ipc_server);
     let ipc_server_clone = ipc_server.clone();
     tokio::spawn(async move {
@@ -687,6 +706,14 @@ async fn main() -> Result<()> {
     // even at 30 fps the steady-state overhead is negligible.
     const ANIMATION_TICK_MS: u32 = 33; // ~30fps
     let mut ipc_shutdown_rx = ipc_shutdown_rx;
+    let reload = ReloadCtx {
+        config_path: &config_path,
+        engine: &engine,
+        handle: &handle,
+        message_loop: &message_loop,
+        mouse_tracker: &mouse_tracker,
+        ipc_server: &ipc_server,
+    };
 
     // Main loop: process tray actions + tick animations + wait for shutdown signal
     'main: loop {
@@ -788,24 +815,26 @@ async fn main() -> Result<()> {
         // every keypress + tray click; the user noticed it as input lag.
         tokio::time::sleep(Duration::from_millis(8)).await;
 
+        // The config error that was found at startup is shown as soon as the tray icon is there.
+        if let Some((title, text, attempts)) = pending_balloon.take() {
+            if system.tray_icon().try_balloon(&title, &balloon_text(&text)) {
+                info!("Showed the config error balloon");
+            } else if attempts < 500 {
+                pending_balloon = Some((title, text, attempts + 1));
+            } else {
+                warn!("The tray icon never came up; the config error balloon was not shown");
+            }
+        }
+
         // Handle file-watcher config reloads
         match config_reload_rx.try_recv() {
-            Ok(new_config) => {
-                info!("Config file changed — reloading");
-                apply_loaded_config(new_config, &engine, &handle, &message_loop, &mouse_tracker);
-            }
+            Ok(outcome) => reload.outcome(outcome, &system),
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
                 warn!(
                     "Config reload channel lagged {} events — reloading from disk",
                     n
                 );
-                reload_config_from_disk(
-                    &config_path,
-                    &engine,
-                    &handle,
-                    &message_loop,
-                    &mouse_tracker,
-                );
+                reload.from_disk(&system);
             }
             Err(_) => {} // Empty or closed — normal
         }
@@ -815,13 +844,7 @@ async fn main() -> Result<()> {
             match ipc_reload_rx.try_recv() {
                 Ok(()) => {
                     info!("IPC: Reloading config from disk");
-                    reload_config_from_disk(
-                        &config_path,
-                        &engine,
-                        &handle,
-                        &message_loop,
-                        &mouse_tracker,
-                    );
+                    reload.from_disk(&system);
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
@@ -861,13 +884,7 @@ async fn main() -> Result<()> {
                     // Tray reload bypasses the file-watcher channel (used for explicit
                     // user-driven reloads, e.g. after editing the file in a different
                     // editor) — load directly from disk and re-apply everything.
-                    reload_config_from_disk(
-                        &config_path,
-                        &engine,
-                        &handle,
-                        &message_loop,
-                        &mouse_tracker,
-                    );
+                    reload.from_disk(&system);
                 }
                 TrayAction::Quit => {
                     info!("Quit requested via tray icon");
@@ -934,23 +951,93 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn reload_config_from_disk(
-    config_path: &Path,
-    engine: &Arc<RwLock<TilingEngine>>,
-    handle: &BackendHandle,
-    message_loop: &MessageLoop,
-    mouse_tracker: &Arc<RwLock<MouseTracker>>,
-) -> bool {
-    match Config::load(config_path) {
-        Ok(new_config) => {
-            apply_loaded_config(new_config, engine, handle, message_loop, mouse_tracker);
+/// What reloading the config needs: the places it is applied to and the places the result is
+/// reported to (the log, a tray balloon, the IPC event stream).
+struct ReloadCtx<'a> {
+    config_path: &'a Path,
+    engine: &'a Arc<RwLock<TilingEngine>>,
+    handle: &'a BackendHandle,
+    message_loop: &'a MessageLoop,
+    mouse_tracker: &'a Arc<RwLock<MouseTracker>>,
+    ipc_server: &'a Arc<IpcServer>,
+}
+
+impl<'a> ReloadCtx<'a> {
+    /// Read the file now (a reload that was asked for: the tray menu, `wiri-ctl reload-config`).
+    fn from_disk(&self, system: &SystemIntegration) -> bool {
+        let decoded = wiri::config::loader::load_logged(self.config_path);
+        if decoded.has_errors() {
+            self.report_failure(&decoded.issues, system);
+            false
+        } else {
+            let warnings = decoded.warning_count();
+            self.apply(decoded.config, warnings);
             info!("Config reloaded successfully");
             true
         }
-        Err(e) => {
-            warn!("Config reload failed: {}", e);
-            false
+    }
+
+    /// The result of a reload the file watcher did.
+    fn outcome(&self, outcome: ReloadOutcome, system: &SystemIntegration) {
+        match outcome {
+            ReloadOutcome::Applied { config, warnings } => {
+                info!("Config file changed — reloaded ({} warnings)", warnings.len());
+                self.apply(*config, warnings.len());
+            }
+            ReloadOutcome::Failed { issues, .. } => self.report_failure(&issues, system),
         }
+    }
+
+    fn apply(&self, config: Config, warnings: usize) {
+        apply_loaded_config(
+            config,
+            self.engine,
+            self.handle,
+            self.message_loop,
+            self.mouse_tracker,
+        );
+        self.ipc_server.broadcast_event(IpcEvent::ConfigLoaded {
+            config_path: self.config_path.display().to_string(),
+            failed: false,
+            error: None,
+            warnings: warnings as u32,
+        });
+    }
+
+    /// The file has errors: the last good config stays, the user is told where the first
+    /// error is, and the event stream says the load failed.
+    fn report_failure(&self, issues: &[ValidationIssue], system: &SystemIntegration) {
+        let summary = wiri::config::failure_summary(self.config_path, issues);
+        error!(
+            "Config reload failed - the last good config stays in use: {}",
+            summary
+        );
+        let text = balloon_text(&format!("{} - last good config kept.", summary));
+        if !system.tray_icon().try_balloon("wiri: config error", &text) {
+            warn!("The config error balloon could not be shown");
+        }
+        let warnings = issues
+            .iter()
+            .filter(|i| i.severity == wiri::config::ValidationSeverity::Warning)
+            .count();
+        self.ipc_server.broadcast_event(IpcEvent::ConfigLoaded {
+            config_path: self.config_path.display().to_string(),
+            failed: true,
+            error: Some(summary),
+            warnings: warnings as u32,
+        });
+    }
+}
+
+/// A balloon holds 255 characters; a longer message is cut with an ellipsis.
+fn balloon_text(text: &str) -> String {
+    const MAX: usize = 240;
+    if text.chars().count() <= MAX {
+        text.to_string()
+    } else {
+        let mut cut: String = text.chars().take(MAX - 1).collect();
+        cut.push('…');
+        cut
     }
 }
 

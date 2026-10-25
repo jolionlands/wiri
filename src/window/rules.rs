@@ -121,6 +121,9 @@ mod tests {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: is_active,
+            is_active_in_column: false,
         }
     }
 
@@ -327,6 +330,9 @@ mod tests {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: true,
+            is_active_in_column: false,
         };
         assert!(
             resolve_window_rules(&rules, &ctx_both).float,
@@ -343,6 +349,9 @@ mod tests {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: false,
+            is_active_in_column: false,
         };
         assert!(
             !resolve_window_rules(&rules, &ctx_class_only).float,
@@ -359,6 +368,9 @@ mod tests {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: true,
+            is_active_in_column: false,
         };
         assert!(
             !resolve_window_rules(&rules, &ctx_active_only).float,
@@ -463,6 +475,9 @@ mod tests {
             is_floating,
             is_urgent,
             at_startup,
+            aumid: None,
+            is_focused: is_active,
+            is_active_in_column: false,
         }
     }
 

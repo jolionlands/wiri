@@ -249,9 +249,40 @@ fn merge_hotkeys(
     (merged, overridden)
 }
 
+/// niri's per-bind options that change when a hotkey fires: `repeat=false` (holding the key
+/// fires the action once) and `cooldown-ms=` (after a fire the bind is ignored for that long).
+#[derive(Debug, Clone, Default)]
+struct BindOptions {
+    /// False: the key's auto-repeat does not fire the action again.
+    no_repeat: bool,
+    cooldown: Option<std::time::Duration>,
+    /// `hotkey-overlay-title=`: `Some(Some(text))` replaces the action name in the key-bindings
+    /// overlay, `Some(None)` (`null`) hides the bind from it.
+    title: Option<Option<String>>,
+}
+
+/// Whether a hotkey press fires its action: `repeat` says the key is auto-repeating, `last`
+/// is when the bind last fired.  Pure so the rules can be tested.
+fn bind_may_fire(
+    options: &BindOptions,
+    is_repeat: bool,
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if options.no_repeat && is_repeat {
+        return false;
+    }
+    if let (Some(cooldown), Some(last)) = (options.cooldown, last) {
+        if now.saturating_duration_since(last) < cooldown {
+            return false;
+        }
+    }
+    true
+}
+
 /// Build hotkey list from config binds, optionally extending the built-in
 /// defaults so newly-shipped actions stay available to users with stale
-/// configs.
+/// configs.  The second value holds the options of the binds that have any.
 ///
 /// Resolution order:
 ///   1. Read `binds.extend_defaults` (default `true`).
@@ -264,7 +295,9 @@ fn merge_hotkeys(
 ///      config binds replace defaults entirely (with the same skip-and-log
 ///      semantics), and an empty surviving table falls back to defaults
 ///      so the daemon never ships zero hotkeys after a bad reload.
-fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u32, u32, Action)> {
+fn build_hotkey_list(
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+) -> (Vec<(u32, u32, Action)>, HashMap<(u32, u32), BindOptions>) {
     let terminal = resolve_terminal_action(engine);
     let eng = engine.read();
     let binds = eng.config_binds();
@@ -286,14 +319,30 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
             "Hotkeys: {} from defaults, 0 from config (0 overridden)",
             default_count
         );
-        return defaults;
+        return (defaults, HashMap::new());
     }
 
     // Parse every config bind once.
     let mut parsed_config: Vec<(u32, u32, Action)> = Vec::with_capacity(config_binds.len());
+    let mut options: HashMap<(u32, u32), BindOptions> = HashMap::new();
     for bind in config_binds {
         match bind_to_hotkey(bind, prefix) {
-            Ok(row) => parsed_config.push(row),
+            Ok(row) => {
+                if !bind.repeat || bind.cooldown_ms.is_some() || bind.hotkey_overlay_title.is_some()
+                {
+                    options.insert(
+                        (row.0, row.1),
+                        BindOptions {
+                            no_repeat: !bind.repeat,
+                            cooldown: bind
+                                .cooldown_ms
+                                .map(|ms| std::time::Duration::from_millis(ms as u64)),
+                            title: bind.hotkey_overlay_title.clone(),
+                        },
+                    );
+                }
+                parsed_config.push(row)
+            }
             Err(why) => warn!("Config bind: {}, skipping", why),
         }
     }
@@ -315,9 +364,9 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
     }
     if merged.is_empty() {
         warn!("Hotkey table empty after merge; defaults reinstated");
-        return default_hotkeys(prefix, shift_prefix, terminal);
+        return (default_hotkeys(prefix, shift_prefix, terminal), HashMap::new());
     }
-    merged
+    (merged, options)
 }
 
 /// Chords that wiri must NEVER attempt to register.  These are reserved by
@@ -453,12 +502,19 @@ pub struct RegisteredBinding {
     /// Action this binding fires.  Held as a debug-formatted string so the
     /// IPC layer (which doesn't depend on `Action`'s serde impl) can ship it.
     pub action: String,
+    /// niri's `hotkey-overlay-title=`: `Some(Some(text))` is shown in the key-bindings overlay
+    /// instead of the action name, `Some(None)` hides the bind from it.
+    pub title: Option<Option<String>>,
 }
 
 /// Refresh the global REGISTERED_BINDINGS snapshot after a (re-)registration
 /// pass.  Stores only bindings that Windows actually accepted (i.e. whose ID
 /// appears in `registered_ids`) so users get a true picture of what's live.
-fn update_current_bindings_snapshot(hotkeys: &[(u32, u32, Action)], registered_ids: &[i32]) {
+fn update_current_bindings_snapshot(
+    hotkeys: &[(u32, u32, Action)],
+    registered_ids: &[i32],
+    options: &HashMap<(u32, u32), BindOptions>,
+) {
     let base_id = 32768i32;
     let mut snap: Vec<RegisteredBinding> = Vec::with_capacity(hotkeys.len());
     for (i, (mods, vk, action)) in hotkeys.iter().enumerate() {
@@ -471,9 +527,47 @@ fn update_current_bindings_snapshot(hotkeys: &[(u32, u32, Action)], registered_i
             modifiers: *mods,
             vk_code: *vk,
             action: format!("{:?}", action),
+            title: options.get(&(*mods, *vk)).and_then(|o| o.title.clone()),
         });
     }
     *REGISTERED_BINDINGS.lock() = snap;
+}
+
+/// The rows of the key-bindings overlay: the chord and what it does, the action's name unless
+/// the bind has a `hotkey-overlay-title`, and no row for a bind whose title is `null`.
+fn overlay_rows(bindings: &[RegisteredBinding]) -> Vec<(String, String)> {
+    bindings
+        .iter()
+        .filter_map(|b| {
+            let chord = crate::ipc::server::format_chord(b.modifiers, b.vk_code);
+            match &b.title {
+                Some(None) => None,
+                Some(Some(text)) => Some((chord, text.clone())),
+                None => Some((chord, b.action.clone())),
+            }
+        })
+        .collect()
+}
+
+/// The options of the registered binds that have any, by hotkey id (with the virtual key
+/// that auto-repeat is detected on).
+fn options_by_id(
+    hotkeys: &[(u32, u32, Action)],
+    registered_ids: &[i32],
+    options: &HashMap<(u32, u32), BindOptions>,
+) -> HashMap<i32, (u32, BindOptions)> {
+    let base_id = 32768i32;
+    let mut by_id = HashMap::new();
+    for (i, (mods, vk, _)) in hotkeys.iter().enumerate() {
+        let id = base_id + i as i32;
+        if !registered_ids.contains(&id) {
+            continue;
+        }
+        if let Some(o) = options.get(&(*mods, *vk)) {
+            by_id.insert(id, (*vk, o.clone()));
+        }
+    }
+    by_id
 }
 
 /// Return a clone of every hotkey currently registered with Windows.
@@ -593,10 +687,13 @@ impl MessageLoop {
 
         // Register initial hotkeys.  Keep `current_hotkeys` so the snapshot
         // and hot-reload paths share a single source of truth.
-        let current_hotkeys = build_hotkey_list(&engine);
+        let (current_hotkeys, bind_options) = build_hotkey_list(&engine);
         let (mut registered_ids, mut action_map) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
-        update_current_bindings_snapshot(&current_hotkeys, &registered_ids);
+        update_current_bindings_snapshot(&current_hotkeys, &registered_ids, &bind_options);
+        // niri's `repeat=false` / `cooldown-ms=` binds, by hotkey id, and when each last fired.
+        let mut id_options = options_by_id(&current_hotkeys, &registered_ids, &bind_options);
+        let mut last_fire: HashMap<i32, std::time::Instant> = HashMap::new();
 
         *running.lock() = true;
         info!(
@@ -619,11 +716,13 @@ impl MessageLoop {
                     // Hot-reload: unregister old, re-read config, register new
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
-                    let new_hotkeys = build_hotkey_list(&engine);
+                    let (new_hotkeys, new_options) = build_hotkey_list(&engine);
                     let (new_ids, new_map) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
                     action_map = new_map;
-                    update_current_bindings_snapshot(&new_hotkeys, &registered_ids);
+                    update_current_bindings_snapshot(&new_hotkeys, &registered_ids, &new_options);
+                    id_options = options_by_id(&new_hotkeys, &registered_ids, &new_options);
+                    last_fire.clear();
                     info!("Hotkey reload complete");
                     continue;
                 }
@@ -631,6 +730,15 @@ impl MessageLoop {
                     // WM_HOTKEY
                     let hotkey_id = msg.wParam.0 as i32;
                     if let Some(action) = action_map.get(&hotkey_id) {
+                        if let Some((vk, options)) = id_options.get(&hotkey_id) {
+                            let now = std::time::Instant::now();
+                            let is_repeat = crate::input::last_press_was_repeat(*vk);
+                            if !bind_may_fire(options, is_repeat, last_fire.get(&hotkey_id).copied(), now) {
+                                debug!("HOTKEY id={} ignored (key repeat or cooldown)", hotkey_id);
+                                continue;
+                            }
+                            last_fire.insert(hotkey_id, now);
+                        }
                         info!("HOTKEY id={} -> {:?}", hotkey_id, action);
                         execute_action(action, &engine, &backend_handle, &quit_tx);
                     }
@@ -1329,13 +1437,7 @@ pub(crate) fn perform_action(
                         .unwrap_or_else(|| "Ctrl+Alt".to_string());
                     crate::overlay::bindings_cheatsheet::default_bindings_table(&prefix_name)
                 } else {
-                    raw.iter()
-                        .map(|b| {
-                            let chord = crate::ipc::server::format_chord(b.modifiers, b.vk_code);
-                            let action = b.action.clone();
-                            (chord, action)
-                        })
-                        .collect()
+                    overlay_rows(&raw)
                 };
                 info!("ShowKeyBindings: toggling cheatsheet ({} rows)", rows.len());
                 cs.toggle(rows);
@@ -1677,6 +1779,58 @@ mod tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             ..crate::config::HotkeyBinding::default()
         }
+    }
+
+    #[test]
+    fn repeat_false_and_cooldown_decide_whether_a_press_fires() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let no_repeat = BindOptions {
+            no_repeat: true,
+            ..BindOptions::default()
+        };
+        assert!(bind_may_fire(&no_repeat, false, None, t0), "the first press fires");
+        assert!(!bind_may_fire(&no_repeat, true, Some(t0), t0), "auto-repeat does not");
+        let repeating = BindOptions::default();
+        assert!(bind_may_fire(&repeating, true, Some(t0), t0), "binds repeat by default");
+        let cooldown = BindOptions {
+            cooldown: Some(Duration::from_millis(150)),
+            ..BindOptions::default()
+        };
+        assert!(bind_may_fire(&cooldown, false, None, t0));
+        assert!(!bind_may_fire(&cooldown, false, Some(t0), t0 + Duration::from_millis(100)));
+        assert!(bind_may_fire(&cooldown, false, Some(t0), t0 + Duration::from_millis(150)));
+        // The options of a config bind are found again by the hotkey id.
+        let hotkeys = vec![
+            (MOD_CTRL | MOD_ALT, 0x54u32, Action::ToggleFloating),
+            (MOD_CTRL | MOD_ALT, 0x51u32, Action::CloseWindow),
+        ];
+        let mut options = HashMap::new();
+        options.insert((MOD_CTRL | MOD_ALT, 0x51u32), cooldown.clone());
+        let by_id = options_by_id(&hotkeys, &[32768, 32769], &options);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id.get(&32769).map(|(vk, _)| *vk), Some(0x51));
+        // A bind Windows refused to register has no options to look up.
+        assert!(options_by_id(&hotkeys, &[32768], &options).is_empty());
+    }
+
+    #[test]
+    fn the_overlay_shows_titles_and_hides_null_titles() {
+        let row = |vk: u32, action: &str, title: Option<Option<&str>>| RegisteredBinding {
+            id: 32768,
+            modifiers: MOD_CTRL | MOD_ALT,
+            vk_code: vk,
+            action: action.to_string(),
+            title: title.map(|t| t.map(|s| s.to_string())),
+        };
+        let rows = overlay_rows(&[
+            row(0x54, "SpawnCmd(\"wt\")", Some(Some("Open a Terminal"))),
+            row(0x51, "CloseWindow", None),
+            row(0x58, "Quit", Some(None)),
+        ]);
+        assert_eq!(rows.len(), 2, "the null title hides its bind: {:?}", rows);
+        assert_eq!(rows[0].1, "Open a Terminal");
+        assert_eq!(rows[1].1, "CloseWindow");
     }
 
     #[test]

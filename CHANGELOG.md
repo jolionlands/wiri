@@ -5,6 +5,30 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2A — a real config parser, window rules, fullscreen, IPC (2026-10-25)
+- **A real KDL config parser with visible errors.**  The line scanner is gone.  `src/config/kdl.rs` reads
+  KDL (nested blocks, `/-` slashdash, `/* */`, raw strings `r#"..."#`, escapes, numbers, a BOM, UTF-16
+  files) with no new dependency, and `src/config/decode.rs` maps it onto the config and reports every
+  problem with `line:column`.  niri's syntax loads as written: a `binds { Mod+T { spawn "wt.exe"; } }`
+  block with `repeat=false`, `cooldown-ms=`, `allow-when-locked=` and `hotkey-overlay-title=`, `input`,
+  `layout` (`gaps`, `border`, `focus-ring`, `shadow`, `struts`), `output`, `workspace`, `window-rule`,
+  `animations`, `spawn-at-startup`, `include`.  wiri's older spellings keep working.  An unknown section
+  or key, a value of the wrong type, a bad color, a misspelled action or key and a bad regular
+  expression are errors (with a "did you mean"); a niri option wiri lacks, a bind that cannot work on
+  Windows and a duplicate bind are warnings.  `cooldown-ms=` and `repeat=false` act (the keyboard hook
+  tells key auto-repeat from a first press), `hotkey-overlay-title=` titles the key-bindings overlay.
+- **A bad config is never applied half.**  At startup an erroneous config is not used: wiri starts with
+  its defaults and a tray balloon names the first error (`file:line:column`).  On a reload the last good
+  config stays in use, a balloon names the file and line, every error is in the log, and a
+  `config_loaded` IPC event with `failed: true` and the error text is sent.  The reload is a
+  trailing-edge debounce: the file is read once, 200 ms after the last change to it or to a file it
+  includes (included files in other directories are watched too), so an editor that saves in steps never
+  gets half a file applied.  `wiri-ctl validate-config [path]` runs the same parser and also checks the
+  included files; `wiri-ctl reload-config` answers with the first error.
+- The shipped `resources/default_config.kdl` and `examples/` are written in niri syntax.  A string that
+  starts like a Windows path keeps its backslashes (`"C:\Program Files\x"`), elsewhere a bad escape is an
+  error that points at it and a raw string always works.
+
 ### Phase 1 — safe to daily-drive (2026-10-24)
 Each item is verified on a spare Windows 11 laptop with `scripts/live-test.ps1` (real key
 presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phase1-report.md`.

@@ -2,8 +2,16 @@
 //
 // wiri default configuration
 // ───────────────────────────────────────────────────────────────────────────
-// Copy this file to %APPDATA%\wiri\config.kdl and customise.  wiri watches
-// the file and hot-reloads on save (~100 ms debounce); no restart needed.
+// This is KDL, the syntax niri's config uses: a niri `binds {}` block, `window-rule`s, `include`
+// and `spawn-at-startup` lines paste in as they are.  Copy this file to %APPDATA%\wiri\config.kdl
+// and edit it.  wiri watches the file and reloads it a moment after you save; a mistake is reported
+// in a balloon from the tray icon (file, line and column) and the last good config stays.
+// `wiri-ctl validate-config` checks a file without loading it.
+//
+//   // ...        a comment            /- node       comments out one node or a whole section
+//   r#"..."#      a raw string: no escapes, so Windows paths and regexes need no doubled backslashes
+//
+// A string that starts like a Windows path ("C:\Program Files\x") may keep its backslashes as they are.
 //
 // Reference: https://github.com/wiri-wm/wiri/blob/main/docs/SPEC.md
 //
@@ -15,34 +23,31 @@ version "1.0"
 // ───────────────────────────────────────────────────────────────────────────
 input {
     keyboard {
-        layout "us"
         repeat-delay 250        // ms before keyrepeat kicks in
         repeat-rate 25          // keys/sec while held
-        // numlock true         // turn NumLock on at startup
+        // numlock              // turn NumLock on at startup
     }
     mouse {
-        natural-scroll false    // true = invert wheel direction (macOS-style)
+        // natural-scroll      // invert the wheel direction (macOS-style) for wiri's own wheel binds
         scroll-speed 1.0        // multiplier on the system wheel delta
-        acceleration 0.0        // advisory; Windows mouse accel is system-wide
-        sensitivity 1.0
-        tap-to-click false      // tap-to-click on touchpads
     }
     // touch {
     //     enable true
     //     tap-to-click true
     //     scroll-speed 1.0
     // }
-    focus {
-        follows-mouse false     // focus the window under the cursor automatically
-        focus-delay-ms 150      // small delay so a fast pointer pass doesn't grab focus
-        warp-on-focus false     // warp the cursor to the centre of the newly focused window
-    }
+
+    // niri: the window under the pointer gets the keyboard focus.  `focus-delay-ms` is wiri's own.
+    // focus-follows-mouse
+    // focus-delay-ms 150
+    // warp-mouse-to-focus   // move the pointer to the middle of a window that was focused with the keyboard
+
     // niri: asking for the workspace you are on (focus-workspace 2 on the second one)
     // goes back to the previous workspace.
     // workspace-auto-back-and-forth
-    // Modifier prefix for the default keybindings ("ctrl-alt", "alt",
-    // "super" = Win key, "win-alt", "ctrl-shift").  Custom `binds {}`
-    // blocks below override everything.
+
+    // What `Mod` means in the binds below: "ctrl-alt" (the default), "alt", "ctrl", "super" (the Win key),
+    // "win-alt" or "ctrl-shift".
     // mod-key "ctrl-alt"
 }
 
@@ -50,32 +55,34 @@ input {
 // Layout — gaps, borders, focus ring, shadows, scrolling
 // ───────────────────────────────────────────────────────────────────────────
 layout {
+    // niri writes one number (`gaps 16`) for the gap between windows and around the screen;
+    // wiri can also tell them apart.
     gaps {
-        inner 16                // gap between tiled windows
-        outer 8                 // gap from the screen edge
+        inner 16                // between tiled windows
+        outer 8                 // from the screen edge
     }
-    borders {
-        width 4                 // 0 disables borders entirely
-        color "#4d4d4d"
-        color-focused "#3381d9"
-        color-urgent "#cc3344"  // colour for windows in the "urgent" state
-        // radius 8             // rounded corner radius (px). 0 = square.
-        // padding 0            // inner padding between content and border.
+    // struts { left 0; right 0; top 0; bottom 0 }   // room kept free for a bar, in pixels
+
+    border {
+        width 4                 // 0 (or `off`) turns the border off
+        inactive-color "#4d4d4d"
+        active-color "#3381d9"
+        urgent-color "#cc3344"  // windows that ask for attention
+        // radius 8             // rounded corners (px); 0 = square
+        // padding 0            // space between content and border
     }
     focus-ring {
-        width 3                 // 0 disables the ring
-        color "#3381d9"         // active ring colour
-        // gap 6                // gap between window edge and ring (px)
+        width 3                 // 0 (or `off`) turns the ring off
+        active-color "#3381d9"
         // inactive-color "#404040"
+        // gap 6                // gap between window edge and ring (px)
     }
-    shadows {
-        enable false            // DWM drops a soft drop-shadow on tiled windows
-        // opacity 0.5
-        // offset-x 10
-        // offset-y 10
-        // blur 20
+    shadow {
+        off                     // `on` lets DWM drop a soft shadow under tiled windows
+        // softness 20          // niri's name for the blur radius
         // spread 0
-        // color "#000000"
+        // offset x=0 y=5
+        // color "#00000070"
     }
 
     // Column width mode: "proportional" (the columns share the screen) or
@@ -112,266 +119,221 @@ layout {
     // compatibility.
     // strip-frame true
 
-    // Snap-on-drag (niri parity): while the user holds Alt and drags a
-    // tile with the left mouse button, snap the window's left edge to
-    // nearby column edges, the mid-screen guide, and the monitor edges.
-    // A tiny vertical line is painted at the active snap target.
+    // Snap-on-drag: while you hold Alt and drag a tile with the left mouse button,
+    // its left edge snaps to nearby column edges, the mid-screen guide and the
+    // monitor edges.  A thin vertical line is painted at the snap target.
     // snap-on-drag true
     // snap-threshold-px 20
 
-    // Smart borders (niri `borders { disable-when-only-one-window true }`
-    // parity): when `true`, suppress the DWM border on workspaces that
-    // contain exactly one column with exactly one tile.  Frees up usable
-    // space when there's nothing to delimit.  Default false.
+    // Smart borders: no border on a workspace that holds exactly one column with
+    // exactly one tile.  Default false.
     // smart-borders true
-    // The equivalent nested form also works:
-    // borders { smart true }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Animations
 // ───────────────────────────────────────────────────────────────────────────
 animations {
-    enable false                // off by default; performance-conscious
+    off                         // `on` to animate; performance-conscious default
     duration 200                // ms
     easing "ease-out-cubic"     // none | linear | ease-in | ease-out | ease-in-out | cubic-out
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Keybindings (Ctrl+Alt prefix by default)
+// Keybindings.  `Mod` is Ctrl+Alt unless `input { mod-key }` says otherwise.
 //
-// When any binds are defined, they REPLACE the defaults entirely.  Comment
-// out a line to leave its key combo unbound.
+// These binds are added to wiri's built-in defaults (a bind here wins when it uses
+// the same keys as a built-in one).  `extend-defaults false` inside `binds {}` drops
+// the built-ins so that only this block counts.
+//
+// A bind is a key combination and one action in braces; niri's properties are
+// accepted: repeat=false (holding the key fires once), cooldown-ms=300,
+// hotkey-overlay-title="...".  Comment a bind out with // or `/-` to unbind it.
 // ───────────────────────────────────────────────────────────────────────────
 binds {
     // Focus navigation
-    Ctrl+Alt+Left   focus-column-left
-    Ctrl+Alt+Right  focus-column-right
-    Ctrl+Alt+Up     focus-up
-    Ctrl+Alt+Down   focus-down
+    Mod+Left   { focus-column-left; }
+    Mod+Right  { focus-column-right; }
+    Mod+Up     { focus-window-up; }
+    Mod+Down   { focus-window-down; }
 
     // Move columns
-    Ctrl+Alt+Shift+Left  move-column-left
-    Ctrl+Alt+Shift+Right move-column-right
+    Mod+Shift+Left   { move-column-left; }
+    Mod+Shift+Right  { move-column-right; }
 
     // Window actions
-    Ctrl+Alt+Q       close-window
+    Mod+Q { close-window; }
     // Open a terminal — prefers Windows Terminal (`wt.exe`), falling back to
-    // PowerShell via the shell path so the user is never dropped into a bare
-    // cmd.exe prompt.  Override this line in your config if you want a
-    // different terminal (Alacritty, WezTerm, Ghostty, etc.).
-    Ctrl+Alt+Return  spawn-cmd "start wt.exe || start powershell.exe"
-    Ctrl+Alt+F       toggle-fullscreen
-    Ctrl+Alt+T       toggle-floating
+    // PowerShell via the shell path so you are never dropped into a bare
+    // cmd.exe prompt.  Change this line for another terminal (Alacritty, WezTerm,
+    // Ghostty, ...): `Mod+Return { spawn "alacritty"; }`.
+    Mod+Return hotkey-overlay-title="Open a Terminal" { spawn-sh "start wt.exe || start powershell.exe"; }
+    Mod+F { fullscreen-window; }
+    Mod+T { toggle-window-floating; }
 
     // Infinite scroll (scrolls the view; focus follows)
-    Ctrl+Alt+H       scroll-left
-    Ctrl+Alt+L       scroll-right
+    Mod+H { scroll-left; }
+    Mod+L { scroll-right; }
 
-    // Column-width presets.  set-column-width takes niri's size argument too: "50%",
-    // "+10%", "-10%" (of the view), "1200", "+100" (pixels); "cycle" is niri's
-    // switch-preset-column-width (a third, a half, two thirds).
-    Ctrl+Alt+Bracket_Left  set-column-width "1/3"
-    Ctrl+Alt+Bracket_Right set-column-width "2/3"
-    Ctrl+Alt+Backslash     set-column-width "cycle"
+    // Column-width presets.  set-column-width takes niri's size argument: "50%", "+10%", "-10%"
+    // (of the view), "1200", "+100" (pixels); switch-preset-column-width cycles a third, a half,
+    // two thirds.
+    Mod+Bracket_Left   { set-column-width "33.333%"; }
+    Mod+Bracket_Right  { set-column-width "66.667%"; }
+    Mod+Backslash      { switch-preset-column-width; }
 
-    // niri-parity: column-rearrange + size actions
-    //   Ctrl+Alt+Comma   → consume-window-into-column: the first window of the
-    //                      column on the right moves under the focused window
-    //   Ctrl+Alt+Period  → expel-window-from-column: the bottom window of the
-    //                      focused column gets a column of its own on the right
-    //   Ctrl+Alt+E       → expand column to fill leftover work-area width
-    //   Ctrl+Alt+Shift+F → maximize-column: the column is as wide as the view
-    //                      (toggle; also for a column of one window)
-    //   Ctrl+Alt+Shift+L → grow column width by 5%
-    //   Ctrl+Alt+Shift+H → shrink column width by 5%
-    //   Ctrl+Alt+Shift+K → grow tile height by 5% (multi-tile columns)
-    //   Ctrl+Alt+Shift+J → shrink tile height by 5% (multi-tile columns)
-    //   Ctrl+Alt+Shift+PageUp/PageDown → move column to monitor left/right
-    Ctrl+Alt+Comma         consume-window-into-column
-    Ctrl+Alt+Period        expel-window-from-column
-    Ctrl+Alt+E             expand-column-to-available
-    Ctrl+Alt+Shift+F       maximize-column
-    Ctrl+Alt+Shift+L       grow-column-width
-    Ctrl+Alt+Shift+H       shrink-column-width
-    Ctrl+Alt+Shift+K       grow-tile-height
-    Ctrl+Alt+Shift+J       shrink-tile-height
+    // Column rearrange and sizing
+    //   Mod+Comma   consume-window-into-column: the first window of the column on the right
+    //               moves under the focused window
+    //   Mod+Period  expel-window-from-column: the bottom window of the focused column gets
+    //               a column of its own on the right
+    //   Mod+E       the column takes the width the others leave free
+    //   Mod+Shift+F maximize-column: the column is as wide as the view (toggle; also for one window)
+    //   Mod+Shift+L / H  grow / shrink the column width by 5%
+    //   Mod+Shift+K / J  grow / shrink the tile height by 5% (columns with several windows)
+    Mod+Comma        { consume-window-into-column; }
+    Mod+Period       { expel-window-from-column; }
+    Mod+E            { expand-column-to-available-width; }
+    Mod+Shift+F      { maximize-column; }
+    Mod+Shift+L      { grow-column-width; }
+    Mod+Shift+H      { shrink-column-width; }
+    Mod+Shift+K      { grow-tile-height; }
+    Mod+Shift+J      { shrink-tile-height; }
 
     // niri keymap: columns and windows
-    //   Ctrl+Alt+Home / End               → focus the first / last column
-    //   Ctrl+Alt+Shift+Home / End         → move the column to the start / end of the strip
-    //   Ctrl+Alt+Shift+Bracket_Left/Right → consume-or-expel-window-left / right: a lone
-    //                                       window joins the column on that side, one of
-    //                                       several leaves its column on that side
-    //   Ctrl+Alt+K / J                    → move-window-up / down inside the column
-    Ctrl+Alt+Home                focus-column-first
-    Ctrl+Alt+End                 focus-column-last
-    Ctrl+Alt+Shift+Home          move-column-to-first
-    Ctrl+Alt+Shift+End           move-column-to-last
-    Ctrl+Alt+Shift+Bracket_Left  consume-or-expel-window-left
-    Ctrl+Alt+Shift+Bracket_Right consume-or-expel-window-right
-    Ctrl+Alt+K                   move-window-up
-    Ctrl+Alt+J                   move-window-down
+    //   Mod+Home / End                    focus the first / last column
+    //   Mod+Shift+Home / End              move the column to the start / end of the strip
+    //   Mod+Shift+Bracket_Left / Right    consume-or-expel-window-left / right: a lone window
+    //                                     joins the column on that side, one of several leaves
+    //   Mod+K / J                         move-window-up / down inside the column
+    Mod+Home                    { focus-column-first; }
+    Mod+End                     { focus-column-last; }
+    Mod+Shift+Home              { move-column-to-first; }
+    Mod+Shift+End               { move-column-to-last; }
+    Mod+Shift+Bracket_Left      { consume-or-expel-window-left; }
+    Mod+Shift+Bracket_Right     { consume-or-expel-window-right; }
+    Mod+K                       { move-window-up; }
+    Mod+J                       { move-window-down; }
 
-    // Workspace + column reorder (niri parity)
-    //   Ctrl+Alt+Shift+Page_Up/Down → swap the focused workspace with the
-    //                                 one above / below on the same monitor
-    //   Ctrl+Alt+Shift+Up/Down      → move the focused column to the
-    //                                 workspace above / below (creates dst
-    //                                 workspace if missing)
-    //   Ctrl+Alt+Shift+Comma/Period → move-column-to-monitor-left/right
-    //                                 (relocated from Page_Up/Down so the
-    //                                 Page_* chords match the niri default)
-    Ctrl+Alt+Shift+Page_Up    move-workspace-up
-    Ctrl+Alt+Shift+Page_Down  move-workspace-down
-    Ctrl+Alt+Shift+Up         move-column-to-workspace-up
-    Ctrl+Alt+Shift+Down       move-column-to-workspace-down
-    Ctrl+Alt+Shift+Comma      move-column-to-monitor-left
-    Ctrl+Alt+Shift+Period     move-column-to-monitor-right
+    // Workspaces and monitors
+    //   Mod+Shift+Page_Up / Down    swap the workspace with the one above / below
+    //   Mod+Shift+Up / Down         move the column to the workspace above / below
+    //   Mod+Shift+Comma / Period    move the column to the monitor on the left / right
+    Mod+Shift+Page_Up    { move-workspace-up; }
+    Mod+Shift+Page_Down  { move-workspace-down; }
+    Mod+Shift+Up         { move-column-to-workspace-up; }
+    Mod+Shift+Down       { move-column-to-workspace-down; }
+    Mod+Shift+Comma      { move-column-to-monitor-left; }
+    Mod+Shift+Period     { move-column-to-monitor-right; }
 
     // Quit
-    Ctrl+Alt+Shift+Q quit
+    Mod+Shift+Q { quit; }
 
-    // Workspaces
-    Ctrl+Alt+1 switch-workspace 1
-    Ctrl+Alt+2 switch-workspace 2
-    Ctrl+Alt+3 switch-workspace 3
-    Ctrl+Alt+4 switch-workspace 4
-    Ctrl+Alt+5 switch-workspace 5
-    Ctrl+Alt+6 switch-workspace 6
-    Ctrl+Alt+7 switch-workspace 7
-    Ctrl+Alt+8 switch-workspace 8
-    Ctrl+Alt+9 switch-workspace 9
+    // Workspaces: Mod+1 is the first workspace of the monitor, Mod+2 the second, ...
+    // (focus-workspace "name" goes to a named workspace)
+    Mod+1 { focus-workspace 1; }
+    Mod+2 { focus-workspace 2; }
+    Mod+3 { focus-workspace 3; }
+    Mod+4 { focus-workspace 4; }
+    Mod+5 { focus-workspace 5; }
+    Mod+6 { focus-workspace 6; }
+    Mod+7 { focus-workspace 7; }
+    Mod+8 { focus-workspace 8; }
+    Mod+9 { focus-workspace 9; }
 
     // Overview (zoom out to see all columns across every workspace).
     //
     // NOTE: Ctrl+Alt+Tab is reserved by Windows for the system task switcher
     // (the accessibility cousin of Alt+Tab) — RegisterHotKey usually succeeds
     // but the OS still intercepts the chord, so the binding silently never
-    // fires.  The default below uses Ctrl+Alt+Space and Escape instead.
+    // fires.  The default below uses Mod+Space and Escape instead.
     //
     // The bare Escape binding is state-gated: it only triggers an overview
     // toggle WHEN overview is active.  Outside overview, Escape stays
     // available for other applications.
-    Ctrl+Alt+Space overview-toggle
-    Escape         overview-toggle
-    Ctrl+Alt+O     overview-select
+    Mod+Space  { toggle-overview; }
+    Escape     { toggle-overview; }
+    Mod+O      { overview-select; }
 
     // Screenshot: capture the full virtual desktop to a BMP file under
     // %USERPROFILE%\Pictures\wiri-<timestamp>.bmp (falls back to the
     // current working directory if Pictures is not writable).
-    Ctrl+Alt+P   screenshot
+    Mod+P { screenshot; }
 
-    // Window-screenshot: capture only the focused window via
-    // PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT).  Output file lands
-    // under %USERPROFILE%\Pictures\wiri-window-<hwnd>-<timestamp>.bmp.
-    Ctrl+Alt+Shift+S  window-screenshot
+    // Window screenshot: capture only the focused window via
+    // PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT).  The file lands under
+    // %USERPROFILE%\Pictures\wiri-window-<hwnd>-<timestamp>.bmp.
+    Mod+Shift+S { screenshot-window; }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Programs to launch on wiri startup.  One entry per `spawn-at-startup` line.
-// Each argument is its own quoted token.
+// Programs to start with wiri.  One line per program, each argument its own string.
 // ───────────────────────────────────────────────────────────────────────────
 // spawn-at-startup "wt.exe"
 // spawn-at-startup "explorer.exe" "shell:startup"
+// spawn-sh-at-startup "start /min notepad.exe"
 
 // ───────────────────────────────────────────────────────────────────────────
-// Include other KDL files (niri parity).  Paths are resolved relative to
-// this file (or absolute).  Cycles are detected and the nesting depth is
-// capped at 8.  `include` directives are pre-processed before KDL parsing.
+// Include other KDL files.  Paths are relative to this file, absolute, `~/...` or
+// start with an environment variable (`%USERPROFILE%\...`).  An include is read
+// where it stands: a later `binds` replaces earlier binds on the same keys.
+// `optional=true` makes a missing file a warning instead of an error.
 // ───────────────────────────────────────────────────────────────────────────
 // include "binds.kdl"
-// include "C:/Users/me/.config/wiri/window-rules.kdl"
+// include optional=true "work.kdl"
 
 // ───────────────────────────────────────────────────────────────────────────
-// Shell-command shortcut (niri parity).  `spawn-cmd "<command>"` is the
-// Windows equivalent of niri's `spawn-sh`; the dispatcher runs the argument
-// through `cmd.exe /C "<command>"`.
-// ───────────────────────────────────────────────────────────────────────────
-// binds {
-//     Ctrl+Alt+S spawn-cmd "wt.exe"
-//     Ctrl+Alt+B spawn-cmd "start https://example.com"
-// }
-
-// ───────────────────────────────────────────────────────────────────────────
-// Output configuration — uncomment and adjust for your monitors.
-// `name` matches the friendly device name shown by Windows display settings.
+// Output configuration — uncomment and adjust for your monitors.  The name is
+// the Windows device name (`\\.\DISPLAY1`, see `wiri-ctl list-monitors`).
 // ───────────────────────────────────────────────────────────────────────────
 // output "Primary" {
-//     x 0
-//     y 0
-//     width 2560
-//     height 1440
 //     scale 1.0
-//     enable true
-//     // primary true
-//     // vrr true                  // variable refresh rate
-//     // transform "normal"        // normal | 90 | 180 | 270
+//     // off                      // niri: keep wiri off this monitor
+//     // focus-at-startup
+//     // variable-refresh-rate
+//     // transform "normal"       // normal | 90 | 180 | 270
+//     // position x=0 y=0
 // }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Workspace configuration — uncomment to declare named workspaces.  They exist from
-// the start, in the order declared, even when empty (niri's named workspaces), and
-// binds reach them with `focus-workspace "Main"`.  `focus-workspace 2` is the second
-// workspace from the top of the monitor.
+// Named workspaces exist from the start, in the order declared, even when empty (niri's
+// named workspaces); binds reach them with `focus-workspace "web"`.  `focus-workspace 2`
+// is the second workspace from the top of the monitor.
 // ───────────────────────────────────────────────────────────────────────────
-// workspace "Main" {
-//     layout "tile"
-//     monitor "Primary"
-//     follow-on-focus true
-// }
-// workspace "Comms" {
-//     layout "tile"
-//     monitor "Primary"
+// workspace "web"
+// workspace "chat" {
+//     open-on-output "Primary"
 // }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Window rules — pattern-match windows on creation and apply properties.
-// Two styles are supported:
+// Window rules — niri's: a window matches a rule when it matches ANY of its `match`
+// lines (the properties of one line must ALL hold) and none of its `exclude` lines.
 //
-//   1. Flat fields (back-compat):
-//        window-rule {
-//            class-name "Firefox"
-//            floating true
-//        }
+//   app-id   a regular expression searched in the program's file name (`firefox.exe`, and
+//            `firefox` without the extension) and, for Store apps, in the AppUserModelID
+//   title    a regular expression searched in the window title
+//   is-active / is-focused / is-floating / is-urgent / at-startup = true or false
 //
-//   2. `match { }` block (regex + AND-combined matchers):
-//        window-rule {
-//            match {
-//                class-name-regex "^(chrome|edge|firefox)$"
-//                title-regex ".*Picture-in-Picture.*"
-//            }
-//            float true
-//            sticky true
-//        }
+// Properties: open-on-output, open-on-workspace "name", open-floating, open-fullscreen,
+// open-maximized, open-focused, default-column-width { proportion 0.5; } (or { fixed 800; }),
+// default-window-height, min-width, max-width, min-height, max-height, opacity.
 // ───────────────────────────────────────────────────────────────────────────
 // window-rule {
-//     class-name "Firefox"
-//     floating true
+//     match app-id=r#"^firefox"# title="^Picture-in-Picture$"
+//     open-floating true
+//     open-focused false
 // }
 // window-rule {
-//     class-name "mspaint"
-//     default-width 800
-//     default-height 600
-//     opacity 1.0
+//     match app-id=r#"^(steam|discord)"#
+//     open-on-workspace "chat"
 // }
 // window-rule {
-//     match { process-name-regex "(?i)^(steam|discord)\.exe$" }
-//     workspace "Comms"
-//     sticky true
+//     match app-id="^mspaint"
+//     default-column-width { fixed 800; }
+//     default-window-height { fixed 600; }
 // }
 // window-rule {
-//     // Strip Windows-Terminal native title-bar so tiles are pixel-perfect.
-//     class-name "CASCADIA_HOSTING_WINDOW_CLASS"
-//     opacity 1.0
-// }
-//
-// Blur backdrop (niri `blur { … }` parity) — request an Aero-style
-// `DwmEnableBlurBehindWindow` backdrop for any window matching the rule.
-// Best paired with `float true` so the blur sits over the desktop / lower
-// tiles instead of over the apps you're working with.
-// window-rule {
-//     class-name "MyFloater"
-//     float true
-//     blur true
+//     // Every window except terminals opens at 95% opacity.
+//     exclude app-id=r#"^(WindowsTerminal|wt)"#
+//     opacity 0.95
 // }

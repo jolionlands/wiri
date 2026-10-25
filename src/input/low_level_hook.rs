@@ -55,6 +55,19 @@ const VK_ESCAPE: u32 = 0x1B;
 /// Maximum gap between two Alt key-down events that counts as a double-tap (ms).
 const DOUBLE_TAP_WINDOW_MS: u128 = 250;
 
+// Key auto-repeat tracking for binds with `repeat=false`.  The keyboard hook sees every key
+// down and up before the system turns a registered chord into WM_HOTKEY, so by the time
+// the hotkey arrives these say whether this press was the key repeating.
+const KEY_FLAG_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KEY_IS_DOWN: [std::sync::atomic::AtomicBool; 256] = [KEY_FLAG_OFF; 256];
+static KEY_PRESS_WAS_REPEAT: [std::sync::atomic::AtomicBool; 256] = [KEY_FLAG_OFF; 256];
+
+/// True when the last press of the key `vk` was auto-repeat: the key was already down.
+/// False when the keyboard hook is not running (every press then counts as a first press).
+pub fn last_press_was_repeat(vk: u32) -> bool {
+    KEY_PRESS_WAS_REPEAT[(vk & 0xFF) as usize].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Global grab state — what kind of interactive operation is active
 #[derive(Debug, Clone)]
 pub enum GrabState {
@@ -345,6 +358,18 @@ unsafe extern "system" fn keyboard_hook_callback(
 
     let is_key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
     let is_key_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+
+    {
+        use std::sync::atomic::Ordering;
+        let slot = (vk & 0xFF) as usize;
+        if is_key_down {
+            let was_down = KEY_IS_DOWN[slot].swap(true, Ordering::Relaxed);
+            KEY_PRESS_WAS_REPEAT[slot].store(was_down, Ordering::Relaxed);
+        } else if is_key_up {
+            KEY_IS_DOWN[slot].store(false, Ordering::Relaxed);
+            KEY_PRESS_WAS_REPEAT[slot].store(false, Ordering::Relaxed);
+        }
+    }
 
     if is_key_down {
         if vk == VK_MENU {

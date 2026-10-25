@@ -9,6 +9,11 @@ pub enum ConfigError {
     #[error("Failed to parse KDL: {0}")]
     KdlParse(String),
 
+    /// The config has errors: `file:line:column: error: message` of the first one, and how
+    /// many more there are.
+    #[error("{0}")]
+    Invalid(String),
+
     #[error("Invalid value for {field}: {message}")]
     InvalidValue { field: String, message: String },
 

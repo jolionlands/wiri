@@ -400,12 +400,20 @@ impl TrayIcon {
 
     /// Show a balloon notification from the tray icon.
     pub fn show_balloon(&self, title: &str, message: &str) -> Result<()> {
+        let _ = self.try_balloon(title, message);
+        Ok(())
+    }
+
+    /// Show a balloon notification; false when the tray icon is not there (yet) or the shell
+    /// refused it.  The title is cut to 63 and the message to 255 UTF-16 units, each ended by a
+    /// null as the shell requires.
+    pub fn try_balloon(&self, title: &str, message: &str) -> bool {
         let hwnd_raw = *self.hwnd_raw.lock();
         let hwnd_val = match hwnd_raw {
             Some(v) => v,
             None => {
-                warn!("show_balloon: tray window not yet created");
-                return Ok(());
+                tracing::debug!("try_balloon: tray window not yet created");
+                return false;
             }
         };
         let hwnd = HWND(hwnd_val as *mut std::ffi::c_void);
@@ -418,21 +426,22 @@ impl TrayIcon {
             nid.uFlags = NIF_INFO;
             nid.dwInfoFlags = NIIF_INFO;
 
-            // szInfoTitle (max 64 chars including null)
-            let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-            let title_len = title_wide.len().min(nid.szInfoTitle.len());
+            // szInfoTitle (max 64 units including the null)
+            let title_wide: Vec<u16> = title.encode_utf16().collect();
+            let title_len = title_wide.len().min(nid.szInfoTitle.len() - 1);
             nid.szInfoTitle[..title_len].copy_from_slice(&title_wide[..title_len]);
 
-            // szInfo (max 256 chars including null)
-            let msg_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
-            let msg_len = msg_wide.len().min(nid.szInfo.len());
+            // szInfo (max 256 units including the null)
+            let msg_wide: Vec<u16> = message.encode_utf16().collect();
+            let msg_len = msg_wide.len().min(nid.szInfo.len() - 1);
             nid.szInfo[..msg_len].copy_from_slice(&msg_wide[..msg_len]);
 
             if !Shell_NotifyIconW(NIM_MODIFY, &nid as *const _ as *const _).as_bool() {
-                warn!("show_balloon: Shell_NotifyIconW NIM_MODIFY failed");
+                tracing::debug!("try_balloon: Shell_NotifyIconW NIM_MODIFY failed");
+                return false;
             }
         }
-        Ok(())
+        true
     }
 
     pub fn set_icon(

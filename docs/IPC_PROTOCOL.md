@@ -626,17 +626,23 @@ Emitted when keyboard focus moves to a different window.
 
 ### `config_loaded`
 
-Emitted when the configuration file is loaded or reloaded.
+Emitted when the configuration file is reloaded (niri's `ConfigLoaded { failed }`).
 
 ```json
-{"type":"config_loaded","data":{"config_path":"C:\\Users\\user\\AppData\\Roaming\\wiri\\config.kdl"}}
+{"type":"config_loaded","data":{"config_path":"C:\\Users\\user\\AppData\\Roaming\\wiri\\config.kdl","failed":false,"error":null,"warnings":2}}
+{"type":"config_loaded","data":{"config_path":"C:\\Users\\user\\AppData\\Roaming\\wiri\\config.kdl","failed":true,"error":"C:\\Users\\user\\AppData\\Roaming\\wiri\\config.kdl:12:5: error: unknown option 'gapz' in 'layout' (did you mean 'gaps'?)","warnings":0}}
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `config_path` | `string` | Absolute path of the loaded config file |
+| `config_path` | `string` | Absolute path of the config file |
+| `failed` | `bool` | True when the file has errors: it was **not** applied and the last good config stays in use |
+| `error` | `string` or `null` | When `failed`: `file:line:column: error: message` of the first error, with `(+N more)` when there are others; `file` is the included file when the error is in one |
+| `warnings` | `number` | How many things in the file wiri ignores (niri options it lacks, binds that cannot work on Windows) |
 
-**When:** wiri starts or `reload_config` IPC is processed.
+**When:** the file watcher saw the config (or a file it includes) change and 200 ms of quiet passed,
+the `reload_config` request was processed, or **Reload Config** was chosen in the tray menu.  A tray
+balloon with the same text is shown when `failed` is true.
 
 ---
 

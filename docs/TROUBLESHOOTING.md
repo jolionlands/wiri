@@ -125,6 +125,22 @@ the underlying OS error. Common causes:
 
 A `wiri-ctl reload-config` still works.
 
+### "wiri: config error" balloon, or my changes are not applied
+
+The config file has an error, so wiri did not apply it (at startup it uses its defaults; after an edit the
+previous config stays).  The balloon, the log (`%LOCALAPPDATA%\wiri\wiri.log`) and
+`wiri-ctl validate-config` all say where: `...\config.kdl:12:5: error: unknown option 'gapz' in 'layout'
+(did you mean 'gaps'?)` is line 12, column 5.  Fix the line and save; wiri re-reads the file about 200 ms
+after the last change.  Typical causes:
+
+- A misspelled option, section or action name (the message suggests the closest one).
+- A Windows path in a string that does not start like a path: `spawn-sh "echo hi > C:\x.txt"` has the
+  escape `\x`; write `\\` or use a raw string `r#"echo hi > C:\x.txt"#`.
+- A `{` or a string that was never closed (the error points at the opening one).
+
+A *warning* does not stop the file from loading: it says what wiri ignores (a niri option wiri does not
+have, a bind that cannot work on Windows).  `wiri-ctl validate-config` lists them.
+
 ## Window behaviour
 
 ### A window keeps respawning at the wrong size
@@ -135,8 +151,9 @@ log lines like `auto-floated <hwnd> after 3 SetWindowPos failures`. Add a
 window rule to make this explicit:
 
 ```kdl
-window-rules {
-    class "ProblemApp" { float true }
+window-rule {
+    match app-id="^ProblemApp"
+    open-floating true
 }
 ```
 

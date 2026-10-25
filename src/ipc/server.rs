@@ -26,6 +26,8 @@ pub struct IpcServer {
     shutdown_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Optional sender to request a config reload on the main loop.
     reload_tx: parking_lot::Mutex<Option<mpsc::UnboundedSender<()>>>,
+    /// The config file wiri loaded, so `reload_config` can answer with what is wrong in it.
+    config_path: parking_lot::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl IpcServer {
@@ -37,7 +39,13 @@ impl IpcServer {
             backend: None,
             shutdown_tx: parking_lot::Mutex::new(None),
             reload_tx: parking_lot::Mutex::new(None),
+            config_path: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Tell the server which config file is in use.
+    pub fn set_config_path(&self, path: std::path::PathBuf) {
+        *self.config_path.lock() = Some(path);
     }
 
     /// Connect this IPC server to the tiling engine so it can query real state
@@ -435,9 +443,26 @@ impl IpcServer {
             }
             IpcMessage::ReloadConfig => {
                 info!("IPC: Reload config requested");
+                // The reload itself (and the balloon, and the event) happens on the main loop;
+                // the answer says right away whether the file can be loaded.
+                let path = self.config_path.lock().clone();
+                let problem = path.and_then(|p| {
+                    let decoded = crate::config::loader::load_quiet(&p);
+                    if decoded.has_errors() {
+                        Some(crate::config::failure_summary(&p, &decoded.issues))
+                    } else {
+                        None
+                    }
+                });
                 if let Some(tx) = self.reload_tx.lock().as_ref() {
                     match tx.send(()) {
-                        Ok(()) => serde_json::json!({"success": true}),
+                        Ok(()) => match problem {
+                            Some(summary) => serde_json::json!({
+                                "success": false,
+                                "error": summary
+                            }),
+                            None => serde_json::json!({"success": true}),
+                        },
                         Err(_) => serde_json::json!({
                             "success": false,
                             "error": "reload channel is closed"

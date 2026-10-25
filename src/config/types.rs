@@ -10,6 +10,9 @@ pub struct Config {
     /// Programs to spawn at startup. Each entry is [program, arg1, arg2, …].
     /// Populated from `spawn-at-startup "prog" "arg"` top-level KDL lines.
     pub spawn_at_startup: Vec<Vec<String>>,
+    /// Shell command lines to run at startup (`spawn-sh-at-startup "cmd"`), each through
+    /// `cmd.exe /d /s /c` like the `spawn-sh` bind.
+    pub spawn_sh_at_startup: Vec<String>,
 }
 
 impl Default for Config {
@@ -36,6 +39,7 @@ impl Default for Config {
             binds: BindsConfig::default(),
             animations: AnimationsConfig::default_config(),
             spawn_at_startup: Vec::new(),
+            spawn_sh_at_startup: Vec::new(),
         }
     }
 }
@@ -263,6 +267,15 @@ pub struct LayoutConfigPartial {
     pub shadow_spread: Option<u32>,
     /// Per-output override for `LayoutConfig::smart_borders`.
     pub smart_borders: Option<bool>,
+    pub max_visible_columns: Option<u32>,
+    pub snap_on_drag: Option<bool>,
+    pub snap_threshold_px: Option<u32>,
+    pub status_bar: Option<bool>,
+    pub hide_method: Option<String>,
+    pub reserve_top: Option<u32>,
+    pub reserve_bottom: Option<u32>,
+    pub reserve_left: Option<u32>,
+    pub reserve_right: Option<u32>,
 }
 
 impl LayoutConfigPartial {
@@ -358,6 +371,33 @@ impl LayoutConfigPartial {
         }
         if let Some(v) = self.smart_borders {
             out.smart_borders = v;
+        }
+        if let Some(v) = self.max_visible_columns {
+            out.max_visible_columns = v;
+        }
+        if let Some(v) = self.snap_on_drag {
+            out.snap_on_drag = v;
+        }
+        if let Some(v) = self.snap_threshold_px {
+            out.snap_threshold_px = v;
+        }
+        if let Some(v) = self.status_bar {
+            out.status_bar = v;
+        }
+        if let Some(ref v) = self.hide_method {
+            out.hide_method = v.clone();
+        }
+        if let Some(v) = self.reserve_top {
+            out.reserve_top = v;
+        }
+        if let Some(v) = self.reserve_bottom {
+            out.reserve_bottom = v;
+        }
+        if let Some(v) = self.reserve_left {
+            out.reserve_left = v;
+        }
+        if let Some(v) = self.reserve_right {
+            out.reserve_right = v;
         }
         out
     }
@@ -664,6 +704,89 @@ pub enum Matcher {
     IsUrgent,
     /// Match only during the startup phase.
     AtStartup,
+    /// niri `app-id="regex"`: the regex is searched in the process's file name
+    /// (`firefox.exe`), in that name without `.exe` (`firefox`) and in the window's
+    /// AppUserModelID (packaged apps), anywhere in the string.
+    AppId(RegexPat),
+    /// niri `title="regex"`: the regex is searched anywhere in the window title.
+    TitleSearch(RegexPat),
+    /// niri `class-name="regex"` / wiri extension: searched in the window class.
+    ClassSearch(RegexPat),
+    /// wiri extension `process-name="regex"`: searched in the process's file name.
+    ProcessSearch(RegexPat),
+    /// Match only when the window has the keyboard focus (niri `is-focused`).
+    IsFocused,
+    /// Match only when the window is the active one of its column (niri `is-active-in-column`).
+    IsActiveInColumn,
+    /// The opposite of the matcher inside (`is-active=false`).
+    Not(Box<Matcher>),
+}
+
+/// A regular expression from the config, kept with its source text.
+#[derive(Debug, Clone)]
+pub struct RegexPat {
+    pub source: String,
+    pub regex: regex::Regex,
+}
+
+impl RegexPat {
+    /// Compile `source` (Rust regex syntax, like niri's).
+    pub fn new(source: &str) -> std::result::Result<RegexPat, regex::Error> {
+        let regex = regex::Regex::new(source)?;
+        Ok(RegexPat {
+            source: source.to_string(),
+            regex,
+        })
+    }
+
+    /// True when the regex matches anywhere in `text`.
+    pub fn is_match(&self, text: &str) -> bool {
+        self.regex.is_match(text)
+    }
+}
+
+/// niri's preset size: a proportion of the view or a fixed size in pixels
+/// (`default-column-width { proportion 0.5; }`, `{ fixed 800; }`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SizeSpec {
+    Proportion(f64),
+    Fixed(u32),
+}
+
+/// One `match` or `exclude` line of a niri window rule: every condition has to hold.
+#[derive(Debug, Clone, Default)]
+pub struct MatchGroup {
+    pub conds: Vec<Matcher>,
+}
+
+impl MatchGroup {
+    pub fn matches(&self, ctx: &MatcherContext<'_>) -> bool {
+        self.conds.iter().all(|m| m.matches(ctx))
+    }
+}
+
+/// True when any candidate name of a window matches an `app-id` regex.  Windows has no
+/// app-id: the process's file name, that name without its extension and the
+/// AppUserModelID of a packaged app stand in for it.
+pub fn app_id_matches(pat: &RegexPat, ctx: &MatcherContext<'_>) -> bool {
+    if let Some(name) = ctx.process_name {
+        if pat.is_match(name) {
+            return true;
+        }
+        let stem = match name.rfind('.') {
+            Some(dot) if dot > 0 => &name[..dot],
+            _ => name,
+        };
+        if stem.len() != name.len() && pat.is_match(stem) {
+            return true;
+        }
+    }
+    if let Some(aumid) = ctx.aumid {
+        if pat.is_match(aumid) {
+            return true;
+        }
+    }
+    false
 }
 
 impl Matcher {
@@ -711,6 +834,31 @@ impl Matcher {
             Matcher::IsFloating => ctx.is_floating,
             Matcher::IsUrgent => ctx.is_urgent,
             Matcher::AtStartup => ctx.at_startup,
+            Matcher::AppId(pat) => app_id_matches(pat, ctx),
+            Matcher::TitleSearch(pat) => pat.is_match(ctx.title),
+            Matcher::ClassSearch(pat) => pat.is_match(ctx.class_name),
+            Matcher::ProcessSearch(pat) => ctx.process_name.map_or(false, |p| pat.is_match(p)),
+            Matcher::IsFocused => ctx.is_focused,
+            Matcher::IsActiveInColumn => ctx.is_active_in_column,
+            Matcher::Not(inner) => !inner.matches(ctx),
+        }
+    }
+
+    /// True for the conditions that depend on the window's state (focus, floating, urgency)
+    /// rather than on what it is: a rule that has one has to be looked at again when that
+    /// state changes.
+    pub fn is_dynamic(&self) -> bool {
+        match self {
+            Matcher::IsActive
+            | Matcher::IsFloating
+            | Matcher::IsUrgent
+            | Matcher::IsFocused
+            | Matcher::IsActiveInColumn
+            | Matcher::TitleSearch(_)
+            | Matcher::Title(_)
+            | Matcher::TitleRegex(_) => true,
+            Matcher::Not(inner) => inner.is_dynamic(),
+            _ => false,
         }
     }
 }
@@ -736,6 +884,12 @@ pub struct MatcherContext<'a> {
     pub is_floating: bool,
     pub is_urgent: bool,
     pub at_startup: bool,
+    /// The AppUserModelID of a packaged (UWP / MSIX) app, when the window has one.
+    pub aumid: Option<&'a str>,
+    /// The window has the keyboard focus.
+    pub is_focused: bool,
+    /// The window is the active one of its column.
+    pub is_active_in_column: bool,
 }
 
 impl<'a> MatcherContext<'a> {
@@ -760,6 +914,9 @@ impl<'a> MatcherContext<'a> {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: false,
+            is_active_in_column: false,
         }
     }
 
@@ -777,6 +934,9 @@ impl<'a> MatcherContext<'a> {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: false,
+            is_active_in_column: false,
         }
     }
 }
@@ -840,15 +1000,64 @@ pub struct WindowRule {
     /// Cap the initial physical size of the window to `(width_px, height_px)`.
     /// Either dimension of `0` means "no cap on that axis".
     pub open_max_bounds: Option<(u32, u32)>,
+
+    // ---- niri window-rule matching: `match` lines (any) and `exclude` lines (none) ----
+    /// niri: a window matches the rule when it matches ANY of these (an empty list matches
+    /// every window), each group being the AND of its conditions.
+    pub match_groups: Vec<MatchGroup>,
+    /// niri: a window that matches ANY of these is left out.
+    pub exclude_groups: Vec<MatchGroup>,
+
+    // ---- niri properties (applied when the rule matches) ----
+    /// `default-column-width`: `Some(Some(size))` for `{ proportion 0.5; }` / `{ fixed 800; }`,
+    /// `Some(None)` for an empty block (the window picks its own width), `None` when unset.
+    pub default_column_width: Option<Option<SizeSpec>>,
+    /// `default-window-height`, the same forms.
+    pub default_window_height: Option<Option<SizeSpec>>,
+    /// `open-on-workspace "name"`: the workspace (by name) the window opens on.
+    pub open_on_workspace: Option<String>,
+    /// `open-maximized`: the window's column opens as wide as the view.
+    pub open_maximized: Option<bool>,
+    /// `open-maximized-to-edges`: the window opens maximized to the edges of the work area.
+    pub open_maximized_to_edges: Option<bool>,
+    /// `open-focused`: false keeps the focus where it was when the window opens.
+    pub open_focused: Option<bool>,
+    /// `min-width` / `min-height` / `max-width` / `max-height`: size limits in pixels.
+    pub min_width: Option<u32>,
+    pub min_height: Option<u32>,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
 }
 
 impl WindowRule {
-    /// Returns `true` when this rule matches the given `MatcherContext`.
-    ///
-    /// When `self.matchers` is non-empty all matchers are evaluated (AND).
-    /// When `self.matchers` is empty the flat fields are used for backwards
-    /// compatibility with configs that don't use `match { }` blocks.
+    /// Returns `true` when this rule matches the given `MatcherContext`: the old flat /
+    /// `matchers` conditions all hold, and (niri) the window matches any `match` line, if
+    /// there are any, and none of the `exclude` lines.
     pub fn matches(&self, ctx: &MatcherContext<'_>) -> bool {
+        if !self.legacy_matches(ctx) {
+            return false;
+        }
+        if !self.match_groups.is_empty() && !self.match_groups.iter().any(|g| g.matches(ctx)) {
+            return false;
+        }
+        !self.exclude_groups.iter().any(|g| g.matches(ctx))
+    }
+
+    /// True when any condition of the rule depends on state that changes while a window
+    /// lives (focus, floating, urgency, the title), so the rule has to be looked at again.
+    pub fn has_dynamic_conditions(&self) -> bool {
+        self.matchers.iter().any(|m| m.is_dynamic())
+            || self.title.is_some()
+            || self
+                .match_groups
+                .iter()
+                .chain(self.exclude_groups.iter())
+                .any(|g| g.conds.iter().any(|m| m.is_dynamic()))
+    }
+
+    /// The conditions of the old rule format: `matchers` when there are any (all of them
+    /// must pass), otherwise the flat `class` / `title` / `instance` / `process_name` fields.
+    fn legacy_matches(&self, ctx: &MatcherContext<'_>) -> bool {
         if !self.matchers.is_empty() {
             // Matcher-based path: every matcher must pass.
             return self.matchers.iter().all(|m| m.matches(ctx));
@@ -924,8 +1133,22 @@ pub struct HotkeyBinding {
     /// missing entries mean "not quoted").  `focus-workspace 2` is an index,
     /// `focus-workspace "2"` the workspace named "2".
     pub args_quoted: Vec<bool>,
+    /// niri's `repeat=false` turns this off: holding the key fires the action once.  True
+    /// (the default) lets the key's auto-repeat fire it again.
     pub repeat: bool,
     pub release: bool,
+    /// niri's `cooldown-ms=`: after the action fired, the bind is ignored for this long.
+    pub cooldown_ms: Option<u32>,
+    /// niri's `allow-when-locked=`: accepted; a locked Windows session never delivers hotkeys.
+    pub allow_when_locked: bool,
+    /// niri's `allow-inhibiting=`: accepted; wiri has no shortcut inhibition.
+    pub allow_inhibiting: bool,
+    /// niri's `hotkey-overlay-title=`: `Some(Some(text))` is the title, `Some(None)`
+    /// (`hotkey-overlay-title=null`) hides the bind from the overlay.
+    pub hotkey_overlay_title: Option<Option<String>>,
+    /// Properties written on the action itself (`focus=false` of `move-window-to-workspace`,
+    /// `show-pointer=false` of `screenshot`), as `(name, value)` text.
+    pub action_props: Vec<(String, String)>,
 }
 
 impl HotkeyBinding {
@@ -1013,8 +1236,13 @@ impl Default for HotkeyBinding {
             command: String::new(),
             args: Vec::new(),
             args_quoted: Vec::new(),
-            repeat: false,
+            repeat: true,
             release: false,
+            cooldown_ms: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+            action_props: Vec::new(),
         }
     }
 }

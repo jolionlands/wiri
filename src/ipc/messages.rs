@@ -424,9 +424,21 @@ pub enum IpcEvent {
     #[serde(rename = "workspace_activated")]
     WorkspaceActivated { workspace: String },
 
-    /// Fired when `config.kdl` is loaded (startup) or hot-reloaded via `reload_config`.
+    /// Fired when `config.kdl` is hot-reloaded, by the file watcher, `reload_config` or the
+    /// tray menu.  niri's `ConfigLoaded { failed }`: `failed` is true when the file has errors
+    /// and the last good config stays in use; `error` then says where the first error is
+    /// (`file:line:column: error: message`).  `warnings` counts what the file asks for that
+    /// wiri ignores.
     #[serde(rename = "config_loaded")]
-    ConfigLoaded { config_path: String },
+    ConfigLoaded {
+        config_path: String,
+        #[serde(default)]
+        failed: bool,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        warnings: u32,
+    },
 
     /// Fired when keyboard focus moves to a different tracked window.
     #[serde(rename = "window_focused")]

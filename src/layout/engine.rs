@@ -1387,6 +1387,9 @@ impl TilingEngine {
                     hwnd as *mut std::ffi::c_void,
                 )),
             at_startup,
+            aumid: None,
+            is_focused: is_active,
+            is_active_in_column: false,
         };
         let rules = crate::window::resolve_window_rules(&self.window_rules, &ctx);
 

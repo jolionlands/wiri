@@ -20,6 +20,11 @@
 #          workspace stay visible to the system but are not drawn; Alt+Tab to one brings its workspace; a crash,
 #          a restart and a quit leave nothing cloaked).  (H10, monitor unplug, needs a second display: engine unit
 #          tests only.)
+#          H12 the KDL config (Phase 2A item 1): a niri binds block with properties loads as written and its binds
+#          run (real chords: cooldown-ms=, repeat=false), validate-config names line and column, a bad reload keeps the
+#          last good config and reports it (log, config_loaded event, tray balloon), a half-written save is applied once,
+#          a BOM or UTF-16 file loads, an include in another directory is read and watched, a bad config at startup
+#          falls back to the defaults and says why.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -683,7 +688,7 @@ Start-Sleep -Seconds 2
 $h2Config = @"
 binds {
     Mod+F7 spawn "powershell" "-NoProfile" "-File" "$argdump" "$pdir\bind-spawn.json" "arg one" "C:\Program Files\x y" "double  space" "quote\"d"
-    Mod+F6 spawn-sh "echo shell ok> \"$pdir\bind-shell.txt\""
+    Mod+F6 spawn-sh r#"echo shell ok> "$pdir\bind-shell.txt""#
 }
 spawn-at-startup "powershell" "-NoProfile" "-File" "$argdump" "$pdir\startup-spawn.json" "start arg" "C:\Program Files\startup dir\\"
 "@
@@ -1535,6 +1540,229 @@ $log11c = Join-Path $D 'wiri.stderr11c.log'
 $w = Start-Wiri $log11c ($log11c + '.out')
 Start-Sleep -Seconds 4
 
+# ---- H12: the KDL config - niri's binds block loads as written, a mistake is reported with its place and the last good -----
+# ----      config stays in use, a half-written save is never applied, includes are watched, any encoding loads ---------------
+# The Phase A windows are still open; the binds write marker lines (cmd.exe appending to a file) so that "the bind ran" and
+# "how many times" can be read back.  Everything is written the way a niri user would: a binds block with braces, raw strings,
+# properties (repeat=false, cooldown-ms=, hotkey-overlay-title=), a /- commented bind and a block comment.
+$log12 = Join-Path $D 'wiri.stderr12.log'
+$f12 = @{ bind = (Join-Path $pdir 'h12-bind.txt'); cool = (Join-Path $pdir 'h12-cool.txt'); once = (Join-Path $pdir 'h12-once.txt');
+          rep = (Join-Path $pdir 'h12-rep.txt'); new = (Join-Path $pdir 'h12-new.txt'); inc = (Join-Path $pdir 'h12-inc.txt');
+          bom = (Join-Path $pdir 'h12-bom.txt'); u16 = (Join-Path $pdir 'h12-u16.txt'); extra = (Join-Path $pdir 'h12-extra.kdl') }
+foreach ($p in $f12.Values) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+$utf8NoBom = New-Object Text.UTF8Encoding($false)
+function MarkerLines([string]$path) { if (Test-Path $path) { return @(Get-Content $path | Where-Object { $_ -ne '' }).Count } else { return 0 } }
+function WaitText([string]$path, [string]$needle, [int]$sec) {
+    for ($i = 0; $i -lt ($sec * 4); $i++) {
+        if ((Test-Path $path) -and ((Get-Content $path -Raw -ErrorAction SilentlyContinue) -like "*$needle*")) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
+function CountText([string]$path, [string]$needle) {
+    if (-not (Test-Path $path)) { return 0 }
+    return ([regex]::Matches((Get-Content $path -Raw -ErrorAction SilentlyContinue), [regex]::Escape($needle))).Count
+}
+function H12Binds([string]$tag) {
+    $raw = Ctl $tag @('--json', 'bindings')
+    try { return @(($raw | ConvertFrom-Json).result) } catch { return @() }
+}
+function H12Has($entries, [int]$vkCode) { return (@($entries | Where-Object { $_.vk_code -eq $vkCode -and $_.modifiers -eq 3 }).Count -ge 1) }
+# wiri-ctl called directly: the exit code and the text are the point, so the step list is left alone
+function CtlRaw([string[]]$ctlArgs) {
+    $outFile = Join-Path $D ('h12-raw-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $p = Start-Process -FilePath $ctl -ArgumentList $ctlArgs -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err" -WindowStyle Hidden -PassThru
+    $null = $p.Handle
+    if ($p.WaitForExit(5000)) { $rc = $p.ExitCode } else { Stop-Process -Id $p.Id -Force; $rc = -1 }
+    $text = [string](Get-Content $outFile -Raw -ErrorAction SilentlyContinue) + [string](Get-Content "$outFile.err" -Raw -ErrorAction SilentlyContinue)
+    return [pscustomobject]@{ rc = $rc; text = $text }
+}
+# Hold a chord down with the last key repeating, like a held key does.
+function HoldChord([string]$spec, [int]$repeats) {
+    $keys = @($spec.ToLower().Split('+') | ForEach-Object { [byte]$vk[$_] })
+    foreach ($k in $keys) { [LT]::Key($k, $false); Start-Sleep -Milliseconds 40 }
+    for ($i = 0; $i -lt $repeats; $i++) { Start-Sleep -Milliseconds 170; [LT]::Key($keys[$keys.Count - 1], $false) }
+    Start-Sleep -Milliseconds 90
+    for ($i = $keys.Count - 1; $i -ge 0; $i--) { [LT]::Key($keys[$i], $true); Start-Sleep -Milliseconds 30 }
+}
+
+$h12Good = @"
+// H12: niri's syntax, as it is pasted from a niri config
+input {
+    mod-key "ctrl-alt"
+}
+layout {
+    gaps 12
+    border {
+        width 3
+        active-color "#83a598"
+    }
+}
+binds {
+    Mod+F1 hotkey-overlay-title="Write a marker" { spawn-sh r#"echo marker>> "$($f12.bind)""#; }
+    Mod+F2 cooldown-ms=1500 { spawn-sh r#"echo cool>> "$($f12.cool)""#; }
+    Mod+F3 repeat=false { spawn-sh r#"echo once>> "$($f12.once)""#; }
+    Mod+F5 { spawn-sh r#"echo rep>> "$($f12.rep)""#; }
+    /-Mod+F4 { spawn-sh "echo this bind is commented out"; }
+    /* a block comment */ Mod+F6 { focus-workspace "2"; }
+}
+"@
+Stop-WiriGracefully $w 'h12'
+$w12 = Start-WiriWithConfig $h12Good $log12
+$w = $w12
+Shot 'h12-01-niri-config-loaded'
+$h12b = H12Binds 'h12-bindings-good'
+$h12BindsRegistered = (H12Has $h12b 0x70) -and (H12Has $h12b 0x71) -and (H12Has $h12b 0x72) -and (H12Has $h12b 0x74) -and (H12Has $h12b 0x75)
+$h12SlashdashGone = -not (H12Has $h12b 0x73)
+$h12Issues = (LogLines $log12 ': error: ').Count + (LogLines $log12 ': warning: ').Count
+
+# the bind runs its action (a real chord)
+Chord 'ctrl+alt+f1'
+$h12BindRan = WaitFile $f12.bind 8
+
+# cooldown-ms=1500: a second press 400 ms later is ignored, one after the cooldown fires
+Chord 'ctrl+alt+f2'; Start-Sleep -Milliseconds 400
+Chord 'ctrl+alt+f2'; Start-Sleep -Milliseconds 1200
+$h12CoolAfterTwo = MarkerLines $f12.cool
+Start-Sleep -Milliseconds 800
+Chord 'ctrl+alt+f2'; Start-Sleep -Milliseconds 1200
+$h12CoolAfterThird = MarkerLines $f12.cool
+
+# repeat=false: holding the key down fires once; a bind without it fires for the repeats too
+HoldChord 'ctrl+alt+f3' 6; Start-Sleep -Milliseconds 1200
+$h12Once = MarkerLines $f12.once
+HoldChord 'ctrl+alt+f5' 6; Start-Sleep -Milliseconds 1500
+$h12Rep = MarkerLines $f12.rep
+
+# wiri-ctl validate-config: the niri file is fine (the options wiri lacks are warnings), a mistake names its line and column
+$h12GoodFile = Join-Path $pdir 'h12-good.kdl'
+[IO.File]::WriteAllText($h12GoodFile, ($h12Good + "`nprefer-no-csd`nhotkey-overlay { skip-at-startup }`n"), $utf8NoBom)
+$h12BadFile = Join-Path $pdir 'h12-bad.kdl'
+$h12BadText = @"
+layout {
+    gaps 8
+    gapz 9
+}
+binds {
+    Mod+T { spawn "x"; }
+    Mod+Y { clsoe-window; }
+}
+"@
+[IO.File]::WriteAllText($h12BadFile, $h12BadText, $utf8NoBom)
+$vGood = CtlRaw @('validate-config', (Q $h12GoodFile))
+$vBad = CtlRaw @('validate-config', (Q $h12BadFile))
+Set-Content (Join-Path $D 'h12-validate-good.txt') $vGood.text
+Set-Content (Join-Path $D 'h12-validate-bad.txt') $vBad.text
+$h12ValidateGood = ($vGood.rc -eq 0) -and ($vGood.text -match 'prefer-no-csd') -and ($vGood.text -notmatch ': error: ')
+$h12ValidateBad = ($vBad.rc -eq 1) -and ($vBad.text -match 'h12-bad\.kdl:3:5: error: unknown option ''gapz''') -and
+    ($vBad.text -match 'h12-bad\.kdl:7:\d+: error: bind Mod\+Y: unknown action ''clsoe-window''') -and ($vBad.text -match 'did you mean ''gaps''')
+
+# a bad reload: the last good config stays, the log and the event stream say where, a balloon is asked for
+$evOut = Join-Path $D 'h12-events.txt'
+$evProc = Start-Process -FilePath $ctl -ArgumentList @('events', '--stream', '--filter', 'config_loaded') -RedirectStandardOutput $evOut -RedirectStandardError "$evOut.err" -WindowStyle Hidden -PassThru
+Start-Sleep -Milliseconds 800
+[IO.File]::WriteAllText($cfg, $h12BadText, $utf8NoBom)
+$h12FailedEvent = WaitText $evOut '"failed":true' 8
+Start-Sleep -Milliseconds 1200
+Shot 'h12-02-after-a-bad-reload'
+$h12b = H12Binds 'h12-bindings-after-bad-reload'
+$h12KeptLastGood = (H12Has $h12b 0x70) -and (H12Has $h12b 0x71) -and (H12Has $h12b 0x72) -and (H12Has $h12b 0x74)
+$h12FailedEventHasPlace = ((Get-Content $evOut -Raw -ErrorAction SilentlyContinue) -match 'config\.kdl:3:5')
+$h12LogHasPlace = (@(LogLines $log12 'Config reload failed').Count -ge 1) -and (@(LogLines $log12 'config.kdl:3:5: error').Count -ge 1)
+$h12BalloonFailed = (LogLines $log12 'balloon could not be shown').Count
+$h12FailedEvents1 = CountText $evOut '"failed":true'
+$markerBefore = MarkerLines $f12.bind
+Chord 'ctrl+alt+f1'; Start-Sleep -Milliseconds 1500
+$h12OldBindStillFires = ((MarkerLines $f12.bind) -eq ($markerBefore + 1))
+
+# a save in two steps: half a file, 80 ms later the rest.  Only the finished file may be applied, and nothing is reported.
+$h12New = @"
+input { mod-key "ctrl-alt"; }
+binds {
+    Mod+F1 { spawn-sh r#"echo marker>> "$($f12.bind)""#; }
+    Mod+F7 { spawn-sh r#"echo new>> "$($f12.new)""#; }
+}
+"@
+$h12Half = $h12New.Substring(0, [int]($h12New.Length * 0.62))
+$appliedBefore = CountText $evOut '"failed":false'
+[IO.File]::WriteAllText($cfg, $h12Half, $utf8NoBom)
+Start-Sleep -Milliseconds 80
+[IO.File]::WriteAllText($cfg, $h12New, $utf8NoBom)
+$h12Applied = WaitText $evOut '"failed":false' 8
+Start-Sleep -Milliseconds 1200
+$h12b = H12Binds 'h12-bindings-after-save'
+$h12SaveApplied = (H12Has $h12b 0x76) -and -not (H12Has $h12b 0x71)
+$h12NoFailureForTheSave = ((CountText $evOut '"failed":true') -eq $h12FailedEvents1) -and (((CountText $evOut '"failed":false') - $appliedBefore) -eq 1)
+Chord 'ctrl+alt+f7'
+$h12NewBindRan = WaitFile $f12.new 8
+
+# any encoding: a UTF-8 file with a byte-order mark and CRLF, and a UTF-16 file (what PowerShell's Out-File writes)
+$h12Bom = "binds {`r`n    Mod+F9 { spawn-sh r#`"echo bom>> `"$($f12.bom)`"`"#; }`r`n}`r`n"
+[IO.File]::WriteAllText($cfg, $h12Bom, (New-Object Text.UTF8Encoding($true)))
+Start-Sleep -Milliseconds 2200
+$h12b = H12Binds 'h12-bindings-bom'
+$h12BomLoaded = (H12Has $h12b 0x78) -and -not (H12Has $h12b 0x76)
+$h12Utf16 = "binds {`r`n    Mod+F7 { spawn-sh r#`"echo u16>> `"$($f12.u16)`"`"#; }`r`n}`r`n"
+[IO.File]::WriteAllText($cfg, $h12Utf16, [Text.Encoding]::Unicode)
+Start-Sleep -Milliseconds 2200
+$h12b = H12Binds 'h12-bindings-utf16'
+$h12Utf16Loaded = (H12Has $h12b 0x76) -and -not (H12Has $h12b 0x78)
+
+# include: a file in another directory, read where the include stands, and watched on its own
+$h12Extra1 = "binds {`n    Mod+F6 { spawn-sh r#`"echo inc>> `"$($f12.inc)`"`"#; }`n}`n"
+[IO.File]::WriteAllText($f12.extra, $h12Extra1, $utf8NoBom)
+$h12Inc = "include `"$($f12.extra)`"`nbinds {`n    Mod+F1 { spawn-sh `"echo main`"; }`n}`n"
+[IO.File]::WriteAllText($cfg, $h12Inc, $utf8NoBom)
+Start-Sleep -Milliseconds 2200
+$h12b = H12Binds 'h12-bindings-include'
+$h12IncludeLoaded = (H12Has $h12b 0x75) -and (H12Has $h12b 0x70)
+$h12Extra2 = "binds {`n    Mod+F9 { spawn-sh r#`"echo inc2>> `"$($f12.inc)`"`"#; }`n}`n"
+[IO.File]::WriteAllText($f12.extra, $h12Extra2, $utf8NoBom)
+Start-Sleep -Milliseconds 2200
+$h12b = H12Binds 'h12-bindings-include-edited'
+$h12IncludeWatched = (H12Has $h12b 0x78) -and -not (H12Has $h12b 0x75)
+
+# wiri-ctl reload-config tells what is wrong with the file (the same parser)
+[IO.File]::WriteAllText($cfg, $h12BadText, $utf8NoBom)
+Start-Sleep -Milliseconds 2200
+$rBad = CtlRaw @('reload-config')
+Set-Content (Join-Path $D 'h12-reload-bad.txt') $rBad.text
+$h12ReloadCommandSaysWhy = ($rBad.rc -ne 0) -and ($rBad.text -match 'config\.kdl:3:5')
+
+if ($evProc -and -not $evProc.HasExited) { Stop-Process -Id $evProc.Id -Force }
+
+# a config with a mistake at startup: wiri starts with its defaults and says why
+$h12BadStart = "input {`n    repeat-delay 250`n    repeat-rat 25`n}`n"
+Stop-WiriGracefully $w 'h12b'
+$log12b = Join-Path $D 'wiri.stderr12b.log'
+[IO.File]::WriteAllText($cfg, $h12BadStart, $utf8NoBom)
+$w12b = Start-Wiri $log12b ($log12b + '.out')
+Start-Sleep -Seconds 3
+Shot 'h12-03-bad-config-at-startup'
+Start-Sleep -Seconds 2
+$w = $w12b
+$h12b = H12Binds 'h12-bindings-bad-startup'
+$h12DefaultsAtStartup = (H12Has $h12b 0x51) -and (@($h12b).Count -ge 50)
+$h12StartupReported = (@(LogLines $log12b 'Using defaults (config error').Count -ge 1) -and (@(LogLines $log12b 'config.kdl:3:5: error').Count -ge 1)
+$h12StartupBalloon = (@(LogLines $log12b 'Showed the config error balloon').Count -ge 1)
+$h12Values = [ordered]@{
+    binds_registered = $h12BindsRegistered; slashdash_gone = $h12SlashdashGone; issues_in_log = $h12Issues
+    bind_ran = $h12BindRan; cool_after_two = $h12CoolAfterTwo; cool_after_third = $h12CoolAfterThird; once = $h12Once; rep = $h12Rep
+    validate_good = $vGood.text; validate_bad = $vBad.text
+    failed_event = $h12FailedEvent; kept_last_good = $h12KeptLastGood; event_has_place = $h12FailedEventHasPlace
+    log_has_place = $h12LogHasPlace; balloon_failed = $h12BalloonFailed; old_bind_still_fires = $h12OldBindStillFires
+    save_applied = $h12SaveApplied; no_failure_for_the_save = $h12NoFailureForTheSave; new_bind_ran = $h12NewBindRan
+    bom = $h12BomLoaded; utf16 = $h12Utf16Loaded; include = $h12IncludeLoaded; include_watched = $h12IncludeWatched
+    reload_command = $rBad.text; defaults_at_startup = $h12DefaultsAtStartup; startup_reported = $h12StartupReported; startup_balloon = $h12StartupBalloon
+}
+$h12Values | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'h12-values.json')
+# the instance that is left running for the rest of the script: the default config again
+Stop-WiriGracefully $w12b 'h12c'
+Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+$log12c = Join-Path $D 'wiri.stderr12c.log'
+$w = Start-Wiri $log12c ($log12c + '.out')
+Start-Sleep -Seconds 4
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -1782,6 +2010,34 @@ $summary = [ordered]@{
     h11_restart_uncloaks_what_the_dead_wiri_hid = ((@($h11CloakedAfterRestart | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11VisibleAfterRestart | Where-Object { $_ }).Count -eq 3) -and (@($h11DrawnAfterRestart | Where-Object { $_ -gt 1000 }).Count -ge 1))
     h11_windows_are_cloaked_again_before_the_quit = ((@($h11CloakedBeforeQuit | Where-Object { $_ -gt 0 }).Count -eq 3) -and (@($h11VisibleBeforeQuit | Where-Object { $_ }).Count -eq 3))
     h11_quit_uncloaks_everything = ((@($h11CloakedAfterQuit | Where-Object { $_ -eq 0 }).Count -eq 3) -and (@($h11VisibleAfterQuit | Where-Object { $_ }).Count -eq 3))
+    # --- Phase 2A / H12: the KDL config
+    h12_generated_default_config_has_no_issues = (((LogLines $log1 ': error: ').Count + (LogLines $log1 ': warning: ').Count) -eq 0)
+    h12_niri_binds_block_registered = $h12BindsRegistered
+    h12_slashdashed_bind_is_not_registered = $h12SlashdashGone
+    h12_niri_config_loads_without_issues = ($h12Issues -eq 0)
+    h12_bind_runs_its_action = $h12BindRan
+    h12_cooldown_ignores_a_press_inside_it = ($h12CoolAfterTwo -eq 1)
+    h12_cooldown_ends = ($h12CoolAfterThird -eq 2)
+    h12_repeat_false_fires_once = ($h12Once -eq 1)
+    h12_binds_repeat_by_default = ($h12Rep -ge 3)
+    h12_validate_config_accepts_a_niri_file = $h12ValidateGood
+    h12_validate_config_names_line_and_column = $h12ValidateBad
+    h12_bad_reload_gives_a_failed_config_loaded_event = $h12FailedEvent
+    h12_bad_reload_keeps_the_last_good_binds = $h12KeptLastGood
+    h12_failed_event_names_file_line_column = $h12FailedEventHasPlace
+    h12_bad_reload_is_logged_with_its_place = $h12LogHasPlace
+    h12_error_balloon_could_be_shown = ($h12BalloonFailed -eq 0)
+    h12_old_bind_still_fires_after_a_bad_reload = $h12OldBindStillFires
+    h12_half_written_save_is_applied_once_and_not_reported = ($h12SaveApplied -and $h12NoFailureForTheSave)
+    h12_bind_of_the_new_config_runs = $h12NewBindRan
+    h12_utf8_bom_config_loads = $h12BomLoaded
+    h12_utf16_config_loads = $h12Utf16Loaded
+    h12_include_binds_load = $h12IncludeLoaded
+    h12_editing_an_include_reloads = $h12IncludeWatched
+    h12_reload_config_command_says_why = $h12ReloadCommandSaysWhy
+    h12_bad_startup_config_falls_back_to_defaults = $h12DefaultsAtStartup
+    h12_bad_startup_config_is_reported = $h12StartupReported
+    h12_bad_startup_balloon_was_shown = $h12StartupBalloon
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

@@ -164,6 +164,9 @@ mod tests {
             },
             IpcEvent::ConfigLoaded {
                 config_path: "test.kdl".into(),
+                failed: true,
+                error: Some("test.kdl:3:5: error: unknown option 'x' in 'layout'".into()),
+                warnings: 2,
             },
             IpcEvent::MonitorChanged {
                 monitor_name: "Monitor1".into(),
