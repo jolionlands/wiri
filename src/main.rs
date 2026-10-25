@@ -543,64 +543,13 @@ async fn main() -> Result<()> {
     // InputConfig; user toggles it in their KDL config under `input { ... }`.
     let mouse_config = MouseFocusConfig {
         focus_follows_mouse: config.input.focus_follows_mouse,
-        warp_on_focus: false,
-        focus_delay_ms: 200,
+        warp_on_focus: config.input.warp_on_focus,
+        focus_delay_ms: config.input.focus_delay_ms,
         raise_on_click: true,
     };
     let mouse_tracker = Arc::new(RwLock::new(MouseTracker::new(mouse_config)));
-    let mouse_engine = engine.clone();
-    let mouse_tracker_clone = mouse_tracker.clone();
-    tokio::spawn(async move {
-        loop {
-            {
-                let mut tracker = mouse_tracker_clone.write();
-                tracker.update_cursor_pos();
-                if tracker.focus_follows_mouse() && tracker.check_focus_delay() {
-                    let pos = tracker.cursor_pos();
-                    // Find which monitor the cursor is on
-                    let eng = mouse_engine.read();
-                    let monitors_map: std::collections::HashMap<_, _> = eng
-                        .monitors()
-                        .iter()
-                        .map(|(oid, m)| (*oid, (m.bounds, m.work_area)))
-                        .collect();
-                    if let Some(output_id) = tracker.monitor_at_cursor(&monitors_map) {
-                        // Find which window the cursor is over
-                        let mut found_window = None;
-                        for (_, monitor) in eng.monitors().iter() {
-                            if let Some(workspace) = monitor.workspace() {
-                                for (col_idx, col) in workspace.columns.iter().enumerate() {
-                                    for tile in &col.tiles {
-                                        if let Some(info) = eng.tiled_windows().get(&tile.window_id)
-                                        {
-                                            if info.bounds.contains_point(pos) {
-                                                if monitor.focus_window != Some(tile.window_id) {
-                                                    found_window =
-                                                        Some((tile.window_id, col_idx, output_id));
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        drop(eng);
-                        if let Some((wid, col_idx, oid)) = found_window {
-                            let mut eng_write = mouse_engine.write();
-                            if let Some(m) = eng_write.monitors_mut().get_mut(&oid) {
-                                m.focus_window = Some(wid);
-                                m.focus_column = Some(col_idx);
-                            }
-                            tracker.record_focus_change();
-                            wiri::ipc::notify_state_changed();
-                        }
-                    }
-                }
-            } // Drop all locks before await
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    });
+    // Focus-follows-mouse and warp are driven by the input message thread's
+    // hook notifications and one-shot delay timer, never by cursor polling.
 
     // Workspace indicator overlay — shown whenever the active workspace changes.
     let overlay = Arc::new(WorkspaceIndicator::new());
@@ -1044,8 +993,8 @@ fn apply_loaded_config(
     let new_layout_config = LayoutConfig::from_config(&new_config);
     let mouse_config = MouseFocusConfig {
         focus_follows_mouse: new_config.input.focus_follows_mouse,
-        warp_on_focus: false,
-        focus_delay_ms: 200,
+        warp_on_focus: new_config.input.warp_on_focus,
+        focus_delay_ms: new_config.input.focus_delay_ms,
         raise_on_click: true,
     };
 
