@@ -344,6 +344,25 @@ async fn main() -> Result<()> {
 
     // Initialize tiling engine
     let engine = Arc::new(RwLock::new(TilingEngine::new(layout_config.clone())));
+    let animation_wake = Arc::new(tokio::sync::Notify::new());
+    engine
+        .write()
+        .set_animation_notifier(Arc::clone(&animation_wake));
+    engine.write().install_recent_windows(
+        wiri::overlay::recent_windows::DwmRecentWindows::new(),
+        Arc::downgrade(&engine),
+    );
+
+    let overview_host = wiri::overlay::DwmThumbnailOverview::new();
+    {
+        let weak_engine = Arc::downgrade(&engine);
+        let overview_backend = backend.handle();
+        overview_host.set_handler(Arc::new(move |command| {
+            if let Some(engine) = weak_engine.upgrade() {
+                engine.write().overview_command(command, &overview_backend);
+            }
+        }));
+    }
 
     // Install a LayoutRequest channel between the engine and a backend drainer.
     // The engine can opt-in to dispatching ops over this channel via
@@ -373,8 +392,8 @@ async fn main() -> Result<()> {
         engine.set_layout_request_channel(layout_req_tx);
 
         // The overlay layer draws niri's focus ring, border and shadow around the windows.
-        // Its windows are created when the first decoration is needed and its thread ends
-        // with the last one: at rest there is neither.
+        // Windows are created on first use on the existing hotkey message pump.
+        // No decoration thread, frame clock or recurring wake-up exists at rest.
         let decor_layer: std::sync::Arc<dyn wiri::overlay::decor::DecorSink> =
             std::sync::Arc::new(wiri::overlay::decor::layer::DecorLayer::new());
         wiri::overlay::decor::install_global(decor_layer.clone());
@@ -383,19 +402,7 @@ async fn main() -> Result<()> {
         // Opt into DWM thumbnail-based overview: shrunken live previews of
         // every window are composited by DWM instead of resizing the real
         // HWNDs. Falls back gracefully if DWM is unavailable.
-        engine.install_thumbnail_overview(wiri::overlay::DwmThumbnailOverview::new());
-
-        // Configure animations from config
-        let anim_cfg = &config.animations;
-        let easing = match anim_cfg.easing.as_str() {
-            "ease-out-cubic" | "cubic-bezier" => wiri::layout::Easing::CubicOut,
-            "ease-in" => wiri::layout::Easing::EaseIn,
-            "ease-out" => wiri::layout::Easing::EaseOut,
-            "ease-in-out" => wiri::layout::Easing::EaseInOut,
-            "linear" => wiri::layout::Easing::Linear,
-            _ => wiri::layout::Easing::CubicOut,
-        };
-        engine.update_animation_settings(anim_cfg.enabled, anim_cfg.duration, easing);
+        engine.install_thumbnail_overview(overview_host);
 
         // Lane D: case-insensitive identity matching, no named-block index fallback.
         wiri::backend::output_runtime::sync(&config, &backend.handle(), &mut engine);
@@ -578,7 +585,6 @@ async fn main() -> Result<()> {
     // (default chord: prefix+Shift+/ = prefix+?).  Installed as a global so
     // execute_action can reach it without extra plumbing.
     let cheatsheet = Arc::new(BindingsCheatsheet::new());
-    let _ = cheatsheet.clone().spawn();
     wiri::overlay::bindings_cheatsheet::set_global_cheatsheet(cheatsheet.clone());
     info!("Key-bindings cheatsheet overlay installed");
 
@@ -642,13 +648,48 @@ async fn main() -> Result<()> {
 
     print_help();
 
-    // Track time for animation ticking
-    let mut last_tick = std::time::Instant::now();
-    // 30 fps (~33 ms) halves the Win32 call budget vs. 60 fps with no visible
-    // quality loss for tiling animations. The applied-state cache (engine.rs)
-    // makes each apply_all call sub-microsecond when nothing has changed, so
-    // even at 30 fps the steady-state overhead is negligible.
-    const ANIMATION_TICK_MS: u32 = 33; // ~30fps
+    // Animations have their own frame worker; idle animations need no polling.
+    let animation_worker = {
+        let weak_engine = Arc::downgrade(&engine);
+        let wake = Arc::clone(&animation_wake);
+        let animation_handle = handle.clone();
+        tokio::spawn(async move {
+            let mut last_tick = std::time::Instant::now();
+            loop {
+                // Register before probing so an animation starting during the
+                // transition to idle cannot leave the worker asleep.
+                let notified = wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let active = {
+                    let Some(engine) = weak_engine.upgrade() else {
+                        break;
+                    };
+                    let active = engine.read().has_active_animations();
+                    active
+                };
+                if !active {
+                    notified.await;
+                    last_tick = std::time::Instant::now();
+                    continue;
+                }
+
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                let now = std::time::Instant::now();
+                let delta_ms = now
+                    .duration_since(last_tick)
+                    .as_millis()
+                    .min(u32::MAX as u128) as u32;
+                last_tick = now;
+                let Some(engine) = weak_engine.upgrade() else {
+                    break;
+                };
+                let _ = engine
+                    .write()
+                    .tick_animations_with_backend(delta_ms, &animation_handle);
+            }
+        })
+    };
     let mut ipc_shutdown_rx = ipc_shutdown_rx;
     let reload = ReloadCtx {
         config_path: &config_path,
@@ -659,40 +700,8 @@ async fn main() -> Result<()> {
         ipc_server: &ipc_server,
     };
 
-    // Main loop: process tray actions + tick animations + wait for shutdown signal
+    // Main loop: process tray actions + wait for shutdown signal
     'main: loop {
-        // Tick animations if enabled.  apply_all is cheap when no state changed
-        // because the applied-state cache in the engine skips all Win32 calls.
-        //
-        // Idle-tick optimisation: when no animation is in flight we do NOT
-        // need to acquire the engine write lock or walk every tile every
-        // 33 ms.  Holding the write lock blocks WinEvent callbacks, IPC
-        // requests, hotkey actions, and the mouse hook — even though the
-        // per-tile work is O(n) hash lookups, the write-lock contention
-        // itself is the visible source of input/event latency the user
-        // perceives as "lag".  Other code paths (hotkeys, WinEvents,
-        // mouse drags) call apply_all/apply_layout_for_monitor directly
-        // when they change state, so the periodic tick is only needed to
-        // drive ongoing animations.
-        {
-            let elapsed = last_tick.elapsed().as_millis() as u32;
-            if elapsed >= ANIMATION_TICK_MS {
-                last_tick = std::time::Instant::now();
-
-                // Cheap read-lock probe first — bail out fast on idle ticks.
-                let needs_tick = engine.read().has_active_animations();
-                if needs_tick {
-                    // try_write so we never block the main loop behind a
-                    // long-running write holder (e.g. a hotkey handler).
-                    // If contended, the next tick (33 ms later) picks it up.
-                    if let Some(mut eng) = engine.try_write() {
-                        eng.tick_animations(elapsed);
-                        eng.apply_all(&handle);
-                    }
-                }
-            }
-        }
-
         // Workspace-indicator: detect workspace switches and show the overlay.
         // Polling is cheap — active_workspace is a plain i32 field; no Win32 calls.
         {
@@ -751,13 +760,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        // 8 ms sleep — keeps the loop tight (~125 Hz) so hotkey/IPC events
-        // are picked up with minimum perceptible lag.  The expensive
-        // apply_all path is gated by has_active_animations() above so this
-        // tight cycle is cheap when idle (~one engine.read() + a try_recv).
-        // 33 ms here previously added a baseline ~16 ms median latency to
-        // every keypress + tray click; the user noticed it as input lag.
-        tokio::time::sleep(Duration::from_millis(8)).await;
+        // Retain the existing tray/reload cadence; animation timing no longer
+        // depends on this loop and sleeps entirely when no timeline is active.
+        tokio::time::sleep(Duration::from_millis(33)).await;
 
         // The config error that was found at startup is shown as soon as the tray icon is there.
         if let Some((title, text, attempts)) = pending_balloon.take() {
@@ -880,6 +885,10 @@ async fn main() -> Result<()> {
             break 'main;
         }
     }
+
+    // Stop animation writes before restoring the original window state.
+    animation_worker.abort();
+    let _ = animation_worker.await;
 
     // Restore tiled windows to their original positions and styles so the
     // user doesn't lose their layout on quit.

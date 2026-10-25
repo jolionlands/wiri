@@ -67,7 +67,7 @@ fn function_args(inner: &str) -> Vec<&str> {
 fn channel(arg: &str) -> Option<u8> {
     if let Some(p) = arg.strip_suffix('%') {
         let v: f64 = p.trim().parse().ok()?;
-        return Some((v.clamp(0.0, 100.0) * 2.55).round() as u8);
+        return Some((v.clamp(0.0, 100.0) * 255.0 / 100.0).round() as u8);
     }
     let v: f64 = arg.parse().ok()?;
     Some(v.clamp(0.0, 255.0).round() as u8)
@@ -77,7 +77,7 @@ fn channel(arg: &str) -> Option<u8> {
 fn alpha(arg: &str) -> Option<u8> {
     if let Some(p) = arg.strip_suffix('%') {
         let v: f64 = p.trim().parse().ok()?;
-        return Some((v.clamp(0.0, 100.0) * 2.55).round() as u8);
+        return Some((v.clamp(0.0, 100.0) * 255.0 / 100.0).round() as u8);
     }
     let v: f64 = arg.parse().ok()?;
     Some((v.clamp(0.0, 1.0) * 255.0).round() as u8)

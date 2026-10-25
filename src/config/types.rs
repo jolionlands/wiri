@@ -6,6 +6,7 @@ pub struct Config {
     pub workspace: Vec<WorkspaceConfig>,
     pub window_rules: Vec<WindowRule>,
     pub binds: BindsConfig,
+    pub recent_windows: super::recent_windows_config::RecentWindowsConfig,
     pub animations: AnimationsConfig,
     /// niri screenshot-path: Pictures default, a strftime template, or null (clipboard only).
     pub screenshot_path: crate::screenshot::path::ScreenshotPath,
@@ -41,6 +42,7 @@ impl Default for Config {
             workspace: Vec::new(),
             window_rules: Vec::new(),
             binds: BindsConfig::default(),
+            recent_windows: super::recent_windows_config::RecentWindowsConfig::default(),
             animations: AnimationsConfig::default_config(),
             screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
@@ -287,6 +289,7 @@ pub struct LayoutConfigPartial {
     pub scroll_step: Option<u32>,
     pub column_width: Option<u32>,
     pub column_width_mode: Option<String>,
+    pub default_column_display: Option<String>,
     pub strip_frame: Option<bool>,
     pub border_color_urgent: Option<String>,
     pub border_radius: Option<u32>,
@@ -379,6 +382,9 @@ impl LayoutConfigPartial {
         }
         if let Some(ref v) = self.column_width_mode {
             out.column_width_mode = v.clone();
+        }
+        if let Some(ref v) = self.default_column_display {
+            out.default_column_display = v.clone();
         }
         if let Some(v) = self.strip_frame {
             out.strip_frame = v;
@@ -482,6 +488,8 @@ pub struct LayoutConfig {
     pub scroll_step: u32,
     pub column_width: u32,
     pub column_width_mode: String,
+    /// niri display for newly opened columns: `normal` or `tabbed`.
+    pub default_column_display: String,
     /// Proportional mode: split the screen among at most this many columns
     /// (default 3); further windows scroll in.  0 = no limit.
     pub max_visible_columns: u32,
@@ -574,6 +582,7 @@ impl LayoutConfig {
             scroll_step: 200,
             column_width: 500,
             column_width_mode: "proportional".to_string(),
+            default_column_display: "normal".to_string(),
             max_visible_columns: 3,
             strip_frame: false,
             border_color_urgent: "#cc3344".to_string(),
@@ -1385,34 +1394,9 @@ impl Default for HotkeyBinding {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct AnimationsConfig {
-    pub enabled: bool,
-    pub duration: u32,
-    pub easing: String,
-    pub focus_transition: bool,
-    pub workspace_transition: bool,
-    pub window_move: bool,
-    pub window_resize: bool,
-    pub popup: bool,
-    pub shadow: bool,
-}
-
-impl AnimationsConfig {
-    pub fn default_config() -> Self {
-        Self {
-            enabled: false,
-            duration: 200,
-            easing: "cubic-bezier".to_string(),
-            focus_transition: true,
-            workspace_transition: true,
-            window_move: true,
-            window_resize: true,
-            popup: true,
-            shadow: true,
-        }
-    }
-}
+#[path = "animation_config.rs"]
+mod animation_config;
+pub use animation_config::AnimationsConfig;
 
 pub fn parse_color(color: &str) -> Option<[u8; 4]> {
     let color = color.trim();

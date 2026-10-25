@@ -1,16 +1,8 @@
 //! Event-driven keyboard input for the recent-windows switcher.
 //!
-//! Integration (the existing keyboard-action drainer remains the only worker):
-//! - Publish an `InputSnapshot` on startup/reload, using the *effective* ordinary
-//!   hotkey table, including defaults and overrides, not just config binds.
-//! - Wire that drainer's `Sender<KeyboardEvent>` with `set_sender`. Legacy hook
-//!   actions can use `send_action` instead of a separate `Sender<Action>`.
-//! - Call `key_event` for every keyboard down/up, before legacy double-Alt /
-//!   Escape handling; return a nonzero hook result when it returns `true`.
-//!   Reset the legacy double-Alt chain on consumption; bypass its recognition
-//!   while `is_active()` is true so switcher input cannot also toggle overview.
-//! - Drain `Action` as before and forward `Recent` to the engine. The engine
-//!   calls `set_active` on session changes, including failed opening attempts.
+//! Events share lane B's ordered message-thread dispatcher, with no channel,
+//! relay thread, engine access or OS query on the hook path. Startup/reload
+//! publishes the effective ordinary binding table; ordinary binds win collisions.
 //!
 //! Opening publishes active=true *before* queuing Cycle, so a modifier release
 //! arriving before the drainer starts is still queued behind the opening event.
@@ -19,7 +11,6 @@
 //! are needed here. Locks protect only small input-owned state/snapshots.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, LazyLock};
 
 use parking_lot::{Mutex, RwLock};
@@ -41,13 +32,6 @@ const VK_LCONTROL: u32 = 0xA2;
 const VK_RCONTROL: u32 = 0xA3;
 const VK_LMENU: u32 = 0xA4;
 const VK_RMENU: u32 = 0xA5;
-
-/// Shared with the existing keyboard-action channel; no additional drainer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyboardEvent {
-    Action(Action),
-    Recent(RecentInput),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecentInput {
@@ -90,9 +74,6 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SNAPSHOT: LazyLock<RwLock<Arc<CompiledSnapshot>>> =
     LazyLock::new(|| RwLock::new(Arc::new(CompiledSnapshot::default())));
 static KEYS: LazyLock<Mutex<KeyState>> = LazyLock::new(|| Mutex::new(KeyState::default()));
-static SENDER: LazyLock<RwLock<Option<Sender<KeyboardEvent>>>> =
-    LazyLock::new(|| RwLock::new(None));
-
 /// Publish configuration + the resolved normal hotkeys together, on startup and
 /// every reload. Until the first publication, recent input is disabled.
 /// Disabling/closing a session in the engine must also call `set_active(false)`.
@@ -101,23 +82,10 @@ pub fn publish_snapshot(snapshot: InputSnapshot) {
     *SNAPSHOT.write() = compiled;
 }
 
-pub fn set_sender(sender: Sender<KeyboardEvent>) {
-    *SENDER.write() = Some(sender);
-}
-
-/// Call after stopping the keyboard hook. Reset physical state for a subsequent
-/// hook installation; ordinary session closure should use `set_active(false)`.
-pub fn clear_sender() {
-    *SENDER.write() = None;
+/// Call after stopping the keyboard hook, before shutting down the dispatcher.
+pub fn reset() {
     ACTIVE.store(false, Ordering::Release);
     *KEYS.lock() = KeyState::default();
-}
-
-/// Bridge legacy low-level hook actions into the same ordered channel.
-/// Returns false when unwired or when the receiver has gone away.
-pub fn send_action(action: Action) -> bool {
-    let sender = SENDER.read().clone();
-    sender.is_some_and(|tx| tx.send(KeyboardEvent::Action(action)).is_ok())
 }
 
 /// Acknowledge every drained Cycle, including repeats. A reset may have cleared
@@ -125,15 +93,13 @@ pub fn send_action(action: Action) -> bool {
 /// Reconcile under KEYS and queue the missing release behind existing input.
 /// Never clear suppression: swallowed downs still own their matching ups.
 pub fn set_active(active: bool) {
-    let sender = SENDER.read().clone();
     let keys = KEYS.lock();
     ACTIVE.store(active, Ordering::Release);
-    if active && keys.modifiers() == 0 {
-        if let Some(tx) = sender {
-            if tx.send(KeyboardEvent::Recent(RecentInput::Modifiers(false))).is_err() {
-                ACTIVE.store(false, Ordering::Release);
-            }
-        }
+    if active
+        && keys.modifiers() == 0
+        && !super::dispatch::send_recent(RecentInput::Modifiers(false))
+    {
+        ACTIVE.store(false, Ordering::Release);
     }
 }
 
@@ -150,27 +116,15 @@ pub fn is_active() -> bool {
 /// polling here: on key-up it can still include the very key being released.
 pub fn key_event(vk: u32, down: bool, up: bool, foreground: isize) -> bool {
     let snapshot = SNAPSHOT.read().clone();
-    let sender = SENDER.read().clone();
+    let connected = super::dispatch::is_initialized();
     let mut keys = KEYS.lock();
-    let was_suppressed = keys
-        .suppressed
-        .get(vk as usize)
-        .copied()
-        .unwrap_or(false);
-    let decision = keys.event(
-        &snapshot,
-        &ACTIVE,
-        sender.is_some(),
-        vk,
-        down,
-        up,
-        foreground,
-    );
+    let was_suppressed = keys.suppressed.get(vk as usize).copied().unwrap_or(false);
+    let decision = keys.event(&snapshot, &ACTIVE, connected, vk, down, up, foreground);
 
     // event() marks opening active synchronously, before this send. Holding only
     // the input-state mutex here also preserves event order if callers overlap.
-    if let (Some(input), Some(tx)) = (decision.input, sender) {
-        if tx.send(KeyboardEvent::Recent(input)).is_err() {
+    if let Some(input) = decision.input {
+        if !super::dispatch::send_recent(input) {
             ACTIVE.store(false, Ordering::Release);
             // Fail open on a NEW press when there is no consumer. An already
             // swallowed press must still keep its repeats/up suppressed.
@@ -188,11 +142,11 @@ pub fn key_event(vk: u32, down: bool, up: bool, foreground: isize) -> bool {
 /// the switcher or treat a dismissed-overlay key as application input.
 pub fn consumed_key_event(vk: u32, down: bool, up: bool) {
     let snapshot = SNAPSHOT.read().clone();
-    let sender = SENDER.read().clone();
+    let connected = super::dispatch::is_initialized();
     let mut keys = KEYS.lock();
-    let decision = keys.consumed_event(&snapshot, &ACTIVE, sender.is_some(), vk, down, up);
-    if let (Some(input), Some(tx)) = (decision.input, sender) {
-        if tx.send(KeyboardEvent::Recent(input)).is_err() {
+    let decision = keys.consumed_event(&snapshot, &ACTIVE, connected, vk, down, up);
+    if let Some(input) = decision.input {
+        if !super::dispatch::send_recent(input) {
             ACTIVE.store(false, Ordering::Release);
         }
     }
@@ -371,16 +325,16 @@ fn action_command(action: &Action) -> Option<RecentCommand> {
 
 fn session_command(vk: u32) -> Option<RecentCommand> {
     Some(match vk {
-        0x1B => RecentCommand::Cancel,                       // Escape
-        0x0D => RecentCommand::Confirm,                      // Enter
+        0x1B => RecentCommand::Cancel,                        // Escape
+        0x0D => RecentCommand::Confirm,                       // Enter
         0x41 => RecentCommand::Scope(RecentScope::All),       // A
         0x57 => RecentCommand::Scope(RecentScope::Workspace), // W
         0x4F => RecentCommand::Scope(RecentScope::Output),    // O
-        0x53 => RecentCommand::CycleScope,                   // S
-        0x25 => RecentCommand::Previous,                     // Left
-        0x27 => RecentCommand::Next,                         // Right
-        0x24 => RecentCommand::First,                        // Home
-        0x23 => RecentCommand::Last,                         // End
+        0x53 => RecentCommand::CycleScope,                    // S
+        0x25 => RecentCommand::Previous,                      // Left
+        0x27 => RecentCommand::Next,                          // Right
+        0x24 => RecentCommand::First,                         // Home
+        0x23 => RecentCommand::Last,                          // End
         _ => return None,
     })
 }
@@ -411,8 +365,17 @@ impl KeyState {
         // In particular either Win key, or the other Alt/Shift side, keeps a
         // session alive after the original modifier was released.
         [
-            VK_MENU, VK_LMENU, VK_RMENU, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
-            VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_LWIN, VK_RWIN,
+            VK_MENU,
+            VK_LMENU,
+            VK_RMENU,
+            VK_CONTROL,
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_SHIFT,
+            VK_LSHIFT,
+            VK_RSHIFT,
+            VK_LWIN,
+            VK_RWIN,
         ]
         .iter()
         .filter(|vk| self.physical[**vk as usize])
@@ -428,15 +391,26 @@ impl KeyState {
     }
 
     fn consumed_event(
-        &mut self, snapshot: &CompiledSnapshot, active: &AtomicBool,
-        connected: bool, vk: u32, down: bool, up: bool,
+        &mut self,
+        snapshot: &CompiledSnapshot,
+        active: &AtomicBool,
+        connected: bool,
+        vk: u32,
+        down: bool,
+        up: bool,
     ) -> Decision {
-        if vk == 0 || vk >= 256 || down == up { return Decision::default(); }
+        if vk == 0 || vk >= 256 || down == up {
+            return Decision::default();
+        }
         self.physical[vk as usize] = down;
-        if up { self.suppressed[vk as usize] = false; }
+        if up {
+            self.suppressed[vk as usize] = false;
+        }
         Decision {
             consume: false,
-            input: (connected && snapshot.enabled && active.load(Ordering::Acquire)
+            input: (connected
+                && snapshot.enabled
+                && active.load(Ordering::Acquire)
                 && modifier_flag(vk) != 0)
                 .then_some(RecentInput::Modifiers(self.modifiers() != 0)),
         }
@@ -481,12 +455,18 @@ impl KeyState {
             };
         }
 
-        let ordinary = snapshot.hotkeys.iter()
+        let ordinary = snapshot
+            .hotkeys
+            .iter()
             .find(|(modifiers, key, _)| ordinary_matches(*modifiers, *key, vk, held));
         // Normal hotkeys own collisions, even when the recent chord uses a
         // modifier as its trigger. They stay on WM_HOTKEY outside a session.
         if ordinary.is_none() {
-            if let Some(binding) = snapshot.recent.iter().find(|binding| binding.matches(vk, held)) {
+            if let Some(binding) = snapshot
+                .recent
+                .iter()
+                .find(|binding| binding.matches(vk, held))
+            {
                 // Do not wait for the drainer to open: its next event may be
                 // the final modifier-up. Repeats merely send another Cycle.
                 active.store(true, Ordering::Release);
@@ -499,7 +479,9 @@ impl KeyState {
             // navigation, including Enter/A/W/O/S with opening modifiers held.
             // An explicit recent chord still keeps cycling on auto-repeat.
             let command = session_command(vk).or_else(|| {
-                snapshot.navigation.iter()
+                snapshot
+                    .navigation
+                    .iter()
                     .find(|(key, _)| *key == vk)
                     .map(|(_, command)| *command)
             });
@@ -507,7 +489,10 @@ impl KeyState {
                 return self.consume(slot, RecentInput::Command(command));
             }
             if modifier {
-                return Decision { consume: suppressed, input: Some(RecentInput::Modifiers(held != 0)) };
+                return Decision {
+                    consume: suppressed,
+                    input: Some(RecentInput::Modifiers(held != 0)),
+                };
             }
         }
         if suppressed || modifier || ordinary.is_some() {
@@ -518,7 +503,8 @@ impl KeyState {
         }
         Decision {
             consume: false,
-            input: (foreground != 0).then_some(RecentInput::ApplicationKey(WindowId::new(foreground))),
+            input: (foreground != 0)
+                .then_some(RecentInput::ApplicationKey(WindowId::new(foreground))),
         }
     }
 }
@@ -536,52 +522,87 @@ mod tests {
 
     impl Hook {
         fn new(snapshot: InputSnapshot) -> Self {
-            Self { keys: KeyState::default(), active: AtomicBool::new(false),
-                snapshot: CompiledSnapshot::new(snapshot) }
+            Self {
+                keys: KeyState::default(),
+                active: AtomicBool::new(false),
+                snapshot: CompiledSnapshot::new(snapshot),
+            }
         }
-        fn press(&mut self, vk: u32) -> Decision { self.event(vk, true, false, 42) }
-        fn release(&mut self, vk: u32) -> Decision { self.event(vk, false, true, 42) }
+        fn press(&mut self, vk: u32) -> Decision {
+            self.event(vk, true, false, 42)
+        }
+        fn release(&mut self, vk: u32) -> Decision {
+            self.event(vk, false, true, 42)
+        }
         fn event(&mut self, vk: u32, down: bool, up: bool, foreground: isize) -> Decision {
-            self.keys.event(&self.snapshot, &self.active, true, vk, down, up, foreground)
+            self.keys
+                .event(&self.snapshot, &self.active, true, vk, down, up, foreground)
         }
-        fn running(&self) -> bool { self.active.load(Ordering::Acquire) }
+        fn running(&self) -> bool {
+            self.active.load(Ordering::Acquire)
+        }
     }
 
     fn custom(chord: &str, cycle: RecentCycle) -> InputSnapshot {
         let mut snapshot = InputSnapshot::default();
-        snapshot.config.binds = vec![RecentBind { chord: chord.into(), action: cycle }];
+        snapshot.config.binds = vec![RecentBind {
+            chord: chord.into(),
+            action: cycle,
+        }];
         snapshot
     }
 
     fn input(input: RecentInput, consume: bool) -> Decision {
-        Decision { consume, input: Some(input) }
+        Decision {
+            consume,
+            input: Some(input),
+        }
     }
 
     #[test]
     fn ordinary_bind_wins_opening_collision_and_maps_inside_session() {
         let mut snapshot = InputSnapshot::default();
-        snapshot.hotkeys.push((MOD_ALT, 0x09, Action::FocusColumnRight));
+        snapshot
+            .hotkeys
+            .push((MOD_ALT, 0x09, Action::FocusColumnRight));
         let mut hook = Hook::new(snapshot);
         hook.press(VK_LMENU);
         assert_eq!(hook.press(0x09), Decision::default());
         assert!(!hook.running());
         assert_eq!(hook.release(0x09), Decision::default());
         hook.active.store(true, Ordering::Release);
-        assert_eq!(hook.press(0x09), input(RecentInput::Command(RecentCommand::Next), true));
+        assert_eq!(
+            hook.press(0x09),
+            input(RecentInput::Command(RecentCommand::Next), true)
+        );
     }
 
     #[test]
     fn effective_defaults_beat_mod_grave_but_not_alt_grave() {
         let mut snapshot = InputSnapshot::default();
-        snapshot.hotkeys.push((MOD_CTRL | MOD_ALT, 0xC0, Action::FocusPrevious));
+        snapshot
+            .hotkeys
+            .push((MOD_CTRL | MOD_ALT, 0xC0, Action::FocusPrevious));
         let mut hook = Hook::new(snapshot);
-        hook.press(VK_CONTROL); hook.press(VK_MENU);
+        hook.press(VK_CONTROL);
+        hook.press(VK_MENU);
         assert_eq!(hook.press(0xC0), Decision::default());
         assert!(!hook.running());
-        hook.release(0xC0); hook.release(VK_CONTROL);
-        assert_eq!(hook.press(0xC0), input(RecentInput::Cycle(RecentCycle {
-            filter_app_id: true, ..RecentCycle::default()
-        }, 42), true));
+        hook.release(0xC0);
+        hook.release(VK_CONTROL);
+        assert_eq!(
+            hook.press(0xC0),
+            input(
+                RecentInput::Cycle(
+                    RecentCycle {
+                        filter_app_id: true,
+                        ..RecentCycle::default()
+                    },
+                    42
+                ),
+                true
+            )
+        );
     }
 
     #[test]
@@ -592,31 +613,57 @@ mod tests {
         // No event has been drained, nor has the engine acknowledged opening.
         assert!(hook.running());
         let release = hook.release(VK_MENU);
-        assert_eq!(opening, input(RecentInput::Cycle(RecentCycle::default(), 42), true));
+        assert_eq!(
+            opening,
+            input(RecentInput::Cycle(RecentCycle::default(), 42), true)
+        );
         assert_eq!(release, input(RecentInput::Modifiers(false), false));
     }
 
     #[test]
     fn repeats_cycle_without_reopening_or_app_input_and_keep_opening_scope() {
-        let cycle = RecentCycle { backwards: true, filter_app_id: true, scope: RecentScope::Workspace };
+        let cycle = RecentCycle {
+            backwards: true,
+            filter_app_id: true,
+            scope: RecentScope::Workspace,
+        };
         let mut hook = Hook::new(custom("Alt+Tab", cycle));
         hook.press(VK_RMENU);
         for _ in 0..5 {
             assert_eq!(hook.press(0x09), input(RecentInput::Cycle(cycle, 42), true));
             assert!(hook.running());
         }
-        assert_eq!(hook.release(0x09), Decision { consume: true, input: None });
+        assert_eq!(
+            hook.release(0x09),
+            Decision {
+                consume: true,
+                input: None
+            }
+        );
         assert_eq!(hook.release(0x09), Decision::default());
     }
 
     #[test]
     fn consumed_keyups_and_repeats_stay_suppressed_after_engine_closes() {
         let mut hook = Hook::new(InputSnapshot::default());
-        hook.press(VK_LMENU); hook.press(0x09);
+        hook.press(VK_LMENU);
+        hook.press(0x09);
         hook.active.store(false, Ordering::Release);
-        assert_eq!(hook.press(0x09), Decision { consume: true, input: None });
+        assert_eq!(
+            hook.press(0x09),
+            Decision {
+                consume: true,
+                input: None
+            }
+        );
         assert!(!hook.running());
-        assert_eq!(hook.release(0x09), Decision { consume: true, input: None });
+        assert_eq!(
+            hook.release(0x09),
+            Decision {
+                consume: true,
+                input: None
+            }
+        );
         // A fresh press may open the next session.
         assert!(hook.press(0x09).consume);
         assert!(hook.running());
@@ -625,49 +672,85 @@ mod tests {
     #[test]
     fn every_physical_modifier_keeps_session_until_the_last_release() {
         let mut hook = Hook::new(custom("Alt+Ctrl+Shift+Win+Tab", RecentCycle::default()));
-        for vk in [VK_LMENU, VK_RCONTROL, VK_LSHIFT, VK_RWIN] { hook.press(vk); }
+        for vk in [VK_LMENU, VK_RCONTROL, VK_LSHIFT, VK_RWIN] {
+            hook.press(vk);
+        }
         assert!(hook.press(0x09).consume);
         for vk in [VK_LMENU, VK_RCONTROL, VK_LSHIFT] {
             assert_eq!(hook.release(vk), input(RecentInput::Modifiers(true), false));
         }
-        assert_eq!(hook.release(VK_RWIN), input(RecentInput::Modifiers(false), false));
+        assert_eq!(
+            hook.release(VK_RWIN),
+            input(RecentInput::Modifiers(false), false)
+        );
     }
 
     #[test]
     fn generic_modifiers_and_both_sides_are_tracked_without_polling() {
-        for (generic, left, right) in [(VK_MENU, VK_LMENU, VK_RMENU),
-            (VK_CONTROL, VK_LCONTROL, VK_RCONTROL), (VK_SHIFT, VK_LSHIFT, VK_RSHIFT),
-            (VK_LWIN, VK_LWIN, VK_RWIN)]
-        {
+        for (generic, left, right) in [
+            (VK_MENU, VK_LMENU, VK_RMENU),
+            (VK_CONTROL, VK_LCONTROL, VK_RCONTROL),
+            (VK_SHIFT, VK_LSHIFT, VK_RSHIFT),
+            (VK_LWIN, VK_LWIN, VK_RWIN),
+        ] {
             let mut hook = Hook::new(InputSnapshot::default());
             hook.active.store(true, Ordering::Release);
-            assert_eq!(hook.press(generic), input(RecentInput::Modifiers(true), false));
-            assert_eq!(hook.release(generic), input(RecentInput::Modifiers(false), false));
-            hook.press(left); hook.press(right);
-            assert_eq!(hook.release(left), input(RecentInput::Modifiers(true), false));
-            assert_eq!(hook.release(right), input(RecentInput::Modifiers(false), false));
+            assert_eq!(
+                hook.press(generic),
+                input(RecentInput::Modifiers(true), false)
+            );
+            assert_eq!(
+                hook.release(generic),
+                input(RecentInput::Modifiers(false), false)
+            );
+            hook.press(left);
+            hook.press(right);
+            assert_eq!(
+                hook.release(left),
+                input(RecentInput::Modifiers(true), false)
+            );
+            assert_eq!(
+                hook.release(right),
+                input(RecentInput::Modifiers(false), false)
+            );
         }
     }
 
     #[test]
     fn higher_priority_modal_consumption_still_tracks_modifiers_without_dispatch() {
         let mut hook = Hook::new(custom("Ctrl+Alt", RecentCycle::default()));
-        assert_eq!(hook.keys.consumed_event(&hook.snapshot, &hook.active, true,
-            VK_LCONTROL, true, false), Decision::default());
+        assert_eq!(
+            hook.keys
+                .consumed_event(&hook.snapshot, &hook.active, true, VK_LCONTROL, true, false),
+            Decision::default()
+        );
         // A swallowed trigger must not open recent windows or promote MRU.
-        assert_eq!(hook.keys.consumed_event(&hook.snapshot, &hook.active, true,
-            VK_RMENU, true, false), Decision::default());
+        assert_eq!(
+            hook.keys
+                .consumed_event(&hook.snapshot, &hook.active, true, VK_RMENU, true, false),
+            Decision::default()
+        );
         assert!(!hook.running());
-        hook.keys.consumed_event(&hook.snapshot, &hook.active, true, VK_RMENU, false, true);
+        hook.keys
+            .consumed_event(&hook.snapshot, &hook.active, true, VK_RMENU, false, true);
         assert!(hook.press(VK_RMENU).consume);
-        assert_eq!(hook.keys.consumed_event(&hook.snapshot, &hook.active, true,
-            VK_RMENU, false, true), input(RecentInput::Modifiers(true), false));
+        assert_eq!(
+            hook.keys
+                .consumed_event(&hook.snapshot, &hook.active, true, VK_RMENU, false, true),
+            input(RecentInput::Modifiers(true), false)
+        );
         assert!(!hook.keys.suppressed[VK_RMENU as usize]);
-        assert_eq!(hook.keys.consumed_event(&hook.snapshot, &hook.active, true,
-            VK_LCONTROL, false, true), input(RecentInput::Modifiers(false), false));
+        assert_eq!(
+            hook.keys
+                .consumed_event(&hook.snapshot, &hook.active, true, VK_LCONTROL, false, true),
+            input(RecentInput::Modifiers(false), false)
+        );
         assert_eq!(hook.keys.modifiers(), 0);
-        assert_eq!(hook.keys.consumed_event(&hook.snapshot, &hook.active, true,
-            0x53, true, false), Decision::default());
+        assert_eq!(
+            hook.keys
+                .consumed_event(&hook.snapshot, &hook.active, true, 0x53, true, false),
+            Decision::default()
+        );
     }
 
     #[test]
@@ -675,10 +758,19 @@ mod tests {
         let mut hook = Hook::new(custom("Ctrl+Alt", RecentCycle::default()));
         hook.press(VK_LCONTROL);
         for _ in 0..2 {
-            assert_eq!(hook.press(VK_RMENU), input(RecentInput::Cycle(RecentCycle::default(), 42), true));
+            assert_eq!(
+                hook.press(VK_RMENU),
+                input(RecentInput::Cycle(RecentCycle::default(), 42), true)
+            );
         }
-        assert_eq!(hook.release(VK_RMENU), input(RecentInput::Modifiers(true), true));
-        assert_eq!(hook.release(VK_LCONTROL), input(RecentInput::Modifiers(false), false));
+        assert_eq!(
+            hook.release(VK_RMENU),
+            input(RecentInput::Modifiers(true), true)
+        );
+        assert_eq!(
+            hook.release(VK_LCONTROL),
+            input(RecentInput::Modifiers(false), false)
+        );
     }
 
     #[test]
@@ -699,10 +791,16 @@ mod tests {
 
     #[test]
     fn no_zero_modifiers_or_modifier_only_self_chords_after_mod_resolution() {
-        for (chord, mod_key) in [("Tab", MOD_ALT), ("Alt+Alt_L", MOD_ALT),
-            ("Mod+Alt", MOD_ALT), ("Mod+Tab", 0), ("Ctrl++Tab", MOD_ALT),
-            ("Foo+Tab", MOD_ALT), ("Alt+NotAKey", MOD_ALT), ("Alt+Mod", DEFAULT_MOD_KEY)]
-        {
+        for (chord, mod_key) in [
+            ("Tab", MOD_ALT),
+            ("Alt+Alt_L", MOD_ALT),
+            ("Mod+Alt", MOD_ALT),
+            ("Mod+Tab", 0),
+            ("Ctrl++Tab", MOD_ALT),
+            ("Foo+Tab", MOD_ALT),
+            ("Alt+NotAKey", MOD_ALT),
+            ("Alt+Mod", DEFAULT_MOD_KEY),
+        ] {
             let mut snapshot = custom(chord, RecentCycle::default());
             snapshot.mod_key = mod_key;
             assert!(CompiledSnapshot::new(snapshot).recent.is_empty(), "{chord}");
@@ -712,11 +810,16 @@ mod tests {
     #[test]
     fn mod_resolution_scope_and_backwards_flags_are_preserved() {
         for scope in [RecentScope::Output, RecentScope::Workspace] {
-            let cycle = RecentCycle { backwards: true, filter_app_id: true, scope };
+            let cycle = RecentCycle {
+                backwards: true,
+                filter_app_id: true,
+                scope,
+            };
             let mut snapshot = custom("Mod+Shift+grave", cycle);
             snapshot.mod_key = MOD_WIN;
             let mut hook = Hook::new(snapshot);
-            hook.press(VK_RWIN); hook.press(VK_RSHIFT);
+            hook.press(VK_RWIN);
+            hook.press(VK_RSHIFT);
             assert_eq!(hook.press(0xC0), input(RecentInput::Cycle(cycle, 42), true));
         }
     }
@@ -724,36 +827,58 @@ mod tests {
     #[test]
     fn modal_keys_and_their_ups_are_consumed_even_with_opening_modifiers() {
         let mut snapshot = InputSnapshot::default();
-        snapshot.hotkeys.push((MOD_ALT, 0x0D, Action::Spawn(vec!["terminal".into()])));
+        snapshot
+            .hotkeys
+            .push((MOD_ALT, 0x0D, Action::Spawn(vec!["terminal".into()])));
         snapshot.hotkeys.push((MOD_CTRL, 0x57, Action::CloseWindow));
         snapshot.hotkeys.push((MOD_CTRL, 0x53, Action::Screenshot));
-        snapshot.hotkeys.push((MOD_CTRL, 0x25, Action::FocusColumnRight));
+        snapshot
+            .hotkeys
+            .push((MOD_CTRL, 0x25, Action::FocusColumnRight));
         let mut hook = Hook::new(snapshot);
-        hook.press(VK_MENU); hook.press(0x09); hook.release(0x09);
-        for (vk, command) in [(0x1B, RecentCommand::Cancel), (0x0D, RecentCommand::Confirm),
+        hook.press(VK_MENU);
+        hook.press(0x09);
+        hook.release(0x09);
+        for (vk, command) in [
+            (0x1B, RecentCommand::Cancel),
+            (0x0D, RecentCommand::Confirm),
             (0x41, RecentCommand::Scope(RecentScope::All)),
             (0x57, RecentCommand::Scope(RecentScope::Workspace)),
-            (0x4F, RecentCommand::Scope(RecentScope::Output)), (0x53, RecentCommand::CycleScope),
-            (0x25, RecentCommand::Previous), (0x27, RecentCommand::Next),
-            (0x24, RecentCommand::First), (0x23, RecentCommand::Last)]
-        {
+            (0x4F, RecentCommand::Scope(RecentScope::Output)),
+            (0x53, RecentCommand::CycleScope),
+            (0x25, RecentCommand::Previous),
+            (0x27, RecentCommand::Next),
+            (0x24, RecentCommand::First),
+            (0x23, RecentCommand::Last),
+        ] {
             assert_eq!(hook.press(vk), input(RecentInput::Command(command), true));
-            assert_eq!(hook.release(vk), Decision { consume: true, input: None });
+            assert_eq!(
+                hook.release(vk),
+                Decision {
+                    consume: true,
+                    input: None
+                }
+            );
         }
     }
 
     #[test]
     fn ordinary_navigation_keys_ignore_modifiers_and_do_not_promote_app_input() {
-        for (action, command) in [(Action::FocusColumnLeft, RecentCommand::Previous),
-            (Action::FocusColumnRight, RecentCommand::Next), (Action::FocusColumnFirst, RecentCommand::First),
-            (Action::FocusColumnLast, RecentCommand::Last), (Action::CloseWindow, RecentCommand::Close),
-            (Action::Screenshot, RecentCommand::Screenshot), (Action::WindowScreenshot, RecentCommand::Screenshot),
-            (Action::ScreenshotWindow, RecentCommand::Screenshot)]
-        {
+        for (action, command) in [
+            (Action::FocusColumnLeft, RecentCommand::Previous),
+            (Action::FocusColumnRight, RecentCommand::Next),
+            (Action::FocusColumnFirst, RecentCommand::First),
+            (Action::FocusColumnLast, RecentCommand::Last),
+            (Action::CloseWindow, RecentCommand::Close),
+            (Action::Screenshot, RecentCommand::Screenshot),
+            (Action::WindowScreenshot, RecentCommand::Screenshot),
+            (Action::ScreenshotWindow, RecentCommand::Screenshot),
+        ] {
             let mut snapshot = InputSnapshot::default();
             snapshot.hotkeys.push((MOD_CTRL | MOD_WIN, 0x4A, action));
             let mut hook = Hook::new(snapshot);
-            hook.press(VK_MENU); hook.press(0x09);
+            hook.press(VK_MENU);
+            hook.press(0x09);
             assert_eq!(hook.press(0x4A), input(RecentInput::Command(command), true));
             hook.active.store(false, Ordering::Release);
             assert!(hook.release(0x4A).consume);
@@ -783,7 +908,10 @@ mod tests {
         let mut hook = Hook::new(custom("Alt+W", RecentCycle::default()));
         hook.press(VK_MENU);
         for _ in 0..3 {
-            assert_eq!(hook.press(0x57), input(RecentInput::Cycle(RecentCycle::default(), 42), true));
+            assert_eq!(
+                hook.press(0x57),
+                input(RecentInput::Cycle(RecentCycle::default(), 42), true)
+            );
         }
     }
 
@@ -791,14 +919,20 @@ mod tests {
     fn application_keys_are_immediate_pass_through_not_modifiers_or_keyups() {
         let mut hook = Hook::new(InputSnapshot::default());
         for _ in 0..2 {
-            assert_eq!(hook.press(0x58), input(RecentInput::ApplicationKey(WindowId::new(42)), false));
+            assert_eq!(
+                hook.press(0x58),
+                input(RecentInput::ApplicationKey(WindowId::new(42)), false)
+            );
         }
         assert_eq!(hook.release(0x58), Decision::default());
         assert_eq!(hook.event(0x58, true, false, 0), Decision::default());
         assert_eq!(hook.press(VK_MENU), Decision::default());
         // An application key stays pass-through even while a session exists.
         hook.press(0x09);
-        assert_eq!(hook.press(0x58), input(RecentInput::ApplicationKey(WindowId::new(42)), false));
+        assert_eq!(
+            hook.press(0x58),
+            input(RecentInput::ApplicationKey(WindowId::new(42)), false)
+        );
     }
 
     #[test]
@@ -823,10 +957,16 @@ mod tests {
         hook.press(VK_RSHIFT);
         assert_eq!(
             hook.press(0x09),
-            input(RecentInput::Cycle(RecentCycle {
-                backwards: true,
-                ..RecentCycle::default()
-            }, 42), true)
+            input(
+                RecentInput::Cycle(
+                    RecentCycle {
+                        backwards: true,
+                        ..RecentCycle::default()
+                    },
+                    42
+                ),
+                true
+            )
         );
 
         let mut hook = Hook::new(snapshot);
@@ -851,15 +991,31 @@ mod tests {
         let snapshot = CompiledSnapshot::new(InputSnapshot::default());
         let active = AtomicBool::new(false);
         let mut keys = KeyState::default();
-        assert_eq!(keys.event(&snapshot, &active, false, VK_MENU, true, false, 42), Decision::default());
-        assert_eq!(keys.event(&snapshot, &active, false, 0x09, true, false, 42), Decision::default());
+        assert_eq!(
+            keys.event(&snapshot, &active, false, VK_MENU, true, false, 42),
+            Decision::default()
+        );
+        assert_eq!(
+            keys.event(&snapshot, &active, false, 0x09, true, false, 42),
+            Decision::default()
+        );
         assert!(!active.load(Ordering::Acquire));
         // Physical tracking was not disabled along with the sender.
-        assert!(keys.event(&snapshot, &active, true, 0x09, true, false, 42).consume);
-        for (vk, down, up) in [(0, true, false), (256, true, false),
-            (u32::MAX, false, true), (0x09, false, false), (0x09, true, true)]
-        {
-            assert_eq!(keys.event(&snapshot, &active, true, vk, down, up, 42), Decision::default());
+        assert!(
+            keys.event(&snapshot, &active, true, 0x09, true, false, 42)
+                .consume
+        );
+        for (vk, down, up) in [
+            (0, true, false),
+            (256, true, false),
+            (u32::MAX, false, true),
+            (0x09, false, false),
+            (0x09, true, true),
+        ] {
+            assert_eq!(
+                keys.event(&snapshot, &active, true, vk, down, up, 42),
+                Decision::default()
+            );
         }
     }
 }

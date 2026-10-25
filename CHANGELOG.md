@@ -5,6 +5,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — look and feel on the shared input pump
+- Land configured spring/easing motion, unified passive decorations, active-only tabs, live overview/recent previews and Important Hotkeys from lane A. Preserve lane B's primary keyboard engine, pointer/focus handling, fallback bindings and message-thread dispatcher: no legacy keyboard relay thread/channel.
+- Modal dismissal and recent events keep physical modifier state and captured down/up pairs synchronized; tagged activation input cannot promote MRU. Keep lane D screenshots/output handling unchanged. See the Phase 2B report for source-run evidence and pending integrated validation.
+
 ### Phase 2B integration — recent-window diagnostics
 - Preserve lane A's shell-collision-free recent-window fixture and foreground/preview diagnostics; no assertions are relaxed.
 

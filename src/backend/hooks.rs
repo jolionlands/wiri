@@ -304,18 +304,16 @@ unsafe extern "system" fn winevent_proc(
             // EVENT_OBJECT_LOCATIONCHANGE
             let hwnd_isize = hwnd.0 as isize;
 
-            // Fast-path: if wiri itself just moved this window, skip the entire
-            // handler.  This breaks the SetWindowPos → LOCATIONCHANGE → send_event
-            // → apply_all → SetWindowPos ping-pong without relying solely on the
-            // 200 ms LAST_LOCATION throttle.
-            if backend.is_self_applied_recent(hwnd_isize) {
-                return;
-            }
-
-            // Somebody else moved or resized it (a drag by the title bar, the program itself):
-            // the frame drawn around it follows at once.
+            // Decorations also follow our own moves (interactive grabs and animation frames),
+            // before the layout feedback guard. The layer never requests a layout itself.
             if let Some(decor) = crate::overlay::decor::global() {
                 decor.moved(hwnd_isize);
+            }
+
+            // Fast-path: if wiri itself just moved this window, skip the layout handler.
+            // This breaks SetWindowPos → LOCATIONCHANGE → apply_all ping-pong.
+            if backend.is_self_applied_recent(hwnd_isize) {
+                return;
             }
 
             // A window that became maximized or as big as its monitor (or stopped being) on

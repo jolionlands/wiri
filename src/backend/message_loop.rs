@@ -354,6 +354,22 @@ fn build_hotkey_list(
     (merged, options)
 }
 
+/// Keep the low-level switcher hook on the same resolved ordinary bind table.
+fn publish_recent_input(
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    hotkeys: &[(u32, u32, Action)],
+) {
+    let eng = engine.read();
+    let config = eng.full_config();
+    crate::input::recent::publish_snapshot(crate::input::recent::InputSnapshot {
+        config: config.map(|c| c.recent_windows.clone()).unwrap_or_default(),
+        mod_key: config
+            .map(|c| resolve_mod_prefix(&c.input.mod_key).0)
+            .unwrap_or(MOD_CTRL | MOD_ALT),
+        hotkeys: hotkeys.to_vec(),
+    });
+}
+
 /// Chords that wiri must NEVER attempt to register.  These are reserved by
 /// Windows for security- or system-critical functions and stealing them at
 /// the WM layer causes very bad user-visible behaviour (e.g. binding
@@ -543,6 +559,7 @@ fn update_current_bindings_snapshot(
 
 /// The rows of the key-bindings overlay: the chord and what it does, the action's name unless
 /// the bind has a `hotkey-overlay-title`, and no row for a bind whose title is `null`.
+#[cfg(test)]
 fn overlay_rows(bindings: &[RegisteredBinding]) -> Vec<(String, String)> {
     bindings
         .iter()
@@ -647,6 +664,7 @@ impl MessageLoop {
             }
         };
         info!("Hotkey window created");
+        crate::overlay::decor::layer::attach_message_thread();
 
         // Store thread state for hot-reload support
         *HOTKEY_THREAD.lock() = Some(HotkeyThreadState {
@@ -667,6 +685,7 @@ impl MessageLoop {
             ),
         }
         let (mut current_hotkeys, bind_options) = build_hotkey_list(&engine);
+        publish_recent_input(&engine, &current_hotkeys);
         keyboard::ENGINE
             .lock()
             .configure(&current_hotkeys, &bind_options);
@@ -695,6 +714,9 @@ impl MessageLoop {
                 if msg.message == WM_STOP_MESSAGE_LOOP {
                     break;
                 }
+                if crate::overlay::decor::layer::handle_message(msg.message) {
+                    continue;
+                }
                 if crate::input::focus::handle_message(&msg) {
                     continue;
                 }
@@ -704,6 +726,7 @@ impl MessageLoop {
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
                     let (new_hotkeys, new_options) = build_hotkey_list(&engine);
+                    publish_recent_input(&engine, &new_hotkeys);
                     keyboard::ENGINE
                         .lock()
                         .configure(&new_hotkeys, &new_options);
@@ -724,6 +747,18 @@ impl MessageLoop {
                             crate::input::dispatch::Work::Action(action) => {
                                 info!("KEYHOOK -> {:?}", action);
                                 execute_action(&action, &engine, &backend_handle, &quit_tx);
+                            }
+                            crate::input::dispatch::Work::Recent(input) => {
+                                let screenshot =
+                                    engine.write().recent_input(input, &backend_handle);
+                                if screenshot {
+                                    execute_action(
+                                        &Action::Screenshot,
+                                        &engine,
+                                        &backend_handle,
+                                        &quit_tx,
+                                    );
+                                }
                             }
                             crate::input::dispatch::Work::Task(task) => task(),
                         }
@@ -760,6 +795,8 @@ impl MessageLoop {
 
         unregister_hotkeys(hwnd, &registered_ids);
         crate::input::stop_keyboard_hook();
+        crate::input::recent::reset();
+        crate::overlay::decor::layer::detach_message_thread();
         crate::input::focus::shutdown();
         crate::input::dispatch::shutdown();
         unsafe {
@@ -1486,17 +1523,12 @@ pub(crate) fn perform_action_on(
             // (what Windows actually accepted) and toggle the cheatsheet overlay.
             if let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet() {
                 let raw = current_bindings();
-                let rows: Vec<(String, String)> = if raw.is_empty() {
-                    // Engine not yet registered — show hardcoded defaults.
-                    let prefix_name = engine
-                        .read()
-                        .full_config()
-                        .map(|c| mod_prefix_display_name(&c.input.mod_key))
-                        .unwrap_or_else(|| "Ctrl+Alt".to_string());
-                    crate::overlay::bindings_cheatsheet::default_bindings_table(&prefix_name)
-                } else {
-                    overlay_rows(&raw)
-                };
+                let prefix = engine
+                    .read()
+                    .full_config()
+                    .map(|c| resolve_mod_prefix(&c.input.mod_key).0)
+                    .unwrap_or(crate::input::DEFAULT_MOD_KEY);
+                let rows = crate::overlay::hotkey_rows::curated_rows(&raw, prefix);
                 info!("ShowKeyBindings: toggling cheatsheet ({} rows)", rows.len());
                 cs.toggle(rows);
             } else {
@@ -1587,20 +1619,6 @@ fn spawn_shell_command(cmd: &str) {
     match crate::hooks::spawner::spawn_shell(cmd) {
         Ok(pid) => info!("SpawnCmd (cmd.exe /c): {} (pid {})", cmd, pid),
         Err(e) => warn!("SpawnCmd failed for {:?}: {}", cmd, e),
-    }
-}
-
-/// Convert a `mod-key` config string to a human-readable prefix label such as
-/// `"Ctrl+Alt"`.  Used by `ShowKeyBindings` to build the fallback default table
-/// when no live registered-bindings snapshot is available.
-fn mod_prefix_display_name(name: &str) -> String {
-    match name.trim().to_lowercase().as_str() {
-        "alt" => "Alt".to_string(),
-        "ctrl" | "control" => "Ctrl".to_string(),
-        "super" | "win" | "meta" => "Win".to_string(),
-        "win-alt" | "super-alt" | "meta-alt" => "Win+Alt".to_string(),
-        "ctrl-shift" => "Ctrl+Shift".to_string(),
-        _ => "Ctrl+Alt".to_string(),
     }
 }
 

@@ -11,6 +11,7 @@ use super::Action;
 pub const WM_INPUT_WORK: u32 = WM_USER + 305;
 pub enum Work {
     Action(Action),
+    Recent(super::recent::RecentInput),
     Task(Box<dyn FnOnce() + Send>),
 }
 static THREAD: AtomicU32 = AtomicU32::new(0);
@@ -36,6 +37,12 @@ fn enqueue(work: Work) -> bool {
         return false;
     }
     true
+}
+pub fn is_initialized() -> bool {
+    THREAD.load(Ordering::Acquire) != 0
+}
+pub fn send_recent(input: super::recent::RecentInput) -> bool {
+    enqueue(Work::Recent(input))
 }
 pub fn send(action: Action) -> bool {
     enqueue(Work::Action(action))

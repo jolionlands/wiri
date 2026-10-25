@@ -579,11 +579,18 @@ impl Monitor {
     pub fn set_focus(&mut self, window_id: WindowId) {
         self.focus_window = Some(window_id);
         self.focus_ring.push(window_id);
-        // Also update focus_column to match.
-        if let Some(workspace) = self.workspace() {
-            if let Some(col_idx) = workspace.find_window_column(window_id) {
-                self.focus_column = Some(col_idx);
+        // Focus and visibility are the same selection in a tabbed column.
+        let col_idx = self
+            .workspace()
+            .and_then(|w| w.find_window_column(window_id));
+        if let Some(col_idx) = col_idx {
+            if let Some(column) = self
+                .workspace_mut()
+                .and_then(|w| w.columns.get_mut(col_idx))
+            {
+                column.select_window(window_id);
             }
+            self.focus_column = Some(col_idx);
         }
     }
 
@@ -693,8 +700,7 @@ impl Monitor {
                 let new_focus = self
                     .workspace()
                     .and_then(|w| w.columns.get(col_idx - 1))
-                    .and_then(|c| c.tiles.first())
-                    .map(|t| t.window_id);
+                    .and_then(|c| c.active_window());
                 if let Some(wid) = new_focus {
                     self.focus_window = Some(wid);
                     self.focus_ring.push(wid);
@@ -711,7 +717,7 @@ impl Monitor {
                     workspace
                         .columns
                         .get(new_col)
-                        .and_then(|col| col.tiles.first().map(|tile| (new_col, tile.window_id)))
+                        .and_then(|col| col.active_window().map(|wid| (new_col, wid)))
                 } else {
                     None
                 }
@@ -743,12 +749,10 @@ impl Monitor {
         let target = self
             .workspace()
             .and_then(|w| w.columns.get(col))
-            .and_then(|c| c.tiles.first())
-            .map(|t| t.window_id);
+            .and_then(|c| c.active_window());
         if let Some(wid) = target {
             self.focus_column = Some(col);
-            self.focus_window = Some(wid);
-            self.focus_ring.push(wid);
+            self.set_focus(wid);
         }
     }
 
@@ -780,8 +784,7 @@ impl Monitor {
             None
         };
         if let Some(wid) = new_wid {
-            self.focus_window = Some(wid);
-            self.focus_ring.push(wid);
+            self.set_focus(wid);
         }
     }
 
@@ -813,8 +816,7 @@ impl Monitor {
             None
         };
         if let Some(wid) = new_wid {
-            self.focus_window = Some(wid);
-            self.focus_ring.push(wid);
+            self.set_focus(wid);
         }
     }
 }

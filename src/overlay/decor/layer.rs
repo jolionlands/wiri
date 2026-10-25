@@ -1,21 +1,18 @@
 //! The Win32 side of the overlay layer.
 //!
 //! One layered, click-through, never-activated tool window per decoration, stacked directly
-//! below the window it belongs to.  The windows live on a thread of their own that is started
-//! when the first decoration is needed and ends when the last one goes, so a desktop with no
-//! decoration has no overlay window and no thread.  Nothing here runs on a timer: the thread
-//! sleeps in a message wait until it is sent work, and checks the windows against their
-//! targets once, shortly after each change.
+//! below the window it belongs to. Windows are created on first use on the existing hotkey
+//! message thread: decorations add no thread or timer. WinEvent location changes keep them
+//! aligned with their targets, including applications that enforce their own minimum sizes.
 //!
 //! The engine hands over the whole set of decorations of a monitor ([`DecorSink::set_output`]);
 //! the layer compares it with what it shows and creates, moves, repaints and destroys the
 //! windows to match.  A window that only moved is moved with `SetWindowPos`; one whose look
 //! changed is painted again and handed to the compositor with `UpdateLayeredWindow`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use tracing::{debug, warn};
@@ -32,12 +29,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, IsWindow,
-    MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassExW, SetWindowPos,
-    TranslateMessage, UpdateLayeredWindow, HTTRANSPARENT, HWND_TOP, MA_NOACTIVATE, MSG,
-    MWMO_INPUTAVAILABLE, PM_NOREMOVE, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, ULW_ALPHA, WM_APP, WM_ERASEBKGND, WM_MOUSEACTIVATE,
-    WM_NCHITTEST, WM_USER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, PostThreadMessageW, RegisterClassExW,
+    SetWindowPos, UpdateLayeredWindow, HTTRANSPARENT, HWND_TOP, MA_NOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, ULW_ALPHA, WM_APP, WM_ERASEBKGND,
+    WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -51,9 +46,6 @@ pub const CLASS_NAME: &str = "WiriDecor";
 
 /// "There are commands in the queue", posted to the thread of the layer.
 const WM_WORK: u32 = WM_APP + 1;
-
-/// How long after a change the layer checks the windows against the frames of their targets.
-const VERIFY_DELAY: Duration = Duration::from_millis(80);
 
 static PAINTS: AtomicU64 = AtomicU64::new(0);
 static MOVES: AtomicU64 = AtomicU64::new(0);
@@ -73,20 +65,46 @@ enum Cmd {
     Quit,
 }
 
-struct Worker {
-    tx: Sender<Cmd>,
-    thread_id: u32,
-    handle: std::thread::JoinHandle<()>,
+static MESSAGE_THREAD: AtomicU32 = AtomicU32::new(0);
+static COMMANDS: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
+thread_local! {
+    static WINDOWS: RefCell<WorkerState> = RefCell::new(WorkerState::new());
 }
 
-impl Worker {
-    fn send(&self, cmd: Cmd) {
-        if self.tx.send(cmd).is_ok() {
+fn send(cmd: Cmd) {
+    let mut queue = COMMANDS.lock();
+    let wake = queue.is_empty();
+    queue.push(cmd);
+    if wake {
+        let id = MESSAGE_THREAD.load(Ordering::Acquire);
+        if id != 0 {
             unsafe {
-                let _ = PostThreadMessageW(self.thread_id, WM_WORK, WPARAM(0), LPARAM(0));
+                let _ = PostThreadMessageW(id, WM_WORK, WPARAM(0), LPARAM(0));
             }
         }
     }
+}
+
+/// Called by the existing hotkey pump after its message queue is ready.
+pub fn attach_message_thread() {
+    MESSAGE_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    handle_message(WM_WORK);
+}
+
+/// Process decoration changes off the engine/main thread, without another UI thread.
+pub fn handle_message(message: u32) -> bool {
+    if message != WM_WORK {
+        return false;
+    }
+    let commands = std::mem::take(&mut *COMMANDS.lock());
+    WINDOWS.with(|state| unsafe { state.borrow_mut().drain(commands) });
+    true
+}
+
+pub fn detach_message_thread() {
+    MESSAGE_THREAD.store(0, Ordering::Release);
+    COMMANDS.lock().clear();
+    WINDOWS.with(|state| unsafe { state.borrow_mut().drain(vec![Cmd::Quit]) });
 }
 
 #[derive(Default)]
@@ -97,7 +115,6 @@ struct LayerState {
     sent: Vec<DecorSpec>,
     /// The windows the sent specs are anchored to, for the hooks' cheap test.
     anchors: HashSet<isize>,
-    worker: Option<Worker>,
 }
 
 /// The overlay layer: see the module documentation.
@@ -131,28 +148,7 @@ impl DecorSink for DecorLayer {
         if merged == st.sent {
             return;
         }
-        if merged.is_empty() {
-            // Nothing left to show: the windows and the thread go.
-            if let Some(worker) = st.worker.take() {
-                worker.send(Cmd::Set(Vec::new()));
-                worker.send(Cmd::Quit);
-                // The thread ends by itself once it has destroyed its windows.
-                drop(worker.handle);
-            }
-            st.sent.clear();
-            st.anchors.clear();
-            return;
-        }
-        if st.worker.is_none() {
-            st.worker = spawn_worker();
-        }
-        match &st.worker {
-            Some(worker) => worker.send(Cmd::Set(merged.clone())),
-            None => {
-                warn!("the overlay layer could not start its thread; no decorations are drawn");
-                return;
-            }
-        }
+        send(Cmd::Set(merged.clone()));
         st.anchors = merged
             .iter()
             .map(|s| s.anchor)
@@ -164,50 +160,24 @@ impl DecorSink for DecorLayer {
     fn moved(&self, hwnd: isize) {
         let st = self.state.lock();
         if st.anchors.contains(&hwnd) {
-            if let Some(worker) = &st.worker {
-                worker.send(Cmd::Moved(hwnd));
-            }
+            send(Cmd::Moved(hwnd));
         }
     }
 
     fn restack(&self, hwnd: isize) {
         let st = self.state.lock();
         if st.anchors.contains(&hwnd) {
-            if let Some(worker) = &st.worker {
-                worker.send(Cmd::Restack(hwnd));
-            }
+            send(Cmd::Restack(hwnd));
         }
     }
 
     fn shutdown(&self) {
-        let worker = {
-            let mut st = self.state.lock();
-            st.per_output.clear();
-            st.sent.clear();
-            st.anchors.clear();
-            st.worker.take()
-        };
-        if let Some(worker) = worker {
-            worker.send(Cmd::Set(Vec::new()));
-            worker.send(Cmd::Quit);
-            let _ = worker.handle.join();
-        }
+        let mut st = self.state.lock();
+        st.per_output.clear();
+        st.sent.clear();
+        st.anchors.clear();
+        send(Cmd::Set(Vec::new()));
     }
-}
-
-fn spawn_worker() -> Option<Worker> {
-    let (tx, rx) = channel::<Cmd>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<u32>(1);
-    let handle = std::thread::Builder::new()
-        .name("wiri-decor".to_string())
-        .spawn(move || unsafe { worker_main(rx, ready_tx) })
-        .ok()?;
-    let thread_id = ready_rx.recv_timeout(Duration::from_secs(2)).ok()?;
-    Some(Worker {
-        tx,
-        thread_id,
-        handle,
-    })
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -267,7 +237,8 @@ struct Dib {
 
 impl Dib {
     unsafe fn new(w: i32, h: i32) -> Option<Dib> {
-        if w <= 0 || h <= 0 {
+        // Bound a malformed/extreme style before allocating a DIB or visiting its pixels.
+        if w <= 0 || h <= 0 || w > 16_384 || h > 16_384 || (w as u64) * (h as u64) > 16_777_216 {
             return None;
         }
         let screen = GetDC(HWND::default());
@@ -349,7 +320,7 @@ impl Overlay {
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide("").as_ptr()),
+            PCWSTR(wide(&format!("WiriDecor {:?} {}", spec.id.kind, spec.id.key)).as_ptr()),
             WS_POPUP,
             b.loc.x,
             b.loc.y,
@@ -459,25 +430,22 @@ impl Drop for Overlay {
 
 struct WorkerState {
     windows: HashMap<DecorId, Overlay>,
-    quit: bool,
-    verify_at: Option<Instant>,
 }
 
 impl WorkerState {
     fn new() -> Self {
         Self {
             windows: HashMap::new(),
-            quit: false,
-            verify_at: None,
         }
     }
 
     /// Take every command that is waiting and act on the last set and on the notices after it.
-    unsafe fn drain(&mut self, rx: &Receiver<Cmd>) {
+    unsafe fn drain(&mut self, commands: Vec<Cmd>) {
+        let mut quit = false;
         let mut latest: Option<Vec<DecorSpec>> = None;
         let mut moved: Vec<isize> = Vec::new();
         let mut restack: Vec<isize> = Vec::new();
-        while let Ok(cmd) = rx.try_recv() {
+        for cmd in commands {
             match cmd {
                 Cmd::Set(v) => {
                     latest = Some(v);
@@ -493,7 +461,7 @@ impl WorkerState {
                         restack.push(h);
                     }
                 }
-                Cmd::Quit => self.quit = true,
+                Cmd::Quit => quit = true,
             }
         }
         if let Some(set) = latest {
@@ -505,9 +473,8 @@ impl WorkerState {
         for h in restack {
             self.restack(h);
         }
-        if self.quit {
+        if quit {
             self.windows.clear();
-            self.verify_at = None;
         }
     }
 
@@ -525,16 +492,10 @@ impl WorkerState {
         for id in gone {
             self.windows.remove(&id);
         }
-        let mut any_frame = false;
         for (id, spec) in want {
-            if matches!(spec.content, DecorContent::Frame(_)) {
-                any_frame = true;
-            }
             self.apply(id, spec);
         }
-        if any_frame {
-            self.verify_at = Some(Instant::now() + VERIFY_DELAY);
-        }
+        self.verify();
     }
 
     /// Make the window of `id` show `spec`.
@@ -631,7 +592,6 @@ impl WorkerState {
     /// Once, a little after a change: frames sit where their windows are, and a decoration
     /// whose window is gone is dropped.
     unsafe fn verify(&mut self) {
-        self.verify_at = None;
         let dead: Vec<DecorId> = self
             .windows
             .iter()
@@ -672,40 +632,4 @@ unsafe fn frame_bounds(hwnd: isize) -> Option<Rect> {
         (r.right - r.left) as u32,
         (r.bottom - r.top) as u32,
     ))
-}
-
-unsafe fn worker_main(rx: Receiver<Cmd>, ready: SyncSender<u32>) {
-    // A thread has no message queue until it asks for one; the thread id is only handed out
-    // once messages can be posted to it.
-    let mut msg = MSG::default();
-    let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
-    ensure_class();
-    let _ = ready.send(GetCurrentThreadId());
-    let mut state = WorkerState::new();
-    loop {
-        let timeout = match state.verify_at {
-            Some(at) => at.saturating_duration_since(Instant::now()).as_millis() as u32,
-            None => u32::MAX, // INFINITE: nothing to do until a command comes
-        };
-        let _ = MsgWaitForMultipleObjectsEx(None, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-            if msg.message == WM_WORK {
-                state.drain(&rx);
-            } else {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        // A command can arrive between the last message and the wait: look once more.
-        state.drain(&rx);
-        if state.quit {
-            break;
-        }
-        if let Some(at) = state.verify_at {
-            if Instant::now() >= at {
-                state.verify();
-            }
-        }
-    }
-    state.windows.clear();
 }

@@ -53,9 +53,16 @@ its column, `maximize-window-to-edges`, an application that goes fullscreen or m
 niri's IPC (the event stream: the state first, then every change; `wiri-ctl action` with niri's arguments, quoting
 and `--id`).
 
-**Phase 2, niri feel (P1), still to do:** a low-level keyboard bind engine (Win-key chords, repeat); mouse and
-wheel binds; one overlay layer for focus ring, border, shadow, tab indicator and insert hint; the spring animation
-pipeline; tabs; an overview that zooms out the workspaces and a recent-windows switcher; hotkey overlay; interactive screenshot selection and pointer/action flags.
+**Phase 2B Lane A (P1), integrated, desktop sign-off pending:** unified lazy decorations, configured
+analytic spring/easing motion, active-only tabbed columns, live DWM workspace/recent previews and a
+monitor-fitting Important Hotkeys sheet. [The Phase 2B report](phase2b-report.md) separates source-run
+live evidence from integrated validation and remaining compositor approximations. Historical counts
+above are not a new Phase 2B parity total. Recent/modal input uses Lane B's existing dispatcher,
+primary keyboard engine and pointer/focus architecture, not the older keyboard relay thread.
+
+**Phase 2C Lane B ([report](phase2c-input-report.md)):** primary low-level keyboard bindings,
+mouse/wheel bindings and event-driven pointer focus are retained. Other Phase 2 work still includes
+interactive screenshot selection/pointer flags and the explicit partial rows in both matrices.
 
 **Phase 2C, Lane D ([report](phase2c-lane-d-report.md)):** focused-output and focused-window PNG
 screenshots, the clipboard, `screenshot-path` and capture events/notifications are implemented.

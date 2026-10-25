@@ -20,7 +20,11 @@ use super::kdl::{self, Node, Pos, Scalar, Value};
 use super::types::*;
 
 // The appearance blocks of `layout {}`: focus ring, border, shadow, insert hint, tab indicator.
+#[path = "decode/animations_decode.rs"]
+mod animations_decode;
 mod effects_decode;
+#[path = "decode/recent_windows_decode.rs"]
+mod recent_windows_decode;
 
 /// How many levels of `include` are followed.
 pub const MAX_INCLUDE_DEPTH: u8 = 8;
@@ -277,6 +281,7 @@ const TOP_LEVEL: &[&str] = &[
     "workspace",
     "window-rule",
     "binds",
+    "recent-windows",
     "animations",
     "spawn-at-startup",
     "spawn-sh-at-startup",
@@ -299,7 +304,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "switch-events" => Some("Windows has no lid or tablet-mode switch events"),
         "debug" => Some("these are compositor debug options"),
         "layer-rule" => Some("Windows has no layer shell"),
-        "recent-windows" => Some("not implemented yet"),
         _ => None,
     }
 }
@@ -825,6 +829,7 @@ impl Decoder {
                 "workspace" => self.decode_workspace(node, cfg),
                 "window-rule" => self.decode_window_rule(node, cfg),
                 "binds" => self.decode_binds(node, cfg),
+                "recent-windows" => self.decode_recent_windows(node, &mut cfg.recent_windows),
                 "animations" => self.decode_animations(node, cfg),
                 "spawn-at-startup" => self.decode_spawn_at_startup(node, cfg),
                 "spawn-sh-at-startup" => {
@@ -1685,6 +1690,17 @@ impl Decoder {
                 "scroll-step" => self.set_u32(child, 100_000, &mut p.scroll_step),
                 "column-width" => self.set_u32(child, 100_000, &mut p.column_width),
                 "column-width-mode" => self.set_text(child, &mut p.column_width_mode),
+                "default-column-display" => {
+                    let mut value = None;
+                    self.set_text(child, &mut value);
+                    if let Some(value) = value {
+                        if matches!(value.as_str(), "normal" | "tabbed") {
+                            p.default_column_display = Some(value);
+                        } else {
+                            self.error(child.pos, "expected column display 'normal' or 'tabbed'");
+                        }
+                    }
+                }
                 "max-visible-columns" => self.set_u32(child, 1000, &mut p.max_visible_columns),
                 "split-ratio" => self.set_f64(child, 0.0, 1.0, &mut p.split_ratio),
                 "auto-balance" => self.set_flag(child, &mut p.auto_balance),
@@ -1704,7 +1720,6 @@ impl Decoder {
                 "center-focused-column"
                 | "always-center-single-column"
                 | "empty-workspace-above-first"
-                | "default-column-display"
                 | "preset-column-widths"
                 | "default-column-width"
                 | "preset-window-heights"
@@ -1877,85 +1892,7 @@ impl Decoder {
     // ---- animations ------------------------------------------------------------------
 
     fn decode_animations(&mut self, node: &Node, cfg: &mut Config) {
-        self.section(node);
-        for child in node.kids() {
-            match norm(&child.name).as_str() {
-                "enabled" | "enable" | "on" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.enabled = v;
-                    }
-                }
-                "off" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.enabled = !v;
-                    }
-                }
-                "duration" => {
-                    if let Some(v) = self.arg_u32(child, 60000) {
-                        cfg.animations.duration = v;
-                    }
-                }
-                "easing" | "curve" => {
-                    if let Some(v) = self.arg_text(child) {
-                        cfg.animations.easing = v;
-                    }
-                }
-                "focus-transition" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.focus_transition = v;
-                    }
-                }
-                "workspace-transition" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.workspace_transition = v;
-                    }
-                }
-                "window-move" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.window_move = v;
-                    }
-                }
-                "window-resize" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.window_resize = v;
-                    }
-                }
-                "popup" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.popup = v;
-                    }
-                }
-                "shadow" => {
-                    if let Some(v) = self.flag(child) {
-                        cfg.animations.shadow = v;
-                    }
-                }
-                "slowdown"
-                | "workspace-switch"
-                | "window-open"
-                | "window-close"
-                | "horizontal-view-movement"
-                | "window-movement"
-                | "config-notification-open-close"
-                | "exit-confirmation-open-close"
-                | "screenshot-ui-open"
-                | "overview-open-close"
-                | "recent-windows-close" => self.unsupported(child, "animation curves"),
-                _ => self.unknown(
-                    child,
-                    "'animations'",
-                    &[
-                        "off",
-                        "on",
-                        "enabled",
-                        "duration",
-                        "easing",
-                        "slowdown",
-                        "window-open",
-                    ],
-                ),
-            }
-        }
+        self.decode_animation_options(node, &mut cfg.animations);
     }
 
     // ---- workspaces ------------------------------------------------------------------
@@ -2756,7 +2693,7 @@ mod tests {
     #[test]
     fn bad_values_are_errors_at_the_value() {
         let d = load(
-            "layout {\n    inner-gaps \"eight\"\n    border-color \"red\"\n    scroll-step -5\n}\n",
+            "layout {\n    inner-gaps \"eight\"\n    border-color \"not-a-color\"\n    scroll-step -5\n}\n",
         );
         let errs = errors(&d);
         assert_eq!(errs.len(), 3, "{:?}", errs);
@@ -2868,7 +2805,8 @@ mod tests {
     fn the_unsupported_layout_options_are_warnings() {
         let d = load("layout {\n    center-focused-column \"never\"\n    preset-column-widths { proportion 0.5; }\n    tab-indicator { off }\n}\n");
         assert!(errors(&d).is_empty());
-        assert_eq!(warnings(&d).len(), 3);
+        assert_eq!(warnings(&d).len(), 2);
+        assert!(d.config.layout.effects.tab_indicator.off);
     }
 
     #[test]
@@ -2981,7 +2919,8 @@ mod tests {
         assert!(!cfg.animations.enabled);
         let d = load("animations {\n    slowdown 3.0\n    workspace-switch { spring damping-ratio=1.0 stiffness=1000 epsilon=0.0001 }\n}\n");
         assert!(errors(&d).is_empty());
-        assert_eq!(warnings(&d).len(), 2);
+        assert!(warnings(&d).is_empty(), "spring and slowdown now act");
+        assert_eq!(d.config.animations.slowdown, 3.0);
     }
 
     #[test]
@@ -3457,7 +3396,7 @@ mod tests {
         assert_eq!(normalize_color("#AbCdEf").as_deref(), Some("#abcdef"));
         assert_eq!(normalize_color("accent").as_deref(), Some("accent"));
         assert_eq!(normalize_color("").as_deref(), Some(""));
-        assert_eq!(normalize_color("red"), None);
+        assert_eq!(normalize_color("red").as_deref(), Some("#ff0000"));
         assert_eq!(normalize_color("#12345"), None);
         assert_eq!(normalize_color("#ggg"), None);
     }

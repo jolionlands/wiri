@@ -157,6 +157,109 @@ pub(super) fn window_radius(requested: Option<u32>, rounded_corners: bool) -> f3
     }
 }
 
+/// The indicator uses the active tab's area and belongs to that column, not to a screen-wide
+/// HUD. Non-selected tabs are fainter; urgency overrides both active and inactive colours.
+fn tab_specs(
+    cfg: &LayoutConfig,
+    workspace: &crate::layout::Workspace,
+    positions: &HashMap<WindowId, Rect>,
+    modes: &HashMap<WindowId, DrawMode>,
+    urgent: &HashSet<WindowId>,
+    focused_output: bool,
+    view: Rect,
+    accent: Option<[u8; 4]>,
+) -> Vec<DecorSpec> {
+    use crate::layout::workspace::ColumnDisplay;
+    use crate::overlay::decor::TabsSpec;
+    let style = &cfg.effects.tab_indicator;
+    if style.off {
+        return Vec::new();
+    }
+    workspace
+        .columns
+        .iter()
+        .filter_map(|col| {
+            let ColumnDisplay::Tabbed { active_tab } = col.display else {
+                return None;
+            };
+            if col.tiles.is_empty() || (style.hide_when_single_tab && col.tiles.len() == 1) {
+                return None;
+            }
+            let active = col.tiles.get(active_tab)?.window_id;
+            if modes.get(&active).map_or(false, |m| *m != DrawMode::Inset) {
+                return None;
+            }
+            let area = *positions.get(&active)?;
+            if !area.intersects(view) {
+                return None;
+            }
+            let fallback = if !cfg.effects.border.off {
+                &cfg.effects.border
+            } else {
+                &cfg.effects.focus_ring
+            };
+            let paints = col
+                .tiles
+                .iter()
+                .enumerate()
+                .map(|(i, tile)| {
+                    let is_urgent = urgent.contains(&tile.window_id);
+                    let paint = if is_urgent {
+                        style.urgent.as_ref()
+                    } else if focused_output {
+                        style.active.as_ref()
+                    } else {
+                        style.inactive.as_ref()
+                    };
+                    let paint = paint
+                        .and_then(|s| paint_of(s, accent))
+                        .or_else(|| paint_for(fallback, is_urgent, focused_output, accent))
+                        .unwrap_or(Paint::Solid(Rgba::new(128, 200, 255, 255)));
+                    if i == active_tab {
+                        paint
+                    } else {
+                        paint.faded(0.5)
+                    }
+                })
+                .collect();
+            Some(DecorSpec::tabs(
+                col.tiles[0].window_id.as_isize(),
+                active.as_isize(),
+                TabsSpec {
+                    area,
+                    position: style.position,
+                    width: style.width.round() as i32,
+                    gap: style.gap.round() as i32,
+                    gaps_between: style.gaps_between_tabs.round() as i32,
+                    length: style.length as f32,
+                    corner_radius: style.corner_radius as f32,
+                    tabs: paints,
+                    view,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Visible column geometry shared by drop hit-testing and the insert hint. Hidden tabs can
+/// retain stale bounds from a previous layout; they must not influence either destination.
+pub(super) fn column_drop_bounds(column: &crate::layout::Column) -> Option<Rect> {
+    let mut rects = column
+        .visible_tile_indices()
+        .into_iter()
+        .map(|i| column.tiles[i].cached_bounds)
+        .filter(|r| r.size.w > 0 && r.size.h > 0);
+    let first = rects.next()?;
+    let (mut l, mut t, mut r, mut b) = (first.loc.x, first.loc.y, first.right(), first.bottom());
+    for rect in rects {
+        l = l.min(rect.loc.x);
+        t = t.min(rect.loc.y);
+        r = r.max(rect.right());
+        b = b.max(rect.bottom());
+    }
+    Some(Rect::new(l, t, (r - l) as u32, (b - t) as u32))
+}
+
 impl TilingEngine {
     /// Install the overlay layer: from now on the decorations of every monitor are described
     /// to `sink` after each layout pass.
@@ -224,7 +327,51 @@ impl TilingEngine {
             ),
             lone_tile,
         };
-        sink.set_output(key, frame_specs(&inputs, &tiles));
+        let mut specs = frame_specs(&inputs, &tiles);
+        if let Some(ws) = monitor.workspace() {
+            specs.extend(tab_specs(
+                cfg,
+                ws,
+                positions,
+                draw_modes,
+                &self.urgent_windows,
+                inputs.focus_monitor,
+                view,
+                inputs.accent,
+            ));
+        }
+        sink.set_output(key, specs);
+    }
+
+    /// Show the drop destination while a column is being dragged. The same column hit-test
+    /// drives both the hint and the eventual swap, so the preview never promises another slot.
+    pub fn update_insert_hint(&self, cursor_x: Option<i32>) {
+        use crate::overlay::decor::{HintSpec, TRANSIENT_OUTPUT};
+        let Some(sink) = &self.decor else { return };
+        let spec = (|| {
+            let x = cursor_x?;
+            let output = self.monitors.focused_id()?;
+            let monitor = self.monitors.get(&output)?;
+            let col = self.column_at_x(x)?;
+            let column = monitor.workspace()?.columns.get(col)?;
+            let cfg = self.effective_config(output);
+            if cfg.effects.insert_hint.off {
+                return None;
+            }
+            Some(DecorSpec::hint(HintSpec {
+                rect: column_drop_bounds(column)?,
+                radius: window_radius(
+                    cfg.effects.corner_radius,
+                    crate::backend::osversion::supports_rounded_corners(),
+                ),
+                paint: paint_of(
+                    &cfg.effects.insert_hint.paint,
+                    crate::backend::accent::current_windows_accent_rgba(),
+                )?,
+                view: monitor.work_area,
+            }))
+        })();
+        sink.set_output(TRANSIENT_OUTPUT, spec.into_iter().collect());
     }
 
     /// Remove every decoration (a quit, or the overlay layer being turned off).
@@ -471,6 +618,31 @@ mod tests {
         assert_eq!(a, b);
         let keys: Vec<isize> = a.iter().map(|s| s.id.key).collect();
         assert_eq!(keys, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn column_drop_geometry_ignores_hidden_tabs_and_unlaid_out_tiles() {
+        use crate::layout::workspace::ColumnDisplay;
+        use crate::layout::{Column, Tile};
+        let mut column = Column::new();
+        for id in 1..=3 {
+            column.add_tile(Tile::new(wid(id)));
+        }
+        column.tiles[0].cached_bounds = Rect::new(-500, 700, 200, 400);
+        column.tiles[1].cached_bounds = Rect::new(420, 8, 350, 712);
+        column.display = ColumnDisplay::Tabbed { active_tab: 1 };
+        assert_eq!(
+            column_drop_bounds(&column),
+            Some(Rect::new(420, 8, 350, 712))
+        );
+        column.display = ColumnDisplay::Stacked;
+        column.tiles[0].cached_bounds = Rect::new(420, 8, 350, 300);
+        column.tiles[1].cached_bounds = Rect::new(420, 316, 350, 404);
+        assert_eq!(
+            column_drop_bounds(&column),
+            Some(Rect::new(420, 8, 350, 712))
+        );
+        assert_eq!(column_drop_bounds(&Column::new()), None);
     }
 
     #[test]

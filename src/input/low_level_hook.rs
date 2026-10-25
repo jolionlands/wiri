@@ -111,6 +111,8 @@ static HOOK_HANDLE: LazyLock<Mutex<Option<HookThread>>> = LazyLock::new(|| Mutex
 
 /// Handle for the installed `WH_KEYBOARD_LL` hook.
 static KB_HOOK_HANDLE: LazyLock<Mutex<Option<HookThread>>> = LazyLock::new(|| Mutex::new(None));
+static DOUBLE_ALT: Mutex<super::double_alt::DoubleAlt> =
+    Mutex::new(super::double_alt::DoubleAlt::new());
 
 fn run_hook_message_loop(name: &str) {
     let mut msg = MSG::default();
@@ -287,7 +289,7 @@ unsafe extern "system" fn keyboard_hook_callback(
         return CallNextHookEx(None, n_code, w_param, l_param);
     }
     let kb = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
-    if kb.dwExtraInfo == MENU_MASK_TAG {
+    if kb.dwExtraInfo == MENU_MASK_TAG || kb.dwExtraInfo == crate::backend::ACTIVATION_INPUT_TAG {
         return CallNextHookEx(None, n_code, w_param, l_param);
     }
     let msg = w_param.0 as u32;
@@ -303,9 +305,45 @@ unsafe extern "system" fn keyboard_hook_callback(
         let old = KEY_IS_DOWN[slot].swap(pressed, Ordering::Relaxed);
         KEY_PRESS_WAS_REPEAT[slot].store(pressed && old, Ordering::Relaxed);
     }
-    let decision = crate::input::keyboard::ENGINE
+    let now = Instant::now();
+    if crate::overlay::bindings_cheatsheet::dismiss_on_key(vk, pressed) {
+        crate::input::recent::consumed_key_event(vk, pressed, !pressed);
+        let mut keyboard = crate::input::keyboard::ENGINE.lock();
+        keyboard.modal_event(vk, pressed);
+        DOUBLE_ALT
+            .lock()
+            .event(vk, pressed, keyboard.modifiers(), now, false);
+        return LRESULT(1);
+    }
+    let recent_was_active = crate::input::recent::is_active();
+    let recent_consumed = crate::input::recent::key_event(
+        vk,
+        pressed,
+        !pressed,
+        windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize,
+    );
+    if recent_was_active || crate::input::recent::is_active() || recent_consumed {
+        let mut keyboard = crate::input::keyboard::ENGINE.lock();
+        let captured = keyboard.modal_event(vk, pressed);
+        DOUBLE_ALT
+            .lock()
+            .event(vk, pressed, keyboard.modifiers(), now, false);
+        return if recent_consumed || captured {
+            LRESULT(1)
+        } else {
+            CallNextHookEx(None, n_code, w_param, l_param)
+        };
+    }
+    let mut decision = crate::input::keyboard::ENGINE
         .lock()
-        .event(vk, pressed, Instant::now());
+        .event(vk, pressed, now);
+    let mods = crate::input::keyboard::ENGINE.lock().modifiers();
+    let double_alt = DOUBLE_ALT
+        .lock()
+        .event(vk, pressed, mods, now, !decision.consume);
+    if double_alt.consume {
+        decision = double_alt;
+    }
     if decision.mask_menu {
         mask_shell_menu();
     }
@@ -351,6 +389,11 @@ pub fn cancel_grab() {
     if !matches!(state.grab, GrabState::None) {
         info!("Cancelling active grab");
         state.grab = GrabState::None;
+        if let Some(engine) = state.engine.clone() {
+            crate::input::dispatch::send_work(Box::new(move || {
+                engine.read().update_insert_hint(None)
+            }));
+        }
     }
 }
 
@@ -401,6 +444,28 @@ unsafe extern "system" fn mouse_hook_callback(
     }
     let msg = w_param.0 as u32;
     let event = &*(l_param.0 as *const MSLLHOOKSTRUCT);
+    if msg != WM_MOUSEMOVE {
+        if let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet()
+            .filter(|cs| cs.is_visible())
+        {
+            if msg == WM_MOUSEWHEEL {
+                cs.scroll((event.mouseData >> 16) as i16 > 0);
+                return LRESULT(1);
+            }
+            let button = match msg {
+                0x201 => Some(0),
+                0x204 => Some(1),
+                0x207 => Some(2),
+                0x20B => Some(if event.mouseData >> 16 == 1 { 3 } else { 4 }),
+                _ => None,
+            };
+            if let Some(button) = button {
+                cs.dismiss();
+                crate::input::pointer::ENGINE.lock().capture_gesture(button);
+                return LRESULT(1);
+            }
+        }
+    }
     let cursor = Point::new(event.pt.x, event.pt.y);
     if msg == WM_MOUSEMOVE {
         crate::input::focus::on_mouse_move(cursor);
@@ -531,7 +596,14 @@ unsafe extern "system" fn mouse_hook_callback(
                             return CallNextHookEx(None, n_code, w_param, l_param);
                         };
                         drop(eng);
+                        let hint = matches!(&next, GrabState::ColumnReorder(_));
                         HOOK_STATE.lock().grab = next;
+                        if hint {
+                            let engine = engine.clone();
+                            crate::input::dispatch::send_work(Box::new(move || {
+                                engine.read().update_insert_hint(Some(cursor.x))
+                            }));
+                        }
                         crate::input::pointer::ENGINE
                             .lock()
                             .capture_gesture(if msg == WM_LBUTTONDOWN { 0 } else { 1 });
@@ -548,6 +620,9 @@ unsafe extern "system" fn mouse_hook_callback(
 }
 
 fn preview_rect(wid: WindowId, rect: Rect, backend: &BackendHandle) {
+    if let Some(sink) = crate::overlay::decor::global() {
+        sink.moved(wid.as_isize());
+    }
     let _ = backend.set_window_position(
         wid.as_isize(),
         rect,
@@ -684,8 +759,11 @@ fn process_grab(
             }
         }
         GrabState::ColumnReorder(g) => {
-            if msg == WM_LBUTTONUP {
+            if msg == WM_MOUSEMOVE {
+                engine.read().update_insert_hint(Some(cursor.x));
+            } else if msg == WM_LBUTTONUP {
                 let mut eng = engine.write();
+                eng.update_insert_hint(None);
                 if let Some(dst) = eng.column_at_x(cursor.x) {
                     eng.swap_columns(g.source_col, dst, backend);
                 }

@@ -1,7 +1,9 @@
 //! Recent-windows integration. Preview navigation never changes focus or MRU.
 use super::{BackendHandle, TilingEngine};
 use crate::config::recent_windows_config::RecentWindowsConfig;
-use crate::overlay::recent_windows::{RecentDebouncer, RecentHistory, RecentOutcome, RecentPreviewSink, RecentSession, RecentWindow};
+use crate::overlay::recent_windows::{
+    RecentDebouncer, RecentHistory, RecentOutcome, RecentPreviewSink, RecentSession, RecentWindow,
+};
 use crate::utils::WindowId;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
@@ -18,14 +20,21 @@ pub(super) struct RecentState {
 }
 
 impl TilingEngine {
-    pub fn install_recent_windows(&mut self, sink: Arc<dyn RecentPreviewSink>, engine: Weak<parking_lot::RwLock<Self>>) {
+    pub fn install_recent_windows(
+        &mut self,
+        sink: Arc<dyn RecentPreviewSink>,
+        engine: Weak<parking_lot::RwLock<Self>>,
+    ) {
         self.recent_reset();
         self.recent.sink = Some(sink);
         self.recent.engine = engine;
     }
 
     fn recent_config(&self) -> RecentWindowsConfig {
-        self.full_config.as_ref().map(|c| c.recent_windows.clone()).unwrap_or_default()
+        self.full_config
+            .as_ref()
+            .map(|c| c.recent_windows.clone())
+            .unwrap_or_default()
     }
 
     /// Reload/disable/quit cancels the session and its one-shot deadline. No joins.
@@ -34,26 +43,48 @@ impl TilingEngine {
         self.recent.history.cancel_pending();
         self.recent.session = None;
         self.recent.observed = None;
-        if let Some(sink) = &self.recent.sink { sink.hide(); }
+        if let Some(sink) = &self.recent.sink {
+            sink.hide();
+        }
         crate::input::recent::set_active(false);
     }
 
     fn recent_windows(&mut self, backend: &BackendHandle) -> Vec<RecentWindow> {
         let mut windows = Vec::new();
         for (&id, info) in &self.tiled_windows {
-            if self.minimized.contains_key(&id) { continue; }
-            let location = self.locate_window(id).map(|(o, w, _)| (o, w))
+            if self.minimized.contains_key(&id) {
+                continue;
+            }
+            let location = self
+                .locate_window(id)
+                .map(|(o, w, _)| (o, w))
                 .or_else(|| self.float_location(id));
-            let Some((output, workspace)) = location else { continue; };
+            let Some((output, workspace)) = location else {
+                continue;
+            };
             // Cached process identity, never a title or a class-name heuristic.
-            let app_id = self.recent.identities.entry(id).or_insert_with(|| {
-                self.rule_state.get(&id).and_then(|s| s.aumid.clone().or_else(|| s.process_name.clone()))
-                    .or_else(|| backend.process_name_for_pid(info.process_id))
-                    .unwrap_or_else(|| format!("pid:{}", info.process_id)).to_ascii_lowercase()
-            }).clone();
-            windows.push(RecentWindow { id, output, workspace, app_id,
-                width: info.bounds.size.w.max(1), height: info.bounds.size.h.max(1),
-                urgent: self.urgent_windows.contains(&id) });
+            let app_id = self
+                .recent
+                .identities
+                .entry(id)
+                .or_insert_with(|| {
+                    self.rule_state
+                        .get(&id)
+                        .and_then(|s| s.aumid.clone().or_else(|| s.process_name.clone()))
+                        .or_else(|| backend.process_name_for_pid(info.process_id))
+                        .unwrap_or_else(|| format!("pid:{}", info.process_id))
+                        .to_ascii_lowercase()
+                })
+                .clone();
+            windows.push(RecentWindow {
+                id,
+                output,
+                workspace,
+                app_id,
+                width: info.bounds.size.w.max(1),
+                height: info.bounds.size.h.max(1),
+                urgent: self.urgent_windows.contains(&id),
+            });
         }
         // HashMap order must not decide which new, as-yet-unfocused window cycles next.
         windows.sort_by_key(|w| w.id.as_isize());
@@ -62,12 +93,21 @@ impl TilingEngine {
 
     pub(super) fn recent_foreground_changed(&mut self, id: WindowId, backend: &BackendHandle) {
         let config = self.recent_config();
-        if !config.enabled { return; }
+        if !config.enabled {
+            return;
+        }
         // An external focus change ends the camera without stealing focus back.
-        if self.recent.session.as_ref().is_some_and(|s| s.origin() != id) {
+        if self
+            .recent
+            .session
+            .as_ref()
+            .is_some_and(|s| s.origin() != id)
+        {
             self.recent_reset();
         }
-        if self.recent.session.is_some() || self.recent.observed == Some(id) { return; }
+        if self.recent.session.is_some() || self.recent.observed == Some(id) {
+            return;
+        }
         self.recent.observed = Some(id);
         let windows = self.recent_windows(backend);
         self.recent.history.sync(&windows);
@@ -82,7 +122,9 @@ impl TilingEngine {
             self.recent.debounce.schedule(deadline, move |generation| {
                 if let Some(engine) = weak.upgrade() {
                     let mut engine = engine.write();
-                    if engine.recent.session.is_none() { engine.recent.history.expire(generation); }
+                    if engine.recent.session.is_none() {
+                        engine.recent.history.expire(generation);
+                    }
                 }
             });
         } else if config.debounce_ms == 0 {
@@ -92,19 +134,30 @@ impl TilingEngine {
 
     /// Dispatch on the existing keyboard-action drainer, never inside WH_KEYBOARD_LL.
     /// Returns true only for the existing screenshot UI action.
-    pub fn recent_input(&mut self, input: crate::input::recent::RecentInput, backend: &BackendHandle) -> bool {
+    pub fn recent_input(
+        &mut self,
+        input: crate::input::recent::RecentInput,
+        backend: &BackendHandle,
+    ) -> bool {
         use crate::input::recent::RecentInput;
-        if !self.recent_config().enabled { self.recent_reset(); return false; }
+        if !self.recent_config().enabled {
+            self.recent_reset();
+            return false;
+        }
         match input {
             RecentInput::ApplicationKey(id) => {
                 if self.recent.session.is_none() {
-                    if let Some(id) = self.managed_window_for(id.as_isize(), super::root_owner_of(id.as_isize())) {
+                    if let Some(id) =
+                        self.managed_window_for(id.as_isize(), super::root_owner_of(id.as_isize()))
+                    {
                         // Input and WinEvents use different queues. An older key
                         // for A must not cancel B's newer focus deadline when it
                         // is finally drained; normalize owned dialogs as well.
                         let current = super::query_foreground()
                             .and_then(|fg| self.managed_window_for(fg.hwnd, fg.root_owner));
-                        if current != Some(id) { return false; }
+                        if current != Some(id) {
+                            return false;
+                        }
                         let windows = self.recent_windows(backend);
                         self.recent.history.sync(&windows);
                         self.recent.history.keyboard_input(id);
@@ -114,13 +167,16 @@ impl TilingEngine {
                 }
             }
             RecentInput::Cycle(action, foreground) => {
-                if let Some(session) = &mut self.recent.session { session.cycle(action); }
-                else {
+                if let Some(session) = &mut self.recent.session {
+                    session.cycle(action);
+                } else {
                     self.recent.debounce.cancel();
                     let windows = self.recent_windows(backend);
                     // The hook captures actual foreground with the triggering event.
-                    let focused = self.managed_window_for(foreground, super::root_owner_of(foreground));
-                    self.recent.session = focused.and_then(|id| self.recent.history.begin(&windows, id, action));
+                    let focused =
+                        self.managed_window_for(foreground, super::root_owner_of(foreground));
+                    self.recent.session =
+                        focused.and_then(|id| self.recent.history.begin(&windows, id, action));
                 }
                 // Acknowledge repeats too: a reset can race a queued trigger and
                 // otherwise lose the last modifier-up while ACTIVE is false.
@@ -129,24 +185,41 @@ impl TilingEngine {
             }
             RecentInput::Command(command) => {
                 let outcome = self.recent.session.as_mut().map(|s| s.command(command));
-                if let Some(outcome) = outcome { return self.recent_outcome(outcome, backend); }
+                if let Some(outcome) = outcome {
+                    return self.recent_outcome(outcome, backend);
+                }
             }
             RecentInput::Modifiers(held) => {
-                let outcome = self.recent.session.as_ref().map(|s| s.modifiers_changed(held));
-                if let Some(outcome) = outcome { return self.recent_outcome(outcome, backend); }
+                let outcome = self
+                    .recent
+                    .session
+                    .as_ref()
+                    .map(|s| s.modifiers_changed(held));
+                if let Some(outcome) = outcome {
+                    return self.recent_outcome(outcome, backend);
+                }
             }
         }
         false
     }
 
     fn recent_render(&self) {
-        let (Some(session), Some(sink)) = (&self.recent.session, &self.recent.sink) else { return; };
-        let output = self.locate_window(session.origin()).map(|(o, _, _)| o)
+        let (Some(session), Some(sink)) = (&self.recent.session, &self.recent.sink) else {
+            return;
+        };
+        let output = self
+            .locate_window(session.origin())
+            .map(|(o, _, _)| o)
             .or_else(|| self.float_location(session.origin()).map(|(o, _)| o))
             .or_else(|| self.monitors.focused_id());
-        let Some(monitor) = output.and_then(|o| self.monitors.get(&o)) else { return; };
+        let Some(monitor) = output.and_then(|o| self.monitors.get(&o)) else {
+            return;
+        };
         let config = self.recent_config();
-        sink.show(session.frame(monitor.bounds, &config, monitor.scale_factor), config.open_delay_ms);
+        sink.show(
+            session.frame(monitor.bounds, &config, monitor.scale_factor),
+            config.open_delay_ms,
+        );
     }
 
     fn recent_outcome(&mut self, outcome: RecentOutcome, backend: &BackendHandle) -> bool {
@@ -164,7 +237,9 @@ impl TilingEngine {
                     if !floating {
                         if let Some((output, workspace, _)) = self.locate_window(id) {
                             self.monitors.set_focused(output);
-                            let needs_switch = self.monitors.get(&output)
+                            let needs_switch = self
+                                .monitors
+                                .get(&output)
                                 .is_some_and(|m| m.active_workspace != workspace);
                             if needs_switch {
                                 // Use the engine path: it hides the old workspace,
@@ -211,7 +286,9 @@ impl TilingEngine {
 
     pub(super) fn recent_window_removed(&mut self, id: WindowId, backend: &BackendHandle) {
         self.recent.identities.remove(&id);
-        if self.recent.observed == Some(id) { self.recent.observed = None; }
+        if self.recent.observed == Some(id) {
+            self.recent.observed = None;
+        }
         let windows = self.recent_windows(backend);
         self.recent.history.sync(&windows);
         let alive: HashSet<_> = windows.iter().map(|w| w.id).collect();

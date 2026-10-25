@@ -5,8 +5,8 @@
 //! * [`paint`]: a small software rasterizer (rounded shapes, rings, gaussian shadows, linear
 //!   gradients) into a premultiplied BGRA surface.  Pure, tested pixel by pixel.
 //! * [`spec`]: what to draw, as plain data, and how to paint it.  Pure.
-//! * `layer`: the windows.  Created when the first decoration is needed, on a thread of their
-//!   own that ends with the last one; nothing runs at rest.
+//! * `layer`: the windows. Created on first use on the existing hotkey message thread;
+//!   no decoration thread or timer, and no work when nothing changes.
 //!
 //! The engine describes the decorations of a monitor after every layout pass
 //! (`layout/engine/decor.rs`) and hands them to a [`DecorSink`]: the real layer in the
@@ -40,7 +40,7 @@ pub trait DecorSink: Send + Sync {
     /// The window `hwnd` came to the front: its decorations go directly below it again.
     fn restack(&self, hwnd: isize);
 
-    /// Remove every decoration and stop the thread.
+    /// Remove every decoration and release its bitmap/window resources.
     fn shutdown(&self);
 }
 

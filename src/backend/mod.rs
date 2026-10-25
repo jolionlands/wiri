@@ -39,6 +39,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
 };
 
+/// Identifies wiri's activation nudge so it cannot count as application input.
+pub(crate) const ACTIVATION_INPUT_TAG: usize = 0x5749_5249;
+
 /// Inject a harmless key press (F24, which no keyboard has and nothing binds).
 ///
 /// Windows grants the right to call `SetForegroundWindow` to the process that
@@ -52,8 +55,8 @@ fn nudge_foreground_lock() {
     };
     const VK_F24: u8 = 0x87;
     unsafe {
-        keybd_event(VK_F24, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_F24, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_F24, 0, KEYBD_EVENT_FLAGS(0), ACTIVATION_INPUT_TAG);
+        keybd_event(VK_F24, 0, KEYEVENTF_KEYUP, ACTIVATION_INPUT_TAG);
     }
 }
 

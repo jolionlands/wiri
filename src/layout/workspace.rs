@@ -194,10 +194,33 @@ impl Column {
     }
 
     pub fn remove_tile(&mut self, window_id: WindowId) -> Option<Tile> {
-        self.tiles
-            .iter()
-            .position(|t| t.window_id == window_id)
-            .map(|i| self.tiles.remove(i))
+        let index = self.index_of(window_id)?;
+        let tile = self.tiles.remove(index);
+        if let ColumnDisplay::Tabbed { active_tab } = &mut self.display {
+            if index < *active_tab {
+                *active_tab -= 1;
+            }
+        }
+        self.clamp_active_tab();
+        Some(tile)
+    }
+
+    /// Show `window_id` if this is a tabbed column. All focus paths use this, including
+    /// shell activation and consume/expel, so the focused HWND can never be a hidden tab.
+    pub fn select_window(&mut self, window_id: WindowId) {
+        if let Some(index) = self.index_of(window_id) {
+            if let ColumnDisplay::Tabbed { active_tab } = &mut self.display {
+                *active_tab = index;
+            }
+        }
+    }
+
+    pub fn active_window(&self) -> Option<WindowId> {
+        let index = match self.display {
+            ColumnDisplay::Stacked => 0,
+            ColumnDisplay::Tabbed { active_tab } => active_tab,
+        };
+        self.tiles.get(index).map(|t| t.window_id)
     }
 
     pub fn tile_count(&self) -> usize {

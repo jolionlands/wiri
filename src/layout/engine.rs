@@ -22,6 +22,10 @@ use sizing::DrawMode;
 mod ipcview;
 // What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
 mod decor;
+mod motion;
+mod overview;
+mod recent;
+mod tabs;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
@@ -318,6 +322,7 @@ impl Default for BorderColorMode {
 pub struct LayoutConfig {
     pub column_width: u32,
     pub column_width_mode: ColumnWidthMode,
+    pub default_tabbed: bool,
     /// Proportional mode only: never split the view among more than this many
     /// columns.  With 3, one window fills the screen, two share it, three get a
     /// third each, and a fourth window scrolls in instead of squeezing every
@@ -390,6 +395,7 @@ impl Default for LayoutConfig {
         Self {
             column_width: 500,
             column_width_mode: ColumnWidthMode::Fixed,
+            default_tabbed: false,
             max_visible_columns: 0,
             column_gap: 16,
             window_gap: 12,
@@ -474,6 +480,7 @@ impl LayoutConfig {
         lc.scroll_step = config.layout.scroll_step as i32;
         lc.column_width = config.layout.column_width;
         lc.max_visible_columns = config.layout.max_visible_columns;
+        lc.default_tabbed = config.layout.default_column_display == "tabbed";
         lc.column_width_mode = match config.layout.column_width_mode.as_str() {
             "fixed" => ColumnWidthMode::Fixed,
             _ => ColumnWidthMode::Proportional,
@@ -615,6 +622,7 @@ pub struct TilingEngine {
     /// When each fullscreen window went fullscreen.
     fullscreen_since: HashMap<WindowId, std::time::Instant>,
     full_config: Option<crate::config::Config>,
+    recent: recent::RecentState,
     animation: crate::layout::AnimationManager,
     /// Overview mode: None = normal, Some(state) = zoomed out (all workspaces stacked).
     /// See `OverviewState` for the per-workspace Y-offset layout.
@@ -705,7 +713,10 @@ pub struct TilingEngine {
     /// Per-window in-flight position animations: (start_rect, target_rect, start_time, duration).
     /// Populated by `apply_layout_for_monitor` when a tile's target rect differs from its
     /// last applied state and animations are enabled. Drained by `tick_animations`.
-    animating_rects: HashMap<WindowId, (Rect, Rect, std::time::Instant, std::time::Duration)>,
+    animating_rects: HashMap<WindowId, crate::layout::animation::RectAnimation>,
+    motion: crate::config::AnimationsConfig,
+    animation_wake: Option<Arc<tokio::sync::Notify>>,
+    frame_in_progress: bool,
     // ---- Item 3: sticky windows (visible on all workspaces) ----
     /// Windows marked sticky by the user; they float above all workspaces and
     /// are never hidden during workspace switches.
@@ -748,6 +759,7 @@ impl TilingEngine {
             unzoom_pending: HashMap::new(),
             fullscreen_since: HashMap::new(),
             full_config: None,
+            recent: recent::RecentState::default(),
             animation: crate::layout::AnimationManager::disabled(),
             overview: None,
             failed_position: HashMap::new(),
@@ -772,6 +784,9 @@ impl TilingEngine {
             thumbnail_overview: None,
             resize_mode: false,
             animating_rects: HashMap::new(),
+            motion: Default::default(),
+            animation_wake: None,
+            frame_in_progress: false,
             sticky_windows: HashSet::new(),
             workspace_names: HashMap::new(),
             #[cfg(test)]
@@ -1720,6 +1735,23 @@ impl TilingEngine {
             }
         }
 
+        // A new column inherits the configured display; existing multi-window columns keep
+        // theirs. Selecting the new window also makes consume/add into tabbed columns visible.
+        if let Some((oid, wsid, colidx)) = self.locate_window(window_id) {
+            let default_tabbed = self.effective_config(oid).default_tabbed;
+            if let Some(column) = self
+                .monitors
+                .get_mut(&oid)
+                .and_then(|m| m.workspaces.get_mut(&wsid))
+                .and_then(|ws| ws.columns.get_mut(colidx))
+            {
+                if default_tabbed && column.tiles.len() == 1 {
+                    column.switch_to_tabbed();
+                }
+                column.select_window(window_id);
+            }
+        }
+
         // A window that opens maximized or as big as its monitor (it was like that when wiri
         // started, or its application restores that state) is followed like one that does it
         // later.
@@ -1791,6 +1823,7 @@ impl TilingEngine {
                 self.apply_layout_for_monitor(output_id, backend);
             }
         }
+        self.recent_window_removed(window_id, backend);
     }
 
     /// The widest minimum a window may claim: anything above is not a minimum width but
@@ -2131,6 +2164,12 @@ impl TilingEngine {
     /// visible is left where it is (no scroll), and the offset stays inside the
     /// valid range.
     fn reveal_focused_column(&mut self, focused_output: OutputId) {
+        let from = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.workspace())
+            .map(|w| w.scroll_offset.x)
+            .unwrap_or(0);
         let focus_col = self
             .monitors
             .get(&focused_output)
@@ -2156,6 +2195,13 @@ impl TilingEngine {
                 }
             }
         }
+        let target = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.workspace())
+            .map(|w| w.scroll_offset.x)
+            .unwrap_or(from);
+        self.queue_view(focused_output, from, target);
     }
 
     fn hide_inactive_workspace_windows_for_monitor(
@@ -2421,6 +2467,7 @@ impl TilingEngine {
 
         let overview_active = self.is_overview();
         if !overview_active {
+            self.hide_inactive_tabs_for_monitor(output_id, backend);
             self.hide_inactive_workspace_windows_for_monitor(output_id, backend);
             self.reconcile_floats(output_id, backend);
         }
@@ -2527,7 +2574,11 @@ impl TilingEngine {
         // its precomputed vertical section, and union the per-workspace
         // position lists.  Outside overview we keep the original behaviour
         // (active workspace only, no Y offset).
-        let positions: Vec<(WindowId, Rect)> = if overview_active {
+        let positions: Vec<(WindowId, Rect)> = if overview_active
+            && self.thumbnail_overview.is_some()
+        {
+            self.workspace_overview_scene(output_id, work_rect, &eff_cfg)
+        } else if overview_active {
             let monitor = self.monitors.get(&output_id).unwrap();
             let mut out: Vec<(WindowId, Rect)> = Vec::new();
             // Sort by workspace id so the on-screen stack matches the
@@ -2923,42 +2974,23 @@ impl TilingEngine {
                     continue;
                 }
 
-                // Item 1: when animations are enabled and the window already has
-                // a known position (i.e. this is not a first-ever placement),
-                // record the (start, target) pair in `animating_rects` and skip
-                // the immediate SetWindowPos so `tick_animations` can drive it.
-                let animate_transition =
-                    self.animation.is_enabled() && prior.rect != Rect::new(0, 0, 0, 0);
-                if animate_transition && !self.animating_rects.contains_key(&window_id) {
-                    // Only insert if no animation is already in flight for this window.
-                    self.animating_rects.insert(
-                        window_id,
-                        (
-                            prior.rect,
-                            inset_rect,
-                            std::time::Instant::now(),
-                            std::time::Duration::from_millis(
-                                self.animation
-                                    .is_enabled()
-                                    .then(|| {
-                                        self.full_config
-                                            .as_ref()
-                                            .map(|c| c.animations.duration as u64)
-                                            .unwrap_or(200)
-                                    })
-                                    .unwrap_or(200),
-                            ),
-                        ),
-                    );
+                // Scalar camera/workspace frames already supply their displayed geometry.
+                let scalar_frame = self
+                    .animation
+                    .get_value(&crate::layout::AnimationTarget::WorkspaceX(output_id))
+                    .is_some();
+                if prior.rect != Rect::new(0, 0, 0, 0)
+                    && !scalar_frame
+                    && self.queue_rect(window_id, prior.rect, inset_rect)
+                {
                     applied_windows.insert(window_id);
-                    // Update the target in applied_state so the cache considers it
-                    // "in progress" and doesn't re-trigger a new animation.
                     self.applied_state
                         .entry(window_id)
                         .or_insert_with(AppliedState::unset)
                         .rect = inset_rect;
-                    continue; // tick_animations will issue SetWindowPos
+                    continue;
                 }
+                self.animating_rects.remove(&window_id);
 
                 // Accumulate into the batch rather than calling SetWindowPos immediately.
                 // The batch is committed atomically after the tile loop via
@@ -3184,6 +3216,7 @@ impl TilingEngine {
         let result = self.follow_os_foreground(window_id, backend);
         // The rules that depend on the focus look at the two windows again.
         self.rules_after_focus_change(previous, window_id, backend);
+        self.recent_foreground_changed(window_id, backend);
         result
     }
 
@@ -3222,6 +3255,20 @@ impl TilingEngine {
             .hidden_since
             .get(&window_id)
             .map_or(true, |t| t.elapsed() < Self::HIDE_GRACE);
+        let inactive_tab = self
+            .monitors
+            .get(&output_id)
+            .and_then(|m| m.workspaces.get(&workspace_id))
+            .and_then(|ws| ws.columns.get(column_idx))
+            .map_or(false, |col| {
+                matches!(
+                    col.display,
+                    crate::layout::workspace::ColumnDisplay::Tabbed { .. }
+                ) && col.active_window() != Some(window_id)
+            });
+        if inactive_tab && hidden_by_wiri && just_hidden {
+            return None;
+        }
         if on_inactive_workspace && hidden_by_wiri {
             debug!(
                 "foreground report for window {} of workspace {}: just hidden {}, method {:?}",
@@ -3260,9 +3307,7 @@ impl TilingEngine {
             if monitor.active_workspace != workspace_id {
                 monitor.switch_workspace(workspace_id);
             }
-            monitor.focus_window = Some(window_id);
-            monitor.focus_column = Some(column_idx);
-            monitor.focus_ring.push(window_id);
+            monitor.set_focus(window_id);
         }
         self.monitors.set_focused(output_id);
         self.reveal_focused_column(output_id);
@@ -3463,6 +3508,25 @@ impl TilingEngine {
         section_height: i32,
         cfg: &LayoutConfig,
     ) -> Vec<(WindowId, Rect)> {
+        self.calculate_positions_at_zoom(
+            workspace,
+            work_rect,
+            section_y_offset,
+            section_height,
+            cfg,
+            self.effective_zoom(),
+        )
+    }
+
+    fn calculate_positions_at_zoom(
+        &self,
+        workspace: &crate::layout::workspace::Workspace,
+        work_rect: Rect,
+        section_y_offset: i32,
+        section_height: i32,
+        cfg: &LayoutConfig,
+        zoom: f64,
+    ) -> Vec<(WindowId, Rect)> {
         let mut positions = Vec::new();
         let column_gap = cfg.column_gap;
         let window_gap = cfg.window_gap;
@@ -3473,7 +3537,6 @@ impl TilingEngine {
 
         // Item 4: use effective_zoom so auto_tile_zoom is consulted when no manual
         // overview is active.  Falls back to overview_zoom() when overview is on.
-        let zoom = self.effective_zoom();
 
         let (explicit_widths, min_widths, max_widths) = Self::column_inputs(workspace);
         let (col_widths, _) = Self::column_widths_with_limits(
@@ -3603,6 +3666,8 @@ impl TilingEngine {
                     let base_y =
                         work_rect.loc.y + section_y_offset + y_centre_offset + accumulated_y;
                     let rect = Rect::new(screen_x, base_y, scaled_w, window_height as u32);
+                    let rect =
+                        tabs::reserve_indicator(rect, column, &cfg.effects.tab_indicator, zoom);
                     positions.push((tile.window_id, rect));
                     accumulated_y += window_height + effective_gap;
                 }
@@ -3689,10 +3754,10 @@ impl TilingEngine {
             monitor.focus_window
         };
         if let Some(wid) = focused_wid {
+            self.apply_layout_for_monitor(focused_output, backend);
             if self.tiled_windows.contains_key(&wid) {
                 self.activate_now(wid, backend);
             }
-            self.apply_layout_for_monitor(focused_output, backend);
         }
         focused_wid
     }
@@ -3706,10 +3771,10 @@ impl TilingEngine {
             monitor.focus_window
         };
         if let Some(wid) = focused_wid {
+            self.apply_layout_for_monitor(focused_output, backend);
             if self.tiled_windows.contains_key(&wid) {
                 self.activate_now(wid, backend);
             }
-            self.apply_layout_for_monitor(focused_output, backend);
         }
         focused_wid
     }
@@ -5060,6 +5125,13 @@ impl TilingEngine {
         self.animation.set_enabled(enabled);
         self.animation.set_duration(duration_ms);
         self.animation.set_easing(easing);
+        self.motion.enabled = enabled;
+        self.motion.legacy_easing = true;
+        self.motion.duration = duration_ms;
+        self.motion.default_kind = Some(crate::layout::animation::AnimationKind::Easing {
+            duration_ms,
+            curve: easing,
+        });
     }
 
     /// Check if animations are enabled and any are currently active (AnimationManager or
@@ -5141,146 +5213,6 @@ impl TilingEngine {
         self.animation.has_active() || !self.animating_rects.is_empty()
     }
 
-    /// Full-power variant of `tick_animations` that issues `SetWindowPos` via
-    /// `backend` for every in-flight rect animation.  This is the method the
-    /// main event loop should prefer once it has a `BackendHandle` available.
-    pub fn tick_animations_with_backend(&mut self, delta_ms: u32, backend: &BackendHandle) -> bool {
-        // ---- Item 1: drive per-window rect animations ----
-        let now = std::time::Instant::now();
-        let easing = self
-            .animation
-            .is_enabled()
-            .then_some(())
-            .map(|_| {
-                // Read easing from full_config when available, fall back to CubicOut.
-                self.full_config
-                    .as_ref()
-                    .map(|_| crate::layout::Easing::CubicOut)
-                    .unwrap_or(crate::layout::Easing::CubicOut)
-            })
-            .unwrap_or(crate::layout::Easing::CubicOut);
-
-        let mut finished_ids: Vec<WindowId> = Vec::new();
-        for (&wid, &(start_rect, target_rect, start_time, duration)) in &self.animating_rects {
-            let elapsed = now.duration_since(start_time);
-            let t_raw = if duration.is_zero() {
-                1.0f64
-            } else {
-                (elapsed.as_secs_f64() / duration.as_secs_f64()).min(1.0)
-            };
-            // Apply easing
-            let t = {
-                let tc = t_raw.clamp(0.0, 1.0);
-                match easing {
-                    crate::layout::Easing::Linear => tc,
-                    crate::layout::Easing::EaseIn => tc * tc * tc,
-                    crate::layout::Easing::EaseOut | crate::layout::Easing::CubicOut => {
-                        1.0 - (1.0 - tc).powi(3)
-                    }
-                    crate::layout::Easing::EaseInOut => {
-                        if tc < 0.5 {
-                            4.0 * tc * tc * tc
-                        } else {
-                            1.0 - (-2.0 * tc + 2.0_f64).powi(3) / 2.0
-                        }
-                    }
-                    crate::layout::Easing::None => 1.0,
-                }
-            };
-
-            let lerp = |a: i32, b: i32| -> i32 { a + ((b - a) as f64 * t).round() as i32 };
-            let lerp_u = |a: u32, b: u32| -> u32 {
-                let diff = b as f64 - a as f64;
-                (a as f64 + diff * t).round().max(0.0) as u32
-            };
-
-            let interp_rect = Rect::new(
-                lerp(start_rect.loc.x, target_rect.loc.x),
-                lerp(start_rect.loc.y, target_rect.loc.y),
-                lerp_u(start_rect.size.w, target_rect.size.w),
-                lerp_u(start_rect.size.h, target_rect.size.h),
-            );
-
-            if t >= 1.0 {
-                // Animation complete — snap to target.
-                let _ = backend.set_window_position(
-                    wid.as_isize(),
-                    target_rect,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
-                finished_ids.push(wid);
-            } else {
-                let _ = backend.set_window_position(
-                    wid.as_isize(),
-                    interp_rect,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
-            }
-        }
-        for wid in finished_ids {
-            self.animating_rects.remove(&wid);
-        }
-
-        // ---- Legacy AnimationManager tick ----
-        if !self.animation.is_enabled() {
-            return !self.animating_rects.is_empty();
-        }
-        let results = self.animation.tick(delta_ms);
-        // Apply animated values to state
-        for (target, value) in results {
-            match target {
-                crate::layout::AnimationTarget::ScrollX(output_id) => {
-                    if let Some(monitor) = self.monitors.get_mut(&output_id) {
-                        if let Some(workspace) = monitor.workspace_mut() {
-                            workspace.scroll_offset.x = value as i32;
-                        }
-                    }
-                }
-                crate::layout::AnimationTarget::WindowX(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.loc.x = value as i32;
-                    }
-                }
-                crate::layout::AnimationTarget::WindowY(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.loc.y = value as i32;
-                    }
-                }
-                crate::layout::AnimationTarget::WindowW(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.size.w = value as u32;
-                    }
-                }
-                crate::layout::AnimationTarget::WindowH(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.size.h = value as u32;
-                    }
-                }
-                crate::layout::AnimationTarget::Opacity(window_id) => {
-                    // Opacity animations are applied directly to the window via
-                    // SetLayeredWindowAttributes — there is no cached opacity field on
-                    // WindowInfo (it would be redundant with `applied_state.opacity`).
-                    // The `value` parameter here is in 0..=255, so feed it straight in.
-                    if let Some(info) = self.tiled_windows.get(&window_id) {
-                        let alpha = (value as f32 / 255.0).clamp(0.0, 1.0);
-                        self.apply_window_opacity(info.hwnd, alpha);
-                    }
-                }
-                crate::layout::AnimationTarget::WorkspaceX(output_id) => {
-                    // Workspace-transition slide: tracked by Agent F's animation
-                    // module. The current per-monitor offset is consulted at
-                    // layout time via `AnimationManager::get_value(...)` to bias
-                    // column positions; here we just trigger a re-layout so the
-                    // active monitor reflects the new offset.
-                    let _ = output_id; // consumed by the next apply_layout call
-                }
-            }
-        }
-        self.animation.has_active() || !self.animating_rects.is_empty()
-    }
-
     /// Record that a window should animate from its current rect to `target_rect`.
     /// Called externally before `apply_layout_for_monitor` to pre-seed the animation;
     /// also used internally by `apply_layout_for_monitor` when animations are enabled.
@@ -5296,20 +5228,7 @@ impl TilingEngine {
         if start_rect == target_rect {
             return;
         }
-        let duration_ms = self
-            .full_config
-            .as_ref()
-            .map(|c| c.animations.duration as u64)
-            .unwrap_or(200);
-        self.animating_rects.insert(
-            wid,
-            (
-                start_rect,
-                target_rect,
-                std::time::Instant::now(),
-                std::time::Duration::from_millis(duration_ms),
-            ),
-        );
+        self.queue_rect(wid, start_rect, target_rect);
     }
 
     /// Trigger scroll animation for a monitor's workspace.
@@ -5398,6 +5317,10 @@ impl TilingEngine {
     /// resets `scroll_offset.x` on the active workspace so the view starts at
     /// column 0 when overview opens.
     pub fn enter_overview(&mut self, backend: &BackendHandle) {
+        if self.thumbnail_overview.is_some() {
+            self.enter_workspace_overview(backend);
+            return;
+        }
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
@@ -5739,6 +5662,8 @@ impl TilingEngine {
     /// `LayoutConfig::from_config`.  Subsequent layout passes consult
     /// `effective_config(oid)` to pick the right config per monitor.
     pub fn set_full_config(&mut self, config: crate::config::Config) {
+        self.recent_reset();
+        self.configure_motion(&config.animations);
         self.set_window_rules(config.window_rules.clone());
 
         // Rebuild per-monitor overrides from `config.output[*].layout_override`.
@@ -6295,9 +6220,8 @@ impl TilingEngine {
         let monitor = self.monitors.get(&oid)?;
         let workspace = monitor.workspace()?;
         for (idx, col) in workspace.columns.iter().enumerate() {
-            if let Some(tile) = col.tiles.first() {
-                let b = tile.cached_bounds;
-                if x >= b.loc.x && x < b.loc.x + b.size.w as i32 {
+            if let Some(b) = decor::column_drop_bounds(col) {
+                if x >= b.loc.x && x < b.right() {
                     return Some(idx);
                 }
             }
@@ -6388,64 +6312,6 @@ impl TilingEngine {
     // ---- Tabbed column engine methods ----
     // Wired from `Action::{ColumnToggleTabbed, TabNext, TabPrev}` in
     // `backend::message_loop::execute_action`.
-
-    /// Toggle the focused column between Stacked and Tabbed display modes.
-    pub fn toggle_tabbed_for_focused_column(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        use crate::layout::workspace::ColumnDisplay;
-                        match &column.display {
-                            ColumnDisplay::Tabbed { .. } => column.switch_to_stacked(),
-                            ColumnDisplay::Stacked => column.switch_to_tabbed(),
-                        }
-                    }
-                }
-            }
-        }
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
-    /// Advance to the next tab in the focused column (wraps around).
-    pub fn focused_column_next_tab(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        column.next_tab();
-                    }
-                }
-            }
-        }
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
-    /// Go to the previous tab in the focused column (wraps around).
-    pub fn focused_column_prev_tab(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        column.prev_tab();
-                    }
-                }
-            }
-        }
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
 
     /// The latest visible-frame placement submitted by layout (including an
     /// animation's target). Observed WindowInfo bounds can still be stale while
@@ -7838,6 +7704,7 @@ impl TilingEngine {
     /// Called on graceful shutdown so the user gets their layout back instead
     /// of windows frozen in the wiri tile positions.
     pub fn restore_all(&mut self, backend: &BackendHandle) {
+        self.recent_reset();
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
         use windows::Win32::UI::Controls::MARGINS;
@@ -14420,10 +14287,13 @@ mod tests {
         );
 
         // The start and target rects stored in animating_rects must be distinct.
-        if let Some(&(s, t, _, _)) = engine.animating_rects.get(&wid) {
-            assert_ne!(s, t, "start and target rects must differ");
-            assert_eq!(s, start, "stored start rect matches what we seeded");
-            assert_eq!(t, target, "stored target rect matches the requested target");
+        if let Some(rect) = engine.animating_rects.get(&wid) {
+            assert_ne!(rect.from, rect.target, "start and target rects must differ");
+            assert_eq!(rect.from, start, "stored start rect matches what we seeded");
+            assert_eq!(
+                rect.target, target,
+                "stored target rect matches the requested target"
+            );
         }
     }
 

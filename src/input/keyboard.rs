@@ -140,6 +140,20 @@ impl KeyboardEngine {
     pub fn fallback_allowed(&self, key: (u32, u32)) -> bool {
         self.active(key) && self.bindings.get(&key).is_some_and(|b| !b.options.release)
     }
+    /// A higher-priority modal surface owns dispatch, but physical state must
+    /// still advance. Retire captured releases without firing release binds.
+    /// Returns whether this engine already owns the key's down/up pair.
+    pub fn modal_event(&mut self, vk: u32, pressed: bool) -> bool {
+        let Some(slot) = self.down.get_mut(vk as usize) else {
+            return false;
+        };
+        *slot = pressed;
+        if pressed {
+            self.captured.contains_key(&vk)
+        } else {
+            self.captured.remove(&vk).is_some()
+        }
+    }
     pub fn event(&mut self, vk: u32, pressed: bool, now: Instant) -> Decision {
         let Some(slot) = self.down.get_mut(vk as usize) else {
             return Decision::default();
@@ -236,6 +250,34 @@ mod tests {
             &HashMap::from([((8, 0x54), options)]),
         );
         e
+    }
+    #[test]
+    fn modal_input_tracks_modifiers_without_firing_release_bindings() {
+        let mut e = engine(BindOptions {
+            release: true,
+            ..Default::default()
+        });
+        let t = Instant::now();
+        e.event(0x5B, true, t);
+        assert!(e.event(0x54, true, t).consume);
+        assert!(!e.modal_event(0x5B, false));
+        assert_eq!(e.modifiers(), 0);
+        assert!(e.modal_event(0x54, false));
+        assert!(!e.event(0x54, false, t).consume);
+        assert!(!e.modal_event(0xA0, true));
+        assert_eq!(e.modifiers(), 4);
+        e.modal_event(0xA0, false);
+        assert_eq!(e.modifiers(), 0);
+    }
+    #[test]
+    fn modal_unbound_down_cannot_turn_into_a_binding_on_repeat() {
+        let mut e = engine(BindOptions::default());
+        let t = Instant::now();
+        e.modal_event(0x54, true);
+        e.event(0x5B, true, t);
+        assert!(e.event(0x54, true, t).action.is_none());
+        e.event(0x54, false, t);
+        assert_eq!(e.event(0x54, true, t).action, Some(Action::Refresh));
     }
     #[test]
     fn unbound_keys_and_every_modifier_pass_in_both_directions() {

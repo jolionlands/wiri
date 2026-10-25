@@ -1,128 +1,10 @@
-//! Animation system for smooth scrolling and focus transitions.
-//!
-//! Uses tick-based interpolation with configurable duration and easing.
-//! Animations are driven by the main event loop's periodic tick.
-
+//! Event-driven animation timelines shared by scroll, workspace, move and resize.
+mod timeline;
 use crate::utils::WindowId;
 use std::collections::HashMap;
-
-/// Easing function type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Easing {
-    /// No animation — instant
-    None,
-    /// Linear interpolation
-    Linear,
-    /// Ease-in (slow start, fast end)
-    EaseIn,
-    /// Ease-out (fast start, slow end)
-    EaseOut,
-    /// Ease-in-out (slow start and end)
-    EaseInOut,
-    /// Cubic bezier approximation (ease-out-cubic)
-    CubicOut,
-}
-
-impl Default for Easing {
-    fn default() -> Self {
-        Self::CubicOut
-    }
-}
-
-/// A single animation that interpolates a value from start to end
-#[derive(Debug, Clone)]
-pub struct Animation {
-    /// Start value
-    pub start: f64,
-    /// End value
-    pub end: f64,
-    /// Duration in milliseconds
-    pub duration_ms: u32,
-    /// Elapsed time in milliseconds
-    pub elapsed_ms: u32,
-    /// Easing function
-    pub easing: Easing,
-    /// Whether this animation is finished
-    pub finished: bool,
-}
-
-impl Animation {
-    pub fn new(start: f64, end: f64, duration_ms: u32, easing: Easing) -> Self {
-        Self {
-            start,
-            end,
-            duration_ms,
-            elapsed_ms: 0,
-            easing,
-            finished: false,
-        }
-    }
-
-    /// Create an instant (no-animation) transition
-    pub fn instant(end: f64) -> Self {
-        Self {
-            start: end,
-            end,
-            duration_ms: 0,
-            elapsed_ms: 0,
-            easing: Easing::None,
-            finished: true,
-        }
-    }
-
-    /// Advance the animation by `delta_ms` milliseconds and return the current value
-    pub fn tick(&mut self, delta_ms: u32) -> f64 {
-        if self.finished || self.duration_ms == 0 {
-            self.finished = true;
-            return self.end;
-        }
-
-        self.elapsed_ms = (self.elapsed_ms + delta_ms).min(self.duration_ms);
-        let t = self.elapsed_ms as f64 / self.duration_ms as f64;
-        let eased_t = apply_easing(t, self.easing);
-
-        if self.elapsed_ms >= self.duration_ms {
-            self.finished = true;
-            self.end
-        } else {
-            self.start + (self.end - self.start) * eased_t
-        }
-    }
-
-    /// Get the current value without advancing
-    pub fn current(&self) -> f64 {
-        if self.finished || self.duration_ms == 0 {
-            return self.end;
-        }
-        let t = self.elapsed_ms as f64 / self.duration_ms as f64;
-        let eased_t = apply_easing(t, self.easing);
-        self.start + (self.end - self.start) * eased_t
-    }
-
-    /// Check if this animation is complete
-    pub fn is_finished(&self) -> bool {
-        self.finished
-    }
-}
-
-/// Apply an easing function to a linear t value [0..1]
-fn apply_easing(t: f64, easing: Easing) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    match easing {
-        Easing::None => 1.0, // Jump to end immediately
-        Easing::Linear => t,
-        Easing::EaseIn => t * t * t,
-        Easing::EaseOut => 1.0 - (1.0 - t).powi(3),
-        Easing::EaseInOut => {
-            if t < 0.5 {
-                4.0 * t * t * t
-            } else {
-                1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-            }
-        }
-        Easing::CubicOut => 1.0 - (1.0 - t).powi(3),
-    }
-}
+#[cfg(test)]
+use timeline::apply_easing;
+pub use timeline::{Animation, AnimationKind, Easing, RectAnimation, Spring};
 
 /// Type of animated property
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -158,6 +40,9 @@ pub struct AnimationManager {
     enabled: bool,
     default_duration_ms: u32,
     default_easing: Easing,
+    default_kind: AnimationKind,
+    slowdown: f64,
+    wake: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl AnimationManager {
@@ -167,6 +52,12 @@ impl AnimationManager {
             enabled,
             default_duration_ms: duration_ms,
             default_easing: easing,
+            default_kind: AnimationKind::Easing {
+                duration_ms,
+                curve: easing,
+            },
+            slowdown: 1.0,
+            wake: None,
         }
     }
 
@@ -175,20 +66,37 @@ impl AnimationManager {
         Self::new(false, 0, Easing::None)
     }
 
-    /// Start a new animation, replacing any existing one for this target
+    /// Start or retarget from the currently displayed value, preserving spring velocity.
     pub fn animate(&mut self, target: AnimationTarget, start: f64, end: f64) {
-        if !self.enabled || start == end {
-            // No animation needed — store an instant transition
-            self.animations.insert(target, Animation::instant(end));
-            return;
-        }
-        self.animations.insert(
-            target,
-            Animation::new(start, end, self.default_duration_ms, self.default_easing),
-        );
+        self.animate_with_kind(target, start, end, self.default_kind);
     }
 
-    /// Start a new animation with custom duration
+    pub fn animate_with_kind(
+        &mut self,
+        target: AnimationTarget,
+        start: f64,
+        end: f64,
+        kind: AnimationKind,
+    ) {
+        let kind = if self.enabled {
+            kind
+        } else {
+            AnimationKind::Off
+        };
+        if let Some(anim) = self.animations.get_mut(&target) {
+            anim.retarget(end, kind, self.slowdown);
+        } else {
+            self.animations.insert(
+                target,
+                Animation::with_kind(start, end, kind, self.slowdown),
+            );
+        }
+        if let Some(wake) = &self.wake {
+            wake.notify_one();
+        }
+    }
+
+    /// Start a new animation with custom duration (legacy easing API).
     pub fn animate_with_duration(
         &mut self,
         target: AnimationTarget,
@@ -196,14 +104,28 @@ impl AnimationManager {
         end: f64,
         duration_ms: u32,
     ) {
-        if !self.enabled || start == end {
-            self.animations.insert(target, Animation::instant(end));
-            return;
-        }
-        self.animations.insert(
+        self.animate_with_kind(
             target,
-            Animation::new(start, end, duration_ms, self.default_easing),
+            start,
+            end,
+            AnimationKind::Easing {
+                duration_ms,
+                curve: self.default_easing,
+            },
         );
+    }
+
+    pub fn set_notifier(&mut self, wake: std::sync::Arc<tokio::sync::Notify>) {
+        self.wake = Some(wake);
+    }
+    pub fn set_kind(&mut self, kind: AnimationKind) {
+        self.default_kind = kind;
+    }
+    pub fn set_slowdown(&mut self, slowdown: f64) {
+        self.slowdown = slowdown;
+    }
+    pub fn cancel(&mut self, target: &AnimationTarget) {
+        self.animations.remove(target);
     }
 
     /// Advance all animations by delta_ms and return values that changed
@@ -212,11 +134,9 @@ impl AnimationManager {
         let mut finished = Vec::new();
 
         for (target, anim) in &mut self.animations {
-            let prev = anim.current();
             let current = anim.tick(delta_ms);
-            if !anim.is_finished() || (prev - current).abs() > f64::EPSILON {
-                results.push((target.clone(), current));
-            }
+            // Always deliver the terminal value, including an instant/off transition.
+            results.push((target.clone(), current));
             if anim.is_finished() {
                 finished.push(target.clone());
             }
@@ -230,9 +150,10 @@ impl AnimationManager {
         results
     }
 
-    /// Check if any animations are active
+    /// Check whether a tick is pending, including terminal delivery for instant/off
+    /// transitions. Completed timelines remain active until tick delivers their value.
     pub fn has_active(&self) -> bool {
-        self.animations.values().any(|a| !a.finished)
+        !self.animations.is_empty()
     }
 
     /// Get the current value of an animation target, or None if not animating
@@ -269,25 +190,17 @@ impl AnimationManager {
         duration_ms: u32,
     ) {
         let target = AnimationTarget::WorkspaceX(output);
-        if !self.enabled || from_offset_px == to_offset_px {
-            self.animations
-                .insert(target, Animation::instant(to_offset_px));
-            return;
-        }
-        let dur = if duration_ms == 0 {
-            self.default_duration_ms
+        // A different incoming workspace starts at its own edge, not the old slide.
+        self.cancel(&target);
+        let kind = if duration_ms == 0 {
+            self.default_kind
         } else {
-            duration_ms
+            AnimationKind::Easing {
+                duration_ms,
+                curve: self.default_easing,
+            }
         };
-        if dur == 0 {
-            self.animations
-                .insert(target, Animation::instant(to_offset_px));
-            return;
-        }
-        self.animations.insert(
-            target,
-            Animation::new(from_offset_px, to_offset_px, dur, self.default_easing),
-        );
+        self.animate_with_kind(target, from_offset_px, to_offset_px, kind);
     }
 
     /// Read the current workspace-slide offset for a monitor, in pixels.
@@ -304,12 +217,23 @@ impl AnimationManager {
         self.enabled = enabled;
     }
 
+    /// Update the legacy easing duration without replacing a spring/off default.
     pub fn set_duration(&mut self, duration_ms: u32) {
         self.default_duration_ms = duration_ms;
+        if let AnimationKind::Easing { curve, .. } = self.default_kind {
+            self.default_kind = AnimationKind::Easing { duration_ms, curve };
+        }
     }
 
+    /// Update the legacy easing curve without replacing a spring/off default.
     pub fn set_easing(&mut self, easing: Easing) {
         self.default_easing = easing;
+        if let AnimationKind::Easing { duration_ms, .. } = self.default_kind {
+            self.default_kind = AnimationKind::Easing {
+                duration_ms,
+                curve: easing,
+            };
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -390,10 +314,115 @@ mod tests {
         let mut mgr = AnimationManager::disabled();
         let target = AnimationTarget::ScrollX(OutputId::from_name("test"));
         mgr.animate(target.clone(), 0.0, 500.0);
-        // Should be instant since disabled
+        // Disabled transitions remain active until their terminal value is delivered.
+        assert!(mgr.has_active());
         let results = mgr.tick(0);
-        assert!(results.is_empty()); // instant transition already cleaned up
+        assert_eq!(results, vec![(target, 500.0)]);
         assert!(!mgr.has_active());
+        assert!(mgr.tick(0).is_empty());
+    }
+
+    #[test]
+    fn test_pending_terminal_values_are_delivered_by_active_loop() {
+        let target = AnimationTarget::ScrollX(OutputId::from_name("pending-terminal"));
+        for (start, kind) in [
+            (0.0, AnimationKind::Off),
+            (
+                0.0,
+                AnimationKind::Easing {
+                    duration_ms: 0,
+                    curve: Easing::Linear,
+                },
+            ),
+            (
+                0.0,
+                AnimationKind::Easing {
+                    duration_ms: 100,
+                    curve: Easing::None,
+                },
+            ),
+            (
+                100.0,
+                AnimationKind::Easing {
+                    duration_ms: 100,
+                    curve: Easing::Linear,
+                },
+            ),
+        ] {
+            let mut mgr = AnimationManager::new(true, 100, Easing::Linear);
+            assert!(!mgr.has_active());
+            mgr.animate_with_kind(target.clone(), start, 100.0, kind);
+
+            let mut results = Vec::new();
+            let mut ticks = 0;
+            while mgr.has_active() {
+                assert_eq!(ticks, 0, "terminal delivery should require only one tick");
+                results.extend(mgr.tick(0));
+                ticks += 1;
+            }
+            assert_eq!(ticks, 1);
+            assert_eq!(results, vec![(target.clone(), 100.0)]);
+            assert!(mgr.tick(0).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_legacy_setters_update_default_timeline() {
+        let mut mgr = AnimationManager::new(true, 200, Easing::Linear);
+        let target = AnimationTarget::ScrollX(OutputId::from_name("legacy-settings"));
+
+        mgr.set_duration(100);
+        mgr.animate(target.clone(), 0.0, 100.0);
+        assert_eq!(mgr.tick(50), vec![(target.clone(), 50.0)]);
+        assert_eq!(mgr.tick(50), vec![(target.clone(), 100.0)]);
+
+        mgr.set_easing(Easing::EaseIn);
+        mgr.animate(target.clone(), 0.0, 100.0);
+        assert_eq!(mgr.tick(50), vec![(target.clone(), 12.5)]);
+        assert_eq!(mgr.tick(50), vec![(target.clone(), 100.0)]);
+
+        mgr.set_duration(0);
+        mgr.animate(target.clone(), 0.0, 100.0);
+        assert!(mgr.has_active());
+        assert_eq!(mgr.tick(0), vec![(target, 100.0)]);
+        assert!(!mgr.has_active());
+    }
+
+    #[test]
+    fn test_legacy_setters_preserve_other_kind_settings() {
+        let mut mgr = AnimationManager::new(true, 200, Easing::Linear);
+        mgr.set_kind(AnimationKind::Easing {
+            duration_ms: 300,
+            curve: Easing::QuadOut,
+        });
+        mgr.set_duration(100);
+        assert_eq!(
+            mgr.default_kind,
+            AnimationKind::Easing {
+                duration_ms: 100,
+                curve: Easing::QuadOut
+            }
+        );
+
+        mgr.set_kind(AnimationKind::Easing {
+            duration_ms: 300,
+            curve: Easing::QuadOut,
+        });
+        mgr.set_easing(Easing::EaseIn);
+        assert_eq!(
+            mgr.default_kind,
+            AnimationKind::Easing {
+                duration_ms: 300,
+                curve: Easing::EaseIn
+            }
+        );
+
+        for kind in [AnimationKind::Off, AnimationKind::Spring(Spring::default())] {
+            mgr.set_kind(kind);
+            mgr.set_duration(75);
+            mgr.set_easing(Easing::Linear);
+            assert_eq!(mgr.default_kind, kind);
+        }
     }
 
     #[test]

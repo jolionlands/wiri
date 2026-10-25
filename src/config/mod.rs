@@ -4,6 +4,7 @@ pub mod error;
 pub mod kdl;
 pub mod loader;
 pub mod parse;
+pub mod recent_windows_config;
 pub mod types;
 
 pub use decode::{Decoded, MAX_INCLUDE_DEPTH};

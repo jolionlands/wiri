@@ -38,6 +38,8 @@ pub enum OverviewCommand {
     SelectWindow(WindowId),
     /// Activate even an empty workspace, then exit overview.
     SelectWorkspace(i32),
+    PreviousWorkspace,
+    NextWorkspace,
     Close,
 }
 
@@ -694,6 +696,16 @@ mod win {
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((w.0 >> 16) as u16) as i16;
+                let command = if delta < 0 {
+                    OverviewCommand::NextWorkspace
+                } else {
+                    OverviewCommand::PreviousWorkspace
+                };
+                (*ptr).session.clone().command(command);
                 LRESULT(0)
             }
             WM_KEYDOWN if w.0 == 0x1b => {

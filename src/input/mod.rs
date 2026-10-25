@@ -1,4 +1,5 @@
 pub mod dispatch;
+mod double_alt;
 pub mod focus;
 pub mod grab;
 pub mod hotkey;
@@ -6,6 +7,7 @@ pub mod keyboard;
 pub mod low_level_hook;
 pub mod mouse;
 pub mod pointer;
+pub mod recent;
 pub mod snap_guide;
 pub mod touch;
 
