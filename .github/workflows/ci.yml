@@ -74,8 +74,63 @@ jobs:
       - name: Check all targets (fail early on warnings)
         run: cargo check --release --all-targets -j 2 --locked
 
+      - name: Test CI result validation (no desktop automation)
+        shell: powershell
+        run: ./scripts/ci/test-live-summary.ps1
+
       - name: Native tests
         run: cargo test --release -j 2 --locked
 
       - name: Build binaries
         run: cargo build --release -j 2 --locked
+
+      - name: Share binaries with the live job (no second Cargo build)
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-binaries-${{ matrix.target }}
+          path: |
+            target/release/wiri.exe
+            target/release/wiri-ctl.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  live:
+    name: Experimental live desktop (${{ matrix.target }})
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    env:
+      WIRI_LIVE_CI: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-binaries-${{ matrix.target }}
+          path: target/release
+
+      # Windows PowerShell 5.1/.NET Framework is required by the harness's WinForms Add-Type.
+      # Probe first: an installed GUI stack is not a promise of an unlocked input desktop.
+      - name: Probe desktop and run live harness when available
+        shell: powershell
+        run: ./scripts/ci/live-ci.ps1 -Bin target/release -Out .live
+
+      - name: Upload live evidence even on failure or desktop skip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .live/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

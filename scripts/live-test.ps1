@@ -53,7 +53,9 @@ param(
     [int]$LockWaitMinutes = $(if ($env:WIRI_LIVE_LOCK_WAIT_MIN) { [int]$env:WIRI_LIVE_LOCK_WAIT_MIN } else { 0 })
 )
 
-$ErrorActionPreference = 'Continue'
+# CI-only fail-fast: unexpected PowerShell errors must not leave DONE/summary claiming a pass.
+# Deliberate negative config/action tests handle their own errors; normal desktop runs are unchanged.
+$ErrorActionPreference = if ($env:WIRI_LIVE_CI -eq '1') { 'Stop' } else { 'Continue' }
 # A live run drives the whole interactive desktop and shares one config, one IPC pipe and one evidence
 # directory: two at once (an official cycle and a scratch cycle, a manual run) spoil each other's results
 # without either noticing.  A machine-wide named mutex, held until this process ends (Windows frees it
@@ -785,17 +787,22 @@ $null = WaitFile (Join-Path $pdir 'ipc-line.txt') 8
 $ipcLineText = if (Test-Path (Join-Path $pdir 'ipc-line.txt')) { (Get-Content (Join-Path $pdir 'ipc-line.txt') -Raw).Trim() } else { '' }
 $spawnIpcLineOk = ($ipcLineText -eq 'ipc line')
 # A bare program name that lives only on PATH (an App Execution Alias): the example of the default config.
-$topBefore = [LT]::TopLevel()
-$null = Ctl 'h2-ipc-spawn-wt' @('spawn', 'wt.exe')
-$wtWin = $null
-for ($i = 0; $i -lt 40 -and -not $wtWin; $i++) {
-    Start-Sleep -Milliseconds 250
-    $wtWin = @(NewTopLevel $topBefore | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') }) | Select-Object -First 1
+# CI-only dependency switch: null means SKIPPED, never a passing gate. All other spawn tests and
+# the cmd.exe console phases (B/F/H9) still run; a missing wt.exe remains a failure outside CI.
+$spawnWtWindow = $null
+if ($env:WIRI_LIVE_CI -ne '1' -or (Get-Command wt.exe -ErrorAction SilentlyContinue)) {
+    $topBefore = [LT]::TopLevel()
+    $null = Ctl 'h2-ipc-spawn-wt' @('spawn', 'wt.exe')
+    $wtWin = $null
+    for ($i = 0; $i -lt 40 -and -not $wtWin; $i++) {
+        Start-Sleep -Milliseconds 250
+        $wtWin = @(NewTopLevel $topBefore | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') }) | Select-Object -First 1
+    }
+    $spawnWtWindow = [bool]$wtWin
+    Shot '13-spawn-wt'
+    if ($wtWin) { [LT]::Close($wtWin) }
+    Start-Sleep -Seconds 2
 }
-$spawnWtWindow = [bool]$wtWin
-Shot '13-spawn-wt'
-if ($wtWin) { [LT]::Close($wtWin) }
-Start-Sleep -Seconds 2
 $w = $w4
 
 # ---- H3: actions act on the window the user is looking at - a floating one included, a dialog's owner, never a guess ----
@@ -2825,6 +2832,15 @@ $summary = [ordered]@{
     h15_a_late_subscriber_is_told_the_state_as_it_is = $h15LateOk
     h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
     steps = $steps
+}
+# Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
+if ($env:WIRI_LIVE_CI -eq '1') {
+    $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
+        [pscustomobject]@{
+            gate = 'h2_wt_exe_found_on_path'
+            reason = 'Windows Terminal (wt.exe) is not installed/on PATH. Only this explicit wt.exe spawn was skipped; default-terminal fallback and cmd.exe console phases B/F/H9 still ran.'
+        }
+    })
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
