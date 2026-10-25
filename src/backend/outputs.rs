@@ -570,7 +570,7 @@ fn execute_update(paths: &[ccd::DISPLAYCONFIG_PATH_INFO], modes: &[ccd::DISPLAYC
     let flags = ccd::SDC_USE_SUPPLIED_DISPLAY_CONFIG;
     let error = unsafe { ccd::SetDisplayConfig(Some(paths), Some(modes), flags | ccd::SDC_VALIDATE) };
     if error != 0 { return Err(format!("Windows rejected the requested output configuration (validation error {error}); nothing applied")); }
-    let error = unsafe { ccd::SetDisplayConfig(Some(paths), Some(modes), flags | ccd::SDC_APPLY | ccd::SDC_SAVE_TO_DATABASE) };
+    let error = unsafe { ccd::SetDisplayConfig(Some(paths), Some(modes), flags | ccd::SDC_APPLY) };
     if error != 0 { return Err(format!("SetDisplayConfig failed with error {error}")); }
     Ok(())
 }

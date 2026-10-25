@@ -1266,11 +1266,13 @@ impl Decoder {
             position: Position::default(),
             width: 0,
             height: 0,
-            scale: 1.0,
+            scale: 0.0,
             mode: String::new(),
             vrr: false,
             primary: false,
-            transform: "normal".to_string(),
+            position_set: false,
+            focus_at_startup: false,
+            transform: String::new(),
             enable: true,
             layout_override: None,
             mod_key: None,
@@ -1281,11 +1283,13 @@ impl Decoder {
                 "x" => {
                     if let Some(v) = self.arg_i32(child) {
                         out.position.x = v;
+                        out.position_set = true;
                     }
                 }
                 "y" => {
                     if let Some(v) = self.arg_i32(child) {
                         out.position.y = v;
+                        out.position_set = true;
                     }
                 }
                 "width" => {
@@ -1321,9 +1325,11 @@ impl Decoder {
                     }
                     if let Some(v) = x {
                         out.position.x = v.round() as i32;
+                        out.position_set = true;
                     }
                     if let Some(v) = y {
                         out.position.y = v.round() as i32;
+                        out.position_set = true;
                     }
                 }
                 "scale" => {
@@ -1402,7 +1408,9 @@ impl Decoder {
                 }
                 "primary" | "focus-at-startup" => {
                     if let Some(v) = self.flag(child) {
+                        // Legacy primary means initial wiri focus, never Windows primary.
                         out.primary = v;
+                        out.focus_at_startup = v;
                     }
                 }
                 "mod-key" => {

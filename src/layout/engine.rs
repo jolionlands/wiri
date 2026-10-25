@@ -12893,6 +12893,8 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.output.push(crate::config::OutputConfig {
             name: oid_name.to_string(),
+            position_set: false,
+            focus_at_startup: false,
             position: crate::config::types::Position::default(),
             width: 0,
             height: 0,
@@ -12934,6 +12936,8 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.output.push(crate::config::OutputConfig {
             name: oid_name.to_string(),
+            position_set: false,
+            focus_at_startup: false,
             position: crate::config::types::Position::default(),
             width: 0,
             height: 0,
@@ -12976,6 +12980,8 @@ mod tests {
             let mut c = crate::config::Config::default();
             c.output.push(crate::config::OutputConfig {
                 name: oid_name.to_string(),
+                position_set: false,
+                focus_at_startup: false,
                 position: crate::config::types::Position::default(),
                 width: 0,
                 height: 0,

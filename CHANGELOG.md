@@ -40,6 +40,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   balloons and `screenshot_captured { path }` events cover both actions. Live H26-H28 verify PNGs,
   content, clipboard, reload and null events. Interactive selection and per-action pointer/disk flags
   remain outstanding; see `docs/parity/phase2c-lane-d-report.md`.
+- **Output configuration acts on startup/reload.** Connector or EDID identity matching is
+  case-insensitive and no longer falls back by index for an unmatched name. Unset scale keeps real
+  Windows DPI; startup focus follows config order. A conservative CCD planner applies only explicit
+  physical differences, preserves other timings, refuses the last-display-off and unsupported flips,
+  and never persists changes. H29 verifies matching, focus, reload and current-mode no-op; physical
+  mode/position/rotation/off preparation is synthetic-unit-tested only, never applied on the laptop.
 - **Shared-desktop live safety.** The harness refuses foreign daemons instead of killing them,
   isolates AppData/temp inside the worktree, and retains interrupted-run recovery state. The
   recovery metric checks this run's forms, not unrelated windows legitimately hidden again.

@@ -61,6 +61,40 @@ physical outputs were **not** independently exercised live. WGC waits once for a
 Still partial: interactive region UI, per-action `write-to-disk`/`show-pointer`, and niri's
 screenshot action argument surface. The existing hwnd/path window-capture IPC is supported.
 
+## Output item
+
+`backend/outputs.rs` separates read-only CCD/EDID identity discovery, a pure planner/preparer,
+and a conservative Windows executor. Exact case-insensitive connector matches precede friendly
+or make/model/serial matches; a named mismatch never falls back by enumeration index. Default
+scale 0 and empty transform mean unset, and position needs an explicit config node. Refresh
+comparison retains millihertz precision and unchanged timings retain their original rational.
+Only explicit physical differences reach SDC_VALIDATE/SDC_APPLY; no DPI setter, primary-display
+setter, ALLOW_CHANGES fallback or SAVE_TO_DATABASE is used. Invalid/unsupported requests are
+logged rather than silently substituted; last-display-off and cloned-source edits fail closed.
+
+`backend/output_runtime.rs` refreshes the actual monitor snapshot after reload/display events,
+syncs surviving engine monitors without replacing their workspaces, and chooses initial focus
+once in config order. `primary` is a legacy initial-focus alias, never a Windows primary setter.
+Shared-file hooks are the backend exports, OutputConfig/decoder, startup/reload/display-change
+calls in main and three test literals in engine; other implementation is in the new modules.
+
+Live H29 used an unmatched off block before a lowercase connector block, explicit **current
+1366x768** dimensions, and wiri-only scale **1.25**. It verified matching, initial output focus,
+reload to the real Windows DPI, and identical before/after desktop state:
+`[1366,768,60,0,0,0,32]` (size, integer-Hz observation, position, rotation, bit depth).
+No real resolution, DPI, position, orientation, primary or off change was requested or executed.
+Synthetic unit tests cover mode parsing/refresh, no-op/default/error plans, CCW rotation/axis
+conversion, negative positions, EDID validation, preserved unconfigured paths/timings, cloned
+sources, last-display refusal and config-order focus with two invented outputs. Test executables
+cannot call the mutating display executor. A different actual mode/rotation/position or physical
+disconnect/reconnect was **not live-verified**; driver acceptance remains unproven.
+
+Still partial: inactive outputs are not auto-enabled, flipped transforms/VRR are unsupported,
+scale is stored layout metadata rather than full logical-pixel sizing, per-output layout/rule
+aliases still use raw names, and physical output settings apply at startup/reload (not replayed
+on hotplug). Windows keeps its own arrangement and unsupported requests fail closed rather
+than using niri's automatic fallback mode selection.
+
 ## Live harness safety corrections
 
 The pre-existing harness killed every process named wiri and wrote the shared user's AppData.

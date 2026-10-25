@@ -57,8 +57,11 @@ pipeline; tabs; an overview that zooms out the workspaces and a recent-windows s
 
 **Phase 2C, Lane D ([report](phase2c-lane-d-report.md)):** focused-output and focused-window PNG
 screenshots, the clipboard, `screenshot-path` and capture events/notifications are implemented.
-H26-H28 verify both hotkeys, saved PNG content, clipboard and null-on-reload live; screenshot
-selection UI and action flags are not claimed as complete. Other Phase 2 lanes are separate work.
+H26-H28 verify both hotkeys, saved PNG content, clipboard and null-on-reload live. Output
+identity matching, startup focus, reload-to-real-DPI and explicit-current-mode no-op pass H29;
+physical mode/position/rotation/off changes are synthetic-unit-tested only and never exercised
+on this laptop. Screenshot selection UI/action flags and output limitations remain explicit in
+the matrices/report. Other Phase 2 lanes are separate work.
 
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
 quoted autostart path, ARM64 release builds, docs and a demo.

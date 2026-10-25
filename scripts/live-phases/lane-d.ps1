@@ -1,4 +1,4 @@
-# Lane D: one-shot PNG/clipboard screenshots.
+# Lane D: one-shot PNG/clipboard screenshots, output selection and current-mode no-op.
 # Dot-sourced after the existing phases, while the global desktop mutex is still held.
 # No mode, scale, position, rotation or primary-display setters are used by this test.
 Add-Type -TypeDefinition @'
@@ -58,6 +58,12 @@ function DConfig([string]$pathSetting, [string]$scaleSetting) {
     return @"
 screenshot-path $pathSetting
 animations { off }
+output "not-a-connected-output" { off }
+output r"$dConnector" {
+    mode "$dCurrentMode"
+    $scaleSetting
+    focus-at-startup
+}
 binds {
     Ctrl+Alt+F8 { screenshot-screen; }
     Ctrl+Alt+F9 { screenshot-window; }
@@ -67,8 +73,9 @@ binds {
 # Preset false gates survive exceptions, rather than silently disappearing from summary.json.
 foreach ($gate in @('h26_screen_is_a_decodable_png_of_focused_output','h26_template_is_expanded','h26_screen_is_on_clipboard',
     'h27_window_is_a_decodable_png_of_only_the_window','h27_window_contains_the_test_content','h27_window_is_on_clipboard',
-    'h28_null_writes_no_files','h28_both_null_actions_still_copy','h28_screenshot_captured_reports_paths_and_null'
-)) { DGate $gate $false }
+    'h28_null_writes_no_files','h28_both_null_actions_still_copy','h28_screenshot_captured_reports_paths_and_null',
+    'h29_connector_match_is_case_insensitive_not_by_index','h29_focus_at_startup_selects_the_output',
+    'h29_reload_without_scale_preserves_real_dpi','h29_explicit_current_mode_does_not_change_the_desktop')) { DGate $gate $false }
 $dProc = $null; $dEventsProc = $null; $dForm = [IntPtr]::Zero
 try {
     $dScreen = [Windows.Forms.Screen]::PrimaryScreen
@@ -85,6 +92,10 @@ try {
     $dForm = [TestForms]::Open('lane-d-capture', 43, 177, 89)
     Start-Sleep -Milliseconds 1600
     [LT]::SwitchToThisWindow($dForm,$true); Start-Sleep -Milliseconds 700
+    $dMons = @(DMonitors 'h29-monitors-start')
+    $dMatch = @($dMons | Where-Object { $_.name -ieq $dScreen.DeviceName })
+    DGate 'h29_connector_match_is_case_insensitive_not_by_index' ($dMatch.Count -eq 1 -and [Math]::Abs($dMatch[0].scale_factor-1.25) -lt 0.001)
+    DGate 'h29_focus_at_startup_selects_the_output' ($dMatch.Count -eq 1 -and $dMatch[0].focused)
     $dEvents = Join-Path $D 'h28-screenshot-events.txt'
     $dEventsProc = Start-Process -FilePath $ctl -ArgumentList @('events','--stream','--filter','screenshot_captured') -RedirectStandardOutput $dEvents -RedirectStandardError "$dEvents.err" -WindowStyle Hidden -PassThru
     Start-Sleep -Milliseconds 800
@@ -133,7 +144,10 @@ try {
     $saved = @($captured | Where-Object { $null -ne $_.data.path })
     $clipboardOnly = @($captured | Where-Object { $null -eq $_.data.path })
     DGate 'h28_screenshot_captured_reports_paths_and_null' ($captured.Count -eq 4 -and $saved.Count -eq 2 -and $clipboardOnly.Count -eq 2 -and (Test-Path $saved[0].data.path) -and (Test-Path $saved[1].data.path))
+    $dReloaded = @(DMonitors 'h29-monitors-reloaded' | Where-Object { $_.name -ieq $dScreen.DeviceName })
+    DGate 'h29_reload_without_scale_preserves_real_dpi' ($dReloaded.Count -eq 1 -and [Math]::Abs($dReloaded[0].scale_factor - [LaneD]::Scale($dForm)) -lt 0.001)
     $dAfter = [LaneD]::Mode($dScreen.DeviceName)
+    DGate 'h29_explicit_current_mode_does_not_change_the_desktop' (($dBefore -join ',') -eq ($dAfter -join ','))
     [ordered]@{ connector=$dScreen.DeviceName; before=$dBefore; after=$dAfter; screen_png=$dScreenPng; window_png=$dWindowPng; clipboard_screen=$clipScreen; clipboard_window=$clipWindow; events=$captured } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $D 'lane-d-values.json')
 } catch {
     ($_ | Out-String) | Set-Content (Join-Path $D 'lane-d-error.txt')

@@ -321,7 +321,9 @@ async fn main() -> Result<()> {
     let hide_method = hide_method_of(&config);
     wiri::backend::cloak::set_hide_method(hide_method);
 
-    // Initialize backend
+    // Lane D: only explicit, different output settings can call a display setter.
+    wiri::backend::outputs::apply(&config);
+    // Initialize backend after output configuration so its first snapshot is current.
     let mut backend = Backend::new()?;
     info!("Backend initialized");
 
@@ -387,49 +389,8 @@ async fn main() -> Result<()> {
         };
         engine.update_animation_settings(anim_cfg.enabled, anim_cfg.duration, easing);
 
-        // Apply OutputConfig overrides from config (niri parity):
-        // - If a matching OutputConfig has `enable false`, skip the monitor.
-        // - If a matching OutputConfig has a non-zero `scale`, override scale_factor.
-        // Matching is by index order (config output[i] → monitors[i]); name matching
-        // is used when the OutputConfig has a non-empty name field.
-        // Physical repositioning via CCD APIs is out of scope on Windows.
-        for (idx, monitor) in monitors.iter().enumerate() {
-            // Find a matching OutputConfig: prefer name match, fall back to index.
-            let cfg_output = config
-                .output
-                .iter()
-                .find(|o| !o.name.is_empty() && (o.name == monitor.name))
-                .or_else(|| config.output.get(idx));
-
-            let mut effective_scale = monitor.scale_factor;
-            let mut skip = false;
-
-            if let Some(out_cfg) = cfg_output {
-                if !out_cfg.enable {
-                    info!("Skipping disabled output: {}", monitor.name);
-                    skip = true;
-                } else if out_cfg.scale != 0.0
-                    && (out_cfg.scale - monitor.scale_factor).abs() > 1e-6
-                {
-                    info!(
-                        "Output {}: overriding scale {:.2} → {:.2} (from config)",
-                        monitor.name, monitor.scale_factor, out_cfg.scale
-                    );
-                    effective_scale = out_cfg.scale;
-                }
-            }
-
-            if !skip {
-                engine.register_monitor_with_scale(
-                    monitor.id,
-                    monitor.bounds,
-                    monitor.work_area,
-                    effective_scale,
-                );
-                // `open-on-output` and the IPC name a monitor by its device name.
-                engine.set_output_name(monitor.id, &monitor.name);
-            }
-        }
+        // Lane D: case-insensitive identity matching, no named-block index fallback.
+        wiri::backend::output_runtime::sync(&config, &backend.handle(), &mut engine);
     }
 
     // Initialize hotkey manager
@@ -480,6 +441,8 @@ async fn main() -> Result<()> {
             if !foreground.0.is_null() {
                 eng.sync_os_foreground(WindowId::new(foreground.0 as isize), &backend_handle);
             }
+            // Lane D: an explicit startup focus takes precedence over enumeration/OS focus.
+            wiri::backend::output_runtime::focus_at_startup(&config, &backend_handle, &mut eng);
             eng.reveal_focused();
             eng.apply_all(&backend_handle);
         }
@@ -1075,6 +1038,9 @@ fn apply_loaded_config(
     mouse_tracker: &Arc<RwLock<MouseTracker>>,
 ) {
     wiri::screenshot::configure(&new_config);
+    // Lane D: reload physical differences outside the engine lock, then refresh geometry/DPI.
+    wiri::backend::outputs::apply(&new_config);
+    wiri::backend::output_runtime::refresh(handle);
     let new_layout_config = LayoutConfig::from_config(&new_config);
     let mouse_config = MouseFocusConfig {
         focus_follows_mouse: new_config.input.focus_follows_mouse,
@@ -1090,6 +1056,7 @@ fn apply_loaded_config(
     {
         let mut engine = engine.write();
         engine.update_config(new_layout_config);
+        wiri::backend::output_runtime::sync(&new_config, handle, &mut engine);
         engine.set_full_config(new_config);
         engine.set_hide_method(hide_method);
         // The rules were replaced: the windows that are open follow them (their opacity, their
@@ -1119,16 +1086,12 @@ fn hide_method_of(config: &Config) -> wiri::backend::cloak::HideMethod {
 fn configured_monitor_scale(
     config: Option<&Config>,
     monitor: &BackendMonitorInfo,
-    index: usize,
+    _index: usize,
 ) -> Option<f64> {
     let mut effective_scale = monitor.scale_factor;
 
     if let Some(config) = config {
-        let cfg_output = config
-            .output
-            .iter()
-            .find(|o| !o.name.is_empty() && o.name == monitor.name)
-            .or_else(|| config.output.get(index));
+        let cfg_output = wiri::backend::outputs::matching_config(config, monitor);
 
         if let Some(out_cfg) = cfg_output {
             if !out_cfg.enable {
@@ -1148,6 +1111,8 @@ fn sync_monitors_from_backend(
     engine: &Arc<RwLock<TilingEngine>>,
     ipc_server: &Arc<IpcServer>,
 ) {
+    // Lane D: refresh the backend snapshot before diffing a display change.
+    wiri::backend::output_runtime::refresh(handle);
     let backend_monitors = handle.get_monitors();
     let config = engine.read().full_config().cloned();
     {

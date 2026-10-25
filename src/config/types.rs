@@ -26,11 +26,13 @@ impl Default for Config {
                 position: Position::default(),
                 width: 0,
                 height: 0,
-                scale: 1.0,
+                scale: 0.0,
                 mode: String::new(),
                 vrr: false,
                 primary: false,
-                transform: "normal".to_string(),
+                position_set: false,
+                focus_at_startup: false,
+                transform: String::new(),
                 enable: true,
                 layout_override: None,
                 mod_key: None,
@@ -208,6 +210,10 @@ pub struct FocusSubConfig {
 #[derive(Debug, Clone)]
 pub struct OutputConfig {
     pub name: String,
+    /// Unset position leaves the physical desktop arrangement unchanged.
+    pub position_set: bool,
+    /// Select this output in wiri once at startup, not as the Windows primary display.
+    pub focus_at_startup: bool,
     pub position: Position,
     pub width: u32,
     pub height: u32,
@@ -1819,6 +1825,8 @@ mod tests {
     fn test_output_config_mod_key_field_can_be_set() {
         let mut out = OutputConfig {
             name: "DP-1".to_string(),
+            position_set: false,
+            focus_at_startup: false,
             position: Position::default(),
             width: 1920,
             height: 1080,
