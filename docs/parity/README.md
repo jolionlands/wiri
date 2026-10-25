@@ -13,15 +13,15 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 30 | 70 | 111 | 15 |
-| Config, input and IPC (259 rows) | 15 | 86 | 88 | 70 |
+| Layout and behaviour (226 rows) | 53 | 58 | 100 | 15 |
+| Config, input and IPC (259 rows) | 43 | 74 | 72 | 70 |
 
-The counts are as of Phase 1 (`6ea45e4`); the matrices were 2 / 85 / 124 / 15 and 11 / 87 / 91 / 70
-when they were written.  Line numbers in both files refer to commit 1532635. The live fixes since then
-(Phase 0 up to 4b9d834, Phase 1 up to `6ea45e4`) closed some rows and updated the evidence of others
-(a row says "Phase 1, item N" when that item changed it); each matrix ends with a list of the working-tree
-edits that were in flight while it was written.  [The Phase 1 report](phase1-report.md) lists what was
-verified live and what only by unit tests.
+The counts are as of Phase 2A (`b702890`; Phase 1 was 30 / 70 / 111 / 15 and 15 / 86 / 88 / 70, and the matrices were
+2 / 85 / 124 / 15 and 11 / 87 / 91 / 70 when they were written).  Line numbers in both files refer to commit 1532635. The live
+fixes since then (Phase 0 up to 4b9d834, Phase 1 up to `6ea45e4`, Phase 2A up to `b702890`) closed some rows and updated the
+evidence of others (a row says "Phase 1, item N" or "Phase 2A, item N" when that item changed it); each matrix ends with a list
+of the working-tree edits that were in flight while it was written.  [The Phase 1 report](phase1-report.md) and
+[the Phase 2A report](phase2a-report.md) list what was verified live and what only by unit tests.
 
 ## Plan
 
@@ -43,12 +43,18 @@ back after a crash); monitor unplug keeps the windows (**unit-tested only: the t
 display**); hiding inactive workspaces by shell cloaking so windows stay in the taskbar and Alt+Tab is
 there as the opt-in `hide-method "cloak"` (`SW_HIDE` stays the default).
 
-**Phase 2, niri feel (P1):** a real KDL parser with visible errors; a low-level keyboard
-bind engine (Win-key chords, repeat, cooldown); mouse and wheel binds; one overlay layer
-for focus ring, border, shadow, tab indicator and insert hint; the spring animation
-pipeline; tabs; the fullscreen and maximize model; the window-rule engine; an overview
-that zooms out the workspaces and a recent-windows switcher; hotkey overlay; a generic
-IPC action request and niri's event stream; PNG and clipboard screenshots.
+**Phase 2A, done (`0a0bb75`..`b702890`, [report](phase2a-report.md)):** a real KDL parser with visible
+errors (a bad config is never applied half; `cooldown-ms=` and `repeat=false` act); window rules that act
+(`open-on-output`, `open-on-workspace`, `open-floating`, `open-fullscreen`, `open-maximized`, `open-focused`,
+default sizes, size limits, opacity that follows the window); the fullscreen and maximize model (the window keeps
+its column, `maximize-window-to-edges`, an application that goes fullscreen or maximizes itself is followed);
+niri's IPC (the event stream: the state first, then every change; `wiri-ctl action` with niri's arguments, quoting
+and `--id`).
+
+**Phase 2, niri feel (P1), still to do:** a low-level keyboard bind engine (Win-key chords, repeat); mouse and
+wheel binds; one overlay layer for focus ring, border, shadow, tab indicator and insert hint; the spring animation
+pipeline; tabs; an overview that zooms out the workspaces and a recent-windows switcher; hotkey overlay; PNG and
+clipboard screenshots.
 
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
 quoted autostart path, ARM64 release builds, docs and a demo.
@@ -72,4 +78,5 @@ presses, and writes `summary.json` plus screenshots. A change is done when `carg
 --release` and `cargo check --release --all-targets` with `RUSTFLAGS=-D warnings` pass and
 the live gates hold (no repositioning once settled, every test window tiled without
 overlap, no IPC timeouts, no unknown-key warnings, every window visible after quit and
-after a crash restart).
+after a crash restart).  A live run holds a machine-wide lock, so two runs can never overlap
+and spoil each other.
