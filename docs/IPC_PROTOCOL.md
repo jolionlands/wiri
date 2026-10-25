@@ -28,8 +28,21 @@ to query or control wiri at runtime.
 wiri exposes a **named-pipe IPC server** at:
 
 ```
-\\.\pipe\wiri_control
+\\.\pipe\wiri_control_<user>_<session>
 ```
+
+The name carries the user and the session the daemon runs in, because a pipe
+name is machine-global on Windows: with one name for everybody, a second user
+logged in on the same machine (fast user switching, an RDP session) could not
+create its pipe, and its clients would have talked to the first user's daemon.
+`<user>` is the account name (`GetUserNameW`), `<session>` the session id
+(`ProcessIdToSessionId`); both are made safe for a pipe name (letters, digits,
+`-`, `_` and `.` are kept, everything else becomes `_`).
+
+`WIRI_PIPE` overrides the name: set it to the full pipe path
+(`\\.\pipe\wiri_control_alice_1`) and both the daemon and the clients use it.
+That is what the tests use, and what a client that was told where the daemon
+listens uses.
 
 The protocol is simple:
 
@@ -64,8 +77,8 @@ The named pipe is created with a DACL that limits access to:
 | Object owner (wiri process user) | Full | `(A;;GA;;;OW)` |
 
 Other local users on a shared workstation **cannot connect** to
-`\\.\pipe\wiri_control`. Connections from non-elevated processes running as the
-same user succeed because ownership matches.
+`\\.\pipe\wiri_control_<user>_<session>`. Connections from non-elevated
+processes running as the same user succeed because ownership matches.
 
 If wiri cannot build the custom DACL at startup it falls back to the default
 pipe security (inherited from the process token), logging a warning.
@@ -1057,10 +1070,12 @@ use std::io::{Read, Write};
 use std::fs::OpenOptions;
 
 fn main() {
+    // The pipe of this user in this session; `WIRI_PIPE` overrides the name.
+    let path = wiri::ipc::pipe_path();
     let mut pipe = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(r"\\.\pipe\wiri_control")
+        .open(&path)
         .expect("wiri not running");
 
     let req = r#"{"type":"get_state"}"#;
@@ -1084,10 +1099,11 @@ use std::io::Write;
 use std::fs::OpenOptions;
 
 fn main() {
+    let path = wiri::ipc::pipe_path();
     let mut pipe = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(r"\\.\pipe\wiri_control")
+        .open(&path)
         .expect("wiri not running");
 
     let sub = r#"{"type":"subscribe_events","data":{"event_types":[]}}"#;
@@ -1114,10 +1130,27 @@ fn main() {
 ### 7.3 Python — one-shot query (pywin32)
 
 ```python
-import win32file
+import ctypes
+import getpass
 import json
+import os
+import re
+import win32file
+from ctypes import wintypes
 
-PIPE = r'\\.\pipe\wiri_control'
+
+def session_id():
+    """The session this process runs in (1 is the console session)."""
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    sid = wintypes.DWORD()
+    if not kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(sid)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return sid.value
+
+
+# The pipe of this user in this session; WIRI_PIPE overrides the name.
+user = re.sub(r'[^A-Za-z0-9._-]', '_', getpass.getuser())
+PIPE = os.environ.get('WIRI_PIPE') or r'\\.\pipe\wiri_control_%s_%d' % (user, session_id())
 
 handle = win32file.CreateFile(
     PIPE,
@@ -1148,8 +1181,10 @@ win32file.CloseHandle(handle)
 ```python
 import win32file
 import json
+import os
 
-PIPE = r'\\.\pipe\wiri_control'
+# The same name as in 7.3 (WIRI_PIPE, or wiri_control_<user>_<session>).
+PIPE = os.environ.get('WIRI_PIPE') or r'\\.\pipe\wiri_control_alice_1'
 
 handle = win32file.CreateFile(
     PIPE,
@@ -1193,8 +1228,17 @@ win32file.CloseHandle(handle)
 ### 7.5 PowerShell — one-shot query
 
 ```powershell
+# The pipe of this user in this session; WIRI_PIPE overrides the name.
+$user = ($env:USERNAME -replace '[^A-Za-z0-9._-]', '_')
+$session = (Get-Process -Id $PID).SessionId
+$pipeName = if ($env:WIRI_PIPE) {
+    $env:WIRI_PIPE -replace '^\\\\\.\\pipe\\', ''
+} else {
+    "wiri_control_${user}_${session}"
+}
+
 $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
-    '.', 'wiri_control',
+    '.', $pipeName,
     [System.IO.Pipes.PipeDirection]::InOut
 )
 $pipe.Connect(5000)   # 5-second timeout
@@ -1215,8 +1259,17 @@ $response | ConvertFrom-Json | ConvertTo-Json -Depth 10
 ### 7.6 PowerShell — event subscriber
 
 ```powershell
+# The same name as in 7.5.
+$user = ($env:USERNAME -replace '[^A-Za-z0-9._-]', '_')
+$session = (Get-Process -Id $PID).SessionId
+$pipeName = if ($env:WIRI_PIPE) {
+    $env:WIRI_PIPE -replace '^\\\\\.\\pipe\\', ''
+} else {
+    "wiri_control_${user}_${session}"
+}
+
 $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
-    '.', 'wiri_control',
+    '.', $pipeName,
     [System.IO.Pipes.PipeDirection]::InOut
 )
 $pipe.Connect(5000)
@@ -1266,7 +1319,8 @@ wiri-ctl events --stream | jq -r '.type + " " + (.data | tostring)'
 
 The schema is currently at **version 1.2**.  1.2 (2026-10-25) adds niri's request/reply forms
 (§4.9: `workspaces`, `windows`, `focused_window`, `overview_state` and `version`, each answering with
-niri's own shapes).
+niri's own shapes) and the pipe name of the user and the session
+(`\\.\pipe\wiri_control_<user>_<session>`, `WIRI_PIPE` overrides it).
 
 1.1 (2026-10-25) adds niri's event stream (§6.2: the
 state first, then `windows_changed`, `window_opened_or_changed`, `window_focus_changed`,
@@ -1431,7 +1485,8 @@ wiri-ctl reserve-area top 0     # release
 
 ### aurora / crest integration checklist
 
-1. Open `\\.\pipe\wiri_control` with `GENERIC_READ | GENERIC_WRITE`.
+1. Open `\\.\pipe\wiri_control_<user>_<session>` with `GENERIC_READ | GENERIC_WRITE`
+   (the pipe of this user in this session; `WIRI_PIPE` names another one).
 2. Send `subscribe_events` with the event types you care about.
 3. Parse the ack (skip if `subscription_id` is present).
 4. Read events in a background thread/task; dispatch by `"type"`.

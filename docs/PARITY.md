@@ -108,7 +108,7 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 
 | Feature | Status | Notes |
 | --- | :---: | --- |
-| Named-pipe IPC at `\\.\pipe\wiri_control` | ✅ | ACL: Admins + owner only |
+| Named-pipe IPC at `\\.\pipe\wiri_control_<user>_<session>` | ✅ | ACL: Admins + owner only; the name is per user and session, so a second user on the machine does not collide |
 | 30+ `wiri-ctl` subcommands, human + `--json` output | ✅ | |
 | Event streaming (`wiri-ctl events`) | ✅ | wall-clock timestamps |
 | Diagnostic `list-monitors` | ✅ | |

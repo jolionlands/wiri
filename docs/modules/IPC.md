@@ -20,10 +20,13 @@ ipc/
 ### Pipe Path
 
 `
-\\.\pipe\wiri_control
+\\.\pipe\wiri_control_<user>_<session>
 `
 
-The pipe name is fixed for simplicity, allowing external tools to connect without configuration.
+The name carries the user and the session the daemon runs in, because a pipe
+name is machine-global on Windows: with one name for everybody, a second user
+logged in on the same machine would collide with the first one.  `WIRI_PIPE`
+overrides the name (the tests use it).
 
 ### Protocol
 
@@ -223,7 +226,8 @@ struct ClientSubscription {
 impl IpcServer {
     /// Create new IPC server
     pub fn new(rt: Handle) -> Result<Self> {
-        let pipe_name = r""\\.\pipe\wiri_control"".to_string();
+        // The pipe of this user in this session.
+        let pipe_name = crate::ipc::pipe_path();
 
         // Security attributes for secure pipe creation
         let sa = SecurityAttributes::new()
@@ -341,7 +345,8 @@ pub struct IpcClient {
 impl IpcClient {
     /// Connect to the IPC server
     pub async fn connect() -> Result<Self> {
-        let pipe_name = r""\\.\pipe\wiri_control"";
+        // The pipe of this user in this session.
+        let pipe_name = crate::ipc::pipe_path();
 
         // Wait for pipe to be available with timeout
         let timeout = 5000; // 5 seconds

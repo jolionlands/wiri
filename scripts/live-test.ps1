@@ -2236,7 +2236,15 @@ function H15Step([scriptblock]$act, [int]$settleMs) {
 }
 # A request written to the pipe as it is, the way a client in another language sends it.
 function PipeRequest([string]$json) {
-    $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'wiri_control', [System.IO.Pipes.PipeDirection]::InOut)
+    # The pipe of this user in this session (WIRI_PIPE overrides the name).
+    $pipeName = if ($env:WIRI_PIPE) {
+        $env:WIRI_PIPE -replace '^\\\\\.\\pipe\\', ''
+    } else {
+        $user = ($env:USERNAME -replace '[^A-Za-z0-9._-]', '_')
+        $session = (Get-Process -Id $PID).SessionId
+        "wiri_control_${user}_${session}"
+    }
+    $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
     try {
         $c.Connect(5000)
         $bytes = [Text.Encoding]::UTF8.GetBytes($json)

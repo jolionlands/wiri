@@ -106,7 +106,10 @@ window-rule {
 
 ## IPC
 
-wiri exposes a named pipe at `\\.\pipe\wiri_control`. The bundled `wiri-ctl` CLI is the friendly front end:
+wiri exposes a named pipe at `\\.\pipe\wiri_control_<user>_<session>` — the pipe of the
+user and the session the daemon runs in, so that a second user logged in on the same
+machine does not collide with the first one (`WIRI_PIPE` overrides the name). The
+bundled `wiri-ctl` CLI is the friendly front end:
 
 ```pwsh
 wiri-ctl state                       # current engine state

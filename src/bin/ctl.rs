@@ -1,6 +1,7 @@
 //! wiri-ctl — command-line client for the wiri window manager.
 //!
-//! Sends IpcMessage requests over the named pipe at `\\.\pipe\wiri_control`
+//! Sends IpcMessage requests over the named pipe of this user and this session
+//! (`\\.\pipe\wiri_control_<user>_<session>`; `WIRI_PIPE` overrides the name)
 //! and pretty-prints the response.  Pass `--json` to any subcommand for the
 //! raw JSON body (useful for scripting).
 
@@ -13,7 +14,7 @@ use std::os::windows::ffi::OsStrExt;
 use windows::core::PCWSTR;
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 
-use wiri::ipc::{IpcMessage, PIPE_PATH};
+use wiri::ipc::IpcMessage;
 
 // ---------------------------------------------------------------------------
 // Console-safe output
@@ -1469,7 +1470,8 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
     };
 
     // The pipe of this user in this session (see `wiri::ipc::pipe_path`).
-    let pipe_wide: Vec<u16> = OsStr::new(PIPE_PATH)
+    let pipe_path = wiri::ipc::pipe_path();
+    let pipe_wide: Vec<u16> = OsStr::new(&pipe_path)
         .encode_wide()
         .chain(std::iter::once(0u16))
         .collect();
@@ -1480,7 +1482,7 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
         let os_err = std::io::Error::last_os_error();
         anyhow::bail!(
             "Could not connect to wiri IPC pipe at {} — is wiri running?  ({})",
-            PIPE_PATH,
+            pipe_path,
             os_err
         );
     }
@@ -1488,11 +1490,11 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(PIPE_PATH)
+        .open(&pipe_path)
         .map_err(|e| {
             anyhow::anyhow!(
                 "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-                PIPE_PATH,
+                pipe_path,
                 e
             )
         })?;
@@ -1585,7 +1587,9 @@ fn summarize_value(v: &serde_json::Value) -> String {
 // ---------------------------------------------------------------------------
 
 fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_json::Value> {
-    let pipe_wide: Vec<u16> = OsStr::new(PIPE_PATH)
+    // The pipe of this user in this session (see `wiri::ipc::pipe_path`).
+    let pipe_path = wiri::ipc::pipe_path();
+    let pipe_wide: Vec<u16> = OsStr::new(&pipe_path)
         .encode_wide()
         .chain(std::iter::once(0u16))
         .collect();
@@ -1603,18 +1607,18 @@ fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_jso
                 "wiri busy: pipe wait timed out after {}s at {}.\n\
                  Try increasing --timeout, or restart wiri if it is unresponsive.",
                 timeout_secs,
-                PIPE_PATH
+                pipe_path
             );
         } else if os_err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) {
             anyhow::bail!(
                 "Could not find the wiri IPC pipe at {} — is wiri running?",
-                PIPE_PATH
+                pipe_path
             );
         } else {
             anyhow::bail!(
                 "WaitNamedPipeW failed for {}: {}\n\
                  (is wiri running?)",
-                PIPE_PATH,
+                pipe_path,
                 os_err
             );
         }
@@ -1623,11 +1627,11 @@ fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_jso
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(PIPE_PATH)
+        .open(&pipe_path)
         .map_err(|e| {
             anyhow::anyhow!(
                 "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-                PIPE_PATH,
+                pipe_path,
                 e
             )
         })?;

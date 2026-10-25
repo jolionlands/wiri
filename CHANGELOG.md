@@ -5,6 +5,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### The pipe belongs to the user and the session (2026-10-25)
+- **A second user can run wiri.**  The pipe name was machine-global
+  (`\\.\pipe\wiri_control`), so the second user logged in on the same machine (fast
+  user switching, an RDP session) could not create its pipe, was told "another wiri
+  instance is already running", and its clients would have talked to the first user's
+  daemon.  The pipe is now the pipe of one user in one session:
+  `\\.\pipe\wiri_control_<user>_<session>` (the account name and the session id, made
+  safe for a pipe name).  The server, the client and the single-instance check use the
+  same function (`wiri::ipc::pipe_path()`), and `WIRI_PIPE` overrides the name.
+
 ### IPC 1.2 — niri's request/reply forms (2026-10-25)
 - **Five requests answer with niri's shapes.**  `workspaces`, `windows`, `focused_window`,
   `overview_state` and `version` are answered from the engine's current state, with the

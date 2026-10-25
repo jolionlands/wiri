@@ -10,7 +10,7 @@ use super::messages::{
     VersionResponse, WorkspaceInfo, WindowsResponse, WorkspacesResponse,
 };
 use super::state::{self, IpcSnapshot};
-use super::PIPE_PATH;
+use super::pipe_path;
 use crate::layout::TilingEngine;
 use crate::utils::{Rect, WindowId};
 
@@ -18,6 +18,11 @@ use crate::utils::{Rect, WindowId};
 /// that wiri is busy.  `wiri-ctl` and scripts rely on a reply within about two
 /// seconds, whatever the window manager is doing.
 const IPC_RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// `CreateNamedPipe` with `FILE_FLAG_FIRST_PIPE_INSTANCE` fails with this when
+/// the pipe name is already taken: another wiri of this user and session is
+/// serving it.
+const ERROR_ACCESS_DENIED: i32 = 5;
 
 pub struct IpcServer {
     event_tx: broadcast::Sender<IpcEvent>,
@@ -213,8 +218,8 @@ impl IpcServer {
     ///
     /// Security: the named pipe is created with a DACL that grants only
     /// `BUILTIN\Administrators` and the file owner full access — preventing
-    /// other local users from connecting via `\\.\pipe\wiri_control` even on
-    /// a shared workstation.  Implemented via tokio's
+    /// other local users from connecting via `\\.\pipe\wiri_control_<user>_<session>`
+    /// even on a shared workstation.  Implemented via tokio's
     /// `ServerOptions::create_with_security_attributes_raw` so the ACL applies
     /// to every pipe instance, not just the first.
     ///
@@ -227,10 +232,23 @@ impl IpcServer {
     /// synchronous build first, *then* awaits `connect`.  The resulting future
     /// is `Send`, so plain `tokio::spawn` on the multi-thread runtime is fine.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        info!(
-            "IPC server starting on {} (ACL: Admins+Owner only)",
-            PIPE_PATH
-        );
+        // The pipe of this user in this session: another user logged in on the
+        // same machine has a pipe of its own.
+        let pipe = pipe_path();
+        info!("IPC server starting on {} (ACL: Admins+Owner only)", pipe);
+
+        // Another wiri of this user and session may already be running.  The
+        // probe in `main.rs` looks at the machine-wide pipe name and cannot see
+        // the per-user one, so the check is made here, against the pipe that is
+        // actually served.
+        if super::pipe_has_listener(&pipe) {
+            error!(
+                "Another wiri instance is already running (pipe {} has an active listener).",
+                pipe
+            );
+            error!("Use `wiri-ctl quit` to stop it, or kill the process first.");
+            std::process::exit(2);
+        }
 
         const MAX_CREATE_RETRIES: u32 = 5;
         let mut retry_count = 0u32;
@@ -239,7 +257,7 @@ impl IpcServer {
         loop {
             // Synchronous pipe creation — SECURITY_ATTRIBUTES is materialised
             // and dropped entirely within this call, before any `.await` below.
-            let create_result = create_pipe_with_sa(first_instance);
+            let create_result = create_pipe_with_sa(first_instance, &pipe);
             let server = match create_result {
                 Ok(s) => {
                     retry_count = 0;
@@ -247,9 +265,22 @@ impl IpcServer {
                     s
                 }
                 Err(e) if first_instance => {
-                    // First-instance attempt failed — fall back to not requesting
-                    // first_pipe_instance in case another (stale) handle exists.
-                    match create_pipe_with_sa(false) {
+                    // The pipe of this user in this session is taken: another
+                    // wiri is serving it.  (A pipe name is released as soon as
+                    // the last handle to it is closed, so this is not a stale
+                    // one.)
+                    if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+                        error!(
+                            "Another wiri instance is already running (pipe {} is taken).",
+                            pipe
+                        );
+                        error!("Use `wiri-ctl quit` to stop it, or kill the process first.");
+                        std::process::exit(2);
+                    }
+                    // First-instance attempt failed for another reason — fall
+                    // back to not requesting first_pipe_instance in case another
+                    // (stale) handle exists.
+                    match create_pipe_with_sa(false, &pipe) {
                         Ok(s) => {
                             retry_count = 0;
                             first_instance = false;
@@ -2080,6 +2111,7 @@ fn focus_window_by_hwnd(
 /// single-instance probe).
 fn create_pipe_with_sa(
     first_instance: bool,
+    path: &str,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -2109,7 +2141,7 @@ fn create_pipe_with_sa(
     let server = unsafe {
         ServerOptions::new()
             .first_pipe_instance(first_instance)
-            .create_with_security_attributes_raw(PIPE_PATH, sa_ptr)?
+            .create_with_security_attributes_raw(path, sa_ptr)?
     };
     let _ = sa_opt; // keep alive until after the create call.
     Ok(server)

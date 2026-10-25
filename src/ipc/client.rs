@@ -4,7 +4,7 @@
 use tracing::info;
 
 use super::messages::{IpcError, IpcMessage, StateResponse, WindowInfoIpc};
-use super::PIPE_PATH;
+use super::pipe_path;
 
 pub struct IpcClient {
     pipe: Option<tokio::net::windows::named_pipe::NamedPipeClient>,
@@ -18,12 +18,14 @@ impl IpcClient {
     pub async fn connect(&mut self) -> Result<(), IpcError> {
         use tokio::net::windows::named_pipe::ClientOptions;
 
+        // The pipe of this user in this session (see `wiri::ipc::pipe_path`).
+        let path = pipe_path();
         let pipe = ClientOptions::new()
-            .open(PIPE_PATH)
+            .open(&path)
             .map_err(|e| IpcError::ConnectionFailed(e.to_string()))?;
 
         self.pipe = Some(pipe);
-        info!("IPC client connected to {}", PIPE_PATH);
+        info!("IPC client connected to {}", path);
         Ok(())
     }
 

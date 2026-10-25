@@ -6,8 +6,10 @@ A grab-bag of issues you may hit and how to recover.
 
 ### "Another wiri instance is already running"
 
-The IPC named pipe at `\\.\pipe\wiri_control` is held by another process. If
-you're sure wiri isn't running, the pipe may be orphaned. Either:
+The IPC named pipe at `\\.\pipe\wiri_control_<user>_<session>` is held by another
+process.  The name carries the user and the session, so the other instance is one
+of your own, in the same session.  If you're sure wiri isn't running, the pipe may
+be orphaned. Either:
 
 ```pwsh
 wiri-ctl quit         # graceful shutdown of the other instance
@@ -15,7 +17,8 @@ wiri-ctl quit         # graceful shutdown of the other instance
 Get-Process wiri | Stop-Process
 ```
 
-Then start wiri again.
+Then start wiri again.  The name of the pipe wiri listens on is in the log
+(`IPC server starting on \\.\pipe\...`); `WIRI_PIPE` names another one.
 
 ### Where is wiri's log?
 

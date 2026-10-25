@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jolionlands/wiri/raw/main/docs/IPC_SCHEMA.json",
   "title": "wiri IPC protocol",
-  "description": "JSON Schema for every IpcMessage request and IpcEvent variant in the wiri window manager named-pipe IPC. Both types use serde adjacent tagging: {\"type\": \"<variant>\", \"data\": {...}}.",
+  "description": "JSON Schema for every IpcMessage request and IpcEvent variant in the wiri window manager named-pipe IPC. Both types use serde adjacent tagging: {\"type\": \"<variant>\", \"data\": {...}}. The daemon serves on the pipe of one user in one session (\\\\.\\pipe\\wiri_control_<user>_<session>); WIRI_PIPE overrides the name.",
   "version": "1.2",
   "$defs": {
 

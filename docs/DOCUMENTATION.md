@@ -35,7 +35,7 @@
 | **Floating Windows** | Toggle any window to/from floating mode |
 | **Configurable** | KDL configuration file with hot-reload support |
 | **Windows 11 Focus** | Uses `DWMWA_BORDER_COLOR` for colored window borders on Win11+ |
-| **IPC** | Named pipe control interface (`\\.\pipe\wiri_control`) |
+| **IPC** | Named pipe control interface (`\\.\pipe\wiri_control_<user>_<session>`) |
 | **Animation Framework** | Tick-based interpolation with 6 easing functions |
 | **Interactive Mouse** | Alt+drag for move/resize via `WH_MOUSE_LL` global hook |
 
@@ -559,7 +559,7 @@ misspelled action or key is an error.  wiri's older line form (`Mod+Shift+T spaw
 
 ## 6. IPC Protocol
 
-wiri exposes a **named pipe** at `\\.\pipe\wiri_control` for external control via the `wiri-ctl` CLI tool.
+wiri exposes a **named pipe** at `\\.\pipe\wiri_control_<user>_<session>` for external control via the `wiri-ctl` CLI tool.  The name carries the user and the session the daemon runs in, so that a second user logged in on the same machine does not collide with the first one; `WIRI_PIPE` overrides it.
 
 ### Connection
 
@@ -1169,7 +1169,8 @@ pub enum IpcMessage {
 
 **`IpcError`** — Typed error enum: `ConnectionFailed`, `ReadError`, `WriteError`, `SerializationError`, `PipeCreationFailed`, `ClientDisconnected`, `Timeout`, `InvalidMessage`, `WindowsError`.
 
-**Pipe path:** `\\.\pipe\wiri_control`
+**Pipe path:** `\\.\pipe\wiri_control_<user>_<session>` — the pipe of the user and the session
+the daemon runs in (`wiri::ipc::pipe_path()`; `WIRI_PIPE` overrides the name).
 
 ### 7.7 Hooks (`src/hooks/`)
 
