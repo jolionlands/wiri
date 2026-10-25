@@ -97,7 +97,15 @@ fn current_user_name() -> String {
     if ok.is_err() {
         return String::new();
     }
-    String::from_utf16_lossy(&buffer[..len as usize])
+    user_name_from_wide(&buffer[..(len as usize).min(buffer.len())])
+}
+
+/// The name in a `GetUserNameW` buffer.  The length it reports counts the
+/// terminating NUL, which would otherwise become a `_` in the pipe name
+/// (`wiri_control_ark__1` instead of the documented `wiri_control_ark_1`).
+fn user_name_from_wide(buffer: &[u16]) -> String {
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
 }
 
 /// The session this process runs in (1 is the console session, more for an RDP
@@ -165,6 +173,18 @@ mod tests {
             pipe_path_with(None, "alice", 42),
             r"\\.\pipe\wiri_control_alice_42"
         );
+    }
+
+    #[test]
+    fn the_terminating_nul_of_the_user_name_is_not_part_of_it() {
+        let wide: Vec<u16> = "ark\0".encode_utf16().collect();
+        assert_eq!(user_name_from_wide(&wide), "ark");
+        assert_eq!(
+            pipe_path_with(None, &user_name_from_wide(&wide), 1),
+            r"\\.\pipe\wiri_control_ark_1"
+        );
+        let bare: Vec<u16> = "ark".encode_utf16().collect();
+        assert_eq!(user_name_from_wide(&bare), "ark");
     }
 
     #[test]
