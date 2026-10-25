@@ -31,9 +31,20 @@ function H20RBounds([IntPtr]$h) {
 }
 function H20RObserve {
     if ($null -eq $h20rWatch) { return }
-    $now = @($h20rForms | ForEach-Object { H20RBounds $_ })
-    if (($now -join ';') -ne $h20rWatch.bounds -or [LT]::GetForegroundWindow() -ne $h20rWatch.origin) {
+    $now = @($h20rForms | ForEach-Object { H20RBounds $_ }) -join ';'
+    $foreground = [LT]::GetForegroundWindow()
+    $boundsChanged = $now -ne $h20rWatch.bounds
+    $focusChanged = $foreground -ne $h20rWatch.origin
+    if ($boundsChanged -or $focusChanged) {
         $h20rWatch.ok = $false
+        if ($null -eq $h20rWatch.first_mismatch) {
+            $h20rWatch.first_mismatch = [ordered]@{
+                at_utc = [DateTime]::UtcNow.ToString('o'); bounds_changed = $boundsChanged
+                focus_changed = $focusChanged; observed_bounds = $now; foreground = [int64]$foreground
+                foreground_title = [LT]::Title($foreground); foreground_class = [LT]::Class($foreground)
+                foreground_pid = [LT]::Pid($foreground)
+            }
+        }
     }
     $h20rWatch.samples++
 }
@@ -82,15 +93,32 @@ function H20REndSession {
         if (@(H20RHosts).Count -gt 0) { H20RTap 0x1B; $null = H20RGone }
     } finally { H20RRelease }
 }
-function H20RHold([int]$durationMs, [IntPtr]$origin, [long]$selected) {
+function H20RHold([int]$durationMs, [IntPtr]$origin, [long]$selected, [string]$heldModifier) {
     # A negative assertion is observed continuously, not inferred from a single 100ms sleep.
-    $clock = [Diagnostics.Stopwatch]::StartNew(); $ok = $true
+    $started = [DateTime]::UtcNow.ToString('o')
+    $clock = [Diagnostics.Stopwatch]::StartNew(); $ok = $true; $samples = 0; $firstFailure = $null
     do {
         H20RObserve
-        if (-not (H20RShown) -or [LT]::GetForegroundWindow() -ne $origin -or
-            (H20RProp 'WiriRecentSelectedWindow') -ne $selected) { $ok = $false }
+        $shown = H20RShown; $foreground = [LT]::GetForegroundWindow()
+        $actualSelection = H20RProp 'WiriRecentSelectedWindow'
+        if (-not $shown -or $foreground -ne $origin -or $actualSelection -ne $selected) {
+            $ok = $false
+            if ($null -eq $firstFailure) {
+                $firstFailure = [ordered]@{
+                    at_utc = [DateTime]::UtcNow.ToString('o'); elapsed_ms = $clock.ElapsedMilliseconds
+                    host_shown = $shown; foreground = [int64]$foreground; selected = $actualSelection
+                    foreground_title = [LT]::Title($foreground); foreground_class = [LT]::Class($foreground)
+                }
+            }
+        }
+        $samples++
         Start-Sleep -Milliseconds 25
     } while ($clock.ElapsedMilliseconds -lt $durationMs)
+    $h20rEvidence['modifier_holds'] += [ordered]@{
+        held_modifier = $heldModifier; started_at_utc = $started; duration_ms = $durationMs
+        expected_foreground = [int64]$origin; expected_selection = $selected
+        samples = $samples; ok = $ok; first_failure = $firstFailure
+    }
     return $ok
 }
 function H20RHoldCancelled([int]$durationMs, [IntPtr]$origin) {
@@ -138,6 +166,7 @@ $h20rEvidence = [ordered]@{
     scope_coverage = 'A/O/W/S mode changes only; no distinct-output/workspace filtering claim'
     identity_coverage = 'same executable, different/changed titles only; no distinct-app exclusion claim'
     debounce_ms = 750; configured_max_height = 96; max_scale = 0.5; padding = 30
+    modifier_holds = @()
 }
 $h20rConfig = @'
 input { mod-key "ctrl-alt"; }
@@ -184,6 +213,9 @@ public static class H20RecentNative {
     $h20rProc = Start-WiriWithConfig $h20rConfig (Join-Path $D 'h20-stderr.log')
     $h20rProcId = $h20rProc.Id
     H20RRequire (-not $h20rProc.HasExited) 'H20 daemon exited during startup.'
+    # Cache the live process handle, as Ctl does: otherwise Start-Process's object
+    # can report an empty ExitCode after exit even when WaitForExit succeeds.
+    $null = $h20rProc.Handle
     $h20rForms += [TestForms]::OpenKeys('wiri-h20-title-alpha-key-recorder')
     $h20rForms += [TestForms]::Open('wiri-h20-title-bravo', 130, 90, 120)
     $h20rForms += [TestForms]::Open('wiri-h20-title-charlie', 70, 150, 120)
@@ -198,8 +230,9 @@ public static class H20RecentNative {
     $h20rOrigin = $h20rForms[2]
     $h20rWatch = [pscustomobject]@{
         bounds = (@($h20rForms | ForEach-Object { H20RBounds $_ }) -join ';')
-        origin = $h20rOrigin; ok = $true; samples = 0
+        origin = $h20rOrigin; ok = $true; samples = 0; first_mismatch = $null
     }
+    $h20rEvidence['source_watch'] = $h20rWatch
     try {
         H20RRequire (H20ROpen) 'No visible live recent-windows host after Alt+Tab.'
         $summary.h20_real_dwm_previews = H20RWait { (H20RShown) -and (H20RProp 'WiriRecentThumbnailCount') -ge 2 }
@@ -242,22 +275,29 @@ public static class H20RecentNative {
             observed_1366x768 = ($mw -eq 1366 -and $mh -eq 768)
         }
 
-        # Keep the selection alive with OTHER physical modifier families after opening Alt is up.
-        [LT]::Key(0x10, $false); [LT]::Key(0x11, $false); [LT]::Key(0x5B, $false)
-        [LT]::Key(0x12, $true)
-        $held1 = H20RHold 1000 $h20rOrigin ([int64]$h20rForms[0])
-        [LT]::Key(0x10, $true)
-        $held2 = H20RHold 500 $h20rOrigin ([int64]$h20rForms[0])
-        [LT]::Key(0x11, $true)
-        $held3 = H20RHold 500 $h20rOrigin ([int64]$h20rForms[0])
+        # Pairwise hand-offs avoid Ctrl+Alt+Shift+Win (the shell's Office-key chord).
+        # Each OTHER modifier family must sustain the session ALONE after opening Alt is up.
+        [LT]::Key(0x10, $false); [LT]::Key(0x12, $true)
+        $held1 = H20RHold 1000 $h20rOrigin ([int64]$h20rForms[0]) 'Shift'
+        [LT]::Key(0x5B, $false); [LT]::Key(0x10, $true)
+        $held2 = H20RHold 500 $h20rOrigin ([int64]$h20rForms[0]) 'Win'
+        # Keep Ctrl held across Win-up rather than finish on a bare Win release.
+        # Any shell focus/layout change still fails the same strict gates.
+        [LT]::Key(0x11, $false); [LT]::Key(0x5B, $true)
+        $held3 = H20RHold 500 $h20rOrigin ([int64]$h20rForms[0]) 'Ctrl'
         H20RObserve
         $summary.h20_sources_unchanged = ($h20rWatch.ok -and $h20rWatch.samples -gt 0)
         $h20rEvidence['source_watch'] = $h20rWatch
         $h20rWatch = $null # Focus may change only AFTER the last physical modifier is released.
-        [LT]::Key(0x5B, $true)
+        $releaseAt = [DateTime]::UtcNow.ToString('o')
+        [LT]::Key(0x11, $true)
         $committed = H20RWait { [LT]::GetForegroundWindow() -eq $h20rForms[0] -and @(H20RHosts).Count -eq 0 }
         $summary.h20_modifier_release_commit = ($held1 -and $held2 -and $held3 -and $committed)
         $h20rEvidence['held_modifier_observations'] = @($held1, $held2, $held3)
+        $h20rEvidence['modifier_commit'] = [ordered]@{
+            final_modifier = 'Ctrl'; released_at_utc = $releaseAt; committed = $committed
+            foreground = [int64][LT]::GetForegroundWindow(); remaining_hosts = @(H20RHosts).Count
+        }
     } finally { $h20rWatch = $null; H20REndSession }
 
     H20RSeed
@@ -333,12 +373,28 @@ public static class H20RecentNative {
         H20RRequire (H20ROpen) 'Cannot create an active preview host for quit teardown.'
         $quitHosts = @(H20RHosts)
         $liveBeforeQuit = H20RShown
+        # Preserve evidence for every conjunct; a false gate must not imply a host leak
+        # when it was actually a missing exit code or a failed live-host precondition.
+        $quitEvidence = [ordered]@{
+            started_at_utc = [DateTime]::UtcNow.ToString('o'); live_before_quit = $liveBeforeQuit
+            hosts_before = @($quitHosts | ForEach-Object { [int64]$_ }); single_host_before = ($quitHosts.Count -eq 1)
+            wait_timeout_ms = 10000; exited = $null; exit_code = $null; hosts_gone = $null
+            captured_hosts_destroyed = $null; surviving_captured_hosts = $null; remaining_hosts = $null
+        }
+        $h20rEvidence['quit'] = $quitEvidence
         $null = Ctl 'h20-quit-active' @('quit')
         $exited = $h20rProc.WaitForExit(10000)
+        $quitEvidence.exited = $exited
+        if ($exited) { $quitEvidence.exit_code = $h20rProc.ExitCode }
         $gone = H20RGone
-        $oldHostsDestroyed = @($quitHosts | Where-Object { [LT]::IsWindow($_) }).Count -eq 0
+        $quitEvidence.hosts_gone = $gone
+        $survivors = @($quitHosts | Where-Object { [LT]::IsWindow($_) })
+        $oldHostsDestroyed = $survivors.Count -eq 0
+        $quitEvidence.captured_hosts_destroyed = $oldHostsDestroyed
+        $quitEvidence.surviving_captured_hosts = @($survivors | ForEach-Object { [int64]$_ })
+        $quitEvidence.remaining_hosts = @(H20RHosts | ForEach-Object { [int64]$_ })
         $summary.h20_no_hosts_after_quit = ($liveBeforeQuit -and $quitHosts.Count -eq 1 -and
-            $exited -and $h20rProc.ExitCode -eq 0 -and $gone -and $oldHostsDestroyed)
+            $exited -and $quitEvidence.exit_code -eq 0 -and $gone -and $oldHostsDestroyed)
     } finally { H20RRelease }
     $summary.h20_fragment_completed = $true
 } catch {
@@ -352,6 +408,7 @@ public static class H20RecentNative {
         if ($null -ne $h20rProc -and -not $h20rProc.HasExited) { Stop-WiriGracefully $h20rProc 'h20-cleanup' }
         $summary['h20_cleanup_no_hosts'] = H20RGone
     } catch { $h20rIssues.Add("Daemon cleanup: $($_.Exception.Message)") }
+    finally { if ($null -ne $h20rProc) { $h20rProc.Dispose() } }
     foreach ($h in $h20rForms) {
         try { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
         catch { $h20rIssues.Add("Fixture cleanup: $($_.Exception.Message)") }

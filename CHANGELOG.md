@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — recent-window diagnostics
+- Preserve lane A's shell-collision-free recent-window fixture and foreground/preview diagnostics; no assertions are relaxed.
+
 ### Phase 2B integration — recent-window service
 - Import the isolated recent-window session/config/preview model and desktop checks, ahead of re-hosting its keyboard events on lane B's input pump.
 
