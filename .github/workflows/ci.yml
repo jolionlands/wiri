@@ -4,43 +4,78 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep flags identical across check/test/build so Cargo can reuse artifacts.
+  RUSTFLAGS: -D warnings
 
 jobs:
+  format:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   build:
-    name: Build & test (${{ matrix.target }})
-    runs-on: windows-latest
+    name: Native build & test (${{ matrix.target }})
+    needs: format
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-pc-windows-msvc
-          - aarch64-pc-windows-msvc
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # Standard hosted ARM64 runners are available to public repositories.
+          # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install native Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          toolchain: stable-${{ matrix.target }}
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Test (host target only)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test --release --no-fail-fast
-
-      - name: Check (no warnings)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+      - name: Verify native toolchain (not a cross-build or emulated tests)
+        shell: pwsh
         env:
-          RUSTFLAGS: -D warnings
-        run: cargo check --release --all-targets
+          EXPECTED_HOST: ${{ matrix.target }}
+          EXPECTED_ARCH: ${{ runner.arch }}
+        run: |
+          $hostLine = rustc -vV | Select-String '^host: '
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ("$hostLine" -ne "host: $env:EXPECTED_HOST") { throw "Unexpected Rust host: $hostLine" }
+          $wantedArch = if ($env:EXPECTED_HOST -like 'aarch64-*') { 'ARM64' } else { 'X64' }
+          if ($env:EXPECTED_ARCH -ne $wantedArch) { throw "Expected a native $wantedArch runner, got $env:EXPECTED_ARCH" }
+
+      - name: Cache cargo registry and target (per native job)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.target }}
+          # PRs may restore main's cache, but must not replace it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check all targets (fail early on warnings)
+        run: cargo check --release --all-targets -j 2 --locked
+
+      - name: Native tests
+        run: cargo test --release -j 2 --locked
+
+      - name: Build binaries
+        run: cargo build --release -j 2 --locked
