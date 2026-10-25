@@ -6,7 +6,7 @@ function Invoke-LaneEPerf {
     $metrics = [ordered]@{}
     foreach ($name in @(
         'exe_bytes', 'ctl_exe_bytes', 'cold_first_ipc_ms', 'cold_first_layout_ms', 'cold_samples',
-        'cold_start_call_ms', 'existing_sentinel_windows', 'managed_windows',
+        'cold_start_call_ms', 'cold_observer_start_max_ms', 'existing_sentinel_windows', 'managed_windows',
         'idle_seconds', 'idle_cpu_ms', 'idle_one_core_percent', 'idle_context_switches_per_s',
         'idle_input_changed', 'idle_new_threads', 'idle_exited_threads', 'idle_positioning_lines',
         'hotkey_samples', 'hotkey_timeouts', 'hotkey_invalid_samples', 'hotkey_move_median_ms',
@@ -34,7 +34,7 @@ function Invoke-LaneEPerf {
         utc = [DateTime]::UtcNow.ToString('o'); source_commit = ''; binary_version = ''
         configuration = 'shipped default_config.kdl; -v --no-autostart; tray on, animations/status bar/focus-follows-mouse off'
         cold_definition = 'OS process creation to complete successful get_state reply / both pre-existing sentinel windows at tiled heights and non-overlapping visible rects'
-        switches_method = 'NtQuerySystemInformation(SystemProcessInformation) per-thread cumulative ContextSwitches delta / elapsed QPC seconds; PID+TID+creation time matched'
+        switches_method = 'NtQuerySystemInformation(SystemProcessInformation) per-thread cumulative ContextSwitches delta / elapsed QPC seconds; process/TID creation identity matched. Endpoint-based lower bound: exited threads and threads born+exited between snapshots cannot be fully counted.'
         action_definition = 'log deltas from just before one action through 600 ms after it; all managed windows, not just the target'
         setwindowpos_definition = 'SetWindowPos [sync] SUCCESS log lines: successful positioning calls, NOT a complete native API trace (unlogged style/z-order/failures excluded)'
         latency_definition = 'Ctrl+Alt+Shift+F via one SendInput batch to first GetWindowRect change; 1 ms sleeps between observations; no DWM present/final-frame claim'
@@ -54,7 +54,7 @@ function Invoke-LaneEPerf {
     function PRequest([string]$json) {
         # Never send Quit/actions to somebody else's pipe after our child has exited.
         if ($null -eq $owned -or $owned.HasExited) { throw 'Lane E child is not running' }
-        $text = [LaneE.Native]::Request($json, 5000)
+        $text = [LaneE.Native]::Request($json, 5000, $owned.Id)
         $reply = $text | ConvertFrom-Json
         if ($reply.success -ne $true) { throw "Lane E IPC rejected request: $text" }
         return $reply
@@ -69,12 +69,16 @@ function Invoke-LaneEPerf {
         }
     }
     function PAction([string]$group, [string]$name, [string[]]$arguments) {
+        $before = @(FormInfo @($target))[0].rect
         $a = PLog
-        $json = @{ type = 'run_action'; data = @{ name = $name; args = @($arguments) } } | ConvertTo-Json -Compress -Depth 4
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $json = @{ type = 'run_action'; data = @{ name = $name; args = @($arguments) + @('--id', [string][int64]$target) } } | ConvertTo-Json -Compress -Depth 4
         $null = PRequest $json
         Start-Sleep -Milliseconds 600
         $b = PLog
+        $after = @(FormInfo @($target))[0].rect
         $actions.Add([pscustomobject]@{ group = $group; action = $name; args = @($arguments)
+            confirmed = ($before -ne $after); before = $before; after = $after; interval_ms = $clock.Elapsed.TotalMilliseconds
             setwindowpos_lines = $b.swp - $a.swp; positioning_lines = $b.positioning - $a.positioning
             fallback_lines = $b.fallback - $a.fallback })
     }
@@ -123,6 +127,8 @@ function Invoke-LaneEPerf {
         PValue 'cold_first_ipc_ms' $cold.FirstIpcMs
         PValue 'cold_first_layout_ms' $cold.FirstLayoutMs
         PValue 'cold_start_call_ms' $cold.StartCallMs
+        PValue 'cold_observer_start_max_ms' ([Math]::Max($cold.IpcObserverMs, $cold.LayoutObserverMs))
+        $evidence.cold_ipc_observer_ms = $cold.IpcObserverMs; $evidence.cold_layout_observer_ms = $cold.LayoutObserverMs
         PValue 'cold_samples' 1
         PValue 'existing_sentinel_windows' $sentinels.Count
         if ($cold.IpcError) { $errors.Add($cold.IpcError) }
@@ -164,35 +170,47 @@ function Invoke-LaneEPerf {
         for ($i = 0; $i -lt 10; $i++) {
             # Focus is set once, outside the timed region; refuse misattribution if another app steals it.
             $a = PLog
+            $clock = [Diagnostics.Stopwatch]::StartNew()
             $key = [LaneE.Native]::MaximizeAndObserve($target, 1500)
-            $keys.Add($key)
             if ($key.InputsSent -ne 8 -or $key.ForegroundBefore -ne [int64]$target -or $key.ForegroundAfter -ne [int64]$target) { $invalid++ }
-            if ($key.MoveMs -lt 0) { $timeouts++ }
+            if ($key.InputsSent -eq 8 -and $key.MoveMs -lt 0) { $timeouts++ }
             Start-Sleep -Milliseconds 600 # at least 600 ms between injections, even for a fast action
             $b = PLog
+            $finalRect = @(FormInfo @($target))[0].rect
+            $oldCoords = $key.Before -split ','; $newCoords = $finalRect -split ','
+            $widthDelta = ([int]$newCoords[2] - [int]$newCoords[0]) - ([int]$oldCoords[2] - [int]$oldCoords[0])
+            $confirmed = $key.InputsSent -eq 8 -and $key.MoveMs -ge 0 -and $key.ForegroundBefore -eq [int64]$target -and
+                $key.ForegroundAfter -eq [int64]$target -and $(if ($i % 2 -eq 0) { $widthDelta -gt 10 } else { $widthDelta -lt -10 })
+            $keys.Add([pscustomobject]@{ sample = $i + 1; confirmed = $confirmed; observed = $key; final_rect = $finalRect })
             $actions.Add([pscustomobject]@{ group = 'maximize'; action = 'maximize-column'; sample = $i + 1
+                confirmed = $confirmed; interval_ms = $clock.Elapsed.TotalMilliseconds
                 setwindowpos_lines = $b.swp - $a.swp; positioning_lines = $b.positioning - $a.positioning
                 fallback_lines = $b.fallback - $a.fallback })
+            if (-not $confirmed) { $errors.Add('Stopped hotkey observation after an unconfirmed transition (no further input injected)'); break }
         }
-        $valid = @($keys | Where-Object { $_.MoveMs -ge 0 -and $_.InputsSent -eq 8 -and $_.ForegroundBefore -eq [int64]$target -and $_.ForegroundAfter -eq [int64]$target })
+        $valid = @($keys | Where-Object { $_.confirmed } | ForEach-Object { $_.observed })
         PValue 'hotkey_samples' $valid.Count
         PValue 'hotkey_timeouts' $timeouts
         PValue 'hotkey_invalid_samples' $invalid
         PValue 'hotkey_move_median_ms' ([LaneE.Native]::Median([double[]]@($valid | ForEach-Object { $_.MoveMs })))
         if ($valid.Count -gt 0) { PValue 'hotkey_move_max_ms' (($valid | Measure-Object MoveMs -Maximum).Maximum) }
-        PValue 'hotkey_observer_gap_max_ms' (($keys | Measure-Object MaxObserverGapMs -Maximum).Maximum)
+        PValue 'hotkey_observer_gap_max_ms' (($keys | ForEach-Object { $_.observed } | Measure-Object MaxObserverGapMs -Maximum).Maximum)
         PAction 'width' 'set-column-width' @('600')
         PAction 'width' 'set-column-width' @('400')
         PAction 'fullscreen' 'fullscreen-window' @()
         PAction 'fullscreen' 'fullscreen-window' @()
+        # Establish a non-boundary move precondition outside all capture intervals.
+        $null = PRequest ('{"type":"run_action","data":{"name":"move-column-to-last","args":["--id","' + [int64]$target + '"]}}')
+        Start-Sleep -Milliseconds 600
         PAction 'move' 'move-column-left' @()
         PAction 'move' 'move-column-right' @()
         foreach ($group in @('maximize', 'width', 'fullscreen', 'move')) {
-            $rows = @($actions | Where-Object { $_.group -eq $group })
+            $rows = @($actions | Where-Object { $_.group -eq $group -and $_.confirmed })
+            PValue "${group}_action_samples" $rows.Count
             PValue "${group}_setwindowpos_lines_median" ([LaneE.Native]::Median([double[]]@($rows | ForEach-Object { $_.setwindowpos_lines })))
         }
-        $rows = @($actions | Where-Object { $_.group -eq 'maximize' })
-        PValue 'maximize_setwindowpos_lines_max' (($rows | Measure-Object setwindowpos_lines -Maximum).Maximum)
+        $rows = @($actions | Where-Object { $_.group -eq 'maximize' -and $_.confirmed })
+        if ($rows.Count -gt 0) { PValue 'maximize_setwindowpos_lines_max' (($rows | Measure-Object setwindowpos_lines -Maximum).Maximum) }
         PValue 'maximize_positioning_lines_median' ([LaneE.Native]::Median([double[]]@($rows | ForEach-Object { $_.positioning_lines })))
         Start-Sleep -Seconds 5
         $evidence.after_resources = PResources 'after'
@@ -202,19 +220,25 @@ function Invoke-LaneEPerf {
         $errors.Add($_.ToString())
         Write-Warning "Lane E performance information incomplete: $_"
     } finally {
-        if ($null -ne $owned) {
-            if (-not $owned.HasExited) {
+        try {
+            if ($null -ne $owned -and -not $owned.HasExited) {
                 try { $null = PRequest '{"type":"quit"}' } catch { $errors.Add("Perf quit: $_") }
-                if (-not $owned.WaitForExit(10000)) { $owned.Kill(); $owned.WaitForExit(); $errors.Add('Own perf child needed forced shutdown') }
+                if (-not $owned.WaitForExit(10000)) { $owned.Kill(); $null = $owned.WaitForExit(5000); $errors.Add('Own perf child needed forced shutdown') }
             }
-            $owned.Dispose()
+        } catch { $errors.Add("Perf child cleanup: $_") }
+        if ($null -ne $owned) { try { $owned.Dispose() } catch { $errors.Add("Perf process handle cleanup: $_") } }
+        foreach ($h in $sentinels) {
+            try { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } } catch { $errors.Add("Perf form cleanup: $_") }
         }
-        foreach ($h in $sentinels) { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
         PValue 'collector_errors' $errors.Count
         $evidence.metrics = $metrics
-        $evidence | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $perfDir 'measurement.json')
+        try { $evidence | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $perfDir 'measurement.json') }
+        catch { PValue 'collector_errors' ($errors.Count + 1); Write-Warning "Could not write Lane E detail: $_" }
     }
     return $metrics
 }
-$laneEPerf = Invoke-LaneEPerf
-foreach ($key in $laneEPerf.Keys) { $summary[$key] = $laneEPerf[$key] }
+# No collector/evidence failure may prevent the existing harness summary from being written.
+try {
+    $laneEPerf = Invoke-LaneEPerf
+    foreach ($key in $laneEPerf.Keys) { $summary[$key] = $laneEPerf[$key] }
+} catch { $summary['p_collector_errors'] = -1; Write-Warning "Lane E information unavailable: $_" }
