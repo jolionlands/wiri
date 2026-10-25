@@ -641,6 +641,12 @@ impl BackendHandle {
     ) -> Result<()> {
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
 
+        // Mark the move as wiri's own before making it: the location-change echo can arrive
+        // before SetWindowPos returns (on a slow machine, while the success line is logged), and
+        // an unmarked echo of a fullscreen window moved with its slot reads as the application
+        // leaving fullscreen.
+        self.mark_self_applied(hwnd);
+
         // SWP_NOCOPYBITS forces a full repaint of the client area instead of
         // bit-blitting old content — fixes black-content rendering on
         // Windows Terminal / Edge / Electron after a tile move.
@@ -663,7 +669,6 @@ impl BackendHandle {
                 "SetWindowPos SUCCESS: hwnd={} rect=({},{}) {}x{}",
                 hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
             );
-            self.mark_self_applied(hwnd);
             request_redraw(hwnd_win);
             return Ok(());
         }
@@ -683,7 +688,6 @@ impl BackendHandle {
                 "MoveWindow SUCCESS: hwnd={} rect=({},{}) {}x{}",
                 hwnd, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
             );
-            self.mark_self_applied(hwnd);
             request_redraw(hwnd_win);
             return Ok(());
         }
@@ -701,7 +705,6 @@ impl BackendHandle {
         };
         if sync_result.is_ok() {
             debug!("SetWindowPos sync SUCCESS: hwnd={}", hwnd);
-            self.mark_self_applied(hwnd);
             request_redraw(hwnd_win);
             return Ok(());
         }

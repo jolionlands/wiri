@@ -78,6 +78,10 @@ pub(super) struct SizingState {
     /// The rectangle wiri last put the window in is as big as its monitor (a maximized column
     /// without gaps on a monitor without a taskbar), so a covering window is wiri's own doing.
     pub own_rect_covers: bool,
+    /// The rectangle wiri last put the window in is as big as its monitor but beside it (a
+    /// fullscreen window scrolled with its slot), so a window that does not cover its monitor is
+    /// wiri's own doing, not the application leaving fullscreen.
+    pub own_rect_beside_monitor: bool,
     /// The window has been fullscreen for a while.
     pub fullscreen_settled: bool,
 }
@@ -118,7 +122,11 @@ pub(super) fn size_reaction(
     if covers_monitor && !state.fullscreen && !state.own_rect_covers {
         return SizeReaction::EnterFullscreen;
     }
-    if !covers_monitor && state.fullscreen && state.fullscreen_settled {
+    if !covers_monitor
+        && state.fullscreen
+        && state.fullscreen_settled
+        && !state.own_rect_beside_monitor
+    {
         return SizeReaction::LeaveFullscreen;
     }
     SizeReaction::Nothing
@@ -462,18 +470,22 @@ impl TilingEngine {
             return;
         };
         let monitor_bounds = self.monitors.get(&output).map(|m| m.bounds);
-        let own_rect_covers = match (self.applied_state.get(&window_id), monitor_bounds) {
-            (Some(applied), Some(bounds)) => {
-                applied.rect.size.w > 0
-                    && crate::backend::hooks::covers_monitor(applied.rect, bounds)
-            }
-            _ => false,
-        };
+        let (own_rect_covers, own_rect_beside_monitor) =
+            match (self.applied_state.get(&window_id), monitor_bounds) {
+                (Some(applied), Some(bounds)) if applied.rect.size.w > 0 => {
+                    let covers = crate::backend::hooks::covers_monitor(applied.rect, bounds);
+                    let monitor_sized = applied.rect.size.w == bounds.size.w
+                        && applied.rect.size.h == bounds.size.h;
+                    (covers, monitor_sized && !covers)
+                }
+                _ => (false, false),
+            };
         let state = SizingState {
             fullscreen: self.fullscreen_windows.contains(&window_id),
             maximized_edges: self.maximized_edges.contains(&window_id),
             unzoom_pending: self.unzoom_pending.get(&window_id).copied(),
             own_rect_covers,
+            own_rect_beside_monitor,
             fullscreen_settled: self
                 .fullscreen_since
                 .get(&window_id)
@@ -693,6 +705,20 @@ mod tests {
             ..fullscreen
         };
         assert_eq!(size_reaction(false, false, fresh), SizeReaction::Nothing);
+    }
+
+    #[test]
+    fn a_fullscreen_window_wiri_scrolled_beside_its_monitor_has_not_left_fullscreen() {
+        // Focusing a neighbour moves the fullscreen window with its slot, monitor-sized but
+        // beside the monitor.  On a slow machine the echo of that move can come in as a size
+        // class report: it is wiri's own move, not the application leaving fullscreen.
+        let scrolled = SizingState {
+            fullscreen: true,
+            fullscreen_settled: true,
+            own_rect_beside_monitor: true,
+            ..SizingState::default()
+        };
+        assert_eq!(size_reaction(false, false, scrolled), SizeReaction::Nothing);
     }
 
     #[test]
