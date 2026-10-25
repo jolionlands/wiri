@@ -562,7 +562,7 @@ pub fn default_bindings_table(prefix_name: &str) -> Vec<BindingRow> {
         (format!("{}+W", p), "column-width-cycle".into()),
         (format!("{}+-", p), "resize-column-left".into()),
         (format!("{}++", p), "resize-column-right".into()),
-        (format!("{}+Tab", p), "focus-previous (alt-tab)".into()),
+        (format!("{}+`", p), "focus-previous (alt-tab)".into()),
         (format!("{}+P", p), "screenshot".into()),
         (format!("{}+A", p), "toggle-always-on-top".into()),
         (format!("{}+,", p), "consume-window-into-column".into()),

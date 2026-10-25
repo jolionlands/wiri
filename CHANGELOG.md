@@ -105,6 +105,30 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   take the floating and minimized windows of the workspace and (with one monitor) its name along, and
   `move-column-to-workspace-up` / `-down` go to the next workspace that exists instead of an id that
   may not.
+- **Windows Terminal no longer lies on top of its neighbour.**  wiri now asks every window how narrow
+  it can be: the `WM_GETMINMAXINFO` question the system itself puts to a window before each resize
+  (asked once when the window is added, outside the engine lock, with a 120 ms timeout that gives up
+  at once on a hung or higher-integrity window, and twice more at most when the window had no time to
+  answer and takes the focus).  A column is never narrower than its windows can be: in proportional
+  mode the other columns share what is left, in fixed mode the wide one just takes its width and the
+  strip moves over.  Three terminals on a 1366 px screen used to be asked for 440 px each, refused
+  (Windows Terminal will not go below about 462 px) and overlapped.  A width the user asked for that
+  is below the minimum is kept, and comes back when the limit goes.
+- **Fullscreen is exactly the monitor.**  A fullscreen window used to be 7 px larger than the monitor
+  on three sides: the invisible window border measured while it still had a frame was added to a
+  window that no longer has one.  It is placed exactly now, and its border is measured again when
+  the frame comes back.
+- **`Ctrl+Alt+Tab` is no longer a default.**  It is Windows' task switcher, so registering it failed
+  with a warning at every start; `focus-previous` (niri's `Mod+Tab`) is ``Ctrl+Alt+` `` (the key
+  above Tab) by default.  A test keeps every default chord off the ones Windows reserves and off
+  each other.
+- **After a crash, `quit` puts the windows back where they were.**  `hidden.json` now also records
+  the rectangle every managed window had before wiri first moved it.  A restarted wiri takes that
+  record over for the windows that are still there (the same handle, process and class), so a
+  `quit` after a kill or a crash restores the real places instead of piling the windows that the dead
+  wiri had parked below the screen into the middle of it (what is not known is still rescued, now
+  cascaded 32 px apart instead of stacked).  The record is written once for the startup pass, once
+  per new or closed window, and deleted by a graceful quit.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal

@@ -58,7 +58,8 @@ All defaults use the `Ctrl+Alt` prefix. Override the whole set in the `binds {}`
 | Enter | Spawn `cmd.exe` |
 | F | Toggle fullscreen |
 | T | Toggle floating |
-| Tab | Overview (zoom out) |
+| Space | Overview (zoom out) |
+| ` (grave) | Focus the previous window (niri's `Mod+Tab`; `Ctrl+Alt+Tab` is Windows' own) |
 | O | Select window in overview |
 | 1 – 9 | Switch workspace |
 | Shift+Q | Quit wiri |

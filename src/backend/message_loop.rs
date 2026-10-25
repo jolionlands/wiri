@@ -132,11 +132,11 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32
         // KDL `binds {}` block (e.g. Ctrl+Alt+Comma+Shift) or wiri-ctl.
         // ((shift_prefix, 0x48, Action::MoveToMonitorLeft) replaced)
         // ((shift_prefix, 0x4C, Action::MoveToMonitorRight) replaced)
-        // Niri-parity round-2: FocusPrevious (alt-tab MRU) and ToggleAlwaysOnTop
-        // NOTE: if prefix is Ctrl+Alt, prefix+Tab conflicts with the Windows system
-        // Ctrl+Alt+Tab switcher. RegisterHotKey will fail; that's OK — the warning
-        // will be logged and the action remains available via custom KDL binds.
-        (prefix, 0x09, Action::FocusPrevious),     // Tab
+        // Niri-parity round-2: FocusPrevious (alt-tab MRU) and ToggleAlwaysOnTop.
+        // niri's own chord is Mod+Tab, but with the default Ctrl+Alt prefix that is
+        // Windows' task switcher: RegisterHotKey refuses it ("already registered") and
+        // used to log a warning at every start.  The key above Tab stands in for it.
+        (prefix, 0xC0, Action::FocusPrevious),     // ` (grave), the key above Tab
         (prefix, 0x50, Action::Screenshot),        // P (capture desktop to file)
         (prefix, 0x41, Action::ToggleAlwaysOnTop), // A (always-on-top)
         // niri-parity Round 4: rearrange / sizing actions.
@@ -1593,6 +1593,78 @@ mod tests {
         assert!(!is_overview_escape_binding(0, 0x1B, &Action::CloseWindow));
         // Another bare key bound to the overview toggle is not Escape.
         assert!(!is_overview_escape_binding(0, 0x20, &Action::OverviewToggle));
+    }
+
+    /// Chords Windows keeps for itself.  `RegisterHotKey` refuses them (os error 1409) or the
+    /// system takes them first, so a default bind on one logged a warning at every start and
+    /// never fired.
+    const RESERVED_BY_WINDOWS: &[(u32, u32, &str)] = &[
+        (MOD_CTRL | MOD_ALT, 0x09, "Ctrl+Alt+Tab (task switcher)"),
+        (MOD_CTRL | MOD_ALT, 0x2E, "Ctrl+Alt+Delete"),
+        (MOD_CTRL | MOD_SHIFT, 0x1B, "Ctrl+Shift+Esc (task manager)"),
+        (MOD_ALT, 0x09, "Alt+Tab"),
+        (MOD_ALT, 0x73, "Alt+F4"),
+        (MOD_WIN, 0x4C, "Win+L"),
+    ];
+
+    #[test]
+    fn no_default_hotkey_is_a_chord_windows_keeps_for_itself() {
+        let terminal = Action::SpawnCmd("t".to_string());
+        for (prefix, shift_prefix) in [
+            (MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT),
+            (MOD_WIN | MOD_ALT, MOD_WIN | MOD_ALT | MOD_SHIFT),
+            (MOD_ALT, MOD_ALT | MOD_SHIFT),
+        ] {
+            for (mods, vk, action) in default_hotkeys(prefix, shift_prefix, terminal.clone()) {
+                for (reserved_mods, reserved_vk, label) in RESERVED_BY_WINDOWS {
+                    assert!(
+                        !(mods == *reserved_mods && vk == *reserved_vk),
+                        "the default bind for {:?} is {}, which Windows keeps for itself",
+                        action,
+                        label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_hotkeys_do_not_share_a_chord() {
+        // Two binds on one chord: the second registration fails at every start.
+        let terminal = Action::SpawnCmd("t".to_string());
+        let defaults = default_hotkeys(
+            MOD_CTRL | MOD_ALT,
+            MOD_CTRL | MOD_ALT | MOD_SHIFT,
+            terminal,
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (mods, vk, action) in &defaults {
+            assert!(
+                seen.insert((*mods, *vk)),
+                "{:?} shares its chord (mods {:#x}, vk {:#x}) with another default bind",
+                action,
+                mods,
+                vk
+            );
+        }
+    }
+
+    #[test]
+    fn focus_previous_has_a_default_chord_that_registers() {
+        // niri's Mod+Tab is Windows' own task switcher with the Ctrl+Alt prefix: the default
+        // is the key above Tab (grave), and every other prefix gets it as well.
+        let terminal = Action::SpawnCmd("t".to_string());
+        let defaults = default_hotkeys(
+            MOD_CTRL | MOD_ALT,
+            MOD_CTRL | MOD_ALT | MOD_SHIFT,
+            terminal,
+        );
+        let chords: Vec<(u32, u32)> = defaults
+            .iter()
+            .filter(|(_, _, a)| *a == Action::FocusPrevious)
+            .map(|(m, v, _)| (*m, *v))
+            .collect();
+        assert_eq!(chords, vec![(MOD_CTRL | MOD_ALT, 0xC0)]);
     }
 
     fn bind(chord: &str, command: &str, args: &[&str]) -> crate::config::HotkeyBinding {

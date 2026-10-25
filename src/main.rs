@@ -201,9 +201,13 @@ async fn main() -> Result<()> {
     // while some were hidden, show them again now - before the desktop is
     // enumerated, so they are tiled like every other window - and keep
     // recording new hides from here on.
+    //
+    // The same record keeps where every window was before wiri first moved it, so that a
+    // restart after a crash can still put the windows back where they were on `quit`.
+    // Persistence goes on first: reading the old record rewrites it.
     if let Some(path) = wiri::backend::hidden::default_path() {
+        wiri::backend::hidden::enable_persistence(path.clone());
         wiri::backend::hidden::restore_from_file(&path);
-        wiri::backend::hidden::enable_persistence(path);
     }
     {
         let default_hook = std::panic::take_hook();
@@ -426,12 +430,19 @@ async fn main() -> Result<()> {
         for window in &windows {
             info!("  + {} ({})", window.title, window.class_name);
         }
+        // One write of the record for the whole pass, not one per window.
+        let record = wiri::backend::hidden::batch();
         for window in windows {
+            // How narrow can the window be made?  Asked before the engine lock is taken: the
+            // window answers on its own thread.
+            let window_id = WindowId::new(window.hwnd);
+            let min_width = backend_handle.min_track_width(window.hwnd);
             // Initial enumeration: at_startup=true so window rules with `at-startup` matchers fire.
-            engine
-                .write()
-                .add_window_at_startup(window, &backend_handle);
+            let mut eng = engine.write();
+            eng.add_window_at_startup(window, &backend_handle);
+            eng.note_min_width_answer(window_id, min_width);
         }
+        drop(record);
         {
             let mut eng = engine.write();
             // Focus follows what the user is looking at, not whichever window
@@ -1123,7 +1134,15 @@ fn handle_backend_event(
         }
         BackendEvent::ForegroundChanged { hwnd } => {
             let window_id = WindowId::new(hwnd);
+            let was_managed = engine.read().tiled_windows().contains_key(&window_id);
             add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
+            // A window that was too busy to say how narrow it can be (it had just been
+            // created) is asked again when it takes the focus, at most twice.  Not in the
+            // event that added it: it has just been asked.
+            if was_managed && engine.read().min_width_query_wanted(window_id) {
+                let answer = handle.min_track_width(hwnd);
+                engine.write().learn_min_width(window_id, answer, handle);
+            }
             ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
             // The OS already activated this window; only mirror that into the
             // engine's focus state (no activation request of our own, which
@@ -1245,6 +1264,11 @@ fn add_window_if_tileable(
         return false;
     }
 
+    // How narrow can the window be made?  Asked here, once, before the engine lock is
+    // taken (the window answers on its own thread): a terminal that will not go below
+    // 462 px has to get a column that wide, or it lies on top of its neighbour.
+    let min_width = handle.min_track_width(hwnd);
+
     // The check above ran without the write lock: the creation, show and foreground
     // events and the reconcile pass can find the same new window at the same moment.
     // Look again under the lock that adds it, so that only one of them does.
@@ -1269,6 +1293,7 @@ fn add_window_if_tileable(
             info!("+ {} ({}) [{}]", window.title, window.class_name, source);
         }
         eng.add_window(window, handle);
+        eng.note_min_width_answer(window_id, min_width);
         // New windows take the focus; scroll the strip so the new column is on screen.
         eng.reveal_focused();
         eng.apply_all(handle);

@@ -602,6 +602,30 @@ impl BackendHandle {
         // ~11 px shadow on Windows 10/11).  Without this, configured inner
         // gaps between tiles get eaten by overlapping shadows.
         let rect = expand_for_shadow_margin(hwnd_win, rect);
+        self.place_window_frame(hwnd, rect, flags)
+    }
+
+    /// Put the window's frame exactly on `rect`: no shadow-margin compensation.  For a
+    /// window that has no frame (fullscreen: caption and sizing border are stripped), where
+    /// the frame *is* the visible window - compensating with the margins measured while it
+    /// still had a frame made a fullscreen window 7 px larger than the monitor.
+    pub fn set_window_position_exact(
+        &self,
+        hwnd: isize,
+        rect: Rect,
+        flags: SET_WINDOW_POS_FLAGS,
+    ) -> Result<()> {
+        self.place_window_frame(hwnd, rect, flags)
+    }
+
+    /// `SetWindowPos` for the frame rectangle `rect`, with the fallbacks for stubborn windows.
+    fn place_window_frame(
+        &self,
+        hwnd: isize,
+        rect: Rect,
+        flags: SET_WINDOW_POS_FLAGS,
+    ) -> Result<()> {
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
 
         // SWP_NOCOPYBITS forces a full repaint of the client area instead of
         // bit-blitting old content — fixes black-content rendering on
@@ -885,6 +909,25 @@ impl BackendHandle {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
         }
+    }
+
+    /// The narrowest `hwnd` can be made, as a *visible* width in pixels (what the layout
+    /// works in), or `None` when it does not say.
+    ///
+    /// The window is asked with `WM_GETMINMAXINFO`, the question the system itself puts to
+    /// it before every resize (the system marshals the answer across processes; the call is
+    /// bounded by a timeout and gives up at once on a hung or higher-integrity window).  The
+    /// answer is a *window* width, so the invisible border is taken off.  A Windows Terminal
+    /// window answers about 476 px (462 visible); without knowing that, three terminals on a
+    /// 1366 px screen are asked for 440 px each, refuse, and lie on top of one another.
+    ///
+    /// Call it once per window (and again, at most twice, if it did not answer), outside the
+    /// engine lock: the window answers on its own thread.
+    pub fn min_track_width(&self, hwnd: isize) -> Option<u32> {
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        let outer = query_min_track_width(hwnd_win)?;
+        let border = measured_shadow_margins(hwnd_win).map_or(0, |m| m[0] + m[2]);
+        visible_min_width(outer, border)
     }
 
     /// Put a window back exactly where it was before wiri tiled it.  `rect` is
@@ -1297,6 +1340,41 @@ mod tests {
     }
 
     #[test]
+    fn test_forget_shadow_margins_drops_the_measurement() {
+        // A window that lost its frame (fullscreen) or got it back must be measured again.
+        let hwnd: isize = 0x5EED_0001;
+        SHADOW_MARGINS.lock().insert(hwnd, [7, 0, 7, 7]);
+        assert!(SHADOW_MARGINS.lock().contains_key(&hwnd));
+        forget_shadow_margins(hwnd);
+        assert!(!SHADOW_MARGINS.lock().contains_key(&hwnd));
+        // Forgetting a window that was never measured is harmless.
+        forget_shadow_margins(0x5EED_0002);
+    }
+
+    #[test]
+    fn test_visible_min_width_takes_the_invisible_border_off() {
+        // A Windows Terminal window answers 476 px, 14 of which are invisible border:
+        // the visible window is at least 462 px wide.
+        assert_eq!(visible_min_width(476, 14), Some(462));
+        // No border known: the answer is used as it is (a column slightly too wide is
+        // better than one that overlaps).
+        assert_eq!(visible_min_width(476, 0), Some(476));
+        // Nothing, or garbage, is not a minimum.
+        assert_eq!(visible_min_width(0, 14), None);
+        assert_eq!(visible_min_width(-5, 0), None);
+        assert_eq!(visible_min_width(20_000, 14), None);
+        // A border as wide as the window leaves nothing to say.
+        assert_eq!(visible_min_width(14, 14), None);
+    }
+
+    #[test]
+    fn test_min_track_width_of_a_window_that_is_not_there_is_none() {
+        let handle = BackendHandle::default_for_test();
+        assert_eq!(handle.min_track_width(0), None);
+        assert_eq!(handle.min_track_width(0x0DEA_D001), None);
+    }
+
+    #[test]
     fn test_apply_shadow_margins_puts_the_visible_edges_on_the_target() {
         // The visible rect of the window below must land on (100, 50) 600x400:
         // the frame is 7 px wider on both sides and 7 px taller at the bottom.
@@ -1346,24 +1424,35 @@ mod tests {
 /// Without this, configured `inner_gaps` between tiles are eaten by the two
 /// adjacent windows' overlapping shadows, making the tiles appear flush.
 fn expand_for_shadow_margin(hwnd: HWND, rect: Rect) -> Rect {
+    match measured_shadow_margins(hwnd) {
+        Some(margins) => apply_shadow_margins(rect, margins),
+        // Hidden, minimised or mid-move window, or a custom non-client area:
+        // placing it uncompensated is better than guessing.
+        None => rect,
+    }
+}
+
+/// The invisible border of `hwnd` as `[left, top, right, bottom]`: cached, or measured now.
+///
+/// The invisible border of a window does not change while it is managed, but
+/// measuring it needs `GetWindowRect` and DWM's frame bounds to agree - and
+/// right after a (now asynchronous) move they briefly do not.  Measure once,
+/// while the window is at rest, and reuse the answer.
+fn measured_shadow_margins(hwnd: HWND) -> Option<[i32; 4]> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
-    // The invisible border of a window does not change while it is managed, but
-    // measuring it needs `GetWindowRect` and DWM's frame bounds to agree - and
-    // right after a (now asynchronous) move they briefly do not.  Measure once,
-    // while the window is at rest, and reuse the answer.
     let key = hwnd.0 as isize;
     if let Some(margins) = SHADOW_MARGINS.lock().get(&key).copied() {
-        return apply_shadow_margins(rect, margins);
+        return Some(margins);
     }
 
     let mut frame = RECT::default();
     let mut visible = RECT::default();
     unsafe {
         if GetWindowRect(hwnd, &mut frame).is_err() {
-            return rect;
+            return None;
         }
         let hr = DwmGetWindowAttribute(
             hwnd,
@@ -1372,24 +1461,81 @@ fn expand_for_shadow_margin(hwnd: HWND, rect: Rect) -> Rect {
             std::mem::size_of::<RECT>() as u32,
         );
         if hr.is_err() {
-            return rect;
+            return None;
         }
     }
 
-    match shadow_margins_from(&frame, &visible) {
-        Some(margins) => {
-            SHADOW_MARGINS.lock().insert(key, margins);
-            apply_shadow_margins(rect, margins)
+    let margins = shadow_margins_from(&frame, &visible)?;
+    SHADOW_MARGINS.lock().insert(key, margins);
+    Some(margins)
+}
+
+/// How long to wait for a window to answer `WM_GETMINMAXINFO` (a window that has just been
+/// created may be busy for a moment).
+const MIN_TRACK_QUERY_TIMEOUT_MS: u32 = 120;
+
+/// The minimum *window* width (`ptMinTrackSize.x`) `hwnd` answers to `WM_GETMINMAXINFO`.
+/// `None` when it does not answer: it is gone, it is a window of wiri itself, it is hung
+/// (`SMTO_ABORTIFHUNG` returns at once), it belongs to a process wiri may not send messages
+/// to, or it is too busy to answer within the timeout.
+fn query_min_track_width(hwnd: HWND) -> Option<i32> {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_GETMINMAXINFO,
+    };
+
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return None;
         }
-        // Hidden, minimised or mid-move window, or a custom non-client area:
-        // placing it uncompensated is better than guessing.
-        None => rect,
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 || pid == GetCurrentProcessId() {
+            return None;
+        }
+        // The structure is zeroed: a window that answers sets its own minimum, one that does
+        // not leaves 0 (or the system default, which no layout is ever narrower than).
+        let mut info = MINMAXINFO::default();
+        let mut result = 0usize;
+        let answered = SendMessageTimeoutW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            WPARAM(0),
+            LPARAM(&mut info as *mut MINMAXINFO as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            MIN_TRACK_QUERY_TIMEOUT_MS,
+            Some(&mut result),
+        );
+        if answered.0 == 0 {
+            return None;
+        }
+        Some(info.ptMinTrackSize.x)
     }
+}
+
+/// The visible minimum width of a window that answered `outer` (its minimum window width)
+/// and has `border` px of invisible border on its two sides together.  `None` when the
+/// answer is nothing, or not plausible (no screen is 16384 px wide).
+fn visible_min_width(outer: i32, border: i32) -> Option<u32> {
+    const MAX_PLAUSIBLE_PX: i32 = 16_384;
+    if outer <= 0 || outer > MAX_PLAUSIBLE_PX {
+        return None;
+    }
+    let visible = outer - border.max(0);
+    (visible > 0).then_some(visible as u32)
 }
 
 /// Invisible-border margins `[left, top, right, bottom]` per window.
 static SHADOW_MARGINS: std::sync::LazyLock<parking_lot::Mutex<HashMap<isize, [i32; 4]>>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Forget the invisible-border margins measured for `hwnd`.  Call it when the window's
+/// frame changes (fullscreen strips the caption and sizing border, leaving it restores
+/// them): the next placement measures the window again instead of compensating for a
+/// border it does not have (or has again).
+pub fn forget_shadow_margins(hwnd: isize) {
+    SHADOW_MARGINS.lock().remove(&hwnd);
+}
 
 /// Margins between the full window rect (`frame`, what `GetWindowRect` reports)
 /// and the visible one (`visible`, DWM's extended frame bounds), ordered

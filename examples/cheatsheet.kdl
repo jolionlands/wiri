@@ -15,7 +15,7 @@ binds {
     Ctrl+Alt+Down           focus-down
     Ctrl+Alt+H              scroll-left
     Ctrl+Alt+L              scroll-right
-    Ctrl+Alt+Tab            focus-previous              // alt-tab MRU
+    Ctrl+Alt+Grave          focus-previous              // alt-tab MRU (Ctrl+Alt+Tab is Windows' own)
 
     // --- Move focused column ---
     Ctrl+Alt+Shift+Left     move-column-left

@@ -58,7 +58,8 @@ All bindings can be remapped in `config.kdl`.  The default modifier is
 | `Ctrl+Alt+Shift+←/→` | Move the focused column left / right    |
 | `Ctrl+Alt+H/L`       | Scroll the view left / right (vim-keys) |
 | `Ctrl+Alt+1..9`      | Switch to workspace N                   |
-| `Ctrl+Alt+Tab`       | Toggle overview (zoom out)              |
+| `Ctrl+Alt+Space`     | Toggle overview (zoom out)              |
+| ``Ctrl+Alt+` ``      | Focus the previous window               |
 | `Ctrl+Alt+F`         | Toggle fullscreen                       |
 | `Ctrl+Alt+T`         | Toggle floating                         |
 | `Ctrl+Alt+Q`         | Close the focused window                |

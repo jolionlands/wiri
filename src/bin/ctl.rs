@@ -1170,7 +1170,7 @@ fn print_default_bindings_table() {
         (&format!("{}+W", p), "column-width-cycle"),
         (&format!("{}+-", p), "resize-column-left"),
         (&format!("{}++", p), "resize-column-right"),
-        (&format!("{}+Tab", p), "focus-previous (alt-tab)"),
+        (&format!("{}+`", p), "focus-previous (alt-tab)"),
         (&format!("{}+P", p), "screenshot"),
         (&format!("{}+A", p), "toggle-always-on-top"),
         (&format!("{}+,", p), "consume-window-into-column"),

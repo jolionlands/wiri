@@ -545,6 +545,13 @@ pub struct TilingEngine {
     /// Original window bounds at first registration. Used to restore windows
     /// when wiri exits so the user gets their layout back.
     original_bounds: HashMap<WindowId, Rect>,
+    /// The narrowest each window can be made (a visible width in pixels, what the window
+    /// answers to `WM_GETMINMAXINFO`).  The tiles carry a copy for the layout; this is
+    /// the master, because a tile is made anew when its window moves to another workspace.
+    window_min_widths: HashMap<WindowId, u32>,
+    /// How many times a window was asked for its minimum width (it may not answer in time
+    /// when it has just been created).
+    min_width_queries: HashMap<WindowId, u8>,
     // ---- Item 2: always-on-top tracking ----
     /// Windows that have been pinned as HWND_TOPMOST via toggle_always_on_top_for_focused.
     always_on_top: HashSet<WindowId>,
@@ -636,6 +643,8 @@ impl TilingEngine {
             layout_request_tx: None,
             applied_state: HashMap::new(),
             original_bounds: HashMap::new(),
+            window_min_widths: HashMap::new(),
+            min_width_queries: HashMap::new(),
             always_on_top: HashSet::new(),
             auto_tile_threshold: None,
             auto_tile_zoom: None,
@@ -1050,9 +1059,18 @@ impl TilingEngine {
         }
 
         // Capture original bounds (first registration only) so we can restore on quit.
-        self.original_bounds
-            .entry(window_id)
-            .or_insert(window.bounds);
+        // A window that an earlier wiri run moved and left behind (it was killed, or crashed)
+        // is not where it was: that run recorded where it first saw the window (hidden.json),
+        // and the record is what counts.
+        if !self.original_bounds.contains_key(&window_id) {
+            let original = crate::backend::hidden::record_original(
+                window.hwnd,
+                window.process_id,
+                &window.class_name,
+                window.bounds,
+            );
+            self.original_bounds.insert(window_id, original);
+        }
 
         // Wire is_active: compare hwnd against the current foreground window.
         let is_active = unsafe {
@@ -1358,6 +1376,10 @@ impl TilingEngine {
             }
         }
 
+        // A window known to have a minimum width (it floated, or was added again) gets it on
+        // its new tile.
+        self.sync_min_widths();
+
         // Item 7: after adding a window, maintain exactly one trailing empty workspace
         // on the monitor that received the window.
         {
@@ -1398,7 +1420,11 @@ impl TilingEngine {
         // is about to be destroyed (and on auto-float, the window will keep
         // its blur — the user expects a floating "frosted glass" effect).
         self.blur_applied.remove(&window_id);
-        // A destroyed window needs no "show me again after a crash" record.
+        // A destroyed window needs no "show me again after a crash" record, and there is
+        // nothing left to put back.  (Its handle may be given to a new window.)
+        self.original_bounds.remove(&window_id);
+        self.window_min_widths.remove(&window_id);
+        self.min_width_queries.remove(&window_id);
         crate::backend::hidden::forget(window_id.as_isize());
 
         if self.last_activated == Some(window_id) {
@@ -1426,6 +1452,89 @@ impl TilingEngine {
                 self.reveal_focused_column(output_id);
                 self.apply_layout_for_monitor(output_id, backend);
             }
+        }
+    }
+
+    /// The widest minimum a window may claim: anything above is not a minimum width but
+    /// garbage (`WM_GETMINMAXINFO` answers are made by the applications).
+    const MAX_MIN_WIDTH_PX: u32 = 16_384;
+    /// How often a window is asked for its minimum width in all (it may not answer in time
+    /// when it has just been created; it is asked again when it takes the focus).
+    const MAX_MIN_WIDTH_QUERIES: u8 = 3;
+
+    /// The window cannot be made narrower than `width` (a visible width in pixels, from
+    /// its `WM_GETMINMAXINFO`): its column is at least that wide from now on, and the
+    /// columns after it move over instead of lying under it.  0 forgets the limit.
+    /// Returns true when the limit changed.  Lays nothing out: call it before the pass that
+    /// places a new window, or follow it with one (see [`Self::note_min_width_answer`]).
+    pub fn note_window_min_width(&mut self, window_id: WindowId, width: u32) -> bool {
+        let width = width.min(Self::MAX_MIN_WIDTH_PX);
+        let known = self.window_min_widths.get(&window_id).copied().unwrap_or(0);
+        if width == known {
+            return false;
+        }
+        if width == 0 {
+            self.window_min_widths.remove(&window_id);
+        } else {
+            self.window_min_widths.insert(window_id, width);
+        }
+        self.sync_min_widths();
+        true
+    }
+
+    /// Copy the known minimum widths onto the tiles (a tile is made anew when a window
+    /// moves to another workspace or stops floating).
+    fn sync_min_widths(&mut self) {
+        let known = &self.window_min_widths;
+        for monitor in self.monitors.values_mut() {
+            for workspace in monitor.workspaces.values_mut() {
+                for column in workspace.columns.iter_mut() {
+                    for tile in column.tiles.iter_mut() {
+                        tile.min_width = known.get(&tile.window_id).copied().unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Should `window_id` be asked for its minimum width (now, or when it takes the focus)?
+    /// Yes while it is managed, does not float, has not answered, and was asked fewer than
+    /// three times.
+    pub fn min_width_query_wanted(&self, window_id: WindowId) -> bool {
+        self.tiled_windows.contains_key(&window_id)
+            && !self.floating_windows.contains(&window_id)
+            && !self.window_min_widths.contains_key(&window_id)
+            && self.min_width_queries.get(&window_id).copied().unwrap_or(0)
+                < Self::MAX_MIN_WIDTH_QUERIES
+    }
+
+    /// The window was asked for its minimum width and answered `answer` (`None`: it did
+    /// not).  Returns true when the answer changed a column, so that the caller lays the
+    /// monitor out again.
+    pub fn note_min_width_answer(&mut self, window_id: WindowId, answer: Option<u32>) -> bool {
+        let asked = self.min_width_queries.entry(window_id).or_insert(0);
+        *asked = asked.saturating_add(1);
+        match answer {
+            Some(width) => self.note_window_min_width(window_id, width),
+            None => false,
+        }
+    }
+
+    /// [`Self::note_min_width_answer`], and the layout pass it asks for: the monitor the
+    /// window is on is laid out again (once per window that turns out to have a minimum, not
+    /// once per event).
+    pub fn learn_min_width(
+        &mut self,
+        window_id: WindowId,
+        answer: Option<u32>,
+        backend: &BackendHandle,
+    ) {
+        if !self.note_min_width_answer(window_id, answer) {
+            return;
+        }
+        if let Some((output, _, _)) = self.locate_window(window_id) {
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
         }
     }
 
@@ -1782,11 +1891,62 @@ impl TilingEngine {
         gap: i32,
         cfg: &LayoutConfig,
     ) -> Vec<i32> {
-        let auto = Self::auto_column_width(explicit, view_width, gap, cfg);
-        explicit
+        Self::column_widths_with_minimums(explicit, &[], view_width, gap, cfg).0
+    }
+
+    /// [`Self::column_widths`] for columns that cannot be made narrower than `mins` (the
+    /// widest minimum of the windows in each; missing or 0 = no limit), and the width a
+    /// column without a width of its own gets.
+    ///
+    /// A column is never narrower than its minimum: asking a Windows Terminal window for
+    /// less than its ~462 px only makes it overlap its neighbour.  An explicit width below
+    /// the minimum is raised to it.  A column without a width of its own whose minimum is
+    /// above the share it would get keeps that minimum, and the others split what is left
+    /// (in proportional mode; in fixed mode the others keep the configured width).
+    pub fn column_widths_with_minimums(
+        explicit: &[Option<u32>],
+        mins: &[u32],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> (Vec<i32>, i32) {
+        let min_of = |i: usize| mins.get(i).copied().unwrap_or(0);
+        let mut fixed: Vec<Option<u32>> = explicit
+            .iter()
+            .enumerate()
+            .map(|(i, w)| w.map(|w| w.max(min_of(i))))
+            .collect();
+        let mut auto = Self::auto_column_width(&fixed, view_width, gap, cfg);
+        // Every pass fixes at least one more column or stops: at most one pass per column.
+        for _ in 0..fixed.len() {
+            let mut changed = false;
+            for (i, width) in fixed.iter_mut().enumerate() {
+                if width.is_none() && min_of(i) as i32 > auto {
+                    *width = Some(min_of(i));
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+            auto = Self::auto_column_width(&fixed, view_width, gap, cfg);
+        }
+        let widths = fixed
             .iter()
             .map(|w| w.map(|w| w as i32).unwrap_or(auto))
-            .collect()
+            .collect();
+        (widths, auto)
+    }
+
+    /// The explicit width and the minimum width of every column of `workspace`, in order.
+    fn column_inputs(
+        workspace: &crate::layout::workspace::Workspace,
+    ) -> (Vec<Option<u32>>, Vec<u32>) {
+        workspace
+            .columns
+            .iter()
+            .map(|c| (c.width, c.min_width()))
+            .unzip()
     }
 
     /// The width a column without explicit width gets on `workspace`.
@@ -1795,11 +1955,11 @@ impl TilingEngine {
         view_width: i32,
         cfg: &LayoutConfig,
     ) -> i32 {
-        let explicit: Vec<Option<u32>> = workspace.columns.iter().map(|c| c.width).collect();
+        let (explicit, mins) = Self::column_inputs(workspace);
         if explicit.is_empty() {
             return Self::effective_column_width(0, view_width, cfg);
         }
-        Self::auto_column_width(&explicit, view_width, cfg.column_gap, cfg)
+        Self::column_widths_with_minimums(&explicit, &mins, view_width, cfg.column_gap, cfg).1
     }
 
     pub fn apply_layout_for_monitor(&mut self, output_id: OutputId, backend: &BackendHandle) {
@@ -1928,7 +2088,9 @@ impl TilingEngine {
                 monitor.bounds.size.w,
                 monitor.bounds.size.h,
             );
-            let _ = backend.set_window_position(
+            // Exactly the monitor: a fullscreen window has no frame, so there is no
+            // invisible border to compensate for.
+            let _ = backend.set_window_position_exact(
                 window_id.as_isize(),
                 fullscreen_rect,
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
@@ -2825,9 +2987,14 @@ impl TilingEngine {
         // overview is active.  Falls back to overview_zoom() when overview is on.
         let zoom = self.effective_zoom();
 
-        let explicit_widths: Vec<Option<u32>> = workspace.columns.iter().map(|c| c.width).collect();
-        let col_widths: Vec<i32> =
-            Self::column_widths(&explicit_widths, work_rect.size.w as i32, column_gap, cfg);
+        let (explicit_widths, min_widths) = Self::column_inputs(workspace);
+        let (col_widths, _) = Self::column_widths_with_minimums(
+            &explicit_widths,
+            &min_widths,
+            work_rect.size.w as i32,
+            column_gap,
+            cfg,
+        );
 
         let mut col_x: Vec<i32> = Vec::with_capacity(num_columns);
         let mut x = 0i32;
@@ -3645,6 +3812,7 @@ impl TilingEngine {
             monitor.focus_ring.push(window_id);
         }
         info!("Un-floating window {:?}", window_id);
+        self.sync_min_widths();
         self.maintain_empty_workspace(output);
         self.reveal_focused_column(output);
         self.apply_layout_for_monitor(output, backend);
@@ -4259,8 +4427,12 @@ impl TilingEngine {
             SetWindowLongW(hwnd_win, GWL_EXSTYLE, new_ex_style as i32);
         }
 
-        // Position window to cover entire monitor
-        let _ = backend.set_window_position(
+        // Position window to cover entire monitor.  The frame is gone, so the frame IS
+        // the visible window: place it exactly (the invisible border measured while it
+        // still had a frame made it 7 px larger than the monitor), and measure it afresh
+        // the next time it is placed with one.
+        crate::backend::forget_shadow_margins(hwnd);
+        let _ = backend.set_window_position_exact(
             hwnd,
             rect,
             windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
@@ -4307,6 +4479,8 @@ impl TilingEngine {
                     | windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED,
             );
         }
+        // The frame is back: its invisible border has to be measured again.
+        crate::backend::forget_shadow_margins(hwnd);
     }
 
     /// Get all monitors (mutable)
@@ -5186,6 +5360,7 @@ impl TilingEngine {
                 }
             }
         }
+        self.sync_min_widths();
     }
 
     // -----------------------------------------------------------------------
@@ -5336,6 +5511,7 @@ impl TilingEngine {
             }
         }
 
+        self.sync_min_widths();
         self.apply_all(backend);
         Ok(())
     }
@@ -5894,6 +6070,7 @@ impl TilingEngine {
             monitor.active_workspace = prev_ws;
         }
 
+        self.sync_min_widths();
         self.maintain_empty_workspace(focused_output);
         let _ = backend.show_window(window_id.as_isize(), false);
         self.apply_layout_for_monitor(focused_output, backend);
@@ -5970,6 +6147,7 @@ impl TilingEngine {
         if let Some(dst_monitor) = self.monitors.get_mut(&target_output) {
             dst_monitor.add_window_with_width(window_id, width_hint);
         }
+        self.sync_min_widths();
 
         // Maintain trailing empty workspaces on both monitors
         self.maintain_empty_workspace(focused_output);
@@ -6044,10 +6222,7 @@ impl TilingEngine {
         let view = Self::view_width_for_monitor(monitor, cfg);
         let workspace = monitor.workspace()?;
         let column = workspace.columns.get(col_idx)?;
-        let current = column
-            .width
-            .map(|w| w as i32)
-            .unwrap_or_else(|| Self::workspace_default_width(workspace, view, cfg));
+        let current = column.resolved_width(Self::workspace_default_width(workspace, view, cfg));
         Some((col_idx, current, view, cfg.column_gap, 2 * cfg.border_width.max(1)))
     }
 
@@ -6362,7 +6537,7 @@ impl TilingEngine {
             if let Some(focus_col) = monitor.focus_column {
                 if let Some(workspace) = monitor.workspace_mut() {
                     if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        let current = column.width.map(|w| w as i32).unwrap_or(default_col_w);
+                        let current = column.resolved_width(default_col_w);
                         let new_w = (current + delta_px).max(50) as u32;
                         column.set_width(Some(new_w));
                     }
@@ -6583,8 +6758,8 @@ impl TilingEngine {
             }
             let view = Self::view_width_for_monitor(monitor, cfg);
             let gap = cfg.column_gap;
-            let explicit: Vec<Option<u32>> = workspace.columns.iter().map(|c| c.width).collect();
-            let widths = Self::column_widths(&explicit, view, gap, cfg);
+            let (explicit, mins) = Self::column_inputs(workspace);
+            let (widths, _) = Self::column_widths_with_minimums(&explicit, &mins, view, gap, cfg);
             let scroll = workspace.scroll_offset.x;
             let mut x = 0;
             let mut taken = 0;
@@ -6723,7 +6898,7 @@ impl TilingEngine {
             if let Some(focus_col) = monitor.focus_column {
                 if let Some(workspace) = monitor.workspace_mut() {
                     if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        let current = column.width.map(|w| w as i32).unwrap_or(default_col_w);
+                        let current = column.resolved_width(default_col_w);
                         let new_w = (current + delta_px).clamp(min_w, max_w) as u32;
                         column.set_width(Some(new_w));
                     }
@@ -7222,13 +7397,25 @@ impl TilingEngine {
 
         // Restore original bounds (plain GetWindowRect rectangles, so no
         // shadow-margin compensation).  Windows that no longer exist are skipped.
+        // A window whose original place is off every screen is rescued into the middle of
+        // one; several of them are cascaded instead of stacked on one another.
         let work_areas: Vec<Rect> = self.monitors.values().map(|m| m.work_area).collect();
-        for (window_id, &rect) in &self.original_bounds {
-            let _ = backend.restore_window_rect(
-                window_id.as_isize(),
-                restorable_bounds(rect, &work_areas),
-            );
+        let mut originals: Vec<(WindowId, Rect)> = self
+            .original_bounds
+            .iter()
+            .map(|(id, rect)| (*id, *rect))
+            .collect();
+        originals.sort_by_key(|(id, _)| id.as_isize());
+        let mut rescued = 0usize;
+        for (window_id, rect) in originals {
+            let target = restorable_bounds(rect, &work_areas, rescued);
+            if target != rect {
+                rescued += 1;
+            }
+            let _ = backend.restore_window_rect(window_id.as_isize(), target);
         }
+        // Everything is back where it was: nothing is left to remember for the next run.
+        crate::backend::hidden::clear_originals();
     }
 
     // -------------------------------------------------------------------------
@@ -7560,8 +7747,14 @@ impl Default for TilingEngine {
 /// "restoring" it to where it already is would leave it lost.  A rectangle with
 /// less than 64x64 px on any work area is therefore replaced by one centred on
 /// the first work area, at most 70% of its size.
-fn restorable_bounds(original: Rect, work_areas: &[Rect]) -> Rect {
+///
+/// `nth` counts the windows that had to be rescued before this one (0 for the first): each
+/// is shifted 32 px right and down from the one before (eight steps, then it starts over),
+/// so a whole desktop of rescued windows is not one pile.
+fn restorable_bounds(original: Rect, work_areas: &[Rect], nth: usize) -> Rect {
     const MIN_VISIBLE: i32 = 64;
+    const CASCADE_PX: i32 = 32;
+    const CASCADE_STEPS: usize = 8;
     let overlap = |a_start: i32, a_end: i32, b_start: i32, b_end: i32| a_end.min(b_end) - a_start.max(b_start);
     let usable = work_areas.iter().any(|wa| {
         overlap(original.loc.x, original.right(), wa.loc.x, wa.right()) >= MIN_VISIBLE
@@ -7575,12 +7768,11 @@ fn restorable_bounds(original: Rect, work_areas: &[Rect]) -> Rect {
     }
     let w = original.size.w.min(wa.size.w * 7 / 10).max(200);
     let h = original.size.h.min(wa.size.h * 7 / 10).max(150);
-    Rect::new(
-        wa.loc.x + (wa.size.w as i32 - w as i32) / 2,
-        wa.loc.y + (wa.size.h as i32 - h as i32) / 2,
-        w,
-        h,
-    )
+    let step = (nth % CASCADE_STEPS) as i32 * CASCADE_PX;
+    // The centred position, moved down and right but never off the work area.
+    let x = (wa.loc.x + (wa.size.w as i32 - w as i32) / 2 + step).min(wa.right() - w as i32);
+    let y = (wa.loc.y + (wa.size.h as i32 - h as i32) / 2 + step).min(wa.bottom() - h as i32);
+    Rect::new(x.max(wa.loc.x), y.max(wa.loc.y), w, h)
 }
 
 #[cfg(test)]
@@ -13842,23 +14034,298 @@ mod tests {
         let work = [Rect::new(0, 0, 1366, 728)];
         // A normal original position is kept.
         let normal = Rect::new(104, 104, 520, 380);
-        assert_eq!(restorable_bounds(normal, &work), normal);
+        assert_eq!(restorable_bounds(normal, &work, 0), normal);
         // Partly off the edge but still plenty visible: kept.
         let edge = Rect::new(-300, 40, 520, 380);
-        assert_eq!(restorable_bounds(edge, &work), edge);
+        assert_eq!(restorable_bounds(edge, &work, 0), edge);
         // Parked below the screen by an earlier, killed wiri: brought back,
         // centred, at its own size.
         let parked = Rect::new(4, 836, 445, 711);
-        let rescued = restorable_bounds(parked, &work);
+        let rescued = restorable_bounds(parked, &work, 0);
         assert_eq!(rescued.size.w, 445);
         assert_eq!(rescued.size.h, 509); // capped at 70% of the 728 px work area
         assert!(rescued.loc.y >= 0 && rescued.bottom() <= 728, "{:?}", rescued);
         assert!(rescued.loc.x >= 0 && rescued.right() <= 1366, "{:?}", rescued);
         // A sliver of a few pixels does not count as visible.
         let sliver = Rect::new(-510, 100, 520, 380);
-        assert_ne!(restorable_bounds(sliver, &work), sliver);
+        assert_ne!(restorable_bounds(sliver, &work, 0), sliver);
         // No monitors known: nothing to correct against.
-        assert_eq!(restorable_bounds(parked, &[]), parked);
+        assert_eq!(restorable_bounds(parked, &[], 0), parked);
+    }
+
+    #[test]
+    fn test_rescued_windows_are_cascaded_not_stacked() {
+        let work = [Rect::new(0, 0, 1366, 728)];
+        let parked = Rect::new(4, 836, 445, 711);
+        let first = restorable_bounds(parked, &work, 0);
+        let second = restorable_bounds(parked, &work, 1);
+        let third = restorable_bounds(parked, &work, 2);
+        assert_eq!(first.loc.x, (1366 - first.size.w as i32) / 2, "the first one is centred");
+        assert_eq!((second.loc.x - first.loc.x, second.loc.y - first.loc.y), (32, 32));
+        assert_eq!((third.loc.x - second.loc.x, third.loc.y - second.loc.y), (32, 32));
+        assert_eq!(second.size, first.size, "they keep their size");
+        // However many there are, every one stays on the work area.
+        for nth in 0..40 {
+            let r = restorable_bounds(parked, &work, nth);
+            assert!(r.loc.x >= 0 && r.right() <= 1366, "{} {:?}", nth, r);
+            assert!(r.loc.y >= 0 && r.bottom() <= 728, "{} {:?}", nth, r);
+        }
+        // The cascade starts over after eight steps.
+        assert_eq!(restorable_bounds(parked, &work, 8), first);
+    }
+
+    #[test]
+    fn test_removing_a_window_forgets_where_it_was() {
+        // A destroyed window handle can be handed to a new window: the new one must not
+        // inherit the old window's original rectangle.
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(4100, 30, 40), &be);
+        assert_eq!(
+            engine.original_bounds.get(&WindowId::new(4100)),
+            Some(&Rect::new(30, 40, 800, 600))
+        );
+        engine.remove_window(WindowId::new(4100), &be);
+        assert!(engine.original_bounds.get(&WindowId::new(4100)).is_none());
+        engine.add_window(make_window(4100, 500, 60), &be);
+        assert_eq!(
+            engine.original_bounds.get(&WindowId::new(4100)),
+            Some(&Rect::new(500, 60, 800, 600)),
+            "the new window with the same handle is remembered where it is"
+        );
+    }
+
+    // --- Minimum widths (WM_GETMINMAXINFO) ---
+
+    fn proportional_cfg() -> LayoutConfig {
+        LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 640,
+            max_visible_columns: 0,
+            ..LayoutConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_a_column_is_never_narrower_than_its_minimum_in_fixed_mode() {
+        let cfg = LayoutConfig {
+            column_width: 440,
+            ..LayoutConfig::default()
+        };
+        let (widths, auto) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 462, 0],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![440, 462, 440]);
+        assert_eq!(auto, 440);
+        // An explicit width below the minimum is raised to it; a wider one stays.
+        let (widths, _) = TilingEngine::column_widths_with_minimums(
+            &[Some(300), Some(900)],
+            &[462, 462],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![462, 900]);
+        // No minimums at all is what column_widths always gave.
+        assert_eq!(
+            TilingEngine::column_widths_with_minimums(&[None, Some(700)], &[], 1366, 16, &cfg).0,
+            TilingEngine::column_widths(&[None, Some(700)], 1366, 16, &cfg)
+        );
+    }
+
+    #[test]
+    fn test_columns_with_minimums_share_the_view_in_proportional_mode() {
+        let cfg = proportional_cfg();
+        // Three columns on 1366 px: an equal share is 444 px.  Two terminals cannot be
+        // narrower than 462 px, so they keep 462 and the third column gets what is left.
+        let (widths, auto) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 462, 462],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![410, 462, 462]);
+        assert_eq!(auto, 410);
+        assert_eq!(
+            widths.iter().sum::<i32>() + 2 * 16,
+            1366,
+            "the strip still fills the view exactly"
+        );
+        // Without minimums nothing changes, and a minimum below the share changes nothing.
+        assert_eq!(
+            TilingEngine::column_widths(&[None, None, None], 1366, 16, &cfg),
+            vec![444, 444, 444]
+        );
+        let (widths, _) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 300, 0],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![444, 444, 444]);
+    }
+
+    #[test]
+    fn test_a_minimum_that_squeezes_another_column_below_its_own_is_honoured_too() {
+        // 1000 px, three auto columns: 322 px each.  A (600) cannot, so B gets (968-600)/2
+        // = 184 px, which is below B's own minimum (300): B keeps its minimum as well.
+        let cfg = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 200,
+            ..LayoutConfig::default()
+        };
+        let (widths, _) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 600, 300],
+            1000,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths[1], 600);
+        assert_eq!(widths[2], 300);
+        assert!(widths[0] >= 100, "the rest is not squeezed out of existence");
+    }
+
+    #[test]
+    fn test_a_window_that_cannot_get_narrower_widens_its_column_and_the_rest_move_over() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        for hwnd in [5001, 5002, 5003] {
+            engine.add_window(make_window(hwnd, 10, 10), &be);
+        }
+        let work = Rect::new(8, 8, 1904, 1024);
+        let rects = |engine: &TilingEngine| -> HashMap<isize, Rect> {
+            let out = engine.monitors.focused_id().unwrap();
+            let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
+            engine
+                .calculate_positions(ws, work, &engine.config)
+                .into_iter()
+                .map(|(id, r)| (id.as_isize(), r))
+                .collect()
+        };
+        let before = rects(&engine);
+        assert_eq!(before[&5002].size.w, 500);
+
+        assert!(engine.note_window_min_width(WindowId::new(5002), 700));
+        let after = rects(&engine);
+        assert_eq!(after[&5001], before[&5001], "the column before it does not move");
+        assert_eq!(after[&5002].size.w, 700, "its column is as wide as it needs");
+        assert_eq!(
+            after[&5003].loc.x,
+            before[&5003].loc.x + 200,
+            "the column after it moves over instead of lying under it"
+        );
+        assert!(
+            after[&5002].right() + 16 <= after[&5003].loc.x,
+            "no overlap: {:?} {:?}",
+            after[&5002],
+            after[&5003]
+        );
+
+        // The limit goes away again.
+        assert!(!engine.note_window_min_width(WindowId::new(5002), 700), "no change");
+        assert!(engine.note_window_min_width(WindowId::new(5002), 0));
+        assert_eq!(rects(&engine), before);
+        assert!(!engine.note_window_min_width(WindowId::new(5002), 0));
+    }
+
+    #[test]
+    fn test_a_user_width_below_the_minimum_is_kept_but_not_used() {
+        // The user asked for 400 px; the window will not go below 650 px.  The column is
+        // 650 px wide, and the 400 px the user asked for is what comes back when the limit
+        // goes (niri keeps the requested width the same way).
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(5031, 10, 10), &be);
+        let out = engine.monitors.focused_id().unwrap();
+        engine
+            .monitors
+            .get_mut(&out)
+            .and_then(|m| m.workspace_mut())
+            .unwrap()
+            .columns[0]
+            .set_width(Some(400));
+        engine.note_window_min_width(WindowId::new(5031), 650);
+        let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
+        assert_eq!(ws.columns[0].width, Some(400));
+        assert_eq!(ws.columns[0].resolved_width(500), 650);
+        let positions = engine.calculate_positions(ws, Rect::new(8, 8, 1904, 1024), &engine.config);
+        assert_eq!(positions[0].1.size.w, 650);
+        engine.note_window_min_width(WindowId::new(5031), 0);
+        let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
+        assert_eq!(ws.columns[0].resolved_width(500), 400);
+    }
+
+    fn tile_min(engine: &TilingEngine, id: isize) -> Option<u32> {
+        engine
+            .monitors
+            .values()
+            .flat_map(|m| m.workspaces.values())
+            .flat_map(|w| w.columns.iter())
+            .flat_map(|c| c.tiles.iter())
+            .find(|t| t.window_id == WindowId::new(id))
+            .map(|t| t.min_width)
+    }
+
+    #[test]
+    fn test_the_minimum_width_follows_the_window_to_another_workspace_and_back_from_floating() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(5011, 10, 10), &be);
+        engine.note_window_min_width(WindowId::new(5011), 650);
+        assert_eq!(tile_min(&engine, 5011), Some(650));
+        // Moved to another workspace: the tile is made anew, with the same limit.
+        engine.move_window_to_workspace(1, &be);
+        assert_eq!(tile_min(&engine, 5011), Some(650));
+        // Floated (no tile) and tiled again.
+        engine.toggle_floating_for(WindowId::new(5011), &be);
+        assert_eq!(tile_min(&engine, 5011), None, "a floating window has no tile");
+        engine.toggle_floating_for(WindowId::new(5011), &be);
+        assert_eq!(tile_min(&engine, 5011), Some(650));
+    }
+
+    #[test]
+    fn test_a_closed_window_takes_its_limit_with_it() {
+        // Window handles are recycled: the next window with this handle starts without a limit.
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(5021, 10, 10), &be);
+        engine.note_window_min_width(WindowId::new(5021), 650);
+        engine.remove_window(WindowId::new(5021), &be);
+        engine.add_window(make_window(5021, 10, 10), &be);
+        assert_eq!(tile_min(&engine, 5021), Some(0));
+        assert!(engine.min_width_query_wanted(WindowId::new(5021)), "asked afresh");
+    }
+
+    #[test]
+    fn test_a_window_that_does_not_answer_is_asked_again_but_not_forever() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        let id = WindowId::new(5041);
+        assert!(!engine.min_width_query_wanted(id), "not managed: nothing to ask");
+        engine.add_window(make_window(5041, 10, 10), &be);
+        assert!(engine.min_width_query_wanted(id));
+        // Asked once when it opened, and again twice when it took the focus: no answer.
+        for _ in 0..3 {
+            assert!(engine.min_width_query_wanted(id));
+            assert!(!engine.note_min_width_answer(id, None));
+        }
+        assert!(!engine.min_width_query_wanted(id), "three tries are all it gets");
+        // An answer ends the asking, and a limit above the layout's own changes the layout.
+        engine.add_window(make_window(5042, 10, 10), &be);
+        let other = WindowId::new(5042);
+        assert!(engine.note_min_width_answer(other, Some(600)));
+        assert!(!engine.min_width_query_wanted(other));
+        assert_eq!(tile_min(&engine, 5042), Some(600));
+        // An absurd answer is capped, not trusted.
+        assert!(engine.note_window_min_width(other, 1_000_000));
+        assert_eq!(tile_min(&engine, 5042), Some(16_384));
     }
 
     #[test]

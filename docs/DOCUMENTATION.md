@@ -245,7 +245,8 @@ binds {
     Ctrl+Alt+T toggle-floating
     Ctrl+Alt+H scroll-left
     Ctrl+Alt+L scroll-right
-    Ctrl+Alt+Tab overview
+    Ctrl+Alt+Space overview
+    Ctrl+Alt+Grave focus-previous
     Ctrl+Alt+O overview-select
     Ctrl+Alt+Shift+Q quit
     Ctrl+Alt+1 switch-workspace 1
@@ -401,7 +402,8 @@ All default bindings use the `Ctrl+Alt` prefix:
 | T | `toggle-floating` | Toggle focused window floating |
 | H | `scroll-left` | Scroll workspace left |
 | L | `scroll-right` | Scroll workspace right |
-| Tab | `overview` | Toggle overview (zoom out) mode |
+| Space | `overview` | Toggle overview (zoom out) mode |
+| ` (Grave) | `focus-previous` | Focus the window you were on before (niri's `Mod+Tab`; with the Ctrl+Alt prefix that chord is Windows' task switcher) |
 | O | `overview-select` | Select window and exit overview |
 | Shift+Q | `quit` | Exit wiri |
 | 1–9 | `switch-workspace 1`–`9` | Switch to workspace |

@@ -25,6 +25,12 @@ pub struct Tile {
     /// reallocates the column's vertical real estate proportionally.
     /// Always >= 0.1 by construction in the resize helpers.
     pub height_weight: f32,
+    /// The narrowest the window can be made, as a visible width in pixels: what the window
+    /// answers to `WM_GETMINMAXINFO` (a Windows Terminal window will not go below about
+    /// 462 px), set by `TilingEngine::note_window_min_width`.  0 = no limit known.  The
+    /// column of the tile is never narrower than this: asking the window for less only
+    /// makes it overlap its neighbour.
+    pub min_width: u32,
 }
 
 impl Tile {
@@ -36,6 +42,7 @@ impl Tile {
             configure_throttle: ConfigureThrottle::default_60fps(),
             preferred_height: None,
             height_weight: 1.0,
+            min_width: 0,
         }
     }
 }
@@ -128,6 +135,20 @@ impl Column {
             self.maximized = true;
             self.width = Some(view_width);
         }
+    }
+
+    /// The narrowest this column can be: the widest minimum of its windows (0 = none known).
+    pub fn min_width(&self) -> u32 {
+        self.tiles.iter().map(|t| t.min_width).max().unwrap_or(0)
+    }
+
+    /// The width the column has: its own width, or `default_width` when it has none, but
+    /// never less than its windows can be made narrow.
+    pub fn resolved_width(&self, default_width: i32) -> i32 {
+        self.width
+            .map(|w| w as i32)
+            .unwrap_or(default_width)
+            .max(self.min_width() as i32)
     }
 
     /// Keep the active tab of a tabbed column on a tile that exists.
@@ -707,7 +728,7 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(i, col)| {
-                let w = col.width.map(|w| w as i32).unwrap_or(column_width);
+                let w = col.resolved_width(column_width);
                 w + if i < self.columns.len() - 1 { gap } else { 0 }
             })
             .sum()
@@ -824,7 +845,7 @@ impl Workspace {
     pub fn column_x_and_width(&self, col_idx: usize, default_width: i32, gap: i32) -> (i32, i32) {
         let mut x = 0i32;
         for (i, col) in self.columns.iter().enumerate() {
-            let w = col.width.map(|w| w as i32).unwrap_or(default_width);
+            let w = col.resolved_width(default_width);
             if i == col_idx {
                 return (x, w);
             }
@@ -842,7 +863,7 @@ impl Workspace {
         let adjusted_x = x + self.scroll_offset.x;
         let mut col_left = 0i32;
         for (i, col) in self.columns.iter().enumerate() {
-            let w = col.width.map(|w| w as i32).unwrap_or(column_width);
+            let w = col.resolved_width(column_width);
             let col_right = col_left + w;
             if adjusted_x >= col_left && adjusted_x < col_right {
                 return Some(i);
@@ -863,7 +884,7 @@ impl Workspace {
     ) -> Option<crate::utils::Rect> {
         let mut x = 0i32;
         for col in &self.columns {
-            let w = col.width.map(|w| w as i32).unwrap_or(default_width);
+            let w = col.resolved_width(default_width);
             for tile in &col.tiles {
                 if tile.window_id == window_id {
                     return Some(crate::utils::Rect::new(x, 0, w as u32, tile.size.h));
@@ -1731,6 +1752,40 @@ mod tests {
         assert_eq!(col.width, Some(900));
         col.toggle_maximized(900);
         assert_eq!(col.width, Some(640));
+    }
+
+    #[test]
+    fn test_a_column_with_a_minimum_is_wider_and_pushes_the_next_one_over() {
+        let mut ws = Workspace::new();
+        for id in 1..=3 {
+            ws.add_window_to_new_column(WindowId::new(id));
+        }
+        // Three auto columns of 440 px, 16 px apart.
+        assert_eq!(ws.column_x_and_width(0, 440, 16), (0, 440));
+        assert_eq!(ws.column_x_and_width(1, 440, 16), (456, 440));
+        assert_eq!(ws.column_x_and_width(2, 440, 16), (912, 440));
+        // The window of the middle one cannot be narrower than 462 px.
+        ws.columns[1].tiles[0].min_width = 462;
+        assert_eq!(ws.columns[1].min_width(), 462);
+        assert_eq!(ws.column_x_and_width(0, 440, 16), (0, 440));
+        assert_eq!(ws.column_x_and_width(1, 440, 16), (456, 462));
+        assert_eq!(ws.column_x_and_width(2, 440, 16), (934, 440));
+        assert_eq!(ws.total_width(440, 16), 440 + 16 + 462 + 16 + 440);
+        // Hit-testing and window rectangles use the same widths.
+        assert_eq!(ws.column_at_x(900, 440, 16), Some(1), "the wider column is under 900");
+        assert_eq!(ws.column_at_x(925, 440, 16), None, "and 925 is in the gap after it");
+        assert_eq!(ws.column_at_x(940, 440, 16), Some(2));
+        let rect = ws.current_position_for(WindowId::new(3), 440, 16).unwrap();
+        assert_eq!(rect.loc.x, 934);
+        // A column of its own width above the minimum is not touched; below it is raised.
+        ws.columns[1].width = Some(900);
+        assert_eq!(ws.column_x_and_width(1, 440, 16).1, 900);
+        ws.columns[1].width = Some(300);
+        assert_eq!(ws.column_x_and_width(1, 440, 16).1, 462);
+        // The widest minimum of a column's windows counts.
+        ws.columns[1].tiles.push(Tile::new(WindowId::new(9)));
+        ws.columns[1].tiles[1].min_width = 600;
+        assert_eq!(ws.columns[1].min_width(), 600);
     }
 
     #[test]

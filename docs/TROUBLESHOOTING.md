@@ -38,9 +38,12 @@ that way until wiri runs again.  Every hide is recorded in
 `%LOCALAPPDATA%\wiri\hidden.json` (with the process id and window class, so a
 recycled window handle is never touched).  Just start wiri again: it shows
 those windows before it enumerates the desktop and tiles everything.
-`wiri-ctl quit`, the tray menu and a panic do the same on the way out, and a
-window that an earlier killed wiri left off-screen is moved back onto the work
-area.
+`wiri-ctl quit`, the tray menu and a panic do the same on the way out.  The same
+file also records where every managed window was before wiri first moved it, and
+a restarted wiri takes that over for the windows that are still there: `quit`
+after a kill or a crash puts them back in their real places.  A window whose
+place is not known and that an earlier killed wiri left off-screen is moved back
+onto the work area (several of them cascaded, not stacked).
 
 ### Known hotkey conflicts on Windows
 
@@ -51,7 +54,7 @@ common offenders:
 
 | Chord                  | Captured by                                  |
 |------------------------|----------------------------------------------|
-| `Ctrl+Alt+Tab`         | Windows task switcher (accessibility)        |
+| `Ctrl+Alt+Tab`         | Windows task switcher (accessibility); wiri's `focus-previous` is ``Ctrl+Alt+` `` instead |
 | `Ctrl+Alt+Arrows`      | Intel HD Graphics + AMD Radeon rotation hotkeys (driver-level — wiri can't take them back) |
 | `Win+anything`         | Windows shell reserves the Win modifier      |
 | `Win+L`                | Lock workstation (unconditional)             |

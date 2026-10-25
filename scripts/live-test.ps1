@@ -14,7 +14,9 @@
 #          H6 the niri column keymap (consume/expel, move-window, first/last, maximize-column), pressed
 #          with the shipped default binds, H7 niri's action names and argument grammar (set-column-width
 #          "50%" / "+10%" / "600", presets, focus-workspace 2 against focus-workspace "2", set-window-height),
-#          H8 the workspace model (named workspaces, index addressing, previous, back and forth, no wrap).
+#          H8 the workspace model (named workspaces, index addressing, previous, back and forth, no wrap),
+#          H9 the Phase 0 leftovers (default hotkeys that register, an exact fullscreen, a terminal's minimum width,
+#          windows put back where they were after a crash).
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -395,7 +397,12 @@ $w2 = Start-Wiri $log2 (Join-Path $D 'wiri.stdout2.log')
 Start-Sleep -Seconds 5
 FormInfo $forms | ConvertTo-Json | Set-Content (Join-Path $D '09-forms-restarted.json')
 $visibleAfterRestart = VisibleCount $forms
-$hiddenJsonAfterRestart = (Test-Path $hiddenJson)
+# The record also keeps where every window was before wiri moved it, so the file stays: what must be gone is
+# the list of hidden windows.
+$hiddenJsonAfterRestart = $false
+if (Test-Path $hiddenJson) {
+    try { $hiddenJsonAfterRestart = (@(((Get-Content $hiddenJson -Raw) | ConvertFrom-Json).windows).Count -gt 0) } catch { $hiddenJsonAfterRestart = $true }
+}
 Shot '09-crash-restored'
 Ctl '09-windows-restarted' @('windows') | Out-Null
 $w = $w2    # the instance that is left running from here on
@@ -443,7 +450,7 @@ $vk = @{
     ctrl = 0x11; alt = 0x12; shift = 0x10; esc = 0x1B; space = 0x20; 'return' = 0x0D
     '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; a = 0x41; f = 0x46; j = 0x4A; k = 0x4B; q = 0x51; t = 0x54
     left = 0x25; right = 0x27; home = 0x24; end = 0x23
-    comma = 0xBC; period = 0xBE; lbracket = 0xDB; rbracket = 0xDD
+    comma = 0xBC; period = 0xBE; lbracket = 0xDB; rbracket = 0xDD; grave = 0xC0
     f1 = 0x70; f2 = 0x71; f3 = 0x72; f5 = 0x74; f6 = 0x75; f7 = 0x76; f8 = 0x77; f9 = 0x78
 }
 function Chord([string]$spec) {
@@ -1199,6 +1206,128 @@ Press 'ctrl+alt+1'
 foreach ($h in $sf) { [TestForms]::CloseForm($h) }
 Start-Sleep -Milliseconds 1500
 
+# ---- H9: Phase 0 leftovers - default hotkeys that register, an exact fullscreen, a terminal's minimum width, ------
+# ----     windows put back where they were after a crash ----------------------------------------------------------
+# No config file: the only thing under test is what the shipped defaults do.
+$log9 = Join-Path $D 'wiri.stderr9.log'
+Stop-WiriGracefully $w 'h9'
+Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+$w9 = Start-Wiri $log9 ($log9 + '.out')
+Start-Sleep -Seconds 4
+$w = $w9
+$sb = [System.Windows.Forms.SystemInformation]::VirtualScreen
+# Every default chord registers: Ctrl+Alt+Tab is Windows' own task switcher and was refused at every start.
+$h9FailedHotkeys = (LogLines $log9 'FAIL hotkey').Count
+$h9RegisteredHotkeys = (LogLines $log9 'OK hotkey').Count
+
+# --- the key above Tab takes the place of Ctrl+Alt+Tab: back to the window that had the focus before
+$h9A = [TestForms]::Open('wiri-h9-a', 40, 120, 200); Start-Sleep -Milliseconds 1500
+$h9B = [TestForms]::Open('wiri-h9-b', 200, 120, 40); Start-Sleep -Milliseconds 1800
+FocusForm $h9A
+$h9FocusedA = ([LT]::GetForegroundWindow() -eq $h9A)
+Chord 'ctrl+alt+grave'; Start-Sleep -Milliseconds 1400
+$h9GraveGoesBack = ([LT]::GetForegroundWindow() -eq $h9B)
+
+# --- fullscreen is exactly the monitor (it used to be 7 px larger), and the tile that comes back has the usual inset
+FocusForm $h9B
+$null = Ctl 'h9-action-fullscreen' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 1800
+$fr = Rc $h9B
+$h9FullscreenExact = ($fr.L -eq $sb.Left) -and ($fr.T -eq $sb.Top) -and ($fr.W -eq $sb.Width) -and ($fr.H -eq $sb.Height)
+Set-Content (Join-Path $D 'h9-fullscreen-rect.json') ($fr | ConvertTo-Json)
+Shot 'h9-01-fullscreen'
+$null = Ctl 'h9-action-fullscreen-off' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 1800
+$tr = Rc $h9B
+$ar = Rc $h9A
+$h9FullscreenOffTiles = ($tr.W -lt ($sb.Width - 60)) -and ($tr.H -lt $sb.Height)
+$h9TileAfterFullscreenAligned = (Near $tr.T $ar.T 2) -and (Near $tr.H $ar.H 2)
+Set-Content (Join-Path $D 'h9-tiles-after-fullscreen.json') (@($ar, $tr) | ConvertTo-Json)
+Shot 'h9-02-tile-after-fullscreen'
+[TestForms]::CloseForm($h9A)
+[TestForms]::CloseForm($h9B)
+Start-Sleep -Milliseconds 1500
+
+# --- three terminals side by side: a Windows Terminal window will not get narrower than about 462 px, so its column has to be
+# --- that wide (it used to be asked for 440 px, refuse, and lie on top of its neighbour)
+$topBefore9 = [LT]::TopLevel()
+$cons9 = @()
+foreach ($i in 1..3) {
+    $cons9 += Start-Process -FilePath cmd.exe -ArgumentList '/k', "title wiri-h9-con-$i" -PassThru
+    Start-Sleep -Milliseconds 1600
+}
+Start-Sleep -Seconds 4
+$wts9 = @(NewTopLevel $topBefore9 | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Title($_) -like 'wiri-h9-con-*') })
+$h9TerminalsOpened = ($wts9.Count -eq 3)
+$r9 = @($wts9 | ForEach-Object { Rc $_ })
+Set-Content (Join-Path $D 'h9-terminal-rects.json') ($r9 | ConvertTo-Json)
+Shot 'h9-03-three-terminals'
+# A window that is scrolled out of view is parked below the screen (at x=0, like every parked window): only windows on the screen are compared.
+$on9 = @($r9 | Where-Object { $_.R -gt 0 -and $_.L -lt $sb.Width -and $_.B -gt 0 -and $_.T -lt $sb.Height })
+$h9Overlaps = 0
+for ($a = 0; $a -lt $on9.Count; $a++) { for ($b = $a + 1; $b -lt $on9.Count; $b++) {
+    $x = $on9[$a]; $y = $on9[$b]
+    if ($x.L -lt $y.R - 1 -and $x.R -gt $y.L + 1 -and $x.T -lt $y.B - 1 -and $x.B -gt $y.T + 1) { $h9Overlaps++ }
+} }
+foreach ($c in $cons9) { if (-not $c.HasExited) { Stop-Process -Id $c.Id -Force } }
+Start-Sleep -Seconds 2
+
+# --- a crash does not cost the windows their old places: wiri dies with some of them parked below the screen, is started
+# --- again, and `quit` puts every window back where it was before the first wiri touched it (it used to pile them up in
+# --- the middle of the screen)
+$cf = @()
+foreach ($i in 1..4) {
+    $cf += [TestForms]::Open("wiri-h9-crash-$i", (40 * $i), 140, (230 - 40 * $i))
+    Start-Sleep -Milliseconds 1400
+    $null = Ctl "h9-width-$i" @('set-column-width', '700')     # wide columns: the first ones scroll out of view and are parked
+    Start-Sleep -Milliseconds 500
+}
+Start-Sleep -Seconds 2
+$h9Initial = @{}
+foreach ($f in $cf) { $t = [LT]::Title($f); $h9Initial[$t] = [TestForms]::Initial[$t] }
+$h9Parked = @($cf | Where-Object { (Rc $_).T -ge $sb.Height }).Count
+$hj = Join-Path $wiriData 'hidden.json'
+function H9Originals() {
+    if (-not (Test-Path $hj)) { return 0 }
+    try {
+        $j = (Get-Content $hj -Raw) | ConvertFrom-Json
+        $mine = @($cf | ForEach-Object { [int64]$_ })
+        return @($j.originals | Where-Object { $mine -contains [int64]$_.hwnd }).Count
+    } catch { return -1 }
+}
+$h9OriginalsBefore = H9Originals
+if (Test-Path $hj) { Copy-Item $hj (Join-Path $D 'h9-hidden-before-the-crash.json') -Force }
+Stop-Process -Id $w.Id -Force            # a crash: nothing is put back
+Start-Sleep -Seconds 2
+$h9MovedByWiri = 0
+foreach ($f in $cf) {
+    $init = $h9Initial[[LT]::Title($f)]
+    $r = New-Object LT+RECT; [void][LT]::GetWindowRect($f, [ref]$r)
+    if ($r.L -ne $init.L -or $r.T -ne $init.T) { $h9MovedByWiri++ }
+}
+Shot 'h9-04-after-the-crash'
+$log9b = Join-Path $D 'wiri.stderr9b.log'
+$w9b = Start-Wiri $log9b ($log9b + '.out')
+Start-Sleep -Seconds 5
+$h9OriginalsAfterRestart = H9Originals
+if (Test-Path $hj) { Copy-Item $hj (Join-Path $D 'h9-hidden-after-the-restart.json') -Force }
+Stop-WiriGracefully $w9b 'h9b'
+$h9Restored = 0
+$h9RestoredRects = @()
+foreach ($f in $cf) {
+    $init = $h9Initial[[LT]::Title($f)]
+    $r = New-Object LT+RECT; [void][LT]::GetWindowRect($f, [ref]$r)
+    $h9RestoredRects += [pscustomobject]@{ title = [LT]::Title($f); L = $r.L; T = $r.T; R = $r.R; B = $r.B; initial = "$($init.L),$($init.T),$($init.R),$($init.B)" }
+    if ((Near $r.L $init.L 2) -and (Near $r.T $init.T 2) -and (Near ($r.R - $r.L) ($init.R - $init.L) 2) -and (Near ($r.B - $r.T) ($init.B - $init.T) 2)) { $h9Restored++ }
+}
+Set-Content (Join-Path $D 'h9-restored-rects.json') ($h9RestoredRects | ConvertTo-Json)
+Shot 'h9-05-restored-after-crash-and-quit'
+$h9RecordGoneAfterQuit = -not (Test-Path $hj)
+foreach ($f in $cf) { [TestForms]::CloseForm($f) }
+Start-Sleep -Milliseconds 1500
+# the instance that is left running for the rest of the script
+$log9c = Join-Path $D 'wiri.stderr9c.log'
+$w = Start-Wiri $log9c ($log9c + '.out')
+Start-Sleep -Seconds 4
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -1416,6 +1545,22 @@ $summary = [ordered]@{
     h8_focus_workspace_up_does_not_wrap = $h8NoWrapAtTheTop
     h8_focus_window_switches_to_its_workspace = $h8SwitchedToItsWorkspace
     h8_number_counts_positions_after_a_workspace_went = $h8ThirdIsFormTwo
+    # --- Phase 1 / H9: Phase 0 leftovers
+    h9_failed_default_hotkeys = $h9FailedHotkeys
+    h9_default_hotkeys_registered = ($h9RegisteredHotkeys -ge 60)
+    h9_focus_window_focused_the_first_form = $h9FocusedA
+    h9_ctrl_alt_grave_goes_back_to_the_previous_window = $h9GraveGoesBack
+    h9_fullscreen_covers_exactly_the_monitor = $h9FullscreenExact
+    h9_fullscreen_off_gives_the_tile_back = $h9FullscreenOffTiles
+    h9_tile_after_fullscreen_is_aligned_with_its_neighbour = $h9TileAfterFullscreenAligned
+    h9_three_terminals_opened = $h9TerminalsOpened
+    h9_overlapping_terminal_pairs = $h9Overlaps
+    h9_a_window_was_parked_when_wiri_died = ($h9Parked -ge 1)
+    h9_originals_recorded_before_the_crash = ($h9OriginalsBefore -eq $cf.Count)
+    h9_wiri_had_moved_the_windows_before_the_crash = ($h9MovedByWiri -ge 3)
+    h9_originals_survive_the_restart = ($h9OriginalsAfterRestart -eq $cf.Count)
+    h9_every_window_back_where_it_was_after_crash_and_quit = ($h9Restored -eq $cf.Count)
+    h9_record_gone_after_a_graceful_quit = $h9RecordGoneAfterQuit
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
