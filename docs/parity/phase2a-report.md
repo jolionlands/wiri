@@ -14,7 +14,7 @@ item N" when that item changed it).
 - **The official cycle** (`schtasks /run /tn wiri-cycle`): fetch the pushed branch, `cargo build --release`, `cargo test`,
   `cargo check --all-targets` with `-D warnings`, then `scripts/live-test.ps1` in the interactive session, recorded with
   ffmpeg.  A scratch clone (`wiri-scratch`) gave faster iterations; every item went through an official cycle on its
-  pushed commit.  Three scratch cycles on item 3 and two on item 4 found what is listed under "What the live gates found".
+  pushed commit.  Three scratch cycles on item 3 and two on item 4 found what is listed under "What the tests found along the way".
 - **The live test now refuses to run twice at once** (a machine-wide named mutex in the harness; the idea and first
   version are Codex Sol's `ee41d27`).  The reason: during the first official cycle on item 3 a stale scheduled task started
   a second build and a second live run in the same clone; it overwrote `build.status` (`build_rc=101`, "access denied"
