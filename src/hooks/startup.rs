@@ -10,6 +10,12 @@ use windows::Win32::System::Registry::{
 
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
+fn startup_command(exe_path: &str) -> String {
+    // Run values are command lines. Always quote the executable, even without spaces.
+    // A path from current_exe is unquoted and cannot contain a double quote on Windows.
+    format!("\"{exe_path}\"")
+}
+
 pub struct StartupManager {
     app_name: String,
     exe_path: String,
@@ -120,7 +126,8 @@ impl StartupManager {
                 .chain(std::iter::once(0))
                 .collect();
 
-            let path_bytes: Vec<u8> = OsStr::new(&self.exe_path)
+            let command = startup_command(&self.exe_path);
+            let path_bytes: Vec<u8> = OsStr::new(&command)
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .flat_map(|c| c.to_le_bytes())
@@ -205,5 +212,42 @@ impl StartupManager {
 impl Default for StartupManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_command;
+
+    #[test]
+    fn quotes_executable_paths_with_spaces() {
+        assert_eq!(
+            startup_command(r"C:\Program Files\wiri\wiri.exe"),
+            r#""C:\Program Files\wiri\wiri.exe""#
+        );
+    }
+
+    #[test]
+    fn quotes_executable_paths_without_spaces() {
+        assert_eq!(
+            startup_command(r"C:\wiri\wiri.exe"),
+            r#""C:\wiri\wiri.exe""#
+        );
+    }
+
+    #[test]
+    fn preserves_unicode_executable_paths() {
+        assert_eq!(
+            startup_command(r"C:\Users\Zoë\工具 🦀\wiri.exe"),
+            r#""C:\Users\Zoë\工具 🦀\wiri.exe""#
+        );
+    }
+
+    #[test]
+    fn preserves_unc_executable_paths() {
+        assert_eq!(
+            startup_command(r"\\server\shared apps\wiri.exe"),
+            r#""\\server\shared apps\wiri.exe""#
+        );
     }
 }
