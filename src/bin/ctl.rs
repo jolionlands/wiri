@@ -252,8 +252,12 @@ enum Commands {
     /// Center the focused column on screen
     CenterColumn,
 
-    /// Set the focused column width preset (1/3, 1/2, 2/3, full, cycle)
-    SetColumnWidth { preset: String },
+    /// Set the width of the focused column: niri's size (50%, +10%, -10%, 1200, +100)
+    /// or 1/3, 1/2, 2/3, full, cycle
+    SetColumnWidth {
+        #[arg(allow_hyphen_values = true)]
+        preset: String,
+    },
 
     /// Resize the focused column by ±N pixels
     ResizeColumn { delta_px: i32 },

@@ -8,6 +8,7 @@ use tracing::{debug, info};
 const MAX_POSITION_FAILURES: u8 = 3;
 use super::{ConfigureIntent, Monitor, MonitorSet, ScrollDirection, SizingMode, WorkspaceLayout};
 use crate::backend::{BackendHandle, WindowInfo};
+use crate::input::{proportion_px, SizeChange};
 use crate::utils::{OutputId, Point, Rect, WindowId};
 
 // ---------------------------------------------------------------------------
@@ -445,8 +446,15 @@ pub enum ColumnWidthPreset {
     TwoThirds,     // ~67 %
     ThreeQuarters, // ~75 %
     Full,          // 100 %
-    /// Cycle through OneQuarter → OneThird → Half → TwoThirds → ThreeQuarters → Full → OneQuarter …
+    /// niri's `switch-preset-column-width`: the next of a third, a half and two thirds.
     Cycle,
+}
+
+/// The side of a window a size change applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeAxis {
+    Width,
+    Height,
 }
 
 /// Direction for relative workspace navigation.
@@ -537,9 +545,6 @@ pub struct TilingEngine {
     /// Original window bounds at first registration. Used to restore windows
     /// when wiri exits so the user gets their layout back.
     original_bounds: HashMap<WindowId, Rect>,
-    /// Last column-width preset applied via `set_column_width_preset(Cycle, …)`.
-    /// Starts at `Half` so the first Cycle press → `TwoThirds`.
-    last_column_preset: ColumnWidthPreset,
     // ---- Item 2: always-on-top tracking ----
     /// Windows that have been pinned as HWND_TOPMOST via toggle_always_on_top_for_focused.
     always_on_top: HashSet<WindowId>,
@@ -631,7 +636,6 @@ impl TilingEngine {
             layout_request_tx: None,
             applied_state: HashMap::new(),
             original_bounds: HashMap::new(),
-            last_column_preset: ColumnWidthPreset::Half,
             always_on_top: HashSet::new(),
             auto_tile_threshold: None,
             auto_tile_zoom: None,
@@ -3724,9 +3728,15 @@ impl TilingEngine {
     }
 
     /// Switch a floating window between niri's width presets: a third, a half and
-    /// two thirds of its monitor's work area.
-    pub fn float_cycle_width(&mut self, window_id: WindowId, backend: &BackendHandle) {
-        const PRESETS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
+    /// two thirds of its monitor's work area (`forwards`: the next wider one, else the
+    /// next narrower one).
+    pub fn float_cycle_width(
+        &mut self,
+        window_id: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        let presets = Self::PRESET_COLUMN_PROPORTIONS;
         let Some((output, _)) = self.float_location(window_id) else {
             return;
         };
@@ -3737,11 +3747,21 @@ impl TilingEngine {
             return;
         };
         let current = rect.size.w as f64;
-        let next = PRESETS
-            .iter()
-            .copied()
-            .find(|f| work.size.w as f64 * *f > current + 1.0)
-            .unwrap_or(PRESETS[0]);
+        let wide = |f: f64| work.size.w as f64 * f;
+        let next = if forwards {
+            presets
+                .iter()
+                .copied()
+                .find(|f| wide(*f) > current + 1.0)
+                .unwrap_or(presets[0])
+        } else {
+            presets
+                .iter()
+                .rev()
+                .copied()
+                .find(|f| wide(*f) + 1.0 < current)
+                .unwrap_or(presets[presets.len() - 1])
+        };
         self.float_set_width_fraction(window_id, next, backend);
     }
 
@@ -5920,68 +5940,314 @@ impl TilingEngine {
     }
 
     // -------------------------------------------------------------------------
-    // Item 4 — set_column_width_preset
+    // niri's size grammar: set-column-width, set-window-height and the presets
     // -------------------------------------------------------------------------
 
-    /// Set the focused column's width to a preset fraction of the work_rect,
-    /// or cycle through presets.
-    pub fn set_column_width_preset(&mut self, preset: ColumnWidthPreset, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
+    /// niri's default `preset-column-widths`: a third, a half and two thirds of the view.
+    const PRESET_COLUMN_PROPORTIONS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
 
-        let view_width = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            Self::view_width_for_monitor(monitor, &self.config)
-        };
+    /// The narrowest column a size change makes.
+    const MIN_COLUMN_PX: i32 = 50;
+    /// The widest one (niri has the same limit).
+    const MAX_COLUMN_PX: i32 = 100_000;
 
-        // Resolve Cycle → a concrete preset. Niri-style cycle order:
-        //   1/4 → 1/3 → 1/2 → 2/3 → 3/4 → full → 1/4 …
-        let concrete = match preset {
-            ColumnWidthPreset::Cycle => {
-                let next = match self.last_column_preset {
-                    ColumnWidthPreset::OneQuarter => ColumnWidthPreset::OneThird,
-                    ColumnWidthPreset::OneThird => ColumnWidthPreset::Half,
-                    ColumnWidthPreset::Half => ColumnWidthPreset::TwoThirds,
-                    ColumnWidthPreset::TwoThirds => ColumnWidthPreset::ThreeQuarters,
-                    ColumnWidthPreset::ThreeQuarters => ColumnWidthPreset::Full,
-                    ColumnWidthPreset::Full => ColumnWidthPreset::OneQuarter,
-                    ColumnWidthPreset::Cycle => ColumnWidthPreset::Half,
-                };
-                self.last_column_preset = next;
-                next
-            }
-            other => {
-                self.last_column_preset = other;
-                other
-            }
-        };
+    /// The focused column of `output` and what a size change needs to know about it:
+    /// its index and width, the width of the view, the gap between columns and the room
+    /// the borders take around a window.
+    fn focused_column_metrics(&self, output: OutputId) -> Option<(usize, i32, i32, i32, i32)> {
+        let monitor = self.monitors.get(&output)?;
+        let cfg = self.effective_config(output);
+        let col_idx = monitor.focus_column?;
+        let view = Self::view_width_for_monitor(monitor, cfg);
+        let workspace = monitor.workspace()?;
+        let column = workspace.columns.get(col_idx)?;
+        let current = column
+            .width
+            .map(|w| w as i32)
+            .unwrap_or_else(|| Self::workspace_default_width(workspace, view, cfg));
+        Some((col_idx, current, view, cfg.column_gap, 2 * cfg.border_width.max(1)))
+    }
 
-        let target_w: u32 = match concrete {
-            ColumnWidthPreset::OneQuarter => (view_width / 4).max(50) as u32,
-            ColumnWidthPreset::OneThird => (view_width / 3).max(50) as u32,
-            ColumnWidthPreset::Half => (view_width / 2).max(50) as u32,
-            ColumnWidthPreset::TwoThirds => (view_width * 2 / 3).max(50) as u32,
-            ColumnWidthPreset::ThreeQuarters => (view_width * 3 / 4).max(50) as u32,
-            ColumnWidthPreset::Full => view_width.max(50) as u32,
-            ColumnWidthPreset::Cycle => unreachable!("Cycle resolved above"),
+    /// niri `set-column-width` / `set-window-width`: change the width of the focused
+    /// column (`"50%"`, `"+10%"`, `"1200"`, `"+100"`).  A column with a width of its own
+    /// is not maximized any more.
+    pub fn set_column_width_by(&mut self, change: SizeChange, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
         };
-
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        column.set_width(Some(target_w));
-                    }
-                }
-            }
+        let Some((col_idx, current, view, gap, extra)) = self.focused_column_metrics(output)
+        else {
+            return;
+        };
+        let width = change
+            .resolve(current, view, gap, extra)
+            .clamp(Self::MIN_COLUMN_PX, Self::MAX_COLUMN_PX) as u32;
+        if let Some(column) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+            .and_then(|w| w.columns.get_mut(col_idx))
+        {
+            column.set_width(Some(width));
         }
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
 
-        self.apply_layout_for_monitor(focused_output, backend);
+    /// The index of the preset a column takes next.  `remembered` is the preset the
+    /// column was switched to last (and has not been resized since): the next one goes
+    /// on from there.  Any other column gets the first preset wider than it is, going
+    /// forwards, and the last one narrower than it, going back (niri's `toggle_width`).
+    fn next_preset_index(
+        remembered: Option<usize>,
+        current_px: i32,
+        resolved: &[i32],
+        forwards: bool,
+    ) -> usize {
+        let len = resolved.len().max(1);
+        match remembered {
+            Some(idx) if forwards => (idx + 1) % len,
+            Some(idx) => (idx + len - 1) % len,
+            None if forwards => resolved
+                .iter()
+                .position(|&w| current_px + 1 < w)
+                .unwrap_or(0),
+            None => resolved
+                .iter()
+                .rposition(|&w| w + 1 < current_px)
+                .unwrap_or(len - 1),
+        }
+    }
+
+    /// niri `switch-preset-column-width` (`forwards`) and `-back`: the focused column
+    /// takes the next preset width (a third, a half, two thirds of the view).
+    pub fn switch_preset_column_width(&mut self, forwards: bool, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let Some((col_idx, current, view, gap, _)) = self.focused_column_metrics(output) else {
+            return;
+        };
+        let resolved: Vec<i32> = Self::PRESET_COLUMN_PROPORTIONS
+            .iter()
+            .map(|p| proportion_px(view, gap, *p))
+            .collect();
+        let Some((maximized, remembered)) = self
+            .monitors
+            .get(&output)
+            .and_then(|m| m.workspace())
+            .and_then(|w| w.columns.get(col_idx))
+            .map(|c| (c.maximized, c.preset_idx))
+        else {
+            return;
+        };
+        // A maximized column counts as a column as wide as the view.
+        let idx = if maximized {
+            Self::next_preset_index(None, view, &resolved, forwards)
+        } else {
+            Self::next_preset_index(remembered, current, &resolved, forwards)
+        };
+        let width = resolved[idx].clamp(Self::MIN_COLUMN_PX, Self::MAX_COLUMN_PX) as u32;
+        if let Some(column) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+            .and_then(|w| w.columns.get_mut(col_idx))
+        {
+            column.set_width(Some(width));
+            column.preset_idx = Some(idx);
+        }
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// Set the focused column's width to a fraction of the view (the older wiri
+    /// presets), or switch to the next preset width.
+    pub fn set_column_width_preset(&mut self, preset: ColumnWidthPreset, backend: &BackendHandle) {
+        let milli_percent = match preset {
+            ColumnWidthPreset::Cycle => {
+                self.switch_preset_column_width(true, backend);
+                return;
+            }
+            ColumnWidthPreset::OneQuarter => 25_000,
+            ColumnWidthPreset::OneThird => 33_333,
+            ColumnWidthPreset::Half => 50_000,
+            ColumnWidthPreset::TwoThirds => 66_667,
+            ColumnWidthPreset::ThreeQuarters => 75_000,
+            ColumnWidthPreset::Full => 100_000,
+        };
+        self.set_column_width_by(SizeChange::SetProportion(milli_percent), backend);
+    }
+
+    /// niri `set-window-height`: change the height of the focused window inside its
+    /// column.  Heights are kept as weights, so the window gets the share of the column
+    /// that the new height is and the others keep their proportions.  A column of one
+    /// window (or a tabbed one) always fills the view: nothing happens there.
+    pub fn set_window_height_by(&mut self, change: SizeChange, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let (view_h, gap, extra) = {
+            let Some(monitor) = self.monitors.get(&output) else {
+                return;
+            };
+            let cfg = self.effective_config(output);
+            let view_h = monitor.work_area.size.h as i32
+                - cfg.outer_gaps.0
+                - cfg.outer_gaps.2
+                - cfg.reserve_top as i32
+                - cfg.reserve_bottom as i32;
+            (view_h, cfg.window_gap, 2 * cfg.border_width.max(1))
+        };
+        let changed = {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let (Some(col_idx), Some(window)) = (monitor.focus_column, monitor.focus_window) else {
+                return;
+            };
+            let Some(column) = monitor
+                .workspace_mut()
+                .and_then(|w| w.columns.get_mut(col_idx))
+            else {
+                return;
+            };
+            if column.tiles.len() < 2 || matches!(column.display, crate::layout::workspace::ColumnDisplay::Tabbed { .. }) {
+                return;
+            }
+            let Some(idx) = column.index_of(window) else {
+                return;
+            };
+            let available = (view_h - gap * (column.tiles.len() as i32 - 1)).max(1) as f32;
+            let weights: Vec<f32> = column
+                .tiles
+                .iter()
+                .map(|t| t.height_weight.max(0.1))
+                .collect();
+            let total: f32 = weights.iter().sum();
+            let mine = weights[idx];
+            let others = total - mine;
+            let current_px = (available * mine / total).round() as i32;
+            let target_px = change.resolve(current_px, view_h, gap, extra);
+            // The share of the column the window gets, and the weight that makes it so.
+            let share = (target_px as f32 / available).clamp(0.05, 0.95);
+            column.tiles[idx].height_weight = (share / (1.0 - share) * others).clamp(0.1, 10.0);
+            true
+        };
+        if changed {
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// niri `reset-window-height`: the focused window gets the default weight again.
+    pub fn reset_window_height(&mut self, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let reset = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|monitor| {
+                let (col_idx, window) = (monitor.focus_column?, monitor.focus_window?);
+                monitor.workspace_mut()?.columns.get_mut(col_idx)?.tiles.iter_mut().find(|t| t.window_id == window)
+            })
+            .map(|tile| tile.height_weight = 1.0)
+            .is_some();
+        if reset {
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// Change the width or the height of a floating window (`set-column-width` /
+    /// `set-window-height` on a float): proportions are of its monitor's work area.
+    pub fn float_apply_size_change(
+        &mut self,
+        window_id: WindowId,
+        axis: SizeAxis,
+        change: SizeChange,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let (current, view, least) = match axis {
+            SizeAxis::Width => (rect.size.w as i32, work.size.w as i32, 120),
+            SizeAxis::Height => (rect.size.h as i32, work.size.h as i32, 80),
+        };
+        let size = change
+            .resolve(current, view, 0, 0)
+            .clamp(least, view.max(least)) as u32;
+        let resized = match axis {
+            SizeAxis::Width => Rect::new(rect.loc.x, rect.loc.y, size, rect.size.h),
+            SizeAxis::Height => Rect::new(rect.loc.x, rect.loc.y, rect.size.w, size),
+        };
+        self.place_float(window_id, resized, backend);
+    }
+
+    /// niri `move-window-to-floating` / `move-window-to-tiling`: float or tile a window
+    /// (unlike `toggle-window-floating` nothing happens when it already is).
+    pub fn set_window_floating(
+        &mut self,
+        window_id: WindowId,
+        floating: bool,
+        backend: &BackendHandle,
+    ) {
+        if !self.tiled_windows.contains_key(&window_id) {
+            return;
+        }
+        match (floating, self.floating_windows.contains(&window_id)) {
+            (true, false) => self.float_window(window_id, backend),
+            (false, true) => self.unfloat_window(window_id, backend),
+            _ => {}
+        }
+    }
+
+    /// niri `focus-monitor-left` / `focus-monitor-right`: focus the monitor next to the
+    /// focused one (the monitors are ordered from left to right; nothing happens at the
+    /// edge) and give its focused window the keyboard.  `true` when the focus moved.
+    pub fn focus_monitor_toward(
+        &mut self,
+        direction: ScrollDirection,
+        backend: &BackendHandle,
+    ) -> bool {
+        let Some(current) = self.monitors.focused_id() else {
+            return false;
+        };
+        let mut order: Vec<(i32, i32, OutputId)> = self
+            .monitors
+            .iter()
+            .map(|(&oid, m)| (m.bounds.loc.x, m.bounds.loc.y, oid))
+            .collect();
+        order.sort_by_key(|(x, y, _)| (*x, *y));
+        let Some(pos) = order.iter().position(|(_, _, oid)| *oid == current) else {
+            return false;
+        };
+        let target = match direction {
+            ScrollDirection::Left => pos.checked_sub(1),
+            ScrollDirection::Right => (pos + 1 < order.len()).then_some(pos + 1),
+        };
+        let Some(target) = target.map(|p| order[p].2) else {
+            return false;
+        };
+        self.set_focused_output(target);
+        let window = self
+            .monitors
+            .get(&target)
+            .and_then(|m| m.focus_window)
+            .filter(|w| self.tiled_windows.contains_key(w));
+        if let Some(window) = window {
+            self.activate_now(window, backend);
+        }
+        // Only the two monitors involved change (their focus borders).
+        self.apply_layout_for_monitor(current, backend);
+        self.apply_layout_for_monitor(target, backend);
+        true
     }
 
     // -------------------------------------------------------------------------
@@ -6208,51 +6474,90 @@ impl TilingEngine {
         }
     }
 
-    /// Expand the focused column so it fills the remaining horizontal space
-    /// inside the work area after all other columns and inter-column gaps
-    /// are accounted for. In `Proportional` mode this is effectively a
-    /// "grow to viewport" — the engine's automatic redistribution leaves
-    /// the column at full viewport width on the next layout pass.
+    /// niri `expand-column-to-available-width`: the focused column takes the room that the
+    /// other columns on screen leave, without resizing them.  Only columns that are fully
+    /// in view count (a column scrolled half out of it does not take room away), and the
+    /// focused column has to be fully in view itself.  When it is the only column on
+    /// screen it becomes maximized, so that `maximize-column` brings its width back.  A
+    /// column that is maximized already is left alone.
     pub fn expand_column_to_available(&mut self, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else {
+        let Some(output) = self.monitors.focused_id() else {
             return;
         };
-
-        let (view_width, default_col_w) = {
-            let Some(monitor) = self.monitors.get(&focused_output) else {
+        // (focused column, its width, the room left, others on screen, where the leftmost
+        // column that is fully in view starts, width of the view)
+        let (active, active_width, available, others, leftmost_x, view) = {
+            let Some(monitor) = self.monitors.get(&output) else {
                 return;
             };
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let dw = monitor
-                .workspace()
-                .map(|w| Self::workspace_default_width(w, vw, &self.config))
-                .unwrap_or_else(|| Self::effective_column_width(1, vw, &self.config));
-            (vw, dw)
+            let cfg = self.effective_config(output);
+            let (Some(active), Some(workspace)) = (monitor.focus_column, monitor.workspace())
+            else {
+                return;
+            };
+            if workspace.columns.get(active).map_or(true, |c| c.maximized) {
+                return;
+            }
+            let view = Self::view_width_for_monitor(monitor, cfg);
+            let gap = cfg.column_gap;
+            let explicit: Vec<Option<u32>> = workspace.columns.iter().map(|c| c.width).collect();
+            let widths = Self::column_widths(&explicit, view, gap, cfg);
+            let scroll = workspace.scroll_offset.x;
+            let mut x = 0;
+            let mut taken = 0;
+            let mut leftmost = None;
+            let mut active_seen = false;
+            let mut others = false;
+            for (idx, w) in widths.iter().enumerate() {
+                let col_x = x;
+                x += w + gap;
+                if col_x < scroll {
+                    continue; // scrolled out on the left
+                }
+                if col_x + w > scroll + view {
+                    break; // runs out of the view on the right
+                }
+                leftmost.get_or_insert(col_x);
+                if idx == active {
+                    active_seen = true;
+                } else {
+                    others = true;
+                }
+                taken += w + gap;
+            }
+            if !active_seen {
+                return;
+            }
+            // What is left of the view once the columns in it and the gaps after them are
+            // counted (the gap after the last column is not part of the view).
+            let available = view + gap - taken;
+            if available <= 0 {
+                return;
+            }
+            (
+                active,
+                widths[active],
+                available,
+                others,
+                leftmost.unwrap_or(0),
+                view.max(Self::MIN_COLUMN_PX) as u32,
+            )
         };
-        let gap = self.config.column_gap;
 
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            let Some(focus_col_idx) = monitor.focus_column else {
-                return;
-            };
-            if let Some(workspace) = monitor.workspace_mut() {
-                let other_columns_sum: i32 = workspace
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| *idx != focus_col_idx)
-                    .map(|(_, c)| c.width.map(|w| w as i32).unwrap_or(default_col_w))
-                    .sum();
-                let other_count = (workspace.columns.len() as i32 - 1).max(0);
-                let total_gaps = gap * other_count;
-                let target_w = (view_width - other_columns_sum - total_gaps).max(50) as u32;
-                if let Some(column) = workspace.columns.get_mut(focus_col_idx) {
-                    column.set_width(Some(target_w));
+        if let Some(workspace) = self.monitors.get_mut(&output).and_then(|m| m.workspace_mut()) {
+            if let Some(column) = workspace.columns.get_mut(active) {
+                if others {
+                    column.set_width(Some((active_width + available).max(Self::MIN_COLUMN_PX) as u32));
+                    // Keep the columns that were in view in view: the leftmost stays at the
+                    // left edge, the focused column grows to the right.
+                    workspace.scroll_offset.x = leftmost_x.max(0);
+                } else {
+                    column.toggle_maximized(view);
                 }
             }
         }
-
-        self.apply_layout_for_monitor(focused_output, backend);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
     }
 
     /// niri `maximize-column`: the focused column becomes as wide as the view
@@ -8736,7 +9041,7 @@ mod tests {
         engine.toggle_floating_for(wid, &be); // 800 wide
         let mut widths = Vec::new();
         for _ in 0..4 {
-            engine.float_cycle_width(wid, &be);
+            engine.float_cycle_width(wid, true, &be);
             widths.push(engine.float_homes.get(&wid).unwrap().rect.size.w);
         }
         // 800 -> a half (960) -> two thirds (1280) -> a third (640) -> a half again.
@@ -10124,114 +10429,293 @@ mod tests {
         );
     }
 
-    // --- set_column_width_preset ---
+    // --- niri's size grammar: set-column-width, the presets, set-window-height ---
 
-    #[test]
-    fn test_column_width_preset_half() {
+    /// An engine (1920 x 1080 monitor, no outer gaps, 16 px between columns, 4 px borders)
+    /// with one tile in each of the given windows' columns.
+    fn engine_with_columns_16(ids: &[isize]) -> TilingEngine {
         let mut engine = TilingEngine::new(LayoutConfig {
             column_width_mode: ColumnWidthMode::Fixed,
             column_width: 500,
             outer_gaps: (0, 0, 0, 0),
             ..LayoutConfig::default()
         });
-        let oid = OutputId::from_name("M");
         engine.register_monitor(
-            oid,
+            OutputId::from_name("M"),
             Rect::new(0, 0, 1920, 1080),
             Rect::new(0, 0, 1920, 1080),
         );
+        for id in ids {
+            engine.add_window(make_window(*id, 0, 0), &BackendHandle::default_for_test());
+        }
+        engine
+    }
 
-        let window = make_window(100, 500, 400);
-        engine.add_window(window, &BackendHandle::default_for_test());
+    fn column_width_of(engine: &TilingEngine, col: usize) -> Option<u32> {
+        let oid = engine.focused_output().unwrap();
+        engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[col].width
+    }
 
+    #[test]
+    fn test_column_width_preset_half() {
+        let mut engine = engine_with_columns_16(&[100]);
         engine.set_column_width_preset(ColumnWidthPreset::Half, &BackendHandle::default_for_test());
+        // Half of the view, minus half of the 16 px gap: two of them and the gap fill 1920.
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+    }
 
-        let oid_e = engine.focused_output().unwrap();
-        let monitor = engine.monitors().get(&oid_e).unwrap();
-        let col_w = monitor.workspace().unwrap().columns[0].width.unwrap();
-        // 50% of 1920 = 960
-        assert_eq!(
-            col_w, 960,
-            "Half preset should set width to 960 (50% of 1920)"
+    #[test]
+    fn test_set_column_width_proportions_make_columns_fill_the_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100, 101, 102]);
+        for id in [100, 101] {
+            focus_window(&mut engine, id);
+            engine.set_column_width_by(SizeChange::SetProportion(50_000), &be);
+        }
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        assert_eq!(column_width_of(&engine, 1), Some(952));
+        assert_eq!(952 + 16 + 952, 1920, "two halves and the gap fill the view exactly");
+        // A third and two thirds fill it too (within the rounding of a pixel).
+        engine.set_column_width_by(SizeChange::SetProportion(33_333), &be);
+        focus_window(&mut engine, 102);
+        engine.set_column_width_by(SizeChange::SetProportion(66_667), &be);
+        let (third, two_thirds) = (
+            column_width_of(&engine, 1).unwrap() as i32,
+            column_width_of(&engine, 2).unwrap() as i32,
+        );
+        assert_eq!((third, two_thirds), (629, 1275));
+        assert_eq!(third + 16 + two_thirds, 1920);
+    }
+
+    #[test]
+    fn test_set_column_width_adjusts_and_sets_pixels() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        engine.set_column_width_by(SizeChange::SetProportion(50_000), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        // +10 % of the view (and the gap), then -10 % brings it back.
+        engine.set_column_width_by(SizeChange::AdjustProportion(10_000), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(1146));
+        engine.set_column_width_by(SizeChange::AdjustProportion(-10_000), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        // A fixed width is the window's: the 4 px borders around it come on top.
+        engine.set_column_width_by(SizeChange::SetFixed(600), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(608));
+        engine.set_column_width_by(SizeChange::AdjustFixed(100), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(708));
+        engine.set_column_width_by(SizeChange::AdjustFixed(-5000), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(50), "never narrower than 50 px");
+        // The window really gets the width (the layout insets the column by the border).
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.set_column_width_by(SizeChange::SetFixed(600), &be);
+        let rect = engine.applied_state.get(&WindowId::new(100)).unwrap().rect;
+        assert_eq!(rect.size.w, 600);
+    }
+
+    #[test]
+    fn test_a_size_change_ends_the_maximized_state_and_goes_on_from_the_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        engine.toggle_maximize_focused_column(&be);
+        engine.set_column_width_by(SizeChange::AdjustProportion(-50_000), &be);
+        let oid = engine.focused_output().unwrap();
+        let col = &engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0];
+        assert!(!col.maximized);
+        // From a column as wide as the view (1920), minus half of it: 1920 / 2 - 8.
+        assert_eq!(col.width, Some(952));
+    }
+
+    #[test]
+    fn test_switch_preset_column_width_follows_niri() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        // A third, a half and two thirds of the view, with the gap: 629, 952, 1275.
+        // The 500 px column gets the first preset that is wider, then the cycle goes on.
+        let mut widths = Vec::new();
+        for _ in 0..4 {
+            engine.switch_preset_column_width(true, &be);
+            widths.push(column_width_of(&engine, 0).unwrap());
+        }
+        assert_eq!(widths, vec![629, 952, 1275, 629]);
+        // Backwards from the first preset: the last one, then down.
+        let mut widths = Vec::new();
+        for _ in 0..3 {
+            engine.switch_preset_column_width(false, &be);
+            widths.push(column_width_of(&engine, 0).unwrap());
+        }
+        assert_eq!(widths, vec![1275, 952, 629]);
+
+        // A width of its own forgets the preset: 700 px -> the first preset wider (952),
+        // and going back from 700 -> the last one narrower (629).
+        engine.set_column_width_by(SizeChange::SetFixed(692), &be); // 692 + 8 = 700
+        engine.switch_preset_column_width(true, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        engine.set_column_width_by(SizeChange::SetFixed(692), &be);
+        engine.switch_preset_column_width(false, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(629));
+
+        // A maximized column counts as one as wide as the view: forwards starts over at
+        // the first preset, backwards takes the last.
+        engine.toggle_maximize_focused_column(&be);
+        engine.switch_preset_column_width(true, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(629));
+        engine.toggle_maximize_focused_column(&be);
+        engine.switch_preset_column_width(false, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(1275));
+    }
+
+    #[test]
+    fn test_next_preset_index() {
+        let presets = [629, 952, 1275];
+        assert_eq!(TilingEngine::next_preset_index(None, 500, &presets, true), 0);
+        assert_eq!(TilingEngine::next_preset_index(None, 629, &presets, true), 1, "equal is not wider");
+        assert_eq!(TilingEngine::next_preset_index(None, 700, &presets, true), 1);
+        assert_eq!(TilingEngine::next_preset_index(None, 1275, &presets, true), 0, "wraps");
+        assert_eq!(TilingEngine::next_preset_index(None, 2000, &presets, true), 0);
+        assert_eq!(TilingEngine::next_preset_index(None, 700, &presets, false), 0);
+        assert_eq!(TilingEngine::next_preset_index(None, 629, &presets, false), 2, "wraps");
+        assert_eq!(TilingEngine::next_preset_index(None, 2000, &presets, false), 2);
+        assert_eq!(TilingEngine::next_preset_index(Some(2), 1275, &presets, true), 0);
+        assert_eq!(TilingEngine::next_preset_index(Some(0), 629, &presets, false), 2);
+        assert_eq!(TilingEngine::next_preset_index(Some(1), 5, &presets, true), 2, "remembered wins");
+    }
+
+    /// A column of two tiles on an engine with one monitor; the first tile is focused.
+    fn engine_with_one_column_of_two() -> TilingEngine {
+        let mut engine = engine_with_columns_16(&[100, 101]);
+        {
+            let oid = engine.focused_output().unwrap();
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(101), 0, 1));
+        }
+        focus_window(&mut engine, 100);
+        engine
+    }
+
+    fn tile_weights(engine: &TilingEngine) -> Vec<f32> {
+        let oid = engine.focused_output().unwrap();
+        engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0]
+            .tiles
+            .iter()
+            .map(|t| t.height_weight)
+            .collect()
+    }
+
+    #[test]
+    fn test_set_window_height_gives_the_window_a_share_of_the_column() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_one_column_of_two();
+        // Column: 1080 px high, 12 px gap between the tiles: 1068 px to share.
+        // 75 % of the view is 0.75 * (1080 + 12) - 12 = 807 px: a share of 807 / 1068.
+        engine.set_window_height_by(SizeChange::SetProportion(75_000), &be);
+        let w = tile_weights(&engine);
+        let share = w[0] / (w[0] + w[1]);
+        assert!((share - 807.0 / 1068.0).abs() < 0.002, "{:?}", w);
+        assert_eq!(w[1], 1.0, "the other window keeps its weight");
+
+        // A fixed height is the window's (the 4 px borders come on top): 300 + 8 px.
+        engine.set_window_height_by(SizeChange::SetFixed(300), &be);
+        let w = tile_weights(&engine);
+        assert!((w[0] / (w[0] + w[1]) - 308.0 / 1068.0).abs() < 0.002, "{:?}", w);
+
+        // +100 px from there, and -10 % of the view.
+        engine.set_window_height_by(SizeChange::AdjustFixed(100), &be);
+        let w = tile_weights(&engine);
+        assert!((w[0] / (w[0] + w[1]) - 408.0 / 1068.0).abs() < 0.002, "{:?}", w);
+        engine.set_window_height_by(SizeChange::AdjustProportion(-10_000), &be);
+        let w = tile_weights(&engine);
+        assert!(
+            (w[0] / (w[0] + w[1]) - (408.0 - 109.2) / 1068.0).abs() < 0.003,
+            "{:?}",
+            w
         );
     }
 
     #[test]
-    fn test_column_width_preset_cycle() {
-        let mut engine = TilingEngine::new(LayoutConfig {
-            column_width_mode: ColumnWidthMode::Fixed,
-            column_width: 500,
-            outer_gaps: (0, 0, 0, 0),
-            ..LayoutConfig::default()
-        });
-        let oid = OutputId::from_name("M");
-        engine.register_monitor(
-            oid,
-            Rect::new(0, 0, 1920, 1080),
-            Rect::new(0, 0, 1920, 1080),
+    fn test_reset_window_height_restores_the_default_weight() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_one_column_of_two();
+        engine.set_window_height_by(SizeChange::SetProportion(80_000), &be);
+        assert!(tile_weights(&engine)[0] > 2.0);
+        engine.reset_window_height(&be);
+        assert_eq!(tile_weights(&engine), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_a_lone_window_has_no_height_to_change() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        engine.set_window_height_by(SizeChange::SetProportion(30_000), &be);
+        assert_eq!(tile_weights(&engine), vec![1.0]);
+    }
+
+    #[test]
+    fn test_float_size_changes_use_the_work_area() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be); // 800 x 600, in the middle of 1920 x 1040
+        let rect = |e: &TilingEngine| e.float_homes.get(&wid).unwrap().rect;
+        engine.float_apply_size_change(wid, SizeAxis::Width, SizeChange::SetProportion(50_000), &be);
+        assert_eq!(rect(&engine).size.w, 960);
+        engine.float_apply_size_change(wid, SizeAxis::Width, SizeChange::AdjustProportion(10_000), &be);
+        assert_eq!(rect(&engine).size.w, 1152);
+        engine.float_apply_size_change(wid, SizeAxis::Width, SizeChange::SetFixed(700), &be);
+        assert_eq!(rect(&engine).size.w, 700);
+        engine.float_apply_size_change(wid, SizeAxis::Height, SizeChange::SetProportion(50_000), &be);
+        assert_eq!(rect(&engine).size.h, 520);
+        engine.float_apply_size_change(wid, SizeAxis::Height, SizeChange::AdjustFixed(-100), &be);
+        assert_eq!(rect(&engine).size.h, 420);
+    }
+
+    #[test]
+    fn test_move_window_to_floating_and_tiling_are_not_toggles() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.set_window_floating(wid, false, &be);
+        assert!(!engine.is_floating(wid), "already tiled: nothing happens");
+        engine.set_window_floating(wid, true, &be);
+        engine.set_window_floating(wid, true, &be);
+        assert!(engine.is_floating(wid), "a second `to floating` does not tile it again");
+        engine.set_window_floating(wid, false, &be);
+        engine.set_window_floating(wid, false, &be);
+        assert!(!engine.is_floating(wid));
+        assert_eq!(engine.locate_window(wid).map(|l| l.2), Some(1), "back in a column of its own");
+    }
+
+    #[test]
+    fn test_focus_monitor_left_and_right_stop_at_the_edges() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        let (a, b, c) = (
+            OutputId::from_name("A"),
+            OutputId::from_name("B"),
+            OutputId::from_name("C"),
         );
-
-        let window = make_window(100, 500, 400);
-        engine.add_window(window, &BackendHandle::default_for_test());
-
-        // Niri-style cycle order:
-        //   1/4 → 1/3 → 1/2 → 2/3 → 3/4 → full → 1/4 …
-        // Default last_column_preset is Half → first Cycle → TwoThirds (1280).
-        engine
-            .set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let oid_e = engine.focused_output().unwrap();
-        let w1 = engine
-            .monitors()
-            .get(&oid_e)
-            .unwrap()
-            .workspace()
-            .unwrap()
-            .columns[0]
-            .width
-            .unwrap();
-        assert_eq!(w1, 1280, "first Cycle from Half should be TwoThirds (1280)");
-
-        // Second Cycle → ThreeQuarters (1440 = 1920 * 3/4)
-        engine
-            .set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let w2 = engine
-            .monitors()
-            .get(&oid_e)
-            .unwrap()
-            .workspace()
-            .unwrap()
-            .columns[0]
-            .width
-            .unwrap();
-        assert_eq!(w2, 1440, "second Cycle should be ThreeQuarters (1440)");
-
-        // Third Cycle → Full (1920)
-        engine
-            .set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let w3 = engine
-            .monitors()
-            .get(&oid_e)
-            .unwrap()
-            .workspace()
-            .unwrap()
-            .columns[0]
-            .width
-            .unwrap();
-        assert_eq!(w3, 1920, "third Cycle should be Full (1920)");
-
-        // Fourth Cycle wraps → OneQuarter (480 = 1920 / 4)
-        engine
-            .set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let w4 = engine
-            .monitors()
-            .get(&oid_e)
-            .unwrap()
-            .workspace()
-            .unwrap()
-            .columns[0]
-            .width
-            .unwrap();
-        assert_eq!(w4, 480, "fourth Cycle should wrap to OneQuarter (480)");
+        // Registered out of order: the monitors are ordered by their position.
+        engine.register_monitor(b, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(c, Rect::new(3840, 0, 1920, 1080), Rect::new(3840, 0, 1920, 1040));
+        engine.set_focused_output(b);
+        assert!(engine.focus_monitor_toward(ScrollDirection::Right, &be));
+        assert_eq!(engine.focused_output(), Some(c));
+        assert!(!engine.focus_monitor_toward(ScrollDirection::Right, &be), "no monitor further right");
+        assert_eq!(engine.focused_output(), Some(c));
+        assert!(engine.focus_monitor_toward(ScrollDirection::Left, &be));
+        assert!(engine.focus_monitor_toward(ScrollDirection::Left, &be));
+        assert_eq!(engine.focused_output(), Some(a));
+        assert!(!engine.focus_monitor_toward(ScrollDirection::Left, &be), "no wrapping around");
+        assert_eq!(engine.focused_output(), Some(a));
     }
 
     // --- Item 5: resize_focused_column_by ---
@@ -11050,6 +11534,78 @@ mod tests {
         assert_eq!(ws.columns[1].width, Some(888));
     }
 
+    /// The strip of `engine_with_columns` scrolled so that its left edge is at `x`.
+    fn scroll_strip_to(engine: &mut TilingEngine, x: i32) {
+        let oid = engine.focused_output().unwrap();
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .scroll_offset
+            .x = x;
+    }
+
+    fn strip_scroll(engine: &TilingEngine) -> i32 {
+        let oid = engine.focused_output().unwrap();
+        engine.monitors().get(&oid).unwrap().workspace().unwrap().scroll_offset.x
+    }
+
+    #[test]
+    fn test_expand_column_counts_only_the_columns_fully_in_view() {
+        let be = BackendHandle::default_for_test();
+        // Six columns of 500 px with 16 px between them: 0, 516, 1032 are fully in a
+        // 1920 px view that starts at 0, the fourth one (1548 .. 2048) is not.
+        let mut engine = engine_with_columns(&[100, 101, 102, 103, 104, 105]);
+        scroll_strip_to(&mut engine, 0);
+        focus_window(&mut engine, 101);
+        engine.expand_column_to_available(&be);
+        // 1920 + 16 - 3 * (500 + 16) = 388 more: the three columns that are off screen
+        // do not take room away (they used to: the width came out as the 50 px minimum).
+        assert_eq!(column_width_of(&engine, 1), Some(888));
+        assert_eq!(column_width_of(&engine, 0), Some(500), "the others are not resized");
+        assert_eq!(strip_scroll(&engine), 0);
+
+        // Scrolled by 300 px the first column is cut off; the next three are in view and
+        // the leftmost of them stays at the left edge afterwards.
+        let mut engine = engine_with_columns(&[100, 101, 102, 103, 104, 105]);
+        scroll_strip_to(&mut engine, 300);
+        focus_window(&mut engine, 102);
+        engine.expand_column_to_available(&be);
+        assert_eq!(column_width_of(&engine, 2), Some(888));
+        assert_eq!(strip_scroll(&engine), 516);
+    }
+
+    #[test]
+    fn test_expand_column_does_nothing_when_the_column_is_not_fully_in_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102, 103, 104]);
+        scroll_strip_to(&mut engine, 0);
+        focus_window(&mut engine, 103); // 1548 .. 2048: runs out of the view
+        engine.expand_column_to_available(&be);
+        assert_eq!(column_width_of(&engine, 3), Some(500));
+    }
+
+    #[test]
+    fn test_expand_a_lone_column_maximizes_it_and_a_maximized_one_is_left_alone() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100]);
+        focus_window(&mut engine, 100);
+        engine.expand_column_to_available(&be);
+        let oid = engine.focused_output().unwrap();
+        let col = &engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0];
+        assert!(col.maximized, "like niri: only this column is in view");
+        assert_eq!(col.width, Some(1920));
+        // Pressed again nothing happens (maximize-column is the way back).
+        engine.expand_column_to_available(&be);
+        let col = &engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0];
+        assert!(col.maximized);
+        assert_eq!(col.width, Some(1920));
+        engine.toggle_maximize_focused_column(&be);
+        assert_eq!(column_width_of(&engine, 0), Some(500), "back to the width it had");
+    }
+
     // ---- Maximize column ----
 
     #[test]
@@ -11309,7 +11865,8 @@ mod tests {
             .columns[0]
             .width
             .unwrap();
-        assert_eq!(w, 480, "OneQuarter on 1920px = 480");
+        // A quarter of the view, minus a quarter of the 16 px gaps: 0.25 * (1920 + 16) - 16.
+        assert_eq!(w, 468, "OneQuarter on 1920px = 468");
 
         engine.set_column_width_preset(
             ColumnWidthPreset::ThreeQuarters,
@@ -11324,7 +11881,7 @@ mod tests {
             .columns[0]
             .width
             .unwrap();
-        assert_eq!(w, 1440, "ThreeQuarters on 1920px = 1440");
+        assert_eq!(w, 1436, "ThreeQuarters on 1920px = 1436");
     }
 
     // ---- Move column to monitor ----

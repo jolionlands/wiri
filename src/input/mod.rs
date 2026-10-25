@@ -72,7 +72,8 @@ pub enum Action {
     MoveToMonitorRight,
     /// Center the focused column on screen
     CenterColumn,
-    /// Cycle through column width presets
+    /// niri `switch-preset-column-width`: cycle through the preset widths (a third,
+    /// a half, two thirds of the view).
     ColumnWidthPresetCycle,
     /// Set column width to 1/2
     ColumnWidthPresetHalf,
@@ -130,7 +131,27 @@ pub enum Action {
     MoveColumnToFirst,
     /// niri `move-column-to-last`.
     MoveColumnToLast,
-    /// Expand the focused column so it fills the leftover work-area width.
+    /// niri `set-column-width` (also `set-window-width`): `"50%"`, `"+10%"`, `"-10%"`,
+    /// `"1200"`, `"+100"`.
+    SetColumnWidth(SizeChange),
+    /// niri `set-window-height`, the same grammar.
+    SetWindowHeight(SizeChange),
+    /// niri `reset-window-height`: the window gets an equal share of its column again.
+    ResetWindowHeight,
+    /// niri `switch-preset-column-width-back`.
+    ColumnWidthPresetCycleBack,
+    /// niri `focus-monitor-left`: focus the monitor on the left (nothing at the edge).
+    FocusMonitorLeft,
+    /// niri `focus-monitor-right`.
+    FocusMonitorRight,
+    /// niri `move-window-to-floating` (not a toggle).
+    MoveWindowToFloating,
+    /// niri `move-window-to-tiling` (not a toggle).
+    MoveWindowToTiling,
+    /// niri `open-overview` (`toggle-overview` toggles, `close-overview` closes).
+    OverviewOpen,
+    /// niri `expand-column-to-available-width`: the focused column fills the
+    /// leftover width of the view.
     ExpandColumnToAvailable,
     /// Toggle per-column maximize (full work-area height). Distinct from
     /// `ToggleFullscreen`, which covers the entire monitor.
@@ -192,9 +213,142 @@ pub enum Action {
     ShowKeyBindings,
 }
 
+/// niri's size argument (`set-column-width`, `set-window-height`): `"50%"` sets a
+/// proportion of the view, `"+10%"` / `"-10%"` adjust it, `"1200"` sets a size in
+/// pixels and `"+100"` / `"-100"` adjust it.  Proportions are kept in thousandths of a
+/// percent (`"33.333%"` is 33333), so an [`Action`] stays `Eq + Hash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SizeChange {
+    /// `"1200"`: the window gets this size (the border around it comes on top).
+    SetFixed(i32),
+    /// `"50%"`: this proportion of the view.
+    SetProportion(i32),
+    /// `"+100"` / `"-100"`: this many pixels more or less.
+    AdjustFixed(i32),
+    /// `"+10%"` / `"-10%"`: this proportion of the view more or less.
+    AdjustProportion(i32),
+}
+
+/// One percent in the units of [`SizeChange`]'s proportions.
+const MILLI_PERCENT: f64 = 1000.0;
+
+impl std::str::FromStr for SizeChange {
+    type Err = &'static str;
+
+    /// niri's grammar: an optional sign, a number, an optional `%` (nothing may
+    /// follow it).  A sign makes it an adjustment, a `%` makes it a proportion.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let adjust = matches!(s.as_bytes().first(), Some(b'+') | Some(b'-'));
+        match s.split_once('%') {
+            Some((value, rest)) => {
+                if !rest.is_empty() {
+                    return Err("trailing characters after '%' are not allowed");
+                }
+                if value.is_empty() {
+                    return Err("value is missing");
+                }
+                let percent: f64 = value.parse().map_err(|_| "error parsing value")?;
+                if !percent.is_finite() {
+                    return Err("error parsing value");
+                }
+                let milli = (percent * MILLI_PERCENT).round() as i32;
+                Ok(if adjust {
+                    SizeChange::AdjustProportion(milli)
+                } else {
+                    SizeChange::SetProportion(milli)
+                })
+            }
+            None => {
+                if s.is_empty() {
+                    return Err("value is missing");
+                }
+                let pixels: i32 = s.parse().map_err(|_| "error parsing value")?;
+                Ok(if adjust {
+                    SizeChange::AdjustFixed(pixels)
+                } else {
+                    SizeChange::SetFixed(pixels)
+                })
+            }
+        }
+    }
+}
+
+/// Pixel size of something that is `proportion` of a view `view_px` long when `gap_px`
+/// separates it from its neighbours: two halves and the gap between them fill the view
+/// exactly, three thirds and two gaps too (niri: `(view - gap) * p - gap`, with the
+/// outer gaps counted in the view).
+pub fn proportion_px(view_px: i32, gap_px: i32, proportion: f64) -> i32 {
+    (proportion * (view_px + gap_px) as f64 - gap_px as f64).round() as i32
+}
+
+impl SizeChange {
+    /// The new size in pixels of something that is `current_px` now, in a view `view_px`
+    /// long with `gap_px` between its neighbours.  `extra_px` is how much larger it is
+    /// than the window it holds (the borders around the window), which a fixed size
+    /// does not include.
+    pub fn resolve(self, current_px: i32, view_px: i32, gap_px: i32, extra_px: i32) -> i32 {
+        let whole = (view_px + gap_px).max(1) as f64;
+        match self {
+            SizeChange::SetFixed(px) => px.saturating_add(extra_px),
+            SizeChange::AdjustFixed(delta) => current_px.saturating_add(delta),
+            SizeChange::SetProportion(milli) => {
+                proportion_px(view_px, gap_px, milli as f64 / (100.0 * MILLI_PERCENT))
+            }
+            SizeChange::AdjustProportion(milli) => {
+                let now = (current_px + gap_px) as f64 / whole;
+                proportion_px(
+                    view_px,
+                    gap_px,
+                    now + milli as f64 / (100.0 * MILLI_PERCENT),
+                )
+            }
+        }
+    }
+}
+
+/// niri's workspace reference: a number is the (1-based) index of a workspace on the
+/// monitor, a quoted string is the name of a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WorkspaceRef {
+    Index(u32),
+    Name(String),
+}
+
+impl WorkspaceRef {
+    /// One word of a bind line: `focus-workspace 2` is the second workspace,
+    /// `focus-workspace "2"` the workspace named "2".  A word that is not a number is a
+    /// name even without quotes (`wiri-ctl action focus-workspace web`).
+    pub fn from_word(word: &str, quoted: bool) -> Option<WorkspaceRef> {
+        if word.is_empty() {
+            return None;
+        }
+        if !quoted {
+            if let Ok(index) = word.parse::<u32>() {
+                // niri counts from 1; 0 is the first workspace as well.
+                return Some(WorkspaceRef::Index(index.max(1)));
+            }
+        }
+        Some(WorkspaceRef::Name(word.to_string()))
+    }
+}
+
 /// Parse an action name string (from config/IPC) into an Action.
 /// Returns None for unknown action names.
+///
+/// The arguments are read as unquoted words: `focus-workspace 2` is the second
+/// workspace.  Config binds go through [`parse_action_flagged`], which also knows
+/// which arguments were written in double quotes.
 pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
+    parse_action_flagged(name, args, &[])
+}
+
+/// [`parse_action_name`] for the words of a `binds {}` line.  `quoted[i]` says whether
+/// `args[i]` was written in double quotes: niri's `focus-workspace 2` is the second
+/// workspace, `focus-workspace "2"` the workspace named "2".  Both the niri names of
+/// the actions and wiri's own older spellings are understood.
+pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
+    let is_quoted = |i: usize| quoted.get(i).copied().unwrap_or(false);
     match name {
         "focus-column-left" | "focus-left" => Some(Action::FocusColumnLeft),
         "focus-column-right" | "focus-right" => Some(Action::FocusColumnRight),
@@ -211,8 +365,10 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "move-column-left" | "move-left" => Some(Action::MoveColumnLeft),
         "move-column-right" | "move-right" => Some(Action::MoveColumnRight),
         "close-window" | "close" => Some(Action::CloseWindow),
-        "toggle-fullscreen" | "fullscreen" => Some(Action::ToggleFullscreen),
-        "toggle-floating" | "float" => Some(Action::ToggleFloating),
+        "toggle-fullscreen" | "fullscreen" | "fullscreen-window" => Some(Action::ToggleFullscreen),
+        "toggle-floating" | "float" | "toggle-window-floating" => Some(Action::ToggleFloating),
+        "move-window-to-floating" => Some(Action::MoveWindowToFloating),
+        "move-window-to-tiling" => Some(Action::MoveWindowToTiling),
         "scroll-left" => Some(Action::ScrollLeft),
         "scroll-right" => Some(Action::ScrollRight),
         "quit" | "exit" => Some(Action::Quit),
@@ -220,11 +376,19 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "minimize" => Some(Action::Minimize),
         "center-window" => Some(Action::CenterWindow),
         "switch-monitor" => Some(Action::SwitchMonitor),
+        "focus-monitor-left" => Some(Action::FocusMonitorLeft),
+        "focus-monitor-right" => Some(Action::FocusMonitorRight),
         "refresh" => Some(Action::Refresh),
         "switch-workspace" | "workspace" => args
             .first()
             .and_then(|s| s.parse::<i32>().ok())
             .map(Action::FocusWorkspace),
+        // niri: a number is the index of the workspace on the monitor, a quoted string
+        // is the name of a workspace.
+        "focus-workspace" => match WorkspaceRef::from_word(args.first()?, is_quoted(0))? {
+            WorkspaceRef::Index(index) => Some(Action::FocusWorkspace(index as i32)),
+            WorkspaceRef::Name(name) => Some(Action::FocusWorkspaceNamed(name)),
+        },
         "move-workspace" => args
             .first()
             .and_then(|s| s.parse::<i32>().ok())
@@ -241,25 +405,38 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "spawn-cmd" | "spawn_cmd" | "spawn-sh" => {
             args.first().map(|cmd| Action::SpawnCmd(cmd.clone()))
         }
-        "overview" | "overview-toggle" | "zoom-out" => Some(Action::OverviewToggle),
-        "overview-exit" | "exit-overview" => Some(Action::OverviewExit),
+        "overview" | "overview-toggle" | "zoom-out" | "toggle-overview" => {
+            Some(Action::OverviewToggle)
+        }
+        "open-overview" => Some(Action::OverviewOpen),
+        "overview-exit" | "exit-overview" | "close-overview" => Some(Action::OverviewExit),
         "overview-left" => Some(Action::OverviewLeft),
         "overview-right" => Some(Action::OverviewRight),
         "overview-select" | "overview-accept" => Some(Action::OverviewSelect),
-        "column-toggle-tabbed" => Some(Action::ColumnToggleTabbed),
+        "column-toggle-tabbed" | "toggle-column-tabbed-display" => Some(Action::ColumnToggleTabbed),
         "tab-next" => Some(Action::TabNext),
         "tab-prev" => Some(Action::TabPrev),
         "move-to-workspace" => args
             .first()
             .and_then(|s| s.parse::<i32>().ok())
             .map(Action::MoveToWorkspace),
-        "move-to-monitor-left" => Some(Action::MoveToMonitorLeft),
-        "move-to-monitor-right" => Some(Action::MoveToMonitorRight),
+        "move-to-monitor-left" | "move-window-to-monitor-left" => Some(Action::MoveToMonitorLeft),
+        "move-to-monitor-right" | "move-window-to-monitor-right" => {
+            Some(Action::MoveToMonitorRight)
+        }
         "center-column" => Some(Action::CenterColumn),
-        // `set-column-width "1/3"` — the spelling the default config and the
-        // cheatsheet example use (niri: `set-column-width "33.333%"`).
-        "set-column-width" => args.first().and_then(|a| parse_column_width_arg(a)),
-        "column-width-preset" | "column-width-cycle" => Some(Action::ColumnWidthPresetCycle),
+        // niri: `set-column-width "50%"`, `"+10%"`, `"1200"`; the wiri spellings
+        // `"1/3"`, `"full"`, `"cycle"` keep working.
+        "set-column-width" | "set-window-width" => args.first().and_then(|a| parse_column_width_arg(a)),
+        "set-window-height" => args
+            .first()
+            .and_then(|a| a.parse::<SizeChange>().ok())
+            .map(Action::SetWindowHeight),
+        "reset-window-height" => Some(Action::ResetWindowHeight),
+        "switch-preset-column-width" | "column-width-preset" | "column-width-cycle" => {
+            Some(Action::ColumnWidthPresetCycle)
+        }
+        "switch-preset-column-width-back" => Some(Action::ColumnWidthPresetCycleBack),
         "column-width-half" | "column-width-1/2" => Some(Action::ColumnWidthPresetHalf),
         "column-width-third" | "column-width-1/3" => Some(Action::ColumnWidthPresetThird),
         "column-width-two-thirds" | "column-width-2/3" => Some(Action::ColumnWidthPresetTwoThirds),
@@ -274,7 +451,9 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "expel-window-from-column" | "expel-window" | "expel-from-column" => {
             Some(Action::ExpelWindowFromColumn)
         }
-        "expand-column-to-available" | "expand-column" => Some(Action::ExpandColumnToAvailable),
+        "expand-column-to-available" | "expand-column" | "expand-column-to-available-width" => {
+            Some(Action::ExpandColumnToAvailable)
+        }
         "maximize-column" | "column-maximize" | "toggle-column-maximize" => {
             Some(Action::MaximizeColumn)
         }
@@ -289,16 +468,19 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "move-column-to-monitor-right" => Some(Action::MoveColumnToMonitorRight),
         "resize-column-left" | "shrink-column" => Some(Action::ResizeColumnLeft),
         "resize-column-right" | "grow-column" => Some(Action::ResizeColumnRight),
-        "focus-workspace-next" | "workspace-next" => Some(Action::FocusWorkspaceNext),
-        "focus-workspace-previous" | "focus-workspace-prev" | "workspace-prev" => {
-            Some(Action::FocusWorkspacePrevious)
+        "focus-workspace-next" | "workspace-next" | "focus-workspace-down" => {
+            Some(Action::FocusWorkspaceNext)
         }
-        "focus-previous" | "alt-tab" | "focus-history-back" => Some(Action::FocusPrevious),
+        "focus-workspace-previous" | "focus-workspace-prev" | "workspace-prev"
+        | "focus-workspace-up" => Some(Action::FocusWorkspacePrevious),
+        "focus-previous" | "alt-tab" | "focus-history-back" | "focus-window-previous" => {
+            Some(Action::FocusPrevious)
+        }
         "toggle-always-on-top" | "always-on-top" | "topmost" => Some(Action::ToggleAlwaysOnTop),
-        "focus-workspace-named" | "focus-workspace" => {
-            args.first().map(|s| Action::FocusWorkspaceNamed(s.clone()))
+        "focus-workspace-named" => args.first().map(|s| Action::FocusWorkspaceNamed(s.clone())),
+        "screenshot" | "take-screenshot" | "capture-screen" | "screenshot-screen" => {
+            Some(Action::Screenshot)
         }
-        "screenshot" | "take-screenshot" | "capture-screen" => Some(Action::Screenshot),
         "window-screenshot" | "capture-window" => Some(Action::WindowScreenshot),
         "enter-resize-mode" | "resize-mode" | "interactive-resize" => Some(Action::EnterResizeMode),
         "move-column-to-workspace-up" | "move-column-up" | "move-column-to-workspace-above" => {
@@ -313,12 +495,12 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
         "set-workspace-layout" | "workspace-layout" => {
             args.first().map(|s| Action::SetWorkspaceLayout(s.clone()))
         }
-        "rename-workspace" | "rename-ws" => {
+        "rename-workspace" | "rename-ws" | "set-workspace-name" => {
             args.first().map(|s| Action::RenameWorkspace(s.clone()))
         }
         "screenshot-window" | "screenshot-focused" => Some(Action::ScreenshotWindow),
         "toggle-backdrop" | "backdrop-cycle" | "backdrop" => Some(Action::ToggleBackdrop),
-        "show-key-bindings" | "show-bindings" | "cheatsheet" | "help" => {
+        "show-key-bindings" | "show-bindings" | "cheatsheet" | "help" | "show-hotkey-overlay" => {
             Some(Action::ShowKeyBindings)
         }
         "set-auto-tile" => {
@@ -339,33 +521,26 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
     }
 }
 
-/// Map the argument of `set-column-width` to a width-preset action.
-/// Accepts fractions (`1/4`, `1/3`, `1/2`, `2/3`, `3/4`), `full`, `cycle`, and
-/// the percentages niri uses (`25%`, `33.3%`, `50%`, `66.6%`, `75%`, `100%`).
+/// The argument of `set-column-width`: niri's size grammar (`"50%"`, `"+10%"`,
+/// `"-10%"`, `"1200"`, `"+100"`), or one of wiri's older spellings: the fractions
+/// `1/4`, `1/3`, `1/2`, `2/3`, `3/4`, `full` and `cycle`.
 pub fn parse_column_width_arg(arg: &str) -> Option<Action> {
     let a = arg.trim().to_lowercase();
+    let proportion = |milli_percent: i32| {
+        Some(Action::SetColumnWidth(SizeChange::SetProportion(milli_percent)))
+    };
     match a.as_str() {
         "cycle" | "preset" | "next" => return Some(Action::ColumnWidthPresetCycle),
-        "full" | "100%" => return Some(Action::ColumnWidthPresetFull),
-        "1/4" | "quarter" => return Some(Action::ColumnWidthPresetQuarter),
-        "1/3" | "third" => return Some(Action::ColumnWidthPresetThird),
-        "1/2" | "half" => return Some(Action::ColumnWidthPresetHalf),
-        "2/3" | "two-thirds" => return Some(Action::ColumnWidthPresetTwoThirds),
-        "3/4" | "three-quarters" => return Some(Action::ColumnWidthPresetThreeQuarters),
+        "back" | "prev" | "previous" => return Some(Action::ColumnWidthPresetCycleBack),
+        "full" => return proportion(100_000),
+        "1/4" | "quarter" => return proportion(25_000),
+        "1/3" | "third" => return proportion(33_333),
+        "1/2" | "half" => return proportion(50_000),
+        "2/3" | "two-thirds" => return proportion(66_667),
+        "3/4" | "three-quarters" => return proportion(75_000),
         _ => {}
     }
-    let percent: f64 = a.strip_suffix('%')?.trim().parse().ok()?;
-    let nearest = [
-        (25.0, Action::ColumnWidthPresetQuarter),
-        (100.0 / 3.0, Action::ColumnWidthPresetThird),
-        (50.0, Action::ColumnWidthPresetHalf),
-        (200.0 / 3.0, Action::ColumnWidthPresetTwoThirds),
-        (75.0, Action::ColumnWidthPresetThreeQuarters),
-        (100.0, Action::ColumnWidthPresetFull),
-    ]
-    .into_iter()
-    .find(|(p, _)| (percent - p).abs() < 1.0);
-    nearest.map(|(_, action)| action)
+    a.parse::<SizeChange>().ok().map(Action::SetColumnWidth)
 }
 
 /// Parse a key name string (from config) into a Windows virtual key code.
@@ -1076,21 +1251,215 @@ mod tests {
         assert_eq!(parse_key_name("Caps_Lock"), Some(0x14));
     }
 
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn test_size_change_grammar_follows_niri() {
+        use SizeChange::*;
+        for (text, expected) in [
+            ("50%", SetProportion(50_000)),
+            ("33.333%", SetProportion(33_333)),
+            ("100%", SetProportion(100_000)),
+            ("+10%", AdjustProportion(10_000)),
+            ("-10%", AdjustProportion(-10_000)),
+            ("-2.5%", AdjustProportion(-2_500)),
+            ("1200", SetFixed(1200)),
+            ("+100", AdjustFixed(100)),
+            ("-100", AdjustFixed(-100)),
+            (" 640 ", SetFixed(640)),
+        ] {
+            assert_eq!(text.parse::<SizeChange>(), Ok(expected), "{text:?}");
+        }
+        for text in ["", "%", "+%", "50%%", "abc", "12.5", "50%x", "1/3", "inf%", "nan%"] {
+            assert!(text.parse::<SizeChange>().is_err(), "{text:?} must not parse");
+        }
+        assert_eq!("".parse::<SizeChange>(), Err("value is missing"));
+        assert_eq!("%".parse::<SizeChange>(), Err("value is missing"));
+        assert_eq!(
+            "50%x".parse::<SizeChange>(),
+            Err("trailing characters after '%' are not allowed")
+        );
+        assert_eq!("12.5".parse::<SizeChange>(), Err("error parsing value"));
+        assert_eq!("abc".parse::<SizeChange>(), Err("error parsing value"));
+        assert!("inf%".parse::<SizeChange>().is_err());
+    }
+
+    #[test]
+    fn test_size_change_resolves_against_the_view() {
+        // A 1350 px view with 16 px gaps and 4 px borders (2 * 4 = 8 px around a window).
+        let (view, gap, extra) = (1350, 16, 8);
+        let px = |change: SizeChange, current: i32| change.resolve(current, view, gap, extra);
+        // Two halves and the gap between them fill the view exactly; so do three thirds.
+        let half = px(SizeChange::SetProportion(50_000), 0);
+        assert_eq!(half, 667);
+        assert_eq!(2 * half + gap, view);
+        let third = px(SizeChange::SetProportion(33_333), 0);
+        assert_eq!(3 * third + 2 * gap, view - 1, "within one pixel of the view");
+        assert_eq!(px(SizeChange::SetProportion(100_000), 0), view);
+        // +10 % of the view (and the gap), -10 % back.
+        assert_eq!(px(SizeChange::AdjustProportion(10_000), half), 804);
+        assert_eq!(px(SizeChange::AdjustProportion(-10_000), 804), 667);
+        // Pixels: a fixed size is the window's, the border comes on top; adjusting is plain.
+        assert_eq!(px(SizeChange::SetFixed(1200), half), 1208);
+        assert_eq!(px(SizeChange::AdjustFixed(100), half), 767);
+        assert_eq!(px(SizeChange::AdjustFixed(-100), half), 567);
+        // Without a gap or border the proportions are plain fractions of the view.
+        assert_eq!(SizeChange::SetProportion(25_000).resolve(0, 1920, 0, 0), 480);
+        assert_eq!(SizeChange::AdjustProportion(5_000).resolve(960, 1920, 0, 0), 1056);
+    }
+
+    #[test]
+    fn test_workspace_reference_number_is_an_index_and_quotes_make_a_name() {
+        assert_eq!(WorkspaceRef::from_word("2", false), Some(WorkspaceRef::Index(2)));
+        assert_eq!(WorkspaceRef::from_word("0", false), Some(WorkspaceRef::Index(1)));
+        assert_eq!(
+            WorkspaceRef::from_word("2", true),
+            Some(WorkspaceRef::Name("2".to_string()))
+        );
+        assert_eq!(
+            WorkspaceRef::from_word("web", false),
+            Some(WorkspaceRef::Name("web".to_string()))
+        );
+        assert_eq!(WorkspaceRef::from_word("", false), None);
+        // The same through a bind line: `focus-workspace 2` / `focus-workspace "2"` / `focus-workspace "web"`.
+        assert_eq!(
+            parse_action_flagged("focus-workspace", &words(&["2"]), &[false]),
+            Some(Action::FocusWorkspace(2))
+        );
+        assert_eq!(
+            parse_action_flagged("focus-workspace", &words(&["2"]), &[true]),
+            Some(Action::FocusWorkspaceNamed("2".to_string()))
+        );
+        assert_eq!(
+            parse_action_flagged("focus-workspace", &words(&["web"]), &[true]),
+            Some(Action::FocusWorkspaceNamed("web".to_string()))
+        );
+        // From wiri-ctl nothing is quoted: a number is an index.
+        assert_eq!(
+            parse_action_name("focus-workspace", &words(&["3"])),
+            Some(Action::FocusWorkspace(3))
+        );
+        assert_eq!(parse_action_name("focus-workspace", &[]), None);
+        // The older spellings keep their meaning.
+        assert_eq!(
+            parse_action_name("switch-workspace", &words(&["4"])),
+            Some(Action::FocusWorkspace(4))
+        );
+        assert_eq!(
+            parse_action_name("focus-workspace-named", &words(&["4"])),
+            Some(Action::FocusWorkspaceNamed("4".to_string()))
+        );
+    }
+
     #[test]
     fn test_parse_column_width_arg() {
-        assert_eq!(parse_column_width_arg("1/3"), Some(Action::ColumnWidthPresetThird));
-        assert_eq!(parse_column_width_arg("2/3"), Some(Action::ColumnWidthPresetTwoThirds));
+        use SizeChange::*;
+        let set = |milli: i32| Some(Action::SetColumnWidth(SetProportion(milli)));
+        assert_eq!(parse_column_width_arg("1/4"), set(25_000));
+        assert_eq!(parse_column_width_arg("1/3"), set(33_333));
+        assert_eq!(parse_column_width_arg("half"), set(50_000));
+        assert_eq!(parse_column_width_arg("2/3"), set(66_667));
+        assert_eq!(parse_column_width_arg("3/4"), set(75_000));
+        assert_eq!(parse_column_width_arg("Full"), set(100_000));
         assert_eq!(parse_column_width_arg("cycle"), Some(Action::ColumnWidthPresetCycle));
-        assert_eq!(parse_column_width_arg("Full"), Some(Action::ColumnWidthPresetFull));
-        assert_eq!(parse_column_width_arg("50%"), Some(Action::ColumnWidthPresetHalf));
-        assert_eq!(parse_column_width_arg("33.3%"), Some(Action::ColumnWidthPresetThird));
-        assert_eq!(parse_column_width_arg("nonsense"), None);
-        assert_eq!(parse_column_width_arg("42%"), None);
+        assert_eq!(parse_column_width_arg("back"), Some(Action::ColumnWidthPresetCycleBack));
+        // niri's grammar: any percentage, adjustments, pixels.
+        assert_eq!(parse_column_width_arg("50%"), set(50_000));
+        assert_eq!(parse_column_width_arg("42%"), set(42_000));
         assert_eq!(
-            parse_action_name("set-column-width", &["1/3".to_string()]),
-            Some(Action::ColumnWidthPresetThird)
+            parse_column_width_arg("+10%"),
+            Some(Action::SetColumnWidth(AdjustProportion(10_000)))
+        );
+        assert_eq!(
+            parse_column_width_arg("-10%"),
+            Some(Action::SetColumnWidth(AdjustProportion(-10_000)))
+        );
+        assert_eq!(
+            parse_column_width_arg("1200"),
+            Some(Action::SetColumnWidth(SetFixed(1200)))
+        );
+        assert_eq!(
+            parse_column_width_arg("+100"),
+            Some(Action::SetColumnWidth(AdjustFixed(100)))
+        );
+        assert_eq!(parse_column_width_arg("nonsense"), None);
+        assert_eq!(parse_column_width_arg("50%x"), None);
+        assert_eq!(
+            parse_action_name("set-column-width", &words(&["1/3"])),
+            set(33_333)
         );
         assert_eq!(parse_action_name("set-column-width", &[]), None);
+        // `set-window-width` is the same thing for a tiled window; the height has its own action.
+        assert_eq!(
+            parse_action_name("set-window-width", &words(&["-10%"])),
+            Some(Action::SetColumnWidth(AdjustProportion(-10_000)))
+        );
+        assert_eq!(
+            parse_action_name("set-window-height", &words(&["+10%"])),
+            Some(Action::SetWindowHeight(AdjustProportion(10_000)))
+        );
+        assert_eq!(
+            parse_action_name("set-window-height", &words(&["50%"])),
+            Some(Action::SetWindowHeight(SetProportion(50_000)))
+        );
+        assert_eq!(parse_action_name("set-window-height", &words(&["tall"])), None);
+        assert_eq!(
+            parse_action_name("reset-window-height", &[]),
+            Some(Action::ResetWindowHeight)
+        );
+    }
+
+    #[test]
+    fn test_niri_action_names_are_understood() {
+        for (name, action) in [
+            ("fullscreen-window", Action::ToggleFullscreen),
+            ("toggle-window-floating", Action::ToggleFloating),
+            ("move-window-to-floating", Action::MoveWindowToFloating),
+            ("move-window-to-tiling", Action::MoveWindowToTiling),
+            ("toggle-overview", Action::OverviewToggle),
+            ("open-overview", Action::OverviewOpen),
+            ("close-overview", Action::OverviewExit),
+            ("toggle-column-tabbed-display", Action::ColumnToggleTabbed),
+            ("switch-preset-column-width", Action::ColumnWidthPresetCycle),
+            ("switch-preset-column-width-back", Action::ColumnWidthPresetCycleBack),
+            ("expand-column-to-available-width", Action::ExpandColumnToAvailable),
+            ("focus-monitor-left", Action::FocusMonitorLeft),
+            ("focus-monitor-right", Action::FocusMonitorRight),
+            ("move-window-to-monitor-left", Action::MoveToMonitorLeft),
+            ("move-window-to-monitor-right", Action::MoveToMonitorRight),
+            ("move-column-to-monitor-left", Action::MoveColumnToMonitorLeft),
+            ("move-column-to-monitor-right", Action::MoveColumnToMonitorRight),
+            ("focus-window-previous", Action::FocusPrevious),
+            ("focus-workspace-down", Action::FocusWorkspaceNext),
+            ("focus-workspace-up", Action::FocusWorkspacePrevious),
+            ("screenshot-screen", Action::Screenshot),
+            ("show-hotkey-overlay", Action::ShowKeyBindings),
+            ("center-column", Action::CenterColumn),
+            ("center-window", Action::CenterWindow),
+            ("close-window", Action::CloseWindow),
+            ("quit", Action::Quit),
+            ("move-workspace-up", Action::MoveWorkspaceUp),
+            ("move-workspace-down", Action::MoveWorkspaceDown),
+            ("move-column-to-workspace-up", Action::MoveColumnToWorkspaceUp),
+            ("move-column-to-workspace-down", Action::MoveColumnToWorkspaceDown),
+        ] {
+            assert_eq!(parse_action_name(name, &[]), Some(action), "{name}");
+        }
+        assert_eq!(
+            parse_action_name("set-workspace-name", &words(&["web"])),
+            Some(Action::RenameWorkspace("web".to_string()))
+        );
+        assert_eq!(
+            parse_action_name("spawn", &words(&["wt.exe", "-d", "C:\\My Projects"])),
+            Some(Action::Spawn(words(&["wt.exe", "-d", "C:\\My Projects"])))
+        );
+        assert_eq!(
+            parse_action_name("spawn-sh", &words(&["echo hi"])),
+            Some(Action::SpawnCmd("echo hi".to_string()))
+        );
+        assert_eq!(parse_action_name("no-such-action", &[]), None);
     }
 
     #[test]

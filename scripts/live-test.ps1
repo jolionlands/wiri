@@ -12,7 +12,8 @@
 #          H1 modifiers, H2 spawn, H3 actions follow the real foreground window (floats, dialogs),
 #          H4 minimized windows leave no gap, H5 floating windows belong to their workspace,
 #          H6 the niri column keymap (consume/expel, move-window, first/last, maximize-column), pressed
-#          with the shipped default binds.
+#          with the shipped default binds, H7 niri's action names and argument grammar (set-column-width
+#          "50%" / "+10%" / "600", presets, focus-workspace 2 against focus-workspace "2", set-window-height).
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -442,7 +443,7 @@ $vk = @{
     '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; a = 0x41; f = 0x46; j = 0x4A; k = 0x4B; q = 0x51; t = 0x54
     left = 0x25; right = 0x27; home = 0x24; end = 0x23
     comma = 0xBC; period = 0xBE; lbracket = 0xDB; rbracket = 0xDD
-    f6 = 0x75; f7 = 0x76; f8 = 0x77; f9 = 0x78
+    f1 = 0x70; f2 = 0x71; f3 = 0x72; f5 = 0x74; f6 = 0x75; f7 = 0x76; f8 = 0x77; f9 = 0x78
 }
 function Chord([string]$spec) {
     $keys = @($spec.ToLower().Split('+') | ForEach-Object { [byte]$vk[$_] })
@@ -986,6 +987,141 @@ Shot 'h6-08-maximize-restored'
 foreach ($h in $sf) { [TestForms]::CloseForm($h) }
 Start-Sleep -Milliseconds 1500
 
+# ---- H7: niri's action names and argument grammar port as they are ------------------------------------------------
+# set-column-width "50%" / "+10%" / "-10%" / "600" / "+100", switch-preset-column-width, focus-workspace 2 (an
+# index) against focus-workspace "2" (a name), and niri's names through wiri-ctl.
+$log7 = Join-Path $D 'wiri.stderr7.log'
+$h7Config = @"
+input {
+    mod-key "ctrl-alt"
+}
+binds {
+    Mod+F1 set-column-width "50%"
+    Mod+F2 set-column-width "+10%"
+    Mod+F3 set-column-width "-10%"
+    Mod+F5 set-column-width "600"
+    Mod+F6 set-column-width "+100"
+    Mod+F7 switch-preset-column-width
+    Mod+F9 switch-preset-column-width-back
+    Mod+2 focus-workspace 2
+    Mod+1 focus-workspace 1
+    Mod+3 focus-workspace "2"
+}
+"@
+Stop-WiriGracefully $w 'h7'
+$w7 = Start-WiriWithConfig $h7Config $log7
+$w = $w7
+$h7BindWarnings = (LogLines $log7 'Config bind:').Count
+$h7BindsRaw = Ctl 'h7-bindings' @('--json', 'bindings')
+$h7Binds = @()
+try { $h7Binds = @(($h7BindsRaw | ConvertFrom-Json).result) } catch { }
+function H7Bind([int]$vkCode, [string]$action) {
+    return (@($h7Binds | Where-Object { $_.vk_code -eq $vkCode -and $_.modifiers -eq 3 -and $_.action -eq $action }).Count -eq 1)
+}
+$h7BindsRegistered = (H7Bind 0x70 'SetColumnWidth(SetProportion(50000))') -and (H7Bind 0x71 'SetColumnWidth(AdjustProportion(10000))') -and
+    (H7Bind 0x72 'SetColumnWidth(AdjustProportion(-10000))') -and (H7Bind 0x74 'SetColumnWidth(SetFixed(600))') -and
+    (H7Bind 0x75 'SetColumnWidth(AdjustFixed(100))') -and (H7Bind 0x76 'ColumnWidthPresetCycle') -and
+    (H7Bind 0x78 'ColumnWidthPresetCycleBack') -and (H7Bind 0x32 'FocusWorkspace(2)') -and
+    (H7Bind 0x31 'FocusWorkspace(1)') -and (H7Bind 0x33 'FocusWorkspaceNamed("2")')
+function WinW($h) { return (Rc $h).W }
+function WinH($h) { return (Rc $h).H }
+$sf = @()
+foreach ($i in 1..3) { $sf += [TestForms]::Open("wiri-h7-$i", (50 * $i), 90, 200); Start-Sleep -Milliseconds 1500 }
+Start-Sleep -Seconds 1
+Shot 'h7-01-three-columns'
+
+# --- the size grammar through real key presses (the middle window; its column is alone in it)
+FocusForm $sf[1]
+Press 'ctrl+alt+f1'
+$wHalf = WinW $sf[1]
+# a 1366 px screen: view 1350, 16 px gaps, 4 px borders: half = (1350 + 16) / 2 - 16 - 8 = 659
+$h7SetPercent = (Near $wHalf 659 14)
+Shot 'h7-02-set-50-percent'
+Press 'ctrl+alt+f2'
+$wPlus = WinW $sf[1]
+$h7AdjustPercentUp = (Near ($wPlus - $wHalf) 137 14)
+Press 'ctrl+alt+f3'
+$h7AdjustPercentDown = (Near (WinW $sf[1]) $wHalf 8)
+Press 'ctrl+alt+f5'
+$h7SetPixels = (Near (WinW $sf[1]) 600 10)
+Press 'ctrl+alt+f6'
+$h7AdjustPixels = (Near (WinW $sf[1]) 700 10)
+Shot 'h7-03-plus-100-pixels'
+
+# two columns at 50 % fill the view exactly: the window edges meet the outer gap (8 px) and border (4 px)
+FocusForm $sf[0]
+Press 'ctrl+alt+f1'
+FocusForm $sf[1]
+Press 'ctrl+alt+f1'
+$a = Rc $sf[0]; $b = Rc $sf[1]
+$h7HalvesFillTheView = (Near $a.L 12 8) -and (Near $b.R ($sb.Width - 12) 8) -and (Near ($b.L - $a.R) 24 8)
+Shot 'h7-04-two-halves'
+
+# switch-preset-column-width: from a 600 px window the first preset that is wider (a half), then two thirds,
+# a third; going back from a third: two thirds
+Press 'ctrl+alt+f5'
+Press 'ctrl+alt+f7'
+$pA = WinW $sf[1]
+Press 'ctrl+alt+f7'
+$pB = WinW $sf[1]
+Press 'ctrl+alt+f7'
+$pC = WinW $sf[1]
+Press 'ctrl+alt+f9'
+$pD = WinW $sf[1]
+# presets of this screen: a third 431, a half 659, two thirds 887 (window widths)
+$h7PresetCycle = (Near $pA 659 14) -and (Near $pB 887 14) -and (Near $pC 431 14) -and (Near $pD 887 14)
+Shot 'h7-05-presets'
+
+# --- focus-workspace 2 is the second workspace, focus-workspace "2" the workspace named "2" (there is none)
+Press 'ctrl+alt+2'
+$h7WorkspaceIndex = ((VisibleCount $sf) -eq 0)
+Shot 'h7-06-workspace-2'
+Press 'ctrl+alt+1'
+$h7WorkspaceIndexBack = ((VisibleCount $sf) -eq 3)
+Press 'ctrl+alt+3'
+$h7QuotedIsAName = ((VisibleCount $sf) -eq 3)
+
+# --- niri's names through wiri-ctl action
+FocusForm $sf[2]
+$null = Ctl 'h7-action-fullscreen' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 1600
+$r = Rc $sf[2]
+$h7FullscreenWindow = ($r.L -le $sb.Left + 1) -and ($r.T -le $sb.Top + 1) -and ($r.R -ge $sb.Right - 1) -and ($r.B -ge $sb.Bottom - 1)
+Shot 'h7-07-fullscreen-window'
+$null = Ctl 'h7-action-fullscreen-off' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 1600
+$h7FullscreenWindowOff = ((Rc $sf[2]).W -lt ($sb.Width - 100))
+$null = Ctl 'h7-action-float' @('action', 'toggle-window-floating'); Start-Sleep -Milliseconds 1300
+$h7ToggleWindowFloating = ((WinOf (WinList 'h7-windows-floating') $sf[2]).floating -eq $true)
+$null = Ctl 'h7-action-float-again' @('action', 'move-window-to-floating'); Start-Sleep -Milliseconds 1300
+$h7ToFloatingIsNoToggle = ((WinOf (WinList 'h7-windows-still-floating') $sf[2]).floating -eq $true)
+$null = Ctl 'h7-action-tile' @('action', 'move-window-to-tiling'); Start-Sleep -Milliseconds 1300
+$h7ToTiling = ((WinOf (WinList 'h7-windows-tiled') $sf[2]).floating -eq $false)
+$null = Ctl 'h7-action-tile-again' @('action', 'move-window-to-tiling'); Start-Sleep -Milliseconds 1300
+$h7ToTilingIsNoToggle = ((WinOf (WinList 'h7-windows-still-tiled') $sf[2]).floating -eq $false)
+$null = Ctl 'h7-action-focus-monitor' @('action', 'focus-monitor-left'); Start-Sleep -Milliseconds 800
+$h7FocusMonitorAtTheEdge = ([LT]::GetForegroundWindow() -eq $sf[2])
+
+# set-window-height: two windows in one column, the upper one gets 70 % of the view, then 30 %, then the default
+FocusForm $sf[0]
+$null = Ctl 'h7-action-consume' @('action', 'consume-window-into-column'); Start-Sleep -Milliseconds 1500
+$hEqual0 = WinH $sf[0]; $hEqual1 = WinH $sf[1]
+$null = Ctl 'h7-action-height-70' @('action', 'set-window-height', '70%'); Start-Sleep -Milliseconds 1500
+# work area 728 - 16 outer gaps = 712 high; 12 px between the windows: 70 % = 0.7 * 724 - 12 = 495 - 8 = 487; the other 700 - 495 - 8 = 197
+$ha = WinH $sf[0]; $hb = WinH $sf[1]
+$h7WindowHeightPercent = (Near $ha 487 14) -and (Near $hb 197 14)
+Shot 'h7-08-height-70'
+$null = Ctl 'h7-action-height-minus-30' @('action', 'set-window-height', '-30%'); Start-Sleep -Milliseconds 1500
+$ha = WinH $sf[0]; $hb = WinH $sf[1]
+$h7WindowHeightAdjust = (Near $ha 270 14) -and (Near $hb 414 14)
+$null = Ctl 'h7-action-height-reset' @('action', 'reset-window-height'); Start-Sleep -Milliseconds 1500
+$h7WindowHeightReset = (Near (WinH $sf[0]) (WinH $sf[1]) 14) -and (Near (WinH $sf[0]) $hEqual0 14)
+Shot 'h7-09-height-reset'
+$null = Ctl 'h7-ctl-set-width' @('set-column-width', '50%'); Start-Sleep -Milliseconds 1300
+$h7CtlSetColumnWidth = (Near (WinW $sf[0]) 659 14)
+$null = Ctl 'h7-ctl-set-width-minus' @('set-column-width', '-10%'); Start-Sleep -Milliseconds 1300
+$h7CtlSetColumnWidthMinus = (Near (WinW $sf[0]) 522 14)
+foreach ($h in $sf) { [TestForms]::CloseForm($h) }
+Start-Sleep -Milliseconds 1500
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -1165,6 +1301,31 @@ $summary = [ordered]@{
     h6_move_column_to_first = $h6ColumnToFirst
     h6_maximize_column_full_width_for_a_one_window_column = $h6MaximizeFull
     h6_maximize_column_restores_the_width = $h6MaximizeRestores
+    # --- Phase 1 / H7: niri action names and argument grammar
+    h7_config_bind_warnings = $h7BindWarnings
+    h7_niri_binds_registered = $h7BindsRegistered
+    h7_set_column_width_percent = $h7SetPercent
+    h7_set_column_width_plus_percent = $h7AdjustPercentUp
+    h7_set_column_width_minus_percent = $h7AdjustPercentDown
+    h7_set_column_width_pixels = $h7SetPixels
+    h7_set_column_width_plus_pixels = $h7AdjustPixels
+    h7_two_50_percent_columns_fill_the_view = $h7HalvesFillTheView
+    h7_switch_preset_column_width_cycles_and_goes_back = $h7PresetCycle
+    h7_focus_workspace_number_is_an_index = $h7WorkspaceIndex
+    h7_focus_workspace_index_back = $h7WorkspaceIndexBack
+    h7_focus_workspace_quoted_number_is_a_name = $h7QuotedIsAName
+    h7_fullscreen_window = $h7FullscreenWindow
+    h7_fullscreen_window_off = $h7FullscreenWindowOff
+    h7_toggle_window_floating = $h7ToggleWindowFloating
+    h7_move_window_to_floating_is_no_toggle = $h7ToFloatingIsNoToggle
+    h7_move_window_to_tiling = $h7ToTiling
+    h7_move_window_to_tiling_is_no_toggle = $h7ToTilingIsNoToggle
+    h7_focus_monitor_left_at_the_edge_keeps_the_focus = $h7FocusMonitorAtTheEdge
+    h7_set_window_height_percent = $h7WindowHeightPercent
+    h7_set_window_height_minus_percent = $h7WindowHeightAdjust
+    h7_reset_window_height = $h7WindowHeightReset
+    h7_wiri_ctl_set_column_width = $h7CtlSetColumnWidth
+    h7_wiri_ctl_set_column_width_minus_percent = $h7CtlSetColumnWidthMinus
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

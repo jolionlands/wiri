@@ -10,6 +10,7 @@ pub use engine::AddWindowTarget;
 pub use engine::{query_foreground, ActionTarget, ForegroundWindow};
 pub use engine::ColumnWidthMode;
 pub use engine::ColumnWidthPreset;
+pub use engine::SizeAxis;
 pub use engine::LayoutConfig;
 pub use engine::TilingEngine;
 pub use engine::WorkspaceDirection;

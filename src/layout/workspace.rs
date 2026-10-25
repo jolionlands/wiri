@@ -89,6 +89,10 @@ pub struct Column {
     /// The width the column had when it was maximized (`Some(None)`: the
     /// layout default), to restore when it is toggled back.
     pub pre_max_width: Option<Option<u32>>,
+    /// The preset (index into niri's `preset-column-widths`) that
+    /// `switch-preset-column-width` gave the column last; the next switch goes on from
+    /// there.  Any other width forgets it.
+    pub preset_idx: Option<usize>,
 }
 
 impl Column {
@@ -99,6 +103,7 @@ impl Column {
             display: ColumnDisplay::Stacked,
             maximized: false,
             pre_max_width: None,
+            preset_idx: None,
         }
     }
 
@@ -107,6 +112,7 @@ impl Column {
     pub fn set_width(&mut self, width: Option<u32>) {
         self.maximized = false;
         self.pre_max_width = None;
+        self.preset_idx = None;
         self.width = width;
     }
 

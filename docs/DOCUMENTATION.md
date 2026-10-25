@@ -458,24 +458,65 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 | `consume-or-expel-window-left` | — | — | A window alone in its column joins the column on its left; one of several leaves its column to the left |
 | `consume-or-expel-window-right` | — | — | The same to the right |
 | `maximize-column` | `column-maximize`, `toggle-column-maximize` | — | Toggle: the column is as wide as the view (also for a column of one window); toggling again restores its width |
+| `set-column-width` | `set-window-width` | `"50%"`, `"+10%"`, `"-10%"`, `"1200"`, `"+100"` | niri's size argument (below); wiri's `"1/3"`, `"2/3"`, `"full"` and `"cycle"` work too. A floating window is resized |
+| `set-window-height` | — | the same | The window's height in its column (the others keep their proportions); a floating window is resized. A column of one window always fills the view |
+| `reset-window-height` | — | — | The window gets an equal share of its column again |
+| `switch-preset-column-width` | `column-width-preset`, `column-width-cycle` | — | niri: the column takes the next width of a third, a half, two thirds of the view (the first one wider than it is; it goes on from there when it was switched last) |
+| `switch-preset-column-width-back` | — | — | The same backwards |
+| `expand-column-to-available-width` | `expand-column-to-available`, `expand-column` | — | niri: the column takes the room that the other columns fully in view leave |
 | `close-window` | `close` | — | Close focused window |
-| `toggle-fullscreen` | `fullscreen` | — | Toggle fullscreen |
-| `toggle-floating` | `float` | — | Toggle floating |
+| `toggle-fullscreen` | `fullscreen`, `fullscreen-window` | — | Toggle fullscreen |
+| `toggle-floating` | `float`, `toggle-window-floating` | — | Toggle floating |
+| `move-window-to-floating` | — | — | Float the window (nothing happens when it floats already) |
+| `move-window-to-tiling` | — | — | Put a floating window back into a column (nothing happens when it is tiled) |
 | `scroll-left` | — | — | Scroll workspace left |
 | `scroll-right` | — | — | Scroll workspace right |
 | `quit` | `exit` | — | Exit wiri |
 | `switch-workspace` | `workspace` | `n` | Focus workspace `n` (1–9) |
+| `focus-workspace` | — | `N` or `"name"` | niri: a number is the index of the workspace on the monitor, a quoted string is the name of a workspace (`focus-workspace 2` is the second workspace, `focus-workspace "2"` the one named 2) |
 | `move-workspace` | — | `n` | Move window to workspace `n` |
 | `spawn` | `exec` | `"cmd"` | Launch a program |
 | `maximize` | — | — | Maximize window |
 | `minimize` | — | — | Minimize window |
 | `center-window` | — | — | Center window |
 | `switch-monitor` | — | — | Focus next monitor |
+| `focus-monitor-left` | — | — | niri: focus the monitor on the left (nothing at the edge) |
+| `focus-monitor-right` | — | — | niri: focus the monitor on the right |
+| `move-to-monitor-left` | `move-window-to-monitor-left` | — | Move the window to the monitor on the left |
+| `move-to-monitor-right` | `move-window-to-monitor-right` | — | Move the window to the monitor on the right |
+| `move-column-to-monitor-left` | — | — | Move the column to the monitor on the left |
+| `move-column-to-monitor-right` | — | — | Move the column to the monitor on the right |
 | `refresh` | — | — | Re-apply layout |
-| `overview` | `overview-toggle`, `zoom-out` | — | Enter/exit overview |
+| `overview` | `overview-toggle`, `zoom-out`, `toggle-overview` | — | Enter/exit overview |
+| `open-overview` | — | — | Enter overview (nothing happens when it is open) |
+| `overview-exit` | `exit-overview`, `close-overview` | — | Leave overview |
 | `overview-left` | — | — | Navigate left in overview |
 | `overview-right` | — | — | Navigate right in overview |
 | `overview-select` | `overview-accept` | — | Select window, exit overview |
+
+---
+
+### niri's size argument
+
+`set-column-width` and `set-window-height` take niri's size argument:
+
+| Argument | Meaning |
+|---|---|
+| `"50%"` | that proportion of the view: two `"50%"` columns and the gap between them fill the view exactly, three `"33.333%"` columns too |
+| `"+10%"` / `"-10%"` | that much more or less (a proportion of the view) than now |
+| `"1200"` | the window gets 1200 px (the border around it comes on top) |
+| `"+100"` / `"-100"` | 100 px more or less than now |
+
+A column that is maximized loses that state when it gets a width of its own.  `wiri-ctl
+set-column-width 50%` and `wiri-ctl action set-window-height 70%` take the same words.
+
+### Porting a niri `binds {}` block
+
+wiri's `binds {}` is a line per bind (`Mod+Shift+T spawn "wt.exe"`), not niri's KDL children, but the
+words after the chord are niri's: the action names above (plus wiri's older spellings), `Mod` for
+the `input { mod-key }` modifier, the quoted/unquoted difference of `focus-workspace`, and the size
+argument.  Actions that need a feature wiri does not have yet are reported as unknown when the
+config is loaded (`wiri-ctl validate-config` lists them).
 
 ---
 

@@ -147,10 +147,12 @@ pub enum IpcMessage {
     #[serde(rename = "center_column")]
     CenterColumn,
 
-    /// Set the focused column to a width preset (`"1/3"`, `"1/2"`, `"2/3"`, `"full"`, `"cycle"`).
+    /// Change the width of the focused column: niri's size argument (`"50%"`, `"+10%"`,
+    /// `"-10%"`, `"1200"`, `"+100"`) or a width preset (`"1/3"`, `"1/2"`, `"2/3"`, `"full"`,
+    /// `"cycle"`).
     #[serde(rename = "set_column_width")]
     SetColumnWidth {
-        preset: String, /* "1/3", "1/2", "2/3", "full", "cycle" */
+        preset: String, /* "50%", "+10%", "1200", "1/3", "full", "cycle", ... */
     },
 
     /// Resize the focused column by `delta_px` pixels (positive = wider, negative = narrower).

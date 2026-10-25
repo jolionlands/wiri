@@ -157,7 +157,9 @@ binds {
     Ctrl+Alt+H       scroll-left
     Ctrl+Alt+L       scroll-right
 
-    // Column-width presets
+    // Column-width presets.  set-column-width takes niri's size argument too: "50%",
+    // "+10%", "-10%" (of the view), "1200", "+100" (pixels); "cycle" is niri's
+    // switch-preset-column-width (a third, a half, two thirds).
     Ctrl+Alt+Bracket_Left  set-column-width "1/3"
     Ctrl+Alt+Bracket_Right set-column-width "2/3"
     Ctrl+Alt+Backslash     set-column-width "cycle"

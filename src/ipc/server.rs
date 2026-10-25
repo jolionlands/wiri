@@ -775,22 +775,24 @@ impl IpcServer {
                 }
             }
             IpcMessage::SetColumnWidth { preset } => {
-                info!("IPC: SetColumnWidth preset={}", preset);
+                info!("IPC: SetColumnWidth {}", preset);
+                // Same words as `set-column-width` in a bind: niri's `"50%"`, `"+10%"`,
+                // `"1200"`, `"+100"`, or `1/3`, `full`, `cycle`.
+                let Some(action) = crate::input::parse_column_width_arg(&preset) else {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": format!(
+                            "bad column width '{}': use 50%, +10%, -10%, 1200, +100, 1/3, full or cycle",
+                            preset
+                        )
+                    });
+                };
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
-                        let p = match preset.to_lowercase().as_str() {
-                            "1/4" | "quarter" => crate::layout::ColumnWidthPreset::OneQuarter,
-                            "1/3" | "third" => crate::layout::ColumnWidthPreset::OneThird,
-                            "1/2" | "half" => crate::layout::ColumnWidthPreset::Half,
-                            "2/3" | "two-thirds" => crate::layout::ColumnWidthPreset::TwoThirds,
-                            "3/4" | "three-quarters" => {
-                                crate::layout::ColumnWidthPreset::ThreeQuarters
-                            }
-                            "full" | "100" => crate::layout::ColumnWidthPreset::Full,
-                            _ => crate::layout::ColumnWidthPreset::Cycle,
-                        };
-                        engine.write().set_column_width_preset(p, backend);
-                        engine.write().apply_all(backend);
+                        let no_quit = Arc::new(parking_lot::Mutex::new(None));
+                        crate::backend::message_loop::perform_action(
+                            &action, engine, backend, &no_quit,
+                        );
                         serde_json::json!({"success": true})
                     }
                     _ => {

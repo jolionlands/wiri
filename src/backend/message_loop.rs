@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::BackendHandle;
-use crate::input::Action;
+use crate::input::{Action, SizeChange};
 use crate::layout::{ScrollDirection, TilingEngine};
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
@@ -66,7 +66,14 @@ fn bind_to_hotkey(
         .ok_or_else(|| format!("{}: unknown key '{}'", bind.chord_text(), bind.key))?;
     let action = bind
         .parse_action()
-        .ok_or_else(|| format!("{}: unknown action '{}'", bind.chord_text(), bind.command))?;
+        .ok_or_else(|| {
+            format!(
+                "{}: unknown action or bad arguments '{} {}'",
+                bind.chord_text(),
+                bind.command,
+                bind.args.join(" ")
+            )
+        })?;
     Ok((mods, vk, action))
 }
 
@@ -1041,59 +1048,69 @@ pub(crate) fn perform_action(
             }
             engine.write().apply_all(backend);
         }
-        Action::ColumnWidthPresetCycle => {
+        Action::ColumnWidthPresetCycle | Action::ColumnWidthPresetCycleBack => {
+            // niri's presets: a third, a half and two thirds of the view.
+            let forwards = matches!(action, Action::ColumnWidthPresetCycle);
             match float_of(target) {
-                // niri's presets: a third, a half, two thirds of the work area.
-                Some(window) => engine.write().float_cycle_width(window, backend),
-                None => engine
-                    .write()
-                    .set_column_width_preset(crate::layout::ColumnWidthPreset::Cycle, backend),
+                Some(window) => engine.write().float_cycle_width(window, forwards, backend),
+                None => engine.write().switch_preset_column_width(forwards, backend),
             }
-            engine.write().apply_all(backend);
         }
-        Action::ColumnWidthPresetHalf => {
-            match float_of(target) {
-                Some(window) => engine
-                    .write()
-                    .float_set_width_fraction(window, 0.5, backend),
-                None => engine
-                    .write()
-                    .set_column_width_preset(crate::layout::ColumnWidthPreset::Half, backend),
-            }
-            engine.write().apply_all(backend);
+        // wiri's fractions are niri proportions of the view.
+        Action::ColumnWidthPresetQuarter
+        | Action::ColumnWidthPresetThird
+        | Action::ColumnWidthPresetHalf
+        | Action::ColumnWidthPresetTwoThirds
+        | Action::ColumnWidthPresetThreeQuarters
+        | Action::ColumnWidthPresetFull => {
+            let milli_percent = match action {
+                Action::ColumnWidthPresetQuarter => 25_000,
+                Action::ColumnWidthPresetThird => 33_333,
+                Action::ColumnWidthPresetHalf => 50_000,
+                Action::ColumnWidthPresetTwoThirds => 66_667,
+                Action::ColumnWidthPresetThreeQuarters => 75_000,
+                _ => 100_000,
+            };
+            change_size(
+                engine,
+                backend,
+                target,
+                crate::layout::SizeAxis::Width,
+                SizeChange::SetProportion(milli_percent),
+            );
         }
-        Action::ColumnWidthPresetThird => {
-            match float_of(target) {
-                Some(window) => engine
-                    .write()
-                    .float_set_width_fraction(window, 1.0 / 3.0, backend),
-                None => engine
-                    .write()
-                    .set_column_width_preset(crate::layout::ColumnWidthPreset::OneThird, backend),
-            }
-            engine.write().apply_all(backend);
+        Action::SetColumnWidth(change) => {
+            change_size(engine, backend, target, crate::layout::SizeAxis::Width, *change);
         }
-        Action::ColumnWidthPresetTwoThirds => {
-            match float_of(target) {
-                Some(window) => engine
-                    .write()
-                    .float_set_width_fraction(window, 2.0 / 3.0, backend),
-                None => engine
-                    .write()
-                    .set_column_width_preset(crate::layout::ColumnWidthPreset::TwoThirds, backend),
-            }
-            engine.write().apply_all(backend);
+        Action::SetWindowHeight(change) => {
+            change_size(engine, backend, target, crate::layout::SizeAxis::Height, *change);
         }
-        Action::ColumnWidthPresetFull => {
-            match float_of(target) {
-                Some(window) => engine
-                    .write()
-                    .float_set_width_fraction(window, 1.0, backend),
-                None => engine
-                    .write()
-                    .set_column_width_preset(crate::layout::ColumnWidthPreset::Full, backend),
+        Action::ResetWindowHeight => {
+            if float_of(target).is_none() {
+                engine.write().reset_window_height(backend);
             }
-            engine.write().apply_all(backend);
+        }
+        Action::MoveWindowToFloating | Action::MoveWindowToTiling => {
+            if let Some(t) = target {
+                engine.write().set_window_floating(
+                    t.window,
+                    matches!(action, Action::MoveWindowToFloating),
+                    backend,
+                );
+            }
+        }
+        Action::FocusMonitorLeft | Action::FocusMonitorRight => {
+            let direction = if matches!(action, Action::FocusMonitorLeft) {
+                ScrollDirection::Left
+            } else {
+                ScrollDirection::Right
+            };
+            engine.write().focus_monitor_toward(direction, backend);
+        }
+        Action::OverviewOpen => {
+            if !engine.read().is_overview() {
+                engine.write().toggle_overview(backend);
+            }
         }
         Action::ResizeColumnLeft => {
             match float_of(target) {
@@ -1139,52 +1156,26 @@ pub(crate) fn perform_action(
         Action::Screenshot => {
             take_screenshot();
         }
-        Action::ColumnWidthPresetQuarter => {
-            match float_of(target) {
-                Some(window) => engine
-                    .write()
-                    .float_set_width_fraction(window, 0.25, backend),
-                None => engine
-                    .write()
-                    .set_column_width_preset(crate::layout::ColumnWidthPreset::OneQuarter, backend),
-            }
-            engine.write().apply_all(backend);
-        }
-        Action::ColumnWidthPresetThreeQuarters => {
-            match float_of(target) {
-                Some(window) => engine
-                    .write()
-                    .float_set_width_fraction(window, 0.75, backend),
-                None => engine
-                    .write()
-                    .set_column_width_preset(crate::layout::ColumnWidthPreset::ThreeQuarters, backend),
-            }
-            engine.write().apply_all(backend);
-        }
         // The column operations belong to the strip: a floating window has no column
         // (niri does nothing for it either).
         Action::ConsumeWindowIntoColumn => {
             if float_of(target).is_none() {
                 engine.write().consume_window_into_column(backend);
-                engine.write().apply_all(backend);
             }
         }
         Action::ExpelWindowFromColumn => {
             if float_of(target).is_none() {
                 engine.write().expel_window_from_column(backend);
-                engine.write().apply_all(backend);
             }
         }
         Action::ConsumeOrExpelWindowLeft => {
             if float_of(target).is_none() {
                 engine.write().consume_or_expel_window_left(backend);
-                engine.write().apply_all(backend);
             }
         }
         Action::ConsumeOrExpelWindowRight => {
             if float_of(target).is_none() {
                 engine.write().consume_or_expel_window_right(backend);
-                engine.write().apply_all(backend);
             }
         }
         Action::MoveWindowUp => match float_of(target) {
@@ -1214,13 +1205,11 @@ pub(crate) fn perform_action(
         Action::ExpandColumnToAvailable => {
             if float_of(target).is_none() {
                 engine.write().expand_column_to_available(backend);
-                engine.write().apply_all(backend);
             }
         }
         Action::MaximizeColumn => {
             if float_of(target).is_none() {
                 engine.write().toggle_maximize_focused_column(backend);
-                engine.write().apply_all(backend);
             }
         }
         Action::GrowColumnWidth => {
@@ -1353,6 +1342,29 @@ pub(crate) fn perform_action(
             } else {
                 info!("ShowKeyBindings: cheatsheet overlay not installed (main.rs wiring missing)");
             }
+        }
+    }
+}
+
+/// Apply a niri size change to the window an action targets: a floating window is
+/// resized (proportions are of its monitor's work area), a tile changes the width of its
+/// column or its own height inside the column.
+fn change_size(
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    target: Option<crate::layout::ActionTarget>,
+    axis: crate::layout::SizeAxis,
+    change: SizeChange,
+) {
+    match (float_of(target), axis) {
+        (Some(window), axis) => {
+            engine
+                .write()
+                .float_apply_size_change(window, axis, change, backend)
+        }
+        (None, crate::layout::SizeAxis::Width) => engine.write().set_column_width_by(change, backend),
+        (None, crate::layout::SizeAxis::Height) => {
+            engine.write().set_window_height_by(change, backend)
         }
     }
 }

@@ -932,7 +932,7 @@ impl HotkeyBinding {
             }
             return None;
         }
-        crate::input::parse_action_name(&self.command, &self.args)
+        crate::input::parse_action_flagged(&self.command, &self.args, &self.args_quoted)
     }
 
     /// Parse modifier strings to Windows MOD flags.

@@ -72,6 +72,25 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   `Ctrl+Alt+Home` / `End`, `Ctrl+Alt+Shift+Home` / `End`, `Ctrl+Alt+Shift+[` / `]`, `Ctrl+Alt+K` /
   `J`.  A floating window has no column: the column actions leave it alone and `move-window-up` /
   `down` nudge it by 50 px.
+- **niri's action names and argument grammar.**  A niri `binds {}` block now ports: `set-column-width`
+  and `set-window-width` take niri's size argument (`"50%"`, `"+10%"`, `"-10%"`, `"1200"`, `"+100"`; wiri's
+  `"1/3"`, `"full"`, `"cycle"` still work), `set-window-height` and `reset-window-height` change a
+  window's share of its column, `focus-workspace 2` is the second workspace while `focus-workspace "2"`
+  is the workspace named 2, and the niri names are accepted for what wiri already does:
+  `fullscreen-window`, `toggle-window-floating`, `move-window-to-floating` / `-tiling` (not toggles),
+  `toggle-overview` / `open-overview` / `close-overview`, `toggle-column-tabbed-display`,
+  `switch-preset-column-width` (and `-back`), `expand-column-to-available-width`,
+  `focus-window-previous`, `focus-workspace-up` / `-down`, `focus-monitor-left` / `-right`,
+  `move-window-to-monitor-left` / `-right`, `screenshot-screen`, `set-workspace-name`,
+  `show-hotkey-overlay`.  A proportion is niri's: two `"50%"` columns and the gap between them fill the
+  view exactly (the old presets were a gap too wide, so three thirds spilled off the screen); a fixed
+  size is the window's, the border comes on top.  `switch-preset-column-width` is niri's cycle (a third,
+  a half, two thirds, the first one wider than the column, going on from the last preset it set) instead
+  of the old quarter-to-full list.  `expand-column-to-available-width` counts only the columns that are
+  fully in view like niri (it subtracted the whole strip, which came out as 50 px on a long one) and
+  maximizes a column that is alone in view.  `wiri-ctl set-column-width` and the IPC request take the
+  same words.  A bind whose action is known but whose arguments are not now says so
+  (`unknown action or bad arguments`).
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal
