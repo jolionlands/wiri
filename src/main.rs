@@ -624,27 +624,12 @@ async fn main() -> Result<()> {
 
                     let ws_label = eng
                         .monitors()
-                        .focused()
-                        .map(|m| {
-                            let ws_id = m.active_workspace_id();
-                            // Try configured workspace name; fall back to "Workspace N".
-                            eng.full_config()
-                                .and_then(|c| {
-                                    c.workspace
-                                        .iter()
-                                        .enumerate()
-                                        .find(|(idx, w)| {
-                                            *idx as i32 == ws_id || w.name == ws_id.to_string()
-                                        })
-                                        .and_then(|(_, w)| {
-                                            if w.name.is_empty() {
-                                                None
-                                            } else {
-                                                Some(w.name.clone())
-                                            }
-                                        })
-                                })
-                                .unwrap_or_else(|| format!("[{}]", ws_id + 1))
+                        .focused_id()
+                        .and_then(|oid| {
+                            let ws_id = eng.monitors().get(&oid)?.active_workspace_id();
+                            Some(eng.workspace_name(ws_id).unwrap_or_else(|| {
+                                format!("[{}]", eng.workspace_number_on(oid, ws_id))
+                            }))
                         })
                         .unwrap_or_default();
 
@@ -735,27 +720,15 @@ async fn main() -> Result<()> {
             let mut last = LAST_WS.lock();
             if current != *last {
                 if let Some(ws_id) = current {
-                    // Use the configured workspace name when available, otherwise
-                    // fall back to "Workspace N" (1-based display index).
-                    let label = engine
-                        .read()
-                        .full_config()
-                        .and_then(|c| {
-                            c.workspace
-                                .iter()
-                                .enumerate()
-                                .find(|(idx, w)| {
-                                    *idx as i32 == ws_id || w.name == ws_id.to_string()
-                                })
-                                .and_then(|(_, w)| {
-                                    if w.name.is_empty() {
-                                        None
-                                    } else {
-                                        Some(w.name.clone())
-                                    }
-                                })
-                        })
-                        .unwrap_or_else(|| format!("Workspace {}", ws_id + 1));
+                    // The workspace's name when it has one, otherwise "Workspace N"
+                    // with N its position from the top of the monitor.
+                    let label = {
+                        let eng = engine.read();
+                        match eng.monitors().focused_id() {
+                            Some(oid) => eng.workspace_label(oid, ws_id),
+                            None => format!("Workspace {}", ws_id + 1),
+                        }
+                    };
                     // Show the overlay centred over the focused monitor so it
                     // lands on the screen the user is looking at — falls back
                     // to the primary monitor if no focused monitor is set.
@@ -776,9 +749,15 @@ async fn main() -> Result<()> {
                     }
                     // Broadcast workspace switch to IPC subscribers.
                     // OutputId wraps a u64 name-hash; expose it via .as_u64().
-                    if let Some(focused_oid) = engine.read().monitors().focused_id() {
+                    let focused = {
+                        let eng = engine.read();
+                        eng.monitors()
+                            .focused_id()
+                            .map(|oid| (oid, eng.workspace_number_on(oid, ws_id)))
+                    };
+                    if let Some((focused_oid, number)) = focused {
                         ipc_server.broadcast_event(IpcEvent::WorkspaceSwitched {
-                            workspace_id: wiri::layout::workspace_number(ws_id),
+                            workspace_id: number,
                             monitor_id: focused_oid.as_u64(),
                         });
                     }
@@ -1151,10 +1130,17 @@ fn handle_backend_event(
             // would hand the focus back and forth between windows of one app).
             let synced = engine.write().sync_os_foreground(window_id, handle);
             if let Some((col_idx, ws_id)) = synced {
+                let number = {
+                    let eng = engine.read();
+                    match eng.locate_window(window_id) {
+                        Some((oid, _, _)) => eng.workspace_number_on(oid, ws_id),
+                        None => wiri::layout::workspace_number(ws_id),
+                    }
+                };
                 ipc_server.broadcast_event(IpcEvent::ColumnFocused {
                     window_hwnd: hwnd,
                     column_index: col_idx,
-                    workspace_id: wiri::layout::workspace_number(ws_id),
+                    workspace_id: number,
                 });
             }
         }

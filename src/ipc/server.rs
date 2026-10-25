@@ -330,15 +330,12 @@ impl IpcServer {
                     let eng = engine.read();
                     let windows = build_window_infos(&eng);
                     let mut workspaces = Vec::new();
-                    for (_oid, monitor) in eng.monitors().iter() {
+                    for (oid, monitor) in eng.monitors().iter() {
                         let ws = monitor.workspace();
+                        let number = eng.workspace_number_on(*oid, monitor.active_workspace_id());
                         workspaces.push(WorkspaceInfo {
-                            name: format!(
-                                "workspace-{}",
-                                crate::layout::workspace_number(monitor.active_workspace_id())
-                            ),
-                            id: crate::layout::workspace_number(monitor.active_workspace_id())
-                                as u32,
+                            name: format!("workspace-{}", number),
+                            id: number as u32,
                             window_count: ws
                                 .map(|w| w.columns.iter().map(|c| c.tiles.len()).sum())
                                 .unwrap_or(0),
@@ -377,11 +374,9 @@ impl IpcServer {
                 info!("IPC: Switch to workspace {}", id);
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
-                        // `id` is the 1-based number users type (see
-                        // `crate::layout::workspace_id_from_number`).
-                        engine
-                            .write()
-                            .switch_workspace(crate::layout::workspace_id_from_number(id), backend);
+                        // `id` is the 1-based number users type: the position of the
+                        // workspace on the focused monitor (`focus-workspace 2`).
+                        engine.write().focus_workspace_number(id, backend);
                         serde_json::json!({
                             "success": true,
                             "result": {"workspace_id": id}
@@ -579,7 +574,7 @@ impl IpcServer {
                             let target_id = name
                                 .parse::<i32>()
                                 .ok()
-                                .map(crate::layout::workspace_id_from_number)
+                                .map(|number| engine.read().workspace_id_for_number(number))
                                 .or_else(|| engine.read().workspace_id_by_name(name));
                             let Some(target_id) = target_id else {
                                 return serde_json::json!({
@@ -615,7 +610,7 @@ impl IpcServer {
                             });
                         }
                         let wid = crate::utils::WindowId::new(window_hwnd);
-                        let workspace = crate::layout::workspace_id_from_number(workspace_id);
+                        let workspace = engine.read().workspace_id_for_number(workspace_id);
                         if engine.read().is_floating(wid) {
                             engine.write().float_move_to_workspace(wid, workspace, backend);
                         } else {
@@ -685,12 +680,12 @@ impl IpcServer {
                     let workspaces: Vec<_> = eng
                         .monitors()
                         .iter()
-                        .map(|(_oid, m)| WorkspaceInfo {
+                        .map(|(oid, m)| WorkspaceInfo {
                             name: format!(
                                 "workspace-{}",
-                                crate::layout::workspace_number(m.active_workspace_id())
+                                eng.workspace_number_on(*oid, m.active_workspace_id())
                             ),
-                            id: crate::layout::workspace_number(m.active_workspace_id()) as u32,
+                            id: eng.workspace_number_on(*oid, m.active_workspace_id()) as u32,
                             window_count: m
                                 .workspace()
                                 .map(|w| w.columns.iter().map(|c| c.tiles.len()).sum())
@@ -732,10 +727,8 @@ impl IpcServer {
                 info!("IPC: MoveWindowToWorkspace {}", workspace_id);
                 match (&self.engine, &self.backend) {
                     (Some(engine), Some(backend)) => {
-                        engine.write().move_window_to_workspace(
-                            crate::layout::workspace_id_from_number(workspace_id),
-                            backend,
-                        );
+                        let workspace = engine.read().workspace_id_for_number(workspace_id);
+                        engine.write().move_window_to_workspace(workspace, backend);
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true})
                     }
@@ -924,9 +917,8 @@ impl IpcServer {
                                 work_area_width: m.work_area.size.w,
                                 work_area_height: m.work_area.size.h,
                                 scale_factor: m.scale_factor,
-                                active_workspace: crate::layout::workspace_number(
-                                    m.active_workspace_id(),
-                                ),
+                                active_workspace: eng
+                                    .workspace_number_on(*oid, m.active_workspace_id()),
                                 window_count,
                                 focused: Some(*oid) == focused,
                             }
@@ -1268,13 +1260,13 @@ impl IpcServer {
             IpcMessage::RenameWorkspace { workspace_id, name } => {
                 info!("IPC: RenameWorkspace id={} name={:?}", workspace_id, name);
                 match &self.engine {
-                    Some(e) => match e.write().rename_workspace(
-                        crate::layout::workspace_id_from_number(workspace_id),
-                        &name,
-                    ) {
-                        Ok(()) => serde_json::json!({"success": true}),
-                        Err(err) => serde_json::json!({"success": false, "error": err}),
-                    },
+                    Some(e) => {
+                        let id = e.read().workspace_id_for_number(workspace_id);
+                        match e.write().rename_workspace(id, &name) {
+                            Ok(()) => serde_json::json!({"success": true}),
+                            Err(err) => serde_json::json!({"success": false, "error": err}),
+                        }
+                    }
                     None => {
                         serde_json::json!({"success": false, "error": "engine not initialized"})
                     }
@@ -1330,7 +1322,8 @@ impl IpcServer {
                     let (window_hwnd, workspace_id, monitor_id) = match focused_output {
                         Some(oid) => {
                             let monitor = eng.monitors().get(&oid);
-                            let ws_id = crate::layout::workspace_number(
+                            let ws_id = eng.workspace_number_on(
+                                oid,
                                 monitor.map(|m| m.active_workspace_id()).unwrap_or(0),
                             );
                             let hwnd = monitor
@@ -1364,19 +1357,22 @@ impl IpcServer {
                 if let Some(engine) = &self.engine {
                     let eng = engine.read();
                     let mut workspaces: Vec<serde_json::Value> = Vec::new();
-                    for (_oid, monitor) in eng.monitors().iter() {
-                        for (&ws_id, ws) in monitor.workspaces.iter() {
+                    for (oid, monitor) in eng.monitors().iter() {
+                        for ws_id in monitor.workspace_ids() {
+                            let Some(ws) = monitor.workspaces.get(&ws_id) else {
+                                continue;
+                            };
                             let window_count: usize =
                                 ws.columns.iter().map(|c| c.tiles.len()).sum();
+                            let number = eng.workspace_number_on(*oid, ws_id);
                             let name = eng
                                 .workspace_name(ws_id)
-                                .unwrap_or_else(|| {
-                                    format!("workspace-{}", crate::layout::workspace_number(ws_id))
-                                });
+                                .unwrap_or_else(|| format!("workspace-{}", number));
                             workspaces.push(serde_json::json!({
-                                "id": crate::layout::workspace_number(ws_id),
+                                "id": number,
                                 "name": name,
                                 "window_count": window_count,
+                                "monitor_id": oid.as_u64(),
                             }));
                         }
                     }
@@ -1562,14 +1558,15 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
     use crate::utils::WindowId;
     use std::collections::HashMap;
 
-    // Workspace id, column index and tile index of every window that sits in a strip.
+    // Workspace number, column index and tile index of every window that sits in a strip.
     let mut ws_of: HashMap<WindowId, i32> = HashMap::new();
     let mut place_of: HashMap<WindowId, (usize, usize)> = HashMap::new();
-    for (_oid, monitor) in eng.monitors().iter() {
+    for (oid, monitor) in eng.monitors().iter() {
         for (&ws_id, ws) in monitor.workspaces.iter() {
+            let number = eng.workspace_number_on(*oid, ws_id);
             for (col_idx, col) in ws.columns.iter().enumerate() {
                 for (tile_idx, tile) in col.tiles.iter().enumerate() {
-                    ws_of.insert(tile.window_id, ws_id);
+                    ws_of.insert(tile.window_id, number);
                     place_of.insert(tile.window_id, (col_idx, tile_idx));
                 }
             }
@@ -1592,9 +1589,8 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
             "workspace": ws_of
                 .get(wid)
                 .copied()
-                .or_else(|| eng.float_workspace(*wid))
-                .or_else(|| eng.minimized_workspace(*wid))
-                .map(crate::layout::workspace_number),
+                .or_else(|| eng.float_workspace_number(*wid))
+                .or_else(|| eng.minimized_workspace_number(*wid)),
             // Position in the strip (0-based); null for a floating or minimized window.
             "column": place_of.get(wid).map(|p| p.0),
             "tile": place_of.get(wid).map(|p| p.1),

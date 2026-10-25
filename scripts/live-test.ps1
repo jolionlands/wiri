@@ -13,7 +13,8 @@
 #          H4 minimized windows leave no gap, H5 floating windows belong to their workspace,
 #          H6 the niri column keymap (consume/expel, move-window, first/last, maximize-column), pressed
 #          with the shipped default binds, H7 niri's action names and argument grammar (set-column-width
-#          "50%" / "+10%" / "600", presets, focus-workspace 2 against focus-workspace "2", set-window-height).
+#          "50%" / "+10%" / "600", presets, focus-workspace 2 against focus-workspace "2", set-window-height),
+#          H8 the workspace model (named workspaces, index addressing, previous, back and forth, no wrap).
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -1122,6 +1123,82 @@ $h7CtlSetColumnWidthMinus = (Near (WinW $sf[0]) 522 14)
 foreach ($h in $sf) { [TestForms]::CloseForm($h) }
 Start-Sleep -Milliseconds 1500
 
+# ---- H8: the workspace model: named workspaces that always exist, index addressing, previous, back and forth ----------
+# Config: workspace "mail" (no block) and workspace "web" (block), workspace-auto-back-and-forth in input.
+$log8 = Join-Path $D 'wiri.stderr8.log'
+$h8Config = @"
+input {
+    mod-key "ctrl-alt"
+    workspace-auto-back-and-forth
+}
+workspace "mail"
+workspace "web" {
+}
+binds {
+    Mod+F1 focus-workspace "web"
+    Mod+F2 focus-workspace-previous
+    Mod+F3 focus-workspace 3
+    Mod+F5 focus-workspace 9
+}
+"@
+Stop-WiriGracefully $w 'h8'
+$w8 = Start-WiriWithConfig $h8Config $log8
+$w = $w8
+$h8BindWarnings = (LogLines $log8 'Config bind:').Count
+function WsList([string]$tag) {
+    $raw = Ctl $tag @('--json', 'get-workspace-list')
+    try { return @(($raw | ConvertFrom-Json).result.workspaces) } catch { return @() }
+}
+$wl = WsList 'h8-workspaces-at-start'
+$h8Names = @($wl | ForEach-Object { $_.name })
+# mail and web exist from the start ("web" is empty), the empty workspace below them is the third
+$h8NamedExist = ($wl.Count -eq 3) -and ($h8Names[0] -eq 'mail') -and ($h8Names[1] -eq 'web') -and ($wl[1].window_count -eq 0)
+$sf = @()
+foreach ($i in 1..3) { $sf += [TestForms]::Open("wiri-h8-$i", (50 * $i), 100, 220); Start-Sleep -Milliseconds 1500 }
+Start-Sleep -Seconds 1
+Shot 'h8-01-three-forms-on-mail'
+
+# focus-workspace "web": the named workspace is there although nothing lives on it
+Press 'ctrl+alt+f1'
+$h8WebIsFocusable = ((VisibleCount $sf) -eq 0)
+Shot 'h8-02-web'
+# focus-workspace-previous: back to the workspace the forms are on
+Press 'ctrl+alt+f2'
+$h8Previous = ((VisibleCount $sf) -eq 3)
+# focus-workspace 3 is the empty workspace below the two named ones; asking for it again goes back
+Press 'ctrl+alt+f3'
+$h8ThirdIsTheEmptyOne = ((VisibleCount $sf) -eq 0)
+Press 'ctrl+alt+f3'
+$h8BackAndForth = ((VisibleCount $sf) -eq 3)
+# focus-workspace 9 is not a workspace of its own: it is the last one, and nothing is made up
+Press 'ctrl+alt+f5'
+$wl = WsList 'h8-workspaces-after-9'
+$h8NumberPastTheEnd = ((VisibleCount $sf) -eq 0) -and ($wl.Count -eq 3)
+# niri does not wrap: down at the bottom stays, up at the top stays
+$null = Ctl 'h8-action-down' @('action', 'focus-workspace-down'); Start-Sleep -Milliseconds 1200
+$h8NoWrapAtTheBottom = ((VisibleCount $sf) -eq 0)
+Press 'ctrl+alt+1'
+$h8BackOnTheFirst = ((VisibleCount $sf) -eq 3)
+$null = Ctl 'h8-action-up' @('action', 'focus-workspace-up'); Start-Sleep -Milliseconds 1200
+$h8NoWrapAtTheTop = ((VisibleCount $sf) -eq 3)
+
+# index addressing counts positions: make a workspace in the middle go away, then ask for number 3
+FocusForm $sf[0]
+Press 'ctrl+alt+shift+3'      # form 1 to the third workspace (the empty one: a new empty one appears below)
+FocusForm $sf[1]
+Press 'ctrl+alt+shift+4'      # form 2 to the fourth
+$null = Ctl 'h8-focus-form-1' @('focus-window', [string][int64]$sf[0]); Start-Sleep -Milliseconds 1500
+$h8SwitchedToItsWorkspace = ([LT]::GetForegroundWindow() -eq $sf[0]) -and ([LT]::IsWindowVisible($sf[0]))
+Press 'ctrl+alt+shift+1'      # form 1 back to the first: its workspace (the third) is empty now
+Press 'ctrl+alt+1'            # leave it: the empty workspace in the middle vanishes
+Press 'ctrl+alt+f3'           # focus-workspace 3: the workspace of form 2 (it was the fourth before the gap closed)
+$l = WinList 'h8-windows-after-the-gap'
+$h8ThirdIsFormTwo = ([LT]::IsWindowVisible($sf[1])) -and (-not [LT]::IsWindowVisible($sf[0])) -and ((WinOf $l $sf[1]).workspace -eq 3) -and ((WinOf $l $sf[0]).workspace -eq 1)
+Shot 'h8-03-third-is-form-two'
+Press 'ctrl+alt+1'
+foreach ($h in $sf) { [TestForms]::CloseForm($h) }
+Start-Sleep -Milliseconds 1500
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -1326,6 +1403,19 @@ $summary = [ordered]@{
     h7_reset_window_height = $h7WindowHeightReset
     h7_wiri_ctl_set_column_width = $h7CtlSetColumnWidth
     h7_wiri_ctl_set_column_width_minus_percent = $h7CtlSetColumnWidthMinus
+    # --- Phase 1 / H8: the workspace model
+    h8_config_bind_warnings = $h8BindWarnings
+    h8_named_workspaces_exist_from_the_start = $h8NamedExist
+    h8_focus_workspace_name_of_an_empty_workspace = $h8WebIsFocusable
+    h8_focus_workspace_previous_goes_back = $h8Previous
+    h8_focus_workspace_3_is_the_empty_one_below = $h8ThirdIsTheEmptyOne
+    h8_auto_back_and_forth = $h8BackAndForth
+    h8_a_number_past_the_last_is_the_last = $h8NumberPastTheEnd
+    h8_focus_workspace_down_does_not_wrap = $h8NoWrapAtTheBottom
+    h8_back_on_the_first_workspace = $h8BackOnTheFirst
+    h8_focus_workspace_up_does_not_wrap = $h8NoWrapAtTheTop
+    h8_focus_window_switches_to_its_workspace = $h8SwitchedToItsWorkspace
+    h8_number_counts_positions_after_a_workspace_went = $h8ThirdIsFormTwo
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

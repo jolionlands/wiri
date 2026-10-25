@@ -37,6 +37,9 @@ input {
         focus-delay-ms 150      // small delay so a fast pointer pass doesn't grab focus
         warp-on-focus false     // warp the cursor to the centre of the newly focused window
     }
+    // niri: asking for the workspace you are on (focus-workspace 2 on the second one)
+    // goes back to the previous workspace.
+    // workspace-auto-back-and-forth
     // Modifier prefix for the default keybindings ("ctrl-alt", "alt",
     // "super" = Win key, "win-alt", "ctrl-shift").  Custom `binds {}`
     // blocks below override everything.
@@ -299,8 +302,10 @@ binds {
 // }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Workspace configuration — uncomment to give workspaces friendly names that
-// can be targeted from binds with `focus-workspace-named "Main"`.
+// Workspace configuration — uncomment to declare named workspaces.  They exist from
+// the start, in the order declared, even when empty (niri's named workspaces), and
+// binds reach them with `focus-workspace "Main"`.  `focus-workspace 2` is the second
+// workspace from the top of the monitor.
 // ───────────────────────────────────────────────────────────────────────────
 // workspace "Main" {
 //     layout "tile"

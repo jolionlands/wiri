@@ -472,7 +472,10 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 | `scroll-left` | — | — | Scroll workspace left |
 | `scroll-right` | — | — | Scroll workspace right |
 | `quit` | `exit` | — | Exit wiri |
-| `switch-workspace` | `workspace` | `n` | Focus workspace `n` (1–9) |
+| `switch-workspace` | `workspace` | `n` | Focus the `n`-th workspace from the top of the monitor (`Ctrl+Alt+1`–`9`); a number past the last workspace is the last one |
+| `focus-workspace-down` | `focus-workspace-next`, `workspace-next` | — | The workspace below (no wrapping) |
+| `focus-workspace-up` | `focus-workspace-prev`, `workspace-prev` | — | The workspace above (no wrapping) |
+| `focus-workspace-previous` | `focus-workspace-back` | — | niri: the workspace you were on before this one |
 | `focus-workspace` | — | `N` or `"name"` | niri: a number is the index of the workspace on the monitor, a quoted string is the name of a workspace (`focus-workspace 2` is the second workspace, `focus-workspace "2"` the one named 2) |
 | `move-workspace` | — | `n` | Move window to workspace `n` |
 | `spawn` | `exec` | `"cmd"` | Launch a program |
@@ -495,6 +498,16 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 | `overview-select` | `overview-accept` | — | Select window, exit overview |
 
 ---
+
+### Workspaces
+
+Workspaces are addressed by position, like in niri: `focus-workspace 2` is the second workspace from
+the top of the focused monitor, whichever workspace that is.  There is always one empty workspace at
+the bottom; an empty workspace in the middle goes away when you leave it.  A number past the last
+workspace is the last one.  `workspace "name"` in the config (with or without a block) declares a
+named workspace: it exists from the start, in the order declared, and stays when it is empty.
+`focus-workspace "name"` goes to it.  `input { workspace-auto-back-and-forth }` makes
+`focus-workspace` for the workspace you are on go back to the previous one.
 
 ### niri's size argument
 

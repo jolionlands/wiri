@@ -262,10 +262,10 @@ enum Commands {
     /// Resize the focused column by ±N pixels
     ResizeColumn { delta_px: i32 },
 
-    /// Focus the next workspace
+    /// Focus the workspace below (no wrapping)
     FocusWorkspaceNext,
 
-    /// Focus the previous workspace
+    /// Focus the workspace above (no wrapping)
     FocusWorkspacePrevious,
 
     /// Run any action by its niri name, as if its key were pressed:
@@ -1163,8 +1163,8 @@ fn print_default_bindings_table() {
         (&format!("{}+[", p), "tab-prev"),
         (&format!("{}+1…9", p), "focus-workspace-N"),
         (&format!("{}+1…9", s), "move-to-workspace-N"),
-        (&format!("{}+PageUp", p), "focus-workspace-previous"),
-        (&format!("{}+PageDown", p), "focus-workspace-next"),
+        (&format!("{}+PageUp", p), "focus-workspace-up"),
+        (&format!("{}+PageDown", p), "focus-workspace-down"),
         (&format!("{}+R", p), "enter-resize-mode"),
         (&format!("{}+R", s), "center-column"),
         (&format!("{}+W", p), "column-width-cycle"),

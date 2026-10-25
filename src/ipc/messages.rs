@@ -159,11 +159,13 @@ pub enum IpcMessage {
     #[serde(rename = "resize_column")]
     ResizeColumn { delta_px: i32 },
 
-    /// Switch the focused monitor to the next workspace, wrapping at the end.
+    /// Switch the focused monitor to the workspace below (niri `focus-workspace-down`;
+    /// nothing happens at the bottom).
     #[serde(rename = "focus_workspace_next")]
     FocusWorkspaceNext,
 
-    /// Switch the focused monitor to the previous workspace, wrapping at the beginning.
+    /// Switch the focused monitor to the workspace above (niri `focus-workspace-up`;
+    /// nothing happens at the top).
     #[serde(rename = "focus_workspace_previous")]
     FocusWorkspacePrevious,
 

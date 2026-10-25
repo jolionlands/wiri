@@ -62,6 +62,10 @@ pub struct InputConfig {
     /// "alt", "super" (Win key), "win-alt", "ctrl-shift". Custom KDL `binds`
     /// override this entirely.
     pub mod_key: String,
+    /// niri's `workspace-auto-back-and-forth`: asking for the workspace you are on
+    /// (`focus-workspace 2` while on the second one) goes back to the previous
+    /// workspace instead.
+    pub workspace_auto_back_and_forth: bool,
 
     // ---- nested-block fields surfaced as flat config fields ----
     /// Delay (ms) before focus-follows-mouse kicks in after the pointer
@@ -96,6 +100,7 @@ impl InputConfig {
             mouse_sensitivity: 1.0,
             focus_follows_mouse: false,
             mod_key: "ctrl-alt".to_string(),
+            workspace_auto_back_and_forth: false,
             focus_delay_ms: 0,
             warp_on_focus: false,
             numlock: false,

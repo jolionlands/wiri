@@ -894,10 +894,12 @@ pub(crate) fn perform_action(
             }
         }
         Action::FocusWorkspace(number) => {
-            // `Ctrl+Alt+1` is workspace 1 = engine id 0.
-            engine
-                .write()
-                .switch_workspace(crate::layout::workspace_id_from_number(*number), backend);
+            // `Ctrl+Alt+2` is the second workspace of the monitor (niri's index
+            // addressing), whatever its id is.
+            engine.write().focus_workspace_number(*number, backend);
+        }
+        Action::FocusWorkspaceLast => {
+            engine.write().focus_workspace_last_visited(backend);
         }
         Action::ScrollLeft => {
             engine.write().scroll(ScrollDirection::Left, backend);
@@ -999,7 +1001,7 @@ pub(crate) fn perform_action(
         }
         Action::MoveWorkspace(target_number) => {
             // Move the focused window to workspace number `target_number` (no switch).
-            let workspace = crate::layout::workspace_id_from_number(*target_number);
+            let workspace = engine.read().workspace_id_for_number(*target_number);
             match float_of(target) {
                 Some(window) => engine.write().float_move_to_workspace(window, workspace, backend),
                 None => engine.write().move_window_to_workspace(workspace, backend),
@@ -1022,7 +1024,7 @@ pub(crate) fn perform_action(
             engine.write().apply_all(backend);
         }
         Action::MoveToWorkspace(number) => {
-            let workspace = crate::layout::workspace_id_from_number(*number);
+            let workspace = engine.read().workspace_id_for_number(*number);
             match float_of(target) {
                 Some(window) => engine.write().float_move_to_workspace(window, workspace, backend),
                 None => engine.write().move_window_to_workspace(workspace, backend),
@@ -1126,17 +1128,16 @@ pub(crate) fn perform_action(
             }
             engine.write().apply_all(backend);
         }
+        // niri `focus-workspace-down` / `-up`: the workspace below / above, no wrapping.
         Action::FocusWorkspaceNext => {
             engine
                 .write()
                 .focus_workspace_relative(crate::layout::WorkspaceDirection::Next, backend);
-            engine.write().apply_all(backend);
         }
         Action::FocusWorkspacePrevious => {
             engine
                 .write()
                 .focus_workspace_relative(crate::layout::WorkspaceDirection::Previous, backend);
-            engine.write().apply_all(backend);
         }
         Action::FocusPrevious => {
             engine.write().focus_previous_window(backend);
@@ -1147,7 +1148,6 @@ pub(crate) fn perform_action(
         }
         Action::FocusWorkspaceNamed(name) => {
             engine.write().focus_workspace_named(name, backend);
-            engine.write().apply_all(backend);
         }
         Action::SetAutoTileThreshold(t) => {
             engine.write().set_auto_tile_threshold(*t);

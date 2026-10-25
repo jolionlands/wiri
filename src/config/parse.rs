@@ -165,6 +165,20 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
             continue;
         }
 
+        // niri's named workspace without a block: `workspace "browser"`.
+        if section.is_empty() && line.starts_with("workspace") {
+            let rest = line["workspace".len()..].trim();
+            if line["workspace".len()..].starts_with(char::is_whitespace) && !rest.is_empty() {
+                config.workspace.push(WorkspaceConfig {
+                    name: rest.trim_matches('"').to_string(),
+                    layout: "tile".to_string(),
+                    monitor: String::new(),
+                    follow_on_focus: true,
+                });
+                continue;
+            }
+        }
+
         // Parse key-value pairs
         if let Some((key, value)) = parse_property(line) {
             match section.as_str() {
@@ -232,6 +246,15 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                     }
                 }
                 _ => {}
+            }
+        } else if section.as_str() == "input" {
+            // A flag without a value: niri writes `workspace-auto-back-and-forth` on a
+            // line of its own.
+            if matches!(
+                line.trim(),
+                "workspace-auto-back-and-forth" | "workspace_auto_back_and_forth"
+            ) {
+                config.input.workspace_auto_back_and_forth = true;
             }
         }
     }
@@ -395,6 +418,9 @@ fn apply_input_keyboard_property(key: &str, value: &str, config: &mut Config) {
         }
         "numlock" => {
             config.input.numlock = value == "true" || value == "1";
+        }
+        "workspace-auto-back-and-forth" | "workspace_auto_back_and_forth" => {
+            config.input.workspace_auto_back_and_forth = value != "false" && value != "0";
         }
         "mod-key" | "mod_key" => {
             // Normalize: strip optional surrounding quotes, lowercase, replace + with -
@@ -1233,6 +1259,16 @@ pub fn validate_kdl_config(input: &str) -> Vec<ValidationIssue> {
             continue;
         }
 
+        // A flag without a value in `input { }` (niri: `workspace-auto-back-and-forth`).
+        if section_path.as_str() == "input"
+            && matches!(
+                line.trim(),
+                "workspace-auto-back-and-forth" | "workspace_auto_back_and_forth"
+            )
+        {
+            continue;
+        }
+
         // Standard key=value path. Pull (key, value) and run semantic checks
         // (colour validity, integer parse) where applicable.
         let Some((key, value)) = parse_property(line) else {
@@ -1653,6 +1689,44 @@ output "HDMI-1" {
         let config = parse_kdl_config("").unwrap();
         assert_eq!(config.output.len(), 1);
         assert_eq!(config.output[0].name, "");
+    }
+
+    #[test]
+    fn test_parse_named_workspaces_with_and_without_a_block() {
+        let input = "workspace \"mail\"
+workspace \"web\" {
+}
+workspace \"chat\"
+";
+        let config = parse_kdl_config(input).unwrap();
+        let names: Vec<&str> = config.workspace.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["mail", "web", "chat"], "in the order they are declared");
+        assert!(validate_kdl_config(input).is_empty());
+    }
+
+    #[test]
+    fn test_parse_workspace_auto_back_and_forth() {
+        assert!(!parse_kdl_config("").unwrap().input.workspace_auto_back_and_forth);
+        let flag = parse_kdl_config("input {
+    workspace-auto-back-and-forth
+}
+").unwrap();
+        assert!(flag.input.workspace_auto_back_and_forth);
+        let on = parse_kdl_config("input {
+    workspace-auto-back-and-forth true
+}
+").unwrap();
+        assert!(on.input.workspace_auto_back_and_forth);
+        let off = parse_kdl_config("input {
+    workspace-auto-back-and-forth false
+}
+").unwrap();
+        assert!(!off.input.workspace_auto_back_and_forth);
+        // The validator accepts the bare flag as well.
+        assert!(validate_kdl_config("input {
+    workspace-auto-back-and-forth
+}
+").is_empty());
     }
 
     /// Bug fix #7 — workspace block is now parsed.

@@ -91,6 +91,20 @@ presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phas
   maximizes a column that is alone in view.  `wiri-ctl set-column-width` and the IPC request take the
   same words.  A bind whose action is known but whose arguments are not now says so
   (`unknown action or bad arguments`).
+- **Workspaces are addressed by position, like in niri.**  `focus-workspace 2`, `Ctrl+Alt+2`,
+  `move-to-workspace 2` and the numbers `wiri-ctl` and the status displays show are the position of the
+  workspace from the top of its monitor, not an id: once an empty workspace in the middle has gone (it
+  now goes as soon as you leave it) the second workspace used to be unreachable, and pressing
+  `Ctrl+Alt+2` made an empty one up.  A number past the last workspace is the last one (the empty
+  workspace at the bottom); nothing is made up.  `focus-workspace-up` / `-down` (PageUp / PageDown) no
+  longer wrap around, `focus-workspace-previous` is niri's (the workspace you were on before; wiri's
+  old meaning of the name is `focus-workspace-up`), and `input { workspace-auto-back-and-forth }`
+  makes asking for the workspace you are on go back to the previous one.  Named workspaces
+  (`workspace "mail"`, with or without a block) exist from the start on every monitor, in the order
+  they are declared, and are not removed when they are empty or left.  `move-workspace-up` / `-down`
+  take the floating and minimized windows of the workspace and (with one monitor) its name along, and
+  `move-column-to-workspace-up` / `-down` go to the next workspace that exists instead of an id that
+  may not.
 
 ### Fixed — live-desktop shakedown (2026-10-24)
 First long run on a real desktop (Windows 11, 1366x768, Windows Terminal

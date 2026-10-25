@@ -87,10 +87,12 @@ pub enum Action {
     ResizeColumnLeft,
     /// Grow the focused column by 100 px
     ResizeColumnRight,
-    /// Focus the next workspace
+    /// niri `focus-workspace-down`: the workspace below the active one (no wrapping).
     FocusWorkspaceNext,
-    /// Focus the previous workspace
+    /// niri `focus-workspace-up`: the workspace above the active one (no wrapping).
     FocusWorkspacePrevious,
+    /// niri `focus-workspace-previous`: the workspace the user was on before this one.
+    FocusWorkspaceLast,
     /// Focus the previously focused window (niri-style alt-tab / MRU history)
     FocusPrevious,
     /// Toggle always-on-top for the focused window
@@ -471,8 +473,12 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         "focus-workspace-next" | "workspace-next" | "focus-workspace-down" => {
             Some(Action::FocusWorkspaceNext)
         }
-        "focus-workspace-previous" | "focus-workspace-prev" | "workspace-prev"
-        | "focus-workspace-up" => Some(Action::FocusWorkspacePrevious),
+        "focus-workspace-prev" | "workspace-prev" | "focus-workspace-up" => {
+            Some(Action::FocusWorkspacePrevious)
+        }
+        // niri: the workspace the user was on before this one (wiri's older
+        // `focus-workspace-previous` meant the one above; that is `-up`).
+        "focus-workspace-previous" | "focus-workspace-back" => Some(Action::FocusWorkspaceLast),
         "focus-previous" | "alt-tab" | "focus-history-back" | "focus-window-previous" => {
             Some(Action::FocusPrevious)
         }
@@ -1434,6 +1440,7 @@ mod tests {
             ("focus-window-previous", Action::FocusPrevious),
             ("focus-workspace-down", Action::FocusWorkspaceNext),
             ("focus-workspace-up", Action::FocusWorkspacePrevious),
+            ("focus-workspace-previous", Action::FocusWorkspaceLast),
             ("screenshot-screen", Action::Screenshot),
             ("show-hotkey-overlay", Action::ShowKeyBindings),
             ("center-column", Action::CenterColumn),

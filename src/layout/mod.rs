@@ -390,6 +390,10 @@ pub struct Monitor {
     pub scale_factor: f64,
     pub workspaces: HashMap<i32, Workspace>,
     pub active_workspace: i32,
+    /// The workspace that was active before the current one (niri's
+    /// `focus-workspace-previous` and `workspace-auto-back-and-forth` go back to it).
+    /// It may have been removed since; callers check that it still exists.
+    pub previous_workspace: Option<i32>,
     pub focus_column: Option<usize>,
     pub focus_window: Option<WindowId>,
     /// MRU focus stack — most recently focused window is at the front.
@@ -416,6 +420,7 @@ impl Monitor {
             scale_factor,
             workspaces,
             active_workspace: 0,
+            previous_workspace: None,
             focus_column: None,
             focus_window: None,
             focus_ring: FocusRing::new(32),
@@ -434,9 +439,47 @@ impl Monitor {
         self.active_workspace
     }
 
+    /// The ids of the workspaces from the top of the monitor to the bottom (the
+    /// order is the order of the ids).
+    pub fn workspace_ids(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self.workspaces.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The number of workspace `id` on this monitor: its 1-based position from the top.
+    /// This is what `focus-workspace 2` counts and what the status displays show; the
+    /// ids themselves have gaps once an empty workspace in the middle has gone.
+    pub fn workspace_number_of(&self, id: i32) -> Option<i32> {
+        if !self.workspaces.contains_key(&id) {
+            return None;
+        }
+        Some(self.workspaces.keys().filter(|other| **other < id).count() as i32 + 1)
+    }
+
+    /// The id of the workspace at 1-based `number`; a number past the last workspace
+    /// is the last one (niri: the empty workspace at the bottom).
+    pub fn workspace_id_for_number(&self, number: i32) -> i32 {
+        let ids = self.workspace_ids();
+        let index = (number.max(1) as usize - 1).min(ids.len().saturating_sub(1));
+        ids.get(index).copied().unwrap_or(self.active_workspace)
+    }
+
+    /// The workspace above (`down == false`) or below `id`, if there is one.
+    pub fn workspace_next_to(&self, id: i32, down: bool) -> Option<i32> {
+        self.workspaces
+            .keys()
+            .copied()
+            .filter(|other| if down { *other > id } else { *other < id })
+            .min_by_key(|other| (*other - id).abs())
+    }
+
     pub fn switch_workspace(&mut self, id: i32) {
         if !self.workspaces.contains_key(&id) {
             self.workspaces.insert(id, Workspace::new());
+        }
+        if id != self.active_workspace {
+            self.previous_workspace = Some(self.active_workspace);
         }
         self.active_workspace = id;
         self.focus_column = None;
@@ -893,6 +936,46 @@ mod monitor_tests {
         for id in 0..9 {
             assert_eq!(workspace_id_from_number(workspace_number(id)), id);
         }
+    }
+
+    #[test]
+    fn test_workspace_numbers_count_positions_when_the_ids_have_gaps() {
+        let mut m = make_monitor();
+        for id in [2, 3] {
+            m.workspaces.insert(id, Workspace::new());
+        }
+        // Workspaces 0, 2 and 3: the second one from the top is id 2.
+        assert_eq!(m.workspace_ids(), vec![0, 2, 3]);
+        assert_eq!(m.workspace_number_of(0), Some(1));
+        assert_eq!(m.workspace_number_of(2), Some(2));
+        assert_eq!(m.workspace_number_of(3), Some(3));
+        assert_eq!(m.workspace_number_of(1), None);
+        assert_eq!(m.workspace_id_for_number(1), 0);
+        assert_eq!(m.workspace_id_for_number(2), 2);
+        assert_eq!(m.workspace_id_for_number(3), 3);
+        // Past the last one: the last one.  Nonsense: the first.
+        assert_eq!(m.workspace_id_for_number(9), 3);
+        assert_eq!(m.workspace_id_for_number(0), 0);
+        assert_eq!(m.workspace_id_for_number(-4), 0);
+        // The neighbours skip the gap and stop at the ends.
+        assert_eq!(m.workspace_next_to(0, true), Some(2));
+        assert_eq!(m.workspace_next_to(2, true), Some(3));
+        assert_eq!(m.workspace_next_to(3, true), None);
+        assert_eq!(m.workspace_next_to(3, false), Some(2));
+        assert_eq!(m.workspace_next_to(2, false), Some(0));
+        assert_eq!(m.workspace_next_to(0, false), None);
+    }
+
+    #[test]
+    fn test_a_monitor_remembers_the_workspace_it_came_from() {
+        let mut m = make_monitor();
+        assert_eq!(m.previous_workspace, None);
+        m.switch_workspace(1);
+        assert_eq!(m.previous_workspace, Some(0));
+        m.switch_workspace(1); // not a change
+        assert_eq!(m.previous_workspace, Some(0));
+        m.switch_workspace(0);
+        assert_eq!(m.previous_workspace, Some(1));
     }
 
     #[test]

@@ -727,9 +727,14 @@ impl TilingEngine {
     /// name stored in the first matching `WorkspaceConfig` in `full_config`.
     /// Returns `None` when no name has been set for this workspace.
     pub fn workspace_name(&self, id: i32) -> Option<String> {
-        // Side-table wins over config.
+        // Side-table wins over config.  An empty name there says "no name": the
+        // workspace the config names was moved away from this place.
         if let Some(name) = self.workspace_names.get(&id) {
-            return Some(name.clone());
+            return if name.is_empty() {
+                None
+            } else {
+                Some(name.clone())
+            };
         }
         // Fall through to full_config.workspace[].name
         self.full_config.as_ref().and_then(|cfg| {
@@ -748,17 +753,74 @@ impl TilingEngine {
     }
 
     pub fn workspace_id_by_name(&self, name: &str) -> Option<i32> {
+        if name.is_empty() {
+            return None;
+        }
         self.workspace_names
             .iter()
             .find_map(|(id, ws_name)| (ws_name == name).then_some(*id))
             .or_else(|| {
                 self.full_config.as_ref().and_then(|cfg| {
-                    cfg.workspace
-                        .iter()
-                        .enumerate()
-                        .find_map(|(idx, ws_cfg)| (ws_cfg.name == name).then_some(idx as i32))
+                    cfg.workspace.iter().enumerate().find_map(|(idx, ws_cfg)| {
+                        // A name in the side-table (renamed, or moved away) replaces the
+                        // config's name for that place.
+                        (ws_cfg.name == name && !self.workspace_names.contains_key(&(idx as i32)))
+                            .then_some(idx as i32)
+                    })
                 })
             })
+    }
+
+    /// The text a status display shows for workspace `id` of `output`: its name, or
+    /// `Workspace N` with N its position from the top.
+    pub fn workspace_label(&self, output: OutputId, id: i32) -> String {
+        self.workspace_name(id)
+            .unwrap_or_else(|| format!("Workspace {}", self.workspace_number_on(output, id)))
+    }
+
+    /// The number users see for workspace `id` of `output`: its 1-based position from
+    /// the top (the ids themselves have gaps once an empty workspace in the middle has
+    /// gone).
+    pub fn workspace_number_on(&self, output: OutputId, id: i32) -> i32 {
+        self.monitors
+            .get(&output)
+            .and_then(|m| m.workspace_number_of(id))
+            .unwrap_or_else(|| crate::layout::workspace_number(id))
+    }
+
+    /// The id of the workspace that `number` (1-based, as in `focus-workspace 2`) means
+    /// on the focused monitor; a number past the last workspace is the last one.
+    pub fn workspace_id_for_number(&self, number: i32) -> i32 {
+        match self.monitors.focused() {
+            Some(monitor) => monitor.workspace_id_for_number(number),
+            None => crate::layout::workspace_id_from_number(number),
+        }
+    }
+
+    /// The workspaces the config names always exist, even when they are empty (niri's
+    /// named workspaces).  The n-th `workspace "name"` block is the n-th workspace
+    /// from the top of every monitor.  Called when the config is set and when a
+    /// monitor appears.
+    fn ensure_named_workspaces(&mut self) {
+        let count = self.full_config.as_ref().map_or(0, |c| c.workspace.len()) as i32;
+        let named: Vec<i32> = (0..count)
+            .filter(|id| self.workspace_name(*id).is_some())
+            .collect();
+        if named.is_empty() {
+            return;
+        }
+        let outputs: Vec<OutputId> = self.monitors.keys().copied().collect();
+        for output in outputs {
+            if let Some(monitor) = self.monitors.get_mut(&output) {
+                for id in &named {
+                    monitor
+                        .workspaces
+                        .entry(*id)
+                        .or_insert_with(crate::layout::Workspace::new);
+                }
+            }
+            self.maintain_empty_workspace(output);
+        }
     }
 
     /// Set the focused monitor's active workspace layout mode.
@@ -914,6 +976,8 @@ impl TilingEngine {
         if self.monitors.focused_id().is_none() {
             self.monitors.set_focused(output_id);
         }
+        // The workspaces the config names exist on every monitor.
+        self.ensure_named_workspaces();
     }
 
     pub fn sync_monitor_with_scale(
@@ -3073,6 +3137,8 @@ impl TilingEngine {
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             monitor.switch_workspace(workspace_id);
         }
+        // An empty workspace in the middle disappears once the user has left it (niri).
+        self.maintain_empty_workspace(focused_output);
 
         // Hide old workspace windows, show new ones.
         // Item 3: skip sticky windows — they remain visible across workspace switches.
@@ -4279,6 +4345,22 @@ impl TilingEngine {
         self.minimized.get(&window_id).map(|m| m.workspace)
     }
 
+    /// The number (position from the top of its monitor) of the workspace a floating
+    /// window belongs to.
+    pub fn float_workspace_number(&self, window_id: WindowId) -> Option<i32> {
+        if !self.floating_windows.contains(&window_id) {
+            return None;
+        }
+        let (output, workspace) = self.float_location(window_id)?;
+        Some(self.workspace_number_on(output, workspace))
+    }
+
+    /// The number of the workspace a minimized window comes back to.
+    pub fn minimized_workspace_number(&self, window_id: WindowId) -> Option<i32> {
+        let minimized = self.minimized.get(&window_id)?;
+        Some(self.workspace_number_on(minimized.output, minimized.workspace))
+    }
+
     /// The workspace id (not the user's number) a floating window belongs to.
     pub fn float_workspace(&self, window_id: WindowId) -> Option<i32> {
         if !self.floating_windows.contains(&window_id) {
@@ -5049,6 +5131,7 @@ impl TilingEngine {
         }
 
         self.full_config = Some(config);
+        self.ensure_named_workspaces();
     }
 
     /// Take a snapshot of the current monitor / workspace / column / tile
@@ -6810,11 +6893,10 @@ impl TilingEngine {
     // -------------------------------------------------------------------------
 
     /// Move every tile in the focused column out of the current workspace and
-    /// append them as a single new column to `current_workspace_id + delta`.
-    /// The destination workspace is created if missing.  No-op when the focused
-    /// monitor has no focused column, or when the destination workspace id
-    /// would land on a non-positive value going up (i.e. `delta < 0` and
-    /// `current <= 0`).  Focus follows the moved column to the destination.
+    /// append them as a single new column to the workspace below (`delta > 0`) or
+    /// above (`delta < 0`) the current one.  No-op when the focused monitor has no
+    /// focused column or there is no workspace in that direction.  Focus follows the
+    /// moved column to the destination.
     ///
     /// Used by `Action::MoveColumnToWorkspaceUp` (delta = -1) and
     /// `Action::MoveColumnToWorkspaceDown` (delta = +1).
@@ -6831,18 +6913,18 @@ impl TilingEngine {
             },
             None => return,
         };
-        let dst_ws_id = src_ws_id + delta;
-        // Refuse to step to a negative workspace id (workspace 0 is the
-        // implicit "lowest" wiri default; user-facing labels are still
-        // 1-based via the niri convention, but the engine HashMap can carry
-        // anything).  Without this guard, "move-column-up" from workspace 0
-        // would silently create workspace -1 and strand tiles there.
-        if delta < 0 && dst_ws_id < 0 {
+        // The workspace below / above the active one (nothing at the top or the bottom;
+        // the empty workspace at the bottom is where a column goes to open a new one).
+        if delta == 0 {
             return;
         }
-        if dst_ws_id == src_ws_id {
-            return; // delta == 0 → no-op
-        }
+        let Some(dst_ws_id) = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.workspace_next_to(src_ws_id, delta > 0))
+        else {
+            return;
+        };
 
         // Take the column from the source workspace.
         let column_taken = {
@@ -6892,36 +6974,29 @@ impl TilingEngine {
     // Niri-parity: workspace move/swap (reorder the workspace stack)
     // -------------------------------------------------------------------------
 
-    /// Swap the focused workspace with the workspace at
-    /// `focused_workspace_id + delta` on the same monitor.  Focus follows the
-    /// moved workspace so the user stays on the original tiles.  No-op when
-    /// the swap target is the same as the source, when no monitor is focused,
-    /// or when the resulting move would clobber a workspace that does not
-    /// exist (i.e. `delta < 0` and source is the lowest workspace).
+    /// niri `move-workspace-up` (`delta < 0`) / `move-workspace-down`: the active
+    /// workspace changes places with the one above / below it and the user stays on
+    /// it.  Its floating windows, its minimized windows and (with a single monitor) its
+    /// name go along.  Nothing happens at the top and at the bottom.
     pub fn move_active_workspace(&mut self, delta: i32, backend: &BackendHandle) {
         let Some(focused_output) = self.monitors.focused_id() else {
             return;
         };
-
-        let src_ws_id = match self.monitors.get(&focused_output) {
-            Some(m) => m.active_workspace,
-            None => return,
+        if delta == 0 {
+            return;
+        }
+        let (src_ws_id, dst_ws_id) = {
+            let Some(monitor) = self.monitors.get(&focused_output) else {
+                return;
+            };
+            let src = monitor.active_workspace;
+            let Some(dst) = monitor.workspace_next_to(src, delta > 0) else {
+                return;
+            };
+            (src, dst)
         };
-        let dst_ws_id = src_ws_id + delta;
-        if dst_ws_id == src_ws_id {
-            return;
-        }
-        // Edge guard: refuse to step to a negative workspace id (workspace 0
-        // is the implicit lowest in wiri).  Without this guard the swap
-        // would silently create a workspace at id == -1 and leave the user
-        // stranded on a negative-numbered slot.
-        if delta < 0 && dst_ws_id < 0 {
-            return;
-        }
 
-        // Perform the swap.  Either workspace may or may not exist; we
-        // materialise both before swapping so users can also swap a populated
-        // workspace into a still-empty slot.
+        // The two workspaces trade places: an id is a place counted from the top.
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             let src_ws = monitor
                 .workspaces
@@ -6933,8 +7008,13 @@ impl TilingEngine {
                 .unwrap_or_else(crate::layout::Workspace::new);
             monitor.workspaces.insert(dst_ws_id, src_ws);
             monitor.workspaces.insert(src_ws_id, dst_ws);
-            // Focus follows the moved workspace.
+            // The user stays on the workspace that moved.
             monitor.active_workspace = dst_ws_id;
+            monitor.previous_workspace = match monitor.previous_workspace {
+                Some(p) if p == src_ws_id => Some(dst_ws_id),
+                Some(p) if p == dst_ws_id => Some(src_ws_id),
+                other => other,
+            };
             // Anchor focus_column to the first column of the relocated
             // workspace (or None when it has no columns).
             let new_focus = monitor.workspaces.get(&dst_ws_id).and_then(|w| {
@@ -6955,93 +7035,59 @@ impl TilingEngine {
                 }
             }
         }
+        self.swap_workspace_ties(focused_output, src_ws_id, dst_ws_id);
 
         self.maintain_empty_workspace(focused_output);
         self.apply_layout_for_monitor(focused_output, backend);
+    }
+
+    /// Everything that belongs to a workspace but is not stored in it follows it when
+    /// two workspaces of `output` trade places: floating windows, minimized windows
+    /// and, when there is a single monitor (names are shared by all monitors), the names.
+    fn swap_workspace_ties(&mut self, output: OutputId, a: i32, b: i32) {
+        let swap = |id: &mut i32| {
+            if *id == a {
+                *id = b;
+            } else if *id == b {
+                *id = a;
+            }
+        };
+        for home in self.float_homes.values_mut().filter(|h| h.output == output) {
+            swap(&mut home.workspace);
+        }
+        for minimized in self.minimized.values_mut().filter(|m| m.output == output) {
+            swap(&mut minimized.workspace);
+        }
+        if self.monitors.keys().count() == 1 {
+            // An empty name says "no name", so the config's name for a place does not
+            // apply to the workspace that now sits there.
+            let name_a = self.workspace_name(a).unwrap_or_default();
+            let name_b = self.workspace_name(b).unwrap_or_default();
+            self.workspace_names.insert(a, name_b);
+            self.workspace_names.insert(b, name_a);
+        }
     }
 
     // -------------------------------------------------------------------------
     // Item 6 — focus_workspace_relative
     // -------------------------------------------------------------------------
 
-    /// Switch to the next or previous workspace on the focused monitor (wraps).
+    /// niri `focus-workspace-down` (`Next`) / `focus-workspace-up` (`Previous`): switch
+    /// to the workspace below / above the active one.  Nothing happens at the top and
+    /// at the bottom (niri does not wrap).
     pub fn focus_workspace_relative(
         &mut self,
         direction: WorkspaceDirection,
         backend: &BackendHandle,
     ) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // Collect sorted workspace IDs present on this monitor
-        let (sorted_ids, active_id) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            let mut ids: Vec<i32> = monitor.workspaces.keys().copied().collect();
-            ids.sort();
-            (ids, monitor.active_workspace)
-        };
-
-        if sorted_ids.is_empty() {
-            return;
-        }
-
-        let cur_pos = sorted_ids
-            .iter()
-            .position(|&id| id == active_id)
-            .unwrap_or(0);
-        let new_pos = match direction {
-            WorkspaceDirection::Next => (cur_pos + 1) % sorted_ids.len(),
-            WorkspaceDirection::Previous => cur_pos.checked_sub(1).unwrap_or(sorted_ids.len() - 1),
-        };
-        let new_id = sorted_ids[new_pos];
-
-        // Hide windows on current workspace, switch, show new workspace windows
-        let current_windows: Vec<WindowId> = self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.workspace())
-            .map(|w| {
-                w.columns
-                    .iter()
-                    .flat_map(|c| c.tiles.iter().map(|t| t.window_id))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            monitor.switch_workspace(new_id);
-        }
-
-        for wid in current_windows {
-            let _ = backend.show_window(wid.as_isize(), false);
-        }
-
-        if let Some(monitor) = self.monitors.get(&focused_output) {
-            if let Some(workspace) = monitor.workspace() {
-                for col in &workspace.columns {
-                    for tile in &col.tiles {
-                        let _ = backend.show_window(tile.window_id.as_isize(), true);
-                    }
-                }
-            }
-        }
-
-        self.reveal_focused_column(focused_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-
-        // Activate focused window on new workspace
-        let window_to_activate = self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.focus_window)
-            .filter(|wid| self.tiled_windows.contains_key(wid));
-        if let Some(wid) = window_to_activate {
-            self.activate_now(wid, backend);
+        let target = self.monitors.focused().and_then(|monitor| {
+            monitor.workspace_next_to(
+                monitor.active_workspace,
+                matches!(direction, WorkspaceDirection::Next),
+            )
+        });
+        if let Some(id) = target {
+            self.switch_workspace(id, backend);
         }
     }
 
@@ -7049,17 +7095,28 @@ impl TilingEngine {
     // Item 7 — maintain_empty_workspace
     // -------------------------------------------------------------------------
 
-    /// Ensure there is exactly one empty workspace at `highest_non_empty_id + 1`.
-    /// Empty workspaces beyond that (except the active one) are removed.
+    /// Keep the workspaces of `monitor_id` the way niri does: one empty workspace
+    /// below the last occupied one, no other empty workspace except the one the user
+    /// is on.  A workspace is occupied when it holds a window, a floating window or a
+    /// name (the config's named workspaces always exist).
     pub fn maintain_empty_workspace(&mut self, monitor_id: OutputId) {
         // A workspace that holds only floating windows is not empty: it must survive
         // (and count towards the trailing empty one) or its floats would lose their home.
-        let with_floats: HashSet<i32> = self
+        let mut occupied_without_windows: HashSet<i32> = self
             .float_homes
             .values()
             .filter(|home| home.output == monitor_id)
             .map(|home| home.workspace)
             .collect();
+        if let Some(monitor) = self.monitors.get(&monitor_id) {
+            occupied_without_windows.extend(
+                monitor
+                    .workspaces
+                    .keys()
+                    .copied()
+                    .filter(|id| self.workspace_name(*id).is_some()),
+            );
+        }
         let monitor = match self.monitors.get_mut(&monitor_id) {
             Some(m) => m,
             None => return,
@@ -7067,16 +7124,16 @@ impl TilingEngine {
 
         let active_ws = monitor.active_workspace;
 
-        // Find the highest workspace ID that has at least one window.
-        let highest_non_empty: i32 = monitor
+        // Find the last workspace that is occupied.
+        let highest_occupied: i32 = monitor
             .workspaces
             .iter()
-            .filter(|(id, ws)| !ws.columns.is_empty() || with_floats.contains(*id))
+            .filter(|(id, ws)| !ws.columns.is_empty() || occupied_without_windows.contains(*id))
             .map(|(&id, _)| id)
             .max()
             .unwrap_or(-1);
 
-        let trailing_id = highest_non_empty + 1;
+        let trailing_id = highest_occupied + 1;
 
         // Ensure the trailing empty workspace exists.
         monitor
@@ -7084,8 +7141,8 @@ impl TilingEngine {
             .entry(trailing_id)
             .or_insert_with(crate::layout::Workspace::new);
 
-        // Remove surplus empty workspaces (anything empty that isn't the trailing one
-        // and isn't what the user is currently looking at).
+        // Remove surplus empty workspaces (anything empty that isn't the trailing one,
+        // isn't what the user is currently looking at and holds nothing that must stay).
         let to_remove: Vec<i32> = monitor
             .workspaces
             .iter()
@@ -7093,7 +7150,7 @@ impl TilingEngine {
                 ws.columns.is_empty()
                     && id != trailing_id
                     && id != active_ws
-                    && !with_floats.contains(&id)
+                    && !occupied_without_windows.contains(&id)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -7412,9 +7469,50 @@ impl TilingEngine {
     pub fn focus_workspace_named(&mut self, name: &str, backend: &BackendHandle) {
         use tracing::warn;
         match self.workspace_id_by_name(name) {
-            Some(id) => self.switch_workspace(id, backend),
+            Some(id) => {
+                let id = self.auto_back_and_forth(id);
+                self.switch_workspace(id, backend)
+            }
             None => warn!("workspace name not found: {}", name),
         }
+    }
+
+    /// niri `focus-workspace N` (1-based; a number past the last workspace is the
+    /// last one).
+    pub fn focus_workspace_number(&mut self, number: i32, backend: &BackendHandle) {
+        let id = self.auto_back_and_forth(self.workspace_id_for_number(number));
+        self.switch_workspace(id, backend);
+    }
+
+    /// niri's `workspace-auto-back-and-forth`: asking for the workspace the user is on
+    /// goes back to the previous one instead (`input { workspace-auto-back-and-forth }`).
+    fn auto_back_and_forth(&self, target: i32) -> i32 {
+        let enabled = self
+            .full_config
+            .as_ref()
+            .map_or(false, |c| c.input.workspace_auto_back_and_forth);
+        match self.monitors.focused() {
+            Some(monitor) if enabled && monitor.active_workspace == target => monitor
+                .previous_workspace
+                .filter(|previous| monitor.workspaces.contains_key(previous))
+                .unwrap_or(target),
+            _ => target,
+        }
+    }
+
+    /// niri `focus-workspace-previous`: the workspace the user was on before this one
+    /// (nothing happens when there is none, or it is gone).
+    pub fn focus_workspace_last_visited(&mut self, backend: &BackendHandle) {
+        let Some(monitor) = self.monitors.focused() else {
+            return;
+        };
+        let Some(previous) = monitor
+            .previous_workspace
+            .filter(|p| *p != monitor.active_workspace && monitor.workspaces.contains_key(p))
+        else {
+            return;
+        };
+        self.switch_workspace(previous, backend);
     }
 
     // -------------------------------------------------------------------------
@@ -10809,64 +10907,252 @@ mod tests {
         assert_eq!(w, 50, "minimum column width must be 50px");
     }
 
-    // --- Item 6: focus_workspace_relative ---
+    // --- Item 6: focus_workspace_relative (niri `focus-workspace-down` / `-up`) ---
 
-    #[test]
-    fn test_focus_workspace_next_wraps() {
+    /// A one-monitor engine with a window on each of the given workspace ids (the first
+    /// window on the first id, and so on) and the empty workspace below the last one.
+    fn engine_with_workspaces(ids: &[i32]) -> (TilingEngine, OutputId) {
+        let be = BackendHandle::default_for_test();
         let mut engine = make_engine();
         let oid = engine.focused_output().unwrap();
-        // Create workspaces 0 and 1 on the monitor
-        if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
-            monitor
-                .workspaces
-                .insert(1, crate::layout::Workspace::new());
-        }
-
-        // Currently on ws 0. Next → ws 1.
-        engine
-            .focus_workspace_relative(WorkspaceDirection::Next, &BackendHandle::default_for_test());
-        {
-            let monitor = engine.monitors().get(&oid).unwrap();
-            assert_eq!(
-                monitor.active_workspace, 1,
-                "should have moved to workspace 1"
+        for (n, id) in ids.iter().enumerate() {
+            engine.add_window_with_target(
+                make_window(100 + n as isize, 0, 0),
+                AddWindowTarget::Workspace {
+                    output: oid,
+                    workspace_id: *id,
+                },
+                &be,
+                false,
             );
         }
+        engine.maintain_empty_workspace(oid);
+        (engine, oid)
+    }
 
-        // Next from ws 1 → wraps to ws 0 (only 2 workspaces: 0, 1).
-        engine
-            .focus_workspace_relative(WorkspaceDirection::Next, &BackendHandle::default_for_test());
-        {
-            let monitor = engine.monitors().get(&oid).unwrap();
-            assert_eq!(
-                monitor.active_workspace, 0,
-                "should wrap from ws 1 back to ws 0"
-            );
-        }
+    fn workspace_ids_of(engine: &TilingEngine, oid: OutputId) -> Vec<i32> {
+        engine.monitors().get(&oid).unwrap().workspace_ids()
+    }
+
+    fn active_workspace_of(engine: &TilingEngine, oid: OutputId) -> i32 {
+        engine.monitors().get(&oid).unwrap().active_workspace
     }
 
     #[test]
-    fn test_focus_workspace_previous_wraps() {
+    fn test_focus_workspace_down_and_up_stop_at_the_ends() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2]);
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 0, "nothing above the first (no wrapping)");
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2, "nothing below the empty one at the bottom");
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+    }
+
+    #[test]
+    fn test_workspace_up_and_down_skip_the_gaps_of_the_ids() {
+        let be = BackendHandle::default_for_test();
+        // Workspace 1 never existed (or went away): the second workspace is id 2.
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3]);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 3);
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+    }
+
+    #[test]
+    fn test_focus_workspace_number_counts_positions_not_ids() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        // Positions from the top: 0 is the first, 2 the second, the empty one below is the third.
+        assert_eq!(engine.workspace_number_on(oid, 0), 1);
+        assert_eq!(engine.workspace_number_on(oid, 2), 2);
+        assert_eq!(engine.workspace_number_on(oid, 3), 3);
+        assert_eq!(engine.workspace_id_for_number(2), 2);
+        engine.focus_workspace_number(2, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2, "workspace 2 is the second one, not id 1");
+        engine.focus_workspace_number(3, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 3);
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+        // A number past the last workspace is the last one (the empty one at the bottom):
+        // no workspace 9 is made up.
+        engine.focus_workspace_number(9, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 3);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn test_an_empty_workspace_in_the_middle_goes_when_it_is_left() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        engine.switch_workspace(1, &be); // an empty one in the middle, now active
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2, 3]);
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3], "it vanished as the user left it");
+    }
+
+    #[test]
+    fn test_focus_workspace_previous_goes_back_to_the_last_visited_one() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(active_workspace_of(&engine, oid), 0, "nothing visited yet: nothing happens");
+        engine.focus_workspace_number(2, &be);
+        engine.focus_workspace_number(3, &be);
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(active_workspace_of(&engine, oid), 2, "back and forth between the last two");
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+    }
+
+    #[test]
+    fn test_workspace_auto_back_and_forth_returns_to_the_previous_workspace() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        // Off (the default): asking for the workspace you are on stays there.
+        engine.focus_workspace_number(2, &be);
+        engine.focus_workspace_number(2, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+
+        let mut config = crate::config::Config::default();
+        config.input.workspace_auto_back_and_forth = true;
+        engine.set_full_config(config);
+        engine.focus_workspace_number(2, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 0, "the second workspace again: back to the first");
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1, "the first workspace again: back to the second");
+        // Nothing to go back to: stays.
+        let (mut fresh, foid) = engine_with_workspaces(&[0, 1]);
+        let mut config = crate::config::Config::default();
+        config.input.workspace_auto_back_and_forth = true;
+        fresh.set_full_config(config);
+        fresh.focus_workspace_number(1, &be);
+        assert_eq!(active_workspace_of(&fresh, foid), 0);
+    }
+
+    fn named_workspaces_config(names: &[&str]) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.workspace = names
+            .iter()
+            .map(|name| crate::config::types::WorkspaceConfig {
+                name: name.to_string(),
+                layout: "tile".to_string(),
+                monitor: String::new(),
+                follow_on_focus: false,
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn test_named_workspaces_exist_from_the_start_and_are_never_pruned() {
+        let be = BackendHandle::default_for_test();
+        // The config comes first, the monitor appears afterwards (as at startup).
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        engine.set_full_config(named_workspaces_config(&["web", "chat"]));
+        let oid = OutputId::from_name("M");
+        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        assert_eq!(
+            workspace_ids_of(&engine, oid),
+            vec![0, 1, 2],
+            "both named workspaces exist, empty, with the empty one below them"
+        );
+        // Leave them: they stay, empty as they are.
+        engine.focus_workspace_named("chat", &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        engine.focus_workspace_number(3, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2]);
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2]);
+        // A window on the empty workspace below them opens a new empty one.
+        engine.focus_workspace_number(3, &be);
+        engine.add_window(make_window(100, 0, 0), &be);
+        engine.maintain_empty_workspace(oid);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2, 3]);
+        // The names are the positions' names: the second workspace is "chat".
+        assert_eq!(engine.workspace_id_by_name("chat"), Some(1));
+        assert_eq!(engine.workspace_label(oid, 1), "chat");
+        assert_eq!(engine.workspace_label(oid, 2), "Workspace 3");
+    }
+
+    #[test]
+    fn test_named_workspaces_appear_on_a_config_reload_and_on_a_new_monitor() {
         let mut engine = make_engine();
         let oid = engine.focused_output().unwrap();
-        if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
-            monitor
-                .workspaces
-                .insert(1, crate::layout::Workspace::new());
-            monitor
-                .workspaces
-                .insert(2, crate::layout::Workspace::new());
-        }
-        // On ws 0. Previous → wraps to ws 2.
-        engine.focus_workspace_relative(
-            WorkspaceDirection::Previous,
-            &BackendHandle::default_for_test(),
-        );
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0]);
+        engine.set_full_config(named_workspaces_config(&["web"]));
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1]);
+        let second = OutputId::from_name("Second");
+        engine.register_monitor(second, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        assert_eq!(workspace_ids_of(&engine, second), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_moving_a_workspace_takes_its_floats_and_its_name_along() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.set_full_config(named_workspaces_config(&["web"]));
+        let float = WindowId::new(100);
+        engine.toggle_floating_for(float, &be); // workspace 0 now holds only a float
+        assert_eq!(engine.float_workspace(float), Some(0));
+        assert_eq!(engine.workspace_name(0).as_deref(), Some("web"));
+
+        engine.move_active_workspace(1, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1, "the user stays on the workspace that moved");
+        assert_eq!(engine.float_workspace(float), Some(1), "the float went along");
+        assert_eq!(engine.workspace_name(1).as_deref(), Some("web"), "the name went along");
+        assert_eq!(engine.workspace_name(0), None);
+        assert_eq!(engine.workspace_id_by_name("web"), Some(1));
+        // The window that was on the second workspace is on the first now.
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(
-            monitor.active_workspace, 2,
-            "should wrap backward to last workspace"
+            monitor.workspaces.get(&0).unwrap().columns[0].tiles[0].window_id,
+            WindowId::new(101)
         );
+        // It is the second workspace now.  Moved into the empty one at the bottom it is
+        // still the second: the empty one it traded places with goes away (niri).
+        assert_eq!(engine.workspace_number_on(oid, active_workspace_of(&engine, oid)), 2);
+        engine.move_active_workspace(1, &be);
+        let active = active_workspace_of(&engine, oid);
+        assert_eq!(engine.workspace_number_on(oid, active), 2);
+        assert_eq!(engine.float_workspace(float), Some(active), "the float still goes along");
+        assert_eq!(engine.workspace_id_by_name("web"), Some(active));
+        assert_eq!(workspace_ids_of(&engine, oid).len(), 3, "one empty workspace below the last");
+    }
+
+    #[test]
+    fn test_move_column_to_the_workspace_below_and_above_skips_the_gaps() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        focus_window(&mut engine, 100);
+        engine.move_focused_column_to_workspace(-1, &be);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3], "nothing above the first workspace");
+        engine.move_focused_column_to_workspace(1, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2, "the next workspace below is id 2");
+        let monitor = engine.monitors().get(&oid).unwrap();
+        let on_two: Vec<isize> = monitor
+            .workspaces
+            .get(&2)
+            .unwrap()
+            .columns
+            .iter()
+            .flat_map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()))
+            .collect();
+        assert_eq!(on_two, vec![101, 100]);
     }
 
     // --- Item 7: maintain_empty_workspace ---
@@ -12420,9 +12706,11 @@ mod tests {
     }
 
     #[test]
-    fn test_move_focused_column_to_workspace_up_creates_destination() {
+    fn test_move_focused_column_to_workspace_up_goes_to_the_workspace_above() {
         let mut engine = make_engine_fixed_1920();
-        // Start on workspace 2 with one tile; up = ws 1 which doesn't exist yet.
+        // A tile on workspace 0 and one on id 2 (the second workspace: id 1 never
+        // existed); the workspace above id 2 is id 0, nothing is made up in between.
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         let oid = engine.focused_output().unwrap();
         engine
             .monitors_mut()
@@ -12435,13 +12723,15 @@ mod tests {
         engine.move_focused_column_to_workspace(-1, &BackendHandle::default_for_test());
 
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!(m.active_workspace, 1, "focus relocates to ws 1");
-        let dst = m.workspaces.get(&1).expect("ws 1 was created");
-        assert_eq!(dst.columns.len(), 1);
-        assert_eq!(dst.columns[0].tiles[0].window_id, WindowId::new(200));
-        // Source ws 2 is now empty (and may have been reaped, but not before
-        // maintain_empty_workspace runs — we don't assert one way or the other
-        // beyond "destination has the tile").
+        assert_eq!(m.active_workspace, 0, "focus relocates to the workspace above");
+        let dst = m.workspaces.get(&0).expect("ws 0 exists");
+        assert_eq!(dst.columns.len(), 2);
+        assert_eq!(dst.columns[1].tiles[0].window_id, WindowId::new(200));
+        assert_eq!(
+            m.workspace_ids(),
+            vec![0, 1],
+            "the emptied workspace is gone, the empty one below the last is all that is left"
+        );
     }
 
     #[test]
