@@ -48,6 +48,17 @@ IPC action request and niri's event stream; PNG and clipboard screenshots.
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
 quoted autostart path, ARM64 release builds, docs and a demo.
 
+**Phase 4, super lightweight and fast (owner, 2026-10-24: "full parity and functionality,
+super lightweight performant after core functionality is done"):** once the core works,
+measure first (added to the live test as info gates), then enforce budgets:
+- idle CPU about 0: event-driven only, no polling timers (today a 750 ms reconciler, a
+  500 ms focus-follows-mouse poll and overlay timers wake wiri while nothing happens);
+- few threads (the first live run showed 23 at idle; `tokio` is built with `full`), small
+  private memory and binary, fast cold start to the first tiled layout;
+- hotkey-to-`SetWindowPos` latency within one frame (16 ms) and no extra layout passes
+  per event (count `SetWindowPos` calls per action);
+- measured on the owner's ARM64 laptop as well as on x64.
+
 ## How changes are verified
 
 `scripts/live-test.ps1` runs in an interactive desktop session: it starts the freshly
