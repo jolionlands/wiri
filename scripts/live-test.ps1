@@ -474,6 +474,14 @@ function OnScreen($h) {
 function OnScreenCount($hwnds) { @($hwnds | Where-Object { [LT]::IsWindow($_) -and [LT]::IsWindowVisible($_) -and -not [LT]::IsIconic($_) -and (OnScreen $_) }).Count }
 function NewTopLevel($before) { @([LT]::TopLevel() | Where-Object { $before -notcontains $_ }) }
 
+# Wait at least $minMs, and until $h is the foreground window or $maxMs have passed; true when it is.
+function WaitForeground($h, [int]$minMs, [int]$maxMs) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $minMs -or ([LT]::GetForegroundWindow() -ne $h -and $sw.ElapsedMilliseconds -lt $maxMs)) {
+        Start-Sleep -Milliseconds 50
+    }
+    return ([LT]::GetForegroundWindow() -eq $h)
+}
 # The pipe of this user in this session (WIRI_PIPE overrides the name).
 function WiriPipeName {
     if ($env:WIRI_PIPE) { return ($env:WIRI_PIPE -replace '^\\\\\.\\pipe\\', '') }
@@ -689,6 +697,12 @@ function Chord([string]$spec) {
 [TestForms]::ClearKeys()
 $keysForm = [TestForms]::OpenKeys('wiri-keys')
 Start-Sleep -Milliseconds 1800
+# The keys must go to the form: if something else holds the foreground (a Start menu left open on a fresh
+# hosted runner), ask wiri to focus the form first.
+if ([LT]::GetForegroundWindow() -ne $keysForm) {
+    $null = Ctl '12-keys-focus' @('focus-window', [string][int64]$keysForm)
+    $null = WaitForeground $keysForm 300 3000
+}
 Chord 'esc'; Start-Sleep -Milliseconds 400
 Chord 'a';   Start-Sleep -Milliseconds 400
 Chord 'esc'; Start-Sleep -Milliseconds 400
@@ -1117,7 +1131,16 @@ $h6BindsRegistered = (HasBind 0xBC 3 'ConsumeWindowIntoColumn') -and (HasBind 0x
     (HasBind 0x24 7 'MoveColumnToFirst') -and (HasBind 0x23 7 'MoveColumnToLast') -and (HasBind 0x46 7 'MaximizeColumn')
 function TileOf($list, $hwnd) { $e = WinOf $list $hwnd; if ($null -eq $e -or $null -eq $e.tile) { return -1 } else { return [int]$e.tile } }
 function Press([string]$chord) { Chord $chord; Start-Sleep -Milliseconds 1400 }
-function FocusForm($h) { $null = Ctl 'h6-focus-window' @('focus-window', [string][int64]$h); Start-Sleep -Milliseconds 1300 }
+# Focus a window through wiri and wait (at least 1.3 s, for the strip to settle) until it is the foreground window.
+# Asked once more when another window took the foreground meanwhile (the hosted ARM64 runner keeps relaunching a
+# console prompt that does).
+function FocusForm($h) {
+    $null = Ctl 'h6-focus-window' @('focus-window', [string][int64]$h)
+    if (-not (WaitForeground $h 1300 4000)) {
+        $null = Ctl 'h6-focus-window-again' @('focus-window', [string][int64]$h)
+        $null = WaitForeground $h 800 4000
+    }
+}
 # Three windows, one column each, the last three columns of the strip: s1 | s2 | s3
 $sf = @()
 foreach ($i in 1..3) { $sf += [TestForms]::Open("wiri-h6-$i", (50 * $i), 130, 200); Start-Sleep -Milliseconds 1500 }
@@ -1649,6 +1672,8 @@ $w11b = Start-Wiri $log11b ($log11b + '.out')
 Start-Sleep -Seconds 5
 $h11CloakedAfterRestart = H11Cloaked
 $h11VisibleAfterRestart = H11Visible
+# Which forms are in view depends on how many other windows the new wiri tiles before them; the focused one is.
+$null = Ctl 'h11-focus-after-restart' @('focus-window', [string][int64]$cf11[0]); Start-Sleep -Milliseconds 1500
 $h11DrawnAfterRestart = H11Drawn 'h11-05-after-restart'
 
 # and a quit with windows cloaked puts everything back

@@ -29,6 +29,7 @@ $summary = [pscustomobject]@{ status = 'skipped'; ci = $preflight }
 $oldAppData = $env:APPDATA
 $oldLocalAppData = $env:LOCALAPPDATA
 $failed = $false
+$wslGuard = $null
 try {
     if (-not $ProbeOnly -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:WIRI_LIVE_CI -ne '1')) {
         throw 'Run mode is restricted to disposable GitHub runners with WIRI_LIVE_CI=1. Use -ProbeOnly for a read-only desktop probe.'
@@ -62,6 +63,8 @@ public static class WiriCiDesktop {
         if (hwnd != IntPtr.Zero) GetWindowThreadProcessId(hwnd, out pid);
         return pid;
     }
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    public static void PressEscape() { keybd_event(0x1B, 0, 0, UIntPtr.Zero); keybd_event(0x1B, 0, 2, UIntPtr.Zero); }
 }
 '@
     # The hosted windows-11-arm image (2026-10) boots into Windows' first-run privacy screen, which holds the
@@ -111,6 +114,15 @@ public static class WiriCiDesktop {
                 $preflight.reason = "Windows' first-run privacy screen ($after) holds the foreground and could not be closed. No live phases ran (this is not a pass)."
             }
         }
+        # Then the Start menu / search it leaves open, which takes the first test keys.
+        if ($preflight.interactive_desktop -and -not $ProbeOnly) {
+            foreach ($i in 1..5) {
+                if (@('SearchHost', 'StartMenuExperienceHost') -notcontains (Get-ForegroundProcessName)) { break }
+                [WiriCiDesktop]::PressEscape()
+                Start-Sleep -Milliseconds 700
+            }
+            $preflight.foreground_process = "$($preflight.foreground_process) -> $(Get-ForegroundProcessName)"
+        }
     }
     if ($ProbeOnly) {
         $summary.status = 'probe-only'
@@ -129,6 +141,17 @@ public static class WiriCiDesktop {
         $summary.status = 'running'
         $summary | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $Out 'summary.json') -Encoding UTF8
         $preflight | ConvertTo-Json | Set-Content (Join-Path $Out 'ci-preflight.json') -Encoding UTF8
+        # The hosted ARM64 image keeps relaunching a console "Press any key to install ... (WSL)" prompt, which
+        # takes the foreground in the middle of phases.  Disposable runner: stop each one while the harness runs.
+        $wslGuard = Start-Job -ScriptBlock {
+            while ($true) {
+                foreach ($p in @(Get-Process -Name wsl -ErrorAction SilentlyContinue)) {
+                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                    "stopped wsl.exe pid $($p.Id) at $(Get-Date -Format HH:mm:ss.fff)"
+                }
+                Start-Sleep -Milliseconds 500
+            }
+        }
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\live-test.ps1') -Bin $Bin -Out $evidence
         if ($LASTEXITCODE -ne 0) { throw "Live harness exited with $LASTEXITCODE" }
         if (-not (Test-Path (Join-Path $evidence 'DONE'))) { throw 'Live harness did not finish; no DONE marker.' }
@@ -151,6 +174,11 @@ public static class WiriCiDesktop {
     $summary | Add-Member -NotePropertyName status -NotePropertyValue 'failed' -Force
     Write-Warning $preflight.reason
 } finally {
+    if ($wslGuard) {
+        Stop-Job $wslGuard -ErrorAction SilentlyContinue
+        $preflight['wsl_prompts_stopped'] = @(Receive-Job $wslGuard -ErrorAction SilentlyContinue)
+        Remove-Job $wslGuard -Force -ErrorAction SilentlyContinue
+    }
     $env:APPDATA = $oldAppData
     $env:LOCALAPPDATA = $oldLocalAppData
     # Also leave an explicit result when the desktop probe skipped everything.
