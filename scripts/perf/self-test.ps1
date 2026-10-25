@@ -14,6 +14,18 @@ foreach ($case in @(
 )) {
     if ([LaneE.Native]::Median($case.values) -ne $case.expected) { throw 'Median check failed' }
 }
+# Regression: the live daemon keeps its debug file open for writing. Read with write sharing.
+$sharedPath = Join-Path $PSScriptRoot ('.self-test-' + [Guid]::NewGuid().ToString('N') + '.log')
+$writer = $null
+try {
+    $writer = New-Object IO.FileStream($sharedPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $bytes = [Text.Encoding]::UTF8.GetBytes('shared writer')
+    $writer.Write($bytes, 0, $bytes.Length); $writer.Flush()
+    if ([LaneE.Native]::ReadSharedText($sharedPath) -ne 'shared writer') { throw 'Shared log read failed' }
+} finally {
+    if ($null -ne $writer) { $writer.Dispose() }
+    if (Test-Path $sharedPath) { Remove-Item $sharedPath }
+}
 $a = [LaneE.Native]::ReadThreads($PID)
 $r = [LaneE.Native]::ReadResources($PID)
 if ($a.Threads.Count -lt 1 -or $r.Threads -lt 1 -or $r.PrivateBytes -le 0 -or $r.WorkingSetBytes -le 0) { throw 'Invalid self snapshot' }

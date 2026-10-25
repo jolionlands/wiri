@@ -41,6 +41,8 @@ namespace LaneE {
         public Process Process;
         public double FirstIpcMs = -1, FirstLayoutMs = -1, StartCallMs, IpcObserverMs, LayoutObserverMs;
         public string IpcReply = "", IpcError = "", LayoutError = "";
+        public string[] LayoutRects = new string[0];
+        public int LayoutOnScreenWindows;
         public DateTime StartedUtc;
     }
     public sealed class KeyResult {
@@ -59,6 +61,8 @@ namespace LaneE {
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr h, ref MonitorInfo info);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint pid);
         [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LastInput li);
         [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, Input[] inputs, int size);
@@ -68,6 +72,7 @@ namespace LaneE {
             public int L, T, R, B;
             public override string ToString() { return L + "," + T + "," + R + "," + B; }
         }
+        [StructLayout(LayoutKind.Sequential)] struct MonitorInfo { public uint Size; public Rect Bounds, Work; public uint Flags; }
         [StructLayout(LayoutKind.Sequential)] struct Input { public uint Type; public InputUnion Data; }
         [StructLayout(LayoutKind.Explicit)] struct InputUnion {
             [FieldOffset(0)] public Keyboard Keyboard;
@@ -114,6 +119,11 @@ namespace LaneE {
         static Rect Visible(IntPtr h) {
             Rect r;
             return DwmGetWindowAttribute(h, 9, out r, 16) == 0 ? r : Frame(h);
+        }
+        public static string ReadSharedText(string path) {
+            // ReadAllText shares only for reading: it conflicts with the daemon's open write handle.
+            using (var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var text = new StreamReader(file, Encoding.UTF8, true)) return text.ReadToEnd();
         }
         public static Resources ReadResources(int pid) {
             using (Process p = Process.GetProcessById(pid)) {
@@ -241,16 +251,27 @@ namespace LaneE {
                     long until = origin + (long)(timeoutMs * Stopwatch.Frequency / 1000.0);
                     do {
                         var frames = new List<Rect>();
+                        int onScreen = 0;
                         bool tiled = windows.Length > 0;
                         for (int i = 0; i < windows.Length; i++) {
                             Rect r = Visible(windows[i]);
                             tiled &= IsWindowVisible(windows[i]) && !IsIconic(windows[i]) && r.B - r.T >= minHeight &&
                                 Frame(windows[i]).ToString() != before[i].ToString();
-                            foreach (Rect prev in frames) tiled &= (r.L >= prev.R - 1 || r.R <= prev.L + 1) &&
-                                Math.Abs(r.T - prev.T) <= 2 && Math.Abs(r.B - prev.B) <= 2;
+                            // Existing apps can separate the sentinel columns. A scrolled-out tile is parked
+                            // below the monitors by wiri: require disjoint rectangles, not a common Y row.
+                            foreach (Rect prev in frames) tiled &= r.L >= prev.R - 1 || r.R <= prev.L + 1 ||
+                                r.T >= prev.B - 1 || r.B <= prev.T + 1;
+                            var monitor = new MonitorInfo { Size = (uint)Marshal.SizeOf(typeof(MonitorInfo)) };
+                            if (!GetMonitorInfo(MonitorFromWindow(windows[i], 2), ref monitor)) throw new IOException("GetMonitorInfo failed");
+                            if (r.L < monitor.Work.R && r.R > monitor.Work.L && r.T < monitor.Work.B && r.B > monitor.Work.T) onScreen++;
                             frames.Add(r);
                         }
-                        if (tiled) { result.FirstLayoutMs = Ms(Stopwatch.GetTimestamp() - origin); return; }
+                        if (tiled && onScreen > 0) {
+                            result.FirstLayoutMs = Ms(Stopwatch.GetTimestamp() - origin);
+                            result.LayoutRects = frames.ConvertAll(delegate(Rect r) { return r.ToString(); }).ToArray();
+                            result.LayoutOnScreenWindows = onScreen;
+                            return;
+                        }
                         Thread.Sleep(1);
                     } while (Stopwatch.GetTimestamp() < until);
                     result.LayoutError = "Existing sentinel windows did not reach non-overlapping tiled heights within timeout";

@@ -29,11 +29,11 @@ function Invoke-LaneEPerf {
     $log = Join-Path $perfDir 'local\wiri\wiri.log'
     $evidence = [ordered]@{
         schema = 1; kind = 'info only; no performance thresholds'; unavailable = -1
-        machine = $env:COMPUTERNAME; os = [Environment]::OSVersion.VersionString
+        machine = $env:COMPUTERNAME; os = @(); observer_reported_os = [Environment]::OSVersion.VersionString
         collector_bitness = [IntPtr]::Size * 8; logical_processors = [Environment]::ProcessorCount
         utc = [DateTime]::UtcNow.ToString('o'); source_commit = ''; binary_version = ''
         configuration = 'shipped default_config.kdl; -v --no-autostart; tray on, animations/status bar/focus-follows-mouse off'
-        cold_definition = 'OS process creation to complete successful get_state reply / both pre-existing sentinel windows at tiled heights and non-overlapping visible rects'
+        cold_definition = 'OS process creation to complete successful get_state reply / both pre-existing sentinels resized to tiled heights with disjoint rects and at least one on-screen (scrolled-out tiles may be parked below monitors)'
         switches_method = 'NtQuerySystemInformation(SystemProcessInformation) per-thread cumulative ContextSwitches delta / elapsed QPC seconds; process/TID creation identity matched. Endpoint-based lower bound: exited threads and threads born+exited between snapshots cannot be fully counted.'
         action_definition = 'log deltas from just before one action through 600 ms after it; all managed windows, not just the target'
         setwindowpos_definition = 'SetWindowPos [sync] SUCCESS log lines: successful positioning calls, NOT a complete native API trace (unlogged style/z-order/failures excluded)'
@@ -61,7 +61,7 @@ function Invoke-LaneEPerf {
     }
     function PLog {
         if (-not (Test-Path $log)) { throw 'Lane E child did not write its isolated debug log' }
-        $text = [IO.File]::ReadAllText($log)
+        $text = [LaneE.Native]::ReadSharedText($log)
         return [pscustomobject]@{
             positioning = [regex]::Matches($text, 'Positioning window ').Count
             swp = [regex]::Matches($text, 'SetWindowPos(?: sync)? SUCCESS:').Count
@@ -70,6 +70,7 @@ function Invoke-LaneEPerf {
     }
     function PAction([string]$group, [string]$name, [string[]]$arguments) {
         $before = @(FormInfo @($target))[0].rect
+        $beforeState = (PRequest '{"type":"get_state"}').result.windows | Where-Object { $_.hwnd -eq [int64]$target }
         $a = PLog
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $json = @{ type = 'run_action'; data = @{ name = $name; args = @($arguments) + @('--id', [string][int64]$target) } } | ConvertTo-Json -Compress -Depth 4
@@ -77,8 +78,17 @@ function Invoke-LaneEPerf {
         Start-Sleep -Milliseconds 600
         $b = PLog
         $after = @(FormInfo @($target))[0].rect
+        $intervalMs = $clock.Elapsed.TotalMilliseconds
+        # The viewport can follow a swap, leaving the target's rectangle unchanged. Confirm the
+        # column mutation in IPC state outside the log interval rather than rejecting a real move.
+        $afterState = (PRequest '{"type":"get_state"}').result.windows | Where-Object { $_.hwnd -eq [int64]$target }
+        $confirmed = $before -ne $after
+        if ($group -eq 'move') { $confirmed = $null -ne $beforeState -and $null -ne $afterState -and $beforeState.column -ne $afterState.column }
+        if ($group -eq 'fullscreen') { $confirmed = $confirmed -and $beforeState.fullscreen -ne $afterState.fullscreen }
         $actions.Add([pscustomobject]@{ group = $group; action = $name; args = @($arguments)
-            confirmed = ($before -ne $after); before = $before; after = $after; interval_ms = $clock.Elapsed.TotalMilliseconds
+            confirmed = $confirmed; before = $before; after = $after; interval_ms = $intervalMs
+            column_before = $beforeState.column; column_after = $afterState.column
+            fullscreen_before = $beforeState.fullscreen; fullscreen_after = $afterState.fullscreen
             setwindowpos_lines = $b.swp - $a.swp; positioning_lines = $b.positioning - $a.positioning
             fallback_lines = $b.fallback - $a.fallback })
     }
@@ -91,6 +101,7 @@ function Invoke-LaneEPerf {
         $evidence.exe_sha256 = (Get-FileHash $wiri -Algorithm SHA256).Hash
         $evidence.ctl_sha256 = (Get-FileHash $ctl -Algorithm SHA256).Hash
         $evidence.cpu = @(Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors)
+        $evidence.os = @(Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber)
         # The harness has finished and quit all its children. Refuse rather than stop any unrelated process.
         if (@(Get-Process wiri -ErrorAction SilentlyContinue).Count -ne 0) { throw 'A wiri process is still running; perf phase will not stop or measure it' }
         if (-not ('LaneE.Native' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot '..\perf\Native.cs') }
@@ -129,6 +140,7 @@ function Invoke-LaneEPerf {
         PValue 'cold_start_call_ms' $cold.StartCallMs
         PValue 'cold_observer_start_max_ms' ([Math]::Max($cold.IpcObserverMs, $cold.LayoutObserverMs))
         $evidence.cold_ipc_observer_ms = $cold.IpcObserverMs; $evidence.cold_layout_observer_ms = $cold.LayoutObserverMs
+        $evidence.cold_layout_rects = $cold.LayoutRects; $evidence.cold_layout_on_screen_windows = $cold.LayoutOnScreenWindows
         PValue 'cold_samples' 1
         PValue 'existing_sentinel_windows' $sentinels.Count
         if ($cold.IpcError) { $errors.Add($cold.IpcError) }
