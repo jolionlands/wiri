@@ -6,6 +6,7 @@ pub mod hidden;
 pub mod hooks;
 pub mod hotkey_conflicts;
 pub mod message_loop;
+pub mod osversion;
 // Lane D: on-demand output identity/config and event-driven monitor refresh.
 pub mod output_runtime;
 pub mod outputs;

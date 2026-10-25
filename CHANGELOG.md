@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — decoration foundation
+- Port the Phase 2B effects decoder, pure decoration model and passive layer foundation onto the integrated input/output base, retaining both backend module lists.
+
 ### The pipe belongs to the user and the session (2026-10-25)
 - **A second user can run wiri.**  The pipe name was machine-global
   (`\\.\pipe\wiri_control`), so the second user logged in on the same machine (fast

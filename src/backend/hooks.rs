@@ -207,6 +207,10 @@ unsafe extern "system" fn winevent_proc(
                 backend.send_event(BackendEvent::WindowUrgentCleared { hwnd: hwnd_isize });
             }
             backend.send_event(BackendEvent::ForegroundChanged { hwnd: hwnd_isize });
+            // The window came to the front: whatever is drawn around it goes directly below it.
+            if let Some(decor) = crate::overlay::decor::global() {
+                decor.restack(hwnd_isize);
+            }
         }
         0x000A => {
             // EVENT_SYSTEM_MOVESIZESTART
@@ -306,6 +310,12 @@ unsafe extern "system" fn winevent_proc(
             // 200 ms LAST_LOCATION throttle.
             if backend.is_self_applied_recent(hwnd_isize) {
                 return;
+            }
+
+            // Somebody else moved or resized it (a drag by the title bar, the program itself):
+            // the frame drawn around it follows at once.
+            if let Some(decor) = crate::overlay::decor::global() {
+                decor.moved(hwnd_isize);
             }
 
             // A window that became maximized or as big as its monitor (or stopped being) on

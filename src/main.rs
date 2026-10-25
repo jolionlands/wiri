@@ -372,6 +372,14 @@ async fn main() -> Result<()> {
         engine.set_hide_method(hide_method);
         engine.set_layout_request_channel(layout_req_tx);
 
+        // The overlay layer draws niri's focus ring, border and shadow around the windows.
+        // Its windows are created when the first decoration is needed and its thread ends
+        // with the last one: at rest there is neither.
+        let decor_layer: std::sync::Arc<dyn wiri::overlay::decor::DecorSink> =
+            std::sync::Arc::new(wiri::overlay::decor::layer::DecorLayer::new());
+        wiri::overlay::decor::install_global(decor_layer.clone());
+        engine.install_decor_sink(decor_layer);
+
         // Opt into DWM thumbnail-based overview: shrunken live previews of
         // every window are composited by DWM instead of resizing the real
         // HWNDs. Falls back gracefully if DWM is unavailable.

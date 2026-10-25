@@ -1,4 +1,5 @@
 pub mod decode;
+pub mod effects;
 pub mod error;
 pub mod kdl;
 pub mod loader;
@@ -6,6 +7,10 @@ pub mod parse;
 pub mod types;
 
 pub use decode::{Decoded, MAX_INCLUDE_DEPTH};
+pub use effects::{
+    color_text, parse_css_color, Effects, EffectsPartial, GradientSpace, GradientStyle,
+    InsertHintStyle, PaintStyle, RingStyle, ShadowStyle, TabIndicatorStyle, TabPosition,
+};
 pub use error::{ConfigError, Result};
 pub use loader::{
     default_config_dir, default_config_path, failure_summary, ConfigLoader, ReloadOutcome,
