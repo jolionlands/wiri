@@ -1256,12 +1256,14 @@ Shot 'h7-01-three-columns'
 FocusForm $sf[1]
 Press 'ctrl+alt+f1'
 $wHalf = WinW $sf[1]
-# a 1366 px screen: view 1350, 16 px gaps, 4 px borders: half = (1350 + 16) / 2 - 16 - 8 = 659
-$h7SetPercent = (Near $wHalf 659 14)
+# The window width of a proportion p of the work area W: the view is W - 16, a column gets p * (view + 16 px gap)
+# minus the gap, and the window sits inside 4 px borders, so p * W - 24 (a 1366 px screen: a half is 659).
+function H7Width([double]$p) { return [int][Math]::Round($p * $swa.Width - 24) }
+$h7SetPercent = (Near $wHalf (H7Width 0.5) 14)
 Shot 'h7-02-set-50-percent'
 Press 'ctrl+alt+f2'
 $wPlus = WinW $sf[1]
-$h7AdjustPercentUp = (Near ($wPlus - $wHalf) 137 14)
+$h7AdjustPercentUp = (Near ($wPlus - $wHalf) ([Math]::Round(0.1 * $swa.Width)) 14)
 Press 'ctrl+alt+f3'
 $h7AdjustPercentDown = (Near (WinW $sf[1]) $wHalf 8)
 Press 'ctrl+alt+f5'
@@ -1293,8 +1295,9 @@ Press 'ctrl+alt+f7'
 $pC = WinW $sf[1]
 Press 'ctrl+alt+f9'
 $pD = WinW $sf[1]
-# presets of this screen: a third 431, a half 659, two thirds 887 (window widths)
-$h7PresetCycle = (Near $pA 659 14) -and (Near $pB 887 14) -and (Near $pC 431 14) -and (Near $pD 887 14)
+# presets: a third, a half, two thirds (on a 1366 px screen 431, 659 and 887 px windows)
+$h7PresetCycle = (Near $pA (H7Width 0.5) 14) -and (Near $pB (H7Width (2 / 3)) 14) -and (Near $pC (H7Width (1 / 3)) 14) -and
+    (Near $pD (H7Width (2 / 3)) 14)
 Shot 'h7-05-presets'
 
 # --- focus-workspace 2 is the second workspace, focus-workspace "2" the workspace named "2" (there is none)
@@ -1341,9 +1344,9 @@ $null = Ctl 'h7-action-height-reset' @('action', 'reset-window-height'); Start-S
 $h7WindowHeightReset = (Near (WinH $sf[0]) (WinH $sf[1]) 14) -and (Near (WinH $sf[0]) $hEqual0 14)
 Shot 'h7-09-height-reset'
 $null = Ctl 'h7-ctl-set-width' @('set-column-width', '50%'); Start-Sleep -Milliseconds 1300
-$h7CtlSetColumnWidth = (Near (WinW $sf[0]) 659 14)
+$h7CtlSetColumnWidth = (Near (WinW $sf[0]) (H7Width 0.5) 14)
 $null = Ctl 'h7-ctl-set-width-minus' @('set-column-width', '-10%'); Start-Sleep -Milliseconds 1300
-$h7CtlSetColumnWidthMinus = (Near (WinW $sf[0]) 522 14)
+$h7CtlSetColumnWidthMinus = (Near (WinW $sf[0]) (H7Width 0.4) 14)
 foreach ($h in $sf) { [TestForms]::CloseForm($h) }
 Start-Sleep -Milliseconds 1500
 
