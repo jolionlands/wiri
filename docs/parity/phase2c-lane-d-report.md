@@ -95,6 +95,24 @@ aliases still use raw names, and physical output settings apply at startup/reloa
 on hotplug). Windows keeps its own arrangement and unsupported requests fail closed rather
 than using niri's automatic fallback mode selection.
 
+## Legacy terminal overlap found by verification
+
+The first completed run's H9 measured one real **11px** terminal overlap, despite the new
+screenshot/output checks passing. One terminal was admitted through its initial foreground
+event, timed out asking WM_GETMINMAXINFO, and never received the already-managed foreground
+retry until refocus. Main now also retries on a managed window's title-readiness event, outside
+the engine lock, using the **existing three-query lifetime cap**. No timer or location polling
+was added. Separately, `sync_min_widths` now converts max(native, rule) **visible-window**
+minimum to tile units by adding both engine borders, just as rule limits already did.
+
+Two new pure regressions replay three 466px minima with 4px borders (474px tiles, visible
+request 466px, scrolling/no overlap), duplicate-answer suppression and rule/native precedence;
+existing lifecycle/budget/movement tests were updated for the correct units. Shared-file edits
+are the bounded title-event hook in main and the one-line conversion plus tests in engine.
+The final unchanged H9 gate is **0 overlapping pairs**: visible x ranges are
+`[-88,378]`, `[402,868]`, `[892,1358]`, all 466px wide with **24px gaps**. Dynamic changes after a
+window has already answered, native minimum heights and maximum sizes remain outside this fix.
+
 ## Live harness safety corrections
 
 The pre-existing harness killed every process named wiri and wrote the shared user's AppData.

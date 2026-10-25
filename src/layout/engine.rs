@@ -1818,7 +1818,9 @@ impl TilingEngine {
                     for tile in column.tiles.iter_mut() {
                         let window_min = known.get(&tile.window_id).copied().unwrap_or(0);
                         let rule = limits.get(&tile.window_id).copied().unwrap_or_default();
-                        tile.min_width = window_min.max(rules::RuleLimits::for_tile(rule.min_width, border));
+                        // Both native and rule minima describe the visible window; a tile
+                        // also contains wiri's border, which placement subtracts again.
+                        tile.min_width = rules::RuleLimits::for_tile(window_min.max(rule.min_width), border);
                         tile.max_width = rules::RuleLimits::for_tile(rule.max_width, border);
                         tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
                         tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
@@ -14597,11 +14599,12 @@ mod tests {
 
         assert!(engine.note_window_min_width(WindowId::new(5002), 700));
         let after = rects(&engine);
+        let border = 2 * engine.config.border_width.max(1);
         assert_eq!(after[&5001], before[&5001], "the column before it does not move");
-        assert_eq!(after[&5002].size.w, 700, "its column is as wide as it needs");
+        assert_eq!(after[&5002].size.w, (700 + border) as u32, "the window plus its border");
         assert_eq!(
             after[&5003].loc.x,
-            before[&5003].loc.x + 200,
+            before[&5003].loc.x + 200 + border,
             "the column after it moves over instead of lying under it"
         );
         assert!(
@@ -14620,9 +14623,9 @@ mod tests {
 
     #[test]
     fn test_a_user_width_below_the_minimum_is_kept_but_not_used() {
-        // The user asked for 400 px; the window will not go below 650 px.  The column is
-        // 650 px wide, and the 400 px the user asked for is what comes back when the limit
-        // goes (niri keeps the requested width the same way).
+        // The user asked for 400 px; the window will not go below 650 px. The column
+        // also contains its border. The requested 400 px comes back when the limit goes
+        // (niri keeps the requested width the same way).
         let mut engine = make_engine();
         let be = BackendHandle::default_for_test();
         engine.add_window(make_window(5031, 10, 10), &be);
@@ -14637,9 +14640,10 @@ mod tests {
         engine.note_window_min_width(WindowId::new(5031), 650);
         let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
         assert_eq!(ws.columns[0].width, Some(400));
-        assert_eq!(ws.columns[0].resolved_width(500), 650);
+        let tile_width = 650 + 2 * engine.config.border_width.max(1);
+        assert_eq!(ws.columns[0].resolved_width(500), tile_width);
         let positions = engine.calculate_positions(ws, Rect::new(8, 8, 1904, 1024), &engine.config);
-        assert_eq!(positions[0].1.size.w, 650);
+        assert_eq!(positions[0].1.size.w, tile_width as u32);
         engine.note_window_min_width(WindowId::new(5031), 0);
         let ws = engine.monitors.get(&out).and_then(|m| m.workspace()).unwrap();
         assert_eq!(ws.columns[0].resolved_width(500), 400);
@@ -14662,15 +14666,16 @@ mod tests {
         let be = BackendHandle::default_for_test();
         engine.add_window(make_window(5011, 10, 10), &be);
         engine.note_window_min_width(WindowId::new(5011), 650);
-        assert_eq!(tile_min(&engine, 5011), Some(650));
+        let minimum = 650 + 2 * engine.config.border_width.max(1) as u32;
+        assert_eq!(tile_min(&engine, 5011), Some(minimum));
         // Moved to another workspace: the tile is made anew, with the same limit.
         engine.move_window_to_workspace(1, &be);
-        assert_eq!(tile_min(&engine, 5011), Some(650));
+        assert_eq!(tile_min(&engine, 5011), Some(minimum));
         // Floated (no tile) and tiled again.
         engine.toggle_floating_for(WindowId::new(5011), &be);
         assert_eq!(tile_min(&engine, 5011), None, "a floating window has no tile");
         engine.toggle_floating_for(WindowId::new(5011), &be);
-        assert_eq!(tile_min(&engine, 5011), Some(650));
+        assert_eq!(tile_min(&engine, 5011), Some(minimum));
     }
 
     #[test]
@@ -14705,10 +14710,60 @@ mod tests {
         let other = WindowId::new(5042);
         assert!(engine.note_min_width_answer(other, Some(600)));
         assert!(!engine.min_width_query_wanted(other));
-        assert_eq!(tile_min(&engine, 5042), Some(600));
-        // An absurd answer is capped, not trusted.
+        let border = 2 * engine.config.border_width.max(1) as u32;
+        assert_eq!(tile_min(&engine, 5042), Some(600 + border));
+        // An absurd visible-window answer is capped before adding the tile border.
         assert!(engine.note_window_min_width(other, 1_000_000));
-        assert_eq!(tile_min(&engine, 5042), Some(16_384));
+        assert_eq!(tile_min(&engine, 5042), Some(16_384 + border));
+    }
+
+    #[test]
+    fn native_readiness_answer_widens_three_terminal_tiles_including_borders() {
+        let mut engine = TilingEngine::new(LayoutConfig {
+            column_width: 431,
+            column_width_mode: ColumnWidthMode::Fixed,
+            border_width: 4,
+            column_gap: 24,
+            ..LayoutConfig::default()
+        });
+        let output = OutputId::from_name("1366px");
+        let work = Rect::new(0, 0, 1366, 720);
+        engine.register_monitor(output, work, work);
+        let be = BackendHandle::default_for_test();
+        for hwnd in [5051, 5052, 5053] {
+            let id = WindowId::new(hwnd);
+            engine.add_window(make_window(hwnd, 0, 0), &be);
+            assert!(!engine.note_min_width_answer(id, None), "not ready on admission");
+            assert!(engine.min_width_query_wanted(id), "a native readiness hint may retry");
+            assert!(engine.note_min_width_answer(id, Some(466)));
+            assert!(!engine.note_min_width_answer(id, Some(466)), "no duplicate relayout");
+            assert!(!engine.min_width_query_wanted(id), "a successful answer ends retries");
+            assert_eq!(tile_min(&engine, hwnd), Some(474));
+        }
+        let ws = engine.monitors.get(&output).and_then(|m| m.workspace()).unwrap();
+        let positions = engine.calculate_positions(ws, work, &engine.config);
+        assert_eq!(positions.len(), 3);
+        for (_, rect) in &positions {
+            assert_eq!(rect.size.w - 8, 466, "placement leaves the native visible minimum");
+        }
+        for pair in positions.windows(2) {
+            assert!(pair[0].1.right() + 24 <= pair[1].1.loc.x, "tiles scroll, never overlap");
+        }
+        assert!(positions[2].1.right() - positions[0].1.loc.x > work.size.w as i32);
+    }
+
+    #[test]
+    fn native_and_rule_minima_use_the_larger_window_width_before_adding_border() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        let id = WindowId::new(5061);
+        engine.add_window(make_window(5061, 0, 0), &be);
+        engine.rule_limits.insert(id, rules::RuleLimits { min_width: 800, ..Default::default() });
+        engine.note_window_min_width(id, 650);
+        let border = 2 * engine.config.border_width.max(1) as u32;
+        assert_eq!(tile_min(&engine, 5061), Some(800 + border));
+        engine.note_window_min_width(id, 900);
+        assert_eq!(tile_min(&engine, 5061), Some(900 + border));
     }
 
     // --- A monitor is unplugged: its windows stay, and go back when it comes back ---

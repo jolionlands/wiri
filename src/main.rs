@@ -1310,6 +1310,13 @@ fn handle_backend_event(
             });
         }
         BackendEvent::WindowTitleChanged { hwnd } => {
+            // A newly created terminal may answer its minimum only once its title is ready.
+            // Reuse the same three-query lifetime cap as foreground retries, outside the lock.
+            let window_id = WindowId::new(hwnd);
+            if engine.read().min_width_query_wanted(window_id) {
+                let answer = handle.min_track_width(hwnd);
+                engine.write().learn_min_width(window_id, answer, handle);
+            }
             // The backend has read the new title already.  The engine keeps it, and the
             // window rules that look at titles are evaluated again for the window (only
             // when some rule does).

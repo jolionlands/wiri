@@ -46,6 +46,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   physical differences, preserves other timings, refuses the last-display-off and unsupported flips,
   and never persists changes. H29 verifies matching, focus, reload and current-mode no-op; physical
   mode/position/rotation/off preparation is synthetic-unit-tested only, never applied on the laptop.
+- **Terminal minimum-width regression.** An unanswered admission query can now retry when the
+  title becomes ready, still outside the engine lock and within the existing three-query cap.
+  Native visible minima include wiri's border in tile units, just like rule minima. Two pure
+  regressions and the unchanged live H9 gate verify three 466px terminals with no overlap.
 - **Shared-desktop live safety.** The harness refuses foreign daemons instead of killing them,
   isolates AppData/temp inside the worktree, and retains interrupted-run recovery state. The
   recovery metric checks this run's forms, not unrelated windows legitimately hidden again.
