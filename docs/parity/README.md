@@ -14,14 +14,16 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
 | Layout and behaviour (226 rows) | 53 | 58 | 100 | 15 |
-| Config, input and IPC (259 rows) | 43 | 74 | 72 | 70 |
+| Config, input and IPC (259 rows) | 51 | 71 | 67 | 70 |
 
-The counts are as of Phase 2A (`b702890`; Phase 1 was 30 / 70 / 111 / 15 and 15 / 86 / 88 / 70, and the matrices were
-2 / 85 / 124 / 15 and 11 / 87 / 91 / 70 when they were written).  Line numbers in both files refer to commit 1532635. The live
-fixes since then (Phase 0 up to 4b9d834, Phase 1 up to `6ea45e4`, Phase 2A up to `b702890`) closed some rows and updated the
-evidence of others (a row says "Phase 1, item N" or "Phase 2A, item N" when that item changed it); each matrix ends with a list
-of the working-tree edits that were in flight while it was written.  [The Phase 1 report](phase1-report.md) and
-[the Phase 2A report](phase2a-report.md) list what was verified live and what only by unit tests.
+The counts reflect current feature-row statuses through Phase 2C Lane D. Earlier checkpoints
+(layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
+30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
+11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;
+phase-labelled rows relocate the changed code by function name. Each matrix ends with a list
+of the working-tree edits that were in flight during the original audit. The
+[Phase 1](phase1-report.md), [Phase 2A](phase2a-report.md) and
+[Phase 2C Lane D](phase2c-lane-d-report.md) reports distinguish live verification from unit tests.
 
 ## Plan
 

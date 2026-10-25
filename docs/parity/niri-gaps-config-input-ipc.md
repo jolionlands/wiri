@@ -19,28 +19,32 @@ Sources read (read-only, nothing built or run):
 
 ## Status counts
 
+Current feature-row counts through Phase 2C Lane D, including earlier phases. The
+headline findings below describe the original audit unless marked with a later phase.
+
 | section | rows | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- | --- |
-| 1. Config system (loading, KDL syntax, include, live reload, errors, validate) | 28 | 2 | 16 | 9 | 1 |
+| 1. Config system (loading, KDL syntax, include, live reload, errors, validate) | 28 | 16 | 8 | 3 | 1 |
 | 2. Keyboard input | 10 | 0 | 4 | 1 | 5 |
 | 3. Pointing devices (touchpad, mouse, trackpoint, trackball, tablet, touch) | 18 | 0 | 5 | 9 | 4 |
-| 4. General input settings (focus-follows-mouse, warp, workspace back-and-forth, mod key) | 7 | 0 | 3 | 3 | 1 |
-| 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 1 | 8 | 11 | 1 |
+| 4. General input settings (focus-follows-mouse, warp, workspace back-and-forth, mod key) | 7 | 1 | 3 | 2 | 1 |
+| 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 7 | 9 | 4 | 1 |
 | 6. Hotkey overlay ("Important Hotkeys") | 7 | 0 | 2 | 5 | 0 |
-| 7. Screenshots | 11 | 0 | 6 | 5 | 0 |
-| 8. IPC transport, protocol and CLI | 11 | 2 | 6 | 3 | 0 |
-| 9. IPC `Request` variants (one row each) | 16 | 0 | 7 | 7 | 2 |
-| 10. IPC `Event` variants (one row each) | 20 | 3 | 5 | 9 | 3 |
-| 11. Outputs (config and runtime behaviour) | 17 | 1 | 10 | 3 | 3 |
+| 7. Screenshots | 11 | 5 | 5 | 1 | 0 |
+| 8. IPC transport, protocol and CLI | 11 | 3 | 5 | 3 | 0 |
+| 9. IPC `Request` variants (one row each) | 16 | 1 | 7 | 6 | 2 |
+| 10. IPC `Event` variants (one row each) | 20 | 12 | 1 | 4 | 3 |
+| 11. Outputs (config and runtime behaviour) | 17 | 3 | 8 | 3 | 3 |
 | 12. Actions in scope (non-layout), one row each | 29 | 1 | 9 | 10 | 9 |
-| 13. Misc top-level config (startup, environment, cursor, clipboard, session) | 11 | 0 | 2 | 4 | 5 |
+| 13. Misc top-level config (startup, environment, cursor, clipboard, session) | 11 | 1 | 1 | 4 | 5 |
 | 14. Switch events, named workspaces config, recent windows (Alt-Tab) | 13 | 0 | 4 | 8 | 1 |
 | 15. Layer rules | 5 | 0 | 0 | 0 | 5 |
 | 16. Debug options | 22 | 0 | 0 | 0 | 22 |
 | 17. Accessibility, security model, screencasting, Xwayland | 13 | 1 | 0 | 4 | 8 |
-| **total** | **259** | **11** | **87** | **91** | **70** |
+| **total** | **259** | **51** | **71** | **67** | **70** |
 
-Release tagging of the rows: main-only 9, release 238, release? 12. Priorities of the non-N/A rows: P0 4, P1 59, P2 115, no priority needed (done) 11.
+Release tagging of the rows: main-only 9, release 238, release? 12. Priorities of the
+189 non-N/A rows: P0 1, P1 33, P2 104, unprioritized (`-`) 51 (50 done, one partial).
 
 ## Headline findings (verified in code, not from docs)
 

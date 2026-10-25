@@ -2,7 +2,10 @@
 
 Research only: nothing was built, run, installed or edited; no git commands. Written 2026-10-24 by research agent A.
 
-## Summary
+## Original audit summary (2026-10-24)
+
+Current status counts are in [README.md](README.md); phase-labelled rows below update
+this original snapshot with implementation and verification evidence.
 
 - 226 rows (niri features and every in-scope Action, one row per Action or tightly paired Actions). Status: done 2, partial 85, missing 124, N/A on Windows 15. Priority: P0 41 rows (40 still open), P1 76 (75 open), P2 109 (94 open).
 - The two `done` rows are `focus-window-up/down` on stacked columns and per-monitor DPI handling. Almost everything else that looks present is `partial` because it parses but is never acted on, has different semantics, or only exists through IPC.
