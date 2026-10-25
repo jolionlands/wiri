@@ -7,14 +7,9 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::os::windows::ffi::OsStrExt;
 
-use windows::core::PCWSTR;
-use windows::Win32::System::Pipes::WaitNamedPipeW;
-
-use wiri::ipc::IpcMessage;
+use wiri::ipc::{IpcClient, IpcMessage};
 
 // ---------------------------------------------------------------------------
 // Console-safe output
@@ -158,7 +153,7 @@ fn version_static() -> &'static str {
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Invocation,
 
     /// Timeout in seconds for IPC connection
     #[arg(short, long, default_value = "5", global = true)]
@@ -167,6 +162,30 @@ struct Cli {
     /// Emit the raw JSON response instead of a formatted summary.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Print the request JSON and exit without connecting to the daemon.
+    #[arg(long, global = true)]
+    print_request: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Invocation {
+    #[command(flatten)]
+    Direct(Commands),
+
+    /// niri-compatible prefix: `wiri-ctl msg windows` is `wiri-ctl windows`.
+    Msg {
+        #[command(subcommand)]
+        command: Commands,
+    },
+}
+
+impl Invocation {
+    fn into_command(self) -> Commands {
+        match self {
+            Self::Direct(command) | Self::Msg { command } => command,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -188,6 +207,39 @@ enum Commands {
 
     /// The window that has the keyboard focus, in niri's shape.
     FocusedWindow,
+
+    /// List connected outputs, in niri's shape.
+    Outputs,
+
+    /// The output that currently has focus, or null.
+    FocusedOutput,
+
+    /// List keyboard layout names and the current layout index.
+    KeyboardLayouts,
+
+    /// Pick a window interactively.
+    PickWindow,
+
+    /// Pick a color on screen.
+    PickColor,
+
+    /// Configure an output: NAME ACTION [ARGS], or NAME '<external enum JSON>'.
+    /// Actions: on, off, mode, scale, transform, position, vrr, max-bpc.
+    Output {
+        name: String,
+        #[arg(required = true, num_args = 1.., allow_negative_numbers = true)]
+        action: Vec<String>,
+    },
+
+    /// Ask the daemon to return a diagnostic error.
+    #[command(alias = "return-error")]
+    RequestError,
+
+    /// Send JSON from an argument, or stdin when omitted or '-'; print one raw reply line.
+    RawRequest {
+        #[arg(value_name = "JSON")]
+        request: Option<String>,
+    },
 
     /// Whether the overview is open.
     OverviewState,
@@ -243,10 +295,12 @@ enum Commands {
     /// By default prints a human-readable summary line per event.
     /// Pass --stream to emit raw newline-delimited JSON (pipe-safe, jq-friendly).
     /// Pass --filter to receive only certain event types.
-    Events {
+    #[command(alias = "events")]
+    EventStream {
         /// Event types to subscribe to (comma-separated, legacy alias for --filter).
         /// Kept for backwards compatibility; prefer --filter.
-        #[arg(short, long, default_value = "*", hide = true)]
+        /// The short -t is reserved for the global connection timeout.
+        #[arg(long, default_value = "*", hide = true)]
         types: String,
 
         /// Emit raw newline-delimited JSON instead of the human-readable summary.
@@ -486,34 +540,53 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
+    let command = cli.command.into_command();
 
-    // SubscribeEvents has bespoke streaming behaviour — handle it before the
-    // single-request/response path below.
-    if let Commands::Events {
-        types,
-        stream,
-        filter,
-    } = &cli.command
-    {
-        // --filter takes precedence over the legacy --types flag.
-        let effective_types = filter.as_deref().unwrap_or(types.as_str());
-        // --stream or --json both select raw newline-delimited JSON output;
-        // --stream is the preferred flag for documentation purposes.
-        let raw_output = *stream || cli.json;
-        return stream_events(effective_types, cli.timeout, raw_output);
-    }
-
-    // validate-config is a pure-local operation — no IPC, no running daemon
-    // required — so handle it before we try to dial the named pipe.
-    if let Commands::ValidateConfig { path } = &cli.command {
+    // Local validation has no IPC request to print, and must never dial a pipe.
+    if let Commands::ValidateConfig { path } = &command {
+        anyhow::ensure!(
+            !cli.print_request,
+            "validate-config is local and has no IPC request"
+        );
         return validate_config_subcommand(path.as_deref(), cli.json);
     }
 
-    let message = request_for(cli.command);
+    if let Commands::RawRequest { request } = &command {
+        let request = raw_request_text(request.as_deref(), &mut std::io::stdin().lock())?;
+        if cli.print_request {
+            println!("{}", request);
+        } else {
+            let reply = block_on(async {
+                let mut client = connect_ipc(cli.timeout).await?;
+                Ok(client.request_raw(&request).await?)
+            })?;
+            // Intentionally no schema warning or JSON wrapper: niri clients
+            // must see the original reply line, regardless of --json.
+            println!("{}", reply);
+        }
+        return Ok(());
+    }
+
+    let event_output = match &command {
+        Commands::EventStream { stream, .. } => Some(*stream || cli.json),
+        _ => None,
+    };
+    let message = request_for(command)?;
+    if cli.print_request {
+        // The client compacts through Value as well, so this is the actual
+        // request line sent, without the framing newline supplied by println!.
+        println!("{}", serde_json::to_value(&message)?);
+        return Ok(());
+    }
+    if let Some(raw) = event_output {
+        return stream_events(&message, cli.timeout, raw);
+    }
 
     let response = send_ipc_message(&message, cli.timeout)?;
-
+    warn_schema(&response);
     if cli.json {
+        // Keep the existing wiri success/result wrapper, even for requests
+        // that also have an unwrapped niri representation.
         println!("{}", serde_json::to_string_pretty(&response)?);
         return Ok(());
     }
@@ -523,13 +596,24 @@ fn real_main() -> Result<()> {
 }
 
 /// The request a subcommand sends to the daemon.
-fn request_for(command: Commands) -> IpcMessage {
-    match command {
+fn request_for(command: Commands) -> Result<IpcMessage> {
+    Ok(match command {
         Commands::State => IpcMessage::GetState,
         Commands::Windows => IpcMessage::Windows,
         Commands::WindowList => IpcMessage::WindowList,
         Commands::Workspaces => IpcMessage::Workspaces,
         Commands::FocusedWindow => IpcMessage::FocusedWindow,
+        Commands::Outputs => IpcMessage::Outputs,
+        Commands::FocusedOutput => IpcMessage::FocusedOutput,
+        Commands::KeyboardLayouts => IpcMessage::KeyboardLayouts,
+        Commands::PickWindow => IpcMessage::PickWindow,
+        Commands::PickColor => IpcMessage::PickColor,
+        Commands::Output { name, action } => IpcMessage::Output {
+            output: name,
+            action: output_action(&action)?,
+        },
+        Commands::RequestError => IpcMessage::ReturnError,
+        Commands::RawRequest { .. } => unreachable!("raw requests handled before IPC dial"),
         Commands::OverviewState => IpcMessage::OverviewState,
         Commands::Version => IpcMessage::Version,
         Commands::SwitchWorkspace { id } => IpcMessage::SwitchWorkspace { id },
@@ -563,7 +647,9 @@ fn request_for(command: Commands) -> IpcMessage {
         }
         Commands::ReloadConfig => IpcMessage::ReloadConfig,
         Commands::Quit => IpcMessage::Quit,
-        Commands::Events { .. } => unreachable!("events handled above before IPC dial"),
+        Commands::EventStream { types, filter, .. } => IpcMessage::SubscribeEvents {
+            event_types: event_types(filter.as_deref().unwrap_or(&types)),
+        },
         Commands::MoveWindowToWorkspace { workspace_id } => {
             IpcMessage::MoveWindowToWorkspace { workspace_id }
         }
@@ -638,6 +724,93 @@ fn request_for(command: Commands) -> IpcMessage {
             pixels,
             monitor_id,
         },
+    })
+}
+
+fn event_types(types: &str) -> Vec<String> {
+    if types.trim().is_empty() || types.trim() == "*" {
+        Vec::new()
+    } else {
+        types
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Raw JSON may be pretty-printed on stdin, but the wire uses one line.
+fn raw_request_text(argument: Option<&str>, stdin: &mut impl Read) -> Result<String> {
+    let mut input = String::new();
+    match argument {
+        Some(text) if text != "-" => input.push_str(text),
+        _ => {
+            stdin.read_to_string(&mut input)?;
+        }
+    }
+    let value: serde_json::Value = serde_json::from_str(&input)?;
+    Ok(serde_json::to_string(&value)?)
+}
+
+/// Preserve externally tagged JSON verbatim as a value. Friendly words are
+/// only syntactic sugar; capability/range validation belongs to the daemon.
+fn output_action(words: &[String]) -> Result<serde_json::Value> {
+    use serde_json::json;
+    if let [action] = words {
+        if let Ok(value) = serde_json::from_str(action) {
+            return Ok(value);
+        }
+    }
+    let scalar = |text: &str| {
+        serde_json::from_str::<serde_json::Value>(text)
+            .unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
+    };
+    let args: Vec<&str> = words.iter().map(String::as_str).collect();
+    Ok(match args.as_slice() {
+        ["on"] => json!("On"),
+        ["off"] => json!("Off"),
+        ["mode", mode] => json!({"Mode": {"mode": mode}}),
+        ["scale", scale] => json!({"Scale": {"scale": scalar(scale)}}),
+        ["transform", transform] => json!({"Transform": {"transform": transform}}),
+        ["position", "auto"] => json!({"Position": {"position": "Auto"}}),
+        ["position", x, y] => {
+            json!({"Position": {"position": {"x": scalar(x), "y": scalar(y)}}})
+        }
+        ["vrr", vrr] => {
+            let vrr = match *vrr {
+                "on" => json!(true),
+                "off" => json!(false),
+                other => scalar(other),
+            };
+            json!({"Vrr": {"vrr": vrr}})
+        }
+        ["max-bpc", max_bpc] => json!({"MaxBpc": {"max_bpc": scalar(max_bpc)}}),
+        _ => anyhow::bail!(
+            "expected external output-action JSON, or on/off, mode MODE, scale SCALE, \
+             transform TRANSFORM, position X Y/auto, vrr on/off, max-bpc BITS"
+        ),
+    })
+}
+
+fn schema_warning(response: &serde_json::Value) -> Option<String> {
+    let expected = wiri::ipc::wire::SCHEMA_VERSION;
+    match response.get("schema_version") {
+        Some(value) if value.as_str() == Some(expected) => None,
+        Some(value) => Some(format!(
+            "IPC schema mismatch: daemon reports {}, this client expects {}. Update/restart wiri and wiri-ctl together.",
+            value, expected
+        )),
+        None => Some(format!(
+            "Daemon has no schema_version (an old, pre-1.3 daemon); this client expects {}. Update/restart wiri.",
+            expected
+        )),
+    }
+}
+
+fn warn_schema(response: &serde_json::Value) {
+    if let Some(warning) = schema_warning(response) {
+        errln!("Warning: {}", warning);
     }
 }
 
@@ -760,6 +933,11 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
         IpcMessage::Workspaces => print_workspaces(resp),
         IpcMessage::Windows => print_windows(resp),
         IpcMessage::FocusedWindow => print_focused_window(resp),
+        IpcMessage::Outputs
+        | IpcMessage::FocusedOutput
+        | IpcMessage::KeyboardLayouts
+        | IpcMessage::PickWindow
+        | IpcMessage::PickColor => outln!("{}", format_query_result(req, resp)),
         IpcMessage::OverviewState => print_overview_state(resp),
         IpcMessage::Version => print_version(resp),
         IpcMessage::ReloadConfig => outln!("Configuration reloaded."),
@@ -885,6 +1063,55 @@ fn print_human_response(req: &IpcMessage, resp: &serde_json::Value) {
                 outln!("ok");
             }
         }
+    }
+}
+
+/// Human-readable summaries for the new niri-shaped query results. Keep
+/// unknown fields visible rather than silently hiding daemon capabilities.
+fn format_query_result(req: &IpcMessage, resp: &serde_json::Value) -> String {
+    let result = &resp["result"];
+    match req {
+        IpcMessage::Outputs => match result["outputs"].as_object() {
+            Some(outputs) if !outputs.is_empty() => outputs
+                .iter()
+                .map(|(name, output)| format!("{}: {}", name, output))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => "No outputs.".to_string(),
+        },
+        IpcMessage::FocusedOutput => match &result["focused_output"] {
+            serde_json::Value::Null => "No output is focused.".to_string(),
+            output => format!("Focused output: {}", output),
+        },
+        IpcMessage::KeyboardLayouts => {
+            let layouts = &result["keyboard_layouts"];
+            let Some(names) = layouts["names"].as_array().filter(|names| !names.is_empty()) else {
+                return "No keyboard layouts.".to_string();
+            };
+            let current = layouts["current_idx"].as_u64();
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    format!(
+                        "{} {}: {}",
+                        if current == Some(index as u64) { "*" } else { " " },
+                        index,
+                        name.as_str().unwrap_or("unknown")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        IpcMessage::PickWindow => match &result["window"] {
+            serde_json::Value::Null => "No window was picked.".to_string(),
+            window => format!("Picked window: {}", window),
+        },
+        IpcMessage::PickColor => match &result["color"] {
+            serde_json::Value::Null => "No color was picked.".to_string(),
+            color => format!("Picked color: {}", color),
+        },
+        _ => unreachable!("only query requests have these result shapes"),
     }
 }
 
@@ -1488,94 +1715,47 @@ fn print_default_bindings_table() {
 ///
 /// When `raw` is `false` (the default), each event is printed as a
 /// human-readable summary line prefixed with a wall-clock timestamp.
-fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
-    // Parse the effective event-types list.  Empty string or "*" means all.
-    let event_types: Vec<String> = if types.is_empty() || types == "*" {
-        vec![]
-    } else {
-        types
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+fn stream_events(message: &IpcMessage, timeout_secs: u64, raw: bool) -> Result<()> {
+    let IpcMessage::SubscribeEvents { event_types } = message else {
+        unreachable!("event-stream sends SubscribeEvents");
     };
-
-    let message = IpcMessage::SubscribeEvents {
-        event_types: event_types.clone(),
-    };
-
-    // The pipe of this user in this session (see `wiri::ipc::pipe_path`).
-    let pipe_path = wiri::ipc::pipe_path();
-    let pipe_wide: Vec<u16> = OsStr::new(&pipe_path)
-        .encode_wide()
-        .chain(std::iter::once(0u16))
-        .collect();
-    let timeout_ms: u32 = timeout_secs.saturating_mul(1000).min(u32::MAX as u64) as u32;
-
-    let wait_ok = unsafe { WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), timeout_ms) };
-    if !wait_ok.as_bool() {
-        let os_err = std::io::Error::last_os_error();
-        anyhow::bail!(
-            "Could not connect to wiri IPC pipe at {} — is wiri running?  ({})",
-            pipe_path,
-            os_err
-        );
-    }
-
-    let mut file = open_pipe_retrying(&pipe_path, &pipe_wide, timeout_ms).map_err(|e| {
-        anyhow::anyhow!(
-            "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-            pipe_path,
-            e
-        )
-    })?;
-
-    let data = serde_json::to_vec(&message)?;
-    file.write_all(&data)?;
-    file.flush()?;
-
-    let filter_desc = if event_types.is_empty() {
-        "all types".to_string()
-    } else {
-        event_types.join(",")
-    };
-    let mode_desc = if raw {
-        "newline-delimited JSON"
-    } else {
-        "human-readable"
-    };
-    errln!(
-        "Subscribed to events ({}) [{}]. Press Ctrl+C to exit.",
-        filter_desc,
-        mode_desc
-    );
-
-    // The server streams length-implicit JSON objects back-to-back; serde_json
-    // tolerates concatenated values in a Deserializer stream.
-    let de = serde_json::Deserializer::from_reader(file).into_iter::<serde_json::Value>();
-    for event in de {
-        match event {
-            Ok(value) => {
-                // First message is the subscribe ack: skip it silently.
-                if value.get("subscription_id").is_some() {
-                    continue;
-                }
-                if raw {
-                    // Emit compact JSON followed by a newline.
-                    // Do NOT pretty-print: third-party consumers (jq, etc.)
-                    // expect one object per line.
-                    println!("{}", serde_json::to_string(&value)?);
-                } else {
-                    outln!("{}", format_event(&value));
-                }
-            }
-            Err(e) => {
-                errln!("event stream closed: {}", e);
-                break;
-            }
+    block_on(async {
+        let mut client = connect_ipc(timeout_secs).await?;
+        let ack = client.request(message).await?;
+        warn_schema(&ack);
+        if ack.get("success").and_then(|value| value.as_bool()) == Some(false) {
+            anyhow::bail!(
+                "event subscription failed: {}",
+                ack.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
+            );
         }
-    }
-    Ok(())
+        let filter_desc = if event_types.is_empty() {
+            "all types".to_string()
+        } else {
+            event_types.join(",")
+        };
+        let mode_desc = if raw {
+            "newline-delimited JSON"
+        } else {
+            "human-readable"
+        };
+        errln!(
+            "Subscribed to events ({}) [{}]. Press Ctrl+C to exit.",
+            filter_desc,
+            mode_desc
+        );
+        // request() already consumed the acknowledgement. The client's
+        // persistent buffer retains any events received alongside it.
+        while let Some(value) = client.read_events().await? {
+            if raw {
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                outln!("{}", format_event(&value));
+            }
+            std::io::stdout().flush()?;
+        }
+        Ok(())
+    })
 }
 
 /// Format an IpcEvent JSON value as a single human-readable line:
@@ -1618,100 +1798,26 @@ fn summarize_value(v: &serde_json::Value) -> String {
 // IPC plumbing
 // ---------------------------------------------------------------------------
 
-/// Open the pipe, waiting for a free instance until `timeout_ms` has passed: another client can take the
-/// instance `WaitNamedPipeW` reported free before this one opens it (`ERROR_PIPE_BUSY`; two `events --stream`
-/// started at the same moment on a hosted CI runner hit this).
-fn open_pipe_retrying(
-    pipe_path: &str,
-    pipe_wide: &[u16],
-    timeout_ms: u32,
-) -> std::io::Result<std::fs::File> {
-    const ERROR_PIPE_BUSY: i32 = 231;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
-    loop {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(pipe_path)
-        {
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                if left.is_zero() {
-                    return Err(e);
-                }
-                let wait_ms = left.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
-                let free = unsafe { WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), wait_ms) };
-                if !free.as_bool() {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-            other => return other,
-        }
-    }
+/// The synchronous CLI drives async pipe I/O on this thread only. No worker
+/// threads or timer driver are needed.
+fn block_on<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?
+        .block_on(future)
+}
+
+async fn connect_ipc(timeout_secs: u64) -> Result<IpcClient> {
+    let mut client = IpcClient::new();
+    client.connect_with_timeout(timeout_secs).await?;
+    Ok(client)
 }
 
 fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_json::Value> {
-    // The pipe of this user in this session (see `wiri::ipc::pipe_path`).
-    let pipe_path = wiri::ipc::pipe_path();
-    let pipe_wide: Vec<u16> = OsStr::new(&pipe_path)
-        .encode_wide()
-        .chain(std::iter::once(0u16))
-        .collect();
-
-    let timeout_ms: u32 = timeout_secs.saturating_mul(1000).min(u32::MAX as u64) as u32;
-
-    let wait_ok = unsafe { WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), timeout_ms) };
-
-    if !wait_ok.as_bool() {
-        let os_err = std::io::Error::last_os_error();
-        const ERROR_SEM_TIMEOUT: i32 = 121;
-        const ERROR_FILE_NOT_FOUND: i32 = 2;
-        if os_err.raw_os_error() == Some(ERROR_SEM_TIMEOUT) {
-            anyhow::bail!(
-                "wiri busy: pipe wait timed out after {}s at {}.\n\
-                 Try increasing --timeout, or restart wiri if it is unresponsive.",
-                timeout_secs,
-                pipe_path
-            );
-        } else if os_err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) {
-            anyhow::bail!(
-                "Could not find the wiri IPC pipe at {} — is wiri running?",
-                pipe_path
-            );
-        } else {
-            anyhow::bail!(
-                "WaitNamedPipeW failed for {}: {}\n\
-                 (is wiri running?)",
-                pipe_path,
-                os_err
-            );
-        }
-    }
-
-    let mut file = open_pipe_retrying(&pipe_path, &pipe_wide, timeout_ms).map_err(|e| {
-        anyhow::anyhow!(
-            "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-            pipe_path,
-            e
-        )
-    })?;
-
-    let data = serde_json::to_vec(message)?;
-    file.write_all(&data)?;
-    file.flush()?;
-
-    let mut buf = Vec::new();
-    match file.read_to_end(&mut buf) {
-        Ok(n) if n > 0 => {
-            let value: serde_json::Value = serde_json::from_slice(&buf[..n])?;
-            Ok(value)
-        }
-        _ => Ok(serde_json::json!({
-            "success": true,
-            "note": "no response data"
-        })),
-    }
+    block_on(async {
+        let mut client = connect_ipc(timeout_secs).await?;
+        Ok(client.request(message).await?)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,14 +1900,17 @@ fn split_quoted_words(words: Vec<String>) -> (Vec<String>, Vec<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_to_ascii, format_focus, request_for, split_quoted_words, Cli};
+    use super::{
+        fold_to_ascii, format_focus, format_query_result, raw_request_text, request_for,
+        schema_warning, split_quoted_words, Cli, Commands,
+    };
     use clap::Parser;
     use wiri::ipc::IpcMessage;
 
     /// The request a command line sends to the daemon.
     fn request_of(args: &[&str]) -> IpcMessage {
         let cli = Cli::try_parse_from(args).expect("the command line parses");
-        request_for(cli.command)
+        request_for(cli.command.into_command()).expect("the request is valid")
     }
 
     #[test]
@@ -1840,6 +1949,13 @@ mod tests {
             "workspaces",
             "windows",
             "focused-window",
+            "outputs",
+            "focused-output",
+            "keyboard-layouts",
+            "pick-window",
+            "pick-color",
+            "request-error",
+            "return-error",
             "overview-state",
             "version",
         ] {
@@ -1863,6 +1979,197 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["wiri-ctl", "workspaces"]).expect("parses");
         assert!(!cli.json, "the readable output is the default");
+    }
+
+    #[test]
+    fn msg_prefix_and_new_queries_generate_the_same_requests() {
+        for (command, kind) in [
+            ("outputs", "outputs"),
+            ("focused-output", "focused_output"),
+            ("keyboard-layouts", "keyboard_layouts"),
+            ("pick-window", "pick_window"),
+            ("pick-color", "pick_color"),
+            ("request-error", "return_error"),
+            ("return-error", "return_error"),
+            ("state", "get_state"),
+            ("window-list", "window_list"),
+        ] {
+            let direct = serde_json::to_value(request_of(&["wiri-ctl", command])).unwrap();
+            let prefixed = serde_json::to_value(request_of(&["wiri-ctl", "msg", command])).unwrap();
+            assert_eq!(direct, prefixed, "{}", command);
+            assert_eq!(direct["type"], kind);
+        }
+        // The optional prefix must not change the established action parser
+        // or reinterpret the program's own command-line flags.
+        for tail in [
+            vec!["action", "set-column-width", "+10%"],
+            vec!["action", "focus-workspace", "\"2\""],
+            vec!["spawn", "wt.exe", "-d", "C:\\My Projects"],
+        ] {
+            let direct: Vec<&str> = std::iter::once("wiri-ctl")
+                .chain(tail.iter().copied())
+                .collect();
+            let prefixed: Vec<&str> = ["wiri-ctl", "msg"].into_iter().chain(tail).collect();
+            assert_eq!(
+                serde_json::to_value(request_of(&direct)).unwrap(),
+                serde_json::to_value(request_of(&prefixed)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn print_request_and_json_flags_are_global_with_or_without_msg() {
+        for args in [
+            vec!["wiri-ctl", "--print-request", "outputs"],
+            vec!["wiri-ctl", "outputs", "--print-request"],
+            vec!["wiri-ctl", "--print-request", "msg", "outputs"],
+            vec!["wiri-ctl", "msg", "--print-request", "outputs"],
+            vec!["wiri-ctl", "msg", "outputs", "--print-request"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.print_request);
+            let message = request_for(cli.command.into_command()).unwrap();
+            assert_eq!(
+                serde_json::to_value(message).unwrap(),
+                serde_json::json!({"type": "outputs"})
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "wiri-ctl",
+            "msg",
+            "output",
+            "DISPLAY1",
+            "position",
+            "-100",
+            "0",
+            "--print-request",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.print_request && cli.json);
+        assert!(matches!(
+            request_for(cli.command.into_command()).unwrap(),
+            IpcMessage::Output { .. }
+        ));
+        for args in [
+            ["wiri-ctl", "--json", "msg", "outputs"],
+            ["wiri-ctl", "msg", "--json", "outputs"],
+            ["wiri-ctl", "msg", "outputs", "--json"],
+        ] {
+            assert!(Cli::try_parse_from(args).unwrap().json);
+        }
+    }
+
+    #[test]
+    fn event_stream_alias_and_filters_have_printable_requests() {
+        for command in ["event-stream", "events"] {
+            let request = request_of(&[
+                "wiri-ctl",
+                "msg",
+                "--print-request",
+                command,
+                "--types",
+                "ignored",
+                "--filter",
+                " window_opened, window_closed, ",
+            ]);
+            assert!(matches!(
+                request,
+                IpcMessage::SubscribeEvents { event_types }
+                    if event_types == vec!["window_opened", "window_closed"]
+            ));
+            assert!(matches!(
+                request_of(&["wiri-ctl", command]),
+                IpcMessage::SubscribeEvents { event_types } if event_types.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn raw_request_argument_or_stdin_is_exactly_one_json_value() {
+        let mut stdin = std::io::Cursor::new(b"{\n \"Action\": { \"CloseWindow\": {} }\n}\n");
+        let from_stdin = raw_request_text(None, &mut stdin).unwrap();
+        assert!(!from_stdin.contains('\n'));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&from_stdin).unwrap(),
+            serde_json::json!({"Action": {"CloseWindow": {}}}));
+        let mut stdin = std::io::Cursor::new(b"\"Windows\"\n");
+        assert_eq!(raw_request_text(Some("-"), &mut stdin).unwrap(), "\"Windows\"");
+        let mut unread = std::io::Cursor::new(b"not JSON");
+        assert_eq!(raw_request_text(Some(" \"Outputs\" "), &mut unread).unwrap(), "\"Outputs\"");
+        assert_eq!(unread.position(), 0);
+        assert!(raw_request_text(Some("\"Outputs\"\n\"Windows\""), &mut unread).is_err());
+        assert!(raw_request_text(Some(""), &mut unread).is_err());
+        for args in [
+            vec!["wiri-ctl", "raw-request"],
+            vec!["wiri-ctl", "msg", "raw-request", "-"],
+            vec!["wiri-ctl", "--print-request", "raw-request", "\"Outputs\""],
+        ] {
+            assert!(matches!(Cli::try_parse_from(args).unwrap().command.into_command(), Commands::RawRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn output_actions_are_external_pascal_enums_and_defer_semantic_validation() {
+        for action in [
+            "\"On\"",
+            "\"Off\"",
+            r#"{"Mode":{"mode":"1920x1080@60"}}"#,
+            r#"{"Scale":{"scale":1.5}}"#,
+            r#"{"Transform":{"transform":"90"}}"#,
+            r#"{"Position":{"position":{"x":-100,"y":0}}}"#,
+            r#"{"Vrr":{"vrr":true}}"#,
+            r#"{"MaxBpc":{"max_bpc":10}}"#,
+            r#"{"FutureAction":{"not_validated_here":true}}"#,
+        ] {
+            let request = request_of(&["wiri-ctl", "msg", "output", "DISPLAY1", action]);
+            let IpcMessage::Output { output, action: value } = request else { panic!("output request") };
+            assert_eq!(output, "DISPLAY1");
+            assert_eq!(value, serde_json::from_str::<serde_json::Value>(action).unwrap());
+        }
+        for (words, expected) in [
+            (vec!["off"], serde_json::json!("Off")),
+            (vec!["on"], serde_json::json!("On")),
+            (vec!["mode", "auto"], serde_json::json!({"Mode":{"mode":"auto"}})),
+            (vec!["scale", "1.5"], serde_json::json!({"Scale":{"scale":1.5}})),
+            (vec!["transform", "90"], serde_json::json!({"Transform":{"transform":"90"}})),
+            (vec!["position", "-100", "0"], serde_json::json!({"Position":{"position":{"x":-100,"y":0}}})),
+            (vec!["position", "auto"], serde_json::json!({"Position":{"position":"Auto"}})),
+            (vec!["vrr", "on"], serde_json::json!({"Vrr":{"vrr":true}})),
+            (vec!["max-bpc", "999"], serde_json::json!({"MaxBpc":{"max_bpc":999}})),
+        ] {
+            let args: Vec<&str> = ["wiri-ctl", "--print-request", "output", "DISPLAY1"].into_iter().chain(words).collect();
+            let IpcMessage::Output { action, .. } = request_of(&args) else { panic!("output request") };
+            assert_eq!(action, expected);
+        }
+    }
+
+    #[test]
+    fn schema_hints_distinguish_matching_mismatched_and_old_daemons() {
+        assert!(schema_warning(&serde_json::json!({"schema_version": wiri::ipc::wire::SCHEMA_VERSION})).is_none());
+        let mismatch = schema_warning(&serde_json::json!({"schema_version": "0.9"})).unwrap();
+        assert!(mismatch.contains("mismatch") && mismatch.contains("0.9") && mismatch.contains("1.3"));
+        let old = schema_warning(&serde_json::json!({"success": true})).unwrap();
+        assert!(old.contains("pre-1.3") && old.contains("old"));
+    }
+
+    #[test]
+    fn new_query_summaries_read_the_named_result_fields() {
+        let response = serde_json::json!({"result": {
+            "outputs": {"DISPLAY1": {"name": "DISPLAY1"}},
+            "focused_output": {"name": "DISPLAY1"},
+            "keyboard_layouts": {"names": ["English", "French"], "current_idx": 1},
+            "window": {"id": 42, "title": "Editor"},
+            "color": {"r": 1.0, "g": 0.0, "b": 0.0}
+        }});
+        assert!(format_query_result(&IpcMessage::Outputs, &response).contains("DISPLAY1"));
+        assert!(format_query_result(&IpcMessage::FocusedOutput, &response).contains("DISPLAY1"));
+        assert_eq!(format_query_result(&IpcMessage::KeyboardLayouts, &response), "  0: English\n* 1: French");
+        assert!(format_query_result(&IpcMessage::PickWindow, &response).contains("Editor"));
+        assert!(format_query_result(&IpcMessage::PickColor, &response).contains("1.0"));
+        let empty = serde_json::json!({"result": {"focused_output": null, "window": null, "color": null}});
+        assert_eq!(format_query_result(&IpcMessage::FocusedOutput, &empty), "No output is focused.");
+        assert_eq!(format_query_result(&IpcMessage::PickWindow, &empty), "No window was picked.");
+        assert_eq!(format_query_result(&IpcMessage::PickColor, &empty), "No color was picked.");
     }
 
     #[test]
