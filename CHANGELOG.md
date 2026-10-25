@@ -57,6 +57,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Shared-desktop live safety.** The harness refuses foreign daemons instead of killing them,
   isolates AppData/temp inside the worktree, and retains interrupted-run recovery state. The
   recovery metric checks this run's forms, not unrelated windows legitimately hidden again.
+### Phase 2C — input (lane B)
+- Keyboard binds now run before the shell in `WH_KEYBOARD_LL`, including configured Win chords;
+  Win+L, Win+D and Win+Shift+S remain Windows-owned. Bound down/up pairs, per-bind repeat/cooldown,
+  manual shortcut inhibition (`allow-inhibiting=false` escape hatches), and the wiri extension
+  `on-release=true` work without stealing unbound keys or faking modifier releases. RegisterHotKey
+  remains a down-only fallback; the hook uses the existing hotkey thread instead of two extra threads.
 
 ### Phase 2A — a real config parser, window rules, fullscreen, IPC (2026-10-25)
 - **A real KDL config parser with visible errors.**  The line scanner is gone.  `src/config/kdl.rs` reads

@@ -2241,6 +2241,12 @@ impl Decoder {
         cfg.binds.hotkeys.extend(parsed);
     }
 
+    fn decode_bind_release(&mut self, node: &Node, value: &Value, bind: &mut HotkeyBinding) {
+        if let Some(release) = self.value_bool(node, value) {
+            bind.release = release;
+        }
+    }
+
     fn decode_bind(&mut self, node: &Node) -> Option<HotkeyBinding> {
         // chord
         let parts: Vec<&str> = node.name.split('+').collect();
@@ -2339,6 +2345,10 @@ impl Decoder {
                     if let Some(v) = self.value_bool(node, &p.value) {
                         bind.repeat = v;
                     }
+                }
+                // Compatibility extension: pinned niri has no generic release property.
+                "on-release" | "release" => {
+                    self.decode_bind_release(node, &p.value, &mut bind);
                 }
                 "cooldown-ms" => {
                     if let Some(v) = self.value_number(node, &p.value, 0.0, 3_600_000.0) {

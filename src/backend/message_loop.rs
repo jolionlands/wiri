@@ -2,7 +2,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -17,6 +17,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::BackendHandle;
 use crate::input::{Action, SizeChange};
+use crate::input::keyboard::{self, BindOptions};
+#[cfg(test)]
+use crate::input::keyboard::bind_may_fire;
 use crate::layout::{ScrollDirection, TilingEngine};
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
@@ -249,37 +252,6 @@ fn merge_hotkeys(
     (merged, overridden)
 }
 
-/// niri's per-bind options that change when a hotkey fires: `repeat=false` (holding the key
-/// fires the action once) and `cooldown-ms=` (after a fire the bind is ignored for that long).
-#[derive(Debug, Clone, Default)]
-struct BindOptions {
-    /// False: the key's auto-repeat does not fire the action again.
-    no_repeat: bool,
-    cooldown: Option<std::time::Duration>,
-    /// `hotkey-overlay-title=`: `Some(Some(text))` replaces the action name in the key-bindings
-    /// overlay, `Some(None)` (`null`) hides the bind from it.
-    title: Option<Option<String>>,
-}
-
-/// Whether a hotkey press fires its action: `repeat` says the key is auto-repeating, `last`
-/// is when the bind last fired.  Pure so the rules can be tested.
-fn bind_may_fire(
-    options: &BindOptions,
-    is_repeat: bool,
-    last: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> bool {
-    if options.no_repeat && is_repeat {
-        return false;
-    }
-    if let (Some(cooldown), Some(last)) = (options.cooldown, last) {
-        if now.saturating_duration_since(last) < cooldown {
-            return false;
-        }
-    }
-    true
-}
-
 /// Build hotkey list from config binds, optionally extending the built-in
 /// defaults so newly-shipped actions stay available to users with stale
 /// configs.  The second value holds the options of the binds that have any.
@@ -328,12 +300,14 @@ fn build_hotkey_list(
     for bind in config_binds {
         match bind_to_hotkey(bind, prefix) {
             Ok(row) => {
-                if !bind.repeat || bind.cooldown_ms.is_some() || bind.hotkey_overlay_title.is_some()
+                if !bind.repeat || bind.release || !bind.allow_inhibiting || bind.cooldown_ms.is_some() || bind.hotkey_overlay_title.is_some()
                 {
                     options.insert(
                         (row.0, row.1),
                         BindOptions {
                             no_repeat: !bind.repeat,
+                            release: bind.release,
+                            allow_inhibiting: bind.allow_inhibiting,
                             cooldown: bind
                                 .cooldown_ms
                                 .map(|ms| std::time::Duration::from_millis(ms as u64)),
@@ -429,6 +403,7 @@ fn register_hotkeys(hwnd: HWND, hotkeys: &[(u32, u32, Action)]) -> (Vec<i32>, Ha
             );
             continue;
         }
+        if !keyboard::ENGINE.lock().fallback_allowed((*mods, *vk)) { continue; }
         let result = unsafe { RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(*mods), *vk) };
         if result.is_ok() {
             registered_ids.push(id);
@@ -458,6 +433,13 @@ fn register_hotkeys(hwnd: HWND, hotkeys: &[(u32, u32, Action)]) -> (Vec<i32>, Ha
         .collect();
 
     (registered_ids, action_map)
+}
+
+fn visible_binding_ids(hotkeys: &[(u32, u32, Action)], fallback: &[i32], hook_active: bool) -> Vec<i32> {
+    if !hook_active { return fallback.to_vec(); }
+    let engine = keyboard::ENGINE.lock();
+    hotkeys.iter().enumerate().filter(|(_, (m,v,a))| engine.active((*m,*v)) && !is_overview_escape_binding(*m,*v,a))
+        .map(|(i,_)| 32768 + i as i32).collect()
 }
 
 /// Unregister all hotkeys by ID
@@ -549,27 +531,6 @@ fn overlay_rows(bindings: &[RegisteredBinding]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The options of the registered binds that have any, by hotkey id (with the virtual key
-/// that auto-repeat is detected on).
-fn options_by_id(
-    hotkeys: &[(u32, u32, Action)],
-    registered_ids: &[i32],
-    options: &HashMap<(u32, u32), BindOptions>,
-) -> HashMap<i32, (u32, BindOptions)> {
-    let base_id = 32768i32;
-    let mut by_id = HashMap::new();
-    for (i, (mods, vk, _)) in hotkeys.iter().enumerate() {
-        let id = base_id + i as i32;
-        if !registered_ids.contains(&id) {
-            continue;
-        }
-        if let Some(o) = options.get(&(*mods, *vk)) {
-            by_id.insert(id, (*vk, o.clone()));
-        }
-    }
-    by_id
-}
-
 /// Return a clone of every hotkey currently registered with Windows.
 /// Empty when the hotkey thread hasn't started or registration failed.
 pub fn current_bindings() -> Vec<RegisteredBinding> {
@@ -601,24 +562,6 @@ impl MessageLoop {
     ) {
         let running = self.running.clone();
         let quit_tx = self.quit_tx.clone();
-        let (keyboard_action_tx, keyboard_action_rx) = mpsc::channel();
-        crate::input::set_keyboard_action_sender(keyboard_action_tx);
-        if let Err(e) = crate::input::start_keyboard_hook() {
-            warn!("Double-Alt keyboard hook disabled: {}", e);
-        }
-        {
-            let engine = engine.clone();
-            let backend_handle = backend_handle.clone();
-            let quit_tx = quit_tx.clone();
-            std::thread::spawn(move || {
-                while let Ok(action) = keyboard_action_rx.recv() {
-                    // Every Escape press in every application arrives here (the hook
-                    // reports it without consuming it), so this is not worth an INFO line.
-                    debug!("KEYHOOK -> {:?}", action);
-                    execute_action(&action, &engine, &backend_handle, &quit_tx);
-                }
-            });
-        }
         std::thread::spawn(move || {
             Self::run_message_loop(running, engine, backend_handle, quit_tx);
         });
@@ -687,13 +630,17 @@ impl MessageLoop {
 
         // Register initial hotkeys.  Keep `current_hotkeys` so the snapshot
         // and hot-reload paths share a single source of truth.
-        let (current_hotkeys, bind_options) = build_hotkey_list(&engine);
-        let (mut registered_ids, mut action_map) = register_hotkeys(hwnd, &current_hotkeys);
+        crate::input::dispatch::initialize(thread_id);
+        let mut hook_active = false;
+        match crate::input::start_keyboard_hook() {
+            Ok(()) => hook_active = true,
+            Err(e) => warn!("Keyboard bind hook disabled; RegisterHotKey fallback only: {}", e),
+        }
+        let (mut current_hotkeys, bind_options) = build_hotkey_list(&engine);
+        keyboard::ENGINE.lock().configure(&current_hotkeys, &bind_options);
+        let (mut registered_ids, _) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
-        update_current_bindings_snapshot(&current_hotkeys, &registered_ids, &bind_options);
-        // niri's `repeat=false` / `cooldown-ms=` binds, by hotkey id, and when each last fired.
-        let mut id_options = options_by_id(&current_hotkeys, &registered_ids, &bind_options);
-        let mut last_fire: HashMap<i32, std::time::Instant> = HashMap::new();
+        update_current_bindings_snapshot(&current_hotkeys, &visible_binding_ids(&current_hotkeys, &registered_ids, hook_active), &bind_options);
 
         *running.lock() = true;
         info!(
@@ -717,30 +664,34 @@ impl MessageLoop {
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
                     let (new_hotkeys, new_options) = build_hotkey_list(&engine);
-                    let (new_ids, new_map) = register_hotkeys(hwnd, &new_hotkeys);
+                    keyboard::ENGINE.lock().configure(&new_hotkeys, &new_options);
+                    let (new_ids, _) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
-                    action_map = new_map;
-                    update_current_bindings_snapshot(&new_hotkeys, &registered_ids, &new_options);
-                    id_options = options_by_id(&new_hotkeys, &registered_ids, &new_options);
-                    last_fire.clear();
+                    update_current_bindings_snapshot(&new_hotkeys, &visible_binding_ids(&new_hotkeys, &registered_ids, hook_active), &new_options);
+                    current_hotkeys = new_hotkeys;
                     info!("Hotkey reload complete");
                     continue;
                 }
-                if msg.message == 0x0312 {
-                    // WM_HOTKEY
-                    let hotkey_id = msg.wParam.0 as i32;
-                    if let Some(action) = action_map.get(&hotkey_id) {
-                        if let Some((vk, options)) = id_options.get(&hotkey_id) {
-                            let now = std::time::Instant::now();
-                            let is_repeat = crate::input::last_press_was_repeat(*vk);
-                            if !bind_may_fire(options, is_repeat, last_fire.get(&hotkey_id).copied(), now) {
-                                debug!("HOTKEY id={} ignored (key repeat or cooldown)", hotkey_id);
-                                continue;
+                if msg.message == crate::input::dispatch::WM_INPUT_WORK {
+                    for work in crate::input::dispatch::take() {
+                        match work {
+                            crate::input::dispatch::Work::Action(action) => {
+                                info!("KEYHOOK -> {:?}", action);
+                                execute_action(&action, &engine, &backend_handle, &quit_tx);
                             }
-                            last_fire.insert(hotkey_id, now);
+                            crate::input::dispatch::Work::Task(task) => task(),
                         }
-                        info!("HOTKEY id={} -> {:?}", hotkey_id, action);
-                        execute_action(action, &engine, &backend_handle, &quit_tx);
+                    }
+                } else if msg.message == 0x0312 {
+                    // WM_HOTKEY is fallback only: a down consumed by WH_KEYBOARD_LL
+                    // never generates it, so normal keys cannot double-fire.
+                    let index = (msg.wParam.0 as i32 - 32768) as usize;
+                    if let Some((mods, vk, _)) = current_hotkeys.get(index) {
+                        let action = keyboard::ENGINE.lock().fallback((*mods, *vk), crate::input::last_press_was_repeat(*vk), std::time::Instant::now());
+                        if let Some(action) = action {
+                            info!("HOTKEY id={} -> {:?}", msg.wParam.0, action);
+                            execute_action(&action, &engine, &backend_handle, &quit_tx);
+                        }
                     }
                 } else {
                     let _ = TranslateMessage(&msg);
@@ -758,6 +709,8 @@ impl MessageLoop {
         }
 
         unregister_hotkeys(hwnd, &registered_ids);
+        crate::input::stop_keyboard_hook();
+        crate::input::dispatch::shutdown();
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
@@ -806,7 +759,6 @@ impl MessageLoop {
     pub fn stop(&self) {
         *self.running.lock() = false;
         crate::input::stop_keyboard_hook();
-        crate::input::clear_keyboard_action_sender();
         let state = HOTKEY_THREAD.lock();
         if let Some(s) = &*state {
             unsafe {
@@ -850,35 +802,12 @@ impl Default for MessageLoop {
     }
 }
 
-/// Key-repeat debounce state. Allows max 8 actions/sec for held keys.
-use std::sync::LazyLock;
-static LAST_ACTION: LazyLock<parking_lot::Mutex<(Action, std::time::Instant)>> =
-    LazyLock::new(|| {
-        // Start 60s in the past so the first real Action::Quit (or any action)
-        // within 125 ms of startup is never silently dropped.
-        let past = std::time::Instant::now() - std::time::Duration::from_secs(60);
-        parking_lot::Mutex::new((Action::Quit, past))
-    });
-
 fn execute_action(
     action: &Action,
     engine: &Arc<parking_lot::RwLock<TilingEngine>>,
     backend: &BackendHandle,
     quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
-    // Debounce key repeat: derive from config keyboard.repeat_rate (defaults to ~8/sec).
-    {
-        let debounce_ms = engine
-            .read()
-            .full_config()
-            .map(|c| crate::input::repeat_debounce_ms(&c.input))
-            .unwrap_or(125);
-        let mut last = LAST_ACTION.lock();
-        if last.0 == *action && last.1.elapsed() < std::time::Duration::from_millis(debounce_ms) {
-            return;
-        }
-        *last = (action.clone(), std::time::Instant::now());
-    }
     perform_action(action, engine, backend, quit_tx);
 }
 
@@ -926,7 +855,8 @@ pub(crate) fn perform_action_on(
         | Action::Screenshot
         | Action::WindowScreenshot
         | Action::ScreenshotWindow
-        | Action::ShowKeyBindings => None,
+        | Action::ShowKeyBindings
+        | Action::ToggleKeyboardShortcutsInhibit => None,
         Action::CloseWindow => engine
             .write()
             .resolve_action_target_for(foreground, true, backend),
@@ -982,6 +912,13 @@ pub(crate) fn perform_action_on(
     }
 
     match action {
+        Action::ToggleKeyboardShortcutsInhibit => {
+            keyboard::ENGINE.lock().toggle_inhibit();
+            info!("Keyboard shortcuts inhibited: {}", keyboard::ENGINE.lock().inhibited());
+            if let Some(thread) = HOTKEY_THREAD.lock().as_ref() {
+                unsafe { let _ = PostThreadMessageW(thread.thread_id, WM_RELOAD_HOTKEYS, WPARAM(0), LPARAM(0)); }
+            }
+        }
         Action::FocusColumnLeft => {
             engine.write().focus_left(backend);
         }
@@ -1839,11 +1776,13 @@ mod tests {
         ];
         let mut options = HashMap::new();
         options.insert((MOD_CTRL | MOD_ALT, 0x51u32), cooldown.clone());
-        let by_id = options_by_id(&hotkeys, &[32768, 32769], &options);
-        assert_eq!(by_id.len(), 1);
-        assert_eq!(by_id.get(&32769).map(|(vk, _)| *vk), Some(0x51));
-        // A bind Windows refused to register has no options to look up.
-        assert!(options_by_id(&hotkeys, &[32768], &options).is_empty());
+        let mut keys = keyboard::KeyboardEngine::default();
+        keys.configure(&hotkeys, &options);
+        let chord = (MOD_CTRL | MOD_ALT, 0x51);
+        assert_eq!(keys.fallback(chord, false, t0), Some(Action::CloseWindow));
+        assert!(keys.fallback(chord, false, t0).is_none());
+        // Different binds do not share their cooldown, even for the same action.
+        assert_eq!(keys.fallback((MOD_CTRL | MOD_ALT, 0x54), false, t0), Some(Action::ToggleFloating));
     }
 
     #[test]

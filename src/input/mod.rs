@@ -1,3 +1,5 @@
+pub mod dispatch;
+pub mod keyboard;
 pub mod grab;
 pub mod hotkey;
 pub mod low_level_hook;
@@ -9,8 +11,8 @@ pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORD
 pub use hotkey::{HotkeyBinding, HotkeyId};
 pub use low_level_hook::{
     begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab,
-    clear_keyboard_action_sender, current_grab, is_grab_active, last_press_was_repeat,
-    set_keyboard_action_sender, start_keyboard_hook, start_mouse_hook, stop_keyboard_hook,
+    current_grab, is_grab_active, last_press_was_repeat,
+    start_keyboard_hook, start_mouse_hook, stop_keyboard_hook,
     stop_mouse_hook, GrabState,
 };
 pub use mouse::{MouseFocusConfig, MouseTracker};
@@ -32,6 +34,9 @@ pub enum Action {
     /// without a shell.
     SpawnCmd(String),
     CloseWindow,
+    /// Toggle manual shortcut inhibition. Windows has no Wayland inhibitor protocol;
+    /// allow-inhibiting=false binds and this escape hatch remain active.
+    ToggleKeyboardShortcutsInhibit,
     MoveColumnLeft,
     MoveColumnRight,
     FocusColumnLeft,
@@ -367,6 +372,7 @@ pub fn action_name_known(name: &str) -> bool {
 pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
     let is_quoted = |i: usize| quoted.get(i).copied().unwrap_or(false);
     match name {
+        "toggle-keyboard-shortcuts-inhibit" => Some(Action::ToggleKeyboardShortcutsInhibit),
         "focus-column-left" | "focus-left" => Some(Action::FocusColumnLeft),
         "focus-column-right" | "focus-right" => Some(Action::FocusColumnRight),
         "focus-up" | "focus-window-up" => Some(Action::FocusUp),

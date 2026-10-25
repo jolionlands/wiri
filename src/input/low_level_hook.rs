@@ -4,17 +4,8 @@
 //! globally. When a grab is active (user is dragging a window), the hook
 //! consumes mouse events and dispatches them to the grab handler.
 //!
-//! ## Double-Alt keyboard hook
-//!
-//! A companion `WH_KEYBOARD_LL` hook is installed by `start_keyboard_hook` /
-//! stopped by `stop_keyboard_hook`.  It tracks consecutive Alt key-down
-//! events: when two Alt presses arrive within `DOUBLE_TAP_WINDOW_MS` (250 ms)
-//! with no intervening non-Alt key, `Action::OverviewToggle` is fired via the
-//! action-sender channel wired by `set_keyboard_action_sender`.
-//!
-//! The hook is a **pass-through**: it calls `CallNextHookEx` for every event
-//! and only consumes the very last Alt-down that completes a double-tap
-//! (by returning `LRESULT(1)` for that single event).
+//! WH_KEYBOARD_LL is the primary bind engine on the existing hotkey thread.
+//! Only bound non-modifier keys are consumed, with RegisterHotKey as a fallback.
 
 use parking_lot::Mutex;
 use std::sync::{Arc, LazyLock};
@@ -48,12 +39,7 @@ const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_KEYUP: u32 = 0x0101;
 const WM_SYSKEYUP: u32 = 0x0105;
 
-/// Virtual key code for the Alt key (either left or right Alt).
-const VK_MENU: u32 = 0x12;
 const VK_ESCAPE: u32 = 0x1B;
-
-/// Maximum gap between two Alt key-down events that counts as a double-tap (ms).
-const DOUBLE_TAP_WINDOW_MS: u128 = 250;
 
 // Key auto-repeat tracking for binds with `repeat=false`.  The keyboard hook sees every key
 // down and up before the system turns a registered chord into WM_HOTKEY, so by the time
@@ -126,19 +112,6 @@ static HOOK_HANDLE: LazyLock<Mutex<Option<HookThread>>> = LazyLock::new(|| Mutex
 
 /// Handle for the installed `WH_KEYBOARD_LL` hook.
 static KB_HOOK_HANDLE: LazyLock<Mutex<Option<HookThread>>> = LazyLock::new(|| Mutex::new(None));
-
-/// Timestamp of the last Alt key-down event.  `None` means the chain was
-/// broken (another key was pressed) or no Alt has been seen yet.
-static LAST_ALT_DOWN: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
-
-/// Whether the previous Alt-down is still being held (haven't seen an Alt-up yet).
-/// Used to distinguish a held Alt from a fresh second tap.
-static ALT_HELD: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
-
-/// Optional sender for `Action` values produced by the keyboard hook.
-/// Wired by `set_keyboard_action_sender`.
-static KB_ACTION_TX: LazyLock<Mutex<Option<std::sync::mpsc::Sender<crate::input::Action>>>> =
-    LazyLock::new(|| Mutex::new(None));
 
 fn run_hook_message_loop(name: &str) {
     let mut msg = MSG::default();
@@ -251,175 +224,52 @@ pub fn stop_mouse_hook() {
 // Keyboard hook — double-Alt detection
 // ---------------------------------------------------------------------------
 
-/// Wire an `Action` sender so the keyboard hook can fire `OverviewToggle`
-/// when a double-Alt is detected.  Must be called before `start_keyboard_hook`.
-pub fn set_keyboard_action_sender(tx: std::sync::mpsc::Sender<crate::input::Action>) {
-    *KB_ACTION_TX.lock() = Some(tx);
-}
-
-pub fn clear_keyboard_action_sender() {
-    *KB_ACTION_TX.lock() = None;
-}
-
-/// Install the low-level keyboard hook for double-Alt detection.
-///
-/// Installs the hook on a dedicated Win32 message-pump thread.
-/// The hook callback is driven by `GetMessage` / `DispatchMessage`. Safe to call
-/// again after `stop_keyboard_hook` — a fresh hook is installed.  Calling
-/// while already installed logs a warning and returns without re-installing.
+/// Install WH_KEYBOARD_LL on the existing hotkey message thread. The callback only
+/// evaluates a small state machine and posts actions; no new input thread is created.
 pub fn start_keyboard_hook() -> Result<(), String> {
-    if KB_HOOK_HANDLE.lock().is_some() {
-        warn!("keyboard hook already installed; skipping duplicate SetWindowsHookExW");
-        return Ok(());
-    }
-
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("wiri-keyboard-hook".to_string())
-        .spawn(move || {
-            let thread_id = unsafe { GetCurrentThreadId() };
-            let hook = unsafe {
-                SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(keyboard_hook_callback),
-                    windows::Win32::Foundation::HMODULE::default(),
-                    0,
-                )
-            };
-
-            match hook {
-                Ok(h) => {
-                    *KB_HOOK_HANDLE.lock() = Some(HookThread {
-                        hook: SendHook(h),
-                        thread_id,
-                    });
-                    info!("Low-level keyboard hook installed (double-Alt detection)");
-                    let _ = ready_tx.send(Ok(()));
-                    run_hook_message_loop("keyboard");
-                    if let Some(hook_thread) = take_hook_for_thread(&KB_HOOK_HANDLE, thread_id) {
-                        unsafe {
-                            let _ = UnhookWindowsHookEx(hook_thread.hook.0);
-                        }
-                        info!("Low-level keyboard hook removed");
-                    }
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(format!(
-                        "SetWindowsHookExW(WH_KEYBOARD_LL) failed: {:?}",
-                        e
-                    )));
-                }
-            }
-        })
-        .map_err(|e| format!("failed to spawn keyboard hook thread: {}", e))?;
-
-    ready_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|e| format!("keyboard hook did not start: {}", e))?
+    if KB_HOOK_HANDLE.lock().is_some() { return Ok(()); }
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_callback), windows::Win32::Foundation::HMODULE::default(), 0) }
+        .map_err(|e| format!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {e}"))?;
+    *KB_HOOK_HANDLE.lock() = Some(HookThread { hook: SendHook(hook), thread_id: unsafe { GetCurrentThreadId() } });
+    info!("Low-level keyboard bind hook installed on hotkey thread");
+    Ok(())
 }
 
-/// Uninstall the low-level keyboard hook.
 pub fn stop_keyboard_hook() {
-    if let Some(hook_thread) = KB_HOOK_HANDLE.lock().take() {
-        unsafe {
-            let _ = UnhookWindowsHookEx(hook_thread.hook.0);
-            let _ = PostThreadMessageW(
-                hook_thread.thread_id,
-                WM_STOP_HOOK_LOOP,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
-        info!("Low-level keyboard hook removed");
+    if let Some(h) = KB_HOOK_HANDLE.lock().take() {
+        unsafe { let _ = UnhookWindowsHookEx(h.hook.0); }
     }
 }
 
-/// Low-level keyboard hook callback.
-///
-/// Pass-through for all keys except Alt.  On Alt-down:
-/// - If `LAST_ALT_DOWN` is set, `ALT_HELD` is false, and elapsed < 250 ms →
-///   double-tap detected: fire `Action::OverviewToggle`, clear the timestamp,
-///   and consume the event (`LRESULT(1)`).
-/// - Otherwise, record the timestamp and pass through.
-///
-/// On any non-Alt key-down: clear `LAST_ALT_DOWN` (breaks the chain).
-unsafe extern "system" fn keyboard_hook_callback(
-    n_code: i32,
-    w_param: WPARAM,
-    l_param: LPARAM,
-) -> LRESULT {
-    if n_code < 0 {
-        return CallNextHookEx(None, n_code, w_param, l_param);
-    }
+// A tagged, unassigned virtual key makes the shell see a chord rather than a lone
+// Win/Alt tap, without faking a modifier up (which would break a physically held key).
+const MENU_MASK_TAG: usize = 0x57495249;
+fn mask_shell_menu() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY};
+    let event = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xE8), dwFlags: flags, dwExtraInfo: MENU_MASK_TAG, ..Default::default() } } };
+    let events = [event(Default::default()), event(KEYEVENTF_KEYUP)];
+    unsafe { let _ = SendInput(&events, std::mem::size_of::<INPUT>() as i32); }
+}
 
-    let msg = w_param.0 as u32;
+unsafe extern "system" fn keyboard_hook_callback(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if n_code < 0 { return CallNextHookEx(None, n_code, w_param, l_param); }
     let kb = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
+    if kb.dwExtraInfo == MENU_MASK_TAG { return CallNextHookEx(None, n_code, w_param, l_param); }
+    let msg = w_param.0 as u32;
+    let pressed = match msg { WM_KEYDOWN | WM_SYSKEYDOWN => true, WM_KEYUP | WM_SYSKEYUP => false, _ => return CallNextHookEx(None,n_code,w_param,l_param) };
     let vk = kb.vkCode;
-
-    let is_key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-    let is_key_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-
     {
         use std::sync::atomic::Ordering;
-        let slot = (vk & 0xFF) as usize;
-        if is_key_down {
-            let was_down = KEY_IS_DOWN[slot].swap(true, Ordering::Relaxed);
-            KEY_PRESS_WAS_REPEAT[slot].store(was_down, Ordering::Relaxed);
-        } else if is_key_up {
-            KEY_IS_DOWN[slot].store(false, Ordering::Relaxed);
-            KEY_PRESS_WAS_REPEAT[slot].store(false, Ordering::Relaxed);
-        }
+        let slot = (vk & 255) as usize;
+        let old = KEY_IS_DOWN[slot].swap(pressed, Ordering::Relaxed);
+        KEY_PRESS_WAS_REPEAT[slot].store(pressed && old, Ordering::Relaxed);
     }
-
-    if is_key_down {
-        if vk == VK_MENU {
-            // Alt key-down event.
-            let mut last = LAST_ALT_DOWN.lock();
-            let mut held = ALT_HELD.lock();
-
-            if let Some(prev) = *last {
-                // There was a previous Alt-down.  Check that:
-                //   1. The key was released between the two presses (!held).
-                //   2. The gap is within the double-tap window.
-                if !*held && prev.elapsed().as_millis() < DOUBLE_TAP_WINDOW_MS {
-                    // Double-tap confirmed.
-                    *last = None;
-                    *held = false;
-                    drop(last);
-                    drop(held);
-                    // Fire OverviewToggle.
-                    if let Some(tx) = KB_ACTION_TX.lock().as_ref() {
-                        let _ = tx.send(crate::input::Action::OverviewToggle);
-                    }
-                    // Consume this Alt-down so the system doesn't act on it.
-                    return LRESULT(1);
-                } else {
-                    // Chain broken or gap too large — start fresh.
-                    *last = Some(Instant::now());
-                    *held = true;
-                }
-            } else {
-                // First Alt-down.
-                *last = Some(Instant::now());
-                *held = true;
-            }
-        } else if vk == VK_ESCAPE {
-            *LAST_ALT_DOWN.lock() = None;
-            *ALT_HELD.lock() = false;
-            if let Some(tx) = KB_ACTION_TX.lock().as_ref() {
-                let _ = tx.send(crate::input::Action::OverviewExit);
-            }
-        } else {
-            // Any non-Alt key-down breaks the double-tap chain.
-            *LAST_ALT_DOWN.lock() = None;
-            *ALT_HELD.lock() = false;
-        }
-    } else if is_key_up && vk == VK_MENU {
-        // Alt released — mark as not held so the next Alt-down can complete a double-tap.
-        *ALT_HELD.lock() = false;
-    }
-
-    CallNextHookEx(None, n_code, w_param, l_param)
+    let decision = crate::input::keyboard::ENGINE.lock().event(vk, pressed, Instant::now());
+    if decision.mask_menu { mask_shell_menu(); }
+    if let Some(action) = decision.action { crate::input::dispatch::send(action); }
+    // Escape remains available to applications, but also exits the manager's modes.
+    if pressed && vk == VK_ESCAPE && !decision.consume { crate::input::dispatch::send(crate::input::Action::OverviewExit); }
+    if decision.consume { LRESULT(1) } else { CallNextHookEx(None, n_code, w_param, l_param) }
 }
 
 /// Start a move grab (called when Alt+LButton is pressed on a tiled window)

@@ -1221,12 +1221,14 @@ pub struct HotkeyBinding {
     /// niri's `repeat=false` turns this off: holding the key fires the action once.  True
     /// (the default) lets the key's auto-repeat fire it again.
     pub repeat: bool,
+    /// Wiri extension `on-release=true` (also `release=true`); pinned niri has no
+    /// generic release-bind property. The chord is captured on down, fired on up.
     pub release: bool,
     /// niri's `cooldown-ms=`: after the action fired, the bind is ignored for this long.
     pub cooldown_ms: Option<u32>,
     /// niri's `allow-when-locked=`: accepted; a locked Windows session never delivers hotkeys.
     pub allow_when_locked: bool,
-    /// niri's `allow-inhibiting=`: accepted; wiri has no shortcut inhibition.
+    /// niri's `allow-inhibiting=`: false keeps the bind active during shortcut inhibition.
     pub allow_inhibiting: bool,
     /// niri's `hotkey-overlay-title=`: `Some(Some(text))` is the title, `Some(None)`
     /// (`hotkey-overlay-title=null`) hides the bind from the overlay.
