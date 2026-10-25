@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — single-instance probe
+- Resolve the startup probe and startup log with `ipc::pipe_path()`, matching the server/client user-session endpoint and `WIRI_PIPE` override instead of probing the unused global prefix. The server's listener check remains unchanged.
+
 ### Phase 2B integration — desktop acceptance checks
 - Add the source lane's 102 H16–H21 checks through one Lane A entry point, retaining H22–H29, IPC and performance phases unchanged. Classify an intentional decoration host as passive only when both its class and all required extended styles match; H16 separately checks styles, shell exclusion and cleanup. No older assertion is weakened.
 

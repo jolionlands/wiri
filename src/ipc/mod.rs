@@ -27,11 +27,9 @@ pub const PIPE_ENV_VAR: &str = "WIRI_PIPE";
 /// The pipe name without the part that makes it the pipe of one user in one
 /// session.  The pipe wiri serves on is [`pipe_path`].
 ///
-/// This is also the name the single-instance probe in `main.rs` looks at.  That
-/// probe cannot be given the per-user name without changing `main.rs`, and it
-/// is harmless as it is: the pipe of this name is not served any more, so the
-/// probe never fires.  The check that matters is made by the IPC server
-/// ([`pipe_has_listener`]), against the pipe of this user and session.
+/// Only a name prefix, not a listener endpoint. The single-instance probe in
+/// `main.rs`, the IPC server ([`pipe_has_listener`]) and clients all resolve
+/// [`pipe_path`], including the user/session suffix or `WIRI_PIPE` override.
 pub const PIPE_PATH: &str = r"\\.\pipe\wiri_control";
 
 /// The pipe wiri serves on: `\\.\pipe\wiri_control_<user>_<session>`.

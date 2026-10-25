@@ -176,7 +176,8 @@ async fn main() -> Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::System::Pipes::WaitNamedPipeW;
-        let pipe_w: Vec<u16> = std::ffi::OsStr::new(wiri::ipc::PIPE_PATH)
+        let pipe_path = wiri::ipc::pipe_path();
+        let pipe_w: Vec<u16> = std::ffi::OsStr::new(&pipe_path)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
@@ -189,7 +190,7 @@ async fn main() -> Result<()> {
         if exists.as_bool() {
             error!(
                 "Another wiri instance is already running (pipe {} has an active listener).",
-                wiri::ipc::PIPE_PATH
+                pipe_path
             );
             error!("Use `wiri-ctl quit` to stop it, or kill the process first.");
             std::process::exit(2);
@@ -508,7 +509,7 @@ async fn main() -> Result<()> {
             error!("IPC server error: {}", e);
         }
     });
-    info!("IPC server started on {}", wiri::ipc::PIPE_PATH);
+    info!("IPC server started on {}", wiri::ipc::pipe_path());
     // A client that subscribes to the event stream is told how the config loaded at startup
     // (nobody is subscribed yet: the server only keeps it for the replay).
     ipc_server.broadcast_event(IpcEvent::ConfigLoaded {
