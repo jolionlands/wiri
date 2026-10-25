@@ -972,11 +972,11 @@ fn print_monitor_list(resp: &serde_json::Value) {
     }
 
     outln!(
-        "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {}",
-        "F", "BOUNDS (x,y wxh)", "DPI", "WS", "WIN", "ID", "WORK AREA (x,y wxh)"
+        "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {:<20}  {}",
+        "F", "BOUNDS (x,y wxh)", "DPI", "WS", "WIN", "ID", "WORK AREA (x,y wxh)", "NAME"
     );
     outln!(
-        "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {}",
+        "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5}  {:<20}  {}",
         "─".repeat(3),
         "─".repeat(18),
         "─".repeat(10),
@@ -984,6 +984,7 @@ fn print_monitor_list(resp: &serde_json::Value) {
         "─".repeat(3),
         "─".repeat(5),
         "─".repeat(20),
+        "─".repeat(12),
     );
 
     for m in &result {
@@ -1012,9 +1013,10 @@ fn print_monitor_list(resp: &serde_json::Value) {
         let win_count = m.get("window_count").and_then(|v| v.as_u64()).unwrap_or(0);
         let id = m.get("output_id").and_then(|v| v.as_u64()).unwrap_or(0);
         let focused = m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
+        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
         outln!(
-            "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5x}  {}",
+            "  {:<3}  {:<18}  {:<10}  {:<5}  {:>3}  {:>5x}  {:<20}  {}",
             if focused { "*" } else { " " },
             format!("{},{} {}x{}", bx, by, bw, bh),
             format!("{:.0}% ({:.1})", scale * 100.0, scale),
@@ -1022,6 +1024,7 @@ fn print_monitor_list(resp: &serde_json::Value) {
             win_count,
             id & 0xFFFF,
             format!("{},{} {}x{}", wx, wy, ww, wh),
+            name,
         );
     }
 

@@ -25,6 +25,11 @@
 #          last good config and reports it (log, config_loaded event, tray balloon), a half-written save is applied once,
 #          a BOM or UTF-16 file loads, an include in another directory is read and watched, a bad config at startup
 #          falls back to the defaults and says why.
+#          H13 window rules that act (Phase 2A item 2): default-column-width / default-window-height, open-maximized,
+#          open-floating, open-fullscreen, open-on-workspace (by name) / open-in-workspace, open-on-output (a real name and one
+#          that is not there), open-focused false, min/max size limits, opacity, `app-id` regexes (process name), several
+#          `match` lines and an `exclude` line, rules that follow the title and the focus of a window while it lives, and a
+#          config reload that reaches the windows that are open.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
 # Outputs (all in C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png screenshots,
@@ -113,6 +118,15 @@ public static class LT {
   // Visible bounds (what the user sees, without the invisible resize border).
   public static RECT Visible(IntPtr h) { RECT r; if (DwmGetWindowAttribute(h, 9, out r, 16) != 0) { GetWindowRect(h, out r); } return r; }
   public static void Close(IntPtr h) { PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetLongValue(IntPtr h, int index);
+  [DllImport("user32.dll")] static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
+  // The alpha (0 to 255) the window is drawn with: 255 for a window that is not layered, -1 when it cannot be read.
+  public static int Alpha(IntPtr h) {
+    if ((GetLongValue(h, -20) & 0x80000) == 0) { return 255; }
+    uint key; byte alpha; uint flags;
+    if (!GetLayeredWindowAttributes(h, out key, out alpha, out flags)) { return -1; }
+    return (flags & 2) != 0 ? (int)alpha : 255;
+  }
   public static void Key(byte vk, bool up) {
     uint f = 0;
     if ((vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E) f |= 1;
@@ -310,6 +324,14 @@ public static class TestForms {
     lock (forms) {
       foreach (var f in forms) {
         if (f.IsHandleCreated && f.Handle == h) { var ff = f; ff.BeginInvoke((MethodInvoker)delegate() { ff.Close(); }); }
+      }
+    }
+  }
+  // The window's own thread changes its title, like a browser tab or a terminal does.
+  public static void SetTitle(IntPtr h, string title) {
+    lock (forms) {
+      foreach (var f in forms) {
+        if (f.IsHandleCreated && f.Handle == h) { var ff = f; ff.BeginInvoke((MethodInvoker)delegate() { ff.Text = title; }); }
       }
     }
   }
@@ -1763,6 +1785,241 @@ $log12c = Join-Path $D 'wiri.stderr12c.log'
 $w = Start-Wiri $log12c ($log12c + '.out')
 Start-Sleep -Seconds 4
 
+# ---- H13: window rules that act -------------------------------------------------------------------------------------
+# One config in niri's syntax, then windows whose titles the rules match.  What a rule did is read from the screen: the visible
+# rectangle of the window (DWM's extended frame bounds), the alpha it is drawn with (GetLayeredWindowAttributes), the workspace
+# `wiri-ctl windows` reports for it, whether it is visible and which window has the foreground.  Every test window is a form of
+# this PowerShell process, so `app-id` has the process name `powershell.exe` to match.
+$log13 = Join-Path $D 'wiri.stderr13.log'
+$h13Monitors = Ctl 'h13-monitors' @('--json', 'list-monitors')
+$h13Output = ''
+try { $h13Output = [string]@(($h13Monitors | ConvertFrom-Json).result)[0].name } catch { }
+$h13Template = @'
+input {
+    mod-key "ctrl-alt"
+}
+layout {
+    gaps 10
+    border {
+        width 4
+    }
+}
+workspace "web"
+workspace "chat"
+
+window-rule {
+    match title="^h13-fixed"
+    default-column-width { fixed 500; }
+}
+window-rule {
+    match title="^h13-half"
+    default-column-width { proportion 0.5; }
+}
+window-rule {
+    match title="^h13-max"
+    open-maximized true
+}
+window-rule {
+    match title="^h13-limit"
+    max-width 420
+    max-height 400
+}
+window-rule {
+    match app-id=r#"^powershell(\.exe)?$"# title="^h13-appid"
+    min-width 333
+}
+window-rule {
+    match app-id=r#"^notepad$"# title="^h13-notappid"
+    min-width 333
+}
+window-rule {
+    match title="^h13-or-a"
+    match title="^h13-or-b"
+    exclude title="private"
+    opacity 0.5
+}
+window-rule {
+    match title="^h13-focus"
+    exclude is-focused=true
+    opacity 0.6
+}
+window-rule {
+    match title="^h13-chat"
+    open-on-workspace "chat"
+}
+window-rule {
+    match title="^h13-num"
+    open-in-workspace 3
+}
+window-rule {
+    match title="^h13-float"
+    open-floating true
+    default-column-width { fixed 420; }
+    default-window-height { fixed 300; }
+}
+window-rule {
+    match title="^h13-full"
+    open-fullscreen true
+}
+window-rule {
+    match title="^h13-quiet"
+    open-focused false
+}
+window-rule {
+    match title="^h13-out-ok"
+    open-on-output r#"@OUTPUT@"#
+    default-column-width { fixed 480; }
+}
+window-rule {
+    match title="^h13-out-no"
+    open-on-output "NoSuchDisplay"
+    default-column-width { fixed 460; }
+}
+'@
+$h13Config = $h13Template.Replace('@OUTPUT@', $h13Output)
+Stop-WiriGracefully $w 'h13'
+$w13 = Start-WiriWithConfig $h13Config $log13
+$w = $w13
+$h13Issues = (LogLines $log13 ': error: ').Count + (LogLines $log13 ': warning: ').Count
+$h13View = $swa.Width - 20            # the work area less the 10 px outer gap on each side
+function H13Open([string]$title, [int]$green) { $h = [TestForms]::Open($title, 90, $green, 160); Start-Sleep -Milliseconds 2200; return $h }
+$h13All = @()
+
+# (a) default-column-width: a fixed size is the window's (the border comes on top), a proportion is niri's
+$h13Fixed = H13Open 'h13-fixed' 60;  $h13All += $h13Fixed
+$h13Half = H13Open 'h13-half' 100;   $h13All += $h13Half
+$rFixed = Rc $h13Fixed
+$rHalf = Rc $h13Half
+$h13FixedWidth = (Near $rFixed.W 500 4)
+$h13HalfWidth = (Near $rHalf.W (0.5 * ($h13View + 10) - 10 - 8) 6)
+Shot 'h13-01-default-widths'
+
+# (b) open-maximized: the column is as wide as the view
+$h13Max = H13Open 'h13-max' 140;     $h13All += $h13Max
+$rMax = Rc $h13Max
+$h13MaxFillsView = (Near $rMax.W ($h13View - 8) 6)
+
+# (c) min / max size: a column asked to be wider than max-width stays at it; the limits follow the title of the window
+$h13Lim = H13Open 'h13-limit' 180;   $h13All += $h13Lim
+$null = Ctl 'h13-wide' @('set-column-width', '900'); Start-Sleep -Milliseconds 1500
+$rLim = Rc $h13Lim
+$h13LimitWidth = (Near $rLim.W 420 4)
+$h13LimitHeight = (Near $rLim.H 400 4)
+Shot 'h13-02-size-limits'
+[TestForms]::SetTitle($h13Lim, 'h13-free now'); Start-Sleep -Milliseconds 1800
+$rFree = Rc $h13Lim
+$h13LimitsLifted = ($rFree.W -gt 800) -and ($rFree.H -gt 500)
+[TestForms]::SetTitle($h13Lim, 'h13-limit again'); Start-Sleep -Milliseconds 1800
+$rAgain = Rc $h13Lim
+$h13LimitsBack = (Near $rAgain.W 420 4) -and (Near $rAgain.H 400 4)
+
+# (d) app-id is a regex searched in the process name: min-width applies to the powershell.exe window, not to the one whose
+# rule wants notepad
+$h13P = H13Open 'h13-appid' 200;     $h13All += $h13P
+$null = Ctl 'h13-narrow-1' @('set-column-width', '100'); Start-Sleep -Milliseconds 1500
+$rP = Rc $h13P
+$h13AppIdMatches = ($rP.W -ge 325)
+$h13N = H13Open 'h13-notappid' 220;  $h13All += $h13N
+$null = Ctl 'h13-narrow-2' @('set-column-width', '100'); Start-Sleep -Milliseconds 1500
+$rN = Rc $h13N
+$h13AppIdNoMatch = ($rN.W -lt 250)
+
+# (e) several match lines are OR-ed, an exclude line vetoes; the rules follow the title of the window
+$oA = H13Open 'h13-or-a' 30;         $h13All += $oA
+$oB = H13Open 'h13-or-b' 60;         $h13All += $oB
+$oC = H13Open 'h13-or-c' 90;         $h13All += $oC
+$oP = H13Open 'h13-or-a private' 120; $h13All += $oP
+$h13OrFirstLine = (Near ([LT]::Alpha($oA)) 128 2)
+$h13OrSecondLine = (Near ([LT]::Alpha($oB)) 128 2)
+$h13OrNoLine = ([LT]::Alpha($oC) -eq 255)
+$h13ExcludeVetoes = ([LT]::Alpha($oP) -eq 255)
+Shot 'h13-03-opacity'
+[TestForms]::SetTitle($oC, 'h13-or-a renamed'); Start-Sleep -Milliseconds 1500
+$h13OpacityFollowsTitle = (Near ([LT]::Alpha($oC)) 128 2)
+[TestForms]::SetTitle($oA, 'h13-or-a private now'); Start-Sleep -Milliseconds 1500
+$h13OpacityLeavesWhenExcluded = ([LT]::Alpha($oA) -eq 255)
+
+# (f) a rule that depends on the focus (exclude is-focused=true): the window without the focus is dimmed, and it follows
+$fA = H13Open 'h13-focus-a' 150;     $h13All += $fA
+$fB = H13Open 'h13-focus-b' 170;     $h13All += $fB
+$h13FocusDimsTheOther = (Near ([LT]::Alpha($fA)) 153 2) -and ([LT]::Alpha($fB) -eq 255)
+FocusForm $fA
+$h13FocusFollows = ([LT]::Alpha($fA) -eq 255) -and (Near ([LT]::Alpha($fB)) 153 2)
+Shot 'h13-04-focus-dimming'
+
+# (g) open-on-workspace "chat": the window opens on that workspace, the user stays where they are
+$wChat = H13Open 'h13-chat' 190;     $h13All += $wChat
+$lc = WinList 'h13-windows-chat'
+$h13ChatWorkspace = ((WinOf $lc $wChat).workspace -eq 2)
+$h13ChatHidden = (-not [LT]::IsWindowVisible($wChat))
+$h13ChatKeepsFocus = ([LT]::GetForegroundWindow() -ne $wChat) -and ((WinOf $lc $fA).workspace -eq 1) -and [LT]::IsWindowVisible($fA)
+$null = Ctl 'h13-go-chat' @('action', 'focus-workspace', 'chat'); Start-Sleep -Milliseconds 1500
+$h13ChatShowsWhenVisited = [LT]::IsWindowVisible($wChat)
+Shot 'h13-05-chat-workspace'
+$null = Ctl 'h13-go-back' @('action', 'focus-workspace', '1'); Start-Sleep -Milliseconds 1500
+# open-in-workspace 3: the workspace at that position (the empty one below the two named ones)
+$wNum = [TestForms]::Open('h13-num', 90, 200, 160); Start-Sleep -Milliseconds 2200; $h13All += $wNum
+$ln = WinList 'h13-windows-num'
+$h13NumWorkspace = ((WinOf $ln $wNum).workspace -eq 3) -and (-not [LT]::IsWindowVisible($wNum))
+
+# (h) open-floating with a default size: floats, at that size, centred
+$h13F = H13Open 'h13-float' 210;     $h13All += $h13F
+$rF = Rc $h13F
+$lf = WinList 'h13-windows-float'
+$h13FloatOpens = ((WinOf $lf $h13F).floating -eq $true)
+$h13FloatSize = (Near $rF.W 420 6) -and (Near $rF.H 300 6)
+$h13FloatCentered = (Near (($rF.L + $rF.R) / 2) (($swa.Left + $swa.Right) / 2) 8) -and (Near (($rF.T + $rF.B) / 2) (($swa.Top + $swa.Bottom) / 2) 8)
+Shot 'h13-06-open-floating'
+
+# (i) open-fullscreen: the window covers the monitor from the start, and leaves fullscreen like any other
+$h13Full = H13Open 'h13-full' 230;   $h13All += $h13Full
+$rFull = Rc $h13Full
+$h13FullscreenOpens = ($rFull.L -le $sb.Left + 1) -and ($rFull.T -le $sb.Top + 1) -and ($rFull.R -ge $sb.Right - 1) -and ($rFull.B -ge $sb.Bottom - 1)
+Shot 'h13-07-open-fullscreen'
+$null = Ctl 'h13-fullscreen-off' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 1800
+$rBack = Rc $h13Full
+$h13FullscreenLeaves = ($rBack.W -lt ($sb.Width - 60))
+[TestForms]::CloseForm($h13Full); Start-Sleep -Milliseconds 1500
+
+# (j) open-focused false: the window that had the focus keeps it
+FocusForm $fA
+$h13Q = H13Open 'h13-quiet' 250;     $h13All += $h13Q
+Start-Sleep -Milliseconds 800
+$lq = WinList 'h13-windows-quiet'
+$h13QuietKeepsFocus = ([LT]::GetForegroundWindow() -eq $fA)
+$h13QuietIsTiled = ($null -ne (WinOf $lq $h13Q)) -and ((WinOf $lq $h13Q).column -ge 0) -and ((WinOf $lq $h13Q).workspace -eq 1)
+
+# (k) open-on-output: the name wiri-ctl list-monitors gives places the window, one that no monitor has is ignored
+$h13OutOk = H13Open 'h13-out-ok' 20;  $h13All += $h13OutOk
+$h13OutNo = H13Open 'h13-out-no' 40;  $h13All += $h13OutNo
+$h13OutputNameReported = ($h13Output -match '^\\\\\.\\DISPLAY\d+$')
+$h13OutputPlaces = (Near (Rc $h13OutOk).W 480 4) -and (OnScreen $h13OutOk)
+$h13OutputUnknownIgnored = (Near (Rc $h13OutNo).W 460 4) -and (OnScreen $h13OutNo)
+
+# (l) a reload reaches the windows that are open: the opacity of the rule changes under them
+$h13Reloaded = $h13Config.Replace('opacity 0.5', 'opacity 0.3')
+[IO.File]::WriteAllText($cfg, $h13Reloaded, $utf8NoBom)
+Start-Sleep -Milliseconds 2800
+$h13ReloadUpdatesOpenWindows = (Near ([LT]::Alpha($oB)) 77 2) -and (Near ([LT]::Alpha($oC)) 77 2) -and ([LT]::Alpha($oA) -eq 255)
+Shot 'h13-08-after-reload'
+$h13Values = [ordered]@{
+    output = $h13Output; view = $h13View; issues = $h13Issues
+    fixed_w = $rFixed.W; half_w = $rHalf.W; max_w = $rMax.W; limit = "$($rLim.W)x$($rLim.H)"; free = "$($rFree.W)x$($rFree.H)"; again = "$($rAgain.W)x$($rAgain.H)"
+    appid_w = $rP.W; notappid_w = $rN.W
+    alpha_or = @([LT]::Alpha($oA), [LT]::Alpha($oB), [LT]::Alpha($oC), [LT]::Alpha($oP))
+    float = "$($rF.W)x$($rF.H) at $($rF.L),$($rF.T)"; fullscreen = "$($rFull.L),$($rFull.T),$($rFull.R),$($rFull.B)"; full_back_w = $rBack.W
+    chat_workspace = (WinOf $lc $wChat).workspace; num_workspace = (WinOf $ln $wNum).workspace
+}
+$h13Values | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'h13-values.json')
+foreach ($h in $h13All) { [TestForms]::CloseForm($h) }
+Start-Sleep -Milliseconds 2000
+# the instance that is left running for the rest of the script: the default config again
+Stop-WiriGracefully $w13 'h13b'
+Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+$log13b = Join-Path $D 'wiri.stderr13b.log'
+$w = Start-Wiri $log13b ($log13b + '.out')
+Start-Sleep -Seconds 4
+
 # ---- Phase D: close one window, quit -----------------------------------------------------------
 [TestForms]::CloseForm($forms[1])
 Start-Sleep -Seconds 2
@@ -2038,6 +2295,40 @@ $summary = [ordered]@{
     h12_bad_startup_config_falls_back_to_defaults = $h12DefaultsAtStartup
     h12_bad_startup_config_is_reported = $h12StartupReported
     h12_bad_startup_balloon_was_shown = $h12StartupBalloon
+    # --- Phase 2A / H13: window rules that act
+    h13_config_loads_without_issues = ($h13Issues -eq 0)
+    h13_monitor_name_is_reported = $h13OutputNameReported
+    h13_default_column_width_fixed = $h13FixedWidth
+    h13_default_column_width_proportion = $h13HalfWidth
+    h13_open_maximized_fills_the_view = $h13MaxFillsView
+    h13_max_width_and_height_hold_the_window = ($h13LimitWidth -and $h13LimitHeight)
+    h13_limits_lift_when_the_title_stops_matching = $h13LimitsLifted
+    h13_limits_return_when_the_title_matches_again = $h13LimitsBack
+    h13_app_id_regex_matches_the_process_name = $h13AppIdMatches
+    h13_app_id_regex_that_does_not_match_leaves_the_window_alone = $h13AppIdNoMatch
+    h13_first_match_line_applies = $h13OrFirstLine
+    h13_second_match_line_applies = $h13OrSecondLine
+    h13_window_matching_no_line_is_untouched = $h13OrNoLine
+    h13_exclude_line_vetoes = $h13ExcludeVetoes
+    h13_opacity_follows_a_new_title = $h13OpacityFollowsTitle
+    h13_opacity_leaves_when_the_title_is_excluded = $h13OpacityLeavesWhenExcluded
+    h13_focus_rule_dims_the_window_without_focus = $h13FocusDimsTheOther
+    h13_focus_rule_follows_the_focus = $h13FocusFollows
+    h13_open_on_workspace_by_name = $h13ChatWorkspace
+    h13_open_on_workspace_window_is_hidden = $h13ChatHidden
+    h13_open_on_workspace_leaves_the_user_where_they_are = $h13ChatKeepsFocus
+    h13_open_on_workspace_window_shows_when_visited = $h13ChatShowsWhenVisited
+    h13_open_in_workspace_by_position = $h13NumWorkspace
+    h13_open_floating_floats_the_window = $h13FloatOpens
+    h13_open_floating_default_size = $h13FloatSize
+    h13_open_floating_is_centred = $h13FloatCentered
+    h13_open_fullscreen_covers_the_monitor = $h13FullscreenOpens
+    h13_open_fullscreen_window_leaves_fullscreen = $h13FullscreenLeaves
+    h13_open_focused_false_keeps_the_foreground = $h13QuietKeepsFocus
+    h13_open_focused_false_window_is_tiled = $h13QuietIsTiled
+    h13_open_on_output_with_a_real_name = $h13OutputPlaces
+    h13_open_on_output_with_an_unknown_name_is_ignored = $h13OutputUnknownIgnored
+    h13_reload_changes_the_opacity_of_open_windows = $h13ReloadUpdatesOpenWindows
     steps = $steps
 }
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')

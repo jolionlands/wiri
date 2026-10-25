@@ -1,4 +1,5 @@
 pub mod accent;
+pub mod aumid;
 pub mod cbt_hook;
 pub mod cloak;
 pub mod hidden;
@@ -902,7 +903,8 @@ impl BackendHandle {
     }
 
     /// Look up the process executable name for a PID via QueryFullProcessImageNameW.
-    /// Returns the file stem (e.g. "firefox" for "C:\Program Files\Mozilla Firefox\firefox.exe").
+    /// Returns the file name (e.g. "firefox.exe" for "C:\Program Files\Mozilla Firefox\firefox.exe");
+    /// window rules match it with and without the extension.
     /// Returns None on failure or for PID 0.
     pub fn process_name_for_pid(&self, pid: u32) -> Option<String> {
         if pid == 0 {
@@ -928,9 +930,16 @@ impl BackendHandle {
             }
             let path = String::from_utf16_lossy(&buf[..size as usize]);
             std::path::Path::new(&path)
-                .file_stem()
+                .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
         }
+    }
+
+    /// The AppUserModelID of the window (`Microsoft.WindowsTerminal_8wekyb3d8bbwe!App`),
+    /// when it has one: what `app-id` in a window rule can match besides the process's
+    /// name.  One call to the shell per window; ask once, when the window opens.
+    pub fn aumid_for_window(&self, hwnd: isize) -> Option<String> {
+        aumid::of_window(hwnd)
     }
 
     /// The narrowest `hwnd` can be made, as a *visible* width in pixels (what the layout

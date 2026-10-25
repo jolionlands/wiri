@@ -104,10 +104,15 @@ impl WindowHandle {
     }
 }
 
+/// What the window rules decide for one window: the properties of every rule that matches it,
+/// a later rule winning over an earlier one for the same property.
+///
+/// niri applies the `open-*` and `default-*` properties when the window opens and no later;
+/// the others (`opacity`, the size limits) follow the window while its title, its focus or
+/// its state changes ([`ResolvedWindowRules::same_dynamic_part`] is how the engine notices).
 #[derive(Debug, Clone)]
 pub struct ResolvedWindowRules {
     pub float: bool,
-    pub workspace: Option<i32>,
     pub column: Option<usize>,
     pub follow_cursor: bool,
     pub border: bool,
@@ -121,28 +126,54 @@ pub struct ResolvedWindowRules {
     /// is a legal value meaning "explicitly fully transparent".
     pub opacity: Option<f32>,
 
-    // ── niri-parity `open-*` placement hints (consumed by add_window) ──────
-    /// Place the window on the monitor with this device name on first map.
-    /// Falls through when None.
+    // ── niri `open-*` placement properties (consumed when the window opens) ──────
+    /// Open on the monitor with this device name (`\\.\DISPLAY1` or `DISPLAY1`); a name
+    /// that no monitor has is ignored.
     pub open_on_output: Option<String>,
-    /// Place the window on this 1-based workspace id on first map.
+    /// Open on the workspace at this 1-based position (wiri's `open-in-workspace 2`, and
+    /// `workspace "2"`).
     pub open_in_workspace: Option<i32>,
-    /// Start the window fullscreen.  None = engine default.
+    /// Open on the workspace with this name (niri's `open-on-workspace "web"`, and
+    /// `workspace "web"`); a name that no workspace has is ignored.
+    pub open_on_workspace: Option<String>,
+    /// Open fullscreen.  None = engine default.
     pub open_fullscreen: Option<bool>,
-    /// Start the window floating.  None = engine default (also see `float`
+    /// Open floating.  None = engine default (also see `float`
     /// flag, which is the resolved `floating` property from any matching
     /// rule; `open_floating` is the explicit `open-floating "…"` directive).
     pub open_floating: Option<bool>,
+    /// Open with its column as wide as the view.
+    pub open_maximized: Option<bool>,
+    /// Open maximized to the edges of the work area (niri 25.11).
+    pub open_maximized_to_edges: Option<bool>,
+    /// `Some(false)`: the window opens without taking the focus.
+    pub open_focused: Option<bool>,
     /// Cap the initial physical size of the window to `(width_px, height_px)`.
     /// Either dimension of `0` means "no cap on that axis".
     pub open_max_bounds: Option<(u32, u32)>,
+
+    // ── niri `default-*` size properties (the size the window opens with) ──────
+    /// `default-column-width`: `Some(Some(size))`, or `Some(None)` for the empty block (the
+    /// window opens with the width it has itself).
+    pub default_column_width: Option<Option<crate::config::types::SizeSpec>>,
+    /// `default-window-height`, the same forms.
+    pub default_window_height: Option<Option<crate::config::types::SizeSpec>>,
+    /// wiri's older `default-width 800`: the width of the column in pixels.
+    pub default_width_px: Option<u32>,
+    /// wiri's older `default-height 400`: the height of the tile in pixels.
+    pub default_height_px: Option<u32>,
+
+    // ── size limits in pixels (the size of the window, without its border) ──────
+    pub min_width: Option<u32>,
+    pub max_width: Option<u32>,
+    pub min_height: Option<u32>,
+    pub max_height: Option<u32>,
 }
 
 impl Default for ResolvedWindowRules {
     fn default() -> Self {
         Self {
             float: false,
-            workspace: None,
             column: None,
             follow_cursor: true,
             border: true,
@@ -150,10 +181,35 @@ impl Default for ResolvedWindowRules {
             opacity: None,
             open_on_output: None,
             open_in_workspace: None,
+            open_on_workspace: None,
             open_fullscreen: None,
             open_floating: None,
+            open_maximized: None,
+            open_maximized_to_edges: None,
+            open_focused: None,
             open_max_bounds: None,
+            default_column_width: None,
+            default_window_height: None,
+            default_width_px: None,
+            default_height_px: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
         }
+    }
+}
+
+impl ResolvedWindowRules {
+    /// True when `other` asks for the same of the properties that follow the window while
+    /// it lives (opacity and the size limits).  The `open-*` and `default-*` properties
+    /// are left out: they are applied once, when the window opens.
+    pub fn same_dynamic_part(&self, other: &ResolvedWindowRules) -> bool {
+        self.opacity == other.opacity
+            && self.min_width == other.min_width
+            && self.max_width == other.max_width
+            && self.min_height == other.min_height
+            && self.max_height == other.max_height
     }
 }
 
@@ -864,10 +920,35 @@ mod tests {
     fn test_resolved_window_rules_default() {
         let rules = ResolvedWindowRules::default();
         assert!(!rules.float);
-        assert!(rules.workspace.is_none());
+        assert!(rules.open_in_workspace.is_none());
+        assert!(rules.open_on_workspace.is_none());
         assert!(rules.column.is_none());
         assert!(rules.follow_cursor);
         assert!(rules.border);
+    }
+
+    #[test]
+    fn only_the_properties_that_follow_the_window_count_as_its_dynamic_part() {
+        let base = ResolvedWindowRules::default();
+        let mut other = base.clone();
+        // What is applied once, when the window opens, is not part of it.
+        other.open_floating = Some(true);
+        other.open_on_workspace = Some("web".to_string());
+        other.default_width_px = Some(500);
+        other.open_focused = Some(false);
+        assert!(base.same_dynamic_part(&other));
+        // Opacity and the size limits are.
+        for change in [
+            (|r: &mut ResolvedWindowRules| r.opacity = Some(0.5)) as fn(&mut ResolvedWindowRules),
+            |r| r.min_width = Some(300),
+            |r| r.max_width = Some(900),
+            |r| r.min_height = Some(200),
+            |r| r.max_height = Some(700),
+        ] {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert!(!base.same_dynamic_part(&changed));
+        }
     }
 
     fn normal_window() -> SkipFacts {

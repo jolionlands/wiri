@@ -14,9 +14,11 @@ pub struct Tile {
     /// positions and `mark_sent()` is called for every tile that had its
     /// position actually issued.
     pub configure_throttle: ConfigureThrottle,
-    /// Preferred height from a window rule's `default_height`.
-    /// Stored here but not yet used by the layout engine — layout currently distributes
-    /// height equally. Wire into calculate_positions when per-tile height is implemented.
+    /// The height a window rule asks for (`default-window-height`, the older
+    /// `default-height`), in pixels of the whole tile: a column of several windows gives
+    /// this tile that much and shares the rest among the others by their weights.  A
+    /// column of one window always fills the view.  The user's own `set-window-height`
+    /// takes it away.
     pub preferred_height: Option<u32>,
     /// niri-style relative tile-height weight inside a column. When
     /// every tile in a column carries the default weight of 1.0 the
@@ -29,8 +31,17 @@ pub struct Tile {
     /// answers to `WM_GETMINMAXINFO` (a Windows Terminal window will not go below about
     /// 462 px), set by `TilingEngine::note_window_min_width`.  0 = no limit known.  The
     /// column of the tile is never narrower than this: asking the window for less only
-    /// makes it overlap its neighbour.
+    /// makes it overlap its neighbour.  A window rule's `min-width` counts as well (the
+    /// larger of the two).
     pub min_width: u32,
+    /// The widest the tile may be, in pixels of the whole tile (a window rule's `max-width`;
+    /// 0 = no limit).  The column of the tile is never wider than the smallest limit of its
+    /// tiles, unless some tile cannot be narrower than that (the minimum wins).
+    pub max_width: u32,
+    /// The least and the most the tile may be tall (`min-height` / `max-height`, in pixels
+    /// of the whole tile; 0 = no limit).
+    pub min_height: u32,
+    pub max_height: u32,
 }
 
 impl Tile {
@@ -43,6 +54,9 @@ impl Tile {
             preferred_height: None,
             height_weight: 1.0,
             min_width: 0,
+            max_width: 0,
+            min_height: 0,
+            max_height: 0,
         }
     }
 }
@@ -142,13 +156,29 @@ impl Column {
         self.tiles.iter().map(|t| t.min_width).max().unwrap_or(0)
     }
 
+    /// The widest this column may be: the smallest limit among its windows (0 = none).
+    /// A minimum above it wins (see [`Column::resolved_width`]).
+    pub fn max_width(&self) -> u32 {
+        self.tiles
+            .iter()
+            .map(|t| t.max_width)
+            .filter(|w| *w > 0)
+            .min()
+            .unwrap_or(0)
+    }
+
     /// The width the column has: its own width, or `default_width` when it has none, but
-    /// never less than its windows can be made narrow.
+    /// never less than its windows can be made narrow and never more than they allow
+    /// (when the two clash, the minimum wins: a window that cannot be narrower than its
+    /// column is wide would lie over the next one).
     pub fn resolved_width(&self, default_width: i32) -> i32 {
-        self.width
-            .map(|w| w as i32)
-            .unwrap_or(default_width)
-            .max(self.min_width() as i32)
+        let min = self.min_width() as i32;
+        let mut width = self.width.map(|w| w as i32).unwrap_or(default_width);
+        let max = self.max_width() as i32;
+        if max > 0 {
+            width = width.min(max);
+        }
+        width.max(min)
     }
 
     /// Keep the active tab of a tabbed column on a tile that exists.
@@ -1786,6 +1816,32 @@ mod tests {
         ws.columns[1].tiles.push(Tile::new(WindowId::new(9)));
         ws.columns[1].tiles[1].min_width = 600;
         assert_eq!(ws.columns[1].min_width(), 600);
+    }
+
+    #[test]
+    fn test_a_column_is_never_wider_than_the_smallest_maximum_of_its_windows() {
+        let mut col = Column::new();
+        col.add_tile(Tile::new(WindowId::new(1)));
+        col.add_tile(Tile::new(WindowId::new(2)));
+        assert_eq!(col.max_width(), 0, "no limit");
+        assert_eq!(col.resolved_width(500), 500);
+        // One window with a limit: the whole column keeps to it, own width or not.
+        col.tiles[0].max_width = 420;
+        assert_eq!(col.max_width(), 420);
+        assert_eq!(col.resolved_width(500), 420);
+        col.width = Some(900);
+        assert_eq!(col.resolved_width(500), 420);
+        // The smallest nonzero limit counts; a tile without a limit says nothing.
+        col.tiles[1].max_width = 380;
+        assert_eq!(col.max_width(), 380);
+        // A narrower column than the limit is left alone.
+        col.width = Some(300);
+        assert_eq!(col.resolved_width(500), 300);
+        // The minimum wins when a window cannot be as narrow as another allows.
+        col.tiles[0].min_width = 462;
+        assert_eq!(col.resolved_width(500), 462);
+        col.width = Some(900);
+        assert_eq!(col.resolved_width(500), 462);
     }
 
     #[test]

@@ -533,6 +533,10 @@ pub struct ListBindingsResponse {
 pub struct MonitorInfo {
     /// Engine-internal OutputId (a deterministic 64-bit name hash).
     pub output_id: u64,
+    /// The device name of the monitor (`\\.\DISPLAY1`): what `open-on-output` in a window
+    /// rule names.  Empty when the engine was not told.
+    #[serde(default)]
+    pub name: String,
     pub bounds_x: i32,
     pub bounds_y: i32,
     pub bounds_width: u32,

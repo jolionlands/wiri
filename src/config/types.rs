@@ -769,17 +769,8 @@ impl MatchGroup {
 /// app-id: the process's file name, that name without its extension and the
 /// AppUserModelID of a packaged app stand in for it.
 pub fn app_id_matches(pat: &RegexPat, ctx: &MatcherContext<'_>) -> bool {
-    if let Some(name) = ctx.process_name {
-        if pat.is_match(name) {
-            return true;
-        }
-        let stem = match name.rfind('.') {
-            Some(dot) if dot > 0 => &name[..dot],
-            _ => name,
-        };
-        if stem.len() != name.len() && pat.is_match(stem) {
-            return true;
-        }
+    if ctx.process_names().iter().flatten().any(|n| pat.is_match(n)) {
+        return true;
     }
     if let Some(aumid) = ctx.aumid {
         if pat.is_match(aumid) {
@@ -822,9 +813,18 @@ impl Matcher {
                     false
                 }
             },
-            Matcher::ProcessName(s) => ctx.process_name.map_or(false, |p| p == s.as_str()),
+            // The process answers to its file name and to that name without `.exe`; Windows
+            // file names do not care about case.
+            Matcher::ProcessName(s) => ctx
+                .process_names()
+                .iter()
+                .flatten()
+                .any(|p| p.eq_ignore_ascii_case(s.as_str())),
             Matcher::ProcessNameRegex(pat) => match regex::Regex::new(pat) {
-                Ok(re) => re.is_match(ctx.process_name.unwrap_or("")),
+                Ok(re) => match ctx.process_names() {
+                    [None, _] => re.is_match(""),
+                    names => names.iter().flatten().any(|p| re.is_match(p)),
+                },
                 Err(e) => {
                     tracing::warn!("ProcessNameRegex: invalid pattern {:?}: {}", pat, e);
                     false
@@ -837,10 +837,20 @@ impl Matcher {
             Matcher::AppId(pat) => app_id_matches(pat, ctx),
             Matcher::TitleSearch(pat) => pat.is_match(ctx.title),
             Matcher::ClassSearch(pat) => pat.is_match(ctx.class_name),
-            Matcher::ProcessSearch(pat) => ctx.process_name.map_or(false, |p| pat.is_match(p)),
+            Matcher::ProcessSearch(pat) => {
+                ctx.process_names().iter().flatten().any(|p| pat.is_match(p))
+            }
             Matcher::IsFocused => ctx.is_focused,
             Matcher::IsActiveInColumn => ctx.is_active_in_column,
             Matcher::Not(inner) => !inner.matches(ctx),
+        }
+    }
+
+    /// True when this condition, or the one it negates, satisfies `test`.
+    pub fn any(&self, test: &dyn Fn(&Matcher) -> bool) -> bool {
+        match self {
+            Matcher::Not(inner) => inner.any(test),
+            other => test(other),
         }
     }
 
@@ -893,6 +903,22 @@ pub struct MatcherContext<'a> {
 }
 
 impl<'a> MatcherContext<'a> {
+    /// The names the window's process answers to: its file name (`firefox.exe`) and that
+    /// name without the extension (`firefox`), or nothing for a window whose process is not
+    /// known.
+    pub fn process_names(&self) -> [Option<&'a str>; 2] {
+        match self.process_name {
+            None => [None, None],
+            Some(name) => {
+                let stem = match name.rfind('.') {
+                    Some(dot) if dot > 0 => Some(&name[..dot]),
+                    _ => None,
+                };
+                [Some(name), stem]
+            }
+        }
+    }
+
     /// Build a `MatcherContext` from the fields previously threaded through
     /// `resolve_window_rules` (class, title, instance, pid).  All boolean
     /// flags are set to `false` — this constructor is only used by external
@@ -1053,6 +1079,56 @@ impl WindowRule {
                 .iter()
                 .chain(self.exclude_groups.iter())
                 .any(|g| g.conds.iter().any(|m| m.is_dynamic()))
+    }
+
+    /// True when any condition of the rule (in `matchers`, a `match` line or an `exclude`
+    /// line) satisfies `test`.
+    pub fn any_condition(&self, test: &dyn Fn(&Matcher) -> bool) -> bool {
+        self.matchers
+            .iter()
+            .chain(
+                self.match_groups
+                    .iter()
+                    .chain(self.exclude_groups.iter())
+                    .flat_map(|g| g.conds.iter()),
+            )
+            .any(|m| m.any(test))
+    }
+
+    /// The rule looks at the AppUserModelID of the window (`app-id`).
+    pub fn uses_app_id(&self) -> bool {
+        self.any_condition(&|m| matches!(m, Matcher::AppId(_)))
+    }
+
+    /// The rule's outcome depends on which window has the focus.
+    pub fn depends_on_focus(&self) -> bool {
+        self.any_condition(&|m| {
+            matches!(
+                m,
+                Matcher::IsActive | Matcher::IsFocused | Matcher::IsActiveInColumn
+            )
+        })
+    }
+
+    /// The rule's outcome depends on the title of the window.
+    pub fn depends_on_title(&self) -> bool {
+        self.title.is_some()
+            || self.any_condition(&|m| {
+                matches!(
+                    m,
+                    Matcher::Title(_) | Matcher::TitleRegex(_) | Matcher::TitleSearch(_)
+                )
+            })
+    }
+
+    /// The rule's outcome depends on whether the window floats.
+    pub fn depends_on_floating(&self) -> bool {
+        self.any_condition(&|m| matches!(m, Matcher::IsFloating))
+    }
+
+    /// The rule's outcome depends on whether the window is urgent (flashing).
+    pub fn depends_on_urgency(&self) -> bool {
+        self.any_condition(&|m| matches!(m, Matcher::IsUrgent))
     }
 
     /// The conditions of the old rule format: `matchers` when there are any (all of them

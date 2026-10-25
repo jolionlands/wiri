@@ -933,6 +933,7 @@ impl IpcServer {
                                 .sum();
                             MonitorInfo {
                                 output_id: oid.as_u64(),
+                                name: eng.output_name(*oid).unwrap_or_default().to_string(),
                                 bounds_x: m.bounds.loc.x,
                                 bounds_y: m.bounds.loc.y,
                                 bounds_width: m.bounds.size.w,

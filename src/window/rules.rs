@@ -2,10 +2,34 @@ use crate::config::types::MatcherContext;
 use crate::config::WindowRule;
 use crate::window::ResolvedWindowRules;
 
+/// The workspace a rule sends a window to, as `(position, name)`: niri's
+/// `open-on-workspace "web"` is a name, wiri's `open-in-workspace 2` a position, and the
+/// older `workspace "2"` / `workspace "web"` is either (a number is a position).  `None`
+/// when the rule does not say.
+fn rule_workspace(rule: &WindowRule) -> Option<(Option<i32>, Option<String>)> {
+    if let Some(name) = rule.open_on_workspace.as_deref() {
+        return Some((None, Some(name.to_string())));
+    }
+    if let Some(number) = rule.open_in_workspace {
+        return Some((Some(number), None));
+    }
+    let text = rule.workspace.as_deref()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(match text.parse::<i32>() {
+        Ok(number) => (Some(number), None),
+        Err(_) => (None, Some(text.to_string())),
+    })
+}
+
 /// Canonical rule resolver. Takes a `MatcherContext` that can carry both string
 /// fields and boolean flags (`is_active`, `is_floating`, `is_urgent`, `at_startup`).
 ///
-/// Rules are evaluated in order; later rules override earlier ones (last-wins).
+/// A window matches a rule when it matches any of the rule's `match` lines (every line is
+/// the AND of its conditions) and none of its `exclude` lines (see `WindowRule::matches`).
+/// Rules are evaluated in order; later rules override earlier ones (last-wins) for every
+/// property that they set.
 pub fn resolve_window_rules(rules: &[WindowRule], ctx: &MatcherContext<'_>) -> ResolvedWindowRules {
     let mut resolved = ResolvedWindowRules::default();
 
@@ -15,8 +39,48 @@ pub fn resolve_window_rules(rules: &[WindowRule], ctx: &MatcherContext<'_>) -> R
             if rule.floating {
                 resolved.float = true;
             }
-            if let Some(ref ws) = rule.workspace {
-                resolved.workspace = Some(ws.parse().ok()).flatten();
+            if let Some((number, name)) = rule_workspace(rule) {
+                resolved.open_in_workspace = number;
+                resolved.open_on_workspace = name;
+            }
+            // wiri's older pixel sizes first: a niri `default-*` block of the same rule wins
+            // over them, and a later rule over an earlier one whichever kind it uses.
+            if let Some(px) = rule.default_width {
+                resolved.default_width_px = Some(px);
+                resolved.default_column_width = None;
+            }
+            if let Some(px) = rule.default_height {
+                resolved.default_height_px = Some(px);
+                resolved.default_window_height = None;
+            }
+            if let Some(size) = rule.default_column_width {
+                resolved.default_column_width = Some(size);
+                resolved.default_width_px = None;
+            }
+            if let Some(size) = rule.default_window_height {
+                resolved.default_window_height = Some(size);
+                resolved.default_height_px = None;
+            }
+            if rule.min_width.is_some() {
+                resolved.min_width = rule.min_width;
+            }
+            if rule.max_width.is_some() {
+                resolved.max_width = rule.max_width;
+            }
+            if rule.min_height.is_some() {
+                resolved.min_height = rule.min_height;
+            }
+            if rule.max_height.is_some() {
+                resolved.max_height = rule.max_height;
+            }
+            if rule.open_maximized.is_some() {
+                resolved.open_maximized = rule.open_maximized;
+            }
+            if rule.open_maximized_to_edges.is_some() {
+                resolved.open_maximized_to_edges = rule.open_maximized_to_edges;
+            }
+            if rule.open_focused.is_some() {
+                resolved.open_focused = rule.open_focused;
             }
             // `rule.opacity` is `Option<f64>`: `Some(x)` is an explicit
             // override (including `Some(0.0)` for "fully transparent"), `None`
@@ -40,22 +104,15 @@ pub fn resolve_window_rules(rules: &[WindowRule], ctx: &MatcherContext<'_>) -> R
             if let Some(ref out) = rule.open_on_output {
                 resolved.open_on_output = Some(out.clone());
             }
-            if let Some(ws) = rule.open_in_workspace {
-                resolved.open_in_workspace = Some(ws);
-            }
             if let Some(fs) = rule.open_fullscreen {
                 resolved.open_fullscreen = Some(fs);
-                // Propagate explicit "open fullscreen" to fullscreen state hint
-                // via the float flag staying as-is; engine wiring will gate this.
             }
             if let Some(fl) = rule.open_floating {
                 resolved.open_floating = Some(fl);
-                if fl {
-                    // Be conservative: an explicit `open-floating true` also
-                    // implies `float = true` so engines that read only `.float`
-                    // still honour the user's intent.
-                    resolved.float = true;
-                }
+                // An explicit `open-floating` says it either way: `true` also sets `float`
+                // (engines that read only `.float` honour it), and `false` takes back a
+                // `float true` of an earlier rule.
+                resolved.float = fl;
             }
             if let Some(bounds) = rule.open_max_bounds {
                 resolved.open_max_bounds = Some(bounds);
@@ -698,5 +755,280 @@ mod tests {
             !result.float,
             "invalid regex pattern must return false, not panic"
         );
+    }
+
+    // ── niri window rules: match lines, exclude lines, properties ────────────
+
+    use crate::config::types::{MatchGroup, RegexPat, SizeSpec};
+
+    fn pat(source: &str) -> RegexPat {
+        RegexPat::new(source).expect("a valid regex")
+    }
+
+    fn group(conds: Vec<Matcher>) -> MatchGroup {
+        MatchGroup { conds }
+    }
+
+    /// A window with the facts rules can look at.
+    fn facts<'a>(
+        title: &'a str,
+        process: Option<&'a str>,
+        aumid: Option<&'a str>,
+        focused: bool,
+    ) -> MatcherContext<'a> {
+        MatcherContext {
+            class_name: "TestClass",
+            title,
+            instance: None,
+            process_name: process,
+            is_active: focused,
+            is_floating: false,
+            is_urgent: false,
+            at_startup: false,
+            aumid,
+            is_focused: focused,
+            is_active_in_column: false,
+        }
+    }
+
+    #[test]
+    fn several_match_lines_are_ored_and_an_exclude_line_vetoes() {
+        let rule = WindowRule {
+            match_groups: vec![
+                group(vec![Matcher::AppId(pat("^firefox$"))]),
+                group(vec![
+                    Matcher::AppId(pat("^chrome$")),
+                    Matcher::TitleSearch(pat("Picture")),
+                ]),
+            ],
+            exclude_groups: vec![group(vec![Matcher::TitleSearch(pat("Private"))])],
+            open_floating: Some(true),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+        let floats = |title: &str, process: &str| {
+            resolve_window_rules(&rules, &facts(title, Some(process), None, false)).float
+        };
+        assert!(floats("Mozilla", "firefox.exe"), "the first match line");
+        assert!(floats("Picture-in-Picture", "chrome.exe"), "the second one: both its conditions");
+        assert!(!floats("Docs", "chrome.exe"), "the second line needs its title as well");
+        assert!(!floats("Private Browsing", "firefox.exe"), "an exclude line vetoes");
+        assert!(!floats("Mozilla", "notepad.exe"), "no line matches");
+    }
+
+    #[test]
+    fn a_rule_without_match_lines_matches_every_window_unless_excluded() {
+        let rule = WindowRule {
+            exclude_groups: vec![group(vec![Matcher::AppId(pat("^code$"))])],
+            opacity: Some(0.8),
+            ..WindowRule::default()
+        };
+        let rules = vec![rule];
+        let opacity = |process: &str| {
+            resolve_window_rules(&rules, &facts("t", Some(process), None, false)).opacity
+        };
+        assert_eq!(opacity("notepad.exe"), Some(0.8));
+        assert_eq!(opacity("code.exe"), None, "the name without .exe is excluded");
+        assert_eq!(opacity("Code.exe"), Some(0.8), "a regex is case sensitive, like niri's");
+    }
+
+    #[test]
+    fn app_id_is_searched_in_the_process_file_name_its_stem_and_the_aumid() {
+        let rules = vec![WindowRule {
+            match_groups: vec![group(vec![Matcher::AppId(pat("Terminal"))])],
+            floating: true,
+            ..WindowRule::default()
+        }];
+        let floats = |process: Option<&str>, aumid: Option<&str>| {
+            resolve_window_rules(&rules, &facts("t", process, aumid, false)).float
+        };
+        assert!(floats(Some("WindowsTerminal.exe"), None), "anywhere in the file name");
+        assert!(
+            floats(Some("explorer.exe"), Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App")),
+            "the AppUserModelID of a packaged app"
+        );
+        assert!(!floats(Some("explorer.exe"), None));
+        assert!(!floats(None, None), "a window whose process is not known has no app-id");
+
+        // The anchors see the name without `.exe` as well as the file name.
+        let anchored = vec![WindowRule {
+            match_groups: vec![group(vec![Matcher::AppId(pat("^firefox$"))])],
+            floating: true,
+            ..WindowRule::default()
+        }];
+        assert!(resolve_window_rules(&anchored, &facts("t", Some("firefox.exe"), None, false)).float);
+        let by_file_name = vec![WindowRule {
+            match_groups: vec![group(vec![Matcher::AppId(pat(r"^firefox\.exe$"))])],
+            floating: true,
+            ..WindowRule::default()
+        }];
+        assert!(resolve_window_rules(&by_file_name, &facts("t", Some("firefox.exe"), None, false)).float);
+    }
+
+    #[test]
+    fn the_older_process_name_matchers_know_the_file_name_and_the_stem() {
+        let by = |m: Matcher| {
+            let rules = vec![WindowRule {
+                matchers: vec![m],
+                floating: true,
+                ..WindowRule::default()
+            }];
+            resolve_window_rules(&rules, &ctx_with_process("c", "t", "Notepad.exe")).float
+        };
+        assert!(by(Matcher::ProcessName("notepad.exe".to_string())));
+        assert!(by(Matcher::ProcessName("NOTEPAD".to_string())), "a stem, any case");
+        assert!(!by(Matcher::ProcessName("note".to_string())));
+        assert!(by(Matcher::ProcessNameRegex("^Notepad$".to_string())));
+        assert!(by(Matcher::ProcessSearch(pat(r"pad\.exe$"))));
+    }
+
+    #[test]
+    fn a_title_regex_reads_the_current_title() {
+        let rules = vec![WindowRule {
+            match_groups: vec![group(vec![Matcher::TitleSearch(pat(r"^\d+ unread"))])],
+            opacity: Some(0.5),
+            ..WindowRule::default()
+        }];
+        let opacity = |title: &str| {
+            resolve_window_rules(&rules, &facts(title, Some("mail.exe"), None, false)).opacity
+        };
+        assert_eq!(opacity("3 unread - Mail"), Some(0.5));
+        assert_eq!(opacity("Mail"), None, "the same window under another title");
+        assert!(rules[0].depends_on_title());
+        assert!(!rules[0].depends_on_focus());
+    }
+
+    #[test]
+    fn is_focused_false_is_a_condition_of_its_own() {
+        // The usual "dim what has not the focus" rule.
+        let rules = vec![WindowRule {
+            match_groups: vec![group(vec![Matcher::Not(Box::new(Matcher::IsFocused))])],
+            opacity: Some(0.7),
+            ..WindowRule::default()
+        }];
+        let at = |focused: bool| {
+            resolve_window_rules(&rules, &facts("t", Some("a.exe"), None, focused)).opacity
+        };
+        assert_eq!(at(false), Some(0.7));
+        assert_eq!(at(true), None);
+        assert!(rules[0].depends_on_focus());
+        assert!(rules[0].has_dynamic_conditions());
+    }
+
+    #[test]
+    fn a_later_rule_wins_for_a_property_only_when_it_sets_it() {
+        let first = WindowRule {
+            match_groups: vec![group(vec![Matcher::AppId(pat("^a$"))])],
+            opacity: Some(0.9),
+            min_width: Some(300),
+            max_width: Some(900),
+            open_focused: Some(false),
+            ..WindowRule::default()
+        };
+        let second = WindowRule {
+            match_groups: vec![group(vec![Matcher::AppId(pat("^a$"))])],
+            max_width: Some(700),
+            min_height: Some(200),
+            open_focused: Some(true),
+            ..WindowRule::default()
+        };
+        let r = resolve_window_rules(&[first, second], &facts("t", Some("a.exe"), None, false));
+        assert_eq!(r.opacity, Some(0.9), "the first rule's, the second sets none");
+        assert_eq!(r.min_width, Some(300));
+        assert_eq!(r.max_width, Some(700), "the second rule's");
+        assert_eq!(r.min_height, Some(200));
+        assert_eq!(r.max_height, None);
+        assert_eq!(r.open_focused, Some(true));
+    }
+
+    #[test]
+    fn open_floating_false_takes_back_a_float_of_an_earlier_rule() {
+        let rules = vec![
+            WindowRule {
+                floating: true,
+                ..WindowRule::default()
+            },
+            WindowRule {
+                open_floating: Some(false),
+                ..WindowRule::default()
+            },
+        ];
+        let r = resolve_window_rules(&rules, &ctx("c", "t"));
+        assert!(!r.float);
+        assert_eq!(r.open_floating, Some(false));
+    }
+
+    #[test]
+    fn a_workspace_is_a_name_a_position_or_the_older_key() {
+        let one = |rule: WindowRule| {
+            let r = resolve_window_rules(&[rule], &ctx("c", "t"));
+            (r.open_in_workspace, r.open_on_workspace)
+        };
+        assert_eq!(
+            one(WindowRule {
+                open_on_workspace: Some("web".into()),
+                ..WindowRule::default()
+            }),
+            (None, Some("web".to_string()))
+        );
+        assert_eq!(
+            one(WindowRule {
+                open_in_workspace: Some(3),
+                ..WindowRule::default()
+            }),
+            (Some(3), None)
+        );
+        assert_eq!(
+            one(WindowRule {
+                workspace: Some("2".into()),
+                ..WindowRule::default()
+            }),
+            (Some(2), None),
+            "a number is a position"
+        );
+        assert_eq!(
+            one(WindowRule {
+                workspace: Some("chat".into()),
+                ..WindowRule::default()
+            }),
+            (None, Some("chat".to_string())),
+            "anything else is a name"
+        );
+        // A later rule replaces the workspace of an earlier one, whichever kind each names.
+        let r = resolve_window_rules(
+            &[
+                WindowRule {
+                    open_in_workspace: Some(2),
+                    ..WindowRule::default()
+                },
+                WindowRule {
+                    open_on_workspace: Some("web".into()),
+                    ..WindowRule::default()
+                },
+            ],
+            &ctx("c", "t"),
+        );
+        assert_eq!((r.open_in_workspace, r.open_on_workspace.as_deref()), (None, Some("web")));
+    }
+
+    #[test]
+    fn the_two_kinds_of_default_size_replace_each_other() {
+        let niri = WindowRule {
+            default_column_width: Some(Some(SizeSpec::Proportion(0.5))),
+            default_window_height: Some(None),
+            ..WindowRule::default()
+        };
+        let older = WindowRule {
+            default_width: Some(640),
+            default_height: Some(480),
+            ..WindowRule::default()
+        };
+        let r = resolve_window_rules(&[niri.clone(), older.clone()], &ctx("c", "t"));
+        assert_eq!((r.default_width_px, r.default_column_width), (Some(640), None));
+        assert_eq!((r.default_height_px, r.default_window_height), (Some(480), None));
+        let r = resolve_window_rules(&[older, niri], &ctx("c", "t"));
+        assert_eq!(r.default_width_px, None);
+        assert_eq!(r.default_column_width, Some(Some(SizeSpec::Proportion(0.5))));
+        assert_eq!(r.default_window_height, Some(None), "the empty block: the window's own height");
     }
 }

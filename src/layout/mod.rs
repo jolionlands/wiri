@@ -73,6 +73,16 @@ impl FocusRing {
         self.stack.retain(|&id| id != window_id);
     }
 
+    /// Put a window the user has not looked at (it opened without the focus) at the back
+    /// of the ring: nothing that was focused before it is displaced.  A window that is
+    /// in the ring already stays where it is.
+    pub fn push_back(&mut self, window_id: WindowId) {
+        if self.stack.contains(&window_id) || self.stack.len() >= self.capacity {
+            return;
+        }
+        self.stack.push(window_id);
+    }
+
     /// Return the most recently focused window (front of stack), if any.
     pub fn current(&self) -> Option<WindowId> {
         self.stack.first().copied()
@@ -1134,6 +1144,27 @@ mod monitor_tests {
         // Window 1 and 2 were evicted.
         ring.remove(WindowId::new(1)); // no-op, already gone
         assert_eq!(ring.len(), 4);
+    }
+
+    #[test]
+    fn test_focus_ring_push_back_displaces_nothing() {
+        let mut ring = FocusRing::new(3);
+        ring.push(WindowId::new(1));
+        ring.push(WindowId::new(2));
+        // A window that opened without the focus goes to the back...
+        ring.push_back(WindowId::new(9));
+        assert_eq!(ring.current(), Some(WindowId::new(2)));
+        assert_eq!(
+            ring.iter_mru().collect::<Vec<_>>(),
+            vec![WindowId::new(2), WindowId::new(1), WindowId::new(9)]
+        );
+        // ...a window that is in the ring stays where it is...
+        ring.push_back(WindowId::new(1));
+        assert_eq!(ring.iter_mru().nth(1), Some(WindowId::new(1)));
+        // ...and a full ring takes no more (the oldest focus is not thrown out for it).
+        ring.push_back(WindowId::new(10));
+        assert_eq!(ring.len(), 3);
+        assert!(!ring.iter_mru().any(|w| w == WindowId::new(10)));
     }
 
     #[test]

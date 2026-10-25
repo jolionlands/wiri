@@ -420,6 +420,8 @@ async fn main() -> Result<()> {
                     monitor.work_area,
                     effective_scale,
                 );
+                // `open-on-output` and the IPC name a monitor by its device name.
+                engine.set_output_name(monitor.id, &monitor.name);
             }
         }
     }
@@ -1065,6 +1067,9 @@ fn apply_loaded_config(
         engine.update_config(new_layout_config);
         engine.set_full_config(new_config);
         engine.set_hide_method(hide_method);
+        // The rules were replaced: the windows that are open follow them (their opacity, their
+        // size limits; the `open-*` properties are for windows that open).
+        engine.reevaluate_all_window_rules(handle);
         engine.apply_all(handle);
     }
     message_loop.reload_hotkeys();
@@ -1135,12 +1140,15 @@ fn sync_monitors_from_backend(
         // are removed: their windows move to a monitor that is there, not into the void.
         for (idx, monitor) in backend_monitors.iter().enumerate() {
             match configured_monitor_scale(config.as_ref(), monitor, idx) {
-                Some(scale) => engine.sync_monitor_with_scale(
-                    monitor.id,
-                    monitor.bounds,
-                    monitor.work_area,
-                    scale,
-                ),
+                Some(scale) => {
+                    engine.sync_monitor_with_scale(
+                        monitor.id,
+                        monitor.bounds,
+                        monitor.work_area,
+                        scale,
+                    );
+                    engine.set_output_name(monitor.id, &monitor.name);
+                }
                 None => {
                     if engine.monitors().contains_key(&monitor.id) {
                         engine.unregister_monitor(&monitor.id);
@@ -1295,7 +1303,16 @@ fn handle_backend_event(
                 height: rect.size.h,
             });
         }
-        BackendEvent::WindowTitleChanged { .. } => {}
+        BackendEvent::WindowTitleChanged { hwnd } => {
+            // The backend has read the new title already.  The engine keeps it, and the
+            // window rules that look at titles are evaluated again for the window (only
+            // when some rule does).
+            if let Some(info) = handle.get_window(hwnd) {
+                engine
+                    .write()
+                    .window_title_changed(WindowId::new(hwnd), &info.title, handle);
+            }
+        }
 
         BackendEvent::WindowMoveResizeStart { hwnd } => {
             debug!("User started manual move/resize on hwnd {}", hwnd);
@@ -1311,12 +1328,18 @@ fn handle_backend_event(
                 window_hwnd: hwnd,
                 urgent,
             });
+            engine
+                .write()
+                .window_urgency_changed(WindowId::new(hwnd), handle);
         }
         BackendEvent::WindowUrgentCleared { hwnd } => {
             ipc_server.broadcast_event(IpcEvent::WindowUrgent {
                 window_hwnd: hwnd,
                 urgent: false,
             });
+            engine
+                .write()
+                .window_urgency_changed(WindowId::new(hwnd), handle);
         }
 
         // CBT events - fire BEFORE window operations

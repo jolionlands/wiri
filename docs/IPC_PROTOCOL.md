@@ -388,6 +388,7 @@ Set the active workspace's layout mode.
 | Field | Type | Description |
 |-------|------|-------------|
 | `output_id` | `u64` | Deterministic 64-bit name hash |
+| `name` | `string` | The Windows device name of the monitor (`\\.\DISPLAY1`): what `open-on-output` in a window rule and `output "name" {}` in the config call it (empty when the engine was not told) |
 | `bounds_x/y` | `i32` | Top-left of physical screen rect |
 | `bounds_width/height` | `u32` | Physical screen size in pixels |
 | `work_area_x/y/width/height` | mixed | Work area excluding taskbar |

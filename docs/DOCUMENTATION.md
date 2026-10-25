@@ -324,14 +324,41 @@ window-rule {
 }
 ```
 
-`app-id` is a regular expression searched in the program's file name (`firefox.exe`, and `firefox`
-without the extension) and, for Store apps, in the AppUserModelID; `title` is searched in the window
-title; `is-active`, `is-focused`, `is-floating`, `is-urgent`, `at-startup` take `true` or `false`.
-Properties: `open-on-output`, `open-on-workspace "name"`, `open-fullscreen`, `open-floating`,
-`open-maximized`, `open-focused`, `default-column-width { proportion 0.5; }` (or `{ fixed 800; }`),
-`default-window-height`, `min-width`, `max-width`, `min-height`, `max-height`, `opacity`, and wiri's
-`float`, `workspace`, `blur`, `sticky`.  The older forms work too: `class-name "x"` directly in the rule
-and `match { class-name "x"; process-name-regex "..."; is-active }` blocks.
+**Matching.**  A window matches a rule when it matches any `match` line (a rule without one matches
+every window) and none of the `exclude` lines; one line is the AND of its properties.  `app-id` is a
+regular expression searched in the program's file name (`firefox.exe`, and `firefox` without the
+extension) and, for Store apps and programs that name themselves, in the AppUserModelID
+(`Microsoft.WindowsTerminal_8wekyb3d8bbwe!App`); `title` is searched in the window title; `class-name` in
+the window class.  `is-active`, `is-focused`, `is-active-in-column`, `is-floating`, `is-urgent` and
+`at-startup` take `true` or `false` (`at-startup` is true for the windows that were already open when
+wiri started).  Regular expressions are Rust's, case sensitive like niri's (`(?i)` turns that off).
+When several rules match, a later rule wins for each property it sets.
+
+**What the properties do.**
+
+| Property | Effect |
+|---|---|
+| `open-on-output "\\.\DISPLAY1"` | the window opens on that monitor (`DISPLAY1` also works); a name no monitor has is ignored.  `wiri-ctl list-monitors` shows the names |
+| `open-on-workspace "chat"` | opens on the named workspace (`workspace "chat"` in the config; a name no workspace has is ignored).  When it is not the workspace you are on, the window is hidden there and your focus stays where it is |
+| `open-in-workspace 2` | wiri's variant: the workspace at that position from the top (the last one for a number past the end).  The older `workspace "2"` / `workspace "web"` key means the same, a number or a name |
+| `open-floating true` / `false` | opens floating, centred; `false` takes back a `float true` of an earlier rule |
+| `open-fullscreen true` | opens fullscreen |
+| `open-maximized true` | the column opens as wide as the view |
+| `open-focused false` | the window that has the focus keeps it: when Windows hands the new window the focus, wiri gives it back (within 2.5 s of the window opening) |
+| `default-column-width { proportion 0.5; }` or `{ fixed 800; }` or `{}` | the width of the new column; a fixed size is the window's, the border comes on top; `{}` keeps the width the window opened with.  A floating window opens at that width |
+| `default-window-height { fixed 400; }` | the height of the tile in a column of several windows (a column of one always fills the view); a floating window opens at that height |
+| `min-width`, `max-width`, `min-height`, `max-height` | limits in pixels of the window; the column / tile is held to them, the minimum winning when they clash |
+| `opacity 0.8` | the window is drawn with that alpha (together with `dim-unfocused`) |
+| wiri's `float`, `blur`, `sticky`, `default-width`, `default-height` | as before (`default-width 800` is the width of the column in pixels) |
+
+The `open-*` and `default-*` properties apply once, when the window opens.  `opacity` and the size
+limits follow the window: they are worked out again when its **title** changes, when the **focus**
+moves (`is-focused`, `is-active`), when the window **floats** or tiles again (`is-floating`), when it
+starts or stops flashing in the taskbar (`is-urgent`), and when the config is reloaded.  Only the
+windows concerned are looked at, and only when some rule depends on that kind of state.
+
+The older forms work too: `class-name "x"` directly in the rule and
+`match { class-name "x"; process-name-regex "..."; is-active }` blocks.
 
 ### `animations {}`
 

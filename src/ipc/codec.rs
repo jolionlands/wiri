@@ -118,6 +118,7 @@ mod tests {
     fn test_monitor_info_serialization() {
         let m = crate::ipc::MonitorInfo {
             output_id: 0xDEAD_BEEF_CAFE_F00D,
+            name: "\\\\.\\DISPLAY2".to_string(),
             bounds_x: 0,
             bounds_y: 0,
             bounds_width: 2560,
@@ -134,6 +135,7 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let parsed: crate::ipc::MonitorInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.output_id, m.output_id);
+        assert_eq!(parsed.name, "\\\\.\\DISPLAY2");
         assert_eq!(parsed.bounds_width, m.bounds_width);
         assert_eq!(parsed.work_area_height, m.work_area_height);
         assert!((parsed.scale_factor - m.scale_factor).abs() < f64::EPSILON);

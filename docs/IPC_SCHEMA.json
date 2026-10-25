@@ -43,6 +43,7 @@
       ],
       "properties": {
         "output_id":         { "type": "integer", "description": "Deterministic 64-bit name hash (OutputId)." },
+        "name":              { "type": "string",  "description": "Windows device name of the monitor (\\\\.\\DISPLAY1), as open-on-output names it; empty when the engine was not told." },
         "bounds_x":          { "type": "integer", "description": "Left edge of physical screen rect." },
         "bounds_y":          { "type": "integer", "description": "Top edge of physical screen rect." },
         "bounds_width":      { "type": "integer", "minimum": 0 },

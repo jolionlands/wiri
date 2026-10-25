@@ -11,6 +11,10 @@ use crate::backend::{BackendHandle, WindowInfo};
 use crate::input::{proportion_px, SizeChange};
 use crate::utils::{OutputId, Point, Rect, WindowId};
 
+// What the window rules do to a window: where it opens, how big, what keeps being true of it.
+mod rules;
+use rules::NO_ALPHA;
+
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
 // ---------------------------------------------------------------------------
@@ -547,6 +551,21 @@ pub struct TilingEngine {
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
     window_rules: Vec<crate::config::WindowRule>,
+    /// Which kinds of window state the rules depend on (the title, the focus, floating,
+    /// urgency, an `app-id`): a change of one makes the engine look at the rules again.
+    rule_flags: rules::RuleFlags,
+    /// What the rules last decided for each managed window, and the facts about the window
+    /// they were decided from.
+    rule_state: HashMap<WindowId, rules::RuleState>,
+    /// The size limits the rules put on each window (the master copy: the tiles carry a copy
+    /// that `sync_min_widths` refreshes, as a tile is made anew when its window moves).
+    rule_limits: HashMap<WindowId, rules::RuleLimits>,
+    /// The height in pixels a rule asks for the tile of each window (`default-window-height`).
+    rule_heights: HashMap<WindowId, u32>,
+    /// Windows that opened with `open-focused false`, for the first focus report they get.
+    unfocused_opens: HashMap<WindowId, rules::UnfocusedOpen>,
+    /// The device name of each monitor (`\\.\DISPLAY1`), as told by `set_output_name`.
+    output_names: HashMap<OutputId, String>,
     full_config: Option<crate::config::Config>,
     animation: crate::layout::AnimationManager,
     /// Overview mode: None = normal, Some(state) = zoomed out (all workspaces stacked).
@@ -666,6 +685,12 @@ impl TilingEngine {
             saved_styles: HashMap::new(),
             saved_ex_styles: HashMap::new(),
             window_rules: Vec::new(),
+            rule_flags: rules::RuleFlags::default(),
+            rule_state: HashMap::new(),
+            rule_limits: HashMap::new(),
+            rule_heights: HashMap::new(),
+            unfocused_opens: HashMap::new(),
+            output_names: HashMap::new(),
             full_config: None,
             animation: crate::layout::AnimationManager::disabled(),
             overview: None,
@@ -1357,136 +1382,85 @@ impl TilingEngine {
             self.original_bounds.insert(window_id, original);
         }
 
-        // Wire is_active: compare hwnd against the current foreground window.
-        let is_active = unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-            let fg = GetForegroundWindow();
-            !fg.0.is_null() && fg.0 as isize == window.hwnd
+        // The facts the rules look at, asked once: the process (its file name) and, when some
+        // rule has an `app-id`, the AppUserModelID of the window.
+        let process_name: Option<String> = backend.process_name_for_pid(window.process_id);
+        let aumid: Option<String> = if self.rule_flags.aumid {
+            backend.aumid_for_window(hwnd)
+        } else {
+            None
         };
-
-        // Wire process_name: look up via QueryFullProcessImageNameW.
-        let process_name_owned: Option<String> = backend.process_name_for_pid(window.process_id);
-
-        let ctx = crate::config::types::MatcherContext {
-            class_name: &window.class_name,
-            title: &window.title,
-            // Win32 has no concept of "instance" in the X11/Wayland sense; the
-            // closest analogue is the process executable name, which we already
-            // populate as `process_name`. Leaving instance unset is correct.
-            // (Users matching apps should write rules against `class` or
-            // `process_name`, not `instance`.)
-            instance: None,
-            process_name: process_name_owned.as_deref(),
-            is_active,
-            // is_floating: at this point the window hasn't been added to floating_windows yet,
-            // so check against the existing set (covers re-adds after toggle_floating).
-            is_floating: self.floating_windows.contains(&window_id),
-            // Item 5: check urgent_windows set; also consult the FLASHWINFO helper stub.
-            is_urgent: self.urgent_windows.contains(&window_id)
-                || crate::window::is_window_flashing(windows::Win32::Foundation::HWND(
-                    hwnd as *mut std::ffi::c_void,
-                )),
+        let rules = self.resolve_rules_for_open(
+            &window,
+            process_name.as_deref(),
+            aumid.as_deref(),
             at_startup,
-            aumid: None,
-            is_focused: is_active,
-            is_active_in_column: false,
-        };
-        let rules = crate::window::resolve_window_rules(&self.window_rules, &ctx);
+        );
+        self.rule_state.insert(
+            window_id,
+            rules::RuleState {
+                process_name,
+                aumid,
+                resolved: rules.clone(),
+            },
+        );
 
-        // Item 8: extract default_width / default_height from matching window rules.
-        // ResolvedWindowRules deliberately doesn't surface these fields (they're a
-        // first-add-only hint, not part of the per-frame resolved state). We do a
-        // second pass here for the same rule list using the same `matches` predicate
-        // so behaviour is identical to a hypothetical resolved field.
-        let (rule_default_width, rule_default_height): (Option<u32>, Option<u32>) = {
-            let mut dw: Option<u32> = None;
-            let mut dh: Option<u32> = None;
-            for rule in &self.window_rules {
-                if rule.matches(&ctx) {
-                    if rule.default_width.is_some() {
-                        dw = rule.default_width;
-                    }
-                    if rule.default_height.is_some() {
-                        dh = rule.default_height;
-                    }
-                }
-            }
-            (dw, dh)
+        // Where it opens: `open-on-output`, `open-on-workspace` / `open-in-workspace`.  A caller
+        // that names the target has chosen; the rules only place a window that comes in the
+        // normal way.
+        let (rule_output, rule_workspace) = match target {
+            AddWindowTarget::Auto => self.rule_placement(&window, &rules),
+            _ => (self.get_target_output(&window), None),
         };
+        let focus_before = self.focus_before(rule_output);
+        self.remember_open_rules(window_id, rule_output, &window, &rules);
 
         if rules.float {
             // A floating window belongs to a workspace like any other: the active one
-            // of the monitor it opens on.
-            let output_id = self.get_target_output(&window);
-            let workspace = self
-                .monitors
-                .get(&output_id)
-                .map_or(0, |m| m.active_workspace);
-            let rect = match self.monitors.get(&output_id).map(|m| m.work_area) {
-                Some(work) => Self::fit_rect_into(window.bounds, work),
-                None => window.bounds,
-            };
+            // of the monitor it opens on, unless the rules name another.
+            let output_id = rule_output;
+            let workspace = rule_workspace.unwrap_or_else(|| {
+                self.monitors
+                    .get(&output_id)
+                    .map_or(0, |m| m.active_workspace)
+            });
+            let rect = self.open_float_rect(window_id, output_id, &window, &rules, at_startup);
             self.register_float(window_id, output_id, workspace, rect);
+            if !at_startup {
+                // Centred, at the size the rules ask for: the window goes there.
+                let _ = backend.set_window_position(
+                    hwnd,
+                    rect,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+            }
             self.tiled_windows.insert(window_id, window);
             info!("Window {:?} started as floating (rule)", window_id);
+            self.act_on_open_rules(window_id, &rules, focus_before, at_startup, backend);
             return;
         }
 
         match target {
             AddWindowTarget::Auto => {
-                let output_id = self.get_target_output(&window);
+                let output_id = rule_output;
 
-                // Item 8: prefer rule default_width over config fixed width.
-                let width_hint = rule_default_width.or_else(|| {
-                    if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                        Some(self.config.column_width)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(monitor) = self.monitors.get_mut(&output_id) {
-                    if let Some(ws_id) = rules.workspace {
-                        if !monitor.workspaces.contains_key(&ws_id) {
-                            monitor
-                                .workspaces
-                                .insert(ws_id, crate::layout::Workspace::new());
+                // The width of the column: what the rules ask for, else the configured fixed
+                // width.
+                let width_hint = self
+                    .open_column_width(output_id, &window, &rules)
+                    .or_else(|| {
+                        if self.config.column_width_mode == ColumnWidthMode::Fixed {
+                            Some(self.config.column_width)
+                        } else {
+                            None
                         }
-                        let previous_ws = monitor.active_workspace;
-                        monitor.active_workspace = ws_id;
-                        monitor.add_window_with_width(window_id, width_hint);
-                        if let Some(dh) = rule_default_height {
-                            if let Some(workspace) = monitor.workspace_mut() {
-                                if let Some(col) = workspace.columns.last_mut() {
-                                    if let Some(tile) = col.tiles.last_mut() {
-                                        tile.preferred_height = Some(dh);
-                                    }
-                                }
-                            }
-                        }
-                        monitor.active_workspace = previous_ws;
-                    } else {
-                        monitor.add_window_with_width(window_id, width_hint);
-                        // Item 8: store preferred_height on the newly added tile.
-                        if let Some(dh) = rule_default_height {
-                            if let Some(workspace) = monitor.workspace_mut() {
-                                // The tile was added to the last column.
-                                if let Some(col) = workspace.columns.last_mut() {
-                                    if let Some(tile) = col.tiles.last_mut() {
-                                        tile.preferred_height = Some(dh);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    });
+                if self.place_new_tile(window_id, output_id, rule_workspace, width_hint) {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
                 self.apply_shadow_for_window(hwnd);
-                if let Some(o) = rules.opacity {
-                    // Explicit opacity override from a window-rule.
-                    // `Some(0.0)` is honoured as fully transparent.
-                    self.apply_window_opacity(window_id.as_isize(), o);
-                }
+                // The opacity of the rule is given by the layout pass (see `wanted_alpha`).
                 if rules.blur {
                     // niri-parity: apply DWM blur backdrop once per HWND.
                     self.apply_window_blur(hwnd, true);
@@ -1684,9 +1658,14 @@ impl TilingEngine {
                 self.maintain_empty_workspace(oid);
             }
         }
+
+        // What the rules ask once the window is in its place: its column as wide as the view,
+        // no focus for it, fullscreen.
+        self.act_on_open_rules(window_id, &rules, focus_before, at_startup, backend);
     }
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        self.forget_rule_state(window_id);
         self.fullscreen_windows.remove(&window_id);
         self.minimized.remove(&window_id);
         self.floating_windows.remove(&window_id);
@@ -1789,15 +1768,31 @@ impl TilingEngine {
             .visible = false;
     }
 
-    /// Copy the known minimum widths onto the tiles (a tile is made anew when a window
-    /// moves to another workspace or stops floating).
+    /// Copy what is known of each window onto its tile: the minimum width the window
+    /// answered, the size limits and the height its window rule asks for (a tile is made
+    /// anew when a window moves to another workspace or stops floating).  The minimum width
+    /// of a tile is the larger of what the window says and what its rule says; the limits
+    /// of a rule are for the window, so the border around it comes on top.
     fn sync_min_widths(&mut self) {
         let known = &self.window_min_widths;
-        for monitor in self.monitors.values_mut() {
+        let limits = &self.rule_limits;
+        let heights = &self.rule_heights;
+        let global_border = 2 * self.config.border_width.max(1) as u32;
+        let per_monitor = &self.config_per_monitor;
+        for (output, monitor) in self.monitors.iter_mut() {
+            let border = per_monitor
+                .get(output)
+                .map_or(global_border, |c| 2 * c.border_width.max(1) as u32);
             for workspace in monitor.workspaces.values_mut() {
                 for column in workspace.columns.iter_mut() {
                     for tile in column.tiles.iter_mut() {
-                        tile.min_width = known.get(&tile.window_id).copied().unwrap_or(0);
+                        let window_min = known.get(&tile.window_id).copied().unwrap_or(0);
+                        let rule = limits.get(&tile.window_id).copied().unwrap_or_default();
+                        tile.min_width = window_min.max(rules::RuleLimits::for_tile(rule.min_width, border));
+                        tile.max_width = rules::RuleLimits::for_tile(rule.max_width, border);
+                        tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
+                        tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
+                        tile.preferred_height = heights.get(&tile.window_id).copied();
                     }
                 }
             }
@@ -2198,15 +2193,9 @@ impl TilingEngine {
         Self::column_widths_with_minimums(explicit, &[], view_width, gap, cfg).0
     }
 
-    /// [`Self::column_widths`] for columns that cannot be made narrower than `mins` (the
-    /// widest minimum of the windows in each; missing or 0 = no limit), and the width a
-    /// column without a width of its own gets.
-    ///
-    /// A column is never narrower than its minimum: asking a Windows Terminal window for
-    /// less than its ~462 px only makes it overlap its neighbour.  An explicit width below
-    /// the minimum is raised to it.  A column without a width of its own whose minimum is
-    /// above the share it would get keeps that minimum, and the others split what is left
-    /// (in proportional mode; in fixed mode the others keep the configured width).
+    /// [`Self::column_widths_with_limits`] without maximums: for columns that cannot be
+    /// made narrower than `mins` (the widest minimum of the windows in each; missing or 0 =
+    /// no limit), and the width a column without a width of its own gets.
     pub fn column_widths_with_minimums(
         explicit: &[Option<u32>],
         mins: &[u32],
@@ -2214,20 +2203,55 @@ impl TilingEngine {
         gap: i32,
         cfg: &LayoutConfig,
     ) -> (Vec<i32>, i32) {
+        Self::column_widths_with_limits(explicit, mins, &[], view_width, gap, cfg)
+    }
+
+    /// [`Self::column_widths`] for columns that cannot be made narrower than `mins` (the
+    /// widest minimum of the windows in each; missing or 0 = no limit) nor wider than
+    /// `maxs` (the smallest maximum of the windows in each; missing or 0 = no limit), and
+    /// the width a column without a width of its own gets.
+    ///
+    /// A column is never narrower than its minimum: asking a Windows Terminal window for
+    /// less than its ~462 px only makes it overlap its neighbour.  An explicit width below
+    /// the minimum is raised to it, one above the maximum (a window rule's `max-width`) is
+    /// cut to it; when a column's limits clash the minimum wins.  A column without a width
+    /// of its own whose limits are not met by the share it would get keeps its limit, and
+    /// the others split what is left (in proportional mode; in fixed mode the others keep
+    /// the configured width).
+    pub fn column_widths_with_limits(
+        explicit: &[Option<u32>],
+        mins: &[u32],
+        maxs: &[u32],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> (Vec<i32>, i32) {
         let min_of = |i: usize| mins.get(i).copied().unwrap_or(0);
+        let max_of = |i: usize| maxs.get(i).copied().unwrap_or(0);
+        // `width` held to the limits of column `i`.
+        let held = |i: usize, width: u32| -> u32 {
+            let width = width.max(min_of(i));
+            match max_of(i) {
+                0 => width,
+                max => width.min(max.max(min_of(i))),
+            }
+        };
         let mut fixed: Vec<Option<u32>> = explicit
             .iter()
             .enumerate()
-            .map(|(i, w)| w.map(|w| w.max(min_of(i))))
+            .map(|(i, w)| w.map(|w| held(i, w)))
             .collect();
         let mut auto = Self::auto_column_width(&fixed, view_width, gap, cfg);
         // Every pass fixes at least one more column or stops: at most one pass per column.
         for _ in 0..fixed.len() {
             let mut changed = false;
             for (i, width) in fixed.iter_mut().enumerate() {
-                if width.is_none() && min_of(i) as i32 > auto {
-                    *width = Some(min_of(i));
-                    changed = true;
+                if width.is_none() {
+                    let wanted = held(i, auto.max(0) as u32);
+                    if wanted as i32 != auto {
+                        *width = Some(wanted);
+                        changed = true;
+                    }
                 }
             }
             if !changed {
@@ -2242,15 +2266,20 @@ impl TilingEngine {
         (widths, auto)
     }
 
-    /// The explicit width and the minimum width of every column of `workspace`, in order.
+    /// The explicit width, the minimum width and the maximum width of every column of
+    /// `workspace`, in order.
     fn column_inputs(
         workspace: &crate::layout::workspace::Workspace,
-    ) -> (Vec<Option<u32>>, Vec<u32>) {
-        workspace
-            .columns
-            .iter()
-            .map(|c| (c.width, c.min_width()))
-            .unzip()
+    ) -> (Vec<Option<u32>>, Vec<u32>, Vec<u32>) {
+        let mut explicit = Vec::with_capacity(workspace.columns.len());
+        let mut mins = Vec::with_capacity(workspace.columns.len());
+        let mut maxs = Vec::with_capacity(workspace.columns.len());
+        for column in &workspace.columns {
+            explicit.push(column.width);
+            mins.push(column.min_width());
+            maxs.push(column.max_width());
+        }
+        (explicit, mins, maxs)
     }
 
     /// The width a column without explicit width gets on `workspace`.
@@ -2259,11 +2288,11 @@ impl TilingEngine {
         view_width: i32,
         cfg: &LayoutConfig,
     ) -> i32 {
-        let (explicit, mins) = Self::column_inputs(workspace);
+        let (explicit, mins, maxs) = Self::column_inputs(workspace);
         if explicit.is_empty() {
             return Self::effective_column_width(0, view_width, cfg);
         }
-        Self::column_widths_with_minimums(&explicit, &mins, view_width, cfg.column_gap, cfg).1
+        Self::column_widths_with_limits(&explicit, &mins, &maxs, view_width, cfg.column_gap, cfg).1
     }
 
     pub fn apply_layout_for_monitor(&mut self, output_id: OutputId, backend: &BackendHandle) {
@@ -2577,10 +2606,6 @@ impl TilingEngine {
             false
         };
 
-        // Pre-compute target opacity values as u8 for comparison.
-        let opacity_full: u32 = 255;
-        let opacity_dim: u32 = (eff_cfg.dim_unfocused * 255.0).round().clamp(0.0, 255.0) as u32;
-
         // When `true`, the overview pass routes per-tile geometry to the
         // installed DWM-thumbnail sink instead of resizing live HWNDs.
         // This leaves the real windows alone (no SetWindowPos, no
@@ -2667,17 +2692,19 @@ impl TilingEngine {
             } else {
                 border_color_normal_u32
             };
-            let new_opacity: u32 = if eff_cfg.dim_unfocused < 1.0 {
-                if is_focused {
-                    opacity_full
-                } else {
-                    opacity_dim
-                }
-            } else {
-                // dim_unfocused == 1.0 means "no dimming"; use sentinel so we
-                // never issue SetLayeredWindowAttributes unnecessarily.
-                0xFFFF_FFFF
-            };
+            // The alpha: the opacity of the window's rule times the dimming of an unfocused
+            // window.  Nothing asking for either keeps the sentinel, so that no
+            // SetLayeredWindowAttributes is issued unnecessarily.
+            let new_opacity: u32 = rules::wanted_alpha(
+                eff_cfg.dim_unfocused,
+                is_focused,
+                self.rule_state
+                    .get(&window_id)
+                    .and_then(|s| s.resolved.opacity),
+                self.applied_state
+                    .get(&window_id)
+                    .map_or(NO_ALPHA, |s| s.opacity),
+            );
 
             // Every tile gets the same inset, focused or not.  A focus-
             // dependent size means each focus change resizes two windows
@@ -3032,6 +3059,24 @@ impl TilingEngine {
         window_id: WindowId,
         backend: &BackendHandle,
     ) -> Option<(usize, i32)> {
+        // A window that opened with `open-focused false` and was handed the focus by
+        // Windows gives it back, once, within a moment of opening.
+        if self.refuse_unwanted_focus(window_id, backend) {
+            return None;
+        }
+        let previous = self.os_foreground;
+        let result = self.follow_os_foreground(window_id, backend);
+        // The rules that depend on the focus look at the two windows again.
+        self.rules_after_focus_change(previous, window_id, backend);
+        result
+    }
+
+    /// [`Self::sync_os_foreground`] without the window rules.
+    fn follow_os_foreground(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) -> Option<(usize, i32)> {
         // Whatever the window is (tiled, floating, unmanaged), it is what the user is
         // looking at now.
         self.os_foreground = Some(window_id);
@@ -3311,10 +3356,11 @@ impl TilingEngine {
         // overview is active.  Falls back to overview_zoom() when overview is on.
         let zoom = self.effective_zoom();
 
-        let (explicit_widths, min_widths) = Self::column_inputs(workspace);
-        let (col_widths, _) = Self::column_widths_with_minimums(
+        let (explicit_widths, min_widths, max_widths) = Self::column_inputs(workspace);
+        let (col_widths, _) = Self::column_widths_with_limits(
             &explicit_widths,
             &min_widths,
+            &max_widths,
             work_rect.size.w as i32,
             column_gap,
             cfg,
@@ -3395,37 +3441,32 @@ impl TilingEngine {
             let available_height = (work_height - total_gap_height).max(0);
             // Per-tile heights honor `Tile.height_weight` so the keyboard
             // resize actions (`Action::GrowTileHeight` / `ShrinkTileHeight`)
-            // can re-bias a column's vertical distribution.
-            let force_equal = visible_count == 1;
-            let weights: Vec<f32> = visible_indices
+            // can re-bias a column's vertical distribution; a tile whose window rule
+            // asks for a height of its own keeps it and the others share the rest
+            // (`default-window-height`), and `min-height` / `max-height` hold a tile.
+            // In overview the pixel sizes are zoomed like the column.
+            let height_scale = if zoom < 1.0 { zoom as f32 } else { 1.0 };
+            let scaled = |px: u32| -> i32 { ((px as f32) * height_scale).round() as i32 };
+            let specs: Vec<rules::HeightSpec> = visible_indices
                 .iter()
-                .map(|&i| {
-                    if force_equal {
-                        1.0
-                    } else {
-                        column
-                            .tiles
-                            .get(i)
-                            .map(|t| t.height_weight.max(0.1))
-                            .unwrap_or(1.0)
-                    }
+                .map(|&i| match column.tiles.get(i) {
+                    Some(t) => rules::HeightSpec {
+                        fixed: t.preferred_height.map(&scaled),
+                        weight: t.height_weight.max(0.1),
+                        min: scaled(t.min_height),
+                        max: scaled(t.max_height),
+                    },
+                    None => rules::HeightSpec {
+                        fixed: None,
+                        weight: 1.0,
+                        min: 0,
+                        max: 0,
+                    },
                 })
                 .collect();
-            let weight_sum: f32 = weights.iter().sum::<f32>().max(0.1);
-            // Pre-compute integer heights, last slot absorbs rounding remainder
-            // so the column always uses the full available height exactly.
-            let mut tile_heights: Vec<i32> = weights
-                .iter()
-                .map(|w| ((available_height as f32) * (w / weight_sum)).floor() as i32)
-                .collect();
-            let leading_sum: i32 = if tile_heights.len() > 1 {
-                tile_heights[..tile_heights.len() - 1].iter().sum()
-            } else {
-                0
-            };
-            if let Some(last) = tile_heights.last_mut() {
-                *last = (available_height - leading_sum).max(0);
-            }
+            // The rounding the shares leave goes to the last tile, so that the column uses
+            // the full available height exactly.
+            let tile_heights: Vec<i32> = rules::distribute_heights(available_height, &specs);
 
             let y_centre_offset = if zoom < 1.0 {
                 let total_used: i32 = tile_heights.iter().sum::<i32>()
@@ -4089,6 +4130,7 @@ impl TilingEngine {
         info!("Floating window {:?} at {:?}", window_id, rect);
         self.maintain_empty_workspace(output);
         self.apply_layout_for_monitor(output, backend);
+        self.rules_after_float_change(window_id, backend);
     }
 
     /// Put a floating window back into the strip of the workspace it belongs to,
@@ -4134,6 +4176,7 @@ impl TilingEngine {
         self.maintain_empty_workspace(output);
         self.reveal_focused_column(output);
         self.apply_layout_for_monitor(output, backend);
+        self.rules_after_float_change(window_id, backend);
     }
 
     /// Float `window_id` if it is tiled, tile it if it floats.
@@ -4161,6 +4204,15 @@ impl TilingEngine {
     fn place_float(&mut self, window_id: WindowId, rect: Rect, backend: &BackendHandle) {
         let Some((output, _)) = self.float_location(window_id) else {
             return;
+        };
+        // The size limits of the window's rules hold a float too (the window's size, with no
+        // border of wiri's around it).
+        let rect = match self.rule_limits.get(&window_id) {
+            Some(limits) => {
+                let (w, h) = limits.clamp(rect.size.w, rect.size.h);
+                Rect::new(rect.loc.x, rect.loc.y, w, h)
+            }
+            None => rect,
         };
         let rect = match self.monitors.get(&output).map(|m| m.work_area) {
             Some(work) => Self::fit_rect_into(rect, work),
@@ -5583,8 +5635,10 @@ impl TilingEngine {
         self.full_config.as_ref()
     }
 
-    /// Set the window rules from configuration
+    /// Set the window rules from configuration.  The windows that are managed keep what the
+    /// old rules decided until [`Self::reevaluate_all_window_rules`] looks at them again.
     pub fn set_window_rules(&mut self, rules: Vec<crate::config::WindowRule>) {
+        self.rule_flags = rules::RuleFlags::of(&rules);
         self.window_rules = rules;
     }
 
@@ -5596,7 +5650,7 @@ impl TilingEngine {
     /// `LayoutConfig::from_config`.  Subsequent layout passes consult
     /// `effective_config(oid)` to pick the right config per monitor.
     pub fn set_full_config(&mut self, config: crate::config::Config) {
-        self.window_rules = config.window_rules.clone();
+        self.set_window_rules(config.window_rules.clone());
 
         // Rebuild per-monitor overrides from `config.output[*].layout_override`.
         self.config_per_monitor.clear();
@@ -6705,9 +6759,12 @@ impl TilingEngine {
             // The share of the column the window gets, and the weight that makes it so.
             let share = (target_px as f32 / available).clamp(0.05, 0.95);
             column.tiles[idx].height_weight = (share / (1.0 - share) * others).clamp(0.1, 10.0);
-            true
+            // The height the user chose replaces the one a window rule asked for.
+            column.tiles[idx].preferred_height = None;
+            Some(window)
         };
-        if changed {
+        if let Some(window) = changed {
+            self.rule_heights.remove(&window);
             self.apply_layout_for_monitor(output, backend);
         }
     }
@@ -6724,9 +6781,14 @@ impl TilingEngine {
                 let (col_idx, window) = (monitor.focus_column?, monitor.focus_window?);
                 monitor.workspace_mut()?.columns.get_mut(col_idx)?.tiles.iter_mut().find(|t| t.window_id == window)
             })
-            .map(|tile| tile.height_weight = 1.0)
-            .is_some();
-        if reset {
+            .map(|tile| {
+                tile.height_weight = 1.0;
+                // The height a window rule asked for is gone too: "default" is auto.
+                tile.preferred_height = None;
+                tile.window_id
+            });
+        if let Some(window) = reset {
+            self.rule_heights.remove(&window);
             self.apply_layout_for_monitor(output, backend);
         }
     }
@@ -7073,8 +7135,9 @@ impl TilingEngine {
             }
             let view = Self::view_width_for_monitor(monitor, cfg);
             let gap = cfg.column_gap;
-            let (explicit, mins) = Self::column_inputs(workspace);
-            let (widths, _) = Self::column_widths_with_minimums(&explicit, &mins, view, gap, cfg);
+            let (explicit, mins, maxs) = Self::column_inputs(workspace);
+            let (widths, _) =
+                Self::column_widths_with_limits(&explicit, &mins, &maxs, view, gap, cfg);
             let scroll = workspace.scroll_offset.x;
             let mut x = 0;
             let mut taken = 0;

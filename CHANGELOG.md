@@ -28,6 +28,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The shipped `resources/default_config.kdl` and `examples/` are written in niri syntax.  A string that
   starts like a Windows path keeps its backslashes (`"C:\Program Files\x"`), elsewhere a bad escape is an
   error that points at it and a raw string always works.
+- **Window rules act.**  Several `match` lines are OR-ed and `exclude` lines veto (a window matches a
+  rule when it matches any `match` line and no `exclude` line); `app-id` and `title` are regular
+  expressions searched in the process's file name (`firefox.exe`, and without `.exe`) or the
+  AppUserModelID, and in the title.  The `open-*` properties were parsed and never read; now
+  `open-on-output` (a monitor by its device name, `wiri-ctl list-monitors` shows it), `open-on-workspace`
+  (by name) and `open-in-workspace` (by position; the older `workspace "2"` / `workspace "web"` key is a
+  position or a name, it used to be an internal id), `open-floating` (centred, at the size
+  `default-column-width` / `default-window-height` ask for), `open-fullscreen`, `open-maximized` and
+  `open-focused false` (the window that had the focus keeps it) all do what they say.
+  `default-column-width` (a proportion, a fixed size or the window's own), `default-window-height`
+  (used by the layout now: a tile of a column of several windows gets that height) and the limits
+  `min-width`, `max-width`, `min-height`, `max-height` hold columns and tiles; `opacity` multiplies with
+  `dim-unfocused`.  Opacity and the limits **follow the window**: they are worked out again when its
+  title changes, when the focus moves, when it floats or tiles again, when it starts or stops flashing
+  and when the config is reloaded - nothing polls, and only windows that a rule depends on are looked
+  at.  `wiri-ctl list-monitors` shows the device name of each monitor.  The process name the rules see is
+  the file name (`firefox.exe`; `process-name "firefox"` still matches).
 
 ### Phase 1 — safe to daily-drive (2026-10-24)
 Each item is verified on a spare Windows 11 laptop with `scripts/live-test.ps1` (real key
