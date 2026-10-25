@@ -13,12 +13,15 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 2 | 85 | 124 | 15 |
-| Config, input and IPC (259 rows) | 11 | 87 | 91 | 70 |
+| Layout and behaviour (226 rows) | 30 | 70 | 111 | 15 |
+| Config, input and IPC (259 rows) | 15 | 86 | 88 | 70 |
 
-Line numbers in both files refer to commit 1532635. The live fixes since then (up to
-4b9d834) closed some rows; each matrix ends with a list of the working-tree edits that
-were in flight while it was written.
+The counts are as of Phase 1 (`6ea45e4`); the matrices were 2 / 85 / 124 / 15 and 11 / 87 / 91 / 70
+when they were written.  Line numbers in both files refer to commit 1532635. The live fixes since then
+(Phase 0 up to 4b9d834, Phase 1 up to `6ea45e4`) closed some rows and updated the evidence of others
+(a row says "Phase 1, item N" when that item changed it); each matrix ends with a list of the working-tree
+edits that were in flight while it was written.  [The Phase 1 report](phase1-report.md) lists what was
+verified live and what only by unit tests.
 
 ## Plan
 
@@ -28,15 +31,17 @@ GUI-subsystem build with a log file, crash-safe hidden windows, Escape reaches
 applications, the overview no longer freezes, `move-column-left/right` swaps. Verified by
 `scripts/live-test.ps1` on a spare Windows 11 laptop.
 
-**Phase 1, safe to daily-drive (P0):** reject unknown modifiers (today `Mod+T` registers a
-global `T`) and add `Mod` tied to `mod-key`; `spawn` and `spawn-at-startup` keep their
+**Phase 1, done (`02e8aab`..`6ea45e4`, [report](phase1-report.md)), safe to daily-drive (P0):** unknown
+modifiers are rejected and `Mod` is tied to `mod-key`; `spawn` and `spawn-at-startup` keep their
 arguments and search PATH; every action targets the real foreground window, floating ones
 included; minimized windows leave no gap; floating windows belong to their workspace;
 niri's keymap semantics (`consume-or-expel`, `maximize-column`, first/last moves) and its
 action names and argument grammar (`focus-workspace 2`, `set-column-width "+10%"`);
-workspace model (index addressing, previous-workspace memory, real named workspaces);
-monitor unplug keeps the windows; hide inactive workspaces by DWM cloaking instead of
-`SW_HIDE` so windows stay in the taskbar and Alt+Tab.
+workspace model (index addressing, previous-workspace memory, real named workspaces); the Phase 0
+leftovers (a terminal's minimum width, an exact fullscreen, no `Ctrl+Alt+Tab` default, windows put
+back after a crash); monitor unplug keeps the windows (**unit-tested only: the test laptop has one
+display**); hiding inactive workspaces by shell cloaking so windows stay in the taskbar and Alt+Tab is
+there as the opt-in `hide-method "cloak"` (`SW_HIDE` stays the default).
 
 **Phase 2, niri feel (P1):** a real KDL parser with visible errors; a low-level keyboard
 bind engine (Win-key chords, repeat, cooldown); mouse and wheel binds; one overlay layer
