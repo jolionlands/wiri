@@ -24,11 +24,6 @@ const EVENT_OBJECT_DESTROY: u32 = 0x8001;
 const EVENT_OBJECT_SHOW: u32 = 0x8002;
 const EVENT_OBJECT_HIDE: u32 = 0x8003;
 const EVENT_OBJECT_REORDER: u32 = 0x8004;
-/// EVENT_OBJECT_STATECHANGE (0x800A) fires when an object's accessibility
-/// state changes — including the STATE_SYSTEM_ALERT bit that apps set when
-/// requesting urgent attention (often accompanies FlashWindow). Monitoring
-/// this gives us a second signal for urgent-window detection.
-const EVENT_OBJECT_STATECHANGE: u32 = 0x800A;
 const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 
@@ -115,7 +110,6 @@ fn register_winevent_hooks() -> Vec<HWINEVENTHOOK> {
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE),
         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY),
         (EVENT_OBJECT_SHOW, EVENT_OBJECT_REORDER),
-        (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
         (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
     ];
@@ -316,23 +310,6 @@ unsafe extern "system" fn winevent_proc(
             // the tile that moved. Re-read the actual stack, never classify this as HIDE.
             backend.send_event(BackendEvent::ZOrderChanged);
         }
-        0x800A => {
-            // EVENT_OBJECT_STATECHANGE — accessibility state changed.
-            // Some apps (e.g. terminals, chat clients) signal attention via the
-            // IAccessible STATE_SYSTEM_ALERT bit rather than FlashWindow. We
-            // emit WindowUrgent only for windows we are already tracking to
-            // avoid turning every control's state-change into a spurious alert.
-            let hwnd_isize = hwnd.0 as isize;
-            if backend.get_window(hwnd_isize).is_some() {
-                let newly_inserted = URGENT_WINDOWS.lock().insert(hwnd_isize);
-                if newly_inserted {
-                    backend.send_event(BackendEvent::WindowUrgent {
-                        hwnd: hwnd_isize,
-                        urgent: true,
-                    });
-                }
-            }
-        }
         0x800B => {
             // EVENT_OBJECT_LOCATIONCHANGE
             let hwnd_isize = hwnd.0 as isize;
@@ -512,6 +489,17 @@ fn detect_size_class_change(backend: &BackendHandle, hwnd: HWND) {
 /// `crate::window::is_window_flashing` helper.
 static URGENT_WINDOWS: LazyLock<Mutex<HashSet<isize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// An actual shell flash notification. Kept separate from generic state changes.
+pub(crate) fn attention_requested(hwnd: isize) {
+    let backend = BACKEND_STORAGE.lock().clone();
+    let Some(backend) = backend else {
+        return;
+    };
+    if backend.get_window(hwnd).is_some() && URGENT_WINDOWS.lock().insert(hwnd) {
+        backend.send_event(BackendEvent::WindowUrgent { hwnd, urgent: true });
+    }
+}
 
 /// Return true if `hwnd` is currently in the urgent/flashing state. Cheap to
 /// call — just a HashSet lookup behind a Mutex.

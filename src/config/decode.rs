@@ -25,6 +25,7 @@ mod animations_decode;
 mod effects_decode;
 #[path = "decode/recent_windows_decode.rs"]
 mod recent_windows_decode;
+mod rule_effects_decode;
 
 /// How many levels of `include` are followed.
 pub const MAX_INCLUDE_DEPTH: u8 = 8;
@@ -2085,14 +2086,16 @@ impl Decoder {
                         rule.default_window_height = Some(v);
                     }
                 }
-                "on-xdg-activate"
-                | "focus-ring"
+                "focus-ring"
                 | "border"
                 | "shadow"
                 | "tab-indicator"
-                | "draw-border-with-background"
                 | "geometry-corner-radius"
-                | "clip-to-geometry"
+                | "clip-to-geometry" => {
+                    self.rule_effect_key(child, &mut rule.effects);
+                }
+                "on-xdg-activate"
+                | "draw-border-with-background"
                 | "baba-is-float"
                 | "block-out-from"
                 | "variable-refresh-rate"
@@ -3299,7 +3302,7 @@ mod tests {
         assert!(e.iter().any(|m| m.contains("takes properties")), "{:?}", e);
         let d = load("window-rule { match is-window-cast-target=true\n focus-ring { off }\n geometry-corner-radius 8 }\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(warnings(&d).len(), 3);
+        assert_eq!(warnings(&d).len(), 1); // Only the compositor-only match is unsupported.
     }
 
     #[test]

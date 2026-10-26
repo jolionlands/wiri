@@ -29,8 +29,14 @@ fn relevant(message: u32, code: usize, shell: u32) -> bool {
     matches!(message, 0x0051 | 0x001A) || (shell != 0 && message == shell && code == 8)
 }
 
-pub(crate) fn observe_message(message: u32, code: usize) {
-    if relevant(message, code, SHELL_MESSAGE.load(Ordering::Acquire)) {
+pub(crate) fn observe_message(message: u32, code: usize, window: isize) {
+    let shell = SHELL_MESSAGE.load(Ordering::Acquire);
+    // HSHELL_FLASH is an actual attention request, unlike a generic accessibility
+    // state change. Reuse this registered shell host; never install another pump.
+    if shell != 0 && message == shell && code == 0x8006 {
+        crate::backend::hooks::attention_requested(window);
+    }
+    if relevant(message, code, shell) {
         super::notify_state_changed();
     }
 }

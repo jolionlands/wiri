@@ -50,8 +50,10 @@ pub struct FrameSpec {
     pub tile: Rect,
     /// The width of the border band; the window is the tile shrunk by this on every side.
     pub band: i32,
-    /// The radius of the window's own corners.
+    /// The legacy uniform radius of the window's own corners, used when `corners` is `None`.
     pub radius: f32,
+    /// Top-left, top-right, bottom-right and bottom-left window radii, overriding `radius`.
+    pub corners: Option<[f32; 4]>,
     pub border: Option<Paint>,
     pub ring_width: i32,
     pub ring: Option<Paint>,
@@ -96,13 +98,10 @@ impl FrameSpec {
 
     pub fn render(&self, surf: &mut Surface, origin: (i32, i32)) {
         let band = self.band.max(0) as f32;
-        let tile_radius = if self.radius > 0.0 {
-            self.radius + band
-        } else {
-            0.0
-        };
-        let tile = RRect::of(self.tile, origin, tile_radius);
-        let window = RRect::of(self.window(), origin, self.radius);
+        let corners = self.corners.unwrap_or([self.radius; 4]);
+        let tile_corners = corners.map(|r| if r > 0.0 { r + band } else { 0.0 });
+        let tile = RRect::of_corners(self.tile, origin, tile_corners);
+        let window = RRect::of_corners(self.window(), origin, corners);
         let view = RRect::of(self.view, origin, 0.0);
         if let Some(sh) = &self.shadow {
             let shape = tile.outset(sh.spread).moved(sh.offset_x, sh.offset_y);
@@ -488,6 +487,7 @@ mod tests {
             tile,
             band: 4,
             radius: 8.0,
+            corners: None,
             border: Some(BLUE),
             ring_width: 3,
             ring: Some(RED),
@@ -549,6 +549,70 @@ mod tests {
         assert_eq!(surf.get(band_x, mid_y), [0, 0, 255, 255]);
         // In the window: nothing.
         assert_eq!(surf.get(130 - b.loc.x, mid_y), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn explicit_frame_corners_override_the_legacy_radius_and_none_keeps_it() {
+        let mut f = frame(Rect::new(20, 20, 80, 80));
+        let render = |f: &FrameSpec| {
+            let mut pixels = vec![0; 120 * 120];
+            f.render(&mut Surface::new(120, 120, &mut pixels), (0, 0));
+            pixels
+        };
+        let legacy = render(&f);
+        f.corners = Some([f.radius; 4]);
+        assert_eq!(render(&f), legacy);
+        f.corners = Some([0.0; 4]);
+        let square = render(&f);
+        assert_ne!(square, legacy);
+        f.corners = None;
+        f.radius = 0.0;
+        assert_eq!(render(&f), square);
+    }
+
+    #[test]
+    fn frame_corners_reach_the_border_ring_and_shadow_in_clockwise_order() {
+        let mut f = frame(Rect::new(20, 20, 80, 80));
+        f.corners = Some([16.0, 0.0, 8.0, 4.0]);
+        let mut pixels = vec![0; 120 * 120];
+        let mut surf = Surface::new(120, 120, &mut pixels);
+        f.render(&mut surf, (0, 0));
+        assert_eq!(
+            surf.get(24, 24),
+            [255, 0, 0, 255],
+            "large top-left cut is ring"
+        );
+        assert_eq!(surf.get(95, 24), [0; 4], "top-right window stays square");
+        assert_eq!(
+            surf.get(95, 95),
+            [0, 0, 255, 255],
+            "bottom-right cut is border"
+        );
+        assert!(
+            surf.get(25, 94)[3] < 30,
+            "bottom-left has the smaller radius"
+        );
+        assert_eq!(surf.get(102, 17), [255, 0, 0, 255], "square ring corner");
+        assert_eq!(surf.get(17, 17), [0; 4], "round ring corner");
+
+        f.ring = None;
+        f.border = None;
+        f.shadow = Some(ShadowSpec {
+            softness: 0.0,
+            spread: 0.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            color: Rgba::new(0, 0, 0, 200),
+            draw_behind_window: true,
+        });
+        surf.clear();
+        f.render(&mut surf, (0, 0));
+        assert_eq!(surf.get(20, 20), [0; 4], "shadow's top-left is round");
+        assert_eq!(
+            surf.get(99, 20),
+            [0, 0, 0, 200],
+            "shadow's top-right is square"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
 
+pub mod rule_effects;
 pub mod rules;
 pub use rules::{resolve_window_rules, resolve_window_rules_legacy};
 
@@ -168,6 +169,7 @@ pub struct ResolvedWindowRules {
     pub max_width: Option<u32>,
     pub min_height: Option<u32>,
     pub max_height: Option<u32>,
+    pub effects: rule_effects::RuleEffects,
 }
 
 impl Default for ResolvedWindowRules {
@@ -196,6 +198,7 @@ impl Default for ResolvedWindowRules {
             max_width: None,
             min_height: None,
             max_height: None,
+            effects: Default::default(),
         }
     }
 }
@@ -210,6 +213,7 @@ impl ResolvedWindowRules {
             && self.max_width == other.max_width
             && self.min_height == other.min_height
             && self.max_height == other.max_height
+            && self.effects == other.effects
     }
 }
 
