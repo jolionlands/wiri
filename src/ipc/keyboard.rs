@@ -60,6 +60,12 @@ pub(crate) fn switch_layout(target: LayoutSwitchTarget) -> Result<(), String> {
         return Err("cannot switch keyboard layout: no foreground keyboard layout".to_owned());
     }
     let selected = select_layout(&layouts, current, target)?;
+    post_layout_request(hwnd, selected)
+}
+
+// Shared Lane-H poster: never activates a layout on the calling thread.
+// Success means queued, not accepted by the foreground application.
+fn post_layout_request(hwnd: windows::Win32::Foundation::HWND, selected: HKL) -> Result<(), String> {
     unsafe {
         PostMessageW(
             hwnd,
@@ -71,11 +77,68 @@ pub(crate) fn switch_layout(target: LayoutSwitchTarget) -> Result<(), String> {
     .map_err(|error| format!("failed to post keyboard layout switch request: {error}"))
 }
 
+/// Foreground/ownership-guarded configured request via the Lane-H poster.
+/// Callers MUST select the dry-run backend before reaching this function.
+/// HWND/thread/layout checks cannot be atomic with an asynchronous post.
+pub(crate) fn request_configured_layout(
+    plan: &ConfiguredLayoutPlan,
+    restore: bool,
+) -> Result<bool, String> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() || hwnd.0 as isize != plan.window {
+        return Ok(false);
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread_id == 0 || thread_id != plan.thread_id {
+        return Ok(false);
+    }
+    let current = unsafe { GetKeyboardLayout(thread_id) }.0 as isize;
+    let Some(target) = configured_request_target(plan, hwnd.0 as isize, thread_id, current, restore)
+    else {
+        return Ok(false);
+    };
+    post_layout_request(hwnd, HKL(target as *mut _))?;
+    Ok(true)
+}
+
+fn configured_request_target(
+    plan: &ConfiguredLayoutPlan,
+    window: isize,
+    thread_id: u32,
+    current: isize,
+    restore: bool,
+) -> Option<isize> {
+    if window == 0
+        || window != plan.window
+        || thread_id == 0
+        || thread_id != plan.thread_id
+        || current == 0
+        || plan.original == 0
+        || plan.selected == 0
+    {
+        return None;
+    }
+    if restore {
+        // The baseline can mean apply is pending. Queue baseline after it too;
+        // never overwrite a third-party HKL or another foreground thread.
+        (current == plan.selected || current == plan.original).then_some(plan.original)
+    } else {
+        (current == plan.original).then_some(plan.selected)
+    }
+}
+
 pub(crate) fn snapshot() -> KeyboardLayoutsIpc {
     let (layouts, current_idx) = order_and_index(
         loaded_layouts().into_iter().map(hkl_bits).collect(),
         foreground_layout(),
     );
+    KeyboardLayoutsIpc {
+        names: names_for_layouts(&layouts),
+        current_idx,
+    }
+}
+
+fn names_for_layouts(layouts: &[u32]) -> Vec<String> {
     let mut cache = NAMES.lock();
     if cache.layouts != layouts {
         // Registry/resource lookups only when the loaded list changes, never
@@ -89,11 +152,106 @@ pub(crate) fn snapshot() -> KeyboardLayoutsIpc {
             .iter()
             .map(|hkl| layout_name(*hkl, registry.as_ref(), &special_ids))
             .collect();
-        cache.layouts = layouts;
+        cache.layouts = layouts.to_vec();
     }
-    KeyboardLayoutsIpc {
-        names: cache.names.clone(),
-        current_idx,
+    cache.names.clone()
+}
+
+/// Read-only plan for an explicit configured layout. Handles retain the full
+/// OS-provided bits; low 32-bit snapshot identities must not become LPARAMs.
+/// No layout is loaded, installed, activated, or requested by this helper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfiguredLayoutPlan {
+    pub(crate) window: isize,
+    pub(crate) thread_id: u32,
+    pub(crate) original: isize,
+    pub(crate) selected: isize,
+    pub(crate) name: String,
+}
+
+/// Resolve one already-loaded layout by its exact Lane-H IPC name. The niri
+/// `us` alias denotes only the standard US physical layout, not every layout
+/// with LANGID 0409. Multiple matching HKLs are an error, never a best guess.
+///
+/// Dry-run may call this planner: it only reads Windows state.
+/// This returns a foreground-thread plan only; it never posts a switch request
+/// or changes the caller's thread layout or the installed/system layout list.
+pub(crate) fn plan_configured_layout(requested: &str) -> Result<ConfiguredLayoutPlan, String> {
+    if requested.trim().is_empty() {
+        return Err("configured keyboard layout name is empty".to_owned());
+    }
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return Err("cannot configure keyboard layout: no foreground window".to_owned());
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread_id == 0 {
+        return Err("cannot configure keyboard layout: no foreground window thread".to_owned());
+    }
+    let current = unsafe { GetKeyboardLayout(thread_id) };
+    if current.0.is_null() {
+        return Err("cannot configure keyboard layout: no foreground keyboard layout".to_owned());
+    }
+    let loaded = loaded_layouts();
+    let (ordered, _) = order_and_index(
+        loaded.iter().copied().map(hkl_bits).collect(),
+        Some(hkl_bits(current)),
+    );
+    let names = names_for_layouts(&ordered);
+    // Preserve full handles from the enumeration, including nonstandard high
+    // bits, and use the foreground handle only for its appended snapshot entry.
+    let handles: Vec<HKL> = ordered
+        .iter()
+        .map(|bits| {
+            loaded
+                .iter()
+                .copied()
+                .find(|hkl| hkl_bits(*hkl) == *bits)
+                .unwrap_or(current)
+        })
+        .collect();
+    let selected = select_named_layout(&handles, &names, requested)?;
+    Ok(ConfiguredLayoutPlan {
+        window: hwnd.0 as isize,
+        thread_id,
+        original: current.0 as isize,
+        selected: selected.0 as isize,
+        name: names[handles
+            .iter()
+            .position(|hkl| *hkl == selected)
+            .expect("selected loaded handle")]
+        .clone(),
+    })
+}
+
+fn select_named_layout(layouts: &[HKL], names: &[String], requested: &str) -> Result<HKL, String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err("configured keyboard layout name is empty".to_owned());
+    }
+    if layouts.len() != names.len() {
+        return Err(
+            "keyboard layout names changed during selection; retry config reload".to_owned(),
+        );
+    }
+    let mut matches = Vec::new();
+    for (&hkl, name) in layouts.iter().zip(names) {
+        let bits = hkl_bits(hkl);
+        let matches_name = if requested == "us" {
+            // Fxxx variants require a Layout Id lookup and must never be
+            // guessed to be US solely because their LANGID happens to be 0409.
+            registry_klid(bits, &[]) == Some(0x0000_0409)
+        } else {
+            requested == name
+        };
+        if bits != 0 && matches_name && !matches.iter().any(|old| hkl_bits(*old) == bits) {
+            matches.push(hkl);
+        }
+    }
+    match matches.as_slice() {
+        [selected] => Ok(*selected),
+        [] => Err(format!("keyboard layout {requested:?} is not loaded by that name (use keyboard-layouts IPC names or the us alias)")),
+        _ => Err(format!("keyboard layout {requested:?} is ambiguous across {} loaded HKLs; no layout selected", matches.len())),
     }
 }
 
@@ -404,6 +562,136 @@ mod tests {
 
     fn test_hkl(bits: u32) -> HKL {
         HKL((bits as i32 as isize) as *mut _)
+    }
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn configured_request_guard_preserves_full_handles_and_rejects_lost_ownership() {
+        let original = test_hkl(0xf002_0409).0 as isize;
+        let selected = test_hkl(0xe001_0411).0 as isize;
+        let plan = ConfiguredLayoutPlan {
+            window: 10, thread_id: 20, original, selected, name: "Synthetic".into(),
+        };
+        assert_eq!(configured_request_target(&plan, 10, 20, original, false), Some(selected));
+        assert_eq!(configured_request_target(&plan, 10, 20, selected, true), Some(original));
+        assert_eq!(configured_request_target(&plan, 10, 20, original, true), Some(original));
+        for (window, thread, current, restore) in [
+            (0, 20, original, false), (11, 20, original, false),
+            (10, 0, original, false), (10, 21, selected, true),
+            (10, 20, 0, true), (10, 20, 30, true), (10, 20, selected, false),
+        ] {
+            assert_eq!(configured_request_target(&plan, window, thread, current, restore), None);
+        }
+    }
+
+    #[test]
+    fn configured_layout_uses_exact_lane_h_names_including_localized_variants() {
+        let layouts = [
+            test_hkl(0x0409_0409),
+            test_hkl(0xf002_0409),
+            test_hkl(0x0419_0419),
+        ];
+        let names = names(&["US", "United States-Dvorak", "Русская"]);
+        for (name, expected) in names.iter().zip(layouts) {
+            assert_eq!(select_named_layout(&layouts, &names, name), Ok(expected));
+        }
+        assert_eq!(
+            select_named_layout(&layouts, &names, "  Русская  "),
+            Ok(layouts[2])
+        );
+        for unknown in [
+            "United States",
+            "Dvorak",
+            "united states-dvorak",
+            "ru",
+            "us,ru",
+            "00000409",
+        ] {
+            assert!(
+                select_named_layout(&layouts, &names, unknown).is_err(),
+                "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_us_alias_is_physical_us_not_a_langid_match_or_variant_guess() {
+        let base = test_hkl(0x0409_0409);
+        let variant = test_hkl(0xf002_0409);
+        let layouts = [variant, base];
+        // The alias must work independently of localized Lane-H display text.
+        let names = names(&["US-Dvorak", "Localized standard US"]);
+        assert_eq!(select_named_layout(&layouts, &names, "us"), Ok(base));
+        assert!(select_named_layout(&[variant], &names[..1], "us").is_err());
+        assert!(select_named_layout(&[test_hkl(0xe001_0409)], &names[..1], "us").is_err());
+        assert_eq!(
+            select_named_layout(&layouts, &names, "US-Dvorak"),
+            Ok(variant)
+        );
+        let cross_language = test_hkl(0x0409_0809);
+        assert_eq!(
+            select_named_layout(&[cross_language], &names[..1], "us"),
+            Ok(cross_language)
+        );
+    }
+
+    #[test]
+    fn configured_layout_rejects_ambiguous_names_and_us_aliases() {
+        let layouts = [test_hkl(0xf002_0409), test_hkl(0xf001_0409)];
+        let same_names = names(&["Same", "Same"]);
+        assert!(select_named_layout(&layouts, &same_names, "Same")
+            .unwrap_err()
+            .contains("ambiguous"));
+        let two_us_handles = [test_hkl(0x0409_0409), test_hkl(0x0409_0809)];
+        assert!(select_named_layout(
+            &two_us_handles,
+            &names(&["US", "US with UK language"]),
+            "us"
+        )
+        .unwrap_err()
+        .contains("ambiguous"));
+    }
+
+    #[test]
+    fn configured_layout_deduplicates_identical_hkls_and_ignores_null_handles() {
+        let actual = test_hkl(0xf002_0409);
+        assert_eq!(
+            select_named_layout(&[actual, actual], &names(&["Dvorak", "Dvorak"]), "Dvorak"),
+            Ok(actual)
+        );
+        assert!(select_named_layout(&[HKL::default()], &names(&["Null"]), "Null").is_err());
+        assert!(select_named_layout(&[], &[], "us").is_err());
+    }
+
+    #[test]
+    fn configured_layout_rejects_empty_names_and_mismatched_snapshots() {
+        for empty in ["", " ", "\t\n"] {
+            assert!(select_named_layout(&[], &[], empty).is_err());
+        }
+        assert!(select_named_layout(&[test_hkl(0x0409_0409)], &[], "us").is_err());
+    }
+
+    #[test]
+    fn configured_selection_keeps_actual_native_handle_bits_not_reconstructed_ids() {
+        for actual in [
+            test_hkl(0xf002_0409),
+            HKL(0xf002_0409usize as *mut _),
+            test_hkl(0xe001_0411),
+        ] {
+            let selected =
+                select_named_layout(&[actual], &names(&["Exact variant"]), "Exact variant")
+                    .unwrap();
+            assert_eq!(selected.0 as isize, actual.0 as isize);
+        }
+        let fallback = fallback_name(0xf003_0409);
+        let unknown = test_hkl(0xf003_0409);
+        assert_eq!(
+            select_named_layout(&[unknown], std::slice::from_ref(&fallback), &fallback),
+            Ok(unknown)
+        );
     }
 
     #[test]
