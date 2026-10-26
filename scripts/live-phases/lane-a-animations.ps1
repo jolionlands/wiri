@@ -110,17 +110,16 @@ animations {
     H17Case 'global_spring_easing_conflict_rejected' 'animations { spring; duration-ms 200; }' 1 @('cannot combine spring')
     H17Case 'override_spring_easing_conflict_rejected' 'animations { workspace-switch { spring; curve "linear"; } }' 1 @('cannot combine spring')
 
+    H17Case 'window_open_close_options_accepted' 'animations { window-open {}; window-close {}; }'
     H17Case 'compositor_options_warn_not_implemented' @'
 animations {
-    window-open {}
-    window-close {}
     config-notification-open-close {}
     exit-confirmation-open-close {}
     screenshot-ui-open {}
     overview-open-close {}
     recent-windows-close {}
 }
-'@ 0 @('window-open', 'window-close', 'config-notification-open-close',
+'@ 0 @('config-notification-open-close',
         'exit-confirmation-open-close', 'screenshot-ui-open', 'overview-open-close',
         'recent-windows-close', 'composited open/close animations') $true
 )

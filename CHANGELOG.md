@@ -32,6 +32,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Lane W — per-window appearance
 - Add sparse niri window-rule focus-ring, border, shadow and tab paints, four-corner geometry and opt-in native clipping with original-region restoration. Attention uses shell flashes/ALERT, not generic accessibility state changes. Changes follow existing rule/focus/resize events; no resting timer or thread. Foreign-HWND clipping is binary and can suppress DWM shadows; compositor blur remains unsupported.
+### Lane K — desktop acceptance checks
+- Add H54–H57 lifecycle, two-frame workspace PNG, cancellation, cross-fade and global-off checks plus before/after 30-second idle/resource observations. H17 now observes the moving thumbnail rather than the already-final cloaked HWND; its unsupported-options fixture retains the unimplemented overlay warnings and separately requires open/close blocks to validate without warnings.
+
 ### Lane K — part-time DWM compositor
 - Animate new tiled windows from half-size/transparent to their final frame while existing strip motion slides neighbours; temporary source cloaks and DWM thumbnails live on one lazy click-through, non-activating topmost layer.
 - Copy available pixels before a wiri close request, then fade/shrink the copy only after destruction. Never keep an application HWND alive or wait for an application capture; unavailable, protected and empty sources fall back without a black tile.
