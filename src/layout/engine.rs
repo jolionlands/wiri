@@ -8291,7 +8291,12 @@ impl TilingEngine {
         } else {
             self.urgent_windows.remove(&window);
         }
-        self.window_urgency_changed(window, backend);
+        // An explicit urgency request is not an activation request: refresh the
+        // urgency-dependent rules without applying the window's activation policy.
+        if self.rule_flags.urgency {
+            self.reevaluate_window_rules(window, backend);
+        }
+        self.refresh_rule_effects(window, backend);
         true
     }
 
@@ -12720,6 +12725,41 @@ mod tests {
             Some(window)
         );
         crate::backend::hooks::clear_urgent(other_hwnd);
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_never_applies_the_activation_policy() {
+        let hwnd = -73_900_005;
+        let other = WindowId::new(-73_900_006);
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.rule_state.insert(
+            window,
+            rules::RuleState {
+                process_name: None,
+                aumid: None,
+                resolved: Default::default(),
+            },
+        );
+        engine
+            .rule_state
+            .get_mut(&window)
+            .unwrap()
+            .resolved
+            .policy
+            .on_xdg_activate = Some(crate::window::rule_policy::OnXdgActivate::Focus);
+        let output = engine.focused_output().unwrap();
+        engine.monitors.get_mut(&output).unwrap().focus_window = Some(other);
+        engine.os_foreground = Some(other);
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert!(engine.is_urgent(window));
+        assert!(crate::backend::hooks::is_urgent_hwnd(hwnd));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().focus_window,
+            Some(other)
+        );
         crate::backend::hooks::clear_urgent(hwnd);
     }
 
