@@ -86,22 +86,8 @@ impl TilingEngine {
         let mut layouts = HashMap::new();
         for (output, monitor) in self.monitors.iter() {
             let cfg = self.effective_config(*output);
-            let work = Rect::new(
-                monitor.work_area.loc.x + cfg.reserve_left as i32 + cfg.outer_gaps.3,
-                monitor.work_area.loc.y + cfg.reserve_top as i32 + cfg.outer_gaps.0,
-                monitor
-                    .work_area
-                    .size
-                    .w
-                    .saturating_sub(cfg.reserve_left + cfg.reserve_right)
-                    .saturating_sub((cfg.outer_gaps.1 + cfg.outer_gaps.3) as u32),
-                monitor
-                    .work_area
-                    .size
-                    .h
-                    .saturating_sub(cfg.reserve_top + cfg.reserve_bottom)
-                    .saturating_sub((cfg.outer_gaps.0 + cfg.outer_gaps.2) as u32),
-            );
+            // The rectangle the tiles are laid out in (signed struts and outer gaps).
+            let work = Self::tiling_work_rect(monitor, cfg);
             let scale = monitor.scale_factor.max(0.01);
             for workspace in monitor.workspaces.values() {
                 use crate::layout::workspace::WorkspaceLayout;

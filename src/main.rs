@@ -1305,22 +1305,24 @@ fn handle_backend_event(
         } => {
             // An application went fullscreen on its own (a video player, F11), or its maximize
             // button was pressed: the engine follows it instead of fighting it.
-            engine.write().window_size_class_changed(
-                WindowId::new(hwnd),
-                zoomed,
-                covers_monitor,
-                handle,
-            );
+            let mut eng = engine.write();
+            let id = WindowId::new(hwnd);
+            if !eng.native_move_resize_active(id) {
+                eng.window_size_class_changed(id, zoomed, covers_monitor, handle);
+            }
         }
 
         BackendEvent::WindowMoveResizeStart { hwnd } => {
             debug!("User started manual move/resize on hwnd {}", hwnd);
+            engine.write().native_move_resize_start(WindowId::new(hwnd));
             ipc_server.broadcast_event(IpcEvent::WindowMoveResizeStart { window_hwnd: hwnd });
         }
         BackendEvent::WindowMoveResizeEnd { hwnd } => {
             debug!("User ended manual move/resize on hwnd {}", hwnd);
+            engine
+                .write()
+                .native_move_resize_end(WindowId::new(hwnd), handle);
             ipc_server.broadcast_event(IpcEvent::WindowMoveResizeEnd { window_hwnd: hwnd });
-            engine.write().apply_all(handle);
         }
         BackendEvent::WindowUrgent { hwnd, urgent } => {
             ipc_server.broadcast_event(IpcEvent::WindowUrgent {

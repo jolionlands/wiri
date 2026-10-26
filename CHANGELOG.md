@@ -74,6 +74,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The performance collector resolves `WIRI_PIPE` or the same per-user/session pipe as
   the daemon instead of the retired global name, with a pure endpoint self-test; earlier
   unavailable samples were collector timeouts, not measurements.
+### Lane G — strip layout and native window manipulation (2026-10-25)
+- **Strip policies and persistent widths.** niri centering modes, the single-column override,
+  mixed fixed/proportional presets and layout default widths act on the effective output view.
+  Explicit widths survive opening/closing neighbors; new columns insert right of the active one,
+  and stacked-tile/workspace activity survives navigation beyond the bounded MRU history.
+  Signed struts no longer wrap to an empty work area. Legacy equal-sharing remains compatible.
+- **Owned dialogs auto-float.** Dialogs center over their owner and follow its workspace/output
+  unless placement rules override; ordinary top-level apps stay tiled and `open-floating false`
+  suppresses the default. Existing workspace-float stacking, non-scrolling geometry and memory
+  are regression-tested rather than replaced.
+- **Native caption/edge drags reconcile on drop.** The app owns its HWND throughout the native
+  move/size loop. On release wiri adopts column width and stacked-tile height, preserving sibling
+  allocation and float geometry; a caption-only tiled move deliberately snaps back to its slot.
+  H40-H44 add real desktop checks, including refresh while the mouse is held. Regressions cover
+  restore/workspace/monitor transfers preserving requested width intent, small proportions not
+  being re-derived after a pixel minimum, `center-focused-column` acting on the effective output
+  even for first/last columns, inactive admission and `open-focused false` restoring the remembered
+  column/tile focus, unsorted float presets remembering their configured cycle, and legacy rule
+  widths outranking the layout default. No new dependency, idle timer, thread or resting window.
+  Limitations/evidence: `docs/parity/lane-g-report.md`.
 
 ### The pipe belongs to the user and the session (2026-10-25)
 - **A second user can run wiri.**  The pipe name was machine-global

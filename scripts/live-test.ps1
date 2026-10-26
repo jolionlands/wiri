@@ -1531,6 +1531,9 @@ Set-Content (Join-Path $D 'h9-fullscreen-rect.json') ($fr | ConvertTo-Json)
 Shot 'h9-01-fullscreen'
 $null = Ctl 'h9-action-fullscreen-off' @('action', 'fullscreen-window'); Start-Sleep -Milliseconds 1800
 $tr = Rc $h9B
+# The neighbour may legitimately be parked outside the scroll viewport. Reveal it
+# before comparing its visible-frame inset, rather than comparing a parking Y.
+FocusForm $h9A
 $ar = Rc $h9A
 $h9FullscreenOffTiles = ($tr.W -lt ($sb.Width - 60)) -and ($tr.H -lt $sb.Height)
 $h9TileAfterFullscreenAligned = (Near $tr.T $ar.T 2) -and (Near $tr.H $ar.H 2)
@@ -2943,6 +2946,7 @@ $summary = [ordered]@{
 . (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-h.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-g.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

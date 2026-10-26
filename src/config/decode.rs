@@ -1535,20 +1535,7 @@ impl Decoder {
                     for c in child.kids() {
                         let side = norm(&c.name);
                         let strut = self.arg_number(c, -65535.0, 65535.0);
-                        let value = match strut {
-                            Some(v) => {
-                                if v < 0.0 {
-                                    self.warn(
-                                        c.pos,
-                                        "negative struts are not supported by wiri; using 0",
-                                    );
-                                    Some(0)
-                                } else {
-                                    Some(v.round() as u32)
-                                }
-                            }
-                            None => None,
-                        };
+                        let value = strut.map(|v| v.round() as i32);
                         match side.as_str() {
                             "left" => p.reserve_left = value.or(p.reserve_left),
                             "right" => p.reserve_right = value.or(p.reserve_right),
@@ -1712,16 +1699,51 @@ impl Decoder {
                 }
                 "status-bar" => self.set_flag(child, &mut p.status_bar),
                 "hide-method" => self.set_text(child, &mut p.hide_method),
-                "reserve-top" => self.set_u32(child, 100_000, &mut p.reserve_top),
-                "reserve-bottom" => self.set_u32(child, 100_000, &mut p.reserve_bottom),
-                "reserve-left" => self.set_u32(child, 100_000, &mut p.reserve_left),
-                "reserve-right" => self.set_u32(child, 100_000, &mut p.reserve_right),
+                "reserve-top" => self.set_i32(child, &mut p.reserve_top),
+                "reserve-bottom" => self.set_i32(child, &mut p.reserve_bottom),
+                "reserve-left" => self.set_i32(child, &mut p.reserve_left),
+                "reserve-right" => self.set_i32(child, &mut p.reserve_right),
+                "center-focused-column" => {
+                    if let Some(mode) = self.arg_text(child) {
+                        if matches!(mode.as_str(), "never" | "always" | "on-overflow") {
+                            p.center_focused_column = Some(mode);
+                        } else {
+                            self.error(child.pos, "expected never, always, or on-overflow");
+                        }
+                    }
+                }
+                "always-center-single-column" => {
+                    self.set_flag(child, &mut p.always_center_single_column)
+                }
+                "default-column-width" => {
+                    if let Some(size) = self.decode_size_block(child) {
+                        p.default_column_width = Some(size);
+                    }
+                }
+                "preset-column-widths" => {
+                    self.section(child);
+                    let mut sizes = Vec::new();
+                    for c in child.kids() {
+                        match norm(&c.name).as_str() {
+                            "proportion" => {
+                                if let Some(v) = self.arg_number(c, 0.0, 100.0) {
+                                    sizes.push(SizeSpec::Proportion(v));
+                                }
+                            }
+                            "fixed" => {
+                                if let Some(v) = self.arg_number(c, 1.0, 100_000.0) {
+                                    sizes.push(SizeSpec::Fixed(v.round() as u32));
+                                }
+                            }
+                            _ => {
+                                self.unknown(c, "'preset-column-widths'", &["proportion", "fixed"])
+                            }
+                        }
+                    }
+                    p.preset_column_widths = Some(sizes);
+                }
                 // niri layout options wiri does not implement yet
-                "center-focused-column"
-                | "always-center-single-column"
-                | "empty-workspace-above-first"
-                | "preset-column-widths"
-                | "default-column-width"
+                "empty-workspace-above-first"
                 | "preset-window-heights"
                 | "background-color"
                 | "fullscreen-backdrop-color" => self.unsupported(child, "layout"),
@@ -2802,11 +2824,59 @@ mod tests {
     }
 
     #[test]
+    fn strip_policy_mixed_presets_and_signed_struts_decode() {
+        let cfg = clean("layout {\n center-focused-column \"on-overflow\"\n always-center-single-column\n default-column-width { proportion 0.5; }\n preset-column-widths { fixed 300; proportion 0.5; fixed 800; }\n gaps 12\n struts { left -20; right 30; top 10; bottom -5; }\n}\n");
+        assert_eq!(cfg.layout.center_focused_column, "on-overflow");
+        assert!(cfg.layout.always_center_single_column);
+        assert_eq!(
+            cfg.layout.default_column_width,
+            Some(Some(SizeSpec::Proportion(0.5)))
+        );
+        assert_eq!(
+            cfg.layout.preset_column_widths,
+            vec![
+                SizeSpec::Fixed(300),
+                SizeSpec::Proportion(0.5),
+                SizeSpec::Fixed(800)
+            ]
+        );
+        assert_eq!(
+            (
+                cfg.layout.reserve_left,
+                cfg.layout.reserve_right,
+                cfg.layout.reserve_top,
+                cfg.layout.reserve_bottom
+            ),
+            (-20, 30, 10, -5)
+        );
+        assert_eq!(cfg.layout.inner_gaps, 12);
+    }
+
+    #[test]
+    fn invalid_strip_policy_and_preset_size_are_errors() {
+        let d = load(
+            "layout { center-focused-column \"sometimes\"; preset-column-widths { fixed -10; } }\n",
+        );
+        assert_eq!(errors(&d).len(), 2);
+    }
+
+    #[test]
+    fn empty_default_column_width_leaves_the_size_to_the_window() {
+        let cfg = clean("layout { default-column-width {} }\n");
+        assert_eq!(cfg.layout.default_column_width, Some(None));
+    }
+
+    #[test]
     fn the_unsupported_layout_options_are_warnings() {
-        let d = load("layout {\n    center-focused-column \"never\"\n    preset-column-widths { proportion 0.5; }\n    tab-indicator { off }\n}\n");
+        let d = load("layout {\n    center-focused-column \"never\"\n    preset-column-widths { proportion 0.5; }\n    tab-indicator { off }\n    empty-workspace-above-first\n}\n");
         assert!(errors(&d).is_empty());
-        assert_eq!(warnings(&d).len(), 2);
+        assert_eq!(warnings(&d).len(), 1, "only empty-workspace-above-first is unsupported");
         assert!(d.config.layout.effects.tab_indicator.off);
+        assert_eq!(d.config.layout.center_focused_column, "never");
+        assert_eq!(
+            d.config.layout.preset_column_widths,
+            vec![SizeSpec::Proportion(0.5)]
+        );
     }
 
     #[test]

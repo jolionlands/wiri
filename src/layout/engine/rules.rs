@@ -538,11 +538,15 @@ impl TilingEngine {
         if target == monitor.active_workspace {
             monitor.add_window_with_width(window_id, width_hint);
         } else {
-            monitor
+            let strip = monitor
                 .workspaces
                 .entry(target)
-                .or_insert_with(crate::layout::Workspace::new)
-                .add_window_to_new_column_with_width(window_id, width_hint);
+                .or_insert_with(crate::layout::Workspace::new);
+            let previous = strip.active_window;
+            strip.insert_window_after_active(window_id, width_hint);
+            if let Some(previous) = previous {
+                strip.remember_focus(previous);
+            }
             monitor.focus_ring.push_back(window_id);
         }
         true
@@ -677,6 +681,9 @@ impl TilingEngine {
                     if let Some(column) = column {
                         monitor.focus_window = Some(previous);
                         monitor.focus_column = Some(column);
+                        if let Some(strip) = monitor.workspace_mut() {
+                            strip.remember_focus(previous);
+                        }
                     }
                 }
                 monitor.focus_ring.remove(window_id);
@@ -1664,6 +1671,16 @@ mod tests {
         assert_eq!(monitor.focus_window, Some(WindowId::new(1)));
         assert_eq!(monitor.focus_column, Some(0));
         assert_eq!(monitor.focus_ring.current(), Some(WindowId::new(1)));
+        assert_eq!(
+            monitor.workspace().unwrap().active_window,
+            Some(WindowId::new(1))
+        );
+        engine.monitors.get_mut(&oid).unwrap().switch_workspace(1);
+        engine.monitors.get_mut(&oid).unwrap().switch_workspace(0);
+        assert_eq!(
+            engine.monitors.get(&oid).unwrap().focus_window,
+            Some(WindowId::new(1))
+        );
         assert!(place_of(&engine, 2).is_some(), "it is in the strip");
         // A window that opens normally takes the focus.
         engine.add_window(window(3, "loud"), &be());

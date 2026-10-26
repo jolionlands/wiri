@@ -98,6 +98,12 @@ impl Default for ColumnDisplay {
 /// A vertical column in the workspace. Can contain multiple stacked tiles.
 pub struct Column {
     pub tiles: Vec<Tile>,
+    /// Remembered independently of monitor MRU history (which is bounded). Window ids
+    /// survive tile insertion, reorder and column swaps without index repair.
+    pub active_window: Option<WindowId>,
+    /// Requested proportion of the view; `width` is its resolved pixel cache.
+    pub width_proportion: Option<f64>,
+    pub width_fixed_logical: Option<f64>,
     /// Explicit column width in pixels (None = use layout default)
     pub width: Option<u32>,
     /// Display mode: stacked (default) or tabbed.
@@ -120,6 +126,9 @@ impl Column {
     pub fn new() -> Self {
         Self {
             tiles: Vec::new(),
+            active_window: None,
+            width_proportion: None,
+            width_fixed_logical: None,
             width: None,
             display: ColumnDisplay::Stacked,
             maximized: false,
@@ -134,7 +143,29 @@ impl Column {
         self.maximized = false;
         self.pre_max_width = None;
         self.preset_idx = None;
+        self.width_proportion = None;
+        self.width_fixed_logical = None;
         self.width = width;
+    }
+
+    pub fn set_proportion(&mut self, proportion: f64, view: i32, gap: i32) {
+        self.set_width(Some(
+            crate::input::proportion_px(view, gap, proportion).clamp(50, 100_000) as u32,
+        ));
+        self.width_proportion = Some(proportion);
+    }
+
+    pub fn set_fixed_logical(&mut self, logical: f64, scale: f64, border: i32) {
+        self.set_width(Some(
+            ((logical * scale).round() as i32 + border).clamp(50, 100_000) as u32,
+        ));
+        self.width_fixed_logical = Some(logical);
+    }
+
+    pub fn active_tile(&self) -> Option<WindowId> {
+        self.active_window
+            .filter(|id| self.index_of(*id).is_some())
+            .or_else(|| self.tiles.first().map(|tile| tile.window_id))
     }
 
     /// niri `toggle_full_width` (`maximize-column`): make the column `view_width`
@@ -201,6 +232,12 @@ impl Column {
                 *active_tab -= 1;
             }
         }
+        if self.active_window == Some(window_id) {
+            self.active_window = self
+                .tiles
+                .get(index.min(self.tiles.len().saturating_sub(1)))
+                .map(|tile| tile.window_id);
+        }
         self.clamp_active_tab();
         Some(tile)
     }
@@ -209,18 +246,20 @@ impl Column {
     /// shell activation and consume/expel, so the focused HWND can never be a hidden tab.
     pub fn select_window(&mut self, window_id: WindowId) {
         if let Some(index) = self.index_of(window_id) {
+            self.active_window = Some(window_id);
             if let ColumnDisplay::Tabbed { active_tab } = &mut self.display {
                 *active_tab = index;
             }
         }
     }
 
+    /// The tile the column shows as active: the visible tab of a tabbed column, otherwise the
+    /// remembered active tile (niri keeps one per column).
     pub fn active_window(&self) -> Option<WindowId> {
-        let index = match self.display {
-            ColumnDisplay::Stacked => 0,
-            ColumnDisplay::Tabbed { active_tab } => active_tab,
-        };
-        self.tiles.get(index).map(|t| t.window_id)
+        match self.display {
+            ColumnDisplay::Tabbed { active_tab } => self.tiles.get(active_tab).map(|t| t.window_id),
+            ColumnDisplay::Stacked => self.active_tile(),
+        }
     }
 
     pub fn tile_count(&self) -> usize {
@@ -354,6 +393,8 @@ pub struct WindowSlot {
     /// The column's own settings; they are lost with the column when this was its
     /// only window.
     pub column_width: Option<u32>,
+    pub column_width_proportion: Option<f64>,
+    pub column_width_fixed_logical: Option<f64>,
     pub column_display: ColumnDisplay,
     pub column_maximized: bool,
     /// The width the column had before it was maximized (see [`Column::pre_max_width`]).
@@ -405,6 +446,8 @@ impl WindowSlot {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub columns: Vec<Column>,
+    /// The active column is anchored by its remembered active window.
+    pub active_window: Option<WindowId>,
     pub scroll_offset: Point,
     /// Per-workspace layout algorithm; defaults to `Scrolling`.
     pub layout_mode: WorkspaceLayout,
@@ -414,6 +457,7 @@ impl Workspace {
     pub fn new() -> Self {
         Self {
             columns: Vec::new(),
+            active_window: None,
             scroll_offset: Point::default(),
             layout_mode: WorkspaceLayout::Scrolling,
         }
@@ -423,6 +467,7 @@ impl Workspace {
     pub fn with_layout(layout_mode: WorkspaceLayout) -> Self {
         Self {
             columns: Vec::new(),
+            active_window: None,
             scroll_offset: Point::default(),
             layout_mode,
         }
@@ -446,6 +491,64 @@ impl Workspace {
         column.add_tile(tile);
         self.columns.push(column);
         self.columns.len() - 1
+    }
+
+    /// niri's default insertion: right of this workspace's active column, not
+    /// the end of the strip. The empty workspace starts at column zero.
+    pub fn insert_window_after_active(&mut self, window_id: WindowId, width: Option<u32>) -> usize {
+        let at = self
+            .active_window
+            .and_then(|id| self.find_window_column(id))
+            .map_or(self.columns.len(), |col| col + 1);
+        let mut column = Column::new();
+        column.width = width;
+        column.add_tile(Tile::new(window_id));
+        self.columns.insert(at, column);
+        self.remember_focus(window_id);
+        at
+    }
+
+    /// Transfer a tile to a new strip without reducing its requested width to
+    /// the old output's pixel cache. Neighbour anchors only apply in the old strip.
+    pub fn insert_slot_after_active(&mut self, mut slot: WindowSlot) -> usize {
+        slot.column = self
+            .active_window
+            .and_then(|id| self.find_window_column(id))
+            .map_or(self.columns.len(), |col| col + 1);
+        slot.above.clear();
+        slot.below.clear();
+        slot.left_of.clear();
+        slot.right_of.clear();
+        let id = slot.window_id;
+        let column = self.put_back(slot);
+        self.remember_focus(id);
+        column
+    }
+
+    pub fn remember_focus(&mut self, window_id: WindowId) {
+        if let Some(index) = self.find_window_column(window_id) {
+            self.active_window = Some(window_id);
+            let column = &mut self.columns[index];
+            column.active_window = Some(window_id);
+            if let ColumnDisplay::Tabbed { active_tab } = &mut column.display {
+                *active_tab = column
+                    .tiles
+                    .iter()
+                    .position(|t| t.window_id == window_id)
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    pub fn remembered_focus(&self) -> Option<(usize, WindowId)> {
+        self.active_window
+            .and_then(|id| self.find_window_column(id).map(|col| (col, id)))
+            .or_else(|| {
+                self.columns
+                    .iter()
+                    .enumerate()
+                    .find_map(|(col, c)| c.active_tile().map(|id| (col, id)))
+            })
     }
 
     /// Add a window to an existing column
@@ -486,6 +589,8 @@ impl Workspace {
             column,
             index,
             column_width: col.width,
+            column_width_proportion: col.width_proportion,
+            column_width_fixed_logical: col.width_fixed_logical,
             column_display: col.display.clone(),
             column_maximized: col.maximized,
             column_pre_max_width: col.pre_max_width,
@@ -555,6 +660,8 @@ impl Workspace {
             .min(self.columns.len());
         let mut col = Column::new();
         col.width = column_width;
+        col.width_proportion = slot.column_width_proportion;
+        col.width_fixed_logical = slot.column_width_fixed_logical;
         col.maximized = column_maximized;
         col.pre_max_width = column_pre_max_width;
         col.display = match column_display {
@@ -588,6 +695,9 @@ impl Workspace {
         source.clamp_active_tab();
         let mut new_col = Column::new();
         new_col.width = source.width;
+        new_col.width_proportion = source.width_proportion;
+        new_col.width_fixed_logical = source.width_fixed_logical;
+        new_col.preset_idx = source.preset_idx;
         new_col.maximized = source.maximized;
         new_col.pre_max_width = source.pre_max_width;
         new_col.add_tile(tile);
@@ -702,7 +812,14 @@ impl Workspace {
         target_col: usize,
         target_index: usize,
     ) -> bool {
-        // Find and remove the window
+        // A newly created column inherits the source width, not a fresh default.
+        let width = self.find_window_column(window_id).map(|i| {
+            (
+                self.columns[i].width,
+                self.columns[i].width_proportion,
+                self.columns[i].width_fixed_logical,
+            )
+        });
         let removed = self.remove_window(window_id);
         if removed.is_none() {
             return false;
@@ -717,6 +834,11 @@ impl Workspace {
         if target_col == self.columns.len() {
             // Append a new column for this tile
             let mut col = Column::new();
+            if let Some((pixels, proportion, logical)) = width {
+                col.width = pixels;
+                col.width_proportion = proportion;
+                col.width_fixed_logical = logical;
+            }
             col.add_tile(tile);
             self.columns.push(col);
         } else {

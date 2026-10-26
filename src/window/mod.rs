@@ -570,9 +570,6 @@ pub fn classify_skip(f: &SkipFacts) -> Option<&'static str> {
     if f.cloaked {
         return Some("cloaked by DWM");
     }
-    if f.owned_popup {
-        return Some("owned popup");
-    }
     if f.width < 80 || f.height < 60 {
         return Some("too small");
     }
@@ -584,6 +581,14 @@ pub fn classify_skip(f: &SkipFacts) -> Option<&'static str> {
         return Some("system or hosted window class");
     }
     None
+}
+
+/// Dialog/parent hints correspond to niri's transient-parent auto-floating. An
+/// ordinary top-level (including a borderless app) must not float just because
+/// it lacks WS_THICKFRAME. Tool/child/no-activate windows are still excluded.
+pub fn should_auto_float(facts: &SkipFacts) -> bool {
+    classify_skip(facts).is_none()
+        && (facts.owned_popup || facts.class_name.eq_ignore_ascii_case("#32770"))
 }
 
 /// Console windows that only wiri is attached to, recorded once at startup.
@@ -998,7 +1003,6 @@ mod tests {
             |f| f.no_activate = true,
             |f| f.topmost = true,
             |f| f.cloaked = true,
-            |f| f.owned_popup = true,
             |f| f.width = 79,
             |f| f.height = 59,
             |f| f.class_name = "Shell_TrayWnd".to_string(),
@@ -1008,6 +1012,27 @@ mod tests {
             mutate(&mut f);
             assert!(classify_skip(&f).is_some(), "{:?} must be skipped", f);
         }
+    }
+
+    #[test]
+    fn dialogs_float_but_normal_toplevels_and_helpers_do_not() {
+        let mut facts = normal_window();
+        assert!(!should_auto_float(&facts));
+        facts.owned_popup = true;
+        assert_eq!(
+            classify_skip(&facts),
+            None,
+            "owned dialog is managed, not skipped"
+        );
+        assert!(should_auto_float(&facts));
+        facts.owned_popup = false;
+        facts.class_name = "#32770".into();
+        assert!(should_auto_float(&facts));
+        facts.child = true;
+        assert!(!should_auto_float(&facts));
+        facts.child = false;
+        facts.tool_window = true;
+        assert!(!should_auto_float(&facts));
     }
 
     #[test]

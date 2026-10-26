@@ -290,6 +290,10 @@ pub struct LayoutConfigPartial {
     pub column_width: Option<u32>,
     pub column_width_mode: Option<String>,
     pub default_column_display: Option<String>,
+    pub center_focused_column: Option<String>,
+    pub always_center_single_column: Option<bool>,
+    pub preset_column_widths: Option<Vec<SizeSpec>>,
+    pub default_column_width: Option<Option<SizeSpec>>,
     pub strip_frame: Option<bool>,
     pub border_color_urgent: Option<String>,
     pub border_radius: Option<u32>,
@@ -304,10 +308,10 @@ pub struct LayoutConfigPartial {
     pub snap_threshold_px: Option<u32>,
     pub status_bar: Option<bool>,
     pub hide_method: Option<String>,
-    pub reserve_top: Option<u32>,
-    pub reserve_bottom: Option<u32>,
-    pub reserve_left: Option<u32>,
-    pub reserve_right: Option<u32>,
+    pub reserve_top: Option<i32>,
+    pub reserve_bottom: Option<i32>,
+    pub reserve_left: Option<i32>,
+    pub reserve_right: Option<i32>,
     /// The `focus-ring`, `border`, `shadow`, `insert-hint` and `tab-indicator` blocks this
     /// `layout {}` names; each replaces the block of the layout it is applied to.
     pub effects: crate::config::effects::EffectsPartial,
@@ -385,6 +389,18 @@ impl LayoutConfigPartial {
         }
         if let Some(ref v) = self.default_column_display {
             out.default_column_display = v.clone();
+        }
+        if let Some(ref v) = self.center_focused_column {
+            out.center_focused_column = v.clone();
+        }
+        if let Some(v) = self.always_center_single_column {
+            out.always_center_single_column = v;
+        }
+        if let Some(ref v) = self.preset_column_widths {
+            out.preset_column_widths = v.clone();
+        }
+        if let Some(v) = self.default_column_width {
+            out.default_column_width = Some(v);
         }
         if let Some(v) = self.strip_frame {
             out.strip_frame = v;
@@ -490,6 +506,10 @@ pub struct LayoutConfig {
     pub column_width_mode: String,
     /// niri display for newly opened columns: `normal` or `tabbed`.
     pub default_column_display: String,
+    pub center_focused_column: String,
+    pub always_center_single_column: bool,
+    pub preset_column_widths: Vec<SizeSpec>,
+    pub default_column_width: Option<Option<SizeSpec>>,
     /// Proportional mode: split the screen among at most this many columns
     /// (default 3); further windows scroll in.  0 = no limit.
     pub max_visible_columns: u32,
@@ -542,16 +562,16 @@ pub struct LayoutConfig {
     // ---- screen-area reservation for external bars / panels ----
     /// Pixels to subtract from the top of each monitor's tiling work area.
     /// Set via `reserve-top N` inside `layout { }`.  Default 0.
-    pub reserve_top: u32,
+    pub reserve_top: i32,
     /// Pixels to subtract from the bottom of each monitor's tiling work area.
     /// Set via `reserve-bottom N` inside `layout { }`.  Default 0.
-    pub reserve_bottom: u32,
+    pub reserve_bottom: i32,
     /// Pixels to subtract from the left of each monitor's tiling work area.
     /// Set via `reserve-left N` inside `layout { }`.  Default 0.
-    pub reserve_left: u32,
+    pub reserve_left: i32,
     /// Pixels to subtract from the right of each monitor's tiling work area.
     /// Set via `reserve-right N` inside `layout { }`.  Default 0.
-    pub reserve_right: u32,
+    pub reserve_right: i32,
 
     /// What the overlay layer draws around the windows: niri's `focus-ring`, `border`,
     /// `shadow`, `insert-hint` and `tab-indicator` blocks, with their colours and gradients.
@@ -581,7 +601,11 @@ impl LayoutConfig {
             auto_balance: false,
             scroll_step: 200,
             column_width: 500,
-            column_width_mode: "proportional".to_string(),
+            column_width_mode: "fixed".to_string(),
+            center_focused_column: "never".to_string(),
+            always_center_single_column: false,
+            preset_column_widths: Vec::new(),
+            default_column_width: None,
             default_column_display: "normal".to_string(),
             max_visible_columns: 3,
             strip_frame: false,

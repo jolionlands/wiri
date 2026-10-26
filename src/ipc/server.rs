@@ -1759,10 +1759,10 @@ impl IpcServer {
                 if let Some(engine) = &self.engine {
                     let mut new_config = engine.read().config().clone();
                     match side.as_str() {
-                        "top" => new_config.reserve_top = pixels,
-                        "bottom" => new_config.reserve_bottom = pixels,
-                        "left" => new_config.reserve_left = pixels,
-                        "right" => new_config.reserve_right = pixels,
+                        "top" => new_config.reserve_top = pixels.min(i32::MAX as u32) as i32,
+                        "bottom" => new_config.reserve_bottom = pixels.min(i32::MAX as u32) as i32,
+                        "left" => new_config.reserve_left = pixels.min(i32::MAX as u32) as i32,
+                        "right" => new_config.reserve_right = pixels.min(i32::MAX as u32) as i32,
                         _ => {
                             return serde_json::json!({
                                 "success": false,

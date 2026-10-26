@@ -3,6 +3,7 @@ pub mod engine;
 pub mod floating;
 pub mod snap;
 pub mod snapshot;
+pub mod strip;
 pub mod workspace;
 
 pub use animation::{Animation, AnimationManager, AnimationTarget, Easing};
@@ -508,9 +509,13 @@ impl Monitor {
                 Some(w) if !w.columns.is_empty() => w,
                 _ => return,
             };
-            self.focus_ring
-                .iter_mru()
-                .find_map(|wid| workspace.find_window_column(wid).map(|col| (col, wid)))
+            workspace
+                .remembered_focus()
+                .or_else(|| {
+                    self.focus_ring
+                        .iter_mru()
+                        .find_map(|wid| workspace.find_window_column(wid).map(|col| (col, wid)))
+                })
                 .or_else(|| {
                     workspace
                         .columns
@@ -568,7 +573,7 @@ impl Monitor {
 
     pub fn add_window_with_width(&mut self, window_id: WindowId, width_hint: Option<u32>) {
         if let Some(workspace) = self.workspace_mut() {
-            let column_idx = workspace.add_window_to_new_column_with_width(window_id, width_hint);
+            let column_idx = workspace.insert_window_after_active(window_id, width_hint);
             self.focus_column = Some(column_idx);
             self.focus_window = Some(window_id);
         }
@@ -579,18 +584,13 @@ impl Monitor {
     pub fn set_focus(&mut self, window_id: WindowId) {
         self.focus_window = Some(window_id);
         self.focus_ring.push(window_id);
-        // Focus and visibility are the same selection in a tabbed column.
-        let col_idx = self
-            .workspace()
-            .and_then(|w| w.find_window_column(window_id));
-        if let Some(col_idx) = col_idx {
-            if let Some(column) = self
-                .workspace_mut()
-                .and_then(|w| w.columns.get_mut(col_idx))
-            {
-                column.select_window(window_id);
+        // The column remembers its active tile and the workspace its active column; in a
+        // tabbed column focus and visibility are the same selection (remember_focus shows the tab).
+        if let Some(workspace) = self.workspace_mut() {
+            workspace.remember_focus(window_id);
+            if let Some(col_idx) = workspace.find_window_column(window_id) {
+                self.focus_column = Some(col_idx);
             }
-            self.focus_column = Some(col_idx);
         }
     }
 
@@ -702,8 +702,7 @@ impl Monitor {
                     .and_then(|w| w.columns.get(col_idx - 1))
                     .and_then(|c| c.active_window());
                 if let Some(wid) = new_focus {
-                    self.focus_window = Some(wid);
-                    self.focus_ring.push(wid);
+                    self.set_focus(wid);
                 }
             }
         }
@@ -724,8 +723,7 @@ impl Monitor {
             });
             if let Some((new_col, window_id)) = info {
                 self.focus_column = Some(new_col);
-                self.focus_window = Some(window_id);
-                self.focus_ring.push(window_id);
+                self.set_focus(window_id);
             }
         }
     }
