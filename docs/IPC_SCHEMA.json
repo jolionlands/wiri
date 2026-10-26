@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jolionlands/wiri/raw/main/docs/IPC_SCHEMA.json",
   "title": "wiri IPC protocol",
-  "description": "JSON Schema for every IpcMessage request and IpcEvent variant in the wiri window manager named-pipe IPC. Both types use serde adjacent tagging: {\"type\": \"<variant>\", \"data\": {...}}. The daemon serves on the pipe of one user in one session (\\\\.\\pipe\\wiri_control_<user>_<session>); WIRI_PIPE overrides the name.",
+  "description": "wiri IPC 1.3: adjacent-tagged IpcMessage/IpcEvent and external NiriRequest/NiriReply/NiriEvent dialects. One UTF-8 JSON value per line, multiple requests per connection. The per-user/session named pipe is \\\\.\\pipe\\wiri_control_<user>_<session>; WIRI_PIPE overrides it. Unknown fields are generally ignored; unsupported variants and invalid fields return recoverable errors. Output actions validate strictly.",
   "version": "1.3",
   "$defs": {
 
@@ -35,29 +35,117 @@
 
     "WindowLayoutIpc": {
       "type": "object",
-      "description": "Where a window sits in its workspace's strip (niri's WindowLayout, the part wiri knows).",
-      "required": ["pos_in_scrolling_layout"],
+      "description": "Logical geometry before offscreen parking; sizes and offsets use output-scale logical pixels. window_size includes native Win32 decorations, not wiri's inset.",
+      "required": ["pos_in_scrolling_layout", "tile_size", "window_size", "tile_pos_in_workspace_view", "window_offset_in_tile"],
       "properties": {
         "pos_in_scrolling_layout": {
           "oneOf": [
             { "type": "null" },
-            {
-              "type": "array",
-              "minItems": 2,
-              "maxItems": 2,
-              "items": { "type": "integer", "minimum": 1 }
-            }
-          ],
-          "description": "[column, tile], both counted from 1; null for a floating or minimized window."
-        }
+            { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 1 } }
+          ]
+        },
+        "tile_size": { "$ref": "#/$defs/LogicalPair" },
+        "window_size": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 0 } },
+        "tile_pos_in_workspace_view": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/LogicalPair" }] },
+        "window_offset_in_tile": { "$ref": "#/$defs/LogicalPair" }
       }
     },
+    "LogicalPair": {
+      "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number" }
+    },
+    "FocusTimestamp": {
+      "description": "Daemon-local monotonic duration since startup; null until managed-window focus is observed. Not wall time or comparable across restarts.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object", "required": ["secs", "nanos"],
+          "properties": {
+            "secs": { "type": "integer", "minimum": 0 },
+            "nanos": { "type": "integer", "minimum": 0, "maximum": 999999999 }
+          }
+        }
+      ]
+    },
+    "KeyboardLayoutsIpc": {
+      "type": "object", "required": ["names", "current_idx"],
+      "description": "Loaded layouts in OS order and foreground-thread index. Empty list uses index 0; names are localized when available, otherwise an honest HKL label.",
+      "properties": {
+        "names": { "type": "array", "items": { "type": "string" } },
+        "current_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "OutputModeIpc": {
+      "type": "object", "required": ["width", "height", "refresh_rate", "is_preferred"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "refresh_rate": { "type": "integer", "minimum": 1, "description": "Millihertz, preserving rational fractional rates." },
+        "is_preferred": { "type": "boolean" }
+      }
+    },
+    "LogicalOutputIpc": {
+      "type": "object", "required": ["x", "y", "width", "height", "scale", "transform"],
+      "properties": {
+        "x": { "type": "integer", "description": "Engine origin in Windows virtual-desktop coordinates." },
+        "y": { "type": "integer" },
+        "width": { "type": "integer", "minimum": 0, "description": "Output width divided by layout scale, rounded." },
+        "height": { "type": "integer", "minimum": 0 },
+        "scale": { "type": "number", "exclusiveMinimum": 0 },
+        "transform": { "enum": [null, "Normal", "90", "180", "270"] }
+      }
+    },
+    "OutputIpc": {
+      "type": "object",
+      "description": "Active Windows output. Unknown hardware fields (including VRR/max_bpc) are null; absent identity strings are empty.",
+      "required": ["name", "make", "model", "serial", "physical_size", "modes", "current_mode", "vrr_supported", "vrr_enabled", "max_bpc", "logical"],
+      "properties": {
+        "name": { "type": "string" },
+        "make": { "type": "string" },
+        "model": { "type": "string" },
+        "serial": { "type": "string" },
+        "physical_size": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 1 }, "description": "Width and height in millimetres." }
+          ]
+        },
+        "modes": { "type": "array", "items": { "$ref": "#/$defs/OutputModeIpc" } },
+        "current_mode": { "type": ["integer", "null"], "minimum": 0, "description": "Index into modes, or null when no current mode was reported." },
+        "vrr_supported": { "type": ["boolean", "null"] },
+        "vrr_enabled": { "type": ["boolean", "null"] },
+        "max_bpc": { "type": ["integer", "null"], "minimum": 0 },
+        "logical": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/LogicalOutputIpc" }] }
+      },
+      "examples": [{
+        "name": "DISPLAY1", "make": "", "model": "", "serial": "", "physical_size": null,
+        "modes": [{ "width": 1366, "height": 768, "refresh_rate": 59940, "is_preferred": true }],
+        "current_mode": 0, "vrr_supported": null, "vrr_enabled": null, "max_bpc": null,
+        "logical": { "x": 0, "y": 0, "width": 1366, "height": 768, "scale": 1.0, "transform": "Normal" }
+      }]
+    },
+    "OutputMap": { "type": "object", "additionalProperties": { "$ref": "#/$defs/OutputIpc" } },
+    "PickedColor": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object", "required": ["rgb"],
+          "description": "SDR desktop sRGB only; HDR conversion is not supported.",
+          "properties": { "rgb": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number", "minimum": 0, "maximum": 1 } } }
+        }
+      ]
+    },
+    "OutputsResponse": { "type": "object", "required": ["outputs"], "properties": { "outputs": { "$ref": "#/$defs/OutputMap" } } },
+    "FocusedOutputResponse": { "type": "object", "required": ["focused_output"], "properties": { "focused_output": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OutputIpc" }] } } },
+    "KeyboardLayoutsResponse": { "type": "object", "required": ["keyboard_layouts"], "properties": { "keyboard_layouts": { "$ref": "#/$defs/KeyboardLayoutsIpc" } } },
+    "PickWindowResponse": { "type": "object", "required": ["window"], "properties": { "window": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/WindowIpc" }] } } },
+    "PickColorResponse": { "type": "object", "required": ["color"], "properties": { "color": { "$ref": "#/$defs/PickedColor" } } },
+    "OutputResponse": { "type": "object", "required": ["output", "temporary"], "properties": { "output": { "type": "string" }, "temporary": { "const": true } } },
 
     "WindowIpc": {
       "type": "object",
       "description": "A window as the event stream describes it: niri's Window, plus what wiri adds (class_name, output, is_fullscreen, is_maximized, is_minimized).",
       "required": [
-        "id", "title", "app_id", "pid", "workspace_id", "is_focused", "is_floating", "is_urgent", "layout",
+        "id", "title", "app_id", "pid", "workspace_id", "is_focused", "is_floating", "is_urgent", "layout", "focus_timestamp",
         "class_name", "output", "is_fullscreen", "is_maximized", "is_minimized"
       ],
       "properties": {
@@ -70,6 +158,7 @@
         "is_floating":  { "type": "boolean" },
         "is_urgent":    { "type": "boolean" },
         "layout":       { "$ref": "#/$defs/WindowLayoutIpc" },
+        "focus_timestamp": { "$ref": "#/$defs/FocusTimestamp" },
         "class_name":   { "type": "string", "description": "Win32 window class." },
         "output":       { "type": ["string", "null"], "description": "Device name of the monitor the window is on (\\\\.\\DISPLAY1)." },
         "is_fullscreen": { "type": "boolean" },
@@ -138,6 +227,7 @@
       "description": "Generic success response with no result payload.",
       "required": ["success"],
       "properties": {
+        "schema_version": { "type": "string" },
         "success": { "const": true },
         "result":  {}
       }
@@ -198,6 +288,7 @@
       "description": "Error response returned when the daemon cannot fulfil a request.",
       "required": ["success", "error"],
       "properties": {
+        "schema_version": { "type": "string" },
         "success": { "const": false },
         "error":   { "type": "string", "description": "Human-readable error description." }
       }
@@ -234,18 +325,72 @@
       "oneOf": [
         { "type": "string", "enum": ["Version", "Outputs", "Workspaces", "Windows", "KeyboardLayouts", "FocusedOutput", "FocusedWindow", "PickWindow", "PickColor", "EventStream", "ReturnError", "OverviewState"] },
         { "type": "object", "minProperties": 1, "maxProperties": 1, "properties": { "Action": {"type": ["object", "string"]}, "Output": {"type": "object"} }, "additionalProperties": false }
+      ],
+      "examples": [
+        "Outputs", "FocusedOutput", "KeyboardLayouts", "PickWindow", "PickColor", "ReturnError", "EventStream",
+        { "Action": { "SetColumnWidth": { "change": { "AdjustProportion": 0.1 }, "id": 42 } } },
+        { "Output": { "output": "DISPLAY1", "action": { "Scale": { "scale": 1.25 } } } }
       ]
     },
     "NiriReply": {
       "oneOf": [
-        { "type": "object", "required": ["Ok"], "properties": {"Ok": {}}, "additionalProperties": false },
+        { "type": "object", "required": ["Ok"], "properties": {"Ok": { "$ref": "#/$defs/NiriResponse" }}, "additionalProperties": false },
         { "type": "object", "required": ["Err"], "properties": {"Err": {"type": "string"}}, "additionalProperties": false }
+      ],
+      "examples": [
+        { "Ok": { "KeyboardLayouts": { "names": ["US"], "current_idx": 0 } } },
+        { "Ok": { "PickedWindow": null } },
+        { "Ok": { "PickedColor": { "rgb": [1.0, 0.5, 0.0] } } },
+        { "Ok": { "OutputConfigChanged": "Applied" } },
+        { "Err": "example error requested by ReturnError" }
+      ]
+    },
+    "NiriResponse": {
+      "oneOf": [
+        { "const": "Handled" },
+        {
+          "type": "object", "minProperties": 1, "maxProperties": 1, "additionalProperties": false,
+          "properties": {
+            "Version": { "type": "string" },
+            "Windows": { "type": "array", "items": { "$ref": "#/$defs/WindowIpc" } },
+            "Workspaces": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceIpc" } },
+            "FocusedWindow": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/WindowIpc" }] },
+            "Outputs": { "$ref": "#/$defs/OutputMap" },
+            "FocusedOutput": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OutputIpc" }] },
+            "KeyboardLayouts": { "$ref": "#/$defs/KeyboardLayoutsIpc" },
+            "OverviewState": { "$ref": "#/$defs/OverviewStateResponse" },
+            "PickedWindow": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/WindowIpc" }] },
+            "PickedColor": { "$ref": "#/$defs/PickedColor" },
+            "OutputConfigChanged": { "const": "Applied" }
+          }
+        }
+      ]
+    },
+    "NiriEvent": {
+      "description": "External event names; data has the corresponding IpcEvent data shape (including additive wiri window fields). Wiri-only variants are omitted.",
+      "type": "object", "minProperties": 1, "maxProperties": 1,
+      "propertyNames": {
+        "enum": ["WorkspacesChanged", "WorkspaceUrgencyChanged", "WorkspaceActivated", "WorkspaceActiveWindowChanged", "WindowsChanged", "WindowOpenedOrChanged", "WindowClosed", "WindowFocusChanged", "WindowFocusTimestampChanged", "WindowUrgencyChanged", "WindowLayoutsChanged", "KeyboardLayoutsChanged", "KeyboardLayoutSwitched", "OverviewOpenedOrClosed", "ConfigLoaded", "ScreenshotCaptured"]
+      },
+      "additionalProperties": { "type": "object" },
+      "examples": [
+        { "WindowFocusTimestampChanged": { "id": 42, "focus_timestamp": { "secs": 1, "nanos": 234 } } },
+        { "KeyboardLayoutsChanged": { "keyboard_layouts": { "names": ["US", "Dvorak"], "current_idx": 0 } } },
+        { "KeyboardLayoutSwitched": { "idx": 1 } },
+        { "WindowLayoutsChanged": { "changes": [[42, { "pos_in_scrolling_layout": [1, 1], "tile_size": [640.0, 704.0], "window_size": [638, 702], "tile_pos_in_workspace_view": [12.0, 12.0], "window_offset_in_tile": [1.0, 1.0] }]] } }
       ]
     },
 
     "IpcMessage": {
       "description": "Any request sent from a client to the wiri daemon.",
       "oneOf": [
+        {"type":"object","required":["type"],"properties":{"type":{"const":"outputs"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"focused_output"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"keyboard_layouts"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"pick_window"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"pick_color"}}},
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"output"},"data":{"type":"object","required":["output","action"],"properties":{"output":{"type":"string"},"action":{"type":["object","string"]}}}}},
+
         {"type":"object","required":["type"],"properties":{"type":{"const":"return_error"}}},
 
         {
@@ -1023,8 +1168,12 @@
     },
 
     "IpcEvent": {
-      "description": "Any event emitted by the wiri daemon to active subscribe_events subscribers. A new subscriber is first told the state: workspaces_changed, windows_changed, overview_opened_or_closed and config_loaded, in that order (niri's event stream), then what changes.",
+      "description": "Any event emitted by the wiri daemon to active subscribe_events subscribers. A new subscriber is first told the state: workspaces_changed, windows_changed, overview_opened_or_closed, keyboard_layouts_changed and config_loaded, in that order (niri's event stream), then what changes.",
       "oneOf": [
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"window_focus_timestamp_changed"},"data":{"type":"object","required":["id","focus_timestamp"],"properties":{"id":{"type":"integer","minimum":0},"focus_timestamp":{"$ref":"#/$defs/FocusTimestamp"}}}}},
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"keyboard_layouts_changed"},"data":{"type":"object","required":["keyboard_layouts"],"properties":{"keyboard_layouts":{"$ref":"#/$defs/KeyboardLayoutsIpc"}}}}},
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"keyboard_layout_switched"},"data":{"type":"object","required":["idx"],"properties":{"idx":{"type":"integer","minimum":0}}}}},
+
 
         {
           "description": "A screenshot was copied to the clipboard; path is null for clipboard-only or when saving failed.",

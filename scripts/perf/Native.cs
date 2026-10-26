@@ -64,6 +64,9 @@ namespace LaneE {
         [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr h, ref MonitorInfo info);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint pid);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetUserNameW")] static extern bool GetUserName(StringBuilder name, ref uint length);
+        [DllImport("kernel32.dll")] static extern uint GetCurrentProcessId();
+        [DllImport("kernel32.dll")] static extern bool ProcessIdToSessionId(uint pid, out uint session);
         [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LastInput li);
         [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, Input[] inputs, int size);
         [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr data, int size, out int needed);
@@ -209,6 +212,26 @@ namespace LaneE {
         // Explicitly configured alongside the owned child's WIRI_PIPE override.
         // Never fall back to the obsolete machine-global pipe.
         public static string PipeName { get; set; }
+        // Keep endpoint discovery identical to ipc::pipe_path, not the retired
+        // machine-global name. Resolve only a local pipe; never scan servers.
+        public static string PipeNameFor(string over, string user, uint session) {
+            if (!String.IsNullOrWhiteSpace(over)) {
+                const string prefix = @"\\.\pipe\";
+                string path = over.Trim();
+                if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    throw new ArgumentException("WIRI_PIPE must name a local Win32 pipe");
+                return path.Substring(prefix.Length);
+            }
+            var clean = new StringBuilder();
+            for (int i = 0; i < (user ?? "").Length; i++) {
+                char c = user[i];
+                bool ascii = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.';
+                clean.Append(ascii ? c : '_');
+                // Rust replaces Unicode scalar values, not UTF-16 code units.
+                if (Char.IsHighSurrogate(c) && i + 1 < user.Length && Char.IsLowSurrogate(user[i + 1])) i++;
+            }
+            return "wiri_control_" + (clean.Length == 0 ? "user" : clean.ToString()) + "_" + session.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
         public static string Request(string json, int timeoutMs, int expectedPid) {
             if (String.IsNullOrWhiteSpace(PipeName)) throw new InvalidOperationException("Owned child's pipe is not configured");
             long deadline = Stopwatch.GetTimestamp() + (long)(timeoutMs * Stopwatch.Frequency / 1000.0);

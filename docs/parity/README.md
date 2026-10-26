@@ -24,7 +24,8 @@ Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 1
 phase-labelled rows relocate the changed code by function name. Each matrix ends with a list
 of the working-tree edits that were in flight during the original audit. The
 [Phase 1](phase1-report.md), [Phase 2A](phase2a-report.md) and
-[Phase 2C Lane D](phase2c-lane-d-report.md) reports distinguish live verification from unit tests.
+[Phase 2C Lane D](phase2c-lane-d-report.md) and [Lane H](lane-h-report.md)
+reports distinguish live verification from unit tests.
 
 ## Plan
 

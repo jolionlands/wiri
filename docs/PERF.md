@@ -46,6 +46,13 @@ original shared-desktop setup.
 - `.live/p-startup.png`, `p-after.png`: before/after perf scenario screenshots.
   Raw evidence is local/git-ignored; the baseline below is the durable digest.
 
+Lane H fixes a collector bug: `Native.Request` now resolves `WIRI_PIPE` or the
+same sanitized user/session pipe as the daemon, rather than the retired global
+`wiri_control` pipe. Server-PID validation before every write remains unchanged.
+The collector self-test covers discovery/overrides without starting wiri or
+connecting to a pipe. Earlier Lane H collector timeouts are unavailable samples,
+not a performance regression or a zero-cost result.
+
 Resource endpoints are five seconds after startup observations and five seconds after
 the perf actions, **in the same process**, not across the main harness's many restarts.
 Private/working-set bytes, OS thread/handle counts and `GetGuiResources` GDI/USER

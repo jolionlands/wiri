@@ -1,6 +1,5 @@
-// JSON framing helpers for IPC messages and events.
-// The existing code uses raw serde_json (no newline delimiter or length prefix);
-// these helpers wrap that behaviour identically.
+// JSON value helpers for IPC messages and events. These deliberately omit
+// transport delimiters; client/server JSON-line framing lives in client/wire.
 use super::messages::{IpcError, IpcEvent, IpcMessage};
 
 /// Serialize an [`IpcMessage`] to a JSON byte vector.
@@ -205,6 +204,17 @@ mod tests {
             },
             IpcEvent::WindowFocusChanged { id: Some(1) },
             IpcEvent::WindowFocusChanged { id: None },
+            IpcEvent::WindowFocusTimestampChanged {
+                id: 1,
+                focus_timestamp: Some(std::time::Duration::from_nanos(123_456)),
+            },
+            IpcEvent::KeyboardLayoutsChanged {
+                keyboard_layouts: KeyboardLayoutsIpc {
+                    names: vec!["US".into()],
+                    current_idx: 0,
+                },
+            },
+            IpcEvent::KeyboardLayoutSwitched { idx: 0 },
             IpcEvent::WindowUrgencyChanged {
                 id: 1,
                 urgent: true,
@@ -214,6 +224,7 @@ mod tests {
                     1,
                     WindowLayoutIpc {
                         pos_in_scrolling_layout: Some((2, 1)),
+                        ..WindowLayoutIpc::default()
                     },
                 )],
             },
@@ -238,7 +249,9 @@ mod tests {
             is_urgent: false,
             layout: WindowLayoutIpc {
                 pos_in_scrolling_layout: Some((1, 1)),
+                ..WindowLayoutIpc::default()
             },
+            focus_timestamp: None,
             class_name: "C".into(),
             output: Some("\\\\.\\DISPLAY1".into()),
             is_fullscreen: false,

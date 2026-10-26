@@ -1085,7 +1085,10 @@ fn format_query_result(req: &IpcMessage, resp: &serde_json::Value) -> String {
         },
         IpcMessage::KeyboardLayouts => {
             let layouts = &result["keyboard_layouts"];
-            let Some(names) = layouts["names"].as_array().filter(|names| !names.is_empty()) else {
+            let Some(names) = layouts["names"]
+                .as_array()
+                .filter(|names| !names.is_empty())
+            else {
                 return "No keyboard layouts.".to_string();
             };
             let current = layouts["current_idx"].as_u64();
@@ -1095,7 +1098,11 @@ fn format_query_result(req: &IpcMessage, resp: &serde_json::Value) -> String {
                 .map(|(index, name)| {
                     format!(
                         "{} {}: {}",
-                        if current == Some(index as u64) { "*" } else { " " },
+                        if current == Some(index as u64) {
+                            "*"
+                        } else {
+                            " "
+                        },
                         index,
                         name.as_str().unwrap_or("unknown")
                     )
@@ -1726,7 +1733,9 @@ fn stream_events(message: &IpcMessage, timeout_secs: u64, raw: bool) -> Result<(
         if ack.get("success").and_then(|value| value.as_bool()) == Some(false) {
             anyhow::bail!(
                 "event subscription failed: {}",
-                ack.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
+                ack.get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
             );
         }
         let filter_desc = if event_types.is_empty() {
@@ -2090,12 +2099,20 @@ mod tests {
         let mut stdin = std::io::Cursor::new(b"{\n \"Action\": { \"CloseWindow\": {} }\n}\n");
         let from_stdin = raw_request_text(None, &mut stdin).unwrap();
         assert!(!from_stdin.contains('\n'));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&from_stdin).unwrap(),
-            serde_json::json!({"Action": {"CloseWindow": {}}}));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&from_stdin).unwrap(),
+            serde_json::json!({"Action": {"CloseWindow": {}}})
+        );
         let mut stdin = std::io::Cursor::new(b"\"Windows\"\n");
-        assert_eq!(raw_request_text(Some("-"), &mut stdin).unwrap(), "\"Windows\"");
+        assert_eq!(
+            raw_request_text(Some("-"), &mut stdin).unwrap(),
+            "\"Windows\""
+        );
         let mut unread = std::io::Cursor::new(b"not JSON");
-        assert_eq!(raw_request_text(Some(" \"Outputs\" "), &mut unread).unwrap(), "\"Outputs\"");
+        assert_eq!(
+            raw_request_text(Some(" \"Outputs\" "), &mut unread).unwrap(),
+            "\"Outputs\""
+        );
         assert_eq!(unread.position(), 0);
         assert!(raw_request_text(Some("\"Outputs\"\n\"Windows\""), &mut unread).is_err());
         assert!(raw_request_text(Some(""), &mut unread).is_err());
@@ -2104,7 +2121,10 @@ mod tests {
             vec!["wiri-ctl", "msg", "raw-request", "-"],
             vec!["wiri-ctl", "--print-request", "raw-request", "\"Outputs\""],
         ] {
-            assert!(matches!(Cli::try_parse_from(args).unwrap().command.into_command(), Commands::RawRequest { .. }));
+            assert!(matches!(
+                Cli::try_parse_from(args).unwrap().command.into_command(),
+                Commands::RawRequest { .. }
+            ));
         }
     }
 
@@ -2122,32 +2142,69 @@ mod tests {
             r#"{"FutureAction":{"not_validated_here":true}}"#,
         ] {
             let request = request_of(&["wiri-ctl", "msg", "output", "DISPLAY1", action]);
-            let IpcMessage::Output { output, action: value } = request else { panic!("output request") };
+            let IpcMessage::Output {
+                output,
+                action: value,
+            } = request
+            else {
+                panic!("output request")
+            };
             assert_eq!(output, "DISPLAY1");
-            assert_eq!(value, serde_json::from_str::<serde_json::Value>(action).unwrap());
+            assert_eq!(
+                value,
+                serde_json::from_str::<serde_json::Value>(action).unwrap()
+            );
         }
         for (words, expected) in [
             (vec!["off"], serde_json::json!("Off")),
             (vec!["on"], serde_json::json!("On")),
-            (vec!["mode", "auto"], serde_json::json!({"Mode":{"mode":"auto"}})),
-            (vec!["scale", "1.5"], serde_json::json!({"Scale":{"scale":1.5}})),
-            (vec!["transform", "90"], serde_json::json!({"Transform":{"transform":"90"}})),
-            (vec!["position", "-100", "0"], serde_json::json!({"Position":{"position":{"x":-100,"y":0}}})),
-            (vec!["position", "auto"], serde_json::json!({"Position":{"position":"Auto"}})),
+            (
+                vec!["mode", "auto"],
+                serde_json::json!({"Mode":{"mode":"auto"}}),
+            ),
+            (
+                vec!["scale", "1.5"],
+                serde_json::json!({"Scale":{"scale":1.5}}),
+            ),
+            (
+                vec!["transform", "90"],
+                serde_json::json!({"Transform":{"transform":"90"}}),
+            ),
+            (
+                vec!["position", "-100", "0"],
+                serde_json::json!({"Position":{"position":{"x":-100,"y":0}}}),
+            ),
+            (
+                vec!["position", "auto"],
+                serde_json::json!({"Position":{"position":"Auto"}}),
+            ),
             (vec!["vrr", "on"], serde_json::json!({"Vrr":{"vrr":true}})),
-            (vec!["max-bpc", "999"], serde_json::json!({"MaxBpc":{"max_bpc":999}})),
+            (
+                vec!["max-bpc", "999"],
+                serde_json::json!({"MaxBpc":{"max_bpc":999}}),
+            ),
         ] {
-            let args: Vec<&str> = ["wiri-ctl", "--print-request", "output", "DISPLAY1"].into_iter().chain(words).collect();
-            let IpcMessage::Output { action, .. } = request_of(&args) else { panic!("output request") };
+            let args: Vec<&str> = ["wiri-ctl", "--print-request", "output", "DISPLAY1"]
+                .into_iter()
+                .chain(words)
+                .collect();
+            let IpcMessage::Output { action, .. } = request_of(&args) else {
+                panic!("output request")
+            };
             assert_eq!(action, expected);
         }
     }
 
     #[test]
     fn schema_hints_distinguish_matching_mismatched_and_old_daemons() {
-        assert!(schema_warning(&serde_json::json!({"schema_version": wiri::ipc::wire::SCHEMA_VERSION})).is_none());
+        assert!(schema_warning(
+            &serde_json::json!({"schema_version": wiri::ipc::wire::SCHEMA_VERSION})
+        )
+        .is_none());
         let mismatch = schema_warning(&serde_json::json!({"schema_version": "0.9"})).unwrap();
-        assert!(mismatch.contains("mismatch") && mismatch.contains("0.9") && mismatch.contains("1.3"));
+        assert!(
+            mismatch.contains("mismatch") && mismatch.contains("0.9") && mismatch.contains("1.3")
+        );
         let old = schema_warning(&serde_json::json!({"success": true})).unwrap();
         assert!(old.contains("pre-1.3") && old.contains("old"));
     }
@@ -2163,13 +2220,26 @@ mod tests {
         }});
         assert!(format_query_result(&IpcMessage::Outputs, &response).contains("DISPLAY1"));
         assert!(format_query_result(&IpcMessage::FocusedOutput, &response).contains("DISPLAY1"));
-        assert_eq!(format_query_result(&IpcMessage::KeyboardLayouts, &response), "  0: English\n* 1: French");
+        assert_eq!(
+            format_query_result(&IpcMessage::KeyboardLayouts, &response),
+            "  0: English\n* 1: French"
+        );
         assert!(format_query_result(&IpcMessage::PickWindow, &response).contains("Editor"));
         assert!(format_query_result(&IpcMessage::PickColor, &response).contains("1.0"));
-        let empty = serde_json::json!({"result": {"focused_output": null, "window": null, "color": null}});
-        assert_eq!(format_query_result(&IpcMessage::FocusedOutput, &empty), "No output is focused.");
-        assert_eq!(format_query_result(&IpcMessage::PickWindow, &empty), "No window was picked.");
-        assert_eq!(format_query_result(&IpcMessage::PickColor, &empty), "No color was picked.");
+        let empty =
+            serde_json::json!({"result": {"focused_output": null, "window": null, "color": null}});
+        assert_eq!(
+            format_query_result(&IpcMessage::FocusedOutput, &empty),
+            "No output is focused."
+        );
+        assert_eq!(
+            format_query_result(&IpcMessage::PickWindow, &empty),
+            "No window was picked."
+        );
+        assert_eq!(
+            format_query_result(&IpcMessage::PickColor, &empty),
+            "No color was picked."
+        );
     }
 
     #[test]

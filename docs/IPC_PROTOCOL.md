@@ -48,10 +48,11 @@ The protocol accepts **one UTF-8 JSON value per line**, with one compact JSON re
 per line. Keep the connection open to send more requests, including after an error.
 A connection switched to `EventStream` / `subscribe_events` is dedicated to events.
 
-For existing clients, a complete first JSON value **without a newline** is still a
+For existing clients, a complete first wiri-envelope JSON value **without a newline** is still a
 one-shot request: the daemon replies and closes, so old `read_to_end` clients work.
 Write the newline together with the JSON value when using the persistent protocol;
 without a delimiter a complete first value is indistinguishable from a legacy request.
+Niri external values always wait for their newline, including a fragmented delimiter.
 Partial JSON and multiple lines in one write are supported. Each request line is
 limited to 64 KiB; an oversized line is drained and answered with an error, after
 which the next line is usable. Unknown variants and invalid fields return an error;
@@ -152,9 +153,10 @@ Wiri replies include additive `schema_version: "1.3"`; niri envelopes keep one k
 ```
 
 Before any change the stream carries the **current state** as events (niri's event stream:
-`workspaces_changed`, `windows_changed`, `overview_opened_or_closed`, `config_loaded`; see
-[§6](#6-event-types)).  The filter applies to them too, so the example above, which names two
-other types, sees none of them; a subscription without a filter starts with all four.
+`workspaces_changed`, `windows_changed`, `overview_opened_or_closed`,
+`keyboard_layouts_changed`, `config_loaded`; see [§6](#6-event-types)). The filter applies
+to them too, so the example above, which names two other types, sees none of them; a
+subscription without a filter starts with all five.
 
 ---
 
@@ -510,7 +512,7 @@ Success is `{"success":true}`: the action ran as if its key had been pressed.  W
 
 ### 4.9 niri's request/reply forms
 
-Five requests answer with **niri's** shapes, not wiri's own: the same objects the
+Requests answer with **niri's** shapes, alongside wiri's own: the same objects the
 event stream describes (niri's `Workspace` and `Window`), so that a client written
 against niri reads them without knowing wiri.  They are answered from the engine's
 current state, with the same code that builds the state a new subscriber of the
@@ -553,17 +555,19 @@ The window objects are niri's `Window`, plus what wiri adds:
 | `is_focused` | `boolean` | The window has the keyboard focus |
 | `is_floating` | `boolean` | The window floats instead of being tiled |
 | `is_urgent` | `boolean` | The window asks for attention |
-| `layout` | `object` | `{"pos_in_scrolling_layout":[column,tile]}` (both counted from 1), **null** for a floating or minimized window |
+| `layout` | `object` | Logical geometry: column/tile indices from 1 (null for floating/minimized), `tile_size`, `window_size`, `tile_pos_in_workspace_view`, `window_offset_in_tile` |
+| `focus_timestamp` | `object \| null` | `{secs,nanos}` since daemon startup, from a monotonic clock; null until first observed focus |
 | `class_name` | `string` | The Win32 window class (wiri's addition) |
 | `output` | `string \| null` | The device name of the monitor the window is on (wiri's addition) |
 | `is_fullscreen` | `boolean` | The window covers its monitor (wiri's addition) |
 | `is_maximized` | `boolean` | Maximized to the edges of the work area (wiri's addition) |
 | `is_minimized` | `boolean` | The window is minimized (wiri's addition) |
 
-Two niri fields have no Windows meaning and are therefore **not** reported:
-`focus_timestamp` (when the window was focused — Windows has no such stamp) and
-`focus_timestamp`-like timing of the overview.  Everything else that Windows
-cannot tell is `null`, never missing.
+Window layouts describe the engine's target geometry before offscreen parking, in
+output-scale logical pixels. Window size excludes wiri's inset, but includes native
+Win32 decorations (not a Wayland client-surface size). Minimized/absent-output view
+positions are null. Duplicate foreground reports do not restamp focus; closing a
+window removes its history. Timestamps are not wall clock or cross-restart values.
 
 **Examples**
 
@@ -578,14 +582,14 @@ cannot tell is `null`, never missing.
 {"type":"windows"}
 ```
 ```json
-{"success":true,"result":{"windows":[{"id":328756,"title":"Terminal","app_id":"WindowsTerminal.exe","pid":4242,"workspace_id":4294967297,"is_focused":true,"is_floating":false,"is_urgent":false,"layout":{"pos_in_scrolling_layout":[1,1]},"class_name":"CASCADIA_HOSTING_WINDOW_CLASS","output":"\\\\.\\DISPLAY1","is_fullscreen":false,"is_maximized":false,"is_minimized":false}]}}
+{"success":true,"result":{"windows":[{"id":328756,"title":"Terminal","app_id":"WindowsTerminal.exe","pid":4242,"workspace_id":4294967297,"is_focused":true,"is_floating":false,"is_urgent":false,"layout":{"pos_in_scrolling_layout":[1,1],"tile_size":[640.0,704.0],"window_size":[638,702],"tile_pos_in_workspace_view":[12.0,12.0],"window_offset_in_tile":[1.0,1.0]},"focus_timestamp":{"secs":12,"nanos":345},"class_name":"CASCADIA_HOSTING_WINDOW_CLASS","output":"\\\\.\\DISPLAY1","is_fullscreen":false,"is_maximized":false,"is_minimized":false}]}}
 ```
 
 ```json
 {"type":"focused_window"}
 ```
 ```json
-{"success":true,"result":{"focused_window":{"id":328756,"title":"Terminal","app_id":"WindowsTerminal.exe","pid":4242,"workspace_id":4294967297,"is_focused":true,"is_floating":false,"is_urgent":false,"layout":{"pos_in_scrolling_layout":[1,1]},"class_name":"CASCADIA_HOSTING_WINDOW_CLASS","output":"\\\\.\\DISPLAY1","is_fullscreen":false,"is_maximized":false,"is_minimized":false}}}
+{"success":true,"result":{"focused_window":{"id":328756,"title":"Terminal","app_id":"WindowsTerminal.exe","pid":4242,"workspace_id":4294967297,"is_focused":true,"is_floating":false,"is_urgent":false,"layout":{"pos_in_scrolling_layout":[1,1],"tile_size":[640.0,704.0],"window_size":[638,702],"tile_pos_in_workspace_view":[12.0,12.0],"window_offset_in_tile":[1.0,1.0]},"focus_timestamp":{"secs":12,"nanos":345},"class_name":"CASCADIA_HOSTING_WINDOW_CLASS","output":"\\\\.\\DISPLAY1","is_fullscreen":false,"is_maximized":false,"is_minimized":false}}}
 ```
 
 ```json
@@ -605,6 +609,83 @@ cannot tell is `null`, never missing.
 The `wiri-ctl` subcommands are `wiri-ctl workspaces`, `wiri-ctl windows`,
 `wiri-ctl focused-window`, `wiri-ctl overview-state` and `wiri-ctl version`;
 each of them prints the readable form, and `--json` prints the raw reply.
+
+---
+
+### 4.10 IPC 1.3 queries, interactive picks and temporary outputs
+
+| Request / CLI subcommand | Wiri `result` payload |
+|---|---|
+| `outputs` | `{"outputs":{name:Output,...}}` |
+| `focused-output` | `{"focused_output":Output or null}` |
+| `keyboard-layouts` | `{"keyboard_layouts":{"names":[...],"current_idx":0}}` |
+| `pick-window` | `{"window":Window or null}` |
+| `pick-color` | `{"color":{"rgb":[r,g,b]} or null}` |
+
+Wire names replace hyphens with underscores. External requests use PascalCase;
+replies are `Ok` with `Outputs`, `FocusedOutput`, `KeyboardLayouts`, `PickedWindow`
+or `PickedColor` respectively. Output queries are read-only. Outputs expose CCD/EDID
+identity, physical size (mm), modes (refresh in millihertz), current mode index and
+logical position/size/scale/transform. Unknown physical size, mode, transform, VRR
+or max-bpc are null rather than invented; absent identity strings are empty.
+Disconnected/inactive outputs cannot currently be enabled by IPC.
+
+Picks wait for the next left click, consume its down/up pair without activating
+the clicked window, and consume Escape down/up to return null. Only managed root
+windows are returned; an unmanaged click is null. Disconnect cancels the pending
+pick; a second picker is rejected while busy. Physical and injected input are
+supported, with matching-origin release guards. Picks have no normal response
+deadline and use existing hooks/dispatch, not a polling thread or overlay.
+Color samples are normalized SDR desktop sRGB via GetPixel; HDR conversion is not
+supported. Keep the desktop unlocked for picks.
+
+`output <name> <action>` sends `{"type":"output","data":{"output":name,"action":...}}`.
+Actions include `on`, `off`, `mode WIDTHxHEIGHT[@HZ]`, `scale NUMBER|auto`,
+`transform normal|90|180|270` and `position X Y`. It calls the existing conservative
+CCD executor for only that target and commits an in-memory override on success.
+Reloading the config discards overrides; no config/registry persistence, global
+reload or primary-display change occurs. Scale is wiri layout scale, **not Windows
+DPI**. Unsupported flips/custom timings/VRR/max-bpc and unsafe topology requests
+return errors. External success is `{"Ok":{"OutputConfigChanged":"Applied"}}`.
+Physical output changes and multi-monitor paths are synthetic-unit-tested only;
+no test changes the laptop's display settings.
+
+Examples below are illustrative; output mutations must not be used on the shared
+laptop. `--print-request` is a safe way to inspect an output request offline.
+
+```json
+"KeyboardLayouts"
+{"Ok":{"KeyboardLayouts":{"names":["US"],"current_idx":0}}}
+"PickWindow"
+{"Ok":{"PickedWindow":null}}
+"PickColor"
+{"Ok":{"PickedColor":{"rgb":[1.0,0.0,0.0]}}}
+"ReturnError"
+{"Err":"example error requested by ReturnError"}
+```
+
+External event examples (after `"EventStream"` and `{"Ok":"Handled"}`):
+
+```json
+{"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":["US","Dvorak"],"current_idx":0}}}
+{"KeyboardLayoutSwitched":{"idx":1}}
+{"WindowFocusTimestampChanged":{"id":42,"focus_timestamp":{"secs":1,"nanos":234}}}
+{"WindowLayoutsChanged":{"changes":[[42,{"pos_in_scrolling_layout":[1,1],"tile_size":[640.0,704.0],"window_size":[638,702],"tile_pos_in_workspace_view":[12.0,12.0],"window_offset_in_tile":[1.0,1.0]}]]}}
+```
+
+### 4.11 CLI and reusable Rust client
+
+`wiri-ctl msg <command>` is an optional niri-style prefix. `--json` keeps the wiri
+success/result envelope (including `schema_version`). `window-list` keeps wiri's
+legacy geometry records; `windows` gives niri Window records. `event-stream` aliases
+`events --stream`; `request-error` exercises ReturnError.
+
+`--print-request` prints serialized JSON without connecting. `raw-request JSON`
+(or no argument / `-` to read one JSON value from stdin to EOF) sends either dialect and prints the
+unmodified one-line response. Ordinary commands warn on stderr when the reply's
+schema version is absent or differs from 1.3. Raw responses remain untouched.
+`ipc::IpcClient` provides reusable `connect`, `request` and `read_events`; a stream
+connection is dedicated to events, and dropping it disconnects.
 
 ---
 
@@ -679,7 +760,8 @@ what changes, so it never has to ask.**  Right after the ack the stream carries,
 1. `workspaces_changed` - every workspace of every monitor,
 2. `windows_changed` - every window wiri manages (`is_focused` says which one has the keyboard focus),
 3. `overview_opened_or_closed` - whether the overview is open,
-4. `config_loaded` - how the config loaded at startup or the last time it was reloaded,
+4. `keyboard_layouts_changed` - loaded names and foreground-thread current index,
+5. `config_loaded` - how the config loaded at startup or the last time it was reloaded,
 
 and then the deltas.  A client keeps its model by replacing the workspaces on `workspaces_changed`
 and the windows on `windows_changed`, and applying the other events to them:
@@ -695,7 +777,10 @@ and the windows on `windows_changed`, and applying the other events to them:
 | `window_closed` `{id}` | removes the window |
 | `window_focus_changed` `{id}` | `id` is the only focused window (`null`: none) |
 | `window_urgency_changed` `{id, urgent}` | sets the window's `is_urgent` |
-| `window_layouts_changed` `{changes}` | sets `layout` of the windows named |
+| `window_layouts_changed` `{changes}` | sets the complete `layout` of the windows named |
+| `window_focus_timestamp_changed` `{id, focus_timestamp}` | updates the window's monotonic focus stamp |
+| `keyboard_layouts_changed` `{keyboard_layouts}` | replaces names and current index |
+| `keyboard_layout_switched` `{idx}` | changes only the current index |
 | `overview_opened_or_closed` `{is_open}` | the overview is open or not |
 
 The events are derived from the state of the layout engine, not from what happened to produce it:
@@ -718,7 +803,12 @@ what wiri adds:
 | `is_focused` | `bool` | The window has the keyboard focus (wiri manages the window the OS says is in the foreground) |
 | `is_floating` | `bool` | |
 | `is_urgent` | `bool` | The window asked for attention |
-| `layout.pos_in_scrolling_layout` | `[column, tile]` or `null` | Both counted from 1; `null` for a floating or minimized window.  niri's sizes and offsets are not reported |
+| `layout.pos_in_scrolling_layout` | `[column, tile]` or `null` | Both counted from 1; null for floating/minimized windows |
+| `layout.tile_size` | `[number, number]` | Logical tile width/height before parking |
+| `layout.window_size` | `[integer, integer]` | Logical native-window width/height, including Windows decorations |
+| `layout.tile_pos_in_workspace_view` | `[number, number]` or `null` | Output-local logical position; null when no view is known |
+| `layout.window_offset_in_tile` | `[number, number]` | Logical border inset; zero for floating/fullscreen/maximized windows |
+| `focus_timestamp` | `{secs,nanos}` or `null` | Monotonic daemon-relative most recent focus; null until observed |
 | `class_name` | `string` | wiri: the Win32 window class |
 | `output` | `string` or `null` | wiri: device name of the monitor the window is on (`\\.\DISPLAY1`) |
 | `is_fullscreen`, `is_maximized`, `is_minimized` | `bool` | wiri: fullscreen; maximized to the edges of the work area (`maximize-window-to-edges`); minimized |
@@ -742,11 +832,11 @@ or `path: null` for clipboard-only or a disk-save failure. It is a change event,
 initial state, and can be selected with `events --stream --filter screenshot_captured`.
 Hotkeys, tray and both window-capture requests share the event path.
 
-Differences from niri: the envelope (`{"type","data"}`, not niri's externally tagged enum), the extra
-fields marked wiri above, no `WindowFocusTimestampChanged`, keyboard layout, cast and touchpad
-events (they have no Windows counterpart yet), and ids that are window handles.  The events of wiri's own
-that predate this contract (`window_opened`, `window_focused`, `workspace_switched`, `column_focused`,
-`window_moved`, ...) are kept as they were.
+Differences from niri: wiri requests select the adjacent envelope (`{"type","data"}`),
+while external requests select niri's externally tagged events. Window ids are HWNDs;
+Windows decorations count in window sizes. Cast and touchpad-toggle events remain unsupported.
+The extra fields marked wiri above and older wiri events (`window_opened`, `window_focused`,
+`workspace_switched`, `column_focused`, `window_moved`, ...) are retained.
 
 ---
 
@@ -828,9 +918,25 @@ wiri's `window_urgent` is sent as well when Windows reports the attention reques
 
 ### `window_layouts_changed`
 
-niri's `WindowLayoutsChanged`: `{"changes": [[328756, {"pos_in_scrolling_layout": [2, 1]}], ...]}`.
-**When:** windows changed their column or their place in it (a column moved, a window was consumed into
-or expelled from a column, a column before them closed).
+niri's `WindowLayoutsChanged`: `{"changes":[[id,layout],...]}` contains the complete
+logical layout described in §4.9. Column/tile moves, scrolling, resizing, stacking,
+sizing states and scale changes can produce it; unchanged snapshots are silent.
+A window sent whole already carries its layout and timestamp, so it gets no
+redundant per-field delta in that batch.
+
+### `window_focus_timestamp_changed`
+
+`{"id":328756,"focus_timestamp":{"secs":12,"nanos":345}}`: the most recent
+observed managed-window focus changed. Duplicate foreground notifications are
+silent; focus history is retained while another (even unmanaged) window has focus.
+
+### `keyboard_layouts_changed` / `keyboard_layout_switched`
+
+The full `{"keyboard_layouts":{"names":["US"],"current_idx":0}}` is replayed
+on subscribe and when the loaded names change. A current-index-only change emits
+`{"idx":1}`. GetKeyboardLayoutList and the foreground thread's GetKeyboardLayout
+are read on foreground, shell-language and input/settings notifications; no timer
+polls. Localized registry display names are cached until the loaded list changes.
 
 ---
 
@@ -1388,8 +1494,9 @@ if event.get("type") == "workspace_switched":
 ### Track the state from the event stream
 
 Subscribe with an empty filter and keep a model: the stream starts with the whole state
-(`workspaces_changed`, `windows_changed`, `overview_opened_or_closed`, `config_loaded`) and goes on with
-the changes (§6.2), so there is nothing to query first and nothing to poll.
+(`workspaces_changed`, `windows_changed`, `overview_opened_or_closed`,
+`keyboard_layouts_changed`, `config_loaded`) and goes on with the changes (§6.2), so there is
+nothing to query first and nothing to poll.
 
 ```python
 workspaces, windows = {}, {}

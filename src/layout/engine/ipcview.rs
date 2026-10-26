@@ -25,6 +25,22 @@ fn workspace_ipc_id(tag: u64, workspace: i32) -> u64 {
     (tag << 32) | u64::from(workspace as u32)
 }
 
+fn layout_geometry(rect: Rect, output: Rect, scale: f64, inset: i32) -> WindowLayoutIpc {
+    WindowLayoutIpc {
+        pos_in_scrolling_layout: None,
+        tile_size: (rect.size.w as f64 / scale, rect.size.h as f64 / scale),
+        window_size: (
+            (rect.size.w.saturating_sub(inset as u32 * 2) as f64 / scale).round() as i32,
+            (rect.size.h.saturating_sub(inset as u32 * 2) as f64 / scale).round() as i32,
+        ),
+        tile_pos_in_workspace_view: Some((
+            (rect.loc.x - output.loc.x) as f64 / scale,
+            (rect.loc.y - output.loc.y) as f64 / scale,
+        )),
+        window_offset_in_tile: (inset as f64 / scale, inset as f64 / scale),
+    }
+}
+
 /// A tag from 1 to 0xFFFFF for each id, in the order given.  An id that would get a tag
 /// that is taken gets the next free one.
 fn tags_for(ids: &[u64]) -> Vec<u64> {
@@ -49,6 +65,77 @@ fn output_tags(outputs: &[OutputId]) -> HashMap<OutputId, u64> {
 }
 
 impl TilingEngine {
+    /// Duplicate foreground reports do not reorder MRU history. Unmanaged windows
+    /// still break a focus interval, but never acquire managed-window history.
+    pub(super) fn record_ipc_foreground(&mut self, window: WindowId) {
+        if self.os_foreground != Some(window) && self.tiled_windows.contains_key(&window) {
+            let stamp = self.focus_epoch.elapsed().max(
+                self.last_focus_stamp
+                    .saturating_add(std::time::Duration::from_nanos(1)),
+            );
+            self.last_focus_stamp = stamp;
+            self.focus_timestamps.insert(window, stamp);
+        }
+        self.os_foreground = Some(window);
+    }
+
+    /// Describe logical geometry before the offscreen-parking optimization. The
+    /// pure calculators are shared with layout application; no Win32 calls or
+    /// layout mutations occur, including for inactive workspaces.
+    fn ipc_layouts(&self) -> HashMap<WindowId, WindowLayoutIpc> {
+        let mut layouts = HashMap::new();
+        for (output, monitor) in self.monitors.iter() {
+            let cfg = self.effective_config(*output);
+            let work = Rect::new(
+                monitor.work_area.loc.x + cfg.reserve_left as i32 + cfg.outer_gaps.3,
+                monitor.work_area.loc.y + cfg.reserve_top as i32 + cfg.outer_gaps.0,
+                monitor
+                    .work_area
+                    .size
+                    .w
+                    .saturating_sub(cfg.reserve_left + cfg.reserve_right)
+                    .saturating_sub((cfg.outer_gaps.1 + cfg.outer_gaps.3) as u32),
+                monitor
+                    .work_area
+                    .size
+                    .h
+                    .saturating_sub(cfg.reserve_top + cfg.reserve_bottom)
+                    .saturating_sub((cfg.outer_gaps.0 + cfg.outer_gaps.2) as u32),
+            );
+            let scale = monitor.scale_factor.max(0.01);
+            for workspace in monitor.workspaces.values() {
+                use crate::layout::workspace::WorkspaceLayout;
+                let positions = match workspace.layout_mode {
+                    WorkspaceLayout::Scrolling => self.calculate_positions(workspace, work, cfg),
+                    WorkspaceLayout::BStack => {
+                        self.calculate_positions_bstack(workspace, work, cfg)
+                    }
+                    WorkspaceLayout::Spiral => self.calculate_positions_spiral(workspace, work),
+                };
+                let ids = positions.iter().map(|(id, _)| *id).collect();
+                let modes = self.sizing_draw_modes(&ids);
+                let positions = Self::apply_sizing_states(
+                    positions,
+                    &modes,
+                    work,
+                    monitor.work_area,
+                    monitor.bounds,
+                );
+                for (window, rect) in positions {
+                    let inset = if modes.get(&window).copied().unwrap_or(DrawMode::Inset)
+                        == DrawMode::Inset
+                    {
+                        cfg.border_width.max(1)
+                    } else {
+                        0
+                    };
+                    layouts.insert(window, layout_geometry(rect, monitor.bounds, scale, inset));
+                }
+            }
+        }
+        layouts
+    }
+
     /// The device name of a monitor as event-stream clients see it (`\\.\DISPLAY1`); the id
     /// when the engine was never told.
     fn ipc_output_name(&self, output: OutputId) -> String {
@@ -159,6 +246,7 @@ impl TilingEngine {
         let names: HashMap<OutputId, &String> = outputs.iter().map(|(n, o)| (*o, n)).collect();
 
         let places = self.ipc_places();
+        let layouts = self.ipc_layouts();
         let focused_output = self.monitors.focused_id();
         // The keyboard focus is the OS foreground window, when wiri manages it.
         let focused_window = self
@@ -199,6 +287,26 @@ impl TilingEngine {
         let mut windows: Vec<WindowIpc> = Vec::with_capacity(self.tiled_windows.len());
         for (window, info) in &self.tiled_windows {
             let place = places.get(window);
+            let mut layout = layouts.get(window).cloned().unwrap_or_else(|| {
+                let rect = self
+                    .float_homes
+                    .get(window)
+                    .map_or(info.bounds, |home| home.rect);
+                let monitor = place.and_then(|p| self.monitors.get(&p.output));
+                let mut layout = layout_geometry(
+                    rect,
+                    monitor.map_or(Rect::default(), |m| m.bounds),
+                    monitor.map_or(1.0, |m| m.scale_factor.max(0.01)),
+                    0,
+                );
+                if self.minimized.contains_key(window) || monitor.is_none() {
+                    layout.tile_pos_in_workspace_view = None;
+                }
+                layout
+            });
+            layout.pos_in_scrolling_layout = place
+                .and_then(|p| p.slot)
+                .map(|(column, tile)| (column + 1, tile + 1));
             windows.push(WindowIpc {
                 id: window.as_isize() as u64,
                 title: (!info.title.is_empty()).then(|| info.title.clone()),
@@ -215,11 +323,8 @@ impl TilingEngine {
                 is_focused: focused_window == Some(*window),
                 is_floating: self.floating_windows.contains(window),
                 is_urgent: self.urgent_windows.contains(window),
-                layout: WindowLayoutIpc {
-                    pos_in_scrolling_layout: place
-                        .and_then(|p| p.slot)
-                        .map(|(column, tile)| (column + 1, tile + 1)),
-                },
+                layout,
+                focus_timestamp: self.focus_timestamps.get(window).copied(),
                 class_name: info.class_name.clone(),
                 output: place.and_then(|p| names.get(&p.output).map(|name| (*name).clone())),
                 is_fullscreen: self.fullscreen_windows.contains(window),
@@ -233,6 +338,7 @@ impl TilingEngine {
             windows,
             workspaces,
             overview_open: self.overview.is_some(),
+            keyboard_layouts: None,
         }
     }
 }
@@ -486,6 +592,90 @@ mod tests {
             after.workspaces.len() > before.workspaces.len(),
             "the workspace it went to is listed"
         );
+    }
+
+    #[test]
+    fn focus_stamps_are_monotonic_deduplicated_and_removed_with_the_window() {
+        let (mut engine, backend) = engine_with(&[100, 101]);
+        let one = WindowId::new(100);
+        let two = WindowId::new(101);
+        assert_eq!(window_of(&engine.ipc_snapshot(), 100).focus_timestamp, None);
+        engine.sync_os_foreground(one, &backend);
+        let first = engine.focus_timestamps[&one];
+        engine.sync_os_foreground(one, &backend);
+        assert_eq!(
+            engine.focus_timestamps[&one], first,
+            "duplicate notification"
+        );
+        engine.sync_os_foreground(two, &backend);
+        let second = engine.focus_timestamps[&two];
+        assert!(second > first);
+        engine.sync_os_foreground(WindowId::new(999), &backend);
+        assert!(!engine.focus_timestamps.contains_key(&WindowId::new(999)));
+        engine.sync_os_foreground(one, &backend);
+        assert!(engine.focus_timestamps[&one] > second);
+        assert_eq!(engine.focus_timestamps[&two], second);
+        engine.remove_window(one, &backend);
+        assert!(!engine.focus_timestamps.contains_key(&one));
+        engine.add_window(make_window(100), &backend);
+        assert_eq!(window_of(&engine.ipc_snapshot(), 100).focus_timestamp, None);
+    }
+
+    #[test]
+    fn geometry_uses_logical_output_local_coordinates_and_border_offsets() {
+        let layout = layout_geometry(
+            Rect::new(-1400, 150, 900, 600),
+            Rect::new(-1600, 0, 1600, 900),
+            1.5,
+            3,
+        );
+        assert_eq!(layout.tile_size, (600.0, 400.0));
+        assert_eq!(layout.window_size, (596, 396));
+        assert_eq!(layout.window_offset_in_tile, (2.0, 2.0));
+        assert_eq!(
+            layout.tile_pos_in_workspace_view,
+            Some((200.0 / 1.5, 100.0))
+        );
+    }
+
+    #[test]
+    fn offscreen_and_inactive_tiles_keep_their_logical_geometry_not_the_parking_rect() {
+        let (mut engine, backend) = engine_with(&[100, 101, 102, 103, 104]);
+        let snapshot = engine.ipc_snapshot();
+        for window in &snapshot.windows {
+            assert!(window.layout.tile_size.0 > 0.0 && window.layout.tile_size.1 > 0.0);
+            assert!(window.layout.window_size.0 > 0 && window.layout.window_size.1 > 0);
+            let (x, y) = window.layout.tile_pos_in_workspace_view.unwrap();
+            assert!(
+                x.abs() < 10_000.0 && y.abs() < 10_000.0,
+                "not parked: {window:?}"
+            );
+        }
+        let before = window_of(&snapshot, 100).layout.clone();
+        engine.switch_workspace(1, &backend);
+        assert_eq!(window_of(&engine.ipc_snapshot(), 100).layout, before);
+        engine.toggle_floating_for(WindowId::new(101), &backend);
+        let floating = window_of(&engine.ipc_snapshot(), 101).clone();
+        assert_eq!(floating.layout.window_offset_in_tile, (0.0, 0.0));
+        assert!(floating.layout.tile_size.0 > 0.0);
+    }
+
+    #[test]
+    fn fullscreen_geometry_is_exact_and_multimonitor_scale_is_unit_tested() {
+        let (mut engine, backend) = engine_with(&[100]);
+        let output = OutputId::from_name("TestMonitor");
+        engine.sync_monitor_with_scale(
+            output,
+            Rect::new(-1920, 0, 1920, 1080),
+            Rect::new(-1920, 0, 1920, 1040),
+            1.5,
+        );
+        engine.toggle_fullscreen_for(WindowId::new(100), &backend);
+        let layout = window_of(&engine.ipc_snapshot(), 100).layout.clone();
+        assert_eq!(layout.tile_size, (1280.0, 720.0));
+        assert_eq!(layout.window_size, (1280, 720));
+        assert_eq!(layout.window_offset_in_tile, (0.0, 0.0));
+        assert_eq!(layout.tile_pos_in_workspace_view, Some((0.0, 0.0)));
     }
 
     #[test]

@@ -4,17 +4,15 @@
 
 use std::collections::HashMap;
 
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_ENUM_MODES,
-    DXGI_ERROR_MORE_DATA, DXGI_ERROR_NOT_FOUND,
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_ENUM_MODES, DXGI_ERROR_MORE_DATA,
+    DXGI_ERROR_NOT_FOUND,
 };
 
 use super::{
-    build_update, ccd, execute_update, millihertz, parse_edid, plan_output, read_edid,
-    wide_string, OutputConfig, OutputIdentity, Rotation, Topology,
+    build_update, ccd, execute_update, millihertz, parse_edid, plan_output, read_edid, wide_string,
+    OutputConfig, OutputIdentity, Rotation, Topology,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +67,9 @@ fn target_index(identities: &[OutputIdentity], name: &str) -> Result<usize, Stri
         [] => Err(format!(
             "output '{name}' is not active; enabling an inactive output is unsupported"
         )),
-        _ => Err(format!("output '{name}' is ambiguous; use a unique connector name")),
+        _ => Err(format!(
+            "output '{name}' is ambiguous; use a unique connector name"
+        )),
     }
 }
 
@@ -108,12 +108,18 @@ pub fn snapshots() -> Result<Vec<OutputSnapshot>, String> {
             .ok_or("Windows returned an unknown output rotation")?;
         let current = topology.state(index).ok().and_then(|state| {
             let refresh = state.mode.refresh_millihz?;
-            (state.mode.width > 0 && state.mode.height > 0 && refresh > 0)
-                .then_some((state.mode.width, state.mode.height, refresh))
+            (state.mode.width > 0 && state.mode.height > 0 && refresh > 0).then_some((
+                state.mode.width,
+                state.mode.height,
+                refresh,
+            ))
         });
         let preferred = preferred_mode(path);
         let (modes, current_mode) = assemble_modes(
-            available.get(&connector_key(&identity.connector)).cloned().unwrap_or_default(),
+            available
+                .get(&connector_key(&identity.connector))
+                .cloned()
+                .unwrap_or_default(),
             current,
             preferred,
         );
@@ -176,7 +182,12 @@ fn preferred_mode(path: &ccd::DISPLAYCONFIG_PATH_INFO) -> Option<ModeKey> {
         return None;
     }
     let rate = preferred.targetMode.targetVideoSignalInfo.vSyncFreq;
-    mode_key(preferred.width, preferred.height, rate.Numerator, rate.Denominator)
+    mode_key(
+        preferred.width,
+        preferred.height,
+        rate.Numerator,
+        rate.Denominator,
+    )
 }
 
 fn modes_by_connector() -> Result<HashMap<String, Vec<ModeKey>>, String> {
@@ -259,7 +270,12 @@ fn display_modes(output: &IDXGIOutput) -> Result<Vec<ModeKey>, String> {
         return Ok(modes[..count as usize]
             .iter()
             .filter_map(|mode| {
-                mode_key(mode.Width, mode.Height, mode.RefreshRate.Numerator, mode.RefreshRate.Denominator)
+                mode_key(
+                    mode.Width,
+                    mode.Height,
+                    mode.RefreshRate.Numerator,
+                    mode.RefreshRate.Denominator,
+                )
             })
             .collect());
     }
@@ -282,8 +298,7 @@ fn edid_physical_size(bytes: &[u8]) -> Option<(u32, u32)> {
     }
     // A zero in either base-size byte means unknown or an aspect ratio in
     // EDID 1.4, not a physical dimension.
-    (base[21] > 0 && base[22] > 0)
-        .then_some((u32::from(base[21]) * 10, u32::from(base[22]) * 10))
+    (base[21] > 0 && base[22] > 0).then_some((u32::from(base[21]) * 10, u32::from(base[22]) * 10))
 }
 
 #[cfg(test)]
@@ -312,14 +327,20 @@ mod tests {
         let mut other = identity(r"\\.\DISPLAY2");
         other.make.clear();
         other.model = "DISPLAY1".to_string();
-        assert_eq!(target_index(&[identities[0].clone(), other], "display1"), Ok(0));
+        assert_eq!(
+            target_index(&[identities[0].clone(), other], "display1"),
+            Ok(0)
+        );
         assert!(target_index(&[identities[0].clone(), identities[0].clone()], "DISPLAY1").is_err());
         assert_eq!(target_index(&[identities[0].clone()], "DEL U2720Q"), Ok(0));
     }
 
     #[test]
     fn rational_modes_keep_fractional_rates_and_reject_unknown_values() {
-        assert_eq!(mode_key(1920, 1080, 60_000, 1001), Some((1920, 1080, 59_940)));
+        assert_eq!(
+            mode_key(1920, 1080, 60_000, 1001),
+            Some((1920, 1080, 59_940))
+        );
         assert_eq!(mode_key(1920, 1080, 60, 1), Some((1920, 1080, 60_000)));
         assert!(mode_key(1920, 1080, 0, 1).is_none());
         assert!(mode_key(1920, 1080, 60, 0).is_none());
@@ -337,7 +358,9 @@ mod tests {
         assert_eq!(current_mode.refresh_rate, 59_940);
         assert!(!current_mode.is_preferred);
         assert_eq!(modes.iter().filter(|mode| mode.is_preferred).count(), 1);
-        assert!(modes.iter().any(|mode| mode.refresh_rate == 60_000 && mode.is_preferred));
+        assert!(modes
+            .iter()
+            .any(|mode| mode.refresh_rate == 60_000 && mode.is_preferred));
         let (modes, index) = assemble_modes(vec![current], None, None);
         assert!(index.is_none());
         assert!(!modes[0].is_preferred);
@@ -347,7 +370,11 @@ mod tests {
     }
 
     fn checksum(bytes: &mut [u8; 128]) {
-        bytes[127] = 0u8.wrapping_sub(bytes[..127].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
+        bytes[127] = 0u8.wrapping_sub(
+            bytes[..127]
+                .iter()
+                .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        );
     }
 
     fn edid() -> [u8; 128] {
@@ -383,8 +410,8 @@ mod tests {
 
     #[test]
     fn target_only_preparation_preserves_other_paths_and_last_display_guard() {
-        use crate::config::Config;
         use super::super::{OutputMode, OutputState};
+        use crate::config::Config;
         let mut paths = [ccd::DISPLAYCONFIG_PATH_INFO::default(); 2];
         paths[0].sourceInfo.id = 3;
         paths[0].targetInfo.id = 30;

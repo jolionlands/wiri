@@ -1,5 +1,5 @@
 //! The two IPC dialects and bounded, incremental JSON-line framing.
-//! A complete un-delimited first value remains the legacy one-shot protocol.
+//! A complete undelimited first wiri value retains the legacy one-shot protocol.
 use serde_json::{json, Value};
 
 use super::{IpcEvent, IpcMessage};
@@ -234,6 +234,7 @@ pub fn reply(dialect: Dialect, name: &str, mut response: Value) -> Value {
         "overview_state" => ("OverviewState", result.clone()),
         "pick_window" => ("PickedWindow", result["window"].clone()),
         "pick_color" => ("PickedColor", result["color"].clone()),
+        "output" => ("OutputConfigChanged", json!("Applied")),
         _ => return json!({"Ok":"Handled"}),
     };
     let mut tagged = serde_json::Map::new();
@@ -319,10 +320,13 @@ impl Framer {
             return None;
         }
         match serde_json::from_slice::<Value>(&self.pending) {
-            Ok(value) => {
+            Ok(value) if dialect(&value) == Dialect::Wiri => {
                 self.pending.clear();
                 Some(Ok(value))
             }
+            // External niri clients have always used JSON lines. A complete
+            // value is not a frame until its delimiter arrives in a later read.
+            Ok(_) => None,
             Err(error) if error.is_eof() => None,
             Err(error) => {
                 self.pending.clear();
@@ -337,6 +341,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn documented_schema_examples_use_the_current_wire_contract() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../docs/IPC_SCHEMA.json")).unwrap();
+        assert_eq!(schema["version"], SCHEMA_VERSION);
+        let defs = &schema["$defs"];
+        for value in defs["NiriRequest"]["examples"].as_array().unwrap() {
+            let request = decode(value.clone()).unwrap();
+            assert_eq!(request.dialect, Dialect::Niri);
+        }
+        let names = defs["NiriEvent"]["propertyNames"]["enum"]
+            .as_array()
+            .unwrap();
+        for value in defs["NiriEvent"]["examples"].as_array().unwrap() {
+            let (name, data) = value.as_object().unwrap().iter().next().unwrap();
+            assert!(names.contains(&json!(name)));
+            let decoded: IpcEvent = serde_json::from_value(json!({
+                "type": snake_case(name), "data": data,
+            }))
+            .unwrap();
+            assert_eq!(event(Dialect::Niri, &decoded), Some(value.clone()));
+        }
+        let results = [
+            (
+                "keyboard_layouts",
+                json!({"keyboard_layouts":{"names":["US"],"current_idx":0}}),
+            ),
+            ("pick_window", json!({"window":null})),
+            ("pick_color", json!({"color":{"rgb":[1.0,0.5,0.0]}})),
+            ("output", json!({"output":"DISPLAY1","temporary":true})),
+        ];
+        let examples = defs["NiriReply"]["examples"].as_array().unwrap();
+        for ((name, result), expected) in results.into_iter().zip(examples) {
+            assert_eq!(
+                reply(Dialect::Niri, name, json!({"success":true,"result":result})),
+                *expected
+            );
+        }
+        assert_eq!(
+            error(Dialect::Niri, "example error requested by ReturnError"),
+            *examples.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_references_resolve_and_new_window_fields_remain_required() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../docs/IPC_SCHEMA.json")).unwrap();
+        fn visit(value: &Value, schema: &Value) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+                        assert!(
+                            schema
+                                .pointer(reference.strip_prefix('#').unwrap())
+                                .is_some(),
+                            "{reference}"
+                        );
+                    }
+                    for value in map.values() {
+                        visit(value, schema);
+                    }
+                }
+                Value::Array(array) => {
+                    for value in array {
+                        visit(value, schema);
+                    }
+                }
+                _ => {}
+            }
+        }
+        visit(&schema, &schema);
+        let defs = &schema["$defs"];
+        assert!(defs["WindowIpc"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("focus_timestamp")));
+        assert_eq!(
+            defs["WindowLayoutIpc"]["required"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    #[test]
     fn fragmented_and_pipelined_lines_are_independent() {
         let mut f = Framer::default();
         assert!(f.feed(b"{\"type\":\"ver").is_empty());
@@ -348,6 +438,14 @@ mod tests {
         assert!(frames[2].is_err());
         assert_eq!(frames[3].as_ref().unwrap(), "Version");
         assert!(f.legacy().is_none());
+    }
+
+    #[test]
+    fn external_request_waits_for_a_fragmented_delimiter() {
+        let mut f = Framer::default();
+        assert!(f.feed(b"\"Windows\"").is_empty());
+        assert!(f.legacy().is_none());
+        assert_eq!(f.feed(b"\n")[0].as_ref().unwrap(), "Windows");
     }
 
     #[test]

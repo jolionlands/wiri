@@ -2376,13 +2376,13 @@ function PipeRequest([string]$json) {
     } catch { return "error: $_" } finally { $c.Dispose() }
 }
 
-# (a) the state first: a new subscriber is told the workspaces, the windows, the overview and the config, in that order
+# (a) the state first: workspaces, windows, overview, keyboard layouts, config (IPC 1.3)
 $evProc = Start-Process -FilePath $ctl -ArgumentList @('events', '--stream') -RedirectStandardOutput $evAll -RedirectStandardError "$evAll.err" -WindowStyle Hidden -PassThru
 $null = WaitText $evAll '"type":"config_loaded"' 8
 Start-Sleep -Milliseconds 600
 $h15Replay = @(EvList $evAll)
-$h15FirstFour = (@($h15Replay | Select-Object -First 4 | ForEach-Object { $_.type }) -join ',')
-$h15StartsWithState = ($h15FirstFour -eq 'workspaces_changed,windows_changed,overview_opened_or_closed,config_loaded')
+$h15FirstFive = (@($h15Replay | Select-Object -First 5 | ForEach-Object { $_.type }) -join ',')
+$h15StartsWithState = ($h15FirstFive -eq 'workspaces_changed,windows_changed,overview_opened_or_closed,keyboard_layouts_changed,config_loaded')
 $h15Fg = [int64][LT]::GetForegroundWindow()
 $h15WinList = WinList 'h15-windows-at-start'
 $h15Windows = @((EvOf $h15Replay 'windows_changed') | Select-Object -First 1 | ForEach-Object { $_.data.windows } | ForEach-Object { $_ })
@@ -2548,7 +2548,7 @@ $h15NowIds = @($h15NowList | ForEach-Object { [int64]$_.hwnd } | Sort-Object)
 $h15LateIds = @($h15LateWindows | ForEach-Object { [int64]$_.id } | Sort-Object)
 $h15LateFocused = @($h15LateWindows | Where-Object { $_.is_focused -eq $true })
 $h15LateOk = ($h15NowIds.Count -ge 2) -and (SameList $h15NowIds $h15LateIds) -and (($h15LateFocused.Count -eq 0) -or ([int64]$h15LateFocused[0].id -eq [int64][LT]::GetForegroundWindow())) -and
-    ((@(EvList $evLate | Select-Object -First 4 | ForEach-Object { $_.type }) -join ',') -eq 'workspaces_changed,windows_changed,overview_opened_or_closed,config_loaded')
+    ((@(EvList $evLate | Select-Object -First 5 | ForEach-Object { $_.type }) -join ',') -eq 'workspaces_changed,windows_changed,overview_opened_or_closed,keyboard_layouts_changed,config_loaded')
 $h15FilterQuietAtFirst = (@(EvList $evFilter).Count -eq 0)
 [TestForms]::CloseForm($k2); Start-Sleep -Milliseconds 2400
 $h15FilterEvents = @(EvList $evFilter)
@@ -2556,7 +2556,7 @@ $h15FilterOk = $h15FilterQuietAtFirst -and ($h15FilterEvents.Count -ge 1) -and (
     ([int64]$h15FilterEvents[0].data.id -eq [int64]$k2)
 foreach ($p in @($evProc, $evLateProc, $evFilterProc)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
 $h15Values = [ordered]@{
-    issues = $h15Issues; first_four = $h15FirstFour; focused_at_start = $h15Fg
+    issues = $h15Issues; first_five = $h15FirstFive; focused_at_start = $h15Fg
     workspaces_at_start = (@($h15Workspaces | ForEach-Object { "$($_.idx):$($_.name):$($_.id):active=$($_.is_active):focused=$($_.is_focused)" }) -join ' ')
     process = $procName; windows_at_start = $h15Windows.Count; windows_late = $h15LateIds.Count
     events_total = @(EvList $evAll).Count; typed_reply = $typedReply.Trim()
@@ -2942,6 +2942,7 @@ $summary = [ordered]@{
 . (Join-Path $PSScriptRoot 'live-phases\lane-a.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-h.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

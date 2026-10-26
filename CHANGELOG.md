@@ -44,6 +44,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Spawned clients inherit WIRI_PIPE. Framing is bounded per line and subscriptions release on
   disconnect without an idle timer.
 
+### IPC 1.3 — CLI and reusable client (Lane H)
+- Reusable connect/request/read-events client, per-request commands, optional `msg` prefix,
+  `--print-request`, raw JSON argument/stdin requests and schema mismatch guidance.
+  `windows` uses niri's objects; `window-list` retains wiri's geometry list.
+
+### IPC 1.3 — output and keyboard queries (Lane H)
+- Outputs and FocusedOutput expose connector/EDID identity, DXGI rational-rate modes and
+  logical geometry; unknown VRR/max-bpc capabilities remain null. KeyboardLayouts follows the foreground
+  thread with localized layout names, not the IPC caller's thread.
+- Temporary output requests reuse the conservative target-only executor; layout scale
+  never changes Windows DPI. Unsupported settings and last-display-off are errors.
+  Mutating output paths are synthetic-tested only, never applied on the shared laptop;
+  a successful temporary change answers `Ok.OutputConfigChanged: Applied`.
+
+### IPC 1.3 — interactive picks (Lane H)
+- PickWindow and SDR PickColor consume click down/up on the existing input hooks;
+  Escape returns null, disconnect cancels, concurrent picks fail, and release guards
+  survive completion. No extra overlay, idle timer, thread or dependency.
+
+### IPC 1.3 — complete state events (Lane H)
+- Window objects include daemon-relative monotonic focus timestamps and full logical
+  layout geometry before offscreen parking, with dedicated deduplicated delta events.
+- Keyboard layout state replays before deltas; foreground and shell language notifications
+  on the existing hotkey window produce list/switch events without polling.
+- Automated H35-H39 live gates cover both wire dialects, queries, timestamps/layouts,
+  click/Escape consumption and legacy CLI compatibility. A missing second loaded keyboard
+  layout is reported as an explicit skip, not a passed switch check.
+- The performance collector resolves `WIRI_PIPE` or the same per-user/session pipe as
+  the daemon instead of the retired global name, with a pure endpoint self-test; earlier
+  unavailable samples were collector timeouts, not measurements.
+
 ### The pipe belongs to the user and the session (2026-10-25)
 - **A second user can run wiri.**  The pipe name was machine-global
   (`\\.\pipe\wiri_control`), so the second user logged in on the same machine (fast

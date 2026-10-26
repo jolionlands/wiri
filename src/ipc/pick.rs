@@ -19,14 +19,8 @@ pub enum PickKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Effect {
-    Sample {
-        id: u64,
-        kind: PickKind,
-        at: Point,
-    },
-    Cancel {
-        id: u64,
-    },
+    Sample { id: u64, kind: PickKind, at: Point },
+    Cancel { id: u64 },
 }
 impl Effect {
     fn id(self) -> u64 {
@@ -50,19 +44,20 @@ struct Session {
 }
 
 /// Captured releases outlive the request, including when its future is dropped.
-/// Physical down state also prevents stealing a press which began before the pick.
+/// Per-origin down state prevents stealing an already-held press, or letting an
+/// injected release clear a physical guard (and vice versa).
 #[derive(Default)]
 struct PickState {
     next_id: u64,
     active: Option<Session>,
-    left_down: bool,
-    escape_down: bool,
-    captured_left: bool,
-    captured_escape: bool,
+    left_down: [bool; 2],
+    escape_down: [bool; 2],
+    captured_left: Option<bool>,
+    captured_escape: Option<bool>,
 }
 impl PickState {
     fn begin(&mut self, kind: PickKind) -> Result<u64, String> {
-        if self.active.is_some() || self.captured_left || self.captured_escape {
+        if self.active.is_some() || self.captured_left.is_some() || self.captured_escape.is_some() {
             return Err("another pick is active or waiting for its captured input release".into());
         }
         self.next_id = self.next_id.wrapping_add(1);
@@ -84,18 +79,18 @@ impl PickState {
             return false;
         }
         self.active = None;
-        // Never clear captured_* here: the matching physical up must still be eaten.
+        // Never clear captured_* here: the matching-origin up must still be eaten.
         true
     }
 
     fn left(&mut self, pressed: bool, at: Point, injected: bool) -> Decision {
-        if injected {
-            return Decision::default();
-        }
-        let was_down = std::mem::replace(&mut self.left_down, pressed);
-        if self.captured_left {
+        let was_down = std::mem::replace(&mut self.left_down[usize::from(injected)], pressed);
+        if let Some(origin) = self.captured_left {
+            if origin != injected {
+                return Decision::default();
+            }
             if !pressed {
-                self.captured_left = false;
+                self.captured_left = None;
             }
             return Decision {
                 consume: true,
@@ -105,7 +100,7 @@ impl PickState {
         if pressed && !was_down {
             if let Some(session) = self.active.as_mut().filter(|session| !session.resolving) {
                 session.resolving = true;
-                self.captured_left = true;
+                self.captured_left = Some(injected);
                 return Decision {
                     consume: true,
                     effect: Some(Effect::Sample {
@@ -120,13 +115,13 @@ impl PickState {
     }
 
     fn escape(&mut self, pressed: bool, injected: bool) -> Decision {
-        if injected {
-            return Decision::default();
-        }
-        let was_down = std::mem::replace(&mut self.escape_down, pressed);
-        if self.captured_escape {
+        let was_down = std::mem::replace(&mut self.escape_down[usize::from(injected)], pressed);
+        if let Some(origin) = self.captured_escape {
+            if origin != injected {
+                return Decision::default();
+            }
             if !pressed {
-                self.captured_escape = false;
+                self.captured_escape = None;
             }
             return Decision {
                 consume: true,
@@ -136,7 +131,7 @@ impl PickState {
         if pressed && !was_down {
             if let Some(session) = self.active.as_mut().filter(|session| !session.resolving) {
                 session.resolving = true;
-                self.captured_escape = true;
+                self.captured_escape = Some(injected);
                 return Decision {
                     consume: true,
                     effect: Some(Effect::Cancel { id: session.id }),
@@ -177,7 +172,7 @@ impl Drop for RequestGuard {
     }
 }
 
-/// Wait for the next real left click, or Escape (`null`). Returns a managed
+/// Wait for the next left click, or Escape (`null`). Returns a managed
 /// `WindowIpc` object or `{ "rgb": [r, g, b] }` with normalized sRGB channels.
 /// Dropping this future cancels the request. The server must not apply its normal
 /// response deadline while waiting, and should drop it on requester disconnect.
@@ -195,8 +190,8 @@ pub async fn pick(kind: PickKind) -> Result<Value, String> {
         .map_err(|_| "pick response channel closed".to_string())?
 }
 
-/// Called before binds or drag handling. Injected events must never choose a pick
-/// or release a guard belonging to a physical press.
+/// Called before binds or drag handling. Physical and injected input can pick,
+/// but only the matching origin can release its captured press.
 pub(crate) fn mouse_event(message: u32, at: Point, injected: bool) -> bool {
     let pressed = match message {
         0x0201 => true,  // WM_LBUTTONDOWN
@@ -324,8 +319,7 @@ fn color_at(at: Point) -> Result<Value, String> {
 }
 
 fn colorref_to_srgb(pixel: u32) -> [f32; 3] {
-    [pixel & 0xff, (pixel >> 8) & 0xff, (pixel >> 16) & 0xff]
-        .map(|channel| channel as f32 / 255.0)
+    [pixel & 0xff, (pixel >> 8) & 0xff, (pixel >> 16) & 0xff].map(|channel| channel as f32 / 255.0)
 }
 
 #[cfg(test)]
@@ -469,14 +463,18 @@ mod tests {
     }
 
     #[test]
-    fn injected_clicks_and_escape_cannot_select_or_cancel() {
+    fn injected_clicks_and_escape_select_and_cancel_with_paired_guards() {
         let mut state = PickState::default();
-        state.begin(PickKind::Color).unwrap();
-        assert!(!state.left(true, AT, true).consume);
-        assert!(!state.left(false, AT, true).consume);
-        assert!(!state.escape(true, true).consume);
-        assert!(!state.escape(false, true).consume);
-        assert!(state.left(true, AT, false).effect.is_some());
+        let id = state.begin(PickKind::Color).unwrap();
+        assert!(state.left(true, AT, true).effect.is_some());
+        assert!(state.finish(id));
+        assert!(!state.left(false, AT, false).consume);
+        assert!(state.left(false, AT, true).consume);
+        let id = state.begin(PickKind::Color).unwrap();
+        assert_eq!(state.escape(true, true).effect, Some(Effect::Cancel { id }));
+        assert!(state.finish(id));
+        assert!(!state.escape(false, false).consume);
+        assert!(state.escape(false, true).consume);
     }
 
     #[test]
@@ -512,6 +510,9 @@ mod tests {
     fn colorref_is_normalized_srgb_in_rgb_order() {
         assert_eq!(colorref_to_srgb(0), [0.0, 0.0, 0.0]);
         assert_eq!(colorref_to_srgb(0x00ffffff), [1.0, 1.0, 1.0]);
-        assert_eq!(colorref_to_srgb(0x008040ff), [1.0, 64.0 / 255.0, 128.0 / 255.0]);
+        assert_eq!(
+            colorref_to_srgb(0x008040ff),
+            [1.0, 64.0 / 255.0, 128.0 / 255.0]
+        );
     }
 }

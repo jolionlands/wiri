@@ -637,6 +637,10 @@ pub struct TilingEngine {
     /// or floating).  Floating windows are not in the focus ring, so this is how
     /// `toggle_floating` finds the floating window the user is looking at.
     os_foreground: Option<WindowId>,
+    /// IPC focus history uses a monotonic daemon-local clock, never wall time.
+    focus_timestamps: HashMap<WindowId, std::time::Duration>,
+    focus_epoch: std::time::Instant,
+    last_focus_stamp: std::time::Duration,
     /// Optional channel to dispatch backend operations as `LayoutRequest`s instead of
     /// direct calls. When set, a sibling task on the backend drains this channel.
     /// When None, the engine continues to call `BackendApi` methods directly.
@@ -765,6 +769,9 @@ impl TilingEngine {
             failed_position: HashMap::new(),
             last_activated: None,
             os_foreground: None,
+            focus_timestamps: HashMap::new(),
+            focus_epoch: std::time::Instant::now(),
+            last_focus_stamp: std::time::Duration::ZERO,
             layout_request_tx: None,
             applied_state: HashMap::new(),
             decor: None,
@@ -1764,6 +1771,7 @@ impl TilingEngine {
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
         self.forget_rule_state(window_id);
+        self.focus_timestamps.remove(&window_id);
         self.forget_sizing(window_id);
         self.fullscreen_windows.remove(&window_id);
         self.minimized.remove(&window_id);
@@ -3228,7 +3236,7 @@ impl TilingEngine {
     ) -> Option<(usize, i32)> {
         // Whatever the window is (tiled, floating, unmanaged), it is what the user is
         // looking at now.
-        self.os_foreground = Some(window_id);
+        self.record_ipc_foreground(window_id);
         if self.floating_windows.contains(&window_id) {
             // The user is looking at a floating window: it goes to the top of the float stack.
             // Not a float of an inactive workspace that wiri itself hid: Windows reports it as
@@ -4033,7 +4041,7 @@ impl TilingEngine {
         if let Some(fg) = foreground {
             if let Some(wid) = self.managed_window_for(fg.hwnd, fg.root_owner) {
                 if self.floating_windows.contains(&wid) {
-                    self.os_foreground = Some(wid);
+                    self.record_ipc_foreground(wid);
                     self.touch_float(wid);
                     return Some(ActionTarget {
                         window: wid,
@@ -4543,7 +4551,7 @@ impl TilingEngine {
                 self.switch_workspace(workspace, backend);
             }
             self.touch_float(window_id);
-            self.os_foreground = Some(window_id);
+            self.record_ipc_foreground(window_id);
             self.activate_now(window_id, backend);
             // The tile that holds the engine focus is not the target of this activation: the
             // layout pass must not hand the foreground to it now.

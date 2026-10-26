@@ -126,6 +126,7 @@ impl IpcServer {
     fn describe(&self, mirror: &mut Mirror) -> Option<IpcSnapshot> {
         let engine = self.engine.as_ref()?;
         let mut snapshot = engine.read().ipc_snapshot();
+        snapshot.keyboard_layouts = Some(super::keyboard::snapshot());
         let mut live = std::collections::HashSet::new();
         for window in &mut snapshot.windows {
             let Some(pid) = window.pid else { continue };
@@ -364,21 +365,25 @@ impl IpcServer {
 
         let mut buffer = [0u8; 8192];
         let mut framer = super::wire::Framer::default();
+        let mut queued = std::collections::VecDeque::new();
         loop {
-            let n = match pipe.read(&mut buffer).await {
-                Ok(0) => return Ok(()),
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let mut frames = framer.feed(&buffer[..n]);
-            let legacy = frames.is_empty() && !framer.lined;
-            if legacy {
-                if let Some(frame) = framer.legacy() {
-                    frames.push(frame);
+            if queued.is_empty() {
+                let n = match pipe.read(&mut buffer).await {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                };
+                let mut frames = framer.feed(&buffer[..n]);
+                let legacy = frames.is_empty() && !framer.lined;
+                if legacy {
+                    if let Some(frame) = framer.legacy() {
+                        frames.push(frame);
+                    }
                 }
+                queued.extend(frames.into_iter().map(|frame| (frame, legacy)));
             }
-            for frame in frames {
+            if let Some((frame, legacy)) = queued.pop_front() {
                 let dialect = frame
                     .as_ref()
                     .map(super::wire::dialect)
@@ -409,7 +414,43 @@ impl IpcServer {
                         .stream_events(&mut pipe, event_types, request.dialect)
                         .await;
                 }
-                let response = self.respond(request.message).await;
+                let kind = match request.message {
+                    IpcMessage::PickWindow => Some(super::pick::PickKind::Window),
+                    IpcMessage::PickColor => Some(super::pick::PickKind::Color),
+                    _ => None,
+                };
+                let response = if let Some(kind) = kind {
+                    // Interactive requests have no response deadline. Keep reading
+                    // solely to detect disconnect and bound pipelined input; dropping
+                    // the future releases the pick and its eventual captured release.
+                    let pick = super::pick::pick(kind);
+                    tokio::pin!(pick);
+                    let mut pending_bytes = 0;
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut pick => break result,
+                            read = pipe.read(&mut buffer) => {
+                                let n = read?;
+                                if n == 0 { return Ok(()); }
+                                pending_bytes += n;
+                                if pending_bytes > super::wire::MAX_REQUEST_BYTES {
+                                    return Err(anyhow::anyhow!("too much input queued during pick"));
+                                }
+                                queued.extend(framer.feed(&buffer[..n]).into_iter().map(|frame| (frame, false)));
+                                if queued.len() > 64 { return Err(anyhow::anyhow!("too many requests queued during pick")); }
+                            }
+                        }
+                    };
+                    match result {
+                        Ok(value) if kind == super::pick::PickKind::Window => {
+                            serde_json::json!({"success":true,"result":{"window":value}})
+                        }
+                        Ok(value) => serde_json::json!({"success":true,"result":{"color":value}}),
+                        Err(error) => serde_json::json!({"success":false,"error":error}),
+                    }
+                } else {
+                    self.respond(request.message).await
+                };
                 let response = super::wire::reply(request.dialect, &request.name, response);
                 write_line(&mut pipe, &response).await?;
                 if legacy {
@@ -584,6 +625,36 @@ impl IpcServer {
                         .unwrap_or(false),
                 };
                 serde_json::json!({"success": true, "result": reply})
+            }
+            IpcMessage::Outputs | IpcMessage::FocusedOutput => {
+                let focused = matches!(message, IpcMessage::FocusedOutput);
+                let Some(engine) = &self.engine else {
+                    return serde_json::json!({"success":false,"error":"engine not initialized"});
+                };
+                let engine = engine.read();
+                if focused {
+                    serde_json::json!({"success":true,"result":{"focused_output":super::queries::focused_output(&engine, self.backend.as_ref())}})
+                } else {
+                    serde_json::json!({"success":true,"result":{"outputs":super::queries::outputs(&engine, self.backend.as_ref())}})
+                }
+            }
+            IpcMessage::KeyboardLayouts => {
+                serde_json::json!({"success":true,"result":{"keyboard_layouts":super::queries::keyboard_layouts()}})
+            }
+            IpcMessage::Output { output, action } => {
+                let Some(engine) = &self.engine else {
+                    return serde_json::json!({"success":false,"error":"engine not initialized"});
+                };
+                match super::queries::change_output(&output, &action, engine, self.backend.as_ref())
+                {
+                    Ok(result) => serde_json::json!({"success":true,"result":result}),
+                    Err(error) => serde_json::json!({"success":false,"error":error}),
+                }
+            }
+            // Waiting for input is asynchronous and handled before the bounded
+            // blocking-request path. Never park a blocking pool thread here.
+            IpcMessage::PickWindow | IpcMessage::PickColor => {
+                serde_json::json!({"success":false,"error":"interactive picks require a connected IPC client"})
             }
             IpcMessage::ReturnError => {
                 serde_json::json!({"success":false,"error":"example error requested by ReturnError"})
@@ -1902,6 +1973,11 @@ fn is_query(message: &IpcMessage) -> bool {
             | IpcMessage::Windows
             | IpcMessage::FocusedWindow
             | IpcMessage::OverviewState
+            | IpcMessage::Outputs
+            | IpcMessage::FocusedOutput
+            | IpcMessage::KeyboardLayouts
+            | IpcMessage::PickWindow
+            | IpcMessage::PickColor
             | IpcMessage::Version
             | IpcMessage::ReturnError
     )
@@ -2291,6 +2367,19 @@ mod tests {
         assert!(is_query(&IpcMessage::WindowList));
         assert!(is_query(&IpcMessage::MonitorList));
         assert!(is_query(&IpcMessage::GetFocus));
+        for message in [
+            IpcMessage::Outputs,
+            IpcMessage::FocusedOutput,
+            IpcMessage::KeyboardLayouts,
+            IpcMessage::PickWindow,
+            IpcMessage::PickColor,
+        ] {
+            assert!(is_query(&message));
+        }
+        assert!(!is_query(&IpcMessage::Output {
+            output: "synthetic".into(),
+            action: serde_json::json!("On")
+        }));
         assert!(!is_query(&IpcMessage::FocusWindow { window_hwnd: 1 }));
         assert!(!is_query(&IpcMessage::RunAction {
             name: "close-window".into(),
@@ -2466,6 +2555,7 @@ mod tests {
                 "workspaces_changed",
                 "windows_changed",
                 "overview_opened_or_closed",
+                "keyboard_layouts_changed",
                 "config_loaded"
             ]
         );
@@ -2478,7 +2568,11 @@ mod tests {
             }
             other => panic!("unexpected {:?}", other),
         }
-        match &replay[3] {
+        assert!(matches!(
+            &replay[3],
+            IpcEvent::KeyboardLayoutsChanged { .. }
+        ));
+        match &replay[4] {
             IpcEvent::ConfigLoaded { failed, error, .. } => {
                 assert!(*failed);
                 assert!(error.as_deref().unwrap().contains("config.kdl:3:5"));
@@ -2572,8 +2666,18 @@ mod tests {
             .sync_os_foreground(WindowId::new(101), &backend);
         server.sync_state();
         let events = drain(&mut rx);
-        assert_eq!(types(&events), ["window_focus_changed"]);
-        match &events[0] {
+        assert_eq!(
+            types(&events),
+            ["window_focus_timestamp_changed", "window_focus_changed"]
+        );
+        assert!(matches!(
+            &events[0],
+            IpcEvent::WindowFocusTimestampChanged {
+                id: 101,
+                focus_timestamp: Some(_)
+            }
+        ));
+        match &events[1] {
             IpcEvent::WindowFocusChanged { id } => assert_eq!(*id, Some(101)),
             other => panic!("unexpected {:?}", other),
         }

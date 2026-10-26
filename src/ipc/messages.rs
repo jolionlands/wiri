@@ -60,6 +60,13 @@ where
         .collect()
 }
 
+/// niri's loaded keyboard layouts; Windows selects the foreground thread's HKL.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyboardLayoutsIpc {
+    pub names: Vec<String>,
+    pub current_idx: usize,
+}
+
 // ---- Message types ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +462,33 @@ pub enum IpcMessage {
     #[serde(rename = "overview_state", alias = "OverviewState")]
     OverviewState,
 
+    /// Connected displays, keyed by their Windows device name.
+    #[serde(rename = "outputs", alias = "Outputs")]
+    Outputs,
+
+    /// The focused display object, or null.
+    #[serde(rename = "focused_output", alias = "FocusedOutput")]
+    FocusedOutput,
+
+    /// Installed input layouts and the foreground thread's active index.
+    #[serde(rename = "keyboard_layouts", alias = "KeyboardLayouts")]
+    KeyboardLayouts,
+
+    /// Consume the next left click and return the managed window there. Escape cancels.
+    #[serde(rename = "pick_window", alias = "PickWindow")]
+    PickWindow,
+
+    /// Consume the next left click and sample its SDR desktop pixel. Escape cancels.
+    #[serde(rename = "pick_color", alias = "PickColor")]
+    PickColor,
+
+    /// A temporary display change through the shared output executor, never persisted.
+    #[serde(rename = "output", alias = "Output")]
+    Output {
+        output: String,
+        action: serde_json::Value,
+    },
+
     /// Deliberately return an error, for client error-path checks.
     #[serde(rename = "return_error", alias = "ReturnError")]
     ReturnError,
@@ -509,6 +543,13 @@ pub enum IpcEvent {
     #[serde(rename = "window_focus_changed")]
     WindowFocusChanged { id: Option<u64> },
 
+    /// Monotonic time since daemon startup when the window most recently gained focus.
+    #[serde(rename = "window_focus_timestamp_changed")]
+    WindowFocusTimestampChanged {
+        id: u64,
+        focus_timestamp: Option<std::time::Duration>,
+    },
+
     /// niri `WindowUrgencyChanged`: the window asks for attention, or stopped.
     #[serde(rename = "window_urgency_changed")]
     WindowUrgencyChanged { id: u64, urgent: bool },
@@ -518,6 +559,16 @@ pub enum IpcEvent {
     WindowLayoutsChanged {
         changes: Vec<(u64, WindowLayoutIpc)>,
     },
+
+    /// Loaded input layouts or their display names changed (also part of replay).
+    #[serde(rename = "keyboard_layouts_changed")]
+    KeyboardLayoutsChanged {
+        keyboard_layouts: KeyboardLayoutsIpc,
+    },
+
+    /// The foreground thread switched to another loaded input layout.
+    #[serde(rename = "keyboard_layout_switched")]
+    KeyboardLayoutSwitched { idx: usize },
 
     /// niri `OverviewOpenedOrClosed`.
     #[serde(rename = "overview_opened_or_closed")]
@@ -627,17 +678,26 @@ pub struct WorkspaceInfo {
 
 /// niri's `WindowLayout`, the part wiri knows: where the window sits in its workspace's
 /// strip.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowLayoutIpc {
     /// Column and tile of the window in the scrolling layout, both counted from 1; `null`
     /// for a floating or minimized window.
     pub pos_in_scrolling_layout: Option<(usize, usize)>,
+    /// Tile and window geometry in output-local logical pixels (before OS parking).
+    #[serde(default)]
+    pub tile_size: (f64, f64),
+    #[serde(default)]
+    pub window_size: (i32, i32),
+    #[serde(default)]
+    pub tile_pos_in_workspace_view: Option<(f64, f64)>,
+    #[serde(default)]
+    pub window_offset_in_tile: (f64, f64),
 }
 
 /// A window as the event stream describes it: niri's `Window` (`id`, `title`, `app_id`,
 /// `pid`, `workspace_id`, `is_focused`, `is_floating`, `is_urgent`, `layout`), plus what
 /// wiri adds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowIpc {
     /// The window handle (HWND) as a number; it is what `--id` takes in `run_action`.
     pub id: u64,
@@ -654,6 +714,8 @@ pub struct WindowIpc {
     pub is_floating: bool,
     pub is_urgent: bool,
     pub layout: WindowLayoutIpc,
+    #[serde(default)]
+    pub focus_timestamp: Option<std::time::Duration>,
     // ---- what wiri adds ----
     /// The Win32 window class (`CASCADIA_HOSTING_WINDOW_CLASS`).
     pub class_name: String,
@@ -755,14 +817,14 @@ pub struct WorkspacesResponse {
 }
 
 /// The reply of the `windows` request: every window wiri manages.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowsResponse {
     pub windows: Vec<WindowIpc>,
 }
 
 /// The reply of the `focused_window` request: the window that has the keyboard
 /// focus, or `null` when no window wiri manages has it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FocusedWindowResponse {
     pub focused_window: Option<WindowIpc>,
 }
@@ -940,7 +1002,9 @@ mod tests {
             is_urgent: false,
             layout: WindowLayoutIpc {
                 pos_in_scrolling_layout: Some((1, 1)),
+                ..WindowLayoutIpc::default()
             },
+            focus_timestamp: None,
             class_name: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
             output: Some("\\\\.\\DISPLAY1".into()),
             is_fullscreen: false,

@@ -204,8 +204,14 @@ mod tests {
             let mut reader = BufReader::with_capacity(7, bytes.as_bytes());
             let line = read_line(&mut reader).await.unwrap().unwrap();
             assert!(line.len() > 65_536);
-            assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), reply);
-            assert_eq!(read_line(&mut reader).await.unwrap().unwrap(), "{\"next\":true}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                reply
+            );
+            assert_eq!(
+                read_line(&mut reader).await.unwrap().unwrap(),
+                "{\"next\":true}"
+            );
             assert!(read_line(&mut reader).await.unwrap().is_none());
         });
     }
@@ -232,7 +238,9 @@ mod tests {
             let ((), ()) = tokio::join!(
                 async {
                     assert_eq!(
-                        request_on(&mut client, "{\n  \"type\": \"windows\"\n}").await.unwrap(),
+                        request_on(&mut client, "{\n  \"type\": \"windows\"\n}")
+                            .await
+                            .unwrap(),
                         "{ \"success\": true }"
                     );
                     assert_eq!(
@@ -245,8 +253,15 @@ mod tests {
                         read_line(&mut server).await.unwrap().unwrap(),
                         "{\"type\":\"windows\"}"
                     );
-                    server.get_mut().write_all(replies.as_bytes()).await.unwrap();
-                    assert_eq!(read_line(&mut server).await.unwrap().unwrap(), "\"Version\"");
+                    server
+                        .get_mut()
+                        .write_all(replies.as_bytes())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        read_line(&mut server).await.unwrap().unwrap(),
+                        "\"Version\""
+                    );
                 }
             );
         });
@@ -269,10 +284,15 @@ mod tests {
                     assert!(read_line(&mut client).await.unwrap().is_none());
                 },
                 async {
-                    assert_eq!(read_line(&mut server).await.unwrap().unwrap(), "\"EventStream\"");
-                    server.get_mut().write_all(
-                        b"{\"subscription_id\":1}\n{\"type\":\"window_opened\"}\n"
-                    ).await.unwrap();
+                    assert_eq!(
+                        read_line(&mut server).await.unwrap().unwrap(),
+                        "\"EventStream\""
+                    );
+                    server
+                        .get_mut()
+                        .write_all(b"{\"subscription_id\":1}\n{\"type\":\"window_opened\"}\n")
+                        .await
+                        .unwrap();
                     drop(server);
                 }
             );
@@ -297,7 +317,10 @@ mod tests {
                 },
                 async {
                     let mut server = BufReader::new(server);
-                    assert_eq!(read_line(&mut server).await.unwrap().unwrap(), "\"Windows\"");
+                    assert_eq!(
+                        read_line(&mut server).await.unwrap().unwrap(),
+                        "\"Windows\""
+                    );
                     drop(server);
                 }
             );
@@ -308,8 +331,14 @@ mod tests {
     fn disconnected_client_does_not_fabricate_success() {
         run(async {
             let mut client = IpcClient::new();
-            assert!(matches!(client.request_raw("\"Windows\"").await, Err(IpcError::ClientDisconnected)));
-            assert!(matches!(client.read_events().await, Err(IpcError::ClientDisconnected)));
+            assert!(matches!(
+                client.request_raw("\"Windows\"").await,
+                Err(IpcError::ClientDisconnected)
+            ));
+            assert!(matches!(
+                client.read_events().await,
+                Err(IpcError::ClientDisconnected)
+            ));
         });
     }
 }

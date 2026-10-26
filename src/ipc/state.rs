@@ -8,10 +8,10 @@
 // the state.
 use std::collections::HashMap;
 
-use super::messages::{IpcEvent, WindowIpc, WindowLayoutIpc, WorkspaceIpc};
+use super::messages::{IpcEvent, KeyboardLayoutsIpc, WindowIpc, WindowLayoutIpc, WorkspaceIpc};
 
 /// Windows and workspaces as of one moment.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct IpcSnapshot {
     /// Every window wiri manages, by ascending id.
     pub windows: Vec<WindowIpc>,
@@ -19,6 +19,8 @@ pub struct IpcSnapshot {
     /// workspaces of each from the top.
     pub workspaces: Vec<WorkspaceIpc>,
     pub overview_open: bool,
+    /// Filled by the server; pure engine snapshots do not query the host OS.
+    pub keyboard_layouts: Option<KeyboardLayoutsIpc>,
 }
 
 impl IpcSnapshot {
@@ -32,7 +34,7 @@ impl IpcSnapshot {
 /// overview is open, as niri does.  The last config load follows (it is not part of the
 /// snapshot).
 pub fn replay(snapshot: &IpcSnapshot) -> Vec<IpcEvent> {
-    vec![
+    let mut events = vec![
         IpcEvent::WorkspacesChanged {
             workspaces: snapshot.workspaces.clone(),
         },
@@ -42,7 +44,13 @@ pub fn replay(snapshot: &IpcSnapshot) -> Vec<IpcEvent> {
         IpcEvent::OverviewOpenedOrClosed {
             is_open: snapshot.overview_open,
         },
-    ]
+    ];
+    if let Some(keyboard_layouts) = &snapshot.keyboard_layouts {
+        events.push(IpcEvent::KeyboardLayoutsChanged {
+            keyboard_layouts: keyboard_layouts.clone(),
+        });
+    }
+    events
 }
 
 /// The workspaces came or went, or changed their name, monitor or place: what makes niri
@@ -123,6 +131,7 @@ pub fn diff(prev: &IpcSnapshot, next: &IpcSnapshot) -> Vec<IpcEvent> {
     let old_windows: HashMap<u64, &WindowIpc> = prev.windows.iter().map(|w| (w.id, w)).collect();
     let new_ids: std::collections::HashSet<u64> = next.windows.iter().map(|w| w.id).collect();
     let mut urgency = Vec::new();
+    let mut timestamps = Vec::new();
     let mut layouts: Vec<(u64, WindowLayoutIpc)> = Vec::new();
     for new in &next.windows {
         match old_windows.get(&new.id) {
@@ -135,6 +144,9 @@ pub fn diff(prev: &IpcSnapshot, next: &IpcSnapshot) -> Vec<IpcEvent> {
                 window: new.clone(),
             }),
             Some(old) => {
+                if old.focus_timestamp != new.focus_timestamp {
+                    timestamps.push((new.id, new.focus_timestamp));
+                }
                 if old.is_urgent != new.is_urgent {
                     urgency.push((new.id, new.is_urgent));
                 }
@@ -158,10 +170,37 @@ pub fn diff(prev: &IpcSnapshot, next: &IpcSnapshot) -> Vec<IpcEvent> {
     if !layouts.is_empty() {
         events.push(IpcEvent::WindowLayoutsChanged { changes: layouts });
     }
+    for (id, focus_timestamp) in timestamps {
+        events.push(IpcEvent::WindowFocusTimestampChanged {
+            id,
+            focus_timestamp,
+        });
+    }
     if prev.focused_window() != next.focused_window() {
         events.push(IpcEvent::WindowFocusChanged {
             id: next.focused_window(),
         });
+    }
+
+    // ---- keyboard layouts ----
+    if let Some(layouts) = &next.keyboard_layouts {
+        if prev
+            .keyboard_layouts
+            .as_ref()
+            .is_none_or(|old| old.names != layouts.names)
+        {
+            events.push(IpcEvent::KeyboardLayoutsChanged {
+                keyboard_layouts: layouts.clone(),
+            });
+        } else if prev
+            .keyboard_layouts
+            .as_ref()
+            .is_some_and(|old| old.current_idx != layouts.current_idx)
+        {
+            events.push(IpcEvent::KeyboardLayoutSwitched {
+                idx: layouts.current_idx,
+            });
+        }
     }
 
     // ---- the overview ----
@@ -189,7 +228,9 @@ mod tests {
             is_urgent: false,
             layout: WindowLayoutIpc {
                 pos_in_scrolling_layout: Some((id as usize, 1)),
+                ..WindowLayoutIpc::default()
             },
+            focus_timestamp: None,
             class_name: "Class".into(),
             output: Some("\\\\.\\DISPLAY1".into()),
             is_fullscreen: false,
@@ -216,6 +257,7 @@ mod tests {
             windows,
             workspaces,
             overview_open: false,
+            keyboard_layouts: None,
         }
     }
 
@@ -229,6 +271,39 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn keyboard_replay_and_switches_are_deduplicated_and_list_changes_are_full() {
+        let mut prev = IpcSnapshot {
+            keyboard_layouts: Some(KeyboardLayoutsIpc {
+                names: vec!["US".into(), "Dvorak".into()],
+                current_idx: 0,
+            }),
+            ..IpcSnapshot::default()
+        };
+        assert_eq!(
+            types(&replay(&prev)).last().unwrap(),
+            "keyboard_layouts_changed"
+        );
+        let mut next = prev.clone();
+        next.keyboard_layouts.as_mut().unwrap().current_idx = 1;
+        let events = diff(&prev, &next);
+        assert_eq!(types(&events), ["keyboard_layout_switched"]);
+        assert!(matches!(
+            events[0],
+            IpcEvent::KeyboardLayoutSwitched { idx: 1 }
+        ));
+        assert!(diff(&next, &next).is_empty());
+        prev = next.clone();
+        next.keyboard_layouts
+            .as_mut()
+            .unwrap()
+            .names
+            .push("UK".into());
+        next.keyboard_layouts.as_mut().unwrap().current_idx = 2;
+        assert_eq!(types(&diff(&prev, &next)), ["keyboard_layouts_changed"]);
+        assert!(diff(&IpcSnapshot::default(), &IpcSnapshot::default()).is_empty());
     }
 
     #[test]
@@ -398,6 +473,44 @@ mod tests {
             }
             other => panic!("unexpected {:?}", other),
         }
+    }
+
+    #[test]
+    fn every_geometry_field_has_a_layout_delta_even_without_a_column_change() {
+        let prev = snapshot(vec![window(1)], vec![]);
+        for edit in [
+            (|layout: &mut WindowLayoutIpc| layout.tile_size = (800.5, 600.0))
+                as fn(&mut WindowLayoutIpc),
+            |layout| layout.window_size = (795, 595),
+            |layout| layout.tile_pos_in_workspace_view = Some((-8.5, 12.0)),
+            |layout| layout.window_offset_in_tile = (2.0, 2.0),
+        ] {
+            let mut next = prev.clone();
+            edit(&mut next.windows[0].layout);
+            let events = diff(&prev, &next);
+            assert_eq!(types(&events), ["window_layouts_changed"]);
+            if let IpcEvent::WindowLayoutsChanged { changes } = &events[0] {
+                assert_eq!(changes, &vec![(1, next.windows[0].layout.clone())]);
+            }
+        }
+    }
+
+    #[test]
+    fn focus_timestamp_has_its_own_deduplicated_delta_and_full_windows_carry_it() {
+        let prev = snapshot(vec![window(1)], vec![]);
+        let mut next = prev.clone();
+        next.windows[0].focus_timestamp = Some(std::time::Duration::new(42, 7));
+        let events = diff(&prev, &next);
+        assert_eq!(types(&events), ["window_focus_timestamp_changed"]);
+        let value = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(value["data"]["id"], 1);
+        assert_eq!(
+            value["data"]["focus_timestamp"],
+            serde_json::json!({"secs":42,"nanos":7})
+        );
+        assert!(diff(&next, &next).is_empty());
+        next.windows[0].title = Some("new title".into());
+        assert_eq!(types(&diff(&prev, &next)), ["window_opened_or_changed"]);
     }
 
     #[test]

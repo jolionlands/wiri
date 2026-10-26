@@ -49,10 +49,16 @@ pub(crate) fn snapshot() -> KeyboardLayoutsIpc {
             Some(key) if layouts.iter().any(|hkl| is_special(*hkl)) => special_layout_ids(key),
             _ => Vec::new(),
         };
-        cache.names = layouts.iter().map(|hkl| layout_name(*hkl, registry.as_ref(), &special_ids)).collect();
+        cache.names = layouts
+            .iter()
+            .map(|hkl| layout_name(*hkl, registry.as_ref(), &special_ids))
+            .collect();
         cache.layouts = layouts;
     }
-    KeyboardLayoutsIpc { names: cache.names.clone(), current_idx }
+    KeyboardLayoutsIpc {
+        names: cache.names.clone(),
+        current_idx,
+    }
 }
 
 fn loaded_layouts() -> Vec<u32> {
@@ -121,7 +127,13 @@ impl RegistryKey {
         let path = wide(LAYOUTS_KEY);
         let mut key = HKEY::default();
         let status = unsafe {
-            RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(path.as_ptr()), 0, KEY_READ, &mut key)
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(path.as_ptr()),
+                0,
+                KEY_READ,
+                &mut key,
+            )
         };
         if status.is_ok() {
             Some(Self(key))
@@ -142,7 +154,10 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 fn wide_text(buffer: &[u16]) -> Option<String> {
-    let end = buffer.iter().position(|ch| *ch == 0).unwrap_or(buffer.len());
+    let end = buffer
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(buffer.len());
     String::from_utf16(&buffer[..end]).ok()
 }
 
@@ -301,7 +316,8 @@ fn indirect_name(source: &str) -> Option<String> {
 }
 
 fn layout_name(hkl: u32, registry: Option<&RegistryKey>, special_ids: &[LayoutId]) -> String {
-    let Some((key, klid)) = registry.and_then(|key| registry_klid(hkl, special_ids).map(|id| (key, id)))
+    let Some((key, klid)) =
+        registry.and_then(|key| registry_klid(hkl, special_ids).map(|id| (key, id)))
     else {
         return fallback_name(hkl);
     };
@@ -323,7 +339,9 @@ mod tests {
         });
         assert_eq!(name, "Localized US");
         assert_eq!(
-            select_name(1, Some("Literal display"), Some("Text"), |_| panic!("not indirect")),
+            select_name(1, Some("Literal display"), Some("Text"), |_| panic!(
+                "not indirect"
+            )),
             "Literal display"
         );
     }
@@ -332,7 +350,9 @@ mod tests {
     fn unresolved_or_empty_display_uses_text_then_an_honest_fallback() {
         for resolved in [None, Some(String::new()), Some("@unresolved,-1".to_owned())] {
             assert_eq!(
-                select_name(0xf002_0409, Some("@missing,-1"), Some(" Dvorak "), |_| resolved),
+                select_name(0xf002_0409, Some("@missing,-1"), Some(" Dvorak "), |_| {
+                    resolved
+                }),
                 "Dvorak"
             );
         }
@@ -346,7 +366,10 @@ mod tests {
     #[test]
     fn selection_uses_exact_hkl_not_just_the_language() {
         let layouts = vec![0x0409_0409, 0xf002_0409, 0xf001_0409];
-        assert_eq!(order_and_index(layouts.clone(), Some(0xf001_0409)), (layouts, 2));
+        assert_eq!(
+            order_and_index(layouts.clone(), Some(0xf001_0409)),
+            (layouts, 2)
+        );
         assert_eq!(order_and_index(vec![1, 2], Some(3)), (vec![1, 2, 3], 2));
         assert_eq!(order_and_index(vec![0, 2, 2, 1], None), (vec![2, 1], 0));
         assert_eq!(order_and_index(vec![], Some(0)), (vec![], 0));
@@ -355,9 +378,18 @@ mod tests {
     #[test]
     fn special_layout_ids_resolve_variants_without_guessing_base_layouts() {
         let ids = [
-            LayoutId { klid: 0x0001_0409, id: 2 },
-            LayoutId { klid: 0x0002_0409, id: 1 },
-            LayoutId { klid: 0x0001_0405, id: 1 },
+            LayoutId {
+                klid: 0x0001_0409,
+                id: 2,
+            },
+            LayoutId {
+                klid: 0x0002_0409,
+                id: 1,
+            },
+            LayoutId {
+                klid: 0x0001_0405,
+                id: 1,
+            },
         ];
         assert_eq!(registry_klid(0xf002_0409, &ids), Some(0x0001_0409));
         assert_eq!(registry_klid(0xf001_0409, &ids), Some(0x0002_0409));

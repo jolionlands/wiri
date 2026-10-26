@@ -34,14 +34,18 @@ pub fn focused_output(engine: &TilingEngine, backend: Option<&BackendHandle>) ->
     let Some(id) = engine.focused_output() else {
         return Value::Null;
     };
-    let name = engine
-        .output_name(id)
-        .map(str::to_owned)
-        .or_else(|| backend.and_then(|backend| backend.get_monitor(id)).map(|m| m.name));
+    let name = engine.output_name(id).map(str::to_owned).or_else(|| {
+        backend
+            .and_then(|backend| backend.get_monitor(id))
+            .map(|m| m.name)
+    });
     let Some(name) = name else {
         return Value::Null;
     };
-    outputs(engine, backend).get(&name).cloned().unwrap_or(Value::Null)
+    outputs(engine, backend)
+        .get(&name)
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 pub fn keyboard_layouts() -> Value {
@@ -76,17 +80,23 @@ fn render_outputs(
 ) -> Value {
     let mut result = BTreeMap::new();
     for monitor in monitors {
-        let snapshot = snapshots.iter().find(|snapshot| {
-            connector_eq(&snapshot.identity.connector, &monitor.name)
-        });
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| connector_eq(&snapshot.identity.connector, &monitor.name));
         let identity = snapshot.map(|snapshot| &snapshot.identity);
         let modes: Vec<Value> = snapshot.map_or_else(Vec::new, |snapshot| {
-            snapshot.modes.iter().map(|mode| json!({
-                "width": mode.width,
-                "height": mode.height,
-                "refresh_rate": mode.refresh_rate,
-                "is_preferred": mode.is_preferred,
-            })).collect()
+            snapshot
+                .modes
+                .iter()
+                .map(|mode| {
+                    json!({
+                        "width": mode.width,
+                        "height": mode.height,
+                        "refresh_rate": mode.refresh_rate,
+                        "is_preferred": mode.is_preferred,
+                    })
+                })
+                .collect()
         });
         let logical = engine.monitors().get(&monitor.id).map(|logical| {
             let scale = valid_scale(logical.scale_factor).unwrap_or(1.0);
@@ -101,20 +111,23 @@ fn render_outputs(
                 "transform": snapshot.map(|snapshot| rotation_name(snapshot.rotation)),
             })
         });
-        result.insert(monitor.name.clone(), json!({
-            "name": monitor.name,
-            "make": identity.map_or("", |identity| identity.make.as_str()),
-            "model": identity.map_or("", |identity| identity.model.as_str()),
-            "serial": identity.map_or("", |identity| identity.serial.as_str()),
-            "physical_size": snapshot.and_then(|snapshot| snapshot.physical_size),
-            "modes": modes,
-            "current_mode": snapshot.and_then(|snapshot| snapshot.current_mode),
-            // No reliable per-output Windows capability/state source yet.
-            "vrr_supported": Value::Null,
-            "vrr_enabled": Value::Null,
-            "max_bpc": Value::Null,
-            "logical": logical,
-        }));
+        result.insert(
+            monitor.name.clone(),
+            json!({
+                "name": monitor.name,
+                "make": identity.map_or("", |identity| identity.make.as_str()),
+                "model": identity.map_or("", |identity| identity.model.as_str()),
+                "serial": identity.map_or("", |identity| identity.serial.as_str()),
+                "physical_size": snapshot.and_then(|snapshot| snapshot.physical_size),
+                "modes": modes,
+                "current_mode": snapshot.and_then(|snapshot| snapshot.current_mode),
+                // No reliable per-output Windows capability/state source yet.
+                "vrr_supported": Value::Null,
+                "vrr_enabled": Value::Null,
+                "max_bpc": Value::Null,
+                "logical": logical,
+            }),
+        );
     }
     json!(result)
 }
@@ -133,7 +146,11 @@ fn valid_scale(scale: f64) -> Option<f64> {
 }
 
 fn connector_eq(a: &str, b: &str) -> bool {
-    let short = |name: &str| name.trim().trim_start_matches("\\\\.\\").to_ascii_lowercase();
+    let short = |name: &str| {
+        name.trim()
+            .trim_start_matches("\\\\.\\")
+            .to_ascii_lowercase()
+    };
     !a.trim().is_empty() && !b.trim().is_empty() && short(a) == short(b)
 }
 
@@ -144,14 +161,20 @@ fn resolve_target(
     monitors: &[MonitorInfo],
     snapshots: &[OutputSnapshot],
 ) -> Result<MonitorInfo, String> {
-    let connectors: Vec<_> = monitors.iter().filter(|monitor| connector_eq(name, &monitor.name)).collect();
+    let connectors: Vec<_> = monitors
+        .iter()
+        .filter(|monitor| connector_eq(name, &monitor.name))
+        .collect();
     let matches = if connectors.is_empty() {
-        monitors.iter().filter(|monitor| {
-            snapshots.iter().any(|snapshot| {
-                connector_eq(&snapshot.identity.connector, &monitor.name)
-                    && snapshot.identity.matches(name)
+        monitors
+            .iter()
+            .filter(|monitor| {
+                snapshots.iter().any(|snapshot| {
+                    connector_eq(&snapshot.identity.connector, &monitor.name)
+                        && snapshot.identity.matches(name)
+                })
             })
-        }).collect::<Vec<_>>()
+            .collect::<Vec<_>>()
     } else {
         connectors
     };
@@ -343,7 +366,9 @@ fn temporary_config(
     change: &Change,
 ) -> Config {
     let matcher = OutputMatcher { identities };
-    let mut output = config.output.iter()
+    let mut output = config
+        .output
+        .iter()
         .find(|output| connector_eq(&output.name, &monitor.name))
         .or_else(|| matcher.matching_config(config, monitor))
         .cloned()
@@ -353,7 +378,9 @@ fn temporary_config(
     output.name = monitor.name.clone();
     patch_output(&mut output, change);
     let mut result = config.clone();
-    result.output.retain(|known| !connector_eq(&known.name, &monitor.name));
+    result
+        .output
+        .retain(|known| !connector_eq(&known.name, &monitor.name));
     result.output.insert(0, output);
     result
 }
@@ -372,16 +399,32 @@ pub fn change_output(
     let snapshots = outputs::ipc::snapshots().unwrap_or_default();
     let monitor = resolve_target(name, &monitors, &snapshots)?;
     if change == Change::PreferredMode {
-        let mode = snapshots.iter()
+        let mode = snapshots
+            .iter()
             .find(|snapshot| connector_eq(&snapshot.identity.connector, &monitor.name))
             .and_then(|snapshot| snapshot.modes.iter().find(|mode| mode.is_preferred))
             .ok_or("Windows did not report an exact preferred mode; no changes made")?;
-        change = Change::Mode(format!("{}x{}@{}.{:03}", mode.width, mode.height, mode.refresh_rate / 1000, mode.refresh_rate % 1000));
+        change = Change::Mode(format!(
+            "{}x{}@{}.{:03}",
+            mode.width,
+            mode.height,
+            mode.refresh_rate / 1000,
+            mode.refresh_rate % 1000
+        ));
     }
     let mut engine = engine.write();
-    let config = engine.full_config().ok_or("output changes require a loaded configuration")?;
-    let config = temporary_config(config, &monitor,
-        snapshots.iter().map(|snapshot| snapshot.identity.clone()).collect(), &change);
+    let config = engine
+        .full_config()
+        .ok_or("output changes require a loaded configuration")?;
+    let config = temporary_config(
+        config,
+        &monitor,
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.identity.clone())
+            .collect(),
+        &change,
+    );
     let physical_change = !matches!(change, Change::Scale(_));
     if physical_change {
         // Never send accumulated physical overrides: this request changes one
@@ -422,36 +465,61 @@ mod tests {
 
     fn monitor(name: &str) -> MonitorInfo {
         MonitorInfo {
-            id: OutputId::from_name(name), name: name.into(),
+            id: OutputId::from_name(name),
+            name: name.into(),
             bounds: Rect::new(-1280, 0, 1280, 720),
             work_area: Rect::new(-1280, 0, 1280, 680),
-            is_primary: false, scale_factor: 1.5,
+            is_primary: false,
+            scale_factor: 1.5,
         }
     }
 
     #[test]
     fn typed_actions_reject_bad_values_before_any_backend_access() {
-        for value in [json!({"Scale":{"scale":0}}), json!({"Scale":{"scale":"NaN"}}),
-            json!({"Scale":{"scale":true}}), json!({"Mode":{"mode":"0x1080"}}),
+        for value in [
+            json!({"Scale":{"scale":0}}),
+            json!({"Scale":{"scale":"NaN"}}),
+            json!({"Scale":{"scale":true}}),
+            json!({"Mode":{"mode":"0x1080"}}),
             json!({"Mode":{"mode":"1920x1080@59.9401"}}),
             json!({"Transform":{"transform":"Flipped90"}}),
             json!({"Position":{"position":{"x":1.5,"y":0}}}),
-            json!({"Vrr":{"vrr":false}}), json!({"MaxBpc":{"max_bpc":10}}),
-            json!({"Position":{"position":"Auto"}}), json!({"On":{}}),
-            json!({"Scale":{"scale":2,"unexpected":true}})] {
+            json!({"Vrr":{"vrr":false}}),
+            json!({"MaxBpc":{"max_bpc":10}}),
+            json!({"Position":{"position":"Auto"}}),
+            json!({"On":{}}),
+            json!({"Scale":{"scale":2,"unexpected":true}}),
+        ] {
             assert!(parse_action(&value).is_err(), "{value}");
         }
-        assert_eq!(parse_action(&json!({"Scale":{"scale":"Auto"}})).unwrap(), Change::Scale(None));
-        assert_eq!(parse_action(&json!({"Scale":{"scale":1.25}})).unwrap(), Change::Scale(Some(1.25)));
-        assert_eq!(parse_action(&json!({"Mode":{"mode":"1920x1080@59.940"}})).unwrap(), Change::Mode("1920x1080@59.940".into()));
-        assert_eq!(parse_action(&json!({"Position":{"position":{"Specific":{"x":-1920,"y":0}}}})).unwrap(), Change::Position(-1920, 0));
+        assert_eq!(
+            parse_action(&json!({"Scale":{"scale":"Auto"}})).unwrap(),
+            Change::Scale(None)
+        );
+        assert_eq!(
+            parse_action(&json!({"Scale":{"scale":1.25}})).unwrap(),
+            Change::Scale(Some(1.25))
+        );
+        assert_eq!(
+            parse_action(&json!({"Mode":{"mode":"1920x1080@59.940"}})).unwrap(),
+            Change::Mode("1920x1080@59.940".into())
+        );
+        assert_eq!(
+            parse_action(&json!({"Position":{"position":{"Specific":{"x":-1920,"y":0}}}})).unwrap(),
+            Change::Position(-1920, 0)
+        );
     }
 
     #[test]
     fn connector_aliases_resolve_exactly_and_duplicates_fail_closed() {
         let a = monitor("\\\\.\\DISPLAY1");
         let b = monitor("\\\\.\\DISPLAY10");
-        assert_eq!(resolve_target("display1", &[b.clone(), a.clone()], &[]).unwrap().id, a.id);
+        assert_eq!(
+            resolve_target("display1", &[b.clone(), a.clone()], &[])
+                .unwrap()
+                .id,
+            a.id
+        );
         assert!(resolve_target("DISPLAY", &[a.clone(), b], &[]).is_err());
         assert!(resolve_target("display1", &[a.clone(), a], &[]).is_err());
     }
@@ -511,7 +579,13 @@ mod tests {
         assert!(output["logical"]["transform"].is_null());
         assert_eq!(output["modes"], json!([]));
         assert_eq!(output["make"], "");
-        for key in ["physical_size", "current_mode", "vrr_supported", "vrr_enabled", "max_bpc"] {
+        for key in [
+            "physical_size",
+            "current_mode",
+            "vrr_supported",
+            "vrr_enabled",
+            "max_bpc",
+        ] {
             assert!(output[key].is_null(), "{key}");
         }
         assert_eq!(focused_output(&engine, None), *output);
@@ -534,13 +608,58 @@ mod tests {
     }
 
     #[test]
+    fn documented_output_example_matches_a_synthetic_snapshot() {
+        let mut monitor = monitor("DISPLAY1");
+        monitor.bounds = Rect::new(0, 0, 1366, 768);
+        monitor.work_area = Rect::new(0, 0, 1366, 728);
+        monitor.scale_factor = 1.0;
+        let mut engine = TilingEngine::new(crate::layout::LayoutConfig::default());
+        engine.register_monitor(monitor.id, monitor.bounds, monitor.work_area);
+        engine.set_output_name(monitor.id, &monitor.name);
+        let snapshot = OutputSnapshot {
+            identity: OutputIdentity {
+                connector: monitor.name.clone(),
+                ..OutputIdentity::default()
+            },
+            modes: vec![outputs::ipc::OutputModeSnapshot {
+                width: 1366,
+                height: 768,
+                refresh_rate: 59_940,
+                is_preferred: true,
+            }],
+            current_mode: Some(0),
+            physical_size: None,
+            rotation: Rotation::Normal,
+        };
+        let actual = render_outputs(&engine, &[monitor], &[snapshot]);
+        let schema: Value =
+            serde_json::from_str(include_str!("../../docs/IPC_SCHEMA.json")).unwrap();
+        let definition = &schema["$defs"]["OutputIpc"];
+        assert_eq!(actual["DISPLAY1"], definition["examples"][0]);
+        assert_eq!(
+            actual["DISPLAY1"].as_object().unwrap().len(),
+            definition["required"].as_array().unwrap().len()
+        );
+        for key in definition["required"].as_array().unwrap() {
+            assert!(actual["DISPLAY1"].get(key.as_str().unwrap()).is_some());
+        }
+    }
+
+    #[test]
     fn scale_plan_never_contains_a_physical_change() {
         let mut output = neutral_output("connector");
         patch_output(&mut output, &Change::Scale(Some(1.75)));
         let current = outputs::OutputState {
-            mode: outputs::OutputMode { width: 1920, height: 1080, refresh_millihz: Some(59_940) },
-            position: (-1920, 0), rotation: Rotation::Rotate90,
+            mode: outputs::OutputMode {
+                width: 1920,
+                height: 1080,
+                refresh_millihz: Some(59_940),
+            },
+            position: (-1920, 0),
+            rotation: Rotation::Rotate90,
         };
-        assert!(!outputs::plan_output(&output, &current).unwrap().changes_windows());
+        assert!(!outputs::plan_output(&output, &current)
+            .unwrap()
+            .changes_windows());
     }
 }

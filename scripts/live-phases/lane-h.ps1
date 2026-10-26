@@ -49,7 +49,7 @@
     }
     function HWire([string]$label, [string]$direction, [string]$text) {
         [ordered]@{ label = $label; direction = $direction; text = $text } |
-            ConvertTo-Json -Compress | Add-Content (Join-Path $hDir 'wire.ndjson')
+            ConvertTo-Json -Compress | Add-Content -Encoding UTF8 (Join-Path $hDir 'wire.ndjson')
     }
     function HConnect {
         $c = New-Object LaneHConnection $env:WIRI_PIPE, $hOwned.Id
@@ -768,7 +768,7 @@ public static class LaneHNative {
             'Picks use SendInput with owned A foreground/B client guards; observer hooks see injected down/up before wiri; app message filters require zero leaked down/up messages',
             'Bounded registration/input/drain sleeps (500/80/350ms), 3500ms reply budget; disconnect cancels input-free picks pending beyond 1500ms',
             'Interactive unlocked SDR desktop with visible blue probe client; no display settings changed; keyboard-only unsupported-host skip is null')
-        $hDetails | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $hDir 'evidence.json')
+        $hDetails | ConvertTo-Json -Depth 16 | Set-Content -Encoding UTF8 (Join-Path $hDir 'evidence.json')
         $summary['h35_h39_evidence'] = (Join-Path $hDir 'evidence.json')
     }
 }

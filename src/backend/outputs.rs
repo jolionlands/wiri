@@ -5,6 +5,8 @@
 //! current mode never reach `SetDisplayConfig` (not even its validation operation).
 //! Windows owns effective DPI and automatic output placement; neither is reset.
 
+pub mod ipc;
+
 use super::MonitorInfo;
 use crate::config::{Config, OutputConfig};
 use tracing::{info, warn};

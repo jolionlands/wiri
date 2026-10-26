@@ -1,6 +1,10 @@
 pub mod client;
 pub mod codec;
+pub mod keyboard;
+pub(crate) mod keyboard_notify;
 pub mod messages;
+pub mod pick;
+pub mod queries;
 pub mod server;
 pub mod state;
 pub mod wire;
