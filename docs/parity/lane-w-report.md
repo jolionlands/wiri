@@ -33,6 +33,35 @@ compatibility hints; Mica/Acrylic only show through applications which already
 provide a transparent client. Arbitrary foreign-HWND xray/noise/saturation and
 niri blur passes are N/A without owning or injecting into the compositor.
 
+## Item 2 — policy defaults
+
+`default-column-display` is consulted on admission, expel and float-to-tile,
+not during ordinary repaint or tab toggling. Explicit normal overrides a global
+tabbed default. `default-floating-position x=20 y=30 relative-to="bottom-right"`
+uses the work area and logical offsets after size limits; eight anchors and
+negative offsets are supported. A remembered floating rectangle wins thereafter.
+Startup adoption retains existing geometry; explicit positions beat owner centering.
+
+`scroll-factor` composes with the existing mouse/device factor after pointer
+bindings. The existing hook consults a tiny rule-change snapshot, with independent
+axis fractions and recipient/factor reset, then tags its SendInput replacement
+so it bypasses bindings and scaling. Zero suppresses application wheel delivery.
+No engine lock or system setting change is used; UIPI and Windows wheel recipient
+routing still apply. Only physical/ordinary injected wheels are scaled, never
+Wiri's own tagged replacement.
+
+`on-xdg-activate` is latched at admission (including absence). Actual shell flashes
+and ALERT requests implement ignore/set-urgent/focus, with set-urgent as the
+platform default. Windows has no Wayland serial provenance and cannot reliably
+veto an already-granted foreground. Explicit user/IPC focus is never classified
+as an activation request. Thus this is parity for classified Windows attention
+requests, not a promise of universal focus-steal prevention.
+
+The isolated appearance/policy release suite passes 1251 library and 14 CLI
+tests, with warnings denied; the integrated suite below supersedes that count.
+No new idle resource, thread or timer; snapshots update only on rule/config/window
+lifecycle events.
+
 Validation and desktop gate results will be recorded after the integrated
 warnings-denied release suite and locked harness run. Pure tests cover sparse
 merge precedence, located decoder errors, corners, region ownership/restoration

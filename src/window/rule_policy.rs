@@ -185,8 +185,9 @@ impl RulePolicy {
     /// With no position rule, preserve the caller's fallback exactly (including size).
     /// Call only if no remembered floating position exists.
     pub fn floating_rect(self, work: Rect, fallback: Rect, scale: f64) -> Rect {
-        self.default_floating_position
-            .map_or(fallback, |position| position.rect(work, fallback.size, scale))
+        self.default_floating_position.map_or(fallback, |position| {
+            position.rect(work, fallback.size, scale)
+        })
     }
 
     /// Keep the platform's normal decision when unset. The caller must first validate
@@ -232,13 +233,7 @@ impl ScrollAccumulator {
     /// Call even for factor 1 (or reset on bypass) to track recipient/factor changes.
     /// The caller handles pass-through at factor 1 and re-injection at other factors;
     /// injected events must bypass binding dispatch as well as this accumulator.
-    pub fn scale(
-        &mut self,
-        target: WindowId,
-        horizontal: bool,
-        delta: i32,
-        factor: f64,
-    ) -> i32 {
+    pub fn scale(&mut self, target: WindowId, horizontal: bool, delta: i32, factor: f64) -> i32 {
         // A bad snapshot must not turn ordinary scrolling into a swallowed event.
         let factor = if factor.is_finite() && factor >= 0.0 {
             factor
@@ -254,9 +249,7 @@ impl ScrollAccumulator {
         let whole = total.trunc();
         // Saturation also covers an unexpectedly huge composed device multiplier.
         let output = whole as i32;
-        self.remainder[axis] = if whole >= f64::from(i32::MIN)
-            && whole <= f64::from(i32::MAX)
-        {
+        self.remainder[axis] = if whole >= f64::from(i32::MIN) && whole <= f64::from(i32::MAX) {
             total - whole
         } else {
             0.0
@@ -275,11 +268,20 @@ mod tests {
 
     #[test]
     fn enum_values_match_the_pinned_syntax_exactly() {
-        assert_eq!(DefaultColumnDisplay::parse("normal"), Some(DefaultColumnDisplay::Normal));
-        assert_eq!(DefaultColumnDisplay::parse("tabbed"), Some(DefaultColumnDisplay::Tabbed));
+        assert_eq!(
+            DefaultColumnDisplay::parse("normal"),
+            Some(DefaultColumnDisplay::Normal)
+        );
+        assert_eq!(
+            DefaultColumnDisplay::parse("tabbed"),
+            Some(DefaultColumnDisplay::Tabbed)
+        );
         assert_eq!(DefaultColumnDisplay::parse("stacked"), None);
         assert_eq!(OnXdgActivate::parse("ignore"), Some(OnXdgActivate::Ignore));
-        assert_eq!(OnXdgActivate::parse("set-urgent"), Some(OnXdgActivate::SetUrgent));
+        assert_eq!(
+            OnXdgActivate::parse("set-urgent"),
+            Some(OnXdgActivate::SetUrgent)
+        );
         assert_eq!(OnXdgActivate::parse("focus"), Some(OnXdgActivate::Focus));
         assert_eq!(OnXdgActivate::parse("urgent"), None);
         assert_eq!(RelativeTo::parse("center"), None);
@@ -303,7 +305,10 @@ mod tests {
         ];
         for (name, anchor, x, y) in cases {
             assert_eq!(RelativeTo::parse(name), Some(anchor));
-            assert_eq!(position(anchor, 10.0, 20.0).rect(work, size, 2.0), Rect::new(x, y, 200, 100));
+            assert_eq!(
+                position(anchor, 10.0, 20.0).rect(work, size, 2.0),
+                Rect::new(x, y, 200, 100)
+            );
         }
     }
 
@@ -311,14 +316,22 @@ mod tests {
     fn negative_offsets_are_not_clamped_away() {
         let work = Rect::new(100, 200, 1000, 800);
         let size = Size::new(200, 100);
-        assert_eq!(position(RelativeTo::TopLeft, -10.0, -20.0).rect(work, size, 1.0), Rect::new(90, 180, 200, 100));
-        assert_eq!(position(RelativeTo::BottomRight, -10.0, -20.0).rect(work, size, 1.0), Rect::new(910, 920, 200, 100));
+        assert_eq!(
+            position(RelativeTo::TopLeft, -10.0, -20.0).rect(work, size, 1.0),
+            Rect::new(90, 180, 200, 100)
+        );
+        assert_eq!(
+            position(RelativeTo::BottomRight, -10.0, -20.0).rect(work, size, 1.0),
+            Rect::new(910, 920, 200, 100)
+        );
     }
 
     #[test]
     fn fractional_dpi_offsets_round_once_without_scaling_size() {
         let rect = position(RelativeTo::Top, 10.5, -2.25).rect(
-            Rect::new(50, -100, 501, 601), Size::new(100, 200), 1.5,
+            Rect::new(50, -100, 501, 601),
+            Size::new(100, 200),
+            1.5,
         );
         assert_eq!(rect, Rect::new(266, -103, 100, 200));
     }
@@ -326,11 +339,15 @@ mod tests {
     #[test]
     fn oversized_windows_and_extreme_origins_do_not_wrap() {
         let rect = position(RelativeTo::BottomRight, 0.0, 0.0).rect(
-            Rect::new(-100, -100, 50, 50), Size::new(100, 100), 1.0,
+            Rect::new(-100, -100, 50, 50),
+            Size::new(100, 100),
+            1.0,
         );
         assert_eq!(rect, Rect::new(-150, -150, 100, 100));
         let rect = position(RelativeTo::BottomRight, -65_535.0, -65_535.0).rect(
-            Rect::new(i32::MAX, i32::MAX, u32::MAX, u32::MAX), Size::new(1, 1), 2.0,
+            Rect::new(i32::MAX, i32::MAX, u32::MAX, u32::MAX),
+            Size::new(1, 1),
+            2.0,
         );
         assert_eq!(rect, Rect::new(i32::MAX, i32::MAX, 1, 1));
     }
@@ -340,7 +357,10 @@ mod tests {
         let work = Rect::new(10, 20, 100, 100);
         let size = Size::new(10, 10);
         for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(position(RelativeTo::TopLeft, 2.0, 3.0).rect(work, size, scale), Rect::new(12, 23, 10, 10));
+            assert_eq!(
+                position(RelativeTo::TopLeft, 2.0, 3.0).rect(work, size, scale),
+                Rect::new(12, 23, 10, 10)
+            );
         }
     }
 
@@ -350,8 +370,15 @@ mod tests {
         assert!(!policy.column_is_tabbed(false));
         assert!(policy.column_is_tabbed(true));
         let fallback = Rect::new(-20, 30, 400, 300);
-        assert_eq!(policy.floating_rect(Rect::new(0, 0, 1000, 800), fallback, 2.0), fallback);
-        for action in [OnXdgActivate::Ignore, OnXdgActivate::SetUrgent, OnXdgActivate::Focus] {
+        assert_eq!(
+            policy.floating_rect(Rect::new(0, 0, 1000, 800), fallback, 2.0),
+            fallback
+        );
+        for action in [
+            OnXdgActivate::Ignore,
+            OnXdgActivate::SetUrgent,
+            OnXdgActivate::Focus,
+        ] {
             assert_eq!(policy.activation_action(action), action);
         }
         assert_eq!(policy.scroll_multiplier(1.5), 1.5);
@@ -376,13 +403,19 @@ mod tests {
         });
         assert!(!policy.column_is_tabbed(true));
         assert_eq!(policy.default_floating_position, original_position);
-        assert_eq!(policy.activation_action(OnXdgActivate::Focus), OnXdgActivate::Ignore);
+        assert_eq!(
+            policy.activation_action(OnXdgActivate::Focus),
+            OnXdgActivate::Ignore
+        );
         assert_eq!(policy.scroll_multiplier(2.0), 0.0);
         policy.merge(&RulePolicy {
             default_floating_position: Some(position(RelativeTo::TopLeft, 0.0, 0.0)),
             ..RulePolicy::default()
         });
-        assert_eq!(policy.default_floating_position, Some(position(RelativeTo::TopLeft, 0.0, 0.0)));
+        assert_eq!(
+            policy.default_floating_position,
+            Some(position(RelativeTo::TopLeft, 0.0, 0.0))
+        );
     }
 
     #[test]
@@ -403,7 +436,10 @@ mod tests {
 
     #[test]
     fn scroll_composes_device_and_rule_multipliers() {
-        let policy = RulePolicy { scroll_factor: Some(0.75), ..RulePolicy::default() };
+        let policy = RulePolicy {
+            scroll_factor: Some(0.75),
+            ..RulePolicy::default()
+        };
         assert_eq!(policy.scroll_multiplier(2.0), 1.5);
         assert_eq!(policy.scroll_multiplier(0.0), 0.0);
     }
@@ -434,7 +470,9 @@ mod tests {
         for sign in [-1, 1] {
             let mut scroll = ScrollAccumulator::default();
             let target = WindowId::new(1);
-            let values: Vec<_> = (0..4).map(|_| scroll.scale(target, false, sign, 0.25)).collect();
+            let values: Vec<_> = (0..4)
+                .map(|_| scroll.scale(target, false, sign, 0.25))
+                .collect();
             assert_eq!(values, vec![0, 0, 0, sign]);
             assert_eq!(scroll.scale(target, false, 120 * sign, 0.75), 90 * sign);
         }

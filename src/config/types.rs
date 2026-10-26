@@ -1148,6 +1148,7 @@ pub struct WindowRule {
     pub max_height: Option<u32>,
     /// Sparse per-window decoration and geometry overrides.
     pub effects: crate::window::rule_effects::RuleEffects,
+    pub policy: crate::window::rule_policy::RulePolicy,
 }
 
 impl WindowRule {

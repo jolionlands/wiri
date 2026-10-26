@@ -21,6 +21,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add foreground keyboard-layout switching, managed-window urgency actions without focus changes, asynchronous quit confirmation with an explicit skip flag, active config-file switching, monitor power controls and suspend. Spawn expands only a leading home component in its executable, never the other arguments.
 - Add pure parser, typed-wire, layout-selection, quit-property and urgency tests. Typed IPC reaches every system-action executor; urgency flashes the taskbar without activation and clears on foreground before the separate hook event arrives. Legacy management `wiri-ctl quit` remains immediate; action/bind quit confirms unless skipped.
 - H48/H49 checks record events, config-file reload, literal spawn arguments, confirmation and dry-run power audits. Fix their missing F10 mapping and avoid serializing provider-decorated file strings. The interrupted run recorded 18/21 Lane S gates passing; its three failures have targeted corrections but no permitted rerun. See `docs/parity/lane-s-report.md`; no complete live pass is claimed.
+### Lane W — window-policy defaults
+- Add niri per-window column display, anchored first-floating position, application-wheel multiplier and latched ignore/set-urgent/focus policies for actual shell attention requests. Remember floating moves, preserve existing columns and never treat user focus as an application activation request; Windows cannot supply Wayland serials or veto OS-granted foreground.
+
 ### Lane W — per-window appearance
 - Add sparse niri window-rule focus-ring, border, shadow and tab paints, four-corner geometry and opt-in native clipping with original-region restoration. Attention uses shell flashes/ALERT, not generic accessibility state changes. Changes follow existing rule/focus/resize events; no resting timer or thread. Foreign-HWND clipping is binary and can suppress DWM shadows; compositor blur remains unsupported.
 

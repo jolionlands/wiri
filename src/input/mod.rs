@@ -8,6 +8,7 @@ pub mod low_level_hook;
 pub mod mouse;
 pub mod pointer;
 pub mod recent;
+pub(crate) mod rule_scroll;
 pub mod snap_guide;
 pub mod system_actions;
 pub mod touch;
@@ -925,6 +926,7 @@ pub fn apply_mouse_config(config: &InputConfig) {
         config.natural_scroll,
         config.tap_to_click,
     );
+    rule_scroll::configure(config.mouse_speed);
     set_mouse_runtime_config(MouseRuntimeConfig {
         natural_scroll: config.natural_scroll,
         scroll_speed: config.mouse_speed as f32,

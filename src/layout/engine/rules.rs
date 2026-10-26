@@ -510,6 +510,7 @@ impl TilingEngine {
         window: &WindowInfo,
         rules: &ResolvedWindowRules,
     ) {
+        crate::input::rule_scroll::update(window_id, rules.policy.scroll_factor);
         let limits = RuleLimits::of(rules);
         if limits.is_none() {
             self.rule_limits.remove(&window_id);
@@ -609,7 +610,13 @@ impl TilingEngine {
             let cy = rect.loc.y + rect.size.h as i32 / 2;
             rect = Rect::new(cx - width as i32 / 2, cy - height as i32 / 2, width, height);
         }
-        Self::fit_rect_into(rect, work)
+        let rect = Self::fit_rect_into(rect, work);
+        if at_startup {
+            rect
+        } else {
+            let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
+            rules.policy.floating_rect(work, rect, scale)
+        }
     }
 
     /// What the rules ask for once a window has been put in its place: the column as wide as
@@ -739,6 +746,7 @@ impl TilingEngine {
 
     /// Forget everything the rules decided for a window that is gone.
     pub(super) fn forget_rule_state(&mut self, window_id: WindowId) {
+        crate::input::rule_scroll::update(window_id, None);
         self.rule_state.remove(&window_id);
         self.rule_limits.remove(&window_id);
         self.rule_heights.remove(&window_id);
@@ -760,7 +768,7 @@ impl TilingEngine {
         window_id: WindowId,
         backend: &BackendHandle,
     ) -> bool {
-        let resolved = {
+        let mut resolved = {
             let (Some(info), Some(state)) = (
                 self.tiled_windows.get(&window_id),
                 self.rule_state.get(&window_id),
@@ -788,6 +796,9 @@ impl TilingEngine {
         let Some(state) = self.rule_state.get_mut(&window_id) else {
             return false;
         };
+        // Initial activation policy is latched, including an unspecified value.
+        resolved.policy.on_xdg_activate = state.resolved.policy.on_xdg_activate;
+        crate::input::rule_scroll::update(window_id, resolved.policy.scroll_factor);
         let changed = !state.resolved.same_dynamic_part(&resolved);
         let effects_changed = state.resolved.effects != resolved.effects;
         state.resolved = resolved;
@@ -896,7 +907,7 @@ impl TilingEngine {
         let urgent = crate::backend::hooks::is_urgent_hwnd(window_id.as_isize())
             && self.os_foreground != Some(window_id);
         if urgent {
-            self.mark_urgent(window_id);
+            self.requested_activation(window_id, backend);
         } else {
             self.clear_urgent(window_id);
         }

@@ -31,6 +31,7 @@ mod overview;
 mod presets;
 mod recent;
 mod rule_effects;
+mod rule_policy;
 mod strip_model;
 mod tabs;
 
@@ -1559,7 +1560,7 @@ impl TilingEngine {
                     .map_or(0, |m| m.active_workspace)
             });
             let mut rect = self.open_float_rect(window_id, output_id, &window, &rules, at_startup);
-            if !at_startup {
+            if !at_startup && rules.policy.default_floating_position.is_none() {
                 if let Some(owner) = dialog_owner.and_then(Self::live_window_rect) {
                     rect.loc.x = owner.loc.x + (owner.size.w as i32 - rect.size.w as i32) / 2;
                     rect.loc.y = owner.loc.y + (owner.size.h as i32 - rect.size.h as i32) / 2;
@@ -1810,20 +1811,7 @@ impl TilingEngine {
 
         // A new column inherits the configured display; existing multi-window columns keep
         // theirs. Selecting the new window also makes consume/add into tabbed columns visible.
-        if let Some((oid, wsid, colidx)) = self.locate_window(window_id) {
-            let default_tabbed = self.effective_config(oid).default_tabbed;
-            if let Some(column) = self
-                .monitors
-                .get_mut(&oid)
-                .and_then(|m| m.workspaces.get_mut(&wsid))
-                .and_then(|ws| ws.columns.get_mut(colidx))
-            {
-                if default_tabbed && column.tiles.len() == 1 {
-                    column.switch_to_tabbed();
-                }
-                column.select_window(window_id);
-            }
-        }
+        self.apply_new_column_policy(window_id);
 
         // A window that opens maximized or as big as its monitor (it was like that when wiri
         // started, or its application restores that state) is followed like one that does it
@@ -4368,7 +4356,12 @@ impl TilingEngine {
         let work = self.monitors.get(&output).map(|m| m.work_area);
         let rect = match (self.float_memory.get(&window_id).copied(), work) {
             (Some(remembered), Some(work)) => Self::fit_rect_into(remembered, work),
-            _ => self.initial_float_rect(window_id, output),
+            (Some(remembered), None) => remembered,
+            _ => self.first_float_position(
+                window_id,
+                output,
+                self.initial_float_rect(window_id, output),
+            ),
         };
         if let Some(monitor) = self.monitors.get_mut(&output) {
             monitor.remove_window(window_id);
@@ -4448,11 +4441,12 @@ impl TilingEngine {
             monitor.focus_ring.push(window_id);
         }
         info!("Un-floating window {:?}", window_id);
+        self.rules_after_float_change(window_id, backend);
+        self.apply_new_column_policy(window_id);
         self.sync_min_widths();
         self.maintain_empty_workspace(output);
         self.reveal_focused_column(output);
         self.apply_layout_for_monitor(output, backend);
-        self.rules_after_float_change(window_id, backend);
     }
 
     /// Float `window_id` if it is tiled, tile it if it floats.
@@ -7109,6 +7103,10 @@ impl TilingEngine {
         let Some((output, window)) = self.column_op_target() else {
             return;
         };
+        let from_multi = self
+            .locate_window(window)
+            .and_then(|(o, w, c)| self.monitors.get(&o)?.workspaces.get(&w)?.columns.get(c))
+            .is_some_and(|c| c.tiles.len() > 1);
         let moved = {
             let Some(workspace) = self
                 .monitors
@@ -7124,6 +7122,9 @@ impl TilingEngine {
             }
         };
         if moved.is_some() {
+            if from_multi {
+                self.apply_new_column_policy(window);
+            }
             self.finish_column_op(output, backend);
         }
     }
@@ -7160,7 +7161,7 @@ impl TilingEngine {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        {
+        let expelled = {
             let Some(monitor) = self.monitors.get_mut(&output) else {
                 return;
             };
@@ -7184,7 +7185,9 @@ impl TilingEngine {
                     monitor.focus_ring.push(wid);
                 }
             }
-        }
+            expelled
+        };
+        self.apply_new_column_policy(expelled);
         self.finish_column_op(output, backend);
     }
 
