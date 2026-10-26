@@ -487,6 +487,11 @@ unsafe extern "system" fn mouse_hook_callback(
     }
     let msg = w_param.0 as u32;
     let event = &*(l_param.0 as *const MSLLHOOKSTRUCT);
+    // Our replacement wheel must bypass binds as well as scaling. Other injected
+    // input (automation/accessibility) keeps its normal path.
+    if event.dwExtraInfo == super::rule_scroll::REINJECTED {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
     if msg != WM_MOUSEMOVE {
         if let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet()
             .filter(|cs| cs.is_visible())
@@ -587,6 +592,15 @@ unsafe extern "system" fn mouse_hook_callback(
         if mods & (1 | 8) != 0 {
             mask_shell_menu();
         }
+        return LRESULT(1);
+    }
+    if (msg == WM_MOUSEWHEEL || msg == 0x20E)
+        && super::rule_scroll::wheel(
+            event.pt,
+            msg == 0x20E,
+            (event.mouseData >> 16) as i16 as i32,
+        )
+    {
         return LRESULT(1);
     }
     // An explicit click bind wins over the corresponding built-in gesture.

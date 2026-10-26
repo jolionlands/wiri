@@ -26,6 +26,7 @@ mod effects_decode;
 #[path = "decode/recent_windows_decode.rs"]
 mod recent_windows_decode;
 mod rule_effects_decode;
+mod rule_policy;
 
 /// How many levels of `include` are followed.
 pub const MAX_INCLUDE_DEPTH: u8 = 8;
@@ -2094,14 +2095,16 @@ impl Decoder {
                 | "clip-to-geometry" => {
                     self.rule_effect_key(child, &mut rule.effects);
                 }
-                "on-xdg-activate"
-                | "draw-border-with-background"
+                "default-column-display"
+                | "default-floating-position"
+                | "on-xdg-activate"
+                | "scroll-factor" => {
+                    self.rule_policy_key(child, &mut rule.policy);
+                }
+                "draw-border-with-background"
                 | "baba-is-float"
                 | "block-out-from"
                 | "variable-refresh-rate"
-                | "default-column-display"
-                | "default-floating-position"
-                | "scroll-factor"
                 | "pinch-sensitivity"
                 | "tiled-state"
                 | "background-effect"

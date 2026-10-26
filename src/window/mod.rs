@@ -4,6 +4,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
 
 pub mod rule_effects;
+pub mod rule_policy;
 pub mod rules;
 pub use rules::{resolve_window_rules, resolve_window_rules_legacy};
 
@@ -170,6 +171,7 @@ pub struct ResolvedWindowRules {
     pub min_height: Option<u32>,
     pub max_height: Option<u32>,
     pub effects: rule_effects::RuleEffects,
+    pub policy: rule_policy::RulePolicy,
 }
 
 impl Default for ResolvedWindowRules {
@@ -199,6 +201,7 @@ impl Default for ResolvedWindowRules {
             min_height: None,
             max_height: None,
             effects: Default::default(),
+            policy: Default::default(),
         }
     }
 }
@@ -214,6 +217,7 @@ impl ResolvedWindowRules {
             && self.min_height == other.min_height
             && self.max_height == other.max_height
             && self.effects == other.effects
+            && self.policy.same_dynamic_part(&other.policy)
     }
 }
 

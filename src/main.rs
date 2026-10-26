@@ -1352,14 +1352,16 @@ fn handle_backend_event(
                 .native_move_resize_end(WindowId::new(hwnd), handle);
             ipc_server.broadcast_event(IpcEvent::WindowMoveResizeEnd { window_hwnd: hwnd });
         }
-        BackendEvent::WindowUrgent { hwnd, urgent } => {
+        BackendEvent::WindowUrgent { hwnd, .. } => {
+            let urgent = {
+                let mut engine = engine.write();
+                engine.window_urgency_changed(WindowId::new(hwnd), handle);
+                engine.is_urgent(WindowId::new(hwnd))
+            };
             ipc_server.broadcast_event(IpcEvent::WindowUrgent {
                 window_hwnd: hwnd,
                 urgent,
             });
-            engine
-                .write()
-                .set_window_urgent(WindowId::new(hwnd), urgent, handle);
         }
         BackendEvent::WindowUrgentCleared { hwnd } => {
             ipc_server.broadcast_event(IpcEvent::WindowUrgent {

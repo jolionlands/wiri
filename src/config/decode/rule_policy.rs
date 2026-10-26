@@ -94,14 +94,31 @@ impl Decoder {
             if seen[index] {
                 self.error(
                     property.key_pos,
-                    format!("duplicate '{}' property in 'default-floating-position'", property.key),
+                    format!(
+                        "duplicate '{}' property in 'default-floating-position'",
+                        property.key
+                    ),
                 );
                 continue;
             }
             seen[index] = true;
             match index {
-                0 => x = self.policy_number(node, &property.value, -FLOATING_POSITION_LIMIT, FLOATING_POSITION_LIMIT),
-                1 => y = self.policy_number(node, &property.value, -FLOATING_POSITION_LIMIT, FLOATING_POSITION_LIMIT),
+                0 => {
+                    x = self.policy_number(
+                        node,
+                        &property.value,
+                        -FLOATING_POSITION_LIMIT,
+                        FLOATING_POSITION_LIMIT,
+                    )
+                }
+                1 => {
+                    y = self.policy_number(
+                        node,
+                        &property.value,
+                        -FLOATING_POSITION_LIMIT,
+                        FLOATING_POSITION_LIMIT,
+                    )
+                }
                 _ => {
                     if let Some(text) = self.value_text(node, &property.value) {
                         match RelativeTo::parse(&text) {
@@ -117,13 +134,20 @@ impl Decoder {
         }
         for (index, name) in ["x", "y"].iter().enumerate() {
             if !seen[index] {
-                self.error(node.pos, format!("'default-floating-position' needs the '{}' property", name));
+                self.error(
+                    node.pos,
+                    format!("'default-floating-position' needs the '{}' property", name),
+                );
             }
         }
         if self.issues.len() != issue_count {
             return None;
         }
-        Some(FloatingPosition { x: x?, y: y?, relative_to })
+        Some(FloatingPosition {
+            x: x?,
+            y: y?,
+            relative_to,
+        })
     }
 
     /// Unlike the legacy number helper, niri's FloatOrInt does not accept quoted
@@ -137,7 +161,10 @@ impl Decoder {
             return None;
         };
         if !number.is_finite() || number < min || number > max {
-            self.error(value.pos, format!("'{}' must be between {} and {}", node.name, min, max));
+            self.error(
+                value.pos,
+                format!("'{}' must be between {} and {}", node.name, min, max),
+            );
             return None;
         }
         Some(number)
@@ -165,7 +192,11 @@ mod tests {
         let document = kdl::parse(text).expect("test fixture must be syntactically valid KDL");
         let mut decoder = decoder();
         for node in &document.nodes {
-            assert!(decoder.rule_policy_key(node, policy), "unhandled {}", node.name);
+            assert!(
+                decoder.rule_policy_key(node, policy),
+                "unhandled {}",
+                node.name
+            );
         }
         decoder.issues
     }
@@ -174,7 +205,9 @@ mod tests {
         RulePolicy {
             default_column_display: Some(DefaultColumnDisplay::Tabbed),
             default_floating_position: Some(FloatingPosition {
-                x: 10.0, y: 20.0, relative_to: RelativeTo::BottomRight,
+                x: 10.0,
+                y: 20.0,
+                relative_to: RelativeTo::BottomRight,
             }),
             on_xdg_activate: Some(OnXdgActivate::Focus),
             scroll_factor: Some(2.0),
@@ -184,17 +217,28 @@ mod tests {
     #[test]
     fn canonical_nodes_decode_without_warnings() {
         let mut policy = RulePolicy::default();
-        let issues = apply(r#"
+        let issues = apply(
+            r#"
             default-column-display "tabbed"
             default-floating-position x=-32.5 y=48 relative-to="bottom-left"
             on-xdg-activate "set-urgent"
             scroll-factor 0.75
-        "#, &mut policy);
+        "#,
+            &mut policy,
+        );
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(policy.default_column_display, Some(DefaultColumnDisplay::Tabbed));
-        assert_eq!(policy.default_floating_position, Some(FloatingPosition {
-            x: -32.5, y: 48.0, relative_to: RelativeTo::BottomLeft,
-        }));
+        assert_eq!(
+            policy.default_column_display,
+            Some(DefaultColumnDisplay::Tabbed)
+        );
+        assert_eq!(
+            policy.default_floating_position,
+            Some(FloatingPosition {
+                x: -32.5,
+                y: 48.0,
+                relative_to: RelativeTo::BottomLeft,
+            })
+        );
         assert_eq!(policy.on_xdg_activate, Some(OnXdgActivate::SetUrgent));
         assert_eq!(policy.scroll_factor, Some(0.75));
     }
@@ -203,9 +247,14 @@ mod tests {
     fn x_and_y_are_required_but_relative_to_defaults_to_top_left() {
         let mut policy = RulePolicy::default();
         assert!(apply("default-floating-position x=-65535 y=65535", &mut policy).is_empty());
-        assert_eq!(policy.default_floating_position, Some(FloatingPosition {
-            x: -65_535.0, y: 65_535.0, relative_to: RelativeTo::TopLeft,
-        }));
+        assert_eq!(
+            policy.default_floating_position,
+            Some(FloatingPosition {
+                x: -65_535.0,
+                y: 65_535.0,
+                relative_to: RelativeTo::TopLeft,
+            })
+        );
         assert!(apply("default-floating-position x=0 y=-0.25", &mut policy).is_empty());
         assert_eq!(policy.default_floating_position.unwrap().y, -0.25);
     }
@@ -213,10 +262,22 @@ mod tests {
     #[test]
     fn each_anchor_and_activation_value_decodes() {
         let mut policy = RulePolicy::default();
-        for anchor in ["top-left", "top-right", "bottom-left", "bottom-right", "top", "bottom", "left", "right"] {
+        for anchor in [
+            "top-left",
+            "top-right",
+            "bottom-left",
+            "bottom-right",
+            "top",
+            "bottom",
+            "left",
+            "right",
+        ] {
             let text = format!("default-floating-position x=0 y=0 relative-to=\"{anchor}\"");
             assert!(apply(&text, &mut policy).is_empty());
-            assert_eq!(policy.default_floating_position.unwrap().relative_to, RelativeTo::parse(anchor).unwrap());
+            assert_eq!(
+                policy.default_floating_position.unwrap().relative_to,
+                RelativeTo::parse(anchor).unwrap()
+            );
         }
         for action in ["ignore", "set-urgent", "focus"] {
             assert!(apply(&format!("on-xdg-activate \"{action}\""), &mut policy).is_empty());
@@ -229,12 +290,19 @@ mod tests {
         let mut policy = nondefault_policy();
         assert!(apply("scroll-factor 100", &mut policy).is_empty());
         assert_eq!(policy.scroll_factor, Some(100.0));
-        assert!(apply(r#"
+        assert!(apply(
+            r#"
             default-column-display "normal"
             on-xdg-activate "ignore"
             scroll-factor 0
-        "#, &mut policy).is_empty());
-        assert_eq!(policy.default_column_display, Some(DefaultColumnDisplay::Normal));
+        "#,
+            &mut policy
+        )
+        .is_empty());
+        assert_eq!(
+            policy.default_column_display,
+            Some(DefaultColumnDisplay::Normal)
+        );
         assert_eq!(policy.on_xdg_activate, Some(OnXdgActivate::Ignore));
         assert_eq!(policy.scroll_factor, Some(0.0));
     }
@@ -281,7 +349,12 @@ mod tests {
             let before = policy;
             let issues = apply(text, &mut policy);
             assert!(!issues.is_empty(), "no diagnostic for {text}");
-            assert!(issues.iter().all(|issue| issue.severity == ValidationSeverity::Error), "{text}: {issues:?}");
+            assert!(
+                issues
+                    .iter()
+                    .all(|issue| issue.severity == ValidationSeverity::Error),
+                "{text}: {issues:?}"
+            );
             assert_eq!(policy, before, "invalid node changed policy: {text}");
         }
     }
@@ -289,13 +362,19 @@ mod tests {
     #[test]
     fn duplicate_properties_are_rejected_even_if_values_are_identical() {
         for index in 0..3 {
-            let mut node = kdl::parse("default-floating-position x=1 y=2 relative-to=\"top\"").unwrap().nodes.remove(0);
+            let mut node = kdl::parse("default-floating-position x=1 y=2 relative-to=\"top\"")
+                .unwrap()
+                .nodes
+                .remove(0);
             node.props.push(node.props[index].clone());
             let mut decoder = decoder();
             let mut policy = nondefault_policy();
             let before = policy;
             assert!(decoder.rule_policy_key(&node, &mut policy));
-            assert!(decoder.issues.iter().any(|issue| issue.message.contains("duplicate")));
+            assert!(decoder
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("duplicate")));
             assert_eq!(policy, before);
         }
     }
@@ -304,7 +383,11 @@ mod tests {
     fn nonfinite_numeric_values_are_rejected_without_losing_prior_values() {
         for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             for floating in [false, true] {
-                let text = if floating { "default-floating-position x=1 y=2" } else { "scroll-factor 1" };
+                let text = if floating {
+                    "default-floating-position x=1 y=2"
+                } else {
+                    "scroll-factor 1"
+                };
                 let mut node = kdl::parse(text).unwrap().nodes.remove(0);
                 if floating {
                     node.props[0].value.scalar = Scalar::Float(number);
@@ -323,7 +406,10 @@ mod tests {
 
     #[test]
     fn diagnostics_keep_source_file_and_value_position() {
-        let issues = apply("// comment\n\nscroll-factor 101", &mut RulePolicy::default());
+        let issues = apply(
+            "// comment\n\nscroll-factor 101",
+            &mut RulePolicy::default(),
+        );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].file, "rule-policy-test.kdl");
         assert_eq!((issues[0].line, issues[0].column), (3, 15));
@@ -344,18 +430,29 @@ mod tests {
     #[test]
     fn later_valid_nodes_replace_only_the_fields_they_set() {
         let mut policy = nondefault_policy();
-        let issues = apply(r#"
+        let issues = apply(
+            r#"
             default-column-display "normal"
             scroll-factor 0
             scroll-factor 0.5
             default-floating-position x=0 y=0
-        "#, &mut policy);
+        "#,
+            &mut policy,
+        );
         assert!(issues.is_empty());
-        assert_eq!(policy.default_column_display, Some(DefaultColumnDisplay::Normal));
+        assert_eq!(
+            policy.default_column_display,
+            Some(DefaultColumnDisplay::Normal)
+        );
         assert_eq!(policy.scroll_factor, Some(0.5));
         assert_eq!(policy.on_xdg_activate, Some(OnXdgActivate::Focus));
-        assert_eq!(policy.default_floating_position, Some(FloatingPosition {
-            x: 0.0, y: 0.0, relative_to: RelativeTo::TopLeft,
-        }));
+        assert_eq!(
+            policy.default_floating_position,
+            Some(FloatingPosition {
+                x: 0.0,
+                y: 0.0,
+                relative_to: RelativeTo::TopLeft,
+            })
+        );
     }
 }
