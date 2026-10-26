@@ -1010,16 +1010,21 @@ $m = @()
 foreach ($i in 1..3) { $m += [TestForms]::Open("wiri-h4-$i", (60 * $i), 120, 90); Start-Sleep -Milliseconds 1500 }
 Start-Sleep -Seconds 1
 $a1 = Rc $m[0]; $a2 = Rc $m[1]; $a3 = Rc $m[2]
-$h4OrderBefore = ($a1.L -lt $a2.L) -and ($a2.L -lt $a3.L)
-$h4GapBefore = $a3.L - $a1.R
+# The order and the gap are the strip's (wiri's window list): a column scrolled out of view is parked off the
+# screen, where its rectangle says nothing about its place (on a 1024 px screen two of these three fit).
+$l4 = WinList 'h4-windows-three'
+$h4OrderBefore = ((ColOf $l4 $m[0]) -ge 0) -and ((ColOf $l4 $m[1]) -eq ((ColOf $l4 $m[0]) + 1)) -and
+    ((ColOf $l4 $m[2]) -eq ((ColOf $l4 $m[1]) + 1))
 Shot 'h4-01-three-windows'
 
-# (a) the middle one is minimized: its neighbours close up
+# (a) the middle one is minimized: its neighbours close up (in the strip, and on screen when both are in view)
 Minimize $m[1]; Start-Sleep -Milliseconds 1800
 $h4Iconic = [LT]::IsIconic($m[1])
 $b1 = Rc $m[0]; $b3 = Rc $m[2]
 $h4GapAfter = $b3.L - $b1.R
-$h4NoGap = ($h4GapAfter -ge 0) -and ($h4GapAfter -lt 60) -and ($h4GapBefore -gt 300)
+$l4b = WinList 'h4-windows-middle-minimized'
+$h4NoGap = ((ColOf $l4b $m[2]) -eq ((ColOf $l4b $m[0]) + 1)) -and
+    (-not ((OnScreen $m[0]) -and (OnScreen $m[2])) -or (($h4GapAfter -ge 0) -and ($h4GapAfter -lt 60)))
 $h4IpcMinimized = ((WinOf (WinList 'h4-windows-minimized') $m[1]).minimized -eq $true)
 Shot 'h4-02-middle-minimized'
 
@@ -1632,9 +1637,12 @@ Start-Sleep -Seconds 4
 # what the shell itself says (IApplicationView::GetShowInSwitchers), and "Alt+Tab to a window" is the shell's own call
 # (IApplicationView::SwitchTo) - the same interfaces wiri cloaks with, reached from this script through COM interop.
 $log11 = Join-Path $D 'wiri.stderr11.log'
+# (a third of the view per column, so that the three forms are drawn side by side on any screen: with niri's
+# default the windows keep their own width, and two of them fill a 1024 px screen)
 $h11Config = @"
 layout {
     hide-method "cloak"
+    default-column-width { proportion 0.33333; }
 }
 "@
 Stop-WiriGracefully $w 'h11'

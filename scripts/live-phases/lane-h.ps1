@@ -79,7 +79,9 @@
         $r = [LaneHNative]::RunCli($ctl, $ctlArgs, $stdinText, 5000)
         [IO.File]::WriteAllText((Join-Path $hDir "$name.stdout.txt"), $r.Out)
         [IO.File]::WriteAllText((Join-Path $hDir "$name.stderr.txt"), $r.Err)
-        $steps.Add([pscustomobject]@{ step = "lane-h-$name"; args = ($ctlArgs -join ' '); rc = $r.Rc; ms = $r.Ms })
+        # A numeric exit code is recorded as a number, as the other phases do (CI's checker requires it).
+        $rcValue = if ("$($r.Rc)" -match '^-?\d+$') { [int]$r.Rc } else { $r.Rc }
+        $steps.Add([pscustomobject]@{ step = "lane-h-$name"; args = ($ctlArgs -join ' '); rc = $rcValue; ms = $r.Ms })
         return $r
     }
     function HEvents($c, [string]$label, [int]$ms = 1000) {
