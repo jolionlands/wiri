@@ -1033,6 +1033,10 @@ pub(crate) fn perform_action_on(
         Action::System(_) => {
             unreachable!("system actions dispatched before layout target resolution")
         }
+        Action::LayoutFocus(_) | Action::WorkspaceAction(_) | Action::MonitorAction(_) => {
+            // Transport lands before the engine executors in the integration series.
+            warn!("Structured layout executor not installed: {:?}", action);
+        }
         Action::ToggleKeyboardShortcutsInhibit => {
             keyboard::ENGINE.lock().toggle_inhibit();
             info!(

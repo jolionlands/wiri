@@ -1340,22 +1340,24 @@ impl HotkeyBinding {
             }
             return None;
         }
+        let mut words = self.args.clone();
+        let mut quoted = self.args_quoted.clone();
+        quoted.resize(words.len(), false);
         // Implemented action properties use the very same argv validator as CLI
         // and typed IPC, rather than being stored as inert configuration text.
-        if matches!(
+        let every_prop = matches!(
             self.command.as_str(),
             "screenshot" | "screenshot-screen" | "screenshot-window" | "quit"
-        ) {
-            let mut words = self.args.clone();
-            let mut quoted = self.args_quoted.clone();
-            quoted.resize(words.len(), false);
-            for (name, value) in &self.action_props {
+        );
+        for (name, value) in &self.action_props {
+            // Layout action properties share the validated CLI/IPC flag grammar.
+            let layout = matches!(name.as_str(), "focus" | "workspace" | "id" | "debounce-ms");
+            if every_prop || layout {
                 words.extend([format!("--{name}"), value.clone()]);
-                quoted.extend([false, true]);
+                quoted.extend([false, every_prop]);
             }
-            return crate::input::parse_action_flagged(&self.command, &words, &quoted);
         }
-        crate::input::parse_action_flagged(&self.command, &self.args, &self.args_quoted)
+        crate::input::parse_action_flagged(&self.command, &words, &quoted)
     }
 
     /// Parse modifier strings to Windows MOD flags.

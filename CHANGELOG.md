@@ -43,6 +43,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Lane K — animation configuration
 - Decode niri's `window-open` and `window-close` blocks as independent easing/spring/off timelines, including global off/slowdown and legacy overrides. Defaults are 150 ms ease-out-expo for opening and 150 ms ease-out-quad for closing; absent animations remain disabled for wiri compatibility. Pure tests cover defaults, precedence and invalid/duplicate settings.
+### Lane F2 — structured layout action transport
+- Port lane F's shared focus/workspace/monitor grammar onto the integrated branch. Preserve quoted workspace names and carry explicit window-transfer targets through Lane H's typed action path without focus-first activation. Engine execution follows in the next integration part.
 
 ### Phase 2B integration — desktop sign-off
 - Integrated release validation passes: 1114 library + 7 CLI tests, build and all-target check with warnings denied. The complete locked desktop run passes 440 gates, zero failures (102/102 Lane A checks; Lane B/D retained); perf collector errors and final H9 terminal overlaps are zero. Record earlier findings, measured resting cost and remaining limits in the Phase 2B report; recount matrix totals without claiming new features.

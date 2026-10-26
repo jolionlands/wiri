@@ -462,7 +462,26 @@ fn action_props(action: &str) -> &'static [&'static str] {
         | "move-window-to-workspace"
         | "move-column-to-workspace-down"
         | "move-column-to-workspace-up"
-        | "move-column-to-workspace" => &["focus"],
+        | "move-column-to-workspace"
+        | "move-column-up"
+        | "move-column-down"
+        | "move-column-to-workspace-above"
+        | "move-column-to-workspace-below" => &["focus"],
+        "focus-window-previous" | "focus-previous" | "alt-tab" | "focus-history-back" => {
+            &["debounce-ms"]
+        }
+        "move-workspace-to-index"
+        | "set-workspace-name"
+        | "rename-workspace"
+        | "rename-ws"
+        | "unset-workspace-name"
+        | "move-workspace-to-monitor"
+        | "move-workspace-to-monitor-left"
+        | "move-workspace-to-monitor-right"
+        | "move-workspace-to-monitor-up"
+        | "move-workspace-to-monitor-down"
+        | "move-workspace-to-monitor-previous"
+        | "move-workspace-to-monitor-next" => &["workspace"],
         _ => &[],
     }
 }
@@ -2435,7 +2454,15 @@ impl Decoder {
             let allowed = action_props(&action.name);
             for p in &action.props {
                 if allowed.contains(&p.key.as_str()) {
-                    bind.action_props.push((p.key.clone(), p.value.to_text()));
+                    if p.key == "workspace" {
+                        // Preserve the quote bit: workspace="2" names a workspace.
+                        bind.args.push("--workspace".to_string());
+                        bind.args_quoted.push(false);
+                        bind.args.push(p.value.to_text());
+                        bind.args_quoted.push(p.value.is_quoted_str());
+                    } else {
+                        bind.action_props.push((p.key.clone(), p.value.to_text()));
+                    }
                 } else {
                     self.error(
                         p.key_pos,

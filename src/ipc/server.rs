@@ -890,15 +890,13 @@ impl IpcServer {
                     if matches!(name.as_str(), "close-window" | "close") {
                         return self.process_message(IpcMessage::CloseWindow { window_hwnd: hwnd });
                     }
-                    // Any other action acts on the focused window: the window is focused first
-                    // (niri leaves the focus where it is; the focus follows the window here).
-                    if !focus_window_by_hwnd(engine, backend, hwnd) {
-                        return serde_json::json!({
-                            "success": false,
-                            "error": format!("no window with id {} to focus", hwnd)
-                        });
-                    }
                     if name == "focus-window" {
+                        if !focus_window_by_hwnd(engine, backend, hwnd) {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("no window with id {} to focus", hwnd)
+                            });
+                        }
                         engine.write().apply_all(backend);
                         return serde_json::json!({"success": true});
                     }
@@ -908,7 +906,8 @@ impl IpcServer {
                         "error": "focus-window needs --id <window id> (the handle that `wiri-ctl windows` shows)"
                     });
                 }
-                let Some(action) = crate::input::parse_action_flagged(&name, &args, &quoted) else {
+                let Some(mut action) = crate::input::parse_action_flagged(&name, &args, &quoted)
+                else {
                     return serde_json::json!({
                         "success": false,
                         "error": format!("unknown action or bad arguments: {} {:?}", name, args)
@@ -917,8 +916,24 @@ impl IpcServer {
                 if matches!(action, crate::input::Action::Quit) {
                     return self.process_message(IpcMessage::Quit);
                 }
-                // No quit channel: `quit` is handled above.  With `--id` the action acts on that
-                // window whatever the OS reports as the foreground window by now.
+                let target = if let Some(hwnd) = target {
+                    if action.set_layout_window_target(WindowId::new(hwnd)) {
+                        // Transfers carry their target without stealing focus first.
+                        None
+                    } else {
+                        if !focus_window_by_hwnd(engine, backend, hwnd) {
+                            return serde_json::json!({
+                                "success": false,
+                                "error": format!("no window with id {} to focus", hwnd)
+                            });
+                        }
+                        Some(hwnd)
+                    }
+                } else {
+                    None
+                };
+                // No quit channel: `quit` is handled above. The target is carried
+                // by the structured transfer or retained for legacy actions.
                 let no_quit = Arc::new(parking_lot::Mutex::new(None));
                 crate::backend::message_loop::perform_action_on(
                     &action, engine, backend, &no_quit, target,

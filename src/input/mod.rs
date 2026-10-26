@@ -4,6 +4,7 @@ pub mod focus;
 pub mod grab;
 pub mod hotkey;
 pub mod keyboard;
+pub mod layout_actions;
 pub mod low_level_hook;
 pub mod mouse;
 pub mod pointer;
@@ -15,6 +16,7 @@ pub mod touch;
 
 pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
 pub use hotkey::{HotkeyBinding, HotkeyId};
+pub use layout_actions::{FocusAction, MonitorAction, MonitorTarget, WorkspaceAction};
 pub use low_level_hook::{
     begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab, current_grab,
     is_grab_active, last_press_was_repeat, start_keyboard_hook, start_mouse_hook,
@@ -31,6 +33,10 @@ pub use touch::{
 pub enum Action {
     /// Non-layout OS/session actions, shared by IPC and bindings.
     System(system_actions::SystemAction),
+    /// Structured layout focus arguments shared by binds and IPC.
+    LayoutFocus(FocusAction),
+    WorkspaceAction(WorkspaceAction),
+    MonitorAction(MonitorAction),
     Quit,
     /// Run a program: `argv[0]` is the program (searched on PATH when it has no
     /// directory part), the rest are its arguments, each passed through intact
@@ -381,6 +387,9 @@ pub fn action_name_known(name: &str) -> bool {
 /// workspace, `focus-workspace "2"` the workspace named "2".  Both the niri names of
 /// the actions and wiri's own older spellings are understood.
 pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
+    if let Some(action) = layout_actions::parse(name, args, quoted) {
+        return action;
+    }
     let is_quoted = |i: usize| quoted.get(i).copied().unwrap_or(false);
     if let Some(system) = system_actions::parse(name, args) {
         return system.map(|action| {
