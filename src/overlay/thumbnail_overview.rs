@@ -41,8 +41,15 @@ pub enum OverviewCommand {
     SelectWindow(WindowId),
     /// Activate even an empty workspace, then exit overview.
     SelectWorkspace(i32),
+    /// Drag dwell changes the camera without closing it.
+    ActivateWorkspace(i32),
     PreviousWorkspace,
     NextWorkspace,
+    DropWindow {
+        window: WindowId,
+        target: crate::overlay::overview_pointer::DropTarget,
+    },
+    ScrollView(i32),
     Close,
 }
 
@@ -56,6 +63,7 @@ pub trait ThumbnailOverviewSink: Send + Sync {
     /// Default keeps existing/test sinks source-compatible.
     fn set_context(&self, _context: OverviewContext) {}
     fn set_appearance(&self, _style: OverviewConfig, _zoom: f64) {}
+    fn retain_windows(&self, _windows: &[WindowId]) {}
     /// Asynchronous: safe while holding the engine lock.
     fn exit(&self);
     fn registered_count(&self) -> usize;
@@ -136,6 +144,11 @@ impl ThumbnailOverviewSink for MockThumbnailOverview {
         s.last_dst_rect.clear();
         s.context = None;
     }
+    fn retain_windows(&self, windows: &[WindowId]) {
+        let mut s = self.inner.lock();
+        s.registered.retain(|id, _| windows.contains(id));
+        s.last_dst_rect.retain(|id, _| windows.contains(id));
+    }
     fn registered_count(&self) -> usize {
         self.inner.lock().registered.len()
     }
@@ -143,7 +156,7 @@ impl ThumbnailOverviewSink for MockThumbnailOverview {
 
 // Geometry/hit-testing deliberately contain no Win32 calls.
 #[cfg(any(target_os = "windows", test))]
-fn contains(rect: Rect, x: i32, y: i32) -> bool {
+pub(crate) fn contains(rect: Rect, x: i32, y: i32) -> bool {
     let (x, y) = (i64::from(x), i64::from(y));
     x >= i64::from(rect.loc.x)
         && y >= i64::from(rect.loc.y)
@@ -239,8 +252,10 @@ mod win {
         BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, SetBkMode,
         SetTextColor, TextOutW, HDC, PAINTSTRUCT, TRANSPARENT,
     };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
+    const DRAG_DWELL: usize = 1;
     const REFRESH: u32 = WM_APP + 0x219;
     const BACKDROP: u32 = 0x0018_1210;
     const WORKSPACE: u32 = 0x0036_2b24;
@@ -361,6 +376,9 @@ mod win {
                 s.zoom = zoom;
             });
         }
+        fn retain_windows(&self, windows: &[WindowId]) {
+            self.publish(|s| s.tiles.retain(|id, _| windows.contains(id)));
+        }
         fn exit(&self) {
             if let Some(session) = self.session.lock().take() {
                 session.close();
@@ -391,6 +409,8 @@ mod win {
         thumbnails: HashMap<WindowId, Thumbnail>,
         hovered: Option<WindowId>,
         background: Vec<u32>,
+        pointer: crate::overlay::overview_pointer::Pointer,
+        dwell_target: Option<i32>,
     }
     impl Drop for Host {
         fn drop(&mut self) {
@@ -413,7 +433,17 @@ mod win {
             })
         }
         unsafe fn update(&mut self, hwnd: HWND) {
-            self.scene = self.session.scene.lock().clone();
+            let scene = self.session.scene.lock().clone();
+            let background_changed = self.background.is_empty()
+                || self.scene.context != scene.context
+                || self.scene.appearance != scene.appearance
+                || self.scene.zoom != scene.zoom;
+            self.scene = scene;
+            for (&id, tile) in &mut self.scene.tiles {
+                if let Some(rect) = tile.rect {
+                    tile.rect = Some(self.pointer.dragged_rect(id, rect));
+                }
+            }
             if let Some(context) = &self.scene.context {
                 self.bounds = context.bounds;
             }
@@ -481,6 +511,29 @@ mod win {
                     .map(|c| c.workspaces.len())
                     .unwrap_or(0) as isize,
             );
+            if let Some(context) = &self.scene.context {
+                for (index, ws) in context.workspaces.iter().enumerate() {
+                    let prefix = format!("WiriOverviewWorkspace{index}");
+                    for (suffix, value) in [
+                        ("Id", ws.id),
+                        ("X", ws.rect.loc.x),
+                        ("Y", ws.rect.loc.y),
+                        ("W", ws.rect.size.w as i32),
+                        ("H", ws.rect.size.h as i32),
+                    ] {
+                        property(hwnd, &format!("{prefix}{suffix}"), value as isize);
+                    }
+                }
+                property(
+                    hwnd,
+                    "WiriOverviewActiveWorkspace",
+                    context
+                        .workspaces
+                        .iter()
+                        .find(|ws| ws.active)
+                        .map_or(0, |ws| ws.id) as isize,
+                );
+            }
             let rect = focused
                 .and_then(|id| self.scene.tiles.get(&id))
                 .and_then(|t| t.rect)
@@ -489,15 +542,17 @@ mod win {
             property(hwnd, "WiriOverviewFocusY", rect.loc.y as isize);
             property(hwnd, "WiriOverviewFocusW", rect.size.w as isize);
             property(hwnd, "WiriOverviewFocusH", rect.size.h as isize);
-            self.background = appearance::background(
-                self.bounds,
-                self.scene
-                    .context
-                    .iter()
-                    .flat_map(|c| c.workspaces.iter().map(|ws| ws.rect)),
-                self.scene.appearance,
-                self.scene.zoom,
-            );
+            if background_changed {
+                self.background = appearance::background(
+                    self.bounds,
+                    self.scene
+                        .context
+                        .iter()
+                        .flat_map(|c| c.workspaces.iter().map(|ws| ws.rect)),
+                    self.scene.appearance,
+                    self.scene.zoom,
+                );
+            }
             property(
                 hwnd,
                 "WiriOverviewZoomMillionths",
@@ -654,6 +709,8 @@ mod win {
             thumbnails: HashMap::new(),
             hovered: None,
             background: Vec::new(),
+            pointer: Default::default(),
+            dwell_target: None,
         });
         let Ok(hwnd) = CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -709,33 +766,115 @@ mod win {
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-            WM_MOUSEMOVE | WM_LBUTTONUP => {
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MOUSEMOVE => {
                 let x = (l.0 as u16 as i16 as i32) + (*ptr).bounds.loc.x;
                 let y = ((l.0 >> 16) as u16 as i16 as i32) + (*ptr).bounds.loc.y;
-                let command = hit_test((*ptr).scene.context.as_ref(), (*ptr).tiles(), x, y);
-                if msg == WM_LBUTTONUP {
-                    let session = (*ptr).session.clone();
-                    session.command(command);
-                } else {
-                    let hovered = match command {
-                        OverviewCommand::SelectWindow(id) => Some(id),
-                        _ => None,
-                    };
-                    if (*ptr).hovered != hovered {
-                        (*ptr).hovered = hovered;
-                        let _ = InvalidateRect(hwnd, None, false);
+                let hit = hit_test((*ptr).scene.context.as_ref(), (*ptr).tiles(), x, y);
+                let mut command = None;
+                match msg {
+                    WM_LBUTTONDOWN => {
+                        let anchor = match hit {
+                            OverviewCommand::SelectWindow(id) => {
+                                (*ptr).scene.tiles.get(&id).and_then(|t| t.rect)
+                            }
+                            _ => None,
+                        };
+                        (*ptr).pointer.press(hit, x, y);
+                        (*ptr).pointer.set_anchor(anchor);
+                        SetCapture(hwnd);
                     }
+                    WM_LBUTTONUP => {
+                        command = (*ptr).pointer.release((*ptr).scene.context.as_ref(), x, y);
+                        (*ptr).dwell_target = None;
+                        let _ = KillTimer(hwnd, DRAG_DWELL);
+                        let _ = ReleaseCapture();
+                        (*ptr).update(hwnd);
+                    }
+                    WM_RBUTTONDOWN => {
+                        (*ptr).pointer.right_press(x);
+                        SetCapture(hwnd);
+                    }
+                    WM_RBUTTONUP => {
+                        (*ptr).pointer.right_release();
+                        let _ = ReleaseCapture();
+                    }
+                    _ => {
+                        command = (*ptr).pointer.motion(x, y);
+                        let hovered = match hit {
+                            OverviewCommand::SelectWindow(id) => Some(id),
+                            _ => None,
+                        };
+                        if (*ptr).hovered != hovered {
+                            (*ptr).hovered = hovered;
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                        let target = if (*ptr).pointer.dragging_window().is_some() {
+                            (*ptr)
+                                .scene
+                                .context
+                                .as_ref()
+                                .and_then(|c| {
+                                    c.workspaces
+                                        .iter()
+                                        .find(|ws| !ws.active && contains(ws.rect, x, y))
+                                })
+                                .map(|ws| ws.id)
+                        } else {
+                            None
+                        };
+                        if (*ptr).dwell_target != target {
+                            let _ = KillTimer(hwnd, DRAG_DWELL);
+                            (*ptr).dwell_target = target;
+                            if target.is_some() {
+                                SetTimer(hwnd, DRAG_DWELL, 350, None);
+                            }
+                        }
+                        if (*ptr).pointer.dragging_window().is_some() {
+                            (*ptr).update(hwnd);
+                        }
+                    }
+                }
+                if let Some(command) = command {
+                    (*ptr).session.clone().command(command);
                 }
                 LRESULT(0)
             }
+            WM_TIMER if w.0 == DRAG_DWELL => {
+                let _ = KillTimer(hwnd, DRAG_DWELL);
+                if let Some(id) = (*ptr)
+                    .dwell_target
+                    .take()
+                    .filter(|_| (*ptr).pointer.dragging_window().is_some())
+                {
+                    (*ptr)
+                        .session
+                        .clone()
+                        .command(OverviewCommand::ActivateWorkspace(id));
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE => {
+                (*ptr).pointer.cancel();
+                (*ptr).dwell_target = None;
+                let _ = KillTimer(hwnd, DRAG_DWELL);
+                LRESULT(0)
+            }
+            WM_CONTEXTMENU => LRESULT(0),
             WM_MOUSEWHEEL => {
-                let delta = ((w.0 >> 16) as u16) as i16;
-                let command = if delta < 0 {
-                    OverviewCommand::NextWorkspace
-                } else {
-                    OverviewCommand::PreviousWorkspace
-                };
-                (*ptr).session.clone().command(command);
+                let delta = ((w.0 >> 16) as u16) as i16 as i32;
+                let commands = (*ptr).pointer.wheel(delta);
+                let session = (*ptr).session.clone();
+                for command in commands {
+                    session.command(command);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEHWHEEL => {
+                let delta = ((w.0 >> 16) as u16) as i16 as i32;
+                (*ptr)
+                    .session
+                    .clone()
+                    .command(OverviewCommand::ScrollView(delta / 4));
                 LRESULT(0)
             }
             WM_KEYDOWN if w.0 == 0x1b => {

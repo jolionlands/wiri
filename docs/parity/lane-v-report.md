@@ -23,6 +23,24 @@ Unit coverage: typed defaults/ranges/all fields, colour forms, shadow pixels/off
 negative-origin scaling, active-only clock and interrupted close/retirement.
 Release unit run after item 1: 1257 library + 14 CLI tests pass; one doctest ignored.
 
+## Item 2: overview pointer and normal actions
+
+The session host captures complete pointer pairs with an 8 px drag threshold.
+Drops target an existing workspace or a new one above/between/below; insertion
+rotates the normal model with names, floating homes and minimized slots. A 350 ms
+one-shot dwell switches the camera during a drag. Wheel deltas accumulate at 120;
+right-drag/horizontal wheel scroll the normal workspace view at the camera scale.
+The drag image remains anchored to the pointer when the workspace camera changes.
+No idle dwell timer is armed. Pointer-only updates reuse the backdrop raster.
+
+Normal dispatch remains active, with overview-aware workspace switches and source
+refresh/retirement after model changes. Floating previews are included. Existing
+source HWNDs retain their normal sizes; exiting restores workspace/tab visibility.
+Pure tests cover gap targeting, click/drag cancellation, anchored camera changes,
+wheel accumulation, scrolling, insertion/order/names and opening/closing sources.
+H62/H63 exercise camera and pointer messages on the owned host, source lifecycle
+and guarded normal close bindings; no foreign app is clicked or closed.
+
 ## Validation ledger
 
 Full warning-denied release build/test/check, prescribed formatter, and the locked
