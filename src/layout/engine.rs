@@ -675,6 +675,7 @@ pub struct TilingEngine {
     /// Overview mode: None = normal, Some(state) = zoomed out (all workspaces stacked).
     /// See `OverviewState` for the per-workspace Y-offset layout.
     overview: Option<OverviewState>,
+    overview_camera: overview::OverviewCamera,
     /// Counts of consecutive `set_window_position` failures per window.
     /// After `MAX_POSITION_FAILURES` attempts the window is auto-floated and
     /// removed from the tile layout so it stops thrashing the Win32 API.
@@ -822,6 +823,7 @@ impl TilingEngine {
             recent: recent::RecentState::default(),
             animation: crate::layout::AnimationManager::disabled(),
             overview: None,
+            overview_camera: overview::OverviewCamera::default(),
             failed_position: HashMap::new(),
             last_activated: None,
             os_foreground: None,
@@ -5308,7 +5310,10 @@ impl TilingEngine {
     /// Check if animations are enabled and any are currently active (AnimationManager or
     /// per-window rect animations from `animating_rects`).
     pub fn has_active_animations(&self) -> bool {
-        self.animation.has_active() || !self.animating_rects.is_empty() || self.transitions.active()
+        self.animation.has_active()
+            || !self.animating_rects.is_empty()
+            || self.transitions.active()
+            || self.overview_camera.animating()
     }
 
     /// Convenience alias for `has_active_animations` — exposes whether any rect
@@ -5636,6 +5641,14 @@ impl TilingEngine {
     /// the next `apply_layout_for_monitor` pass re-issues `show_window(true)`
     /// when the user switches workspaces back.
     pub fn exit_overview(&mut self, backend: &BackendHandle) {
+        if self.begin_overview_close() {
+            return;
+        }
+        self.finish_overview_close(backend);
+    }
+
+    fn finish_overview_close(&mut self, backend: &BackendHandle) {
+        self.overview_camera = overview::OverviewCamera::default();
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
