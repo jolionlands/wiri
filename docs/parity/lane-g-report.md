@@ -111,7 +111,18 @@ against that proposal rather than a visible frame that never advanced. Live
 `full-window-dragging` is recorded for interpretation; the gates do not assume one
 display mode.
 
-Live result: pending the queued machine-wide desktop run.
+Live result: the final locked run (2026-10-25 21:12–21:21, `DONE` written) passed
+all 347 boolean gates with no failures; `hidden_json_present_after_restart` was the
+only intentionally false value and no other gate failed. All 23 H40–H44 gates are
+true, including real held caption/border drags, the no-placement-after-relayout
+check, post-drop width/height/sibling reconciliation, and the idempotent second
+relayout. The probe measured full-window dragging disabled (`full-window-dragging 0`
+in `lane-g/values.json`), which is why the outline-aware proposal check was needed.
+The same run covered the existing regression suite, H4/H9 included. Evidence in
+`.live/summary.json`, `.live/lane-g/values.json`, `g-*.txt`, `h40-*.png`,
+`h43-floats.png`, `h44-caption-held.png`, `h44-edge-held.png`, `h44-edge-drop.png`.
+Idle resource endpoints stayed informational (`p_*`); no new timer, thread or resting
+window was added by this lane.
 
 ## Cost and remaining work
 
