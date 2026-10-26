@@ -141,14 +141,47 @@ public static class WiriCiDesktop {
         $summary.status = 'running'
         $summary | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $Out 'summary.json') -Encoding UTF8
         $preflight | ConvertTo-Json | Set-Content (Join-Path $Out 'ci-preflight.json') -Encoding UTF8
-        # The hosted ARM64 image keeps relaunching a console "Press any key to install ... (WSL)" prompt, which
-        # takes the foreground in the middle of phases.  Disposable runner: stop each one while the harness runs.
+        # The hosted ARM64 image keeps relaunching a console "Press any key to install ... (WSL)" prompt, and shows
+        # a "Windows created a temporary paging file" message box mid-run; both take the foreground in the middle
+        # of phases.  Disposable runner: stop each prompt and close that message box while the harness runs.
         $wslGuard = Start-Job -ScriptBlock {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class WiriCiNoise {
+    delegate bool EnumProc(IntPtr hwnd, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+    static string Text(IntPtr h, bool cls) { var s = new StringBuilder(512); if (cls) GetClassName(h, s, 512); else GetWindowText(h, s, 512); return s.ToString(); }
+    // Closes visible message boxes (#32770) whose text mentions the paging file; returns how many.
+    public static int ClosePagingFileNotices() {
+        var found = new List<IntPtr>();
+        EnumWindows((h, l) => {
+            if (IsWindowVisible(h) && Text(h, true) == "#32770") {
+                bool hit = false;
+                EnumChildWindows(h, (c, l2) => { if (Text(c, false).IndexOf("paging file", StringComparison.OrdinalIgnoreCase) >= 0) hit = true; return true; }, IntPtr.Zero);
+                if (hit) found.Add(h);
+            }
+            return true;
+        }, IntPtr.Zero);
+        foreach (var h in found) PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); // WM_CLOSE
+        return found.Count;
+    }
+}
+'@
             while ($true) {
                 foreach ($p in @(Get-Process -Name wsl -ErrorAction SilentlyContinue)) {
                     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
                     "stopped wsl.exe pid $($p.Id) at $(Get-Date -Format HH:mm:ss.fff)"
                 }
+                $closed = [WiriCiNoise]::ClosePagingFileNotices()
+                if ($closed -gt 0) { "closed $closed paging-file notice(s) at $(Get-Date -Format HH:mm:ss.fff)" }
                 Start-Sleep -Milliseconds 500
             }
         }
