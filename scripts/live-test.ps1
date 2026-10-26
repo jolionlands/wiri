@@ -1521,7 +1521,8 @@ foreach ($i in 1..3) {
     Start-Sleep -Milliseconds 1600
 }
 Start-Sleep -Seconds 4
-$wts9 = @(NewTopLevel $topBefore9 | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Title($_) -like 'wiri-h9-con-*') })
+# (an elevated console's title starts with "Administrator: ", as on the hosted CI runners)
+$wts9 = @(NewTopLevel $topBefore9 | Where-Object { [LT]::IsWindowVisible($_) -and ([LT]::Title($_) -like '*wiri-h9-con-*') })
 $h9TerminalsOpened = ($wts9.Count -eq 3)
 $r9 = @($wts9 | ForEach-Object { Rc $_ })
 Set-Content (Join-Path $D 'h9-terminal-rects.json') ($r9 | ConvertTo-Json)
