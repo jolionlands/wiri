@@ -3231,7 +3231,22 @@ impl TilingEngine {
         self.os_foreground = Some(window_id);
         if self.floating_windows.contains(&window_id) {
             // The user is looking at a floating window: it goes to the top of the float stack.
-            self.touch_float(window_id);
+            // Not a float of an inactive workspace that wiri itself hid: Windows reports it as
+            // the foreground window when it picks a replacement for a window hidden a moment
+            // ago (a workspace switch hides two floats; the second becomes the foreground), and
+            // touching it would reorder the stack the user comes back to.
+            let on_inactive_workspace = self.float_homes.get(&window_id).map_or(false, |home| {
+                self.monitors
+                    .get(&home.output)
+                    .map_or(false, |m| m.active_workspace != home.workspace)
+            });
+            let hidden_by_wiri = !self
+                .applied_state
+                .get(&window_id)
+                .map_or(true, |s| s.visible);
+            if !(on_inactive_workspace || hidden_by_wiri) {
+                self.touch_float(window_id);
+            }
             return None;
         }
         let (output_id, workspace_id, column_idx) = self.locate_window(window_id)?;
@@ -9810,6 +9825,32 @@ mod tests {
             engine.applied_state.get(&float).unwrap().visible,
             "back with its workspace"
         );
+    }
+
+    #[test]
+    fn test_a_hidden_float_reported_as_foreground_keeps_the_float_stack() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let (older, newer) = (WindowId::new(100), WindowId::new(101));
+        engine.toggle_floating_for(older, &be);
+        engine.toggle_floating_for(newer, &be);
+        engine.apply_all(&be);
+        let seq = |e: &TilingEngine, w: WindowId| e.float_homes.get(&w).unwrap().seq;
+        assert!(seq(&engine, newer) > seq(&engine, older));
+
+        // Leaving the workspace hides both floats; Windows hands the foreground to one of
+        // them as the replacement for the other.  That is not the user looking at it.
+        engine.switch_workspace(crate::layout::workspace_id_from_number(2), &be);
+        engine.follow_os_foreground(older, &be);
+        assert!(
+            seq(&engine, newer) > seq(&engine, older),
+            "the stack the user comes back to is unchanged"
+        );
+
+        // Back on its workspace, a float that becomes the foreground goes on top.
+        engine.switch_workspace(crate::layout::workspace_id_from_number(1), &be);
+        engine.follow_os_foreground(older, &be);
+        assert!(seq(&engine, older) > seq(&engine, newer));
     }
 
     #[test]
