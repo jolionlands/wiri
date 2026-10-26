@@ -114,6 +114,17 @@ public static class WiriCiDesktop {
                 $preflight.reason = "Windows' first-run privacy screen ($after) holds the foreground and could not be closed. No live phases ran (this is not a pass)."
             }
         }
+        # Consoles open in the classic console host, one window each: with Windows Terminal as the default terminal
+        # (both hosted images) the harness's three cmd.exe windows become tabs of one window (h9).
+        if ($preflight.interactive_desktop -and -not $ProbeOnly) {
+            $conhost = '{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}'
+            try {
+                New-Item -Force 'HKCU:\Console\%%Startup' | Out-Null
+                Set-ItemProperty 'HKCU:\Console\%%Startup' -Name DelegationConsole -Value $conhost
+                Set-ItemProperty 'HKCU:\Console\%%Startup' -Name DelegationTerminal -Value $conhost
+                $preflight['default_terminal'] = 'conhost'
+            } catch { Write-Warning "Could not make conhost the default terminal: $($_.Exception.Message)" }
+        }
         # Then the Start menu / search it leaves open, which takes the first test keys.
         if ($preflight.interactive_desktop -and -not $ProbeOnly) {
             foreach ($i in 1..5) {
