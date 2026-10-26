@@ -904,8 +904,10 @@ impl TilingEngine {
 
     /// The window started or stopped asking for attention (it flashes in the taskbar).
     pub fn window_urgency_changed(&mut self, window_id: WindowId, backend: &BackendHandle) {
-        let urgent = crate::backend::hooks::is_urgent_hwnd(window_id.as_isize())
-            && self.os_foreground != Some(window_id);
+        let urgent = crate::backend::hooks::resolve_attention(
+            window_id.as_isize(),
+            self.os_foreground == Some(window_id),
+        );
         if urgent {
             self.requested_activation(window_id, backend);
         } else {

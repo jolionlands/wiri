@@ -1,5 +1,6 @@
 //! Application wheel scaling. Snapshots arrive only on admission/rule/config changes;
-//! the existing LL hook scales only an unbound event and tags its single reinjection.
+//! the existing LL hook scales only an unbound event and queues a tagged reinjection.
+//! SendInput runs after returning from the hook, on the existing input message pump.
 //! No engine lock, timer, worker, or device/system setting is needed.
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -79,9 +80,29 @@ pub(super) fn wheel(point: POINT, horizontal: bool, delta: i32) -> bool {
     if output == 0 {
         return true;
     }
+    // Never call SendInput synchronously inside an LL hook: re-entrant delivery
+    // can let both the original and replacement through. Consume only after the
+    // existing message pump accepted the task, then inject after this callback.
+    super::dispatch::send_work(Box::new(move || {
+        if !inject_wheel(output, horizontal) && !inject_wheel(delta, horizontal) {
+            // Async failure cannot pass the original through, so try one tagged
+            // original-delta fallback. UIPI can reject both; do not retry/spin.
+            tracing::warn!("Application wheel replacement and fallback were rejected");
+        }
+    }))
+}
+
+fn inject_wheel(delta: i32, horizontal: bool) -> bool {
+    let events = wheel_inputs(delta, horizontal);
+    // On partial delivery do not duplicate the delivered portion by also
+    // injecting a fallback. A total failure permits one original-delta attempt.
+    unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) > 0 }
+}
+
+fn wheel_inputs(delta: i32, horizontal: bool) -> Vec<INPUT> {
     // WM_MOUSE[H]WHEEL exposes a signed 16-bit delta. Preserve larger scaled
     // amounts in one SendInput batch instead of silently wrapping at the app.
-    let events: Vec<INPUT> = wheel_deltas(output)
+    wheel_deltas(delta)
         .into_iter()
         .map(|part| INPUT {
             r#type: INPUT_MOUSE,
@@ -98,10 +119,7 @@ pub(super) fn wheel(point: POINT, horizontal: bool, delta: i32) -> bool {
                 },
             },
         })
-        .collect();
-    // UIPI/total failure passes through the original. On partial delivery do not
-    // duplicate the delivered portion by also passing through the original.
-    unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) > 0 }
+        .collect()
 }
 
 fn wheel_deltas(mut delta: i32) -> Vec<i32> {
@@ -116,7 +134,36 @@ fn wheel_deltas(mut delta: i32) -> Vec<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::wheel_deltas;
+    use super::*;
+
+    #[test]
+    fn replacement_batches_preserve_axes_signs_and_bypass_tag() {
+        for horizontal in [false, true] {
+            for delta in [0, 120, -240, 40_000, -40_000] {
+                let inputs = wheel_inputs(delta, horizontal);
+                let delivered: i32 = inputs
+                    .iter()
+                    .map(|input| {
+                        assert_eq!(input.r#type, INPUT_MOUSE);
+                        let mouse = unsafe { input.Anonymous.mi };
+                        assert_eq!(mouse.dwExtraInfo, REINJECTED);
+                        assert_eq!(mouse.dx, 0);
+                        assert_eq!(mouse.dy, 0);
+                        assert_eq!(
+                            mouse.dwFlags,
+                            if horizontal {
+                                MOUSEEVENTF_HWHEEL
+                            } else {
+                                MOUSEEVENTF_WHEEL
+                            }
+                        );
+                        mouse.mouseData as i16 as i32
+                    })
+                    .sum();
+                assert_eq!(delivered, delta);
+            }
+        }
+    }
     #[test]
     fn large_scaled_wheels_preserve_signed_sixteen_bit_delivery() {
         for delta in [0, 120, -120, 40_000, -40_000, 120_000, -120_000] {
