@@ -27,6 +27,7 @@ mod float_stack;
 mod motion;
 mod native_move;
 mod overview;
+mod overview_input;
 mod presets;
 mod recent;
 mod strip_model;
@@ -2552,6 +2553,9 @@ impl TilingEngine {
         }
 
         let overview_active = self.is_overview();
+        if overview_active {
+            self.refresh_overview_sources(output_id, backend);
+        }
         if !overview_active {
             self.hide_inactive_tabs_for_monitor(output_id, backend);
             self.hide_inactive_workspace_windows_for_monitor(output_id, backend);
@@ -3898,6 +3902,9 @@ impl TilingEngine {
 
     /// Switch to a specific workspace
     pub fn switch_workspace(&mut self, workspace_id: i32, backend: &BackendHandle) {
+        if self.switch_workspace_in_overview(workspace_id, backend) {
+            return;
+        }
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
@@ -5385,7 +5392,9 @@ impl TilingEngine {
 
     /// Toggle overview mode — zooms out to show all columns in a grid
     pub fn toggle_overview(&mut self, backend: &BackendHandle) {
-        if self.overview.is_some() {
+        if self.overview_camera.closing && self.thumbnail_overview.is_some() {
+            self.enter_overview(backend);
+        } else if self.overview.is_some() {
             self.exit_overview(backend);
         } else {
             self.enter_overview(backend);

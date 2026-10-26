@@ -3,6 +3,7 @@ pub mod bindings_cheatsheet;
 pub mod decor;
 pub mod hotkey_rows;
 pub mod overview_banner;
+pub mod overview_pointer;
 pub mod recent_windows;
 pub mod screenshot_selection;
 pub mod screenshot_ui;

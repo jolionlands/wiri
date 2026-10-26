@@ -204,6 +204,12 @@ impl TilingEngine {
                     .into_iter()
                     .map(|(wid, rect)| (wid, zoom_rect(rect, view, y, zoom))),
             );
+            positions.extend(self.float_homes.iter().filter_map(|(wid, home)| {
+                (home.output == output && home.workspace == id)
+                    .then(|| self.float_rect_of(*wid))
+                    .flatten()
+                    .map(|rect| (*wid, zoom_rect(rect, view, y, zoom)))
+            }));
         }
         if let Some(sink) = &self.thumbnail_overview {
             sink.set_appearance(self.overview_options(), zoom);
@@ -223,7 +229,10 @@ impl TilingEngine {
         }
         match command {
             OverviewCommand::SelectWindow(wid) => {
-                if let Some((output, ws, _)) = self.locate_window(wid) {
+                if self.floating_windows.contains(&wid) {
+                    self.focus_float(wid, backend);
+                    self.exit_overview(backend);
+                } else if let Some((output, ws, _)) = self.locate_window(wid) {
                     self.monitors.set_focused(output);
                     if let Some(m) = self.monitors.get_mut(&output) {
                         m.switch_workspace(ws);
@@ -239,6 +248,13 @@ impl TilingEngine {
                 self.exit_overview(backend);
             }
             OverviewCommand::Close => self.exit_overview(backend),
+            OverviewCommand::ActivateWorkspace(ws) => {
+                self.switch_workspace_in_overview(ws, backend);
+            }
+            OverviewCommand::DropWindow { window, target } => {
+                self.overview_drop_window(window, target, backend);
+            }
+            OverviewCommand::ScrollView(delta) => self.overview_scroll_view(delta, backend),
             OverviewCommand::PreviousWorkspace | OverviewCommand::NextWorkspace => {
                 let Some(output) = self.monitors.focused_id() else {
                     return;
