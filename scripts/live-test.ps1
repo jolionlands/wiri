@@ -48,6 +48,8 @@
 param(
     [string]$Bin = 'C:\wiri-dev\wiri\target\release',
     [string]$Out = 'C:\wiri-dev\live',
+    # Repeat the unchanged H3-H5 scenarios and H45; keep per-run evidence.
+    [ValidateRange(1, 5)][int]$FloatRuns = 1,
     # WIRI_LIVE_LOCK_WAIT_MIN lets a caller that cannot pass arguments (the official cycle goes through
     # record-live.ps1) queue for the desktop too.
     [int]$LockWaitMinutes = $(if ($env:WIRI_LIVE_LOCK_WAIT_MIN) { [int]$env:WIRI_LIVE_LOCK_WAIT_MIN } else { 0 })
@@ -902,12 +904,13 @@ if ($env:WIRI_LIVE_CI -ne '1' -or (Get-Command wt.exe -ErrorAction SilentlyConti
 }
 $w = $w4
 
+foreach ($floatRun in 1..$FloatRuns) {
 # ---- H3: actions act on the window the user is looking at - a floating one included, a dialog's owner, never a guess ----
 # The visible rectangle of a window as a small object, and "within tol pixels".
 function Rc($h) { $v = [LT]::Visible($h); return [pscustomobject]@{ L = $v.L; T = $v.T; R = $v.R; B = $v.B; W = ($v.R - $v.L); H = ($v.B - $v.T) } }
 function Near([double]$a, [double]$b, [double]$tol) { return ([Math]::Abs($a - $b) -le $tol) }
 function AliveCount($hwnds) { @($hwnds | Where-Object { [LT]::IsWindow($_) }).Count }
-$log5 = Join-Path $D 'wiri.stderr5.log'
+$log5 = Join-Path $D $(if ($FloatRuns -eq 1) { 'wiri.stderr5.log' } else { 'wiri.stderr5-run'+$floatRun+'.log' })
 $h3Config = @"
 input {
     mod-key "ctrl-alt"
@@ -1153,6 +1156,52 @@ $null = Ctl 'h5-focus-float-again' @('focus-window', [string][int64]$ff)
 Start-Sleep -Milliseconds 1200
 $null = CloseFocused $ff 'h5-close-float'; Start-Sleep -Milliseconds 1800
 $h5Closed = -not [LT]::IsWindow($ff)
+
+# Retain every repetition, not only the last values serialized by the normal summary.
+$floatEvidenceDir = Join-Path $D ('float-runs/'+$floatRun)
+$null = New-Item -ItemType Directory -Force $floatEvidenceDir
+$floatGateSnapshot = [ordered]@{
+    h3_float_keeps_foreground = $h3FloatKeepsForeground
+    h3_float_reported_floating = $h3ReportedFloating
+    h3_second_press_tiles_the_same_window = $h3SecondPressTiles
+    h3_second_press_floats_nothing_else = $h3SecondPressFloatsNothingElse
+    h3_tiled_again_has_column_height = $h3TiledAgainHasColumnHeight
+    h3_float_geometry_remembered = $h3FloatGeometryRemembered
+    h3_float_keeps_foreground_after_retoggle = $h3ForegroundAfterThirdPress
+    h3_float_keeps_own_size = $h3FloatOwnSize
+    h3_float_is_centered = $h3FloatCentered
+    h3_move_nudges_float_50px = $h3FloatNudged
+    h3_fullscreen_covers_monitor = $h3FullscreenCovers
+    h3_fullscreen_only_the_float = ($h3FullscreenOthers -eq 0)
+    h3_fullscreen_exit_restores_float = $h3FullscreenRestores
+    h3_ipc_focus_window_tile = $h3IpcFocusTile
+    h3_ipc_focus_window_float = $h3IpcFocusFloat
+    h3_ipc_action_centers_float = $h3IpcCenters
+    h3_close_closes_the_float = $h3FloatClosed
+    h3_tiles_survive_float_close = $h3TilesSurviveFloatClose
+    h3_dialog_was_foreground = $h3DialogForeground
+    h3_close_hits_dialog_not_owner = ($h3DialogClosed -and $h3OwnerSurvives)
+    h3_tool_window_was_foreground = $h3ToolForeground
+    h3_close_refuses_unmanaged_foreground = $h3CloseRefusedOnUnmanaged
+    h5_float_on_top_when_it_floats = $h5FloatOnTop
+    h5_ipc_reports_float_on_workspace_1 = $h5IpcWorkspace1
+    h5_float_hidden_on_another_workspace = $h5HiddenOnWs2
+    h5_float_shown_again_at_its_place = $h5ShownOnWs1
+    h5_float_on_top_after_returning = $h5OnTopAfterReturn
+    h5_overlapping_tile_got_the_focus = $h5TileGotFocus
+    h5_float_stays_above_the_focused_tile = $h5FloatAboveFocusedTile
+    h5_float_stays_above_after_workspace_round_trip = $h5FloatAboveAfterRoundTrip
+    h5_move_input_had_float_foreground = $h5MoveHadForeground
+    h5_move_to_workspace_hides_the_float_here = $h5MovedAwayHidden
+    h5_ipc_reports_float_on_workspace_2 = $h5IpcWorkspace2
+    h5_float_shown_on_its_new_workspace_at_the_same_place = $h5ShownOnWs2
+    h5_float_hidden_again_on_workspace_1 = $h5HiddenAgainOnWs1
+    h5_focus_window_switches_to_the_float_workspace = $h5FocusSwitchesWorkspace
+    h5_float_closed = $h5Closed
+}
+([pscustomobject]$floatGateSnapshot) | ConvertTo-Json | Set-Content (Join-Path $floatEvidenceDir 'summary.json')
+Get-ChildItem $D -File | Where-Object { $_.Name -match '^h[345]-' } | Copy-Item -Destination $floatEvidenceDir
+}
 
 # ---- H6: the niri column keymap behaves like niri, driven by the shipped default binds --------------------------
 $log6 = Join-Path $D 'wiri.stderr6.log'
@@ -2969,6 +3018,7 @@ $summary = [ordered]@{
 . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-h.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-g.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-z.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
