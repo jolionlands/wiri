@@ -1509,11 +1509,9 @@ mod tests {
                 ..Default::default()
             };
             let expected = if skip {
-                crate::input::Action::System(
-                    crate::input::system_actions::SystemAction::Quit {
-                        skip_confirmation: true,
-                    },
-                )
+                crate::input::Action::System(crate::input::system_actions::SystemAction::Quit {
+                    skip_confirmation: true,
+                })
             } else {
                 crate::input::Action::Quit
             };

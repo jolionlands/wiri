@@ -12720,7 +12720,10 @@ mod tests {
             },
         );
         assert!(engine.set_window_urgent(window, true, &backend));
-        assert_eq!(engine.rule_state[&window].resolved.open_focused, Some(false));
+        assert_eq!(
+            engine.rule_state[&window].resolved.open_focused,
+            Some(false)
+        );
         engine.sync_os_foreground(window, &backend);
         assert!(!engine.is_urgent(window));
         assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));

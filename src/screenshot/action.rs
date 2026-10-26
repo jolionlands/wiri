@@ -59,9 +59,7 @@ impl CaptureAction {
                 "--id" if window && out.id.is_none() => {
                     out.id = Some(value()?.parse::<isize>().ok().filter(|n| *n > 0)?)
                 }
-                _ if !word.starts_with('-') && out.path.is_none() => {
-                    out.path = Some(word.clone())
-                }
+                _ if !word.starts_with('-') && out.path.is_none() => out.path = Some(word.clone()),
                 _ => return None,
             }
             i += 1;
