@@ -1,34 +1,26 @@
-//! Loaded keyboard layouts and an owned, event-driven change watcher.
-//!
-//! Queries deliberately do not cache: they work before `start()` and after its
-//! guard is dropped. The watcher only wakes the IPC snapshot/diff machinery.
-
-use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
-use std::thread::{self, JoinHandle};
-
+//! Loaded keyboard layouts, queried on demand. Notifications use the existing
+//! hotkey window (`keyboard_notify`) and foreground hook: no thread or window.
 use serde_json::{json, Value};
-use windows::core::{Error, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use std::sync::LazyLock;
+
+use super::messages::KeyboardLayoutsIpc;
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
     RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, GetKeyboardLayoutList, HKL};
 use windows::Win32::UI::Shell::SHLoadIndirectString;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DeregisterShellHookWindow, DestroyWindow, DispatchMessageW,
-    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, RegisterClassW, RegisterShellHookWindow, RegisterWindowMessageW,
-    TranslateMessage, UnregisterClassW, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_DESTROY, WM_SETTINGCHANGE, WNDCLASSW,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+#[derive(Default)]
+struct NamesCache {
+    layouts: Vec<u32>,
+    names: Vec<String>,
+}
+static NAMES: LazyLock<parking_lot::Mutex<NamesCache>> =
+    LazyLock::new(|| parking_lot::Mutex::new(NamesCache::default()));
 
 const MAX_LAYOUTS: usize = 256;
 const LIST_ATTEMPTS: usize = 3;
@@ -43,17 +35,24 @@ const LAYOUTS_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Keyboard Layouts";
 /// With no foreground window, index 0 is the numeric-schema fallback; an empty
 /// enumeration is represented by `{"names":[],"current_idx":0}`.
 pub fn keyboard_layouts() -> Value {
+    json!(snapshot())
+}
+
+pub(crate) fn snapshot() -> KeyboardLayoutsIpc {
     let (layouts, current_idx) = order_and_index(loaded_layouts(), foreground_layout());
-    let registry = RegistryKey::open();
-    let special_ids = match registry.as_ref() {
-        Some(key) if layouts.iter().any(|hkl| is_special(*hkl)) => special_layout_ids(key),
-        _ => Vec::new(),
-    };
-    let names: Vec<String> = layouts
-        .into_iter()
-        .map(|hkl| layout_name(hkl, registry.as_ref(), &special_ids))
-        .collect();
-    json!({ "names": names, "current_idx": current_idx })
+    let mut cache = NAMES.lock();
+    if cache.layouts != layouts {
+        // Registry/resource lookups only when the loaded list changes, never
+        // on each foreground/layout event (or animation state notification).
+        let registry = RegistryKey::open();
+        let special_ids = match registry.as_ref() {
+            Some(key) if layouts.iter().any(|hkl| is_special(*hkl)) => special_layout_ids(key),
+            _ => Vec::new(),
+        };
+        cache.names = layouts.iter().map(|hkl| layout_name(*hkl, registry.as_ref(), &special_ids)).collect();
+        cache.layouts = layouts;
+    }
+    KeyboardLayoutsIpc { names: cache.names.clone(), current_idx }
 }
 
 fn loaded_layouts() -> Vec<u32> {
@@ -310,238 +309,6 @@ fn layout_name(hkl: u32, registry: Option<&RegistryKey>, special_ids: &[LayoutId
     let display = registry_string(key, &subkey, "Layout Display Name");
     let text = registry_string(key, &subkey, "Layout Text");
     select_name(hkl, display.as_deref(), text.as_deref(), indirect_name)
-}
-
-// Win32 event codes and private watcher messages.
-const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
-const HSHELL_LANGUAGE: usize = 8;
-const WINEVENT_OUTOFCONTEXT: u32 = 0;
-const WM_LAYOUT_CHANGED: u32 = WM_APP + 0x351;
-const WM_STOP_WATCHER: u32 = WM_APP + 0x352;
-
-thread_local! {
-    // Out-of-context WinEvents run on the installing (pumping) thread, so no
-    // process-global HWND/hook routing or cross-thread raw pointers are needed.
-    static WATCHER_WINDOW: Cell<isize> = const { Cell::new(0) };
-    static SHELL_MESSAGE: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Owns the notification window, hook and pumping thread. Retain this guard for
-/// as long as IPC subscriptions should receive layout/foreground changes.
-#[must_use = "dropping the guard stops and joins the keyboard watcher"]
-pub struct KeyboardWatcher {
-    thread_id: u32,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-/// Start a hidden top-level window and its own message pump. No polling timers,
-/// keyboard/input hooks, or Tokio runtime are needed.
-pub fn start() -> Result<KeyboardWatcher, String> {
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<u32, String>>(1);
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
-    let thread = thread::Builder::new()
-        .name("wiri-ipc-keyboard".to_owned())
-        .spawn(move || match WatcherThread::create() {
-            Ok(watcher) => {
-                let thread_id = unsafe { GetCurrentThreadId() };
-                if ready_tx.send(Ok(thread_id)).is_ok() {
-                    crate::ipc::notify_state_changed();
-                    watcher.run(&thread_stop);
-                }
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
-            }
-        })
-        .map_err(|error| format!("Starting keyboard watcher thread: {error}"))?;
-
-    match ready_rx.recv() {
-        Ok(Ok(thread_id)) => Ok(KeyboardWatcher {
-            thread_id,
-            stop,
-            thread: Some(thread),
-        }),
-        result => {
-            let _ = thread.join();
-            Err(match result {
-                Ok(Err(error)) => error,
-                _ => "Keyboard watcher exited before reporting readiness".to_owned(),
-            })
-        }
-    }
-}
-
-impl Drop for KeyboardWatcher {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            if !thread.is_finished() {
-                // The queue exists before readiness is sent. If it is full,
-                // the stop flag still terminates the next pump iteration.
-                let _ = unsafe {
-                    PostThreadMessageW(self.thread_id, WM_STOP_WATCHER, WPARAM(0), LPARAM(0))
-                };
-            }
-            let _ = thread.join();
-        }
-    }
-}
-
-struct WatcherThread {
-    instance: HINSTANCE,
-    class_name: Vec<u16>,
-    hwnd: HWND,
-    hook: HWINEVENTHOOK,
-    shell_registered: bool,
-}
-
-impl WatcherThread {
-    fn create() -> Result<Self, String> {
-        let shell_name = wide("SHELLHOOK");
-        let shell_message = unsafe { RegisterWindowMessageW(PCWSTR(shell_name.as_ptr())) };
-        if shell_message == 0 {
-            return Err(format!("RegisterWindowMessageW(SHELLHOOK): {}", Error::from_win32()));
-        }
-        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }
-            .map_err(|error| format!("GetModuleHandleW: {error}"))?
-            .into();
-        let class_name = wide(&format!("WiriIpcKeyboard-{}", unsafe { GetCurrentThreadId() }));
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(window_proc),
-            hInstance: instance,
-            lpszClassName: PCWSTR(class_name.as_ptr()),
-            ..Default::default()
-        };
-        if unsafe { RegisterClassW(&class) } == 0 {
-            return Err(format!("RegisterClassW(keyboard): {}", Error::from_win32()));
-        }
-        // From here every partial startup failure runs the same cleanup path.
-        let mut owner = Self {
-            instance,
-            class_name,
-            hwnd: HWND::default(),
-            hook: HWINEVENTHOOK::default(),
-            shell_registered: false,
-        };
-        SHELL_MESSAGE.with(|message| message.set(shell_message));
-        owner.hwnd = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                PCWSTR(owner.class_name.as_ptr()),
-                PCWSTR(owner.class_name.as_ptr()),
-                WINDOW_STYLE(0), // No WS_VISIBLE; parent=None means top-level, NOT HWND_MESSAGE.
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                instance,
-                None,
-            )
-        }
-        .map_err(|error| format!("CreateWindowExW(keyboard): {error}"))?;
-        WATCHER_WINDOW.with(|window| window.set(owner.hwnd.0 as isize));
-        if !unsafe { RegisterShellHookWindow(owner.hwnd) }.as_bool() {
-            return Err(format!("RegisterShellHookWindow: {}", Error::from_win32()));
-        }
-        owner.shell_registered = true;
-        // Install on THIS pumping thread, not the IPC caller. Do not set
-        // WINEVENT_SKIPOWNPROCESS: foreground changes to our own UI matter too.
-        owner.hook = unsafe {
-            SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
-                HMODULE::default(),
-                Some(foreground_event),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            )
-        };
-        if owner.hook.is_invalid() {
-            return Err(format!("SetWinEventHook(foreground): {}", Error::from_win32()));
-        }
-        Ok(owner)
-    }
-
-    fn run(&self, stop: &AtomicBool) {
-        let mut message = MSG::default();
-        while !stop.load(Ordering::Acquire) {
-            let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
-            if result.0 == -1 {
-                tracing::warn!("Keyboard watcher GetMessageW failed: {}", Error::from_win32());
-                break;
-            }
-            if result.0 == 0 || message.message == WM_STOP_WATCHER {
-                break;
-            }
-            let _ = unsafe { TranslateMessage(&message) };
-            let _ = unsafe { DispatchMessageW(&message) };
-        }
-    }
-}
-
-impl Drop for WatcherThread {
-    fn drop(&mut self) {
-        WATCHER_WINDOW.with(|window| window.set(0));
-        if !self.hook.is_invalid() {
-            let _ = unsafe { UnhookWinEvent(self.hook) };
-        }
-        if self.shell_registered {
-            let _ = unsafe { DeregisterShellHookWindow(self.hwnd) };
-        }
-        if !self.hwnd.0.is_null() {
-            let _ = unsafe { DestroyWindow(self.hwnd) };
-        }
-        let _ = unsafe { UnregisterClassW(PCWSTR(self.class_name.as_ptr()), self.instance) };
-        SHELL_MESSAGE.with(|message| message.set(0));
-    }
-}
-
-unsafe extern "system" fn foreground_event(
-    _hook: HWINEVENTHOOK,
-    event: u32,
-    _hwnd: HWND,
-    _object: i32,
-    _child: i32,
-    _thread: u32,
-    _time: u32,
-) {
-    if event == EVENT_SYSTEM_FOREGROUND {
-        WATCHER_WINDOW.with(|window| {
-            let raw = window.get();
-            if raw != 0 {
-                // Never run IPC work re-entrantly inside a WinEvent callback.
-                let _ = unsafe {
-                    PostMessageW(HWND(raw as *mut _), WM_LAYOUT_CHANGED, WPARAM(0), LPARAM(0))
-                };
-            }
-        });
-    }
-}
-
-unsafe extern "system" fn window_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    let language_changed = SHELL_MESSAGE.with(|shell| {
-        shell.get() != 0 && message == shell.get() && wparam.0 == HSHELL_LANGUAGE
-    });
-    if language_changed || message == WM_LAYOUT_CHANGED || message == WM_SETTINGCHANGE {
-        // There is no cache to invalidate; the parent resamples and diffs.
-        crate::ipc::notify_state_changed();
-        return LRESULT(0);
-    }
-    if message == WM_CLOSE || message == WM_DESTROY {
-        unsafe { PostQuitMessage(0) };
-        return LRESULT(0);
-    }
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 #[cfg(test)]

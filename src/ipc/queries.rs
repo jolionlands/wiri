@@ -112,6 +112,7 @@ fn render_outputs(
             // No reliable per-output Windows capability/state source yet.
             "vrr_supported": Value::Null,
             "vrr_enabled": Value::Null,
+            "max_bpc": Value::Null,
             "logical": logical,
         }));
     }
@@ -406,6 +407,9 @@ pub fn change_output(
             engine.set_output_name(current.id, &current.name);
         }
     }
+    // Scale-only changes generate no WM_DISPLAYCHANGE. Apply the new layout
+    // now rather than waiting for an unrelated action to position the windows.
+    engine.apply_all(backend);
     drop(engine);
     super::notify_state_changed();
     Ok(json!({"output": monitor.name, "temporary": true}))
@@ -507,7 +511,7 @@ mod tests {
         assert!(output["logical"]["transform"].is_null());
         assert_eq!(output["modes"], json!([]));
         assert_eq!(output["make"], "");
-        for key in ["physical_size", "current_mode", "vrr_supported", "vrr_enabled"] {
+        for key in ["physical_size", "current_mode", "vrr_supported", "vrr_enabled", "max_bpc"] {
             assert!(output[key].is_null(), "{key}");
         }
         assert_eq!(focused_output(&engine, None), *output);
