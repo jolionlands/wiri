@@ -121,6 +121,8 @@ pub enum BackendEvent {
     ForegroundChanged {
         hwnd: isize,
     },
+    /// Actual native z-order changed (often reported on the desktop client).
+    ZOrderChanged,
     WindowTitleChanged {
         hwnd: isize,
     },

@@ -21,8 +21,9 @@ const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
 const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
 const EVENT_OBJECT_DESTROY: u32 = 0x8001;
-const EVENT_OBJECT_SHOW: u32 = 0x8003;
-const EVENT_OBJECT_HIDE: u32 = 0x8004;
+const EVENT_OBJECT_SHOW: u32 = 0x8002;
+const EVENT_OBJECT_HIDE: u32 = 0x8003;
+const EVENT_OBJECT_REORDER: u32 = 0x8004;
 /// EVENT_OBJECT_STATECHANGE (0x800A) fires when an object's accessibility
 /// state changes — including the STATE_SYSTEM_ALERT bit that apps set when
 /// requesting urgent attention (often accompanies FlashWindow). Monitoring
@@ -113,7 +114,7 @@ fn register_winevent_hooks() -> Vec<HWINEVENTHOOK> {
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE),
         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY),
-        (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_SHOW, EVENT_OBJECT_REORDER),
         (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
         (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
@@ -162,6 +163,33 @@ fn run_winevent_message_loop() {
     }
 }
 
+/// USER reports top-level reorders on OBJID_WINDOW or the desktop's OBJID_CLIENT.
+/// Other accessibility controls/children must not turn into whole-desktop repairs.
+fn window_event_object(event: u32, object: i32, child: i32) -> bool {
+    child == 0 && (object == 0 || (event == EVENT_OBJECT_REORDER && object == -4))
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn reorder_accepts_desktop_client_but_not_accessibility_children() {
+        assert!(window_event_object(EVENT_OBJECT_REORDER, 0, 0));
+        assert!(window_event_object(EVENT_OBJECT_REORDER, -4, 0));
+        assert!(!window_event_object(EVENT_OBJECT_REORDER, -4, 1));
+        assert!(!window_event_object(EVENT_OBJECT_REORDER, -8, 0));
+        assert!(!window_event_object(EVENT_OBJECT_LOCATIONCHANGE, -4, 0));
+    }
+
+    #[test]
+    fn show_hide_and_reorder_use_distinct_native_event_ids() {
+        assert_eq!(EVENT_OBJECT_SHOW, 0x8002);
+        assert_eq!(EVENT_OBJECT_HIDE, 0x8003);
+        assert_eq!(EVENT_OBJECT_REORDER, 0x8004);
+    }
+}
+
 unsafe extern "system" fn winevent_proc(
     _event_hook: HWINEVENTHOOK,
     event_type: u32,
@@ -171,7 +199,7 @@ unsafe extern "system" fn winevent_proc(
     _id_thread: u32,
     _timestamp: u32,
 ) {
-    if id_object != 0 || id_child != 0 {
+    if !window_event_object(event_type, id_object, id_child) {
         return;
     }
 
@@ -255,7 +283,7 @@ unsafe extern "system" fn winevent_proc(
             backend.send_event(BackendEvent::WindowDestroyed { hwnd: hwnd_isize });
             backend.remove_window(hwnd_isize);
         }
-        0x8003 => {
+        EVENT_OBJECT_SHOW => {
             // EVENT_OBJECT_SHOW
             // A SHOW event is the first reliable point at which a top-level
             // window has its real title / class / styles set. The earlier
@@ -273,7 +301,7 @@ unsafe extern "system" fn winevent_proc(
             backend.update_window(hwnd_isize, info);
             backend.send_event(BackendEvent::WindowShown { hwnd: hwnd_isize });
         }
-        0x8004 => {
+        EVENT_OBJECT_HIDE => {
             // EVENT_OBJECT_HIDE
             if let Some(mut info) = backend.get_window(hwnd.0 as isize) {
                 info.is_visible = false;
@@ -282,6 +310,11 @@ unsafe extern "system" fn winevent_proc(
                     hwnd: hwnd.0 as isize,
                 });
             }
+        }
+        EVENT_OBJECT_REORDER => {
+            // Top-level z-order changes may name the desktop's client object, not
+            // the tile that moved. Re-read the actual stack, never classify this as HIDE.
+            backend.send_event(BackendEvent::ZOrderChanged);
         }
         0x800A => {
             // EVENT_OBJECT_STATECHANGE — accessibility state changed.

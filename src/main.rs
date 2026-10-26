@@ -1174,6 +1174,7 @@ fn handle_backend_event(
     // CBT notices that are only logged.
     let _state_changed = match &event {
         BackendEvent::WindowMoved { .. }
+        | BackendEvent::ZOrderChanged
         | BackendEvent::WindowResized { .. }
         | BackendEvent::WindowMoveResizeStart { .. }
         | BackendEvent::CbtCreateWindow { .. }
@@ -1260,6 +1261,9 @@ fn handle_backend_event(
                     workspace_id: number,
                 });
             }
+        }
+        BackendEvent::ZOrderChanged => {
+            engine.read().reconcile_float_z_order();
         }
         // Window position/title changes from external sources are
         // overridden by the tiling engine on next layout pass; but we

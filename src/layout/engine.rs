@@ -23,6 +23,7 @@ use sizing::DrawMode;
 mod ipcview;
 // What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
 mod decor;
+mod float_stack;
 mod motion;
 mod native_move;
 mod overview;
@@ -4312,44 +4313,6 @@ impl TilingEngine {
         }
         if newly_shown {
             self.raise_floats(output_id);
-        }
-    }
-
-    /// Put the floating windows of the active workspace of `output_id` above every
-    /// tile again, oldest first so that the most recently used stays on top.  The
-    /// request is asynchronous (it never waits for a hung application).
-    fn raise_floats(&self, output_id: OutputId) {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, HWND_TOP, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        };
-        let Some(active) = self.monitors.get(&output_id).map(|m| m.active_workspace) else {
-            return;
-        };
-        let mut floats: Vec<(u64, WindowId)> = self
-            .float_homes
-            .iter()
-            .filter(|(wid, home)| {
-                home.output == output_id
-                    && home.workspace == active
-                    && !self.fullscreen_windows.contains(*wid)
-                    && !self.minimized.contains_key(*wid)
-            })
-            .map(|(wid, home)| (home.seq, *wid))
-            .collect();
-        floats.sort_by_key(|(seq, _)| *seq);
-        for (_, wid) in floats {
-            unsafe {
-                let _ = SetWindowPos(
-                    HWND(wid.as_isize() as *mut std::ffi::c_void),
-                    HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
-                );
-            }
         }
     }
 
