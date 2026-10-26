@@ -124,11 +124,14 @@ mod tests {
         let prior = engine.applied_state.get(&id).unwrap().rect;
         engine.animating_rects.insert(
             id,
-            (
+            crate::layout::animation::RectAnimation::new(
                 prior,
                 prior,
-                std::time::Instant::now(),
-                std::time::Duration::from_secs(1),
+                crate::layout::animation::AnimationKind::Easing {
+                    duration_ms: 1000,
+                    curve: crate::layout::animation::Easing::Linear,
+                },
+                1.0,
             ),
         );
         engine.native_move_resize_start(id);

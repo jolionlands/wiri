@@ -2870,7 +2870,11 @@ mod tests {
     fn the_unsupported_layout_options_are_warnings() {
         let d = load("layout {\n    center-focused-column \"never\"\n    preset-column-widths { proportion 0.5; }\n    tab-indicator { off }\n    empty-workspace-above-first\n}\n");
         assert!(errors(&d).is_empty());
-        assert_eq!(warnings(&d).len(), 1, "only empty-workspace-above-first is unsupported");
+        assert_eq!(
+            warnings(&d).len(),
+            1,
+            "only empty-workspace-above-first is unsupported"
+        );
         assert!(d.config.layout.effects.tab_indicator.off);
         assert_eq!(d.config.layout.center_focused_column, "never");
         assert_eq!(

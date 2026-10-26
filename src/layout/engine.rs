@@ -24,12 +24,12 @@ mod ipcview;
 // What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
 mod decor;
 mod motion;
-mod overview;
-mod recent;
-mod tabs;
 mod native_move;
+mod overview;
 mod presets;
+mod recent;
 mod strip_model;
+mod tabs;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
