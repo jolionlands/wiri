@@ -467,7 +467,10 @@ impl TilingEngine {
         let monitor = self.monitors.get(&output)?;
         let cfg = self.effective_config(output);
         let view = Self::view_width_for_monitor(monitor, cfg);
-        let border = 2 * cfg.border_inset();
+        let border = 2 * rules
+            .effects
+            .border
+            .inset(&cfg.effects.border, cfg.border_inset());
         let px = match rules.default_column_width {
             Some(Some(spec)) => spec_px(spec, view, cfg.column_gap, border),
             // The empty block: the window picks its own width, that is the one it opened with.
@@ -486,7 +489,10 @@ impl TilingEngine {
         rules: &ResolvedWindowRules,
     ) -> Option<u32> {
         let cfg = self.effective_config(output);
-        let border = 2 * cfg.border_inset();
+        let border = 2 * rules
+            .effects
+            .border
+            .inset(&cfg.effects.border, cfg.border_inset());
         let px = match rules.default_window_height {
             Some(Some(spec)) => spec_px(spec, self.view_height_for(output), cfg.window_gap, border),
             Some(None) => window.bounds.size.h as i32 + border,
@@ -618,8 +624,9 @@ impl TilingEngine {
     ) {
         let floating = self.floating_windows.contains(&window_id);
         if floating {
-            // Floats are not laid out: their alpha is set here.
+            // Floats are not placed by the tiled layout pass.
             self.sync_window_opacity(window_id);
+            self.refresh_rule_effects(window_id, backend);
         }
         if rules.open_maximized == Some(true) && !floating {
             self.open_maximized_column(window_id);
@@ -782,9 +789,13 @@ impl TilingEngine {
             return false;
         };
         let changed = !state.resolved.same_dynamic_part(&resolved);
+        let effects_changed = state.resolved.effects != resolved.effects;
         state.resolved = resolved;
         if changed {
             self.apply_dynamic_rules(window_id, backend);
+        }
+        if effects_changed {
+            self.refresh_rule_effects(window_id, backend);
         }
         changed
     }
@@ -882,9 +893,17 @@ impl TilingEngine {
 
     /// The window started or stopped asking for attention (it flashes in the taskbar).
     pub fn window_urgency_changed(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let urgent = crate::backend::hooks::is_urgent_hwnd(window_id.as_isize())
+            && self.os_foreground != Some(window_id);
+        if urgent {
+            self.mark_urgent(window_id);
+        } else {
+            self.clear_urgent(window_id);
+        }
         if self.rule_flags.urgency {
             self.reevaluate_window_rules(window_id, backend);
         }
+        self.refresh_rule_effects(window_id, backend);
     }
 
     /// The foreground window changed from `previous` to `window_id`: the rules that depend

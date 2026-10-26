@@ -81,6 +81,12 @@ impl TilingEngine {
             }
         }
         let _ = backend.set_window_positions_batched(&frames);
+        // Placement can be asynchronous: clip the observed visible frame, not
+        // the timeline target. Do not invalidate on every animation tick; the
+        // relative-size/inset cache already detects real geometry changes.
+        for (hwnd, _, _) in &frames {
+            self.sync_native_clip(WindowId::new(*hwnd));
+        }
         for wid in finished {
             self.animating_rects.remove(&wid);
         }

@@ -147,23 +147,41 @@ impl RRect {
     /// `rect` (screen pixels) as a rectangle of the surface whose top-left corner is at
     /// `origin` on the screen, with the same radius at every corner.
     pub fn of(rect: Rect, origin: (i32, i32), radius: f32) -> Self {
+        Self::of_corners(rect, origin, [radius; 4])
+    }
+
+    /// As [`Self::of`], with top-left, top-right, bottom-right and bottom-left radii.
+    pub fn of_corners(rect: Rect, origin: (i32, i32), radii: [f32; 4]) -> Self {
         let mut rr = RRect {
             x: (rect.loc.x - origin.0) as f32,
             y: (rect.loc.y - origin.1) as f32,
             w: rect.size.w as f32,
             h: rect.size.h as f32,
-            r: [radius; 4],
+            r: radii,
         };
         rr.fit();
         rr
     }
 
-    /// Keep every radius within half of the shorter side.
+    /// CSS corner-overlap reduction, as in niri's `CornerRadius::fit_to`: scale all radii
+    /// together until the two on each edge fit. A single corner may exceed half a side.
     fn fit(&mut self) {
-        let max = (self.w.min(self.h) / 2.0).max(0.0);
-        for r in self.r.iter_mut() {
-            *r = r.clamp(0.0, max);
+        for r in &mut self.r {
+            *r = if r.is_finite() { r.max(0.0) } else { 0.0 };
         }
+        let [tl, tr, br, bl] = self.r;
+        let mut scale = 1.0f32;
+        for (side, sum) in [
+            (self.w, tl + tr),
+            (self.w, bl + br),
+            (self.h, tl + bl),
+            (self.h, tr + br),
+        ] {
+            if sum > 0.0 {
+                scale = scale.min(side.max(0.0) / sum);
+            }
+        }
+        self.r = self.r.map(|r| r * scale);
     }
 
     pub fn right(&self) -> f32 {
@@ -199,20 +217,24 @@ impl RRect {
 
     /// Signed distance from the point to the outline: negative inside, positive outside.
     pub fn sdf(&self, px: f32, py: f32) -> f32 {
-        let cx = self.x + self.w / 2.0;
-        let cy = self.y + self.h / 2.0;
-        let qx = px - cx;
-        let qy = py - cy;
-        let r = match (qx < 0.0, qy < 0.0) {
-            (true, true) => self.r[0],
-            (false, true) => self.r[1],
-            (false, false) => self.r[2],
-            (true, false) => self.r[3],
-        };
-        let ax = qx.abs() - (self.w / 2.0 - r);
-        let ay = qy.abs() - (self.h / 2.0 - r);
-        let outside = (ax.max(0.0) * ax.max(0.0) + ay.max(0.0) * ay.max(0.0)).sqrt();
-        outside + ax.max(ay).min(0.0) - r
+        let x = px - self.x;
+        let y = py - self.y;
+        let ax = (-x).max(x - self.w);
+        let ay = (-y).max(y - self.h);
+        let mut distance = ax.max(0.0).hypot(ay.max(0.0)) + ax.max(ay).min(0.0);
+        // Test the corner squares, not the rectangle's quadrants: unequal CSS radii can
+        // cross its centre. Opposite corner squares can overlap, so consider all four.
+        for (r, dx, dy) in [
+            (self.r[0], x, y),
+            (self.r[1], self.w - x, y),
+            (self.r[2], self.w - x, self.h - y),
+            (self.r[3], x, self.h - y),
+        ] {
+            if r > 0.0 && dx < r && dy < r {
+                distance = distance.max((dx - r).hypot(dy - r) - r);
+            }
+        }
+        distance
     }
 
     /// How much of the pixel centred on `(px, py)` the shape covers, 0 to 1.
@@ -501,6 +523,38 @@ mod tests {
         );
         let square = RRect::of(Rect::new(20, 20, 100, 100), (0, 0), 0.0).outset(4.0);
         assert_eq!(square.r, [0.0; 4]);
+    }
+
+    #[test]
+    fn unequal_corners_are_fitted_proportionally_without_rounding_square_ones() {
+        let rr = RRect::of_corners(Rect::new(10, 20, 100, 60), (5, 10), [80.0, 40.0, 0.0, 20.0]);
+        // The left edge is limiting: (80 + 20) * 0.6 = 60.
+        assert_eq!((rr.x, rr.y), (5.0, 10.0));
+        for (actual, expected) in rr.r.into_iter().zip([48.0, 24.0, 0.0, 12.0]) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+        assert_eq!(rr.outset(4.0).r, [52.0, 28.0, 0.0, 16.0]);
+        assert_eq!(rr.outset(-30.0).r, [0.0; 4]);
+    }
+
+    #[test]
+    fn a_large_single_corner_is_not_clamped_to_half_a_side() {
+        let rr = RRect::of_corners(Rect::new(0, 0, 100, 20), (0, 0), [20.0, 0.0, 0.0, 0.0]);
+        assert_eq!(rr.r, [20.0, 0.0, 0.0, 0.0]);
+        // This arc crosses the vertical centre of the rectangle.
+        assert!((rr.sdf(0.0, 20.0)).abs() < 1e-5);
+        assert!((rr.sdf(5.0, 15.0) - (15.0f32.hypot(5.0) - 20.0)).abs() < 1e-5);
+        assert_eq!(rr.coverage(99.5, 0.5), 1.0, "top-right stays square");
+    }
+
+    #[test]
+    fn overlapping_opposite_corner_squares_use_both_arcs() {
+        let rr = RRect::of_corners(Rect::new(0, 0, 100, 100), (0, 0), [80.0, 0.0, 80.0, 0.0]);
+        assert!(rr.sdf(21.0, 21.0) > 0.0);
+        assert!(rr.sdf(79.0, 79.0) > 0.0);
+        assert!(rr.sdf(50.0, 50.0) < 0.0);
+        assert_eq!(rr.coverage(99.5, 0.5), 1.0);
+        assert_eq!(rr.coverage(0.5, 99.5), 1.0);
     }
 
     #[test]

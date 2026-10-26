@@ -25,10 +25,12 @@ mod ipcview;
 mod decor;
 mod float_stack;
 mod motion;
+mod native_clip;
 mod native_move;
 mod overview;
 mod presets;
 mod recent;
+mod rule_effects;
 mod strip_model;
 mod tabs;
 
@@ -709,6 +711,8 @@ pub struct TilingEngine {
     /// Windows marked urgent (e.g. via WM_FLASHWINDOW or external hook).
     /// Populated by mark_urgent / cleared by clear_urgent.
     urgent_windows: HashSet<WindowId>,
+    /// Original foreign-window regions, allocated only for opt-in geometry clipping.
+    native_clips: native_clip::ClipState,
     /// Windows whose DWM shadow state has already been applied this session.
     /// `apply_shadow_for_window` is a one-shot per-HWND call: re-issuing the
     /// `DwmExtendFrameIntoClientArea` margins on every layout pass causes some
@@ -812,6 +816,7 @@ impl TilingEngine {
             auto_tile_threshold: None,
             auto_tile_zoom: None,
             urgent_windows: HashSet::new(),
+            native_clips: Default::default(),
             shadow_applied: HashSet::new(),
             blur_applied: HashSet::new(),
             thumbnail_overview: None,
@@ -1831,6 +1836,7 @@ impl TilingEngine {
     }
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        self.native_clips.remove(window_id);
         self.native_moves.remove(&window_id);
         self.animating_rects.remove(&window_id);
         self.forget_rule_state(window_id);
@@ -1951,14 +1957,24 @@ impl TilingEngine {
         let limits = &self.rule_limits;
         let heights = &self.rule_heights;
         let global_border = 2 * self.config.border_inset() as u32;
+        let states = &self.rule_state;
         let per_monitor = &self.config_per_monitor;
         for (output, monitor) in self.monitors.iter_mut() {
+            let cfg = per_monitor.get(output).unwrap_or(&self.config);
             let border = per_monitor
                 .get(output)
                 .map_or(global_border, |c| 2 * c.border_inset() as u32);
             for workspace in monitor.workspaces.values_mut() {
                 for column in workspace.columns.iter_mut() {
                     for tile in column.tiles.iter_mut() {
+                        let border = states.get(&tile.window_id).map_or(border, |s| {
+                            2 * s
+                                .resolved
+                                .effects
+                                .border
+                                .inset(&cfg.effects.border, cfg.border_inset())
+                                as u32
+                        });
                         let window_min = known.get(&tile.window_id).copied().unwrap_or(0);
                         let rule = limits.get(&tile.window_id).copied().unwrap_or_default();
                         // Both native and rule minima describe the visible window; a tile
@@ -2751,8 +2767,6 @@ impl TilingEngine {
         } else {
             None
         };
-        let border_w = eff_cfg.border_inset();
-
         // Resolve the focused border colour for this pass.  When the user
         // opted into `border-color-focused "accent"` we read the live
         // Windows accent (cached for 30 s) and convert it to a `#rrggbb`
@@ -2878,7 +2892,7 @@ impl TilingEngine {
             // shown with the DWM border colour instead of with geometry.
             // A tile that is fullscreen or maximized to the edges has no border around it.
             let inset = if draw_mode == DrawMode::Inset {
-                border_w
+                self.rule_border_inset(window_id, &eff_cfg)
             } else {
                 0
             };
@@ -2891,7 +2905,10 @@ impl TilingEngine {
 
             // The corner radius the config asks for, as the preference DWM understands (windows
             // keep what they have when it asks for none, and on Windows 10 there is nothing to ask).
-            let new_corner: u32 = match eff_cfg.effects.corner_radius {
+            let new_corner: u32 = match self
+                .rule_corner_radius(window_id, output_id)
+                .or(eff_cfg.effects.corner_radius)
+            {
                 Some(n) if crate::backend::osversion::supports_rounded_corners() => {
                     decor::dwm_corner_for(n).0 as u32
                 }
@@ -3217,6 +3234,12 @@ impl TilingEngine {
         // the backend ignores the call when the window is already visible.
         for &sticky_wid in &self.sticky_windows {
             let _ = backend.show_window(sticky_wid.as_isize(), true);
+        }
+
+        // Include cache-hit placements: an observed resize or DPI change can alter the
+        // region without changing the requested layout. No GDI work for unchanged masks.
+        for &window in position_map.keys() {
+            self.sync_native_clip(window);
         }
 
         // The overlay layer draws the focus ring, the border and the shadow around the tiles
@@ -4487,6 +4510,7 @@ impl TilingEngine {
             home.rect = rect;
         }
         self.float_memory.insert(window_id, rect);
+        self.sync_native_clip(window_id);
     }
 
     /// Absolute pointer-grab writeback; shares floating memory, rule limits and work-area
@@ -5173,6 +5197,7 @@ impl TilingEngine {
             }
         }
 
+        self.sync_native_clip(window_id);
         updated
     }
 
@@ -7838,6 +7863,7 @@ impl TilingEngine {
     /// Called on graceful shutdown so the user gets their layout back instead
     /// of windows frozen in the wiri tile positions.
     pub fn restore_all(&mut self, backend: &BackendHandle) {
+        self.native_clips.restore_all();
         self.recent_reset();
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;

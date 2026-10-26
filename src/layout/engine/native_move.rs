@@ -25,6 +25,7 @@ impl TilingEngine {
         // Read the final frame unconditionally, not the throttled LOCATIONCHANGE cache.
         let rect = Self::live_window_rect(id);
         self.finish_native_move(id, rect);
+        self.sync_native_clip(id);
         self.apply_all(backend);
     }
 
@@ -36,6 +37,11 @@ impl TilingEngine {
         self.applied_state.remove(&id);
         self.animating_rects.remove(&id);
         let Some(rect) = final_rect else { return };
+        if rect.size != before.size {
+            // App-side native resize processing can replace the HWND's region.
+            // Invalidate only this observed size change, never every move/frame.
+            self.native_clips.invalidate(id);
+        }
         if let Some(home) = self.float_homes.get_mut(&id) {
             if home.rect.size.w != rect.size.w {
                 home.width_preset_idx = None;

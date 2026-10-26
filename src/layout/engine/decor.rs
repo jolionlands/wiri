@@ -104,6 +104,7 @@ pub(super) fn frame_specs(
                 tile,
                 band,
                 radius: inputs.radius,
+                corners: None,
                 border,
                 ring_width: if ring.is_some() { ring_width } else { 0 },
                 ring,
@@ -168,6 +169,7 @@ fn tab_specs(
     focused_output: bool,
     view: Rect,
     accent: Option<[u8; 4]>,
+    rule_states: Option<&HashMap<WindowId, super::rules::RuleState>>,
 ) -> Vec<DecorSpec> {
     use crate::layout::workspace::ColumnDisplay;
     use crate::overlay::decor::TabsSpec;
@@ -203,6 +205,10 @@ fn tab_specs(
                 .iter()
                 .enumerate()
                 .map(|(i, tile)| {
+                    let mut style = style.clone();
+                    if let Some(state) = rule_states.and_then(|s| s.get(&tile.window_id)) {
+                        state.resolved.effects.tab_indicator.apply(&mut style);
+                    }
                     let is_urgent = urgent.contains(&tile.window_id);
                     let paint = if is_urgent {
                         style.urgent.as_ref()
@@ -300,7 +306,7 @@ impl TilingEngine {
         let lone_tile = monitor.workspace().map_or(false, |ws| {
             ws.columns.len() == 1 && ws.columns[0].tiles.len() == 1
         });
-        let tiles: Vec<(WindowId, Rect, DrawMode)> = positions
+        let mut tiles: Vec<(WindowId, Rect, DrawMode)> = positions
             .iter()
             .filter(|(wid, _)| {
                 !self.floating_windows.contains(wid) && !self.minimized.contains_key(wid)
@@ -327,7 +333,67 @@ impl TilingEngine {
             ),
             lone_tile,
         };
-        let mut specs = frame_specs(&inputs, &tiles);
+        // Floats keep their window size; their border is outside that rectangle.
+        for wid in &self.floating_windows {
+            if self.float_location(*wid) != Some((output_id, monitor.active_workspace))
+                || self.minimized.contains_key(wid)
+            {
+                continue;
+            }
+            if let Some(rect) = self.float_rect_of(*wid) {
+                let band = self.rule_border_inset(*wid, cfg);
+                tiles.push((
+                    *wid,
+                    Rect::new(
+                        rect.loc.x - band,
+                        rect.loc.y - band,
+                        rect.size.w + 2 * band as u32,
+                        rect.size.h + 2 * band as u32,
+                    ),
+                    DrawMode::Inset,
+                ));
+            }
+        }
+        let mut specs = Vec::new();
+        for tile in &tiles {
+            let mut per_window = cfg.clone();
+            if let Some(state) = self.rule_state.get(&tile.0) {
+                per_window.effects = state.resolved.effects.apply_to(&cfg.effects);
+            }
+            per_window.border_width = self.rule_border_inset(tile.0, cfg);
+            let radius = self
+                .rule_state
+                .get(&tile.0)
+                .and_then(|s| s.resolved.effects.geometry_corner_radius)
+                .map_or(inputs.radius, |r| r[0] * monitor.scale_factor as f32);
+            let active = if self
+                .os_foreground
+                .map_or(false, |w| self.floating_windows.contains(&w))
+            {
+                self.os_foreground
+            } else {
+                inputs.active
+            };
+            let window_inputs = FrameInputs {
+                cfg: &per_window,
+                radius,
+                active,
+                ..inputs
+            };
+            let mut frames = frame_specs(&window_inputs, std::slice::from_ref(tile));
+            if let Some(corners) = self
+                .rule_state
+                .get(&tile.0)
+                .and_then(|s| s.resolved.effects.geometry_corner_radius)
+            {
+                for frame in &mut frames {
+                    if let crate::overlay::decor::DecorContent::Frame(spec) = &mut frame.content {
+                        spec.corners = Some(corners.map(|r| r * monitor.scale_factor as f32));
+                    }
+                }
+            }
+            specs.extend(frames);
+        }
         if let Some(ws) = monitor.workspace() {
             specs.extend(tab_specs(
                 cfg,
@@ -338,6 +404,7 @@ impl TilingEngine {
                 inputs.focus_monitor,
                 view,
                 inputs.accent,
+                Some(&self.rule_state),
             ));
         }
         sink.set_output(key, specs);

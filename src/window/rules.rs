@@ -35,6 +35,8 @@ pub fn resolve_window_rules(rules: &[WindowRule], ctx: &MatcherContext<'_>) -> R
 
     for rule in rules {
         if rule.matches(ctx) {
+            // Apply only specified appearance keys; never reset a block to defaults.
+            resolved.effects.merge(&rule.effects);
             // Apply this rule's properties to the resolved rules
             if rule.floating {
                 resolved.float = true;

@@ -815,7 +815,7 @@ impl MessageLoop {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        crate::ipc::keyboard_notify::observe_message(msg, wparam.0);
+        crate::ipc::keyboard_notify::observe_message(msg, wparam.0, lparam.0);
         match msg {
             WM_DESTROY => {
                 PostQuitMessage(0);
