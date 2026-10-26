@@ -186,14 +186,35 @@ public static class WiriCiNoise {
     }
 }
 '@
+            # The prompt comes back every 30 s and wiri tiles and activates it within about 70 ms, faster than
+            # any poll: stop it when the process starts (WMI process-start trace), and poll as a fallback.
+            # The parent is recorded to find what relaunches it.
+            $traced = $true
+            try {
+                Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -Filter "ProcessName='wsl.exe'" -SourceIdentifier WiriWslStart -ErrorAction Stop
+            } catch { $traced = $false; "process-start trace unavailable: $($_.Exception.Message)" }
+            function Parent([int]$parentId) {
+                $p = Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
+                if ($p) { "$parentId $($p.Name) $($p.CommandLine)" } else { "$parentId (gone)" }
+            }
             while ($true) {
-                foreach ($p in @(Get-Process -Name wsl -ErrorAction SilentlyContinue)) {
-                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-                    "stopped wsl.exe pid $($p.Id) at $(Get-Date -Format HH:mm:ss.fff)"
+                if ($traced) {
+                    $e = Wait-Event -SourceIdentifier WiriWslStart -Timeout 1
+                    if ($e) {
+                        $n = $e.SourceEventArgs.NewEvent
+                        Stop-Process -Id $n.ProcessID -Force -ErrorAction SilentlyContinue
+                        "stopped wsl.exe pid $($n.ProcessID) at start $(Get-Date -Format HH:mm:ss.fff); parent $(Parent $n.ParentProcessID)"
+                        Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
+                    }
+                } else {
+                    Start-Sleep -Milliseconds 500
+                }
+                foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" -ErrorAction SilentlyContinue)) {
+                    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+                    "stopped wsl.exe pid $($p.ProcessId) by poll at $(Get-Date -Format HH:mm:ss.fff); parent $(Parent $p.ParentProcessId)"
                 }
                 $closed = [WiriCiNoise]::ClosePagingFileNotices()
                 if ($closed -gt 0) { "closed $closed paging-file notice(s) at $(Get-Date -Format HH:mm:ss.fff)" }
-                Start-Sleep -Milliseconds 500
             }
         }
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\live-test.ps1') -Bin $Bin -Out $evidence
@@ -220,7 +241,7 @@ public static class WiriCiNoise {
 } finally {
     if ($wslGuard) {
         Stop-Job $wslGuard -ErrorAction SilentlyContinue
-        $preflight['wsl_prompts_stopped'] = @(Receive-Job $wslGuard -ErrorAction SilentlyContinue)
+        $preflight['wsl_prompts_stopped'] = @(Receive-Job $wslGuard -ErrorAction SilentlyContinue | ForEach-Object { "$_" })
         Remove-Job $wslGuard -Force -ErrorAction SilentlyContinue
     }
     $env:APPDATA = $oldAppData
