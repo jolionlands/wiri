@@ -399,6 +399,8 @@ pub fn spawn_command_argv(command: &str, args: &[String]) -> Vec<String> {
 /// Start the program `argv[0]` with the arguments `argv[1..]`, each passed
 /// through intact.  Returns the process id.
 pub fn spawn_argv(argv: &[String]) -> Result<u32> {
+    let expanded = crate::input::system_actions::expand_spawn_argv(argv);
+    let argv = expanded.as_slice();
     if argv.is_empty() || argv[0].trim().is_empty() {
         anyhow::bail!("nothing to run: the command is empty");
     }

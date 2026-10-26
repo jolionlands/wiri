@@ -12,6 +12,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add an on-demand focused-output screenshot UI with selection/Space-drag, pointer toggle, save/copy/cancel and absolute destinations through binds, CLI and typed IPC. Frames are frozen before the initially nonactivating host is shown; UI pixels never enter the saved crop.
 - Add pure geometry/options tests and H46 locked desktop checks (validation pending). No new crate, timer or idle worker.
 
+### Lane S item 3 — non-layout system actions
+- Add foreground keyboard-layout switching, managed-window urgency actions without focus changes, asynchronous quit confirmation with an explicit skip flag, active config-file switching, monitor power controls and suspend. Spawn expands only a leading home component in its executable, never the other arguments.
+- Add pure parser, typed-wire, layout-selection and urgency tests. Power actions support the `WIRI_SYSTEM_ACTIONS_DRY_RUN` audit-file hook; unit tests never change power state or display quit dialogs. Integration validation is pending; no new pass totals are claimed.
+
 ### Phase 2B integration — desktop sign-off
 - Integrated release validation passes: 1114 library + 7 CLI tests, build and all-target check with warnings denied. The complete locked desktop run passes 440 gates, zero failures (102/102 Lane A checks; Lane B/D retained); perf collector errors and final H9 terminal overlaps are zero. Record earlier findings, measured resting cost and remaining limits in the Phase 2B report; recount matrix totals without claiming new features.
 

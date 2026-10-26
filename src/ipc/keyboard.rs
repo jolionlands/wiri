@@ -1,18 +1,21 @@
-//! Loaded keyboard layouts, queried on demand. Notifications use the existing
-//! hotkey window (`keyboard_notify`) and foreground hook: no thread or window.
+//! Loaded keyboard layouts and foreground layout requests. Notifications use the
+//! existing hotkey window (`keyboard_notify`) and foreground hook: no thread or window.
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 
 use super::messages::KeyboardLayoutsIpc;
+use crate::input::system_actions::LayoutSwitchTarget;
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS};
+use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, LPARAM, WPARAM};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
     RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, GetKeyboardLayoutList, HKL};
 use windows::Win32::UI::Shell::SHLoadIndirectString;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
+};
 
 #[derive(Default)]
 struct NamesCache {
@@ -38,8 +41,41 @@ pub fn keyboard_layouts() -> Value {
     json!(snapshot())
 }
 
+/// Queue a layout change for the foreground window using snapshot ordering.
+/// Indices are zero-based. Success only means the request was posted; the
+/// foreground application may still reject it.
+pub(crate) fn switch_layout(target: LayoutSwitchTarget) -> Result<(), String> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return Err("cannot switch keyboard layout: no foreground window".to_owned());
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    // Zero would query this IPC thread, not the foreground window's thread.
+    if thread_id == 0 {
+        return Err("cannot switch keyboard layout: no foreground window thread".to_owned());
+    }
+    let layouts = loaded_layouts();
+    let current = unsafe { GetKeyboardLayout(thread_id) };
+    if current.0.is_null() {
+        return Err("cannot switch keyboard layout: no foreground keyboard layout".to_owned());
+    }
+    let selected = select_layout(&layouts, current, target)?;
+    unsafe {
+        PostMessageW(
+            hwnd,
+            WM_INPUTLANGCHANGEREQUEST,
+            WPARAM(0),
+            LPARAM(selected.0 as isize),
+        )
+    }
+    .map_err(|error| format!("failed to post keyboard layout switch request: {error}"))
+}
+
 pub(crate) fn snapshot() -> KeyboardLayoutsIpc {
-    let (layouts, current_idx) = order_and_index(loaded_layouts(), foreground_layout());
+    let (layouts, current_idx) = order_and_index(
+        loaded_layouts().into_iter().map(hkl_bits).collect(),
+        foreground_layout(),
+    );
     let mut cache = NAMES.lock();
     if cache.layouts != layouts {
         // Registry/resource lookups only when the loaded list changes, never
@@ -61,7 +97,11 @@ pub(crate) fn snapshot() -> KeyboardLayoutsIpc {
     }
 }
 
-fn loaded_layouts() -> Vec<u32> {
+fn hkl_bits(hkl: HKL) -> u32 {
+    hkl.0 as usize as u32
+}
+
+fn loaded_layouts() -> Vec<HKL> {
     let mut layouts = Vec::new();
     // Both the allocation and retries are bounded even if layouts keep changing.
     for _ in 0..LIST_ATTEMPTS {
@@ -76,7 +116,7 @@ fn loaded_layouts() -> Vec<u32> {
             continue;
         }
         buffer.truncate((copied as usize).min(capacity));
-        layouts = buffer.iter().map(|hkl| hkl.0 as usize as u32).collect();
+        layouts = buffer;
         let latest_count = unsafe { GetKeyboardLayoutList(None) };
         if latest_count <= copied || capacity == MAX_LAYOUTS {
             break;
@@ -95,7 +135,7 @@ fn foreground_layout() -> Option<u32> {
     if thread_id == 0 {
         return None;
     }
-    let hkl = unsafe { GetKeyboardLayout(thread_id) }.0 as usize as u32;
+    let hkl = hkl_bits(unsafe { GetKeyboardLayout(thread_id) });
     (hkl != 0).then_some(hkl)
 }
 
@@ -118,6 +158,36 @@ fn order_and_index(layouts: Vec<u32>, current: Option<u32>) -> (Vec<u32>, usize)
         None => 0,
     };
     (ordered, index)
+}
+
+fn select_layout(layouts: &[HKL], current: HKL, target: LayoutSwitchTarget) -> Result<HKL, String> {
+    let (ordered, current_idx) = order_and_index(
+        layouts.iter().copied().map(hkl_bits).collect(),
+        Some(hkl_bits(current)),
+    );
+    if ordered.is_empty() {
+        return Err("no keyboard layouts are available".to_owned());
+    }
+    let index = match target {
+        LayoutSwitchTarget::Next => (current_idx + 1) % ordered.len(),
+        LayoutSwitchTarget::Prev => (current_idx + ordered.len() - 1) % ordered.len(),
+        LayoutSwitchTarget::Index(index) => usize::from(index),
+    };
+    let selected = *ordered.get(index).ok_or_else(|| {
+        format!(
+            "keyboard layout index {index} is out of range ({} layouts available)",
+            ordered.len()
+        )
+    })?;
+    // Snapshot identities are u32, but LPARAM needs the full OS-provided HKL.
+    // In particular, zero-extending an Fxxx/E-prefixed ID on 64-bit Windows
+    // loses sign extension. Preserve the actual loaded handle; the only entry
+    // order_and_index can append is the actual foreground handle.
+    Ok(layouts
+        .iter()
+        .copied()
+        .find(|hkl| hkl_bits(*hkl) == selected)
+        .unwrap_or(current))
 }
 
 struct RegistryKey(HKEY);
@@ -330,6 +400,98 @@ fn layout_name(hkl: u32, registry: Option<&RegistryKey>, special_ids: &[LayoutId
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::system_actions::LayoutSwitchTarget::{Index, Next, Prev};
+
+    fn test_hkl(bits: u32) -> HKL {
+        HKL((bits as i32 as isize) as *mut _)
+    }
+
+    #[test]
+    fn switch_next_and_prev_wrap_using_exact_hkls_in_os_order() {
+        // Same language, distinct layouts, deliberately not numerically sorted.
+        let layouts = [
+            test_hkl(0xf002_0409),
+            test_hkl(0x0409_0409),
+            test_hkl(0xf001_0409),
+        ];
+        for (current, next, prev) in [(0, 1, 2), (1, 2, 0), (2, 0, 1)] {
+            assert_eq!(
+                select_layout(&layouts, layouts[current], Next),
+                Ok(layouts[next])
+            );
+            assert_eq!(
+                select_layout(&layouts, layouts[current], Prev),
+                Ok(layouts[prev])
+            );
+        }
+        for target in [Next, Prev, Index(0)] {
+            assert_eq!(
+                select_layout(&layouts[..1], layouts[0], target),
+                Ok(layouts[0])
+            );
+        }
+    }
+
+    #[test]
+    fn switch_indexes_are_zero_based_and_bounded() {
+        let layouts = [test_hkl(0x0409_0409), test_hkl(0xf002_0409)];
+        for (index, expected) in layouts.iter().copied().enumerate() {
+            assert_eq!(
+                select_layout(&layouts, layouts[1], Index(index as u8)),
+                Ok(expected)
+            );
+        }
+        for index in [2, u8::MAX] {
+            assert!(select_layout(&layouts, layouts[0], Index(index)).is_err());
+        }
+    }
+
+    #[test]
+    fn switch_selection_rejects_empty_layouts() {
+        for target in [Next, Prev, Index(0), Index(u8::MAX)] {
+            assert!(select_layout(&[], HKL::default(), target).is_err());
+        }
+    }
+
+    #[test]
+    fn switch_selection_matches_snapshot_deduplication_and_foreground_append() {
+        let base = test_hkl(0x0409_0409);
+        let variant = test_hkl(0xf002_0409);
+        let current = test_hkl(0xf001_0409);
+        let layouts = [HKL::default(), base, base, variant];
+        assert_eq!(select_layout(&layouts, current, Index(0)), Ok(base));
+        assert_eq!(select_layout(&layouts, current, Index(1)), Ok(variant));
+        assert_eq!(select_layout(&layouts, current, Index(2)), Ok(current));
+        assert!(select_layout(&layouts, current, Index(3)).is_err());
+        assert_eq!(select_layout(&layouts, current, Next), Ok(base));
+        assert_eq!(select_layout(&layouts, current, Prev), Ok(variant));
+        assert_eq!(select_layout(&[], current, Next), Ok(current));
+    }
+
+    #[test]
+    fn switch_selection_preserves_sign_extended_hkls_for_lparam() {
+        let base = test_hkl(0x0409_0409);
+        for bits in [0xf002_0409, 0xe001_0411] {
+            let full_hkl = test_hkl(bits);
+            let loaded = select_layout(&[base, full_hkl], base, Index(1)).unwrap();
+            let appended = select_layout(&[base], full_hkl, Index(1)).unwrap();
+            for selected in [loaded, appended] {
+                let lparam = LPARAM(selected.0 as isize);
+                assert_eq!(lparam.0, bits as i32 as isize);
+                assert!(lparam.0 < 0);
+            }
+        }
+    }
+
+    #[test]
+    fn switch_selection_uses_actual_loaded_handles_instead_of_reconstructing_them() {
+        // Preserve even a zero-extended OS handle rather than assuming its high
+        // bits from the snapshot ID or substituting the foreground's handle.
+        let actual = HKL(0xf002_0409usize as *mut _);
+        let current = test_hkl(0xf002_0409);
+        let selected = select_layout(&[actual], current, Index(0)).unwrap();
+        assert_eq!(LPARAM(selected.0 as isize).0, actual.0 as isize);
+    }
 
     #[test]
     fn localized_display_name_precedes_layout_text() {

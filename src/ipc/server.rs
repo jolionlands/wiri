@@ -32,7 +32,7 @@ pub struct IpcServer {
     /// show/hide/position windows.
     backend: Option<crate::backend::BackendHandle>,
     /// Optional one-shot sender to request graceful shutdown of main.
-    shutdown_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    shutdown_tx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Optional sender to request a config reload on the main loop.
     reload_tx: parking_lot::Mutex<Option<mpsc::UnboundedSender<()>>>,
     /// The config file wiri loaded, so `reload_config` can answer with what is wrong in it.
@@ -65,7 +65,7 @@ impl IpcServer {
             event_tx,
             engine: None,
             backend: None,
-            shutdown_tx: parking_lot::Mutex::new(None),
+            shutdown_tx: Arc::new(parking_lot::Mutex::new(None)),
             reload_tx: parking_lot::Mutex::new(None),
             config_path: parking_lot::Mutex::new(None),
             mirror: parking_lot::Mutex::new(Mirror::default()),
@@ -763,23 +763,82 @@ impl IpcServer {
                 }
             }
             IpcMessage::Quit => {
-                info!("IPC: Quit requested — sending shutdown signal to main");
-                if let Some(tx) = self.shutdown_tx.lock().take() {
-                    let _ = tx.send(());
-                } else {
-                    // Fallback if no shutdown channel was wired
-                    warn!("IPC Quit: no shutdown channel set; calling process::exit");
-                    std::process::exit(0);
+                let sender = self.shutdown_tx.clone();
+                match crate::input::system_actions::request_quit(false, move || {
+                    if let Some(tx) = sender.lock().take() {
+                        let _ = tx.send(());
+                    }
+                }) {
+                    Ok(()) => serde_json::json!({"success": true}),
+                    Err(error) => serde_json::json!({"success": false, "error": error}),
                 }
-                serde_json::json!({"success": true})
             }
             IpcMessage::RunAction { name, args, quoted } => {
                 info!("IPC: RunAction {} {:?}", name, args);
+                // Capture an explicit window without focusing it (including a
+                // parked/inactive one). Validate before the generic --id path,
+                // which otherwise changes focus for layout actions.
+                if matches!(name.as_str(), "screenshot-screen" | "screenshot-window" | "screenshot-focused") {
+                    let Some(capture) = crate::screenshot::action::CaptureAction::parse(name != "screenshot-screen", &args) else {
+                        return serde_json::json!({"success":false,"error":"invalid screenshot options (paths must be absolute)"});
+                    };
+                    if let Some(id) = capture.id {
+                        if !self.engine.as_ref().is_some_and(|engine| engine.read().tiled_windows().contains_key(&WindowId::new(id))) {
+                            return serde_json::json!({"success":false,"error":format!("no managed window with id {id}")});
+                        }
+                    }
+                    return match capture.run() {
+                        Ok(path) => serde_json::json!({"success":true,"result":{"path":path}}),
+                        Err(error) => serde_json::json!({"success":false,"error":format!("{error:#}")}),
+                    };
+                }
+                if matches!(name.as_str(), "screenshot" | "take-screenshot" | "capture-screen") {
+                    let Some(options) = crate::overlay::screenshot_ui::Options::parse(&args) else {
+                        return serde_json::json!({"success":false,"error":"invalid screenshot UI options (paths must be absolute)"});
+                    };
+                    return match crate::overlay::screenshot_ui::open(options) {
+                        Ok(()) => serde_json::json!({"success":true}),
+                        Err(error) => serde_json::json!({"success":false,"error":format!("{error:#}")}),
+                    };
+                }
                 // niri's `--id <n>`: the window to act on.
                 let (args, quoted, target) = match split_window_target(&args, &quoted) {
                     Ok(split) => split,
                     Err(error) => return serde_json::json!({"success": false, "error": error}),
                 };
+                if let Some(parsed) = crate::input::system_actions::parse(&name, &args) {
+                    use crate::input::system_actions::{self, SystemAction};
+                    let Some(system) = parsed else {
+                        return serde_json::json!({"success": false, "error": "invalid system action arguments"});
+                    };
+                    if target.is_some() && !matches!(system, SystemAction::WindowUrgent(_)) {
+                        return serde_json::json!({"success": false, "error": "this action does not accept --id"});
+                    }
+                    let _changed = crate::ipc::StateChangeGuard;
+                    let result = match &system {
+                        SystemAction::Quit { skip_confirmation } => {
+                            let sender = self.shutdown_tx.clone();
+                            system_actions::request_quit(*skip_confirmation, move || {
+                                if let Some(tx) = sender.lock().take() {
+                                    let _ = tx.send(());
+                                }
+                            })
+                        }
+                        SystemAction::LoadConfigFile(path) => {
+                            system_actions::request_reload(path.clone())
+                        }
+                        _ => match (&self.engine, &self.backend) {
+                            (Some(engine), Some(backend)) => {
+                                system_actions::execute(&system, engine, backend, target)
+                            }
+                            _ => Err("engine or backend not initialized".into()),
+                        },
+                    };
+                    return match result {
+                        Ok(()) => serde_json::json!({"success": true}),
+                        Err(error) => serde_json::json!({"success": false, "error": error}),
+                    };
+                }
                 let (Some(engine), Some(backend)) = (&self.engine, &self.backend) else {
                     return serde_json::json!({
                         "success": false,

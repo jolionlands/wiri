@@ -928,6 +928,23 @@ pub(crate) fn perform_action_on(
 ) {
     // Event-stream clients are told what the action did to the windows and workspaces.
     let _state_changed = crate::ipc::StateChangeGuard;
+    if let Action::System(system) = action {
+        let result = match system {
+            crate::input::system_actions::SystemAction::Quit { skip_confirmation } => {
+                let sender = quit_tx.clone();
+                crate::input::system_actions::request_quit(*skip_confirmation, move || {
+                    if let Some(tx) = sender.lock().as_ref() {
+                        let _ = tx.send(());
+                    }
+                })
+            }
+            _ => crate::input::system_actions::execute(system, engine, backend, window),
+        };
+        if let Err(error) = result {
+            warn!("System action failed: {}", error);
+        }
+        return;
+    }
     // The window the action acts on is the one the user is looking at: the OS foreground window
     // (or the application window that owns it), a floating window as well as a tile.  The
     // engine's own focus is only the fallback.  `close-window` refuses to guess when an
@@ -947,6 +964,7 @@ pub(crate) fn perform_action_on(
         | Action::Screenshot
         | Action::ScreenshotUi(_)
         | Action::ScreenshotScreen
+        | Action::Capture(_)
         | Action::WindowScreenshot
         | Action::ScreenshotWindow
         | Action::ShowKeyBindings
@@ -1006,6 +1024,9 @@ pub(crate) fn perform_action_on(
     }
 
     match action {
+        Action::System(_) => {
+            unreachable!("system actions dispatched before layout target resolution")
+        }
         Action::ToggleKeyboardShortcutsInhibit => {
             keyboard::ENGINE.lock().toggle_inhibit();
             info!(
@@ -1069,10 +1090,13 @@ pub(crate) fn perform_action_on(
             }
         }
         Action::Quit => {
-            if let Some(tx) = quit_tx.lock().as_ref() {
-                let _ = tx.send(());
-            } else {
-                warn!("Quit hotkey ignored: no quit channel configured");
+            let sender = quit_tx.clone();
+            if let Err(error) = crate::input::system_actions::request_quit(false, move || {
+                if let Some(tx) = sender.lock().as_ref() {
+                    let _ = tx.send(());
+                }
+            }) {
+                warn!("Quit failed: {}", error);
             }
         }
         Action::FocusWorkspace(number) => {
@@ -1369,6 +1393,9 @@ pub(crate) fn perform_action_on(
             }
         }
         Action::ScreenshotScreen => take_screenshot(),
+        Action::Capture(options) => {
+            if let Err(error) = options.run() { warn!("Screenshot failed: {error:#}"); }
+        }
         // The column operations belong to the strip: a floating window has no column
         // (niri does nothing for it either).
         Action::ConsumeWindowIntoColumn => {

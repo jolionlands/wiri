@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::time::Duration;
@@ -501,6 +501,8 @@ async fn main() -> Result<()> {
     ipc_server.set_shutdown_sender(ipc_shutdown_tx);
     let (ipc_reload_tx, mut ipc_reload_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     ipc_server.set_reload_sender(ipc_reload_tx);
+    let (system_reload_tx, mut system_reload_rx) = tokio::sync::mpsc::unbounded_channel();
+    wiri::input::system_actions::set_reload_sender(system_reload_tx);
     ipc_server.set_config_path(config_path.clone());
     let ipc_server = Arc::new(ipc_server);
     let ipc_server_clone = ipc_server.clone();
@@ -692,8 +694,8 @@ async fn main() -> Result<()> {
         })
     };
     let mut ipc_shutdown_rx = ipc_shutdown_rx;
-    let reload = ReloadCtx {
-        config_path: &config_path,
+    let mut reload = ReloadCtx {
+        config_path: config_path.clone(),
         engine: &engine,
         handle: &handle,
         message_loop: &message_loop,
@@ -801,6 +803,28 @@ async fn main() -> Result<()> {
             }
         }
 
+        // System load-config-file: switch the active path and its watcher only after
+        // a successful load. A missing path means reload the currently active file.
+        while let Ok(path) = system_reload_rx.try_recv() {
+            let previous = reload.config_path.clone();
+            if let Some(path) = path {
+                reload.config_path = path;
+            }
+            if reload.from_disk(&system) {
+                if reload.config_path != previous {
+                    ipc_server.set_config_path(reload.config_path.clone());
+                    config_loader.stop_watching();
+                    config_loader = ConfigLoader::new(reload.config_path.clone());
+                    config_reload_rx = config_loader.subscribe();
+                    if let Err(error) = config_loader.start_watching() {
+                        warn!("Could not watch the selected config: {}", error);
+                    }
+                }
+            } else {
+                reload.config_path = previous;
+            }
+        }
+
         // Check for IPC-initiated graceful shutdown
         if let Ok(()) = ipc_shutdown_rx.try_recv() {
             info!("Shutting down (IPC Quit)...");
@@ -842,7 +866,7 @@ async fn main() -> Result<()> {
                 }
                 TrayAction::OpenConfigDir => {
                     // Open the folder containing the active config in Explorer.
-                    if let Some(dir) = config_path.parent() {
+                    if let Some(dir) = reload.config_path.parent() {
                         info!("Tray: opening config dir {}", dir.display());
                         let _ = std::process::Command::new("explorer.exe")
                             .arg(dir.as_os_str())
@@ -908,7 +932,7 @@ async fn main() -> Result<()> {
 /// What reloading the config needs: the places it is applied to and the places the result is
 /// reported to (the log, a tray balloon, the IPC event stream).
 struct ReloadCtx<'a> {
-    config_path: &'a Path,
+    config_path: PathBuf,
     engine: &'a Arc<RwLock<TilingEngine>>,
     handle: &'a BackendHandle,
     message_loop: &'a MessageLoop,
@@ -919,7 +943,7 @@ struct ReloadCtx<'a> {
 impl<'a> ReloadCtx<'a> {
     /// Read the file now (a reload that was asked for: the tray menu, `wiri-ctl reload-config`).
     fn from_disk(&self, system: &SystemIntegration) -> bool {
-        let decoded = wiri::config::loader::load_logged(self.config_path);
+        let decoded = wiri::config::loader::load_logged(&self.config_path);
         if decoded.has_errors() {
             self.report_failure(&decoded.issues, system);
             false
@@ -967,7 +991,7 @@ impl<'a> ReloadCtx<'a> {
     /// The file has errors: the last good config stays, the user is told where the first
     /// error is, and the event stream says the load failed.
     fn report_failure(&self, issues: &[ValidationIssue], system: &SystemIntegration) {
-        let summary = wiri::config::failure_summary(self.config_path, issues);
+        let summary = wiri::config::failure_summary(&self.config_path, issues);
         error!(
             "Config reload failed - the last good config stays in use: {}",
             summary

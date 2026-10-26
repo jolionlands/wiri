@@ -4060,6 +4060,18 @@ impl TilingEngine {
             .find(|wid| self.tiled_windows.contains_key(wid))
     }
 
+    /// Resolve a managed foreground window (including its owned dialogs), with
+    /// the usual engine-state fallback, without synchronizing or moving focus.
+    /// Urgency changes must not activate a window or alter remembered selection.
+    pub fn window_for_non_focusing_action(
+        &self,
+        foreground: Option<ForegroundWindow>,
+    ) -> Option<WindowId> {
+        foreground
+            .and_then(|fg| self.managed_window_for(fg.hwnd, fg.root_owner))
+            .or_else(|| self.state_target().map(|target| target.window))
+    }
+
     /// The target the engine's own state points at: the floating window the OS last
     /// reported as the foreground one, else the focused tile, else the topmost
     /// floating window.  This is what an action acts on when it cannot ask the OS.
@@ -8210,6 +8222,30 @@ impl TilingEngine {
     // -------------------------------------------------------------------------
     // Item 5 — urgent-window API
     // -------------------------------------------------------------------------
+
+    /// Set or reset urgency for a managed window without changing focus.
+    /// Focused windows cannot become urgent. Both the hook registry and the
+    /// engine view are updated before urgency-dependent rules are reevaluated.
+    /// Returns false for an unmanaged window, leaving its state untouched.
+    pub fn set_window_urgent(
+        &mut self,
+        window: WindowId,
+        urgent: bool,
+        backend: &BackendHandle,
+    ) -> bool {
+        if !self.tiled_windows.contains_key(&window) {
+            return false;
+        }
+        let urgent = urgent && self.os_foreground != Some(window);
+        crate::backend::hooks::set_urgent(window.as_isize(), urgent);
+        if urgent {
+            self.urgent_windows.insert(window);
+        } else {
+            self.urgent_windows.remove(&window);
+        }
+        self.window_urgency_changed(window, backend);
+        true
+    }
 
     /// Mark a window as urgent (e.g. after receiving a WM_FLASHWINDOW notification).
     pub fn mark_urgent(&mut self, window_id: WindowId) {
@@ -12529,6 +12565,182 @@ mod tests {
     }
 
     // --- Item 5: urgent window lifecycle ---
+
+    // Seed only managed-window bookkeeping: these tests must not call Win32.
+    fn make_urgency_test_engine(hwnd: isize) -> TilingEngine {
+        let mut engine = make_engine();
+        engine
+            .tiled_windows
+            .insert(WindowId::new(hwnd), make_window(hwnd, 0, 0));
+        crate::backend::hooks::clear_urgent(hwnd);
+        engine
+    }
+
+    #[test]
+    fn test_non_focusing_action_uses_foreground_and_owner_without_changing_selection() {
+        let selected_hwnd = -73_900_007;
+        let foreground_hwnd = -73_900_008;
+        let selected = WindowId::new(selected_hwnd);
+        let foreground_window = WindowId::new(foreground_hwnd);
+        let mut engine = make_urgency_test_engine(selected_hwnd);
+        engine
+            .tiled_windows
+            .insert(foreground_window, make_window(foreground_hwnd, 0, 0));
+        let output = engine.focused_output().unwrap();
+        engine.monitors.get_mut(&output).unwrap().focus_window = Some(selected);
+        engine.os_foreground = Some(selected);
+        for (hwnd, root_owner) in [
+            (foreground_hwnd, foreground_hwnd),
+            (-73_900_009, foreground_hwnd),
+        ] {
+            let foreground = Some(ForegroundWindow {
+                hwnd,
+                root_owner,
+                ignorable: false,
+            });
+            assert_eq!(
+                engine.window_for_non_focusing_action(foreground),
+                Some(foreground_window)
+            );
+            assert_eq!(engine.os_foreground, Some(selected));
+            assert_eq!(engine.focused_output(), Some(output));
+            assert_eq!(
+                engine.monitors.get(&output).unwrap().focus_window,
+                Some(selected)
+            );
+        }
+        engine.floating_windows.insert(foreground_window);
+        assert_eq!(
+            engine.window_for_non_focusing_action(Some(ForegroundWindow {
+                hwnd: foreground_hwnd,
+                root_owner: foreground_hwnd,
+                ignorable: false,
+            })),
+            Some(foreground_window)
+        );
+        assert_eq!(engine.window_for_non_focusing_action(None), Some(selected));
+        assert_eq!(
+            engine.window_for_non_focusing_action(Some(ForegroundWindow {
+                hwnd: -73_900_010,
+                root_owner: -73_900_010,
+                ignorable: false,
+            })),
+            Some(selected)
+        );
+        assert_eq!(engine.os_foreground, Some(selected));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().focus_window,
+            Some(selected)
+        );
+        crate::backend::hooks::clear_urgent(selected_hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_syncs_and_survives_refresh() {
+        let hwnd = -73_900_002;
+        let other_hwnd = -73_900_003;
+        let window = WindowId::new(hwnd);
+        let other = WindowId::new(other_hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        crate::backend::hooks::set_urgent(other_hwnd, true);
+        engine.mark_urgent(other);
+
+        // A monitor's remembered selection is not necessarily OS foreground.
+        let output = engine.focused_output().unwrap();
+        engine.monitors.get_mut(&output).unwrap().focus_window = Some(window);
+        engine.os_foreground = Some(other);
+        for _ in 0..2 {
+            assert!(engine.set_window_urgent(window, true, &backend));
+            assert!(engine.is_urgent(window));
+            assert!(crate::backend::hooks::is_urgent_hwnd(hwnd));
+            engine.refresh_urgent_states();
+            assert!(engine.is_urgent(window));
+        }
+        for _ in 0..2 {
+            assert!(engine.set_window_urgent(window, false, &backend));
+            assert!(!engine.is_urgent(window));
+            assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+            engine.refresh_urgent_states();
+            assert!(!engine.is_urgent(window));
+            assert!(engine.is_urgent(other));
+        }
+        assert_eq!(engine.os_foreground, Some(other));
+        assert_eq!(engine.focused_output(), Some(output));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().focus_window,
+            Some(window)
+        );
+        crate::backend::hooks::clear_urgent(other_hwnd);
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_suppresses_os_foreground() {
+        let hwnd = -73_900_004;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.os_foreground = Some(window);
+        // Repair stale urgency in both views, even when asked to set it.
+        engine.mark_urgent(window);
+        crate::backend::hooks::set_urgent(hwnd, true);
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert!(!engine.is_urgent(window));
+        assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+        engine.refresh_urgent_states();
+        assert!(!engine.is_urgent(window));
+        assert!(engine.set_window_urgent(window, false, &backend));
+        assert_eq!(engine.os_foreground, Some(window));
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_ignores_unmanaged_windows() {
+        let hwnd = -73_900_005;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        crate::backend::hooks::clear_urgent(hwnd);
+        assert!(!engine.set_window_urgent(window, true, &backend));
+        assert!(!engine.is_urgent(window));
+        assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+        crate::backend::hooks::set_urgent(hwnd, true);
+        assert!(!engine.set_window_urgent(window, false, &backend));
+        assert!(crate::backend::hooks::is_urgent_hwnd(hwnd));
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_reevaluates_rules_on_set_and_reset() {
+        let hwnd = -73_900_006;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.set_window_rules(vec![crate::config::WindowRule {
+            matchers: vec![crate::config::types::Matcher::IsUrgent],
+            // Observe resolution without applying any dynamic Win32 properties.
+            open_focused: Some(false),
+            ..Default::default()
+        }]);
+        engine.rule_state.insert(
+            window,
+            rules::RuleState {
+                process_name: None,
+                aumid: None,
+                resolved: Default::default(),
+            },
+        );
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert_eq!(
+            engine.rule_state[&window].resolved.open_focused,
+            Some(false)
+        );
+        assert!(engine.set_window_urgent(window, false, &backend));
+        assert_eq!(engine.rule_state[&window].resolved.open_focused, None);
+        assert_eq!(engine.os_foreground, None);
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
 
     #[test]
     fn test_urgent_window_lifecycle() {

@@ -524,10 +524,43 @@ pub fn urgent_hwnds() -> Vec<isize> {
     URGENT_WINDOWS.lock().iter().copied().collect()
 }
 
+/// Set or reset a window's urgent flag in the same registry used by WinEvents.
+/// This only changes bookkeeping; it does not flash or focus the window.
+pub fn set_urgent(hwnd: isize, urgent: bool) {
+    let mut windows = URGENT_WINDOWS.lock();
+    if urgent {
+        windows.insert(hwnd);
+    } else {
+        windows.remove(&hwnd);
+    }
+}
+
 /// Manually clear the urgent flag for a window (e.g. when the engine
 /// programmatically focuses it without a WinEvent firing).
 pub fn clear_urgent(hwnd: isize) {
-    URGENT_WINDOWS.lock().remove(&hwnd);
+    set_urgent(hwnd, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_urgent_updates_the_shared_registry() {
+        let hwnd = -73_900_001;
+        clear_urgent(hwnd);
+        assert!(!is_urgent_hwnd(hwnd));
+        set_urgent(hwnd, true);
+        set_urgent(hwnd, true);
+        assert!(is_urgent_hwnd(hwnd));
+        assert!(urgent_hwnds().contains(&hwnd));
+        set_urgent(hwnd, false);
+        assert!(!is_urgent_hwnd(hwnd));
+        assert!(!urgent_hwnds().contains(&hwnd));
+        set_urgent(hwnd, true);
+        clear_urgent(hwnd);
+        assert!(!is_urgent_hwnd(hwnd));
+    }
 }
 
 lazy_static::lazy_static! {

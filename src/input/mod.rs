@@ -9,6 +9,7 @@ pub mod mouse;
 pub mod pointer;
 pub mod recent;
 pub mod snap_guide;
+pub mod system_actions;
 pub mod touch;
 
 pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
@@ -27,6 +28,8 @@ pub use touch::{
 /// All actions that can be triggered by hotkeys or IPC
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Action {
+    /// Non-layout OS/session actions, shared by IPC and bindings.
+    System(system_actions::SystemAction),
     Quit,
     /// Run a program: `argv[0]` is the program (searched on PATH when it has no
     /// directory part), the rest are its arguments, each passed through intact
@@ -116,6 +119,8 @@ pub enum Action {
     ScreenshotScreen,
     /// Interactive screenshot with niri's pointer and destination options.
     ScreenshotUi(crate::overlay::screenshot_ui::Options),
+    /// Immediate screen/window capture with validated niri options.
+    Capture(crate::screenshot::action::CaptureAction),
     /// Set the focused column to 1/4 of the work-area width.
     ColumnWidthPresetQuarter,
     /// Set the focused column to 3/4 of the work-area width.
@@ -376,6 +381,20 @@ pub fn action_name_known(name: &str) -> bool {
 /// the actions and wiri's own older spellings are understood.
 pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
     let is_quoted = |i: usize| quoted.get(i).copied().unwrap_or(false);
+    if let Some(system) = system_actions::parse(name, args) {
+        return system.map(|action| {
+            if matches!(
+                action,
+                system_actions::SystemAction::Quit {
+                    skip_confirmation: false
+                }
+            ) {
+                Action::Quit
+            } else {
+                Action::System(action)
+            }
+        });
+    }
     if matches!(name, "screenshot" | "take-screenshot" | "capture-screen") {
         return crate::overlay::screenshot_ui::Options::parse(args).map(|options| {
             if options == crate::overlay::screenshot_ui::Options::default() {
@@ -383,6 +402,14 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
             } else {
                 Action::ScreenshotUi(options)
             }
+        });
+    }
+    if matches!(name, "screenshot-screen" | "screenshot-window" | "screenshot-focused") {
+        let window = name != "screenshot-screen";
+        return crate::screenshot::action::CaptureAction::parse(window, args).map(|options| {
+            if options == crate::screenshot::action::CaptureAction::defaults(window) {
+                if window { Action::ScreenshotWindow } else { Action::ScreenshotScreen }
+            } else { Action::Capture(options) }
         });
     }
     match name {
