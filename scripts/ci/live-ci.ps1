@@ -191,7 +191,7 @@ public static class WiriCiNoise {
             # The parent is recorded to find what relaunches it.
             $traced = $true
             try {
-                Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -Filter "ProcessName='wsl.exe'" -SourceIdentifier WiriWslStart -ErrorAction Stop
+                Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName='wsl.exe'" -SourceIdentifier WiriWslStart -ErrorAction Stop
             } catch { $traced = $false; "process-start trace unavailable: $($_.Exception.Message)" }
             function Parent([int]$parentId) {
                 $p = Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue

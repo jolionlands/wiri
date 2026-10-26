@@ -1522,17 +1522,13 @@ fn stream_events(types: &str, timeout_secs: u64, raw: bool) -> Result<()> {
         );
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&pipe_path)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-                pipe_path,
-                e
-            )
-        })?;
+    let mut file = open_pipe_retrying(&pipe_path, &pipe_wide, timeout_ms).map_err(|e| {
+        anyhow::anyhow!(
+            "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
+            pipe_path,
+            e
+        )
+    })?;
 
     let data = serde_json::to_vec(&message)?;
     file.write_all(&data)?;
@@ -1622,6 +1618,39 @@ fn summarize_value(v: &serde_json::Value) -> String {
 // IPC plumbing
 // ---------------------------------------------------------------------------
 
+/// Open the pipe, waiting for a free instance until `timeout_ms` has passed: another client can take the
+/// instance `WaitNamedPipeW` reported free before this one opens it (`ERROR_PIPE_BUSY`; two `events --stream`
+/// started at the same moment on a hosted CI runner hit this).
+fn open_pipe_retrying(
+    pipe_path: &str,
+    pipe_wide: &[u16],
+    timeout_ms: u32,
+) -> std::io::Result<std::fs::File> {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_path)
+        {
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                let wait_ms = left.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+                let free = unsafe { WaitNamedPipeW(PCWSTR::from_raw(pipe_wide.as_ptr()), wait_ms) };
+                if !free.as_bool() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_json::Value> {
     // The pipe of this user in this session (see `wiri::ipc::pipe_path`).
     let pipe_path = wiri::ipc::pipe_path();
@@ -1660,17 +1689,13 @@ fn send_ipc_message(message: &IpcMessage, timeout_secs: u64) -> Result<serde_jso
         }
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&pipe_path)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
-                pipe_path,
-                e
-            )
-        })?;
+    let mut file = open_pipe_retrying(&pipe_path, &pipe_wide, timeout_ms).map_err(|e| {
+        anyhow::anyhow!(
+            "Could not open wiri IPC pipe at {} — is wiri running?  ({})",
+            pipe_path,
+            e
+        )
+    })?;
 
     let data = serde_json::to_vec(message)?;
     file.write_all(&data)?;
