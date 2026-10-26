@@ -13,12 +13,14 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 80 | 58 | 73 | 15 |
-| Config, input and IPC (260 rows) | 95 | 61 | 34 | 70 |
+| Layout and behaviour (226 rows) | 137 | 38 | 34 | 17 |
+| Config, input and IPC (259 rows) | 98 | 57 | 34 | 70 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
-retained Phase 2C Lane B/D and Lane G/H/S updates; they are not a full live sign-off.
-Lane S system-action rows remain partial until the complete rerun succeeds.
+retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2 updates; they are not a full live sign-off.
+Lane S system-action rows remain partial until the complete rerun succeeds. Lane F2's
+H34 monitor-target gates have not passed live: in its scratch run (513 / 521) the H34
+fixture setup threw before any target was exercised, so those rows rest on unit tests.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
 11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;
