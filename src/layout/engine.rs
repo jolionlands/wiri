@@ -20,11 +20,11 @@ mod sizing;
 use super::strip::CenterFocusedColumn;
 use sizing::DrawMode;
 // The windows and workspaces as the IPC event stream describes them (niri's `Window` and `Workspace`).
-mod insert_move;
 mod action_dispatch;
 mod focus_actions;
 mod foreground;
 mod foreground_runtime;
+mod insert_move;
 mod ipcview;
 #[cfg(test)]
 mod lane_f_integration_tests;
