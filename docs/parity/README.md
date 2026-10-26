@@ -13,19 +13,20 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 71 | 62 | 78 | 15 |
-| Config, input and IPC (259 rows) | 68 | 67 | 54 | 70 |
+| Layout and behaviour (226 rows) | 80 | 58 | 73 | 15 |
+| Config, input and IPC (260 rows) | 95 | 61 | 34 | 70 |
 
-The counts are a recount of current feature-row statuses including integrated Phase 2B and
-retained Phase 2C Lane B/D updates; they are not additional features implemented by A2.
+The counts are a recount of current feature-row statuses including integrated Phase 2B,
+retained Phase 2C Lane B/D and Lane G/H/S updates; they are not a full live sign-off.
+Lane S system-action rows remain partial until the complete rerun succeeds.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
 11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;
 phase-labelled rows relocate the changed code by function name. Each matrix ends with a list
 of the working-tree edits that were in flight during the original audit. The
 [Phase 1](phase1-report.md), [Phase 2A](phase2a-report.md) and
-[Phase 2C Lane D](phase2c-lane-d-report.md) and [Lane H](lane-h-report.md)
-reports distinguish live verification from unit tests.
+[Phase 2C Lane D](phase2c-lane-d-report.md), [Lane H](lane-h-report.md) and
+[Lane S](lane-s-report.md) reports distinguish live verification from unit tests.
 
 ## Plan
 
@@ -66,7 +67,7 @@ idle timer or always-on thread; passive decoration HWNDs are lazy and transient 
 
 **Phase 2C Lane B ([report](phase2c-input-report.md)):** primary low-level keyboard bindings,
 mouse/wheel bindings and event-driven pointer focus are retained. Other Phase 2 work still includes
-interactive screenshot selection/pointer flags and the explicit partial rows in both matrices.
+full live sign-off of Lane S screenshot/system actions and the explicit partial rows in both matrices.
 
 **Phase 2C, Lane D ([report](phase2c-lane-d-report.md)):** focused-output and focused-window PNG
 screenshots, the clipboard, `screenshot-path` and capture events/notifications are implemented.
@@ -75,6 +76,15 @@ identity matching, startup focus, reload-to-real-DPI and explicit-current-mode n
 physical mode/position/rotation/off changes are synthetic-unit-tested only and never exercised
 on this laptop. Screenshot selection UI/action flags and output limitations remain explicit in
 the matrices/report. Other Phase 2 lanes are separate work.
+
+**Lane S ([report](lane-s-report.md)), implementation with incomplete desktop sign-off:**
+frozen screenshot selection, per-capture options/nonfocusing ids and shared non-layout
+system actions are implemented. Warning-denied release build/check and 1241 library +
+14 CLI tests pass. The interrupted desktop run persisted 18/21 Lane S gates passing
+(including all H46/H47 checks), with three failures corrected but not rerun and four
+H49 gates unreached. No full summary or new integrated gate total is claimed. The
+formatter and locked rerun still require runner permission; real power mutations are
+never part of validation.
 
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
 ARM64 release builds, docs and a demo. Lane D fixed always-quoted Run autostart command

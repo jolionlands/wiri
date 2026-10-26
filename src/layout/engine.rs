@@ -3282,6 +3282,11 @@ impl TilingEngine {
         }
         let previous = self.os_foreground;
         let result = self.follow_os_foreground(window_id, backend);
+        // Do not wait for the separate hook-registry clear event: IPC and rules
+        // must already see the foreground window as no longer asking for attention.
+        if self.is_urgent(window_id) {
+            self.set_window_urgent(window_id, false, backend);
+        }
         // The rules that depend on the focus look at the two windows again.
         self.rules_after_focus_change(previous, window_id, backend);
         self.recent_foreground_changed(window_id, backend);
@@ -12691,6 +12696,37 @@ mod tests {
         engine.refresh_urgent_states();
         assert!(!engine.is_urgent(window));
         assert!(engine.set_window_urgent(window, false, &backend));
+        assert_eq!(engine.os_foreground, Some(window));
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_foreground_clears_urgency_before_the_hook_clear_is_delivered() {
+        let hwnd = -73_900_010;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.set_window_rules(vec![crate::config::WindowRule {
+            matchers: vec![crate::config::types::Matcher::IsUrgent],
+            open_focused: Some(false),
+            ..Default::default()
+        }]);
+        engine.rule_state.insert(
+            window,
+            rules::RuleState {
+                process_name: None,
+                aumid: None,
+                resolved: Default::default(),
+            },
+        );
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert_eq!(engine.rule_state[&window].resolved.open_focused, Some(false));
+        engine.sync_os_foreground(window, &backend);
+        assert!(!engine.is_urgent(window));
+        assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+        assert_eq!(engine.rule_state[&window].resolved.open_focused, None);
+        engine.refresh_urgent_states();
+        assert!(!engine.is_urgent(window));
         assert_eq!(engine.os_foreground, Some(window));
         crate::backend::hooks::clear_urgent(hwnd);
     }

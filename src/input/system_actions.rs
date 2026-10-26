@@ -250,7 +250,7 @@ pub fn request_quit(skip: bool, quit: impl FnOnce() + Send + 'static) -> Result<
     Ok(())
 }
 fn confirm_quit() -> bool {
-    if cfg!(test) || std::env::var_os("WIRI_SYSTEM_ACTIONS_DRY_RUN").is_some() {
+    if cfg!(test) {
         return false;
     }
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -295,6 +295,25 @@ pub(crate) fn execute(
                 .and_then(|fg| engine.managed_window_for(fg.hwnd, fg.root_owner))
                 == Some(window);
             engine.set_window_urgent(window, urgent && !is_foreground, backend);
+            let urgent = engine.is_urgent(window);
+            drop(engine);
+            // FlashWindowEx returns the previous active state, not a success
+            // flag. TIMERNOFG lets Windows stop flashing when focus arrives.
+            use windows::Win32::UI::WindowsAndMessaging::{
+                FlashWindowEx, FLASHWINFO, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY,
+            };
+            let flash = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd: windows::Win32::Foundation::HWND(window.as_isize() as *mut _),
+                dwFlags: if urgent {
+                    FLASHW_TRAY | FLASHW_TIMERNOFG
+                } else {
+                    FLASHW_STOP
+                },
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            let _ = unsafe { FlashWindowEx(&flash) };
             Ok(())
         }
         SystemAction::LoadConfigFile(path) => request_reload(path.clone()),
@@ -376,7 +395,7 @@ fn power(action: &SystemAction) -> Result<(), String> {
 /// SetSuspendState requires SeShutdownPrivilege. Restore the exact previous state
 /// on both success and failure instead of leaving a process-wide privilege enabled.
 fn suspend() -> Result<(), String> {
-    use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_NOT_ALL_ASSIGNED};
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE};
     use windows::Win32::Security::{
         AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
         TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,

@@ -763,42 +763,57 @@ impl IpcServer {
                 }
             }
             IpcMessage::Quit => {
-                let sender = self.shutdown_tx.clone();
-                match crate::input::system_actions::request_quit(false, move || {
-                    if let Some(tx) = sender.lock().take() {
-                        let _ = tx.send(());
-                    }
-                }) {
-                    Ok(()) => serde_json::json!({"success": true}),
-                    Err(error) => serde_json::json!({"success": false, "error": error}),
+                // Preserve wiri's legacy management/shutdown command. Niri's
+                // Action::Quit and key bindings use confirmation below.
+                if let Some(tx) = self.shutdown_tx.lock().take() {
+                    let _ = tx.send(());
                 }
+                serde_json::json!({"success": true})
             }
             IpcMessage::RunAction { name, args, quoted } => {
                 info!("IPC: RunAction {} {:?}", name, args);
                 // Capture an explicit window without focusing it (including a
                 // parked/inactive one). Validate before the generic --id path,
                 // which otherwise changes focus for layout actions.
-                if matches!(name.as_str(), "screenshot-screen" | "screenshot-window" | "screenshot-focused") {
-                    let Some(capture) = crate::screenshot::action::CaptureAction::parse(name != "screenshot-screen", &args) else {
+                if matches!(
+                    name.as_str(),
+                    "screenshot-screen" | "screenshot-window" | "screenshot-focused"
+                ) {
+                    let Some(capture) = crate::screenshot::action::CaptureAction::parse(
+                        name != "screenshot-screen",
+                        &args,
+                    ) else {
                         return serde_json::json!({"success":false,"error":"invalid screenshot options (paths must be absolute)"});
                     };
                     if let Some(id) = capture.id {
-                        if !self.engine.as_ref().is_some_and(|engine| engine.read().tiled_windows().contains_key(&WindowId::new(id))) {
+                        if !self.engine.as_ref().is_some_and(|engine| {
+                            engine
+                                .read()
+                                .tiled_windows()
+                                .contains_key(&WindowId::new(id))
+                        }) {
                             return serde_json::json!({"success":false,"error":format!("no managed window with id {id}")});
                         }
                     }
                     return match capture.run() {
                         Ok(path) => serde_json::json!({"success":true,"result":{"path":path}}),
-                        Err(error) => serde_json::json!({"success":false,"error":format!("{error:#}")}),
+                        Err(error) => {
+                            serde_json::json!({"success":false,"error":format!("{error:#}")})
+                        }
                     };
                 }
-                if matches!(name.as_str(), "screenshot" | "take-screenshot" | "capture-screen") {
+                if matches!(
+                    name.as_str(),
+                    "screenshot" | "take-screenshot" | "capture-screen"
+                ) {
                     let Some(options) = crate::overlay::screenshot_ui::Options::parse(&args) else {
                         return serde_json::json!({"success":false,"error":"invalid screenshot UI options (paths must be absolute)"});
                     };
                     return match crate::overlay::screenshot_ui::open(options) {
                         Ok(()) => serde_json::json!({"success":true}),
-                        Err(error) => serde_json::json!({"success":false,"error":format!("{error:#}")}),
+                        Err(error) => {
+                            serde_json::json!({"success":false,"error":format!("{error:#}")})
+                        }
                     };
                 }
                 // niri's `--id <n>`: the window to act on.

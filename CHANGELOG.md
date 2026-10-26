@@ -15,11 +15,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Lane S item 2 — screenshot action options
 - Screen/window captures accept niri disk/pointer flags and absolute paths through binds, CLI and typed IPC. Explicit managed-window ids capture without activation; copy-only overrides a supplied destination.
-- Share the existing PNG/clipboard/event pipeline and composite the pointer only for its receiving window. Add six action tests and typed-wire coverage; H47 desktop validation follows.
+- Share the existing PNG/clipboard/event pipeline and composite the pointer only for its receiving window. Add six action tests and typed-wire coverage; all six H47 gates passed in the interrupted desktop run (full-suite sign-off pending).
 
 ### Lane S item 3 — non-layout system actions
 - Add foreground keyboard-layout switching, managed-window urgency actions without focus changes, asynchronous quit confirmation with an explicit skip flag, active config-file switching, monitor power controls and suspend. Spawn expands only a leading home component in its executable, never the other arguments.
-- Add pure parser, typed-wire, layout-selection and urgency tests. Power actions support the `WIRI_SYSTEM_ACTIONS_DRY_RUN` audit-file hook; unit tests never change power state or display quit dialogs. Integration validation is pending; no new pass totals are claimed.
+- Add pure parser, typed-wire, layout-selection, quit-property and urgency tests. Typed IPC reaches every system-action executor; urgency flashes the taskbar without activation and clears on foreground before the separate hook event arrives. Legacy management `wiri-ctl quit` remains immediate; action/bind quit confirms unless skipped.
+- H48/H49 checks record events, config-file reload, literal spawn arguments, confirmation and dry-run power audits. Fix their missing F10 mapping and avoid serializing provider-decorated file strings. The interrupted run recorded 18/21 Lane S gates passing; its three failures have targeted corrections but no permitted rerun. See `docs/parity/lane-s-report.md`; no complete live pass is claimed.
 
 ### Phase 2B integration — desktop sign-off
 - Integrated release validation passes: 1114 library + 7 CLI tests, build and all-target check with warnings denied. The complete locked desktop run passes 440 gates, zero failures (102/102 Lane A checks; Lane B/D retained); perf collector errors and final H9 terminal overlaps are zero. Record earlier findings, measured resting cost and remaining limits in the Phase 2B report; recount matrix totals without claiming new features.

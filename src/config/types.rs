@@ -1341,7 +1341,7 @@ impl HotkeyBinding {
         // and typed IPC, rather than being stored as inert configuration text.
         if matches!(
             self.command.as_str(),
-            "screenshot" | "screenshot-screen" | "screenshot-window"
+            "screenshot" | "screenshot-screen" | "screenshot-window" | "quit"
         ) {
             let mut words = self.args.clone();
             let mut quoted = self.args_quoted.clone();
@@ -1499,6 +1499,33 @@ bitflags::bitflags! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quit_bind_skip_confirmation_property_reaches_the_executor() {
+        for skip in [false, true] {
+            let bind = HotkeyBinding {
+                command: "quit".into(),
+                action_props: vec![("skip-confirmation".into(), skip.to_string())],
+                ..Default::default()
+            };
+            let expected = if skip {
+                crate::input::Action::System(
+                    crate::input::system_actions::SystemAction::Quit {
+                        skip_confirmation: true,
+                    },
+                )
+            } else {
+                crate::input::Action::Quit
+            };
+            assert_eq!(bind.parse_action(), Some(expected));
+        }
+        let invalid = HotkeyBinding {
+            command: "quit".into(),
+            action_props: vec![("skip-confirmation".into(), "yes".into())],
+            ..Default::default()
+        };
+        assert!(invalid.parse_action().is_none());
+    }
 
     #[test]
     fn test_parse_color_hex6() {

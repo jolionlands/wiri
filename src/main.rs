@@ -1359,7 +1359,7 @@ fn handle_backend_event(
             });
             engine
                 .write()
-                .window_urgency_changed(WindowId::new(hwnd), handle);
+                .set_window_urgent(WindowId::new(hwnd), urgent, handle);
         }
         BackendEvent::WindowUrgentCleared { hwnd } => {
             ipc_server.broadcast_event(IpcEvent::WindowUrgent {
@@ -1368,7 +1368,7 @@ fn handle_backend_event(
             });
             engine
                 .write()
-                .window_urgency_changed(WindowId::new(hwnd), handle);
+                .set_window_urgent(WindowId::new(hwnd), false, handle);
         }
 
         // CBT events - fire BEFORE window operations

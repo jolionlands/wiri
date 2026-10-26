@@ -112,6 +112,11 @@ fn action(value: Value) -> Result<Value, String> {
     if let Some(request) = super::action_options::screenshot(&variant, fields)? {
         return Ok(request);
     }
+    if let Some(words) = crate::input::system_actions::wire_args(&variant, fields) {
+        return Ok(json!({"type":"run_action","data":{
+            "name":snake_case(&variant).replace('_',"-"),"args":words?,"quoted":[]
+        }}));
+    }
     if fields.get("focus") == Some(&Value::Bool(false)) {
         return Err("focus=false is not supported by this Windows action executor".into());
     }
@@ -441,6 +446,57 @@ mod tests {
         assert!(frames[2].is_err());
         assert_eq!(frames[3].as_ref().unwrap(), "Version");
         assert!(f.legacy().is_none());
+    }
+
+    #[test]
+    fn typed_system_actions_preserve_their_semantic_fields() {
+        for (value, expected_name, expected_args) in [
+            (
+                json!({"SwitchLayout":{"target":{"Index":2}}}),
+                "switch-layout",
+                vec!["2"],
+            ),
+            (
+                json!({"SetWindowUrgent":{"id":42}}),
+                "set-window-urgent",
+                vec!["--id", "42"],
+            ),
+            (
+                json!({"Quit":{"skip_confirmation":true}}),
+                "quit",
+                vec!["--skip-confirmation"],
+            ),
+            (
+                json!({"LoadConfigFile":{"path":r"C:\wiri\other.kdl"}}),
+                "load-config-file",
+                vec![r"C:\wiri\other.kdl"],
+            ),
+            (json!("PowerOffMonitors"), "power-off-monitors", vec![]),
+            (json!("PowerOnMonitors"), "power-on-monitors", vec![]),
+            (json!("Suspend"), "suspend", vec![]),
+            (json!("ToggleOverview"), "toggle-overview", vec![]),
+            (json!("OpenOverview"), "open-overview", vec![]),
+            (json!("CloseOverview"), "close-overview", vec![]),
+        ] {
+            let request = decode(json!({"Action":value})).unwrap();
+            let IpcMessage::RunAction { name, args, .. } = request.message else {
+                panic!("not RunAction")
+            };
+            assert_eq!(name, expected_name);
+            assert_eq!(args, expected_args);
+        }
+    }
+
+    #[test]
+    fn typed_system_actions_reject_bad_known_fields() {
+        for value in [
+            json!({"Quit":{"skip_confirmation":"yes"}}),
+            json!({"SwitchLayout":{"target":256}}),
+            json!({"SetWindowUrgent":{"id":0}}),
+            json!({"LoadConfigFile":{"path":5}}),
+        ] {
+            assert!(decode(json!({"Action":value})).is_err());
+        }
     }
 
     #[test]
