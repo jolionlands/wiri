@@ -226,7 +226,26 @@ public static class WiriCiNoise {
         $failures = @(Get-WiriLiveSummaryFailures -Summary $summary -Keys $keys)
         $failed = $failures.Count -gt 0
         $status = if ($failed) { 'failed' } elseif (@($summary.ci_skips).Count) { 'passed-with-skips' } else { 'passed' }
-        if ($failed) { Write-Warning ("Failed live gates: " + ($failures -join ', ')) }
+        if ($failed) {
+            Write-Warning ("Failed live gates: " + ($failures -join ', '))
+            # Print each failed phase's values and its small evidence files, so a hosted-runner failure can be
+            # read from the job log without downloading the artifact (screenshots make it tens of MB).
+            $printed = 0
+            foreach ($p in @($failures | ForEach-Object { if ("$_" -match '^([a-z]+[0-9]+)_') { $Matches[1] } } | Sort-Object -Unique)) {
+                Write-Output "---- $p values"
+                foreach ($prop in $summary.PSObject.Properties) {
+                    if ($prop.Name -like "${p}_*") { Write-Output ('  {0} = {1}' -f $prop.Name, (ConvertTo-Json $prop.Value -Compress -Depth 4)) }
+                }
+                $small = Get-ChildItem $evidence -Filter "$p-*" -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -in '.json', '.txt' -and $_.Length -le 8192 } | Sort-Object LastWriteTime
+                foreach ($f in @($small)) {
+                    if ($printed + $f.Length -gt 65536) { Write-Output "---- (evidence output capped at 64 KB)"; break }
+                    $printed += $f.Length
+                    Write-Output "---- $($f.Name)"
+                    Write-Output (Get-Content $f.FullName -Raw)
+                }
+            }
+        }
         $summary | Add-Member -NotePropertyName status -NotePropertyValue $status -Force
         $summary | Add-Member -NotePropertyName ci_failed_gates -NotePropertyValue $failures -Force
         $summary | Add-Member -NotePropertyName ci -NotePropertyValue $preflight -Force
