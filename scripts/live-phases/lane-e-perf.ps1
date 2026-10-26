@@ -129,6 +129,10 @@ function Invoke-LaneEPerf {
         $info.EnvironmentVariables['LOCALAPPDATA'] = Join-Path $perfDir 'local'
         $info.EnvironmentVariables['APPDATA'] = Join-Path $perfDir 'roaming'
         $info.EnvironmentVariables['WIRI_CONFIG'] = $config
+        # The collector and child must share an explicit endpoint, not the old global prefix.
+        [LaneE.Native]::PipeName = 'wiri_perf_' + $PID + '_' + [Guid]::NewGuid().ToString('N')
+        $info.EnvironmentVariables['WIRI_PIPE'] = '\\.\pipe\' + [LaneE.Native]::PipeName
+        $evidence.pipe = $info.EnvironmentVariables['WIRI_PIPE']
         $height = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height - 64
         $cold = [LaneE.Native]::Start($info, [IntPtr[]]$sentinels, $height, 15000)
         $owned = $cold.Process

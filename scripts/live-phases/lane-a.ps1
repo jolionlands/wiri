@@ -18,8 +18,9 @@ function AFrameFits($h, [int]$margin) {
     $t = Rc $h; $r = Rc $o[0]
     return (Near $r.L ($t.L - $margin) 3) -and (Near $r.T ($t.T - $margin) 3) -and (Near $r.R ($t.R + $margin) 3) -and (Near $r.B ($t.B + $margin) 3)
 }
+# Lane B's reorder gesture is Ctrl+Mod; use Alt so Ctrl is a distinct modifier.
 $a16Config = @'
-input { mod-key "ctrl-alt"; }
+input { mod-key "alt"; }
 animations { off; }
 layout {
     border { on; width 5; active-color "#ff8844"; inactive-color "#505050"; }

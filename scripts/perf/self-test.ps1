@@ -14,6 +14,13 @@ foreach ($case in @(
 )) {
     if ([LaneE.Native]::Median($case.values) -ne $case.expected) { throw 'Median check failed' }
 }
+# An unconfigured observer must fail before opening any pipe, not contact a global daemon.
+try {
+    [LaneE.Native]::Request('{}', 10, $PID) | Out-Null
+    throw 'Unconfigured pipe was accepted'
+} catch {
+    if ($_ -notmatch "Owned child's pipe is not configured") { throw }
+}
 # Regression: the live daemon keeps its debug file open for writing. Read with write sharing.
 $sharedPath = Join-Path $PSScriptRoot ('.self-test-' + [Guid]::NewGuid().ToString('N') + '.log')
 $writer = $null

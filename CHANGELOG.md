@@ -5,6 +5,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — live fixture compatibility
+- H16 now configures Alt as Mod so its unchanged Ctrl+Alt input exercises lane B's Ctrl+Mod column-reorder gesture, rather than the plain Mod move gesture. The insert-hint assertion is unchanged.
+- Fix a real older perf-observer bug: give its owned child an explicit unique `WIRI_PIPE` endpoint and use that endpoint for every PID-validated request instead of the unused global pipe. No measurement thresholds or earlier gates change.
+
 ### Phase 2B integration — single-instance probe
 - Resolve the startup probe and startup log with `ipc::pipe_path()`, matching the server/client user-session endpoint and `WIRI_PIPE` override instead of probing the unused global prefix. The server's listener check remains unchanged.
 

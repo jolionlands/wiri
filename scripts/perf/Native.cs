@@ -206,9 +206,13 @@ namespace LaneE {
             if (remaining <= 0) throw new TimeoutException("IPC total deadline expired");
             return Math.Max(1, (int)Math.Ceiling(remaining));
         }
+        // Explicitly configured alongside the owned child's WIRI_PIPE override.
+        // Never fall back to the obsolete machine-global pipe.
+        public static string PipeName { get; set; }
         public static string Request(string json, int timeoutMs, int expectedPid) {
+            if (String.IsNullOrWhiteSpace(PipeName)) throw new InvalidOperationException("Owned child's pipe is not configured");
             long deadline = Stopwatch.GetTimestamp() + (long)(timeoutMs * Stopwatch.Frequency / 1000.0);
-            using (var pipe = new NamedPipeClientStream(".", "wiri_control", PipeDirection.InOut, PipeOptions.Asynchronous)) {
+            using (var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous)) {
                 pipe.Connect(Remaining(deadline));
                 uint serverPid;
                 if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out serverPid) || serverPid != expectedPid)
