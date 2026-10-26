@@ -445,6 +445,9 @@ impl WindowSlot {
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
+    /// Session-stable identity, independent of output and visible position.
+    pub ipc_id: u64,
+    pub name: Option<String>,
     pub columns: Vec<Column>,
     /// The active column is anchored by its remembered active window.
     pub active_window: Option<WindowId>,
@@ -455,17 +458,16 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new() -> Self {
-        Self {
-            columns: Vec::new(),
-            active_window: None,
-            scroll_offset: Point::default(),
-            layout_mode: WorkspaceLayout::Scrolling,
-        }
+        Self::with_layout(WorkspaceLayout::Scrolling)
     }
 
     /// Create a new workspace with an explicit layout mode.
     pub fn with_layout(layout_mode: WorkspaceLayout) -> Self {
+        // Id allocation only occurs on creation; it is not synchronization.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            ipc_id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: None,
             columns: Vec::new(),
             active_window: None,
             scroll_offset: Point::default(),

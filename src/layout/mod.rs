@@ -400,6 +400,8 @@ pub struct Monitor {
     /// DPI scaling factor (1.0 = 96 DPI, 1.5 = 144 DPI, 2.0 = 192 DPI)
     pub scale_factor: f64,
     pub workspaces: HashMap<i32, Workspace>,
+    /// Visible order is independent of stable local keys and session IPC ids.
+    workspace_order: Vec<i32>,
     pub active_workspace: i32,
     /// The workspace that was active before the current one (niri's
     /// `focus-workspace-previous` and `workspace-auto-back-and-forth` go back to it).
@@ -430,6 +432,7 @@ impl Monitor {
             work_area,
             scale_factor,
             workspaces,
+            workspace_order: vec![0],
             active_workspace: 0,
             previous_workspace: None,
             focus_column: None,
@@ -450,12 +453,54 @@ impl Monitor {
         self.active_workspace
     }
 
-    /// The ids of the workspaces from the top of the monitor to the bottom (the
-    /// order is the order of the ids).
+    /// Stable keys in visible order; discover legacy direct map insertions deterministically.
     pub fn workspace_ids(&self) -> Vec<i32> {
-        let mut ids: Vec<i32> = self.workspaces.keys().copied().collect();
-        ids.sort_unstable();
+        let mut ids: Vec<i32> = self
+            .workspace_order
+            .iter()
+            .copied()
+            .filter(|id| self.workspaces.contains_key(id))
+            .collect();
+        let mut discovered: Vec<i32> = self
+            .workspaces
+            .keys()
+            .copied()
+            .filter(|id| !ids.contains(id))
+            .collect();
+        discovered.sort_unstable();
+        ids.extend(discovered);
         ids
+    }
+
+    pub fn insert_workspace(&mut self, id: i32, workspace: Workspace) {
+        self.workspace_order = self.workspace_ids();
+        if !self.workspace_order.contains(&id) {
+            self.workspace_order.push(id);
+        }
+        self.workspaces.insert(id, workspace);
+    }
+
+    pub fn remove_workspace(&mut self, id: i32) -> Option<Workspace> {
+        self.workspace_order.retain(|other| *other != id);
+        self.workspaces.remove(&id)
+    }
+
+    pub fn move_workspace_to_position(&mut self, id: i32, position: usize) {
+        let mut ids = self.workspace_ids();
+        let Some(from) = ids.iter().position(|other| *other == id) else {
+            return;
+        };
+        ids.remove(from);
+        ids.insert(position.min(ids.len()), id);
+        self.workspace_order = ids;
+    }
+
+    pub fn next_workspace_id(&self) -> i32 {
+        self.workspaces
+            .keys()
+            .copied()
+            .max()
+            .map_or(0, |id| id.saturating_add(1))
     }
 
     /// The number of workspace `id` on this monitor: its 1-based position from the top.
@@ -465,7 +510,10 @@ impl Monitor {
         if !self.workspaces.contains_key(&id) {
             return None;
         }
-        Some(self.workspaces.keys().filter(|other| **other < id).count() as i32 + 1)
+        self.workspace_ids()
+            .iter()
+            .position(|other| *other == id)
+            .map(|position| position as i32 + 1)
     }
 
     /// The id of the workspace at 1-based `number`; a number past the last workspace
@@ -478,11 +526,14 @@ impl Monitor {
 
     /// The workspace above (`down == false`) or below `id`, if there is one.
     pub fn workspace_next_to(&self, id: i32, down: bool) -> Option<i32> {
-        self.workspaces
-            .keys()
-            .copied()
-            .filter(|other| if down { *other > id } else { *other < id })
-            .min_by_key(|other| (*other - id).abs())
+        let ids = self.workspace_ids();
+        let position = ids.iter().position(|other| *other == id)?;
+        let next = if down {
+            position.checked_add(1)?
+        } else {
+            position.checked_sub(1)?
+        };
+        ids.get(next).copied()
     }
 
     pub fn switch_workspace(&mut self, id: i32) {
