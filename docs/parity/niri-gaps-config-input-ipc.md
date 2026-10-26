@@ -1,6 +1,6 @@
 # niri vs wiri parity matrix B: config, input, key bindings, screenshots, IPC, outputs, non-layout actions, misc
 
-Scope: agent B (config system, input devices, binds, hotkey overlay, screenshots, IPC, outputs, non-layout Actions, misc). Layout, window behaviour, layout/focus/workspace actions, window rules, effects, animations and gestures are agent A. Phase 2B Lane A decoration/motion/tab/overview/recent-window results are tracked in [matrix A](niri-gaps-layout-behaviour.md) and [the Phase 2B report](phase2b-report.md); offline H17 config gates are distinguished from desktop motion checks. Historical summary counts below are not recomputed.
+Scope: agent B (config system, input devices, binds, hotkey overlay, screenshots, IPC, outputs, non-layout Actions, misc). Layout, window behaviour, layout/focus/workspace actions, window rules, effects, animations and gestures are agent A. Phase 2B Lane A decoration/motion/tab/overview/recent-window results are tracked in [matrix A](niri-gaps-layout-behaviour.md) and [the Phase 2B report](phase2b-report.md); offline H17 config gates are distinguished from desktop motion checks. A2 integrated validation at `bd71c96` passes 440 live gates (zero failures), all 102 H16–H21 checks and 1114 library + 7 CLI tests. Lane B's existing dispatcher and primary keyboard/pointer/focus architecture are retained; no legacy relay thread is restored. Counts below are recounted from current rows, not additional features implemented by A2.
 
 Sources read (read-only, nothing built or run):
 
@@ -19,32 +19,31 @@ Sources read (read-only, nothing built or run):
 
 ## Status counts
 
-Current feature-row counts through Phase 2C Lane D, including earlier phases. The
-headline findings below describe the original audit unless marked with a later phase.
+Current feature-row counts including integrated Phase 2B and retained Phase 2C Lane B/D
+updates. The headline findings below describe the original audit unless marked with a later phase.
 
 | section | rows | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- | --- |
 | 1. Config system (loading, KDL syntax, include, live reload, errors, validate) | 28 | 16 | 8 | 3 | 1 |
 | 2. Keyboard input | 10 | 0 | 4 | 1 | 5 |
 | 3. Pointing devices (touchpad, mouse, trackpoint, trackball, tablet, touch) | 18 | 0 | 5 | 9 | 4 |
-| 4. General input settings (focus-follows-mouse, warp, workspace back-and-forth, mod key) | 7 | 1 | 3 | 2 | 1 |
-| 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 7 | 9 | 4 | 1 |
-| 6. Hotkey overlay ("Important Hotkeys") | 7 | 0 | 2 | 5 | 0 |
+| 4. General input settings (focus-follows-mouse, warp, workspace back-and-forth, mod key) | 7 | 4 | 2 | 0 | 1 |
+| 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 14 | 4 | 2 | 1 |
+| 6. Hotkey overlay ("Important Hotkeys") | 7 | 2 | 3 | 2 | 0 |
 | 7. Screenshots | 11 | 5 | 5 | 1 | 0 |
 | 8. IPC transport, protocol and CLI | 11 | 3 | 5 | 3 | 0 |
-| 9. IPC `Request` variants (one row each) | 16 | 1 | 7 | 6 | 2 |
+| 9. IPC `Request` variants (one row each) | 16 | 2 | 7 | 5 | 2 |
 | 10. IPC `Event` variants (one row each) | 20 | 12 | 1 | 4 | 3 |
 | 11. Outputs (config and runtime behaviour) | 17 | 3 | 8 | 3 | 3 |
-| 12. Actions in scope (non-layout), one row each | 29 | 1 | 9 | 10 | 9 |
+| 12. Actions in scope (non-layout), one row each | 29 | 1 | 10 | 9 | 9 |
 | 13. Misc top-level config (startup, environment, cursor, clipboard, session) | 11 | 1 | 1 | 4 | 5 |
-| 14. Switch events, named workspaces config, recent windows (Alt-Tab) | 13 | 0 | 4 | 8 | 1 |
+| 14. Switch events, named workspaces config, recent windows (Alt-Tab) | 13 | 4 | 4 | 4 | 1 |
 | 15. Layer rules | 5 | 0 | 0 | 0 | 5 |
 | 16. Debug options | 22 | 0 | 0 | 0 | 22 |
 | 17. Accessibility, security model, screencasting, Xwayland | 13 | 1 | 0 | 4 | 8 |
-| **total** | **259** | **51** | **71** | **67** | **70** |
+| **total** | **259** | **68** | **67** | **54** | **70** |
 
-Release tagging of the rows: main-only 9, release 238, release? 12. Priorities of the
-189 non-N/A rows: P0 1, P1 33, P2 104, unprioritized (`-`) 51 (50 done, one partial).
+Release and priority tags are historical and are not reassigned by this status recount.
 
 ## Headline findings (verified in code, not from docs)
 

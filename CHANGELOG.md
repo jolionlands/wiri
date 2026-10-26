@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — desktop sign-off
+- Integrated release validation passes: 1114 library + 7 CLI tests, build and all-target check with warnings denied. The complete locked desktop run passes 440 gates, zero failures (102/102 Lane A checks; Lane B/D retained); perf collector errors and final H9 terminal overlaps are zero. Record earlier findings, measured resting cost and remaining limits in the Phase 2B report; recount matrix totals without claiming new features.
+
 ### Phase 2B integration — guarded H5 input setup
 - Fix a real older H5 fixture race on the shared desktop: settle before requesting focus, not after, then require and record the float as foreground immediately before its real workspace-move chord. An unrelated terminal took focus during the old 1.5-second gap. Add a precondition gate and evidence without relaxing any existing assertion or changing product targeting.
 
@@ -20,7 +23,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Phase 2B integration — look and feel on the shared input pump
 - Land configured spring/easing motion, unified passive decorations, active-only tabs, live overview/recent previews and Important Hotkeys from lane A. Preserve lane B's primary keyboard engine, pointer/focus handling, fallback bindings and message-thread dispatcher: no legacy keyboard relay thread/channel.
-- Modal dismissal and recent events keep physical modifier state and captured down/up pairs synchronized; tagged activation input cannot promote MRU. Keep lane D screenshots/output handling unchanged. See the Phase 2B report for source-run evidence and pending integrated validation.
+- Modal dismissal and recent events keep physical modifier state and captured down/up pairs synchronized; tagged activation input cannot promote MRU. Keep lane D screenshots/output handling unchanged. See the Phase 2B report for source-run evidence, completed integrated validation and remaining limits.
 
 ### Phase 2B integration — recent-window diagnostics
 - Preserve lane A's shell-collision-free recent-window fixture and foreground/preview diagnostics; no assertions are relaxed.

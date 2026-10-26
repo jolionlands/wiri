@@ -27,8 +27,10 @@ instances. That phase creates two ordinary WinForms windows **before** starting 
 fresh release `wiri.exe`. It copies the shipped default config, keeps the tray on and
 animations/status bar/focus-follows-mouse off, and uses `-v --no-autostart`.
 Only its child's `APPDATA`, `LOCALAPPDATA`, and `WIRI_CONFIG` are redirected into
-`.live/perf`; it does not rewrite the shared config. It refuses an already-running
-wiri, checks every connected pipe's server PID before writing (including Quit), and
+`.live/perf`; it does not rewrite the shared config. Since A2 `f45c441`, the child also gets a
+unique explicit `WIRI_PIPE` shared with the PID-validating observer (the old global pipe no
+longer names the default server). An unconfigured observer fails closed. It refuses an
+already-running wiri, checks every connected pipe's server PID before writing (including Quit), and
 only terminates its own child on failed graceful shutdown. The parent harness holds
 the machine-wide live mutex throughout. Its pre-existing scenarios still use their
 original shared-desktop setup.

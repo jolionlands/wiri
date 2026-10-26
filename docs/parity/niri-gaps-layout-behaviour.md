@@ -7,7 +7,11 @@ Research only: nothing was built, run, installed or edited; no git commands. Wri
 Current status counts are in [README.md](README.md); phase-labelled rows below update
 this original snapshot with implementation and verification evidence. Phase 2B Lane A updates
 cover decorations, motion, tabs, overview and recent windows; [phase2b-report.md](phase2b-report.md)
-separates source-run evidence from A2 integrated-branch validation.
+separates source-run evidence from completed A2 integrated validation (`bd71c96`):
+440 live gates pass, zero fail, including all 102 H16–H21 checks; 1114 library + 7 CLI tests
+pass. Current rows recount to 71 done / 62 partial / 78 missing / 15 N/A. This is a recount,
+not a claim of additional layout work outside the six Phase 2B items. Live limitations and
+earlier intermittent terminal-minimum observations remain explicit in the report.
 
 - 226 rows (niri features and every in-scope Action, one row per Action or tightly paired Actions). Status: done 2, partial 85, missing 124, N/A on Windows 15. Priority: P0 41 rows (40 still open), P1 76 (75 open), P2 109 (94 open).
 - The two `done` rows are `focus-window-up/down` on stacked columns and per-monitor DPI handling. Almost everything else that looks present is `partial` because it parses but is never acted on, has different semantics, or only exists through IPC.

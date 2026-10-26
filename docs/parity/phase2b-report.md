@@ -1,30 +1,120 @@
 # Phase 2B Lane A: look and feel
 
-## A2 integrated-branch validation
+## A2 integrated-branch validation — complete
 
-Integration branch: `meylin/sa-f9cbe-6b716`, starting at `df229cd`. The runner refuses
-cherry-pick, so the six requested source changes are ported as explicit worktree edits in
-source order. Existing LF in the shared engine is retained; no source-branch EOL churn.
-Recent keyboard events now use Lane B's existing ordered `Work` queue on the hotkey
-message thread, not the old action channel/relay or dedicated keyboard-hook thread.
-Primary keyboard binding/fallback/repeat state, pointer grabs, focus dwell/warp and Lane D
-output/screenshot setup are retained. Modal input advances physical keyboard state without
-firing ordinary/release actions. No dependency changes or new idle resources.
+Branch `meylin/sa-f9cbe-6b716`, base `df229cd`; final tested source/binary **`bd71c96`**.
+The runner refused cherry-pick, so the six requested source changes were ported as
+explicit worktree edits in source order. Each part builds. Existing LF in the shared engine
+is retained; no source-branch EOL churn. No dependencies or Cargo.lock changes.
 
-Release build of the first five integration parts passes with `RUSTFLAGS=-D warnings`.
-The source lane's 102 H16–H21 checks are now included before the unchanged Lane B/D/perf
-phases. The only older harness change is a real classification bug: an intentional `WiriDecor`
-counts as passive only with every required extended style and no APPWINDOW flag. H16
-independently tests those properties. No existing assertion or threshold is weakened.
-Integrated unit/all-target/live results will be recorded after the complete locked run.
-Everything below is the **source lane's historical report**, not a claim that its desktop
-run was performed on this integrated branch.
+| Source change | Integrated commit | Scope |
+| --- | --- | --- |
+| `1158e31` | `81ff35c` | decoration foundation (item 1) |
+| `6b52f47` | `a21c603` | session-local overview (item 4), rustc 1.95 explicit autoref |
+| `696c62e` | `976c04a` | recent-window service (item 5) |
+| `5daa01d` | `5e21ebf` | recent-window diagnostics |
+| `16f332f` | `488c279` | shared integration, motion/tabs/hotkeys (items 1/2/3/6) |
+| `922bd30` | `826ba68` | 102 H16–H21 acceptance checks |
 
-## Source-lane report
+Integration corrections: `a804d4c` resolves the startup probe through `pipe_path()`;
+`f45c441` fixes H16's gesture configuration and the perf observer's obsolete endpoint;
+`bd71c96` fixes the older H5 fixture's foreground precondition. None changes a threshold
+or weakens an existing assertion. The IPC/CLI feature lane is otherwise untouched.
+
+**Lane B architecture retained:** recent input uses the existing ordered `Work` queue on
+its hotkey message thread, not the source lane's action channel/relay or dedicated keyboard
+thread. Primary keyboard binding/fallback/repeat state, pointer grabs, focus dwell/warp and
+Lane D output/screenshot setup remain. Modal input advances physical state and retires
+captured releases without firing normal/release actions; tagged activation input is bypassed.
+
+### Final required validation
+
+All three commands passed with `RUSTFLAGS=-D warnings` and `-j 2`: release build,
+release tests (**1114 library + 7 CLI**, zero failed; one ignored doctest), and release
+all-target check. Logs: `.scratch/final-{build,test,check}.log`. CI-toolchain formatting via
+`C:\wiri-dev\fmt.cmd` and the collector-only PowerShell/native self-test also passed.
+
+The exact full live command with `-LockWaitMinutes 120` completed in **1123 seconds**:
+**440 pass / 0 fail / 77 information**, using the unchanged `scripts/live-report.py` rules.
+`.live/summary.json` has 426 true booleans; its sole false boolean is the expected-negative
+`hidden_json_present_after_restart`. No IPC timeout, settled placement or ordinary-form
+overlap; `h9_overlapping_terminal_pairs=0`. H15 typed JSON actions still pass. The H19
+preflight quit returns 1 because its specified precondition is no daemon; it is not a failure.
+
+| Integrated checks | Passed / total |
+| --- | ---: |
+| Lane A H16 decoration | 12 / 12 |
+| H17 config and motion | 45 / 45 (37 offline config checks, not visible-motion evidence) |
+| H18 tabs | 7 / 7 |
+| H19 overview | 7 / 7 |
+| H20 recent windows | 14 / 14 |
+| H21 Important Hotkeys | 17 / 17 |
+| Retained Lane B H22–H25 | 47 / 47 |
+| Retained Lane D H26–H29 | 13 / 13 |
+
+Evidence paths and live-versus-unit limits for each item are listed below; they now also
+refer to the integrated `.live` run. H5 additionally records foreground HWND **791226**
+(the requested float) immediately before input in `h5-move-input.json`. TRIDARIS is x64,
+rustc 1.95, one 1366×768 display / 1366×728 work area at 96 DPI. The collector reports
+**Windows 11 Pro 10.0.22631**, not the Home/build 26200 description in the historical
+source report. No physical display setting changed; multi-output, non-96-DPI and physical
+mode-change behaviour remain unit-tested only. No load/stress/soak tests were run.
+
+### Findings from integrated runs (not pooled with the final result)
+
+- First complete integration run: 438 pass / 1 fail / 73 info. H16's unchanged Ctrl+Alt
+  injection was plain Mod under its Ctrl+Alt configuration: lane B correctly performed a
+  move, not Ctrl+Mod column reorder. Configure Alt as Mod; the insert-hint assertion stays.
+- Second complete run (`f45c441`): 435 pass / 4 fail / 77 info; all 102 Lane A checks passed.
+  H5's float stayed on workspace 1. `wiri.stderr5.log` shows float 7934162 focused at
+  00:26:20.982Z, Terminal 5378534 taking foreground at 00:26:22.403Z, then the move hotkey
+  at 00:26:22.661Z. The terminal, not the float, correctly moved. This caused
+  `h5_move_to_workspace_hides_the_float_here`, `h5_ipc_reports_float_on_workspace_2`,
+  `h5_float_shown_on_its_new_workspace_at_the_same_place` and
+  `h5_float_hidden_again_on_workspace_1` to fail. Preserve evidence in
+  `.scratch/second-live/{summary.json,wiri.stderr5.log,h5-windows-moved.txt}`. The fixture
+  now settles before focusing and adds a foreground precondition gate; no product targeting
+  change. That run also recorded one informational terminal-overlap pair, versus zero in
+  the first and final runs: minimum-width readiness still warrants follow-up, not a guarantee
+  that the older intermittent observation is impossible.
+- An invocation hit the tool's 30-minute ceiling after lock queueing and H15; it had no
+  final summary and is not counted as a completed run. A mutex-only wait followed by the
+  unchanged full command allowed the final run above to complete.
+- The perf observer used the obsolete global pipe. It now assigns its owned child a unique
+  explicit `WIRI_PIPE`, uses that endpoint and retains server-PID validation. Final collector
+  errors **0**; `p_*` remain information only. Passive decoration classification requires
+  both `WiriDecor` and every required extended style, with no APPWINDOW; H16 independently
+  checks those styles, shell exclusion and cleanup.
+
+### Resting cost and remaining work
+
+No added always-on thread or periodic idle timer. Motion has a frame sleep only while it
+animates; MRU focus/preview and pointer dwell are cancellable one-shots. Decorations reuse
+Lane B's message pump: one lazy frame HWND per visible decorated tile, plus eligible tab
+indicators; no insert hint at rest. Overview/recent/cheatsheet hosts and their threads are
+session-local. Existing reconciler/main-loop/indicator activity is not claimed removed.
+
+The final perf checkpoint (`.live/perf/{measurement,idle}.json`, 85 managed windows) has
+**0 ms CPU / 30.0084 s**, unchanged input ticks, **0 positioning lines**, and **251.66/s**
+endpoint-counted context switches (not timer wakeups). Startup/after endpoints: **21/23
+threads**, **8,097,792/9,117,696 private bytes**, **23,838,720/27,742,208 working-set bytes**;
+three passive decoration HWNDs were observed at startup. First IPC/layout: **249.97/186.73
+ms**. Ten confirmed hotkeys: **21.76 ms median / 25.69 ms max**, with a **25.69 ms** maximum
+observer gap. These are a single noisy checkpoint, not proof of zero idle work, a leak slope
+or sub-frame latency. Phase 4's proposed thread, after-action memory, latency and binary
+budgets are not yet met; its historical baseline is unchanged. See [PERF.md](../PERF.md).
+
+Remaining compositor/style/input approximations and unit-only scenarios below stay open
+in the matrices. ARM64, a second display, scaled desktop and full niri compositor parity
+are not claimed. Everything below is the **source lane's historical report**, not a second
+claim that its original desktop run occurred on this branch.
+
+## Source-lane report (historical)
 
 Branch `meylin/sa-c6e38-6b646`, based on the unfinished decoration work in `1158e31`.
 This is the look-and-feel lane, not a claim that every Phase 2/niri compositor feature is done.
-The two matrices record remaining partial rows. Their headline counts remain historical Phase 2A counts.
+The two matrices record remaining partial rows. See README for recounted integrated totals;
+counts cited in this historical source section are not new integrated results.
 Reference: niri `main` e19df12cf8 (v26.04-era docs).
 
 ## Commit organization

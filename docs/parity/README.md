@@ -13,11 +13,12 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 53 | 58 | 100 | 15 |
-| Config, input and IPC (259 rows) | 51 | 71 | 67 | 70 |
+| Layout and behaviour (226 rows) | 71 | 62 | 78 | 15 |
+| Config, input and IPC (259 rows) | 68 | 67 | 54 | 70 |
 
-The counts reflect current feature-row statuses through Phase 2C Lane D. Earlier checkpoints
-(layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
+The counts are a recount of current feature-row statuses including integrated Phase 2B and
+retained Phase 2C Lane B/D updates; they are not additional features implemented by A2.
+Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
 11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;
 phase-labelled rows relocate the changed code by function name. Each matrix ends with a list
@@ -53,12 +54,14 @@ its column, `maximize-window-to-edges`, an application that goes fullscreen or m
 niri's IPC (the event stream: the state first, then every change; `wiri-ctl action` with niri's arguments, quoting
 and `--id`).
 
-**Phase 2B Lane A (P1), integrated, desktop sign-off pending:** unified lazy decorations, configured
-analytic spring/easing motion, active-only tabbed columns, live DWM workspace/recent previews and a
-monitor-fitting Important Hotkeys sheet. [The Phase 2B report](phase2b-report.md) separates source-run
-live evidence from integrated validation and remaining compositor approximations. Historical counts
-above are not a new Phase 2B parity total. Recent/modal input uses Lane B's existing dispatcher,
-primary keyboard engine and pointer/focus architecture, not the older keyboard relay thread.
+**Phase 2B Lane A (P1), integrated and validated (`81ff35c`..`bd71c96`):** unified lazy decorations,
+configured analytic spring/easing motion, active-only tabbed columns, live DWM workspace/recent previews
+and a monitor-fitting Important Hotkeys sheet. The complete locked integrated run passed **440 gates,
+0 failed**, including all **102 H16–H21** checks and retained Lane B/D gates; 1114 library + 7 CLI tests
+pass. [The Phase 2B report](phase2b-report.md) separates current evidence, earlier-run findings and
+remaining compositor approximations. Recent/modal input uses Lane B's existing dispatcher, primary
+keyboard engine and pointer/focus architecture, not the older keyboard relay thread. No new dependency,
+idle timer or always-on thread; passive decoration HWNDs are lazy and transient UI is session-local.
 
 **Phase 2C Lane B ([report](phase2c-input-report.md)):** primary low-level keyboard bindings,
 mouse/wheel bindings and event-driven pointer focus are retained. Other Phase 2 work still includes
