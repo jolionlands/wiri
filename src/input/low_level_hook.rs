@@ -413,6 +413,7 @@ unsafe extern "system" fn keyboard_hook_callback(
         WM_KEYUP | WM_SYSKEYUP => false,
         _ => return CallNextHookEx(None, n_code, w_param, l_param),
     };
+    crate::overlay::compositor::input_activity();
     let vk = kb.vkCode;
     {
         use std::sync::atomic::Ordering;
@@ -699,6 +700,7 @@ unsafe extern "system" fn mouse_hook_callback(
     }
     let msg = w_param.0 as u32;
     let event = &*(l_param.0 as *const MSLLHOOKSTRUCT);
+    crate::overlay::compositor::input_activity();
     // Our replacement wheel must bypass binds as well as scaling. Other injected
     // input (automation/accessibility) keeps its normal path.
     if event.dwExtraInfo == super::rule_scroll::REINJECTED {

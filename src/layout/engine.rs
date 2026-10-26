@@ -35,6 +35,7 @@ mod rule_effects;
 mod rule_policy;
 mod strip_model;
 mod tabs;
+mod transitions;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
@@ -752,6 +753,7 @@ pub struct TilingEngine {
     motion: crate::config::AnimationsConfig,
     animation_wake: Option<Arc<tokio::sync::Notify>>,
     frame_in_progress: bool,
+    transitions: transitions::Transitions,
     // ---- Item 3: sticky windows (visible on all workspaces) ----
     /// Windows marked sticky by the user; they float above all workspaces and
     /// are never hidden during workspace switches.
@@ -827,6 +829,7 @@ impl TilingEngine {
             motion: Default::default(),
             animation_wake: None,
             frame_in_progress: false,
+            transitions: Default::default(),
             sticky_windows: HashSet::new(),
             workspace_names: HashMap::new(),
             #[cfg(test)]
@@ -1821,6 +1824,7 @@ impl TilingEngine {
 
         // What the rules ask once the window is in its place: its column as wide as the view,
         // no focus for it, fullscreen.
+        self.mark_window_opening(window_id, at_startup);
         self.act_on_open_rules(window_id, &rules, focus_before, at_startup, backend);
     }
 
@@ -2320,7 +2324,7 @@ impl TilingEngine {
             .filter(|(ws_id, _)| **ws_id != active_ws)
             .flat_map(|(_, ws)| ws.columns.iter())
             .flat_map(|column| column.tiles.iter().map(|tile| tile.window_id))
-            .filter(|wid| !self.sticky_windows.contains(wid))
+            .filter(|wid| !self.sticky_windows.contains(wid) && !self.transitions.retained(*wid))
             .collect();
 
         for wid in to_hide {
@@ -3066,7 +3070,9 @@ impl TilingEngine {
                     .animation
                     .get_value(&crate::layout::AnimationTarget::WorkspaceX(output_id))
                     .is_some();
-                if prior.rect != Rect::new(0, 0, 0, 0)
+                let opening = self.begin_window_open(window_id, inset_rect, output_id);
+                if !opening
+                    && prior.rect != Rect::new(0, 0, 0, 0)
                     && !scalar_frame
                     && self.queue_rect(window_id, prior.rect, inset_rect)
                 {
@@ -3251,7 +3257,7 @@ impl TilingEngine {
             &position_map,
             &draw_modes,
             work_rect,
-            overview_active,
+            overview_active || self.transitions.workspace_active(output_id),
         );
 
         // Bring the focused window to the foreground if it changed since last layout.
@@ -3921,6 +3927,9 @@ impl TilingEngine {
 
     /// Switch to a specific workspace
     pub fn switch_workspace(&mut self, workspace_id: i32, backend: &BackendHandle) {
+        if self.switch_workspace_composited(workspace_id, backend) {
+            return;
+        }
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
@@ -4327,6 +4336,7 @@ impl TilingEngine {
             if home.output != output_id
                 || self.sticky_windows.contains(wid)
                 || self.minimized.contains_key(wid)
+                || self.transitions.retained(*wid)
             {
                 continue;
             }
@@ -4765,6 +4775,9 @@ impl TilingEngine {
         } else {
             target.window.as_isize()
         };
+        if hwnd == target.window.as_isize() {
+            self.prepare_close_transition(target.window);
+        }
         self.close_window(hwnd);
         // The window leaves the layout when its destroy event arrives.
     }
@@ -5251,7 +5264,7 @@ impl TilingEngine {
     /// Check if animations are enabled and any are currently active (AnimationManager or
     /// per-window rect animations from `animating_rects`).
     pub fn has_active_animations(&self) -> bool {
-        self.animation.has_active() || !self.animating_rects.is_empty()
+        self.animation.has_active() || !self.animating_rects.is_empty() || self.transitions.active()
     }
 
     /// Convenience alias for `has_active_animations` — exposes whether any rect
@@ -7880,6 +7893,7 @@ impl TilingEngine {
     /// Called on graceful shutdown so the user gets their layout back instead
     /// of windows frozen in the wiri tile positions.
     pub fn restore_all(&mut self, backend: &BackendHandle) {
+        self.cancel_composited_transitions(backend);
         self.native_clips.restore_all();
         self.recent_reset();
         use windows::Win32::Foundation::HWND;

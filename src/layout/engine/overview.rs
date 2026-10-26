@@ -20,6 +20,7 @@ fn zoom_rect(rect: Rect, view: Rect, section_y: i32) -> Rect {
 
 impl TilingEngine {
     pub(super) fn enter_workspace_overview(&mut self, backend: &BackendHandle) {
+        self.cancel_composited_transitions(backend);
         let Some(output) = self.monitors.focused_id() else {
             return;
         };

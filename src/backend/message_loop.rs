@@ -665,6 +665,7 @@ impl MessageLoop {
         };
         info!("Hotkey window created");
         crate::overlay::decor::layer::attach_message_thread();
+        crate::overlay::compositor::attach_message_thread();
         crate::ipc::keyboard_notify::initialize(hwnd);
 
         // Store thread state for hot-reload support
@@ -714,6 +715,9 @@ impl MessageLoop {
                 }
                 if msg.message == WM_STOP_MESSAGE_LOOP {
                     break;
+                }
+                if crate::overlay::compositor::handle_message(msg.message) {
+                    continue;
                 }
                 if crate::overlay::decor::layer::handle_message(msg.message) {
                     continue;
@@ -798,6 +802,7 @@ impl MessageLoop {
         crate::ipc::keyboard_notify::shutdown(hwnd);
         crate::input::stop_keyboard_hook();
         crate::input::recent::reset();
+        crate::overlay::compositor::detach_message_thread();
         crate::overlay::decor::layer::detach_message_thread();
         crate::input::focus::shutdown();
         crate::input::dispatch::shutdown();
@@ -928,6 +933,7 @@ pub(crate) fn perform_action_on(
 ) {
     // Event-stream clients are told what the action did to the windows and workspaces.
     let _state_changed = crate::ipc::StateChangeGuard;
+    engine.write().cancel_composited_transitions(backend);
     if let Action::System(system) = action {
         let result = match system {
             crate::input::system_actions::SystemAction::Quit { skip_confirmation } => {

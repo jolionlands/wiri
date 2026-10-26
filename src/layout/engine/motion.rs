@@ -13,6 +13,7 @@ impl TilingEngine {
     }
 
     pub(super) fn configure_motion(&mut self, options: &AnimationsConfig) {
+        self.reset_composited_transitions();
         self.animation.cancel_all();
         self.animating_rects.clear();
         self.animation.set_enabled(options.enabled);
@@ -26,6 +27,10 @@ impl TilingEngine {
     }
 
     pub(super) fn queue_rect(&mut self, wid: WindowId, from: Rect, to: Rect) -> bool {
+        if self.transitions.preparing {
+            return false;
+        }
+        self.begin_content_resize(wid, from, to);
         let movement = self.motion.movement_kind();
         let resize = self.motion.resize_kind();
         if self.is_overview()
@@ -123,11 +128,15 @@ impl TilingEngine {
             self.apply_layout_for_monitor(output, backend);
         }
         self.frame_in_progress = false;
+        self.tick_composited_transitions(delta_ms, backend);
         self.has_active_animations()
     }
 
     /// Camera movements animate the scroll offset, not each column independently.
     pub(super) fn queue_view(&mut self, output: OutputId, from: i32, target: i32) {
+        if self.transitions.preparing {
+            return;
+        }
         let key = AnimationTarget::ScrollX(output);
         let kind = self.motion.view_kind();
         if kind.is_off() || self.motion.slowdown == 0.0 {

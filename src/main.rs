@@ -1222,6 +1222,9 @@ fn handle_backend_event(
             info!("- Window {}", hwnd);
             // `window_closed` is sent when the state shows that the window is gone (and only
             // for a window wiri managed), not for every window that is destroyed.
+            engine
+                .write()
+                .window_destroyed_transition(WindowId::new(hwnd));
             engine.write().remove_window(WindowId::new(hwnd), handle);
             engine.write().apply_all(handle);
         }

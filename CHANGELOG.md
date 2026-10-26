@@ -32,6 +32,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Lane W — per-window appearance
 - Add sparse niri window-rule focus-ring, border, shadow and tab paints, four-corner geometry and opt-in native clipping with original-region restoration. Attention uses shell flashes/ALERT, not generic accessibility state changes. Changes follow existing rule/focus/resize events; no resting timer or thread. Foreign-HWND clipping is binary and can suppress DWM shadows; compositor blur remains unsupported.
+### Lane K — part-time DWM compositor
+- Animate new tiled windows from half-size/transparent to their final frame while existing strip motion slides neighbours; temporary source cloaks and DWM thumbnails live on one lazy click-through, non-activating topmost layer.
+- Copy available pixels before a wiri close request, then fade/shrink the copy only after destruction. Never keep an application HWND alive or wait for an application capture; unavailable, protected and empty sources fall back without a black tile.
+- Slide outgoing and incoming workspaces vertically together, retaining their redirection sources until final layout/visibility reconciliation.
+- Cross-fade pre-resize content with the resized live thumbnail using the configured Phase 2B timeline. Input, actions, reload and quit snap/cancel; all thumbnails, snapshots and layer resources are released at rest, with no added idle clock, timer or thread.
+
 ### Lane K — animation configuration
 - Decode niri's `window-open` and `window-close` blocks as independent easing/spring/off timelines, including global off/slowdown and legacy overrides. Defaults are 150 ms ease-out-expo for opening and 150 ms ease-out-quad for closing; absent animations remain disabled for wiri compatibility. Pure tests cover defaults, precedence and invalid/duplicate settings.
 

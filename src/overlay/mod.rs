@@ -1,5 +1,6 @@
 //! Painted overlays for wiri (workspace indicator, overview banner, etc.)
 pub mod bindings_cheatsheet;
+pub mod compositor;
 pub mod decor;
 pub mod hotkey_rows;
 pub mod overview_banner;

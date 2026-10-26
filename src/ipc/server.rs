@@ -541,6 +541,11 @@ impl IpcServer {
     fn process_message(&self, message: IpcMessage) -> serde_json::Value {
         // Event-stream clients are told what the request did to the windows and workspaces.
         let _state_changed = (!is_query(&message)).then_some(super::StateChangeGuard);
+        if !is_query(&message) {
+            if let (Some(engine), Some(backend)) = (&self.engine, &self.backend) {
+                engine.write().cancel_composited_transitions(backend);
+            }
+        }
         match message {
             IpcMessage::GetState => {
                 if let Some(engine) = &self.engine {
@@ -717,6 +722,11 @@ impl IpcServer {
                         "success": false,
                         "error": format!("Invalid HWND: {}", window_hwnd)
                     });
+                }
+                if let Some(engine) = &self.engine {
+                    engine
+                        .write()
+                        .prepare_close_transition(crate::utils::WindowId::new(window_hwnd));
                 }
                 unsafe {
                     let _ = PostMessageW(

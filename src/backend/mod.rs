@@ -795,10 +795,13 @@ impl BackendHandle {
     /// cloaked is hidden the plain way.  Showing undoes whichever was done.
     pub fn show_window(&self, hwnd: isize, show: bool) -> Result<()> {
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        let composited = crate::overlay::compositor::preserve_cloak(hwnd, show);
         if show {
-            hidden::note_hidden(hwnd, false, false);
-            // A no-op unless this run cloaked the window.
-            cloak::uncloak(hwnd);
+            if !composited {
+                hidden::note_hidden(hwnd, false, false);
+                // A no-op unless this run cloaked the window.
+                cloak::uncloak(hwnd);
+            }
             unsafe {
                 let _ = ShowWindowAsync(hwnd_win, SW_SHOWNA);
             }
