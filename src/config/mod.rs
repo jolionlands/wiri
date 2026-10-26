@@ -5,6 +5,7 @@ pub mod error;
 pub mod gestures_config;
 pub mod kdl;
 pub mod loader;
+pub mod overview_config;
 pub mod parse;
 pub mod recent_windows_config;
 pub mod search;

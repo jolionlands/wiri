@@ -24,6 +24,8 @@ use super::types::*;
 mod animations_decode;
 mod effects_decode;
 mod gestures_decode;
+#[path = "decode/overview_decode.rs"]
+mod overview_decode;
 #[path = "decode/recent_windows_decode.rs"]
 mod recent_windows_decode;
 mod rule_effects_decode;
@@ -309,8 +311,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "config-notification" => Some("wiri always shows a balloon for a config error"),
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
-
-        "overview" => Some("not implemented yet"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
         "debug" => Some("these are compositor debug options"),
         "layer-rule" => Some("Windows has no layer shell"),
@@ -930,6 +930,7 @@ impl Decoder {
                         }
                     }
                 }
+                "overview" => self.decode_overview(node, &mut cfg.overview),
                 "include" => self.decode_include(node, cfg),
                 other => match top_level_unsupported(other) {
                     Some(why) => self.unsupported(node, why),

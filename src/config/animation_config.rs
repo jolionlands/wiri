@@ -23,6 +23,9 @@ pub struct AnimationsConfig {
     pub resize: Option<AnimationKind>,
     pub window_open: Option<AnimationKind>,
     pub window_close: Option<AnimationKind>,
+    pub overview_open_close: Option<AnimationKind>,
+    /// Overview defaults to niri's spring even when legacy HWND motion is not opted in.
+    pub overview_enabled: bool,
 }
 
 impl Default for AnimationsConfig {
@@ -52,6 +55,8 @@ impl AnimationsConfig {
             resize: None,
             window_open: None,
             window_close: None,
+            overview_open_close: None,
+            overview_enabled: true,
         }
     }
 
@@ -122,6 +127,22 @@ impl AnimationsConfig {
 
     pub fn movement_kind(&self) -> AnimationKind {
         self.kind(self.window_move, self.window_movement, 800.0)
+    }
+
+    pub fn overview_kind(&self) -> AnimationKind {
+        if !self.overview_enabled {
+            return AnimationKind::Off;
+        }
+        self.overview_open_close.unwrap_or_else(|| {
+            if self.default_kind.is_some() || self.legacy_easing {
+                self.base_kind()
+            } else {
+                AnimationKind::Spring(Spring {
+                    stiffness: 800.0,
+                    ..Spring::default()
+                })
+            }
+        })
     }
 
     pub fn resize_kind(&self) -> AnimationKind {

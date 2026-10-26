@@ -20,6 +20,7 @@ impl Decoder {
                 | "slowdown"
                 | "workspace-switch"
                 | "horizontal-view-movement"
+                | "overview-open-close"
                 | "window-movement"
                 | "window-open"
                 | "window-close" => Some(name.as_str()),
@@ -38,11 +39,13 @@ impl Decoder {
                 "enabled" | "enable" | "on" => {
                     if let Some(v) = self.flag(child) {
                         cfg.enabled = v;
+                        cfg.overview_enabled = v;
                     }
                 }
                 "off" => {
                     if let Some(v) = self.flag(child) {
                         cfg.enabled = !v;
+                        cfg.overview_enabled = !v;
                     }
                 }
                 "slowdown" => {
@@ -68,6 +71,7 @@ impl Decoder {
                 "workspace-switch"
                 | "horizontal-view-movement"
                 | "window-movement"
+                | "overview-open-close"
                 | "window-open"
                 | "window-close" => {
                     blocks.push(child);
@@ -108,7 +112,6 @@ impl Decoder {
                 "config-notification-open-close"
                 | "exit-confirmation-open-close"
                 | "screenshot-ui-open"
-                | "overview-open-close"
                 | "recent-windows-close" => {
                     self.unsupported(child, "composited open/close animations (only geometry transitions are implemented)");
                 }
@@ -155,6 +158,7 @@ impl Decoder {
                 "horizontal-view-movement" => cfg.horizontal_view_movement = kind,
                 "window-movement" => cfg.window_movement = kind,
                 "window-resize" => cfg.resize = kind,
+                "overview-open-close" => cfg.overview_open_close = kind,
                 "window-open" => cfg.window_open = kind,
                 "window-close" => cfg.window_close = kind,
                 _ => unreachable!(),
