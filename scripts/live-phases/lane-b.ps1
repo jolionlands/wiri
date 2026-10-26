@@ -68,7 +68,8 @@
         try {
             # Compare the connected pipe's server PID, then write quit on THAT
             # handle. A global Ctl quit could instead stop an unrelated daemon.
-            $stop.quit = [LaneBProbe]::QuitOwned($p.Id)
+            # The daemon serves a per-user, per-session pipe (see WiriPipeName), not a bare wiri_control.
+            $stop.quit = [LaneBProbe]::QuitOwned($p.Id, (WiriPipeName))
         } catch { $stop.quit = [string]$_ }
         if (-not $p.WaitForExit(2500)) {
             $stop.forced = $true
@@ -279,8 +280,8 @@ public static class LaneBProbe {
     i.u.m.y = (int)(((long)(y - top) * 65536 + 32768) / height); Send(i);
   }
   public static Point Cursor() { Point p; if (!GetCursorPos(out p)) throw new InvalidOperationException("GetCursorPos"); return p; }
-  public static string QuitOwned(int pid) {
-    using (var pipe = new NamedPipeClientStream(".", "wiri_control", PipeDirection.InOut, PipeOptions.Asynchronous)) {
+  public static string QuitOwned(int pid, string pipeName) {
+    using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous)) {
       pipe.Connect(800);
       uint server;
       if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out server)) throw new Win32Exception(Marshal.GetLastWin32Error());
