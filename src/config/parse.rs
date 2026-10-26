@@ -32,22 +32,28 @@ pub fn validate_config_file(path: &Path) -> Vec<ValidationIssue> {
 /// The config of a decoded text, or the first error (with a count of the others) in
 /// `file:line:column: error: message` form.
 pub fn into_result(decoded: Decoded, default_file: &str) -> Result<Config> {
-    let first = decoded.first_error().cloned();
-    match first {
-        None => Ok(decoded.config),
-        Some(first) => {
-            let more = decoded.error_count().saturating_sub(1);
-            let mut message = first.located(default_file);
-            if more > 0 {
-                message.push_str(&format!(
-                    " (and {} more error{})",
-                    more,
-                    if more == 1 { "" } else { "s" }
-                ));
-            }
-            Err(ConfigError::Invalid(message))
-        }
+    if !decoded.has_errors() {
+        return Ok(decoded.config);
     }
+    let errors: Vec<_> = decoded
+        .issues
+        .iter()
+        .filter(|i| i.severity == ValidationSeverity::Error)
+        .collect();
+    let mut message = errors
+        .iter()
+        .map(|i| super::diagnostics::render(i, default_file))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let more = errors.len().saturating_sub(1);
+    if more > 0 {
+        message.push_str(&format!(
+            " (and {} more error{})",
+            more,
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    Err(ConfigError::Invalid(message))
 }
 
 #[cfg(test)]

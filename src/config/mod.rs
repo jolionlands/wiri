@@ -1,4 +1,5 @@
 pub mod decode;
+pub mod diagnostics;
 pub mod effects;
 pub mod error;
 pub mod gestures_config;
@@ -6,7 +7,9 @@ pub mod kdl;
 pub mod loader;
 pub mod parse;
 pub mod recent_windows_config;
+pub mod search;
 pub mod types;
+mod validation;
 
 pub use decode::{Decoded, MAX_INCLUDE_DEPTH};
 pub use effects::{

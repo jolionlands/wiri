@@ -11,7 +11,7 @@
 #![cfg_attr(not(any(debug_assertions, test)), windows_subsystem = "windows")]
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -57,10 +57,11 @@ fn version_static() -> &'static str {
     about = "A scrollable-tiling window manager for Windows"
 )]
 struct Args {
-    /// Path to the KDL config file. If unset, search $WIRI_CONFIG, %APPDATA%/wiri/config.kdl,
-    /// then %USERPROFILE%/.config/wiri/config.kdl, then fall back to ./config.kdl.
-    #[arg(short, long)]
+    /// KDL path; otherwise use nonempty WIRI_CONFIG, NIRI_CONFIG, then APPDATA/wiri/config.kdl.
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<OfflineCommand>,
     /// Log debug output.  When wiri is started from a console the log is also
     /// shown there (closing that console then stops wiri); it always goes to
     /// %LOCALAPPDATA%\wiri\wiri.log.
@@ -77,6 +78,40 @@ struct Args {
     /// Skip spawning programs listed in spawn-at-startup config entries (useful for testing)
     #[arg(long)]
     no_autostart: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum OfflineCommand {
+    /// Validate the config without starting the window manager.
+    Validate,
+    /// Generate shell completions without starting the window manager.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+}
+
+fn offline_command(args: &Args) -> Option<bool> {
+    match args.command.as_ref()? {
+        OfflineCommand::Validate => {
+            let path = wiri::config::search::resolve(args.config.clone()).path;
+            let decoded = wiri::config::decode::decode_file(&path);
+            for issue in &decoded.issues {
+                eprintln!(
+                    "{}",
+                    wiri::config::diagnostics::render(issue, &path.display().to_string())
+                );
+            }
+            if !decoded.has_errors() {
+                println!("Configuration is valid: {}", path.display());
+            }
+            Some(!decoded.has_errors())
+        }
+        OfflineCommand::Completions { shell } => {
+            clap_complete::generate(*shell, &mut Args::command(), "wiri", &mut std::io::stdout());
+            Some(true)
+        }
+    }
 }
 
 #[tokio::main]
@@ -100,8 +135,18 @@ async fn main() -> Result<()> {
             e.exit()
         }
     };
-    if args.verbose || args.register_autostart || args.unregister_autostart {
+    if args.command.is_some()
+        || args.verbose
+        || args.register_autostart
+        || args.unregister_autostart
+    {
         wiri::logging::attach_parent_console();
+    }
+    if let Some(ok) = offline_command(&args) {
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
     // Remember a console that only wiri is attached to (console-subsystem
     // builds) so it is never tiled.  Must run after the attach above.
@@ -219,42 +264,27 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // Resolve config path: explicit --config wins, otherwise search the standard locations.
-    let config_path: PathBuf = args
-        .config
-        .clone()
-        .or_else(wiri::config::default_config_path)
-        .unwrap_or_else(|| {
-            // First-run: drop a default config at %APPDATA%/wiri/config.kdl so
-            // the user has something to edit instead of a 'config.kdl' in CWD.
-            if let Ok(appdata) = std::env::var("APPDATA") {
-                let dir = PathBuf::from(&appdata).join("wiri");
-                let path = dir.join("config.kdl");
-                if !path.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&dir) {
-                        warn!("Could not create {}: {}", dir.display(), e);
-                    } else if let Err(e) =
-                        std::fs::write(&path, include_str!("../resources/default_config.kdl"))
-                    {
-                        warn!(
-                            "Could not write default config to {}: {}",
-                            path.display(),
-                            e
-                        );
-                    } else {
-                        info!("Wrote default config to {}", path.display());
-                    }
-                }
-                path
-            } else {
-                PathBuf::from("config.kdl")
-            }
-        });
+    // Explicit CLI/env paths are never created, including missing ones.
+    let selected_config = wiri::config::search::resolve(args.config.clone());
+    let created_config = match selected_config.create_default() {
+        Ok(created) => created,
+        Err(e) => {
+            warn!("Could not create default config: {}", e);
+            false
+        }
+    };
+    let config_path = selected_config.path;
 
     // A config with errors is not loaded (niri does the same): wiri starts with its defaults
     // and says why in a balloon as soon as the tray icon exists.
     let startup_decoded = wiri::config::loader::load_logged(&config_path);
-    let mut pending_balloon: Option<(String, String, u32)> = None;
+    let mut pending_balloon: Option<(String, String, u32)> = created_config.then(|| {
+        (
+            "wiri: default config".to_string(),
+            format!("Created a default config file at {}", config_path.display()),
+            0,
+        )
+    });
     // What an event-stream client that connects later is told about this load.
     let startup_warnings = startup_decoded.warning_count() as u32;
     let mut startup_error: Option<String> = None;
@@ -262,11 +292,13 @@ async fn main() -> Result<()> {
         let summary = wiri::config::failure_summary(&config_path, &startup_decoded.issues);
         startup_error = Some(summary.clone());
         warn!("Using defaults (config error: {})", summary);
-        pending_balloon = Some((
-            "wiri: config error".to_string(),
-            format!("{} - using the defaults.", summary),
-            0,
-        ));
+        if !startup_decoded.config.disable_failed_config_notification {
+            pending_balloon = Some((
+                "wiri: config error".to_string(),
+                format!("{} - using the defaults.", summary),
+                0,
+            ));
+        }
         Config::default_config()
     } else {
         info!(
@@ -1005,7 +1037,12 @@ impl<'a> ReloadCtx<'a> {
             summary
         );
         let text = balloon_text(&format!("{} - last good config kept.", summary));
-        if !system.tray_icon().try_balloon("wiri: config error", &text) {
+        let disabled = self
+            .engine
+            .read()
+            .full_config()
+            .is_some_and(|c| c.disable_failed_config_notification);
+        if !disabled && !system.tray_icon().try_balloon("wiri: config error", &text) {
             warn!("The config error balloon could not be shown");
         }
         let warnings = issues
@@ -1570,4 +1607,22 @@ fn should_tile_window(window: &wiri::backend::WindowInfo) -> bool {
     }
 
     window.is_visible
+}
+
+#[cfg(test)]
+mod c2_cli_tests {
+    use super::*;
+    #[test]
+    fn offline_commands_accept_niri_syntax() {
+        let args = Args::try_parse_from(["wiri", "validate", "-c", "test.kdl"]).unwrap();
+        assert!(matches!(args.command, Some(OfflineCommand::Validate)));
+        assert_eq!(args.config, Some(PathBuf::from("test.kdl")));
+        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+            let args = Args::try_parse_from(["wiri", "completions", shell]).unwrap();
+            assert!(matches!(
+                args.command,
+                Some(OfflineCommand::Completions { .. })
+            ));
+        }
+    }
 }

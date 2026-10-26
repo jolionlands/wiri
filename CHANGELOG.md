@@ -5,6 +5,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane C2 item 1 — config policy and diagnostics
+- Match explicit CLI → nonempty WIRI_CONFIG → compatibility NIRI_CONFIG → APPDATA selection; never create explicit paths. Notify after creating the implicit default and support `config-notification { disable-failed }` without hiding logs/events.
+- Reject duplicate singleton nodes with both source locations and invalid ranges/fractional integers. Render source labels, help and include chains in validation/logs. User binds replace defaults unless the wiri `extend-defaults` extension is explicit.
+- Add offline `wiri validate [-c path]`, generated shell completions, pure policy/validation tests and H66 offline checks; desktop evidence is tracked in `docs/parity/lane-c2-report.md`.
+
 ### Lane Z — floating layer survives delayed native raises
 - Repair actual workspace z-order inversions on native REORDER events, not only on focus/layout. Correct the SHOW/HIDE WinEvent IDs so REORDER is no longer misclassified as HIDE. Keep float MRU and tile keyboard focus with asynchronous relative-HWND placement, without TOPMOST, global float promotion, idle timers or new threads.
 - Add deterministic H45 delayed-raise coverage and opt-in repeated H3/H5/H45 evidence. The delayed-layer check fails 3/3 before and passes 4/4 after; the complete release desktop run passes 500 gates. Release validation passes 1210 library + 14 CLI tests. Record repeat pass rates, one unrelated Terminal focus interruption, measured resting cost and limits in `docs/parity/lane-z-report.md`.
