@@ -92,6 +92,9 @@ pub enum WindowState {
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    /// Hardware switch transition, dispatched to configured actions by the parent.
+    /// Initial samples and duplicate states are suppressed by the switch reducer.
+    SwitchEvent(crate::hooks::switch_events::SwitchEvent),
     WindowCreated {
         hwnd: isize,
     },
