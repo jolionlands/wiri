@@ -106,7 +106,43 @@ impl IpcClient {
             };
             return Err(IpcError::ConnectionFailed(hint));
         }
-        self.connect().await
+        // Another client can take the instance the wait reported free before this one opens it
+        // (ERROR_PIPE_BUSY; two `events --stream` started at the same moment on a hosted CI
+        // runner hit this): wait for the next instance until the deadline.
+        use tokio::net::windows::named_pipe::ClientOptions;
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+        loop {
+            match ClientOptions::new().open(&path) {
+                Ok(pipe) => {
+                    self.pipe = Some(BufReader::new(pipe));
+                    info!("IPC client connected to {}", path);
+                    return Ok(());
+                }
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(IpcError::ConnectionFailed(format!(
+                            "{} — every pipe instance stayed busy for {}s ({})",
+                            path, timeout_secs, error
+                        )));
+                    }
+                    let wait_ms = left.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+                    if !unsafe { WaitNamedPipeW(PCWSTR::from_raw(wide.as_ptr()), wait_ms) }
+                        .as_bool()
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                Err(error) => {
+                    return Err(IpcError::ConnectionFailed(format!(
+                        "{} — is wiri running? ({})",
+                        path, error
+                    )))
+                }
+            }
+        }
     }
 
     /// Send a typed wiri request and consume exactly one reply, leaving the
