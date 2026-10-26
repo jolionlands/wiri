@@ -1086,9 +1086,16 @@ Chord 'ctrl+alt+1'; Start-Sleep -Milliseconds 1800
 $h5FloatAboveAfterRoundTrip = ([LT]::TopWindowAt($gcx, $gcy) -eq $ff)
 
 # (c) moved to workspace 2 with the key, it leaves workspace 1 and shows up on 2 at the same place
-$null = Ctl 'h5-focus-float' @('focus-window', [string][int64]$ff)
 Start-Sleep -Milliseconds 1500
-Chord 'ctrl+alt+shift+2'; Start-Sleep -Milliseconds 1800
+$h5MoveForegroundBeforeFocus = [int64][LT]::GetForegroundWindow()
+# Arrange focus AFTER settling: another tenant's newly opened terminal can take it during the sleep.
+$null = Ctl 'h5-focus-float' @('focus-window', [string][int64]$ff)
+$h5MoveForegroundAtInjection = [int64][LT]::GetForegroundWindow()
+$h5MoveHadForeground = ($h5MoveForegroundAtInjection -eq [int64]$ff)
+if ($h5MoveHadForeground) { Chord 'ctrl+alt+shift+2' }
+@{ expected = [int64]$ff; before_focus = $h5MoveForegroundBeforeFocus; before_chord = $h5MoveForegroundAtInjection } |
+    ConvertTo-Json | Set-Content (Join-Path $D 'h5-move-input.json')
+Start-Sleep -Milliseconds 1800
 $h5MovedAwayHidden = -not [LT]::IsWindowVisible($ff)
 $lm = WinList 'h5-windows-moved'
 $h5IpcWorkspace2 = (((WinOf $lm $ff).floating -eq $true) -and ((WinOf $lm $ff).workspace -eq 2))
@@ -2696,6 +2703,7 @@ $summary = [ordered]@{
     h5_overlapping_tile_got_the_focus = $h5TileGotFocus
     h5_float_stays_above_the_focused_tile = $h5FloatAboveFocusedTile
     h5_float_stays_above_after_workspace_round_trip = $h5FloatAboveAfterRoundTrip
+    h5_move_input_had_float_foreground = $h5MoveHadForeground
     h5_move_to_workspace_hides_the_float_here = $h5MovedAwayHidden
     h5_ipc_reports_float_on_workspace_2 = $h5IpcWorkspace2
     h5_float_shown_on_its_new_workspace_at_the_same_place = $h5ShownOnWs2

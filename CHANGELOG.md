@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Phase 2B integration — guarded H5 input setup
+- Fix a real older H5 fixture race on the shared desktop: settle before requesting focus, not after, then require and record the float as foreground immediately before its real workspace-move chord. An unrelated terminal took focus during the old 1.5-second gap. Add a precondition gate and evidence without relaxing any existing assertion or changing product targeting.
+
 ### Phase 2B integration — live fixture compatibility
 - H16 now configures Alt as Mod so its unchanged Ctrl+Alt input exercises lane B's Ctrl+Mod column-reorder gesture, rather than the plain Mod move gesture. The insert-hint assertion is unchanged.
 - Fix a real older perf-observer bug: give its owned child an explicit unique `WIRI_PIPE` endpoint and use that endpoint for every PID-validated request instead of the unused global pipe. No measurement thresholds or earlier gates change.
