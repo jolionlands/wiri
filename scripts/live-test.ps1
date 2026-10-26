@@ -423,9 +423,23 @@ function Shot([string]$name) {
 function Ctl([string]$name, [string[]]$ctlArgs) {
     $outFile = Join-Path $D "$name.txt"
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $p = Start-Process -FilePath $ctl -ArgumentList $ctlArgs -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err" -WindowStyle Hidden -PassThru
-    $null = $p.Handle    # keep the process handle open, otherwise ExitCode comes back empty
-    if ($p.WaitForExit(5000)) { $rc = $p.ExitCode } else { Stop-Process -Id $p.Id -Force; $rc = 'timeout' }
+    # A process this script starts itself keeps its handle, so its exit code is always known (Start-Process's
+    # object lost it when wiri-ctl exited before the handle was opened: rc came back empty on a hosted runner).
+    $psi = New-Object Diagnostics.ProcessStartInfo $ctl
+    $psi.Arguments = $ctlArgs -join ' '    # joined as Start-Process -ArgumentList joins them
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $p = [Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEndAsync()
+    $err = $p.StandardError.ReadToEndAsync()
+    if ($p.WaitForExit(5000)) { $p.WaitForExit(); $rc = $p.ExitCode } else { try { $p.Kill() } catch { }; $rc = 'timeout' }
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($outFile, $(if ($out.Wait(2000)) { $out.Result } else { '' }), $utf8)
+    [IO.File]::WriteAllText("$outFile.err", $(if ($err.Wait(2000)) { $err.Result } else { '' }), $utf8)
     $steps.Add([pscustomobject]@{ step = $name; args = ($ctlArgs -join ' '); rc = $rc; ms = $sw.ElapsedMilliseconds })
     return (Get-Content $outFile -Raw -ErrorAction SilentlyContinue)
 }
