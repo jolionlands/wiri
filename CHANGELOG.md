@@ -10,7 +10,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add deterministic H45 delayed-raise coverage and opt-in repeated H3/H5/H45 evidence. The delayed-layer check fails 3/3 before and passes 4/4 after; the complete release desktop run passes 500 gates. Release validation passes 1210 library + 14 CLI tests. Record repeat pass rates, one unrelated Terminal focus interruption, measured resting cost and limits in `docs/parity/lane-z-report.md`.
 ### Lane S item 1 — frozen screenshot selector
 - Add an on-demand focused-output screenshot UI with selection/Space-drag, pointer toggle, save/copy/cancel and absolute destinations through binds, CLI and typed IPC. Frames are frozen before the initially nonactivating host is shown; UI pixels never enter the saved crop.
-- Add pure geometry/options tests and H46 locked desktop checks (validation pending). No new crate, timer or idle worker.
+- Add pure geometry/options tests and H46 locked desktop checks: 9/9 passed in the interrupted run; full-suite sign-off remains pending. No new crate, timer or idle worker.
+- Finalize the last drag coordinate before reentrant mouse-capture release; held Space autorepeat cannot save when a move-drag ends. Two pure regressions pass.
 
 ### Lane S item 2 — screenshot action options
 - Screen/window captures accept niri disk/pointer flags and absolute paths through binds, CLI and typed IPC. Explicit managed-window ids capture without activation; copy-only overrides a supplied destination.

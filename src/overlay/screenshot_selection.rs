@@ -97,6 +97,15 @@ impl Selection {
         }
     }
 
+    pub fn end_at(&mut self, point: (i32, i32)) {
+        self.motion(point);
+        self.end();
+    }
+
+    pub fn can_confirm_space(&self, repeat: bool) -> bool {
+        !self.dragging && !repeat
+    }
+
     pub fn space(&mut self, down: bool) {
         self.space = down;
     }
@@ -175,6 +184,34 @@ mod tests {
             Selection::new(100, 100, Some(s.region())).region().width,
             50
         );
+    }
+    #[test]
+    fn button_release_uses_its_final_coordinate_before_ending_capture() {
+        let mut s = Selection::new(400, 300, None);
+        s.begin((10, 20));
+        s.motion((30, 40));
+        s.end_at((50, 60));
+        assert!(!s.dragging);
+        assert_eq!(
+            s.region(),
+            Region {
+                x: 10,
+                y: 20,
+                width: 41,
+                height: 41
+            }
+        );
+    }
+    #[test]
+    fn space_repeat_cannot_confirm_after_ending_a_space_drag() {
+        let mut s = Selection::new(400, 300, None);
+        s.begin((10, 20));
+        s.space(true);
+        assert!(!s.can_confirm_space(false));
+        s.end_at((30, 40));
+        assert!(!s.can_confirm_space(true));
+        s.space(false);
+        assert!(s.can_confirm_space(false));
     }
     #[test]
     fn backwards_drag_includes_both_pixels_and_cannot_span_outputs() {

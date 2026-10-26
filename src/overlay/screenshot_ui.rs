@@ -303,12 +303,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return LRESULT(0);
         }
         WM_LBUTTONDOWN => {
-            SetCapture(hwnd);
             let pos = point(lp);
             state.toolbar_down = inside(state.save_button(), pos);
             if !state.toolbar_down {
                 state.selection.begin(pos);
             }
+            SetCapture(hwnd);
         }
         WM_MOUSEMOVE => {
             if state.toolbar_down || !state.selection.dragging {
@@ -317,16 +317,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             state.selection.motion(point(lp));
         }
         WM_LBUTTONUP => {
-            let _ = ReleaseCapture();
-            if state.toolbar_down {
+            let save = if state.toolbar_down {
                 state.toolbar_down = false;
-                if inside(state.save_button(), point(lp)) {
-                    state.outcome = Some(true);
-                    let _ = DestroyWindow(hwnd);
-                }
+                inside(state.save_button(), point(lp))
             } else {
-                state.selection.motion(point(lp));
-                state.selection.end();
+                state.selection.end_at(point(lp));
+                false
+            };
+            if save {
+                state.outcome = Some(true);
+            }
+            // ReleaseCapture reenters through WM_CAPTURECHANGED: finish the
+            // release coordinate and stop borrowing State before that callback.
+            let _ = ReleaseCapture();
+            if save {
+                let _ = DestroyWindow(hwnd);
             }
         }
         WM_CAPTURECHANGED => state.selection.dragging = false,
@@ -343,7 +348,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     let _ = DestroyWindow(hwnd);
                 } else if mods & 5 == 0 {
                     match vk {
-                        0x20 if mods & 2 == 0 && !state.selection.dragging => {
+                        0x20 if mods & 2 == 0 && state.selection.can_confirm_space(repeat) => {
                             state.outcome = Some(true);
                             let _ = DestroyWindow(hwnd);
                         }
