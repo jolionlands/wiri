@@ -20,7 +20,9 @@ impl Decoder {
                 | "slowdown"
                 | "workspace-switch"
                 | "horizontal-view-movement"
-                | "window-movement" => Some(name.as_str()),
+                | "window-movement"
+                | "window-open"
+                | "window-close" => Some(name.as_str()),
                 "window-resize" if child.children.is_some() => Some("window-resize"),
                 _ => None,
             };
@@ -63,7 +65,11 @@ impl Decoder {
                 "spring" => {
                     cfg.default_kind = self.animation_spring(child).map(AnimationKind::Spring);
                 }
-                "workspace-switch" | "horizontal-view-movement" | "window-movement" => {
+                "workspace-switch"
+                | "horizontal-view-movement"
+                | "window-movement"
+                | "window-open"
+                | "window-close" => {
                     blocks.push(child);
                 }
                 "window-resize" if child.children.is_some() => {
@@ -99,9 +105,7 @@ impl Decoder {
                         cfg.shadow = v;
                     }
                 }
-                "window-open"
-                | "window-close"
-                | "config-notification-open-close"
+                "config-notification-open-close"
                 | "exit-confirmation-open-close"
                 | "screenshot-ui-open"
                 | "overview-open-close"
@@ -132,12 +136,27 @@ impl Decoder {
         }
         // Curve-only overrides inherit the final global duration, not a partial one.
         for child in blocks {
-            let kind = Some(self.animation_spec(child, cfg.duration));
+            let default = match norm(&child.name).as_str() {
+                "window-open" => AnimationsConfig {
+                    enabled: true,
+                    ..cfg.clone()
+                }
+                .open_kind(),
+                "window-close" => AnimationsConfig {
+                    enabled: true,
+                    ..cfg.clone()
+                }
+                .close_kind(),
+                _ => AnimationKind::Spring(Spring::default()),
+            };
+            let kind = Some(self.animation_spec(child, cfg.duration, default));
             match norm(&child.name).as_str() {
                 "workspace-switch" => cfg.workspace_switch = kind,
                 "horizontal-view-movement" => cfg.horizontal_view_movement = kind,
                 "window-movement" => cfg.window_movement = kind,
                 "window-resize" => cfg.resize = kind,
+                "window-open" => cfg.window_open = kind,
+                "window-close" => cfg.window_close = kind,
                 _ => unreachable!(),
             }
         }
@@ -194,12 +213,19 @@ impl Decoder {
         valid.then_some(spring)
     }
 
-    fn animation_spec(&mut self, node: &Node, default_duration: u32) -> AnimationKind {
+    fn animation_spec(
+        &mut self,
+        node: &Node,
+        default_duration: u32,
+        default: AnimationKind,
+    ) -> AnimationKind {
         self.section(node);
         let mut seen = std::collections::HashSet::new();
         let mut spring = None;
-        let mut duration = default_duration;
-        let mut curve = Easing::CubicOut;
+        let (mut duration, mut curve) = match default {
+            AnimationKind::Easing { duration_ms, curve } => (duration_ms, curve),
+            _ => (default_duration, Easing::CubicOut),
+        };
         let mut easing = false;
         let mut off = false;
         for child in node.kids() {
@@ -257,7 +283,7 @@ impl Decoder {
                 curve,
             }
         } else {
-            AnimationKind::Spring(Spring::default())
+            default
         }
     }
 }
@@ -266,6 +292,144 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::config::decode::{decode_text, ValidationSeverity};
+
+    fn easing(duration_ms: u32, curve: Easing) -> AnimationKind {
+        AnimationKind::Easing { duration_ms, curve }
+    }
+
+    fn decode_animations(body: &str) -> AnimationsConfig {
+        let d = decode_text(&format!("animations {{ {body} }}"), "", None);
+        assert!(d.issues.is_empty(), "{body}: {:?}", d.issues);
+        d.config.animations
+    }
+
+    #[test]
+    fn open_close_defaults_match_niri_only_when_animations_are_enabled() {
+        let d = decode_text("", "", None);
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
+        assert!(!d.config.animations.enabled);
+        assert_eq!(d.config.animations.open_kind(), AnimationKind::Off);
+        assert_eq!(d.config.animations.close_kind(), AnimationKind::Off);
+
+        // Defaults pinned to niri e19df12cf8, Configuration: Animations.
+        for body in ["", "window-open {}; window-close {};"] {
+            let cfg = decode_animations(body);
+            assert!(cfg.enabled);
+            assert_eq!(cfg.open_kind(), easing(150, Easing::ExpoOut));
+            assert_eq!(cfg.close_kind(), easing(150, Easing::QuadOut));
+            let explicit = !body.is_empty();
+            assert_eq!(cfg.window_open.is_some(), explicit);
+            assert_eq!(cfg.window_close.is_some(), explicit);
+        }
+    }
+
+    #[test]
+    fn open_close_specs_are_typed_independent_overrides() {
+        for (effect, curve, other_curve) in [
+            ("window-open", Easing::ExpoOut, Easing::QuadOut),
+            ("window-close", Easing::QuadOut, Easing::ExpoOut),
+        ] {
+            for (settings, expected) in [
+                ("off;", AnimationKind::Off),
+                ("off false;", easing(150, curve)),
+                ("duration-ms 240;", easing(240, curve)),
+                ("curve linear;", easing(150, Easing::Linear)),
+                (
+                    "duration 320; easing ease-out-quad;",
+                    easing(320, Easing::QuadOut),
+                ),
+                (
+                    "spring damping-ratio=0.7 stiffness=900 epsilon=0.001;",
+                    AnimationKind::Spring(Spring {
+                        damping_ratio: 0.7,
+                        stiffness: 900.0,
+                        epsilon: 0.001,
+                    }),
+                ),
+            ] {
+                let cfg = decode_animations(&format!("{effect} {{ {settings} }};"));
+                let (specific, kind, other, other_kind) = if effect == "window-open" {
+                    (
+                        cfg.window_open,
+                        cfg.open_kind(),
+                        cfg.window_close,
+                        cfg.close_kind(),
+                    )
+                } else {
+                    (
+                        cfg.window_close,
+                        cfg.close_kind(),
+                        cfg.window_open,
+                        cfg.open_kind(),
+                    )
+                };
+                assert_eq!(specific, Some(expected), "{effect}: {settings}");
+                assert_eq!(kind, expected, "{effect}: {settings}");
+                assert_eq!(other, None);
+                assert_eq!(other_kind, easing(150, other_curve));
+            }
+        }
+    }
+
+    #[test]
+    fn open_close_inherit_global_defaults_in_either_order() {
+        for (global, expected) in [
+            ("duration 450; easing linear;", easing(450, Easing::Linear)),
+            (
+                "duration-ms 450; curve linear;",
+                easing(450, Easing::Linear),
+            ),
+            (
+                "spring damping-ratio=0.7 stiffness=900 epsilon=0.001;",
+                AnimationKind::Spring(Spring {
+                    damping_ratio: 0.7,
+                    stiffness: 900.0,
+                    epsilon: 0.001,
+                }),
+            ),
+        ] {
+            for blocks in ["", "window-open {}; window-close {};"] {
+                for body in [format!("{global} {blocks}"), format!("{blocks} {global}")] {
+                    let cfg = decode_animations(&body);
+                    assert_eq!(cfg.open_kind(), expected, "{body}");
+                    assert_eq!(cfg.close_kind(), expected, "{body}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn open_close_global_off_preserves_specs_in_either_order() {
+        let blocks = "window-open { duration-ms 240; curve linear; }; window-close {};";
+        for off in ["off;", "enabled false;"] {
+            for body in [format!("{off} {blocks}"), format!("{blocks} {off}")] {
+                let cfg = decode_animations(&body);
+                assert!(!cfg.enabled);
+                assert_eq!(cfg.open_kind(), AnimationKind::Off);
+                assert_eq!(cfg.close_kind(), AnimationKind::Off);
+                assert_eq!(cfg.window_open, Some(easing(240, Easing::Linear)));
+                assert_eq!(cfg.window_close, Some(easing(150, Easing::QuadOut)));
+            }
+        }
+    }
+
+    #[test]
+    fn open_close_slowdown_is_stored_without_rewriting_kinds() {
+        for slowdown in [0.0, 0.25, 3.0] {
+            let cfg = decode_animations(&format!("slowdown {slowdown};"));
+            assert_eq!(cfg.slowdown, slowdown);
+            assert_eq!(cfg.open_kind(), easing(150, Easing::ExpoOut));
+            assert_eq!(cfg.close_kind(), easing(150, Easing::QuadOut));
+
+            let cfg = decode_animations(&format!(
+                "slowdown {slowdown}; window-open {{ off; }}; \
+                 window-close {{ duration-ms 240; curve linear; }};"
+            ));
+            assert_eq!(cfg.slowdown, slowdown);
+            assert_eq!(cfg.open_kind(), AnimationKind::Off);
+            assert_eq!(cfg.close_kind(), easing(240, Easing::Linear));
+        }
+    }
 
     #[test]
     fn niri_animation_blocks_are_typed_not_ignored() {
@@ -422,10 +586,20 @@ mod tests {
             "horizontal-view-movement { off; }; horizontal-view-movement { off; };",
             "window-movement { off; }; window-movement { off; };",
             "window-resize { off; }; window-resize { off; };",
+            "window-open { off; }; WINDOW_OPEN { off false; };",
+            "window-close { off; }; WINDOW_CLOSE { off false; };",
             "workspace-switch { duration 100; duration_ms 200; };",
             "horizontal-view-movement { curve linear; easing ease-out-expo; };",
             "window-movement { spring; spring stiffness=900; };",
             "window-resize { off; off false; };",
+            "window-open { duration 100; duration_ms 200; };",
+            "window-close { duration 100; duration_ms 200; };",
+            "window-open { curve linear; easing ease-out-expo; };",
+            "window-close { curve linear; easing ease-out-expo; };",
+            "window-open { spring; SPRING stiffness=900; };",
+            "window-close { spring; SPRING stiffness=900; };",
+            "window-open { off; off false; };",
+            "window-close { off; off false; };",
             "spring damping-ratio=0.7 damping_ratio=0.8;",
         ] {
             let d = decode_text(&format!("animations {{ {body} }}"), "", None);
@@ -451,6 +625,8 @@ mod tests {
             for body in [
                 settings.to_owned(),
                 format!("workspace-switch {{ {settings} }}"),
+                format!("window-open {{ {settings} }}"),
+                format!("window-close {{ {settings} }}"),
             ] {
                 let d = decode_text(&format!("animations {{ {body} }}"), "", None);
                 assert!(
@@ -475,6 +651,8 @@ mod tests {
             "workspace-switch { spring epsilon=0; }",
             "workspace-switch { spring mystery=1; }",
             "workspace-switch { spring; duration-ms 20; }",
+            "window-open true",
+            "window-close mystery=1",
         ] {
             let d = decode_text(&format!("animations {{ {body}; }}"), "", None);
             assert!(
@@ -483,6 +661,32 @@ mod tests {
                     .any(|i| i.severity == ValidationSeverity::Error),
                 "accepted {body}"
             );
+        }
+    }
+
+    #[test]
+    fn invalid_open_close_settings_are_errors() {
+        for effect in ["window-open", "window-close"] {
+            for settings in [
+                "off \"typo\";",
+                "duration-ms -2;",
+                "duration-ms 60001;",
+                "curve \"typo\";",
+                "spring damping-ratio=-1;",
+                "spring stiffness=0;",
+                "spring epsilon=0;",
+                "spring mystery=1;",
+            ] {
+                let body = format!("animations {{ {effect} {{ {settings} }} }}");
+                let d = decode_text(&body, "", None);
+                assert!(
+                    d.issues
+                        .iter()
+                        .any(|i| i.severity == ValidationSeverity::Error),
+                    "accepted {body}: {:?}",
+                    d.issues
+                );
+            }
         }
     }
 }

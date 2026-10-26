@@ -21,6 +21,8 @@ pub struct AnimationsConfig {
     pub horizontal_view_movement: Option<AnimationKind>,
     pub window_movement: Option<AnimationKind>,
     pub resize: Option<AnimationKind>,
+    pub window_open: Option<AnimationKind>,
+    pub window_close: Option<AnimationKind>,
 }
 
 impl Default for AnimationsConfig {
@@ -48,6 +50,8 @@ impl AnimationsConfig {
             horizontal_view_movement: None,
             window_movement: None,
             resize: None,
+            window_open: None,
+            window_close: None,
         }
     }
 
@@ -85,6 +89,29 @@ impl AnimationsConfig {
         })
     }
 
+    fn content_kind(&self, specific: Option<AnimationKind>, curve: Easing) -> AnimationKind {
+        if !self.enabled {
+            return AnimationKind::Off;
+        }
+        specific.unwrap_or_else(|| {
+            if self.legacy_easing || self.default_kind.is_some() {
+                self.base_kind()
+            } else {
+                AnimationKind::Easing {
+                    duration_ms: 150,
+                    curve,
+                }
+            }
+        })
+    }
+
+    pub fn open_kind(&self) -> AnimationKind {
+        self.content_kind(self.window_open, Easing::ExpoOut)
+    }
+    pub fn close_kind(&self) -> AnimationKind {
+        self.content_kind(self.window_close, Easing::QuadOut)
+    }
+
     pub fn workspace_kind(&self) -> AnimationKind {
         self.kind(self.workspace_transition, self.workspace_switch, 1000.0)
     }
@@ -99,5 +126,112 @@ impl AnimationsConfig {
 
     pub fn resize_kind(&self) -> AnimationKind {
         self.kind(self.window_resize, self.resize, 800.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn easing(duration_ms: u32, curve: Easing) -> AnimationKind {
+        AnimationKind::Easing { duration_ms, curve }
+    }
+
+    #[test]
+    fn open_close_defaults_require_animation_opt_in() {
+        let mut cfg = AnimationsConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.window_open, None);
+        assert_eq!(cfg.window_close, None);
+        assert_eq!(cfg.open_kind(), AnimationKind::Off);
+        assert_eq!(cfg.close_kind(), AnimationKind::Off);
+
+        cfg.enabled = true;
+        assert_eq!(cfg.open_kind(), easing(150, Easing::ExpoOut));
+        assert_eq!(cfg.close_kind(), easing(150, Easing::QuadOut));
+    }
+
+    #[test]
+    fn open_close_follow_legacy_easing_and_explicit_global_kinds() {
+        let mut cfg = AnimationsConfig {
+            enabled: true,
+            duration: 450,
+            easing: "linear".into(),
+            ..AnimationsConfig::default()
+        };
+        // Legacy fields only override the niri defaults when explicitly opted in.
+        assert_eq!(cfg.open_kind(), easing(150, Easing::ExpoOut));
+        assert_eq!(cfg.close_kind(), easing(150, Easing::QuadOut));
+        cfg.legacy_easing = true;
+        assert_eq!(cfg.open_kind(), easing(450, Easing::Linear));
+        assert_eq!(cfg.close_kind(), easing(450, Easing::Linear));
+
+        for kind in [
+            AnimationKind::Off,
+            easing(320, Easing::QuadOut),
+            AnimationKind::Spring(Spring {
+                damping_ratio: 0.7,
+                stiffness: 900.0,
+                epsilon: 0.001,
+            }),
+        ] {
+            cfg.default_kind = Some(kind);
+            assert_eq!(cfg.open_kind(), kind);
+            assert_eq!(cfg.close_kind(), kind);
+        }
+    }
+
+    #[test]
+    fn open_close_overrides_are_independent_but_global_off_wins() {
+        let spring = AnimationKind::Spring(Spring {
+            damping_ratio: 0.7,
+            stiffness: 900.0,
+            epsilon: 0.001,
+        });
+        for (open, close) in [
+            (AnimationKind::Off, easing(240, Easing::Linear)),
+            (spring, AnimationKind::Off),
+            (easing(310, Easing::ExpoOut), spring),
+        ] {
+            let mut cfg = AnimationsConfig {
+                enabled: true,
+                default_kind: Some(easing(450, Easing::CubicOut)),
+                window_open: Some(open),
+                window_close: Some(close),
+                ..AnimationsConfig::default()
+            };
+            assert_eq!(cfg.open_kind(), open);
+            assert_eq!(cfg.close_kind(), close);
+
+            cfg.enabled = false;
+            assert_eq!(cfg.open_kind(), AnimationKind::Off);
+            assert_eq!(cfg.close_kind(), AnimationKind::Off);
+            assert_eq!(cfg.window_open, Some(open));
+            assert_eq!(cfg.window_close, Some(close));
+
+            cfg.enabled = true;
+            assert_eq!(cfg.open_kind(), open);
+            assert_eq!(cfg.close_kind(), close);
+        }
+    }
+
+    #[test]
+    fn legacy_geometry_flags_do_not_disable_open_close() {
+        let cfg = AnimationsConfig {
+            enabled: true,
+            focus_transition: false,
+            workspace_transition: false,
+            window_move: false,
+            window_resize: false,
+            popup: false,
+            shadow: false,
+            ..AnimationsConfig::default()
+        };
+        assert_eq!(cfg.open_kind(), easing(150, Easing::ExpoOut));
+        assert_eq!(cfg.close_kind(), easing(150, Easing::QuadOut));
+        assert_eq!(cfg.workspace_kind(), AnimationKind::Off);
+        assert_eq!(cfg.view_kind(), AnimationKind::Off);
+        assert_eq!(cfg.movement_kind(), AnimationKind::Off);
+        assert_eq!(cfg.resize_kind(), AnimationKind::Off);
     }
 }
