@@ -109,8 +109,8 @@ pub fn handle_message(message: u32) -> bool {
         if state.as_ref().is_some_and(|s| s.scenes.is_empty()) {
             state.take();
         }
-        if let Some(host) = state.as_mut() {
-            host.paint();
+        if state.as_mut().is_some_and(|host| !host.paint()) {
+            state.take();
         }
     });
     true
@@ -337,6 +337,8 @@ impl Host {
         })
     }
     unsafe fn add(&mut self, scene: Scene) {
+        let since = Instant::now();
+        let cpu = cpu_ms();
         let mut tiles = Vec::new();
         for mut spec in scene.tiles {
             let mut thumbnail = None;
@@ -399,19 +401,20 @@ impl Host {
                     tiles,
                     progress: 0.0,
                     frames: 0,
-                    since: Instant::now(),
-                    cpu: cpu_ms(),
+                    since,
+                    cpu,
                     id: scene.id,
                 },
             );
         }
     }
-    unsafe fn paint(&mut self) {
+    unsafe fn paint(&mut self) -> bool {
         self.canvas.clear();
         let mut registrations = 0;
         let mut last_effect = 0;
         let mut first_source = 0;
         let mut frames = 0;
+        let (mut incoming_y, mut outgoing_y) = (0, 0);
         for scene in self.scenes.values_mut() {
             last_effect = scene.effect as usize;
             frames += scene.frames as usize;
@@ -426,6 +429,13 @@ impl Host {
                     (tile.spec.from, tile.spec.to)
                 };
                 let (dst, alpha) = geometry(scene.effect, from, to, scene.progress);
+                if scene.effect == Effect::Workspace {
+                    if tile.spec.outgoing {
+                        outgoing_y = dst.loc.y;
+                    } else {
+                        incoming_y = dst.loc.y;
+                    }
+                }
                 if let Some(image) = &tile.spec.snapshot {
                     let opacity = if scene.effect == Effect::Resize {
                         255u8.saturating_sub(alpha)
@@ -491,7 +501,7 @@ impl Host {
             AlphaFormat: AC_SRC_ALPHA as u8,
             ..Default::default()
         };
-        let _ = UpdateLayeredWindow(
+        if UpdateLayeredWindow(
             self.hwnd,
             HDC::default(),
             Some(&pos),
@@ -501,12 +511,26 @@ impl Host {
             COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
-        );
+        )
+        .is_err()
+        {
+            return false;
+        }
         prop(self.hwnd, w!("WiriAnimationKind"), last_effect);
         prop(self.hwnd, w!("WiriAnimationSource"), first_source);
         prop(self.hwnd, w!("WiriAnimationFrames"), frames);
         prop(self.hwnd, w!("WiriAnimationThumbnailCount"), registrations);
-        let _ = SetWindowPos(
+        prop(
+            self.hwnd,
+            w!("WiriAnimationIncomingY"),
+            incoming_y as isize as usize,
+        );
+        prop(
+            self.hwnd,
+            w!("WiriAnimationOutgoingY"),
+            outgoing_y as isize as usize,
+        );
+        SetWindowPos(
             self.hwnd,
             HWND_TOPMOST,
             0,
@@ -514,7 +538,8 @@ impl Host {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        )
+        .is_ok()
     }
 }
 impl Drop for Host {

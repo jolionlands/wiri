@@ -108,7 +108,7 @@ impl TilingEngine {
         rect: Rect,
         output: OutputId,
     ) -> bool {
-        if !self.transitions.opening.remove(&wid) {
+        if !self.transitions.opening.remove(&wid) || self.transitions.preparing {
             return false;
         }
         let Some(monitor) = self.monitors.get(&output) else {
