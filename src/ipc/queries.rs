@@ -342,7 +342,10 @@ fn temporary_config(
     change: &Change,
 ) -> Config {
     let matcher = OutputMatcher { identities };
-    let mut output = matcher.matching_config(config, monitor).cloned()
+    let mut output = config.output.iter()
+        .find(|output| connector_eq(&output.name, &monitor.name))
+        .or_else(|| matcher.matching_config(config, monitor))
+        .cloned()
         .unwrap_or_else(|| neutral_output(&monitor.name));
     // A connector-specific block shadows a shared model/default block only for
     // this output, retaining layout/mod-key overrides and previous IPC changes.
@@ -468,6 +471,24 @@ mod tests {
         assert_eq!(source.output.len(), 1);
         assert!(source.output[0].mode.is_empty());
         assert!(source.output[0].name.is_empty());
+    }
+
+    #[test]
+    fn temporary_connector_alias_keeps_existing_connector_overrides() {
+        let monitor = monitor("\\\\.\\DISPLAY1");
+        let mut source = Config::default();
+        source.output[0].mod_key = Some("Super".into());
+        let mut connector = source.output[0].clone();
+        connector.name = "display1".into();
+        connector.mod_key = Some("Alt".into());
+        connector.scale = 1.75;
+        source.output.push(connector);
+        let changed = temporary_config(&source, &monitor, vec![], &Change::Position(-1920, 0));
+        assert_eq!(changed.output.len(), 2);
+        assert_eq!(changed.output[0].name, monitor.name);
+        assert_eq!(changed.output[0].mod_key.as_deref(), Some("Alt"));
+        assert_eq!(changed.output[0].scale, 1.75);
+        assert_eq!(source.output[1].name, "display1");
     }
 
     #[test]
