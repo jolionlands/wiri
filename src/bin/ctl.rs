@@ -749,7 +749,9 @@ fn raw_request_text(argument: Option<&str>, stdin: &mut impl Read) -> Result<Str
             stdin.read_to_string(&mut input)?;
         }
     }
-    let value: serde_json::Value = serde_json::from_str(&input)?;
+    // Windows tools often start piped UTF-8 text with a byte-order mark (a .NET process writing
+    // to a child's stdin under a UTF-8 console code page does): it is not part of the JSON.
+    let value: serde_json::Value = serde_json::from_str(input.trim_start_matches('\u{feff}'))?;
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -2107,6 +2109,12 @@ mod tests {
         assert_eq!(
             raw_request_text(Some("-"), &mut stdin).unwrap(),
             "\"Windows\""
+        );
+        let mut stdin = std::io::Cursor::new(b"\xEF\xBB\xBF\"KeyboardLayouts\"\r\n");
+        assert_eq!(
+            raw_request_text(None, &mut stdin).unwrap(),
+            "\"KeyboardLayouts\"",
+            "a UTF-8 byte-order mark before the JSON is ignored"
         );
         let mut unread = std::io::Cursor::new(b"not JSON");
         assert_eq!(
