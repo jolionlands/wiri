@@ -1,9 +1,9 @@
+use super::environment::ChildEnvironment;
 use crate::utils::cmdline::{build_command_line, quote_arg, split_command_line};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND};
@@ -12,8 +12,9 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetProcessId, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+    CreateProcessW, GetProcessId, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
     PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
@@ -42,14 +43,11 @@ pub struct ScreenshotEvent {
     pub save_path: Option<String>,
 }
 
-pub struct Spawner {
-    env_vars: HashMap<String, String>,
-}
+pub struct Spawner;
 
 impl Spawner {
     pub fn new() -> Self {
-        let env_vars: HashMap<String, String> = std::env::vars().collect();
-        Self { env_vars }
+        Self
     }
 
     /// Start `program` with `args`.  A thin wrapper over [`spawn_argv`], the one
@@ -63,97 +61,44 @@ impl Spawner {
         spawn_argv(&argv)
     }
 
+    /// Per-call additions are merged first; configured child overrides win.
+    /// Like `spawn`, this shares quoting, executable lookup and environment
+    /// snapshots with every other non-elevated launch path.
     pub fn spawn_with_env(
         &self,
         program: &Path,
         args: &[&str],
         env: &[(String, String)],
-        detached: bool,
+        _detached: bool,
     ) -> Result<u32> {
-        let mut cmd_line = program.to_string_lossy().into_owned();
-        for arg in args {
-            cmd_line.push(' ');
-            cmd_line.push_str(arg);
-        }
-
-        unsafe {
-            let mut si = STARTUPINFOW::default();
-            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-            let mut pi = PROCESS_INFORMATION::default();
-
-            // CREATE_NO_WINDOW = suppress the cmd console window that would
-            // otherwise appear for console-subsystem children (e.g. wiri-ctl,
-            // any user script that resolves to a .bat / .cmd / console exe).
-            // DETACHED_PROCESS already implies no console for the child, but
-            // some console-subsystem exes will still allocate one if launched
-            // without CREATE_NO_WINDOW, so we add both for safety.
-            let creation_flags = if detached {
-                DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
-            } else {
-                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
-            };
-
-            let program_wide: Vec<u16> = OsStr::new(program)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let cmd_wide: Vec<u16> = OsStr::new(&cmd_line)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let mut full_env = self.env_vars.clone();
-            for (key, value) in env {
-                full_env.insert(key.clone(), value.clone());
-            }
-
-            let env_block = self.env_to_block(&full_env)?;
-
-            let result = CreateProcessW(
-                PCWSTR::from_raw(program_wide.as_ptr()),
-                PWSTR::from_raw(cmd_wide.as_ptr() as *mut u16),
-                None,
-                None,
-                BOOL::from(false),
-                creation_flags,
-                Some(env_block.as_ptr() as *mut _),
-                None,
-                &mut si,
-                &mut pi,
-            );
-
-            result.context("CreateProcessW failed")?;
-            let pid = pi.dwProcessId;
-            // Close handles immediately — we only need the PID
-            let _ = CloseHandle(pi.hProcess);
-            let _ = CloseHandle(pi.hThread);
-            Ok(pid)
-        }
-    }
-
-    unsafe fn env_to_block(&self, env: &HashMap<String, String>) -> Result<Box<[u16]>> {
-        let mut result: Vec<u16> = Vec::new();
-        for (key, value) in env.iter() {
-            // Proper UTF-16 encoding for Windows environment block
-            result.extend(key.encode_utf16());
-            result.push('=' as u16);
-            result.extend(value.encode_utf16());
-            result.push(0); // Null terminator for each VAR=VALUE entry
-        }
-        result.push(0); // Final null terminator
-        Ok(result.into_boxed_slice())
+        let mut argv = vec![program.to_string_lossy().into_owned()];
+        argv.extend(args.iter().map(|a| a.to_string()));
+        spawn_argv_in(&argv, &ChildEnvironment::capture_with(env)?)
     }
 
     /// Spawn a process elevated (UAC "Run as administrator") via ShellExecuteExW.
-    /// Returns the new process's PID on success.
+    /// Returns the new process's PID on success. Configured environment overrides
+    /// are refused: the UAC broker cannot receive a child environment block.
     pub fn spawn_elevated(cmd: &str, args: &[&str]) -> Result<u32> {
+        if super::environment::has_overrides() {
+            anyhow::bail!(
+                "elevated launches cannot preserve configured environment overrides: \
+                 ShellExecuteExW's UAC broker has no environment-block parameter"
+            );
+        }
+        if cmd.contains('\0') || args.iter().any(|arg| arg.contains('\0')) {
+            anyhow::bail!("elevated command contains NUL");
+        }
         let verb: Vec<u16> = "runas\0".encode_utf16().collect();
         let file: Vec<u16> = OsStr::new(cmd)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let params_str = args.join(" ");
+        let params_str = args
+            .iter()
+            .map(|arg| quote_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
         let params: Vec<u16> = OsStr::new(&params_str)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -243,11 +188,10 @@ impl Spawner {
 //
 // `spawn` / `exec` binds, `spawn-at-startup` and the IPC `spawn` request all end
 // up in `spawn_argv`; `spawn-sh` / `spawn-cmd` end up in `spawn_shell`.  The
-// command line is built with the Windows quoting rules and handed to
-// `CreateProcessW` without an application name, so Windows itself searches the
-// PATH (which is how the App Execution Alias `wt.exe` is found).  Only when that
-// fails does wiri look through PATH and PATHEXT itself, which also finds `.cmd`
-// and `.bat` launchers such as `code.cmd`.
+// command line is built with the Windows quoting rules. Executables, batch
+// launchers and COMSPEC are resolved against the SAME effective child snapshot
+// that CreateProcessW receives. Letting Windows resolve a bare executable would
+// search wiri's own PATH, not the lpEnvironment block's PATH.
 // ---------------------------------------------------------------------------
 
 /// Look `program` up the way a shell would: next to the given directory if it
@@ -260,22 +204,57 @@ pub fn find_program(
     pathext_var: &str,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Option<std::path::PathBuf> {
-    let program_path = Path::new(program);
-    let has_directory = program.contains('\\') || program.contains('/');
-    let has_extension = program_path.extension().is_some();
-    let extensions: Vec<&str> = pathext_var.split(';').filter(|e| !e.is_empty()).collect();
+    find_program_os(
+        OsStr::new(program),
+        OsStr::new(path_var),
+        OsStr::new(pathext_var),
+        exists,
+    )
+}
 
-    let mut bases: Vec<std::path::PathBuf> = Vec::new();
+/// UTF-16 equivalent of `find_program`: inherited PATH entries need not be UTF-8.
+fn find_program_os(
+    program: &OsStr,
+    path_var: &OsStr,
+    pathext_var: &OsStr,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let program_path = Path::new(program);
+    let has_directory = program
+        .encode_wide()
+        .any(|c| matches!(c, 0x5c | 0x2f | 0x3a));
+    let has_extension = program_path.extension().is_some();
+    let extensions: Vec<OsString> = pathext_var
+        .encode_wide()
+        .collect::<Vec<_>>()
+        .split(|c| *c == b';' as u16)
+        .filter(|ext| !ext.is_empty())
+        .map(OsString::from_wide)
+        .collect();
+    let mut bases = Vec::new();
     if has_directory {
         bases.push(program_path.to_path_buf());
     } else {
-        for dir in path_var.split(';').map(|d| d.trim().trim_matches('"')) {
+        let path_units: Vec<_> = path_var.encode_wide().collect();
+        for mut dir in path_units.split(|c| *c == b';' as u16) {
+            // Preserve the existing tolerance for quoted/empty PATH entries.
+            while dir.first().is_some_and(|c| matches!(c, 9..=13 | 32)) {
+                dir = &dir[1..];
+            }
+            while dir.last().is_some_and(|c| matches!(c, 9..=13 | 32)) {
+                dir = &dir[..dir.len() - 1];
+            }
+            while dir.first() == Some(&(b'"' as u16)) {
+                dir = &dir[1..];
+            }
+            while dir.last() == Some(&(b'"' as u16)) {
+                dir = &dir[..dir.len() - 1];
+            }
             if !dir.is_empty() {
-                bases.push(Path::new(dir).join(program));
+                bases.push(PathBuf::from(OsString::from_wide(dir)).join(program));
             }
         }
     }
-
     for base in bases {
         if has_extension && exists(&base) {
             return Some(base);
@@ -283,13 +262,54 @@ pub fn find_program(
         for ext in &extensions {
             let mut name = base.as_os_str().to_os_string();
             name.push(ext);
-            let candidate = std::path::PathBuf::from(name);
+            let candidate = PathBuf::from(name);
             if exists(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+fn resolve_program(program: &OsStr, environment: &ChildEnvironment) -> Option<PathBuf> {
+    let resolved = find_program_os(
+        program,
+        environment.get("PATH").unwrap_or_else(|| OsStr::new("")),
+        environment
+            .get("PATHEXT")
+            .unwrap_or_else(|| OsStr::new(".COM;.EXE;.BAT;.CMD")),
+        &real_file_exists,
+    )?;
+    // PATH may contain relative directories. Freeze their meaning before
+    // CreateProcess changes the child's working directory to USERPROFILE.
+    std::path::absolute(resolved).ok()
+}
+
+fn resolve_comspec(environment: &ChildEnvironment) -> Result<PathBuf> {
+    if let Some(comspec) = environment.get("COMSPEC").filter(|value| !value.is_empty()) {
+        return resolve_program(comspec, environment)
+            .with_context(|| format!("child COMSPEC {:?} was not found", comspec));
+    }
+    // Missing/removed COMSPEC must not resurrect the parent's COMSPEC or PATH.
+    // Use the Windows API's trusted system directory instead.
+    let mut directory = vec![0u16; 32768];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) } as usize;
+    if length > 0 && length < directory.len() {
+        let candidate = PathBuf::from(OsString::from_wide(&directory[..length])).join("cmd.exe");
+        if real_file_exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    let length = unsafe { GetWindowsDirectoryW(Some(&mut directory)) } as usize;
+    if length > 0 && length < directory.len() {
+        let candidate = PathBuf::from(OsString::from_wide(&directory[..length]))
+            .join("System32")
+            .join("cmd.exe");
+        if real_file_exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("COMSPEC is absent and the Windows system command interpreter was not found")
 }
 
 /// Is `path` a `.cmd` / `.bat` script (which needs the command interpreter)?
@@ -305,8 +325,32 @@ fn is_batch_script(path: &Path) -> bool {
 /// parser safely (quotes and `%` are interpreted by the shell even inside
 /// quotes; `spawn-sh` is the way to pass those on purpose).
 pub fn batch_script_command_line(script: &Path, args: &[String], comspec: &str) -> Result<String> {
+    batch_script_command_line_os(script, args, OsStr::new(comspec))?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("batch command line is not representable as UTF-8"))
+}
+
+fn batch_script_command_line_os(
+    script: &Path,
+    args: &[String],
+    comspec: &OsStr,
+) -> Result<OsString> {
+    // The script name crosses cmd's parser too, not just the arguments.
+    if script
+        .as_os_str()
+        .encode_wide()
+        .any(|c| matches!(c, 0 | 10 | 13 | 34 | 37))
+    {
+        anyhow::bail!(
+            "batch file path cannot be passed through cmd safely: {}",
+            script.display()
+        );
+    }
     for arg in args {
-        if arg.chars().any(|c| matches!(c, '"' | '%' | '\n' | '\r')) {
+        if arg
+            .chars()
+            .any(|c| matches!(c, '\0' | '"' | '%' | '\n' | '\r'))
+        {
             anyhow::bail!(
                 "argument {:?} cannot be passed to the batch file {} safely; use spawn-sh instead",
                 arg,
@@ -314,11 +358,50 @@ pub fn batch_script_command_line(script: &Path, args: &[String], comspec: &str) 
             );
         }
     }
-    let mut inner = format!("\"{}\"", script.display());
+    let mut inner = OsString::from("\"");
+    inner.push(script);
+    inner.push("\"");
     for arg in args {
-        inner.push_str(&format!(" \"{}\"", arg));
+        inner.push(" \"");
+        inner.push(arg);
+        inner.push("\"");
     }
-    Ok(format!("{} /d /s /c \"{}\"", quote_arg(comspec), inner))
+    Ok(shell_command_line(comspec, &inner))
+}
+
+/// The MSVC quoting rules, without converting inherited UTF-16 paths to UTF-8.
+fn quote_os_arg(arg: &OsStr) -> OsString {
+    let units: Vec<_> = arg.encode_wide().collect();
+    if !units.is_empty() && !units.iter().any(|c| matches!(c, 9..=13 | 32 | 34)) {
+        return arg.to_os_string();
+    }
+    let mut quoted = vec![b'"' as u16];
+    let mut backslashes = 0;
+    for c in units {
+        if c == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        let count = if c == b'"' as u16 {
+            backslashes * 2 + 1
+        } else {
+            backslashes
+        };
+        quoted.extend(std::iter::repeat(b'\\' as u16).take(count));
+        quoted.push(c);
+        backslashes = 0;
+    }
+    quoted.extend(std::iter::repeat(b'\\' as u16).take(backslashes * 2));
+    quoted.push(b'"' as u16);
+    OsString::from_wide(&quoted)
+}
+
+fn shell_command_line(comspec: &OsStr, command: &OsStr) -> OsString {
+    let mut line = quote_os_arg(comspec);
+    line.push(" /d /s /c \"");
+    line.push(command);
+    line.push("\"");
+    line
 }
 
 fn real_file_exists(path: &Path) -> bool {
@@ -339,15 +422,26 @@ fn spawn_working_directory() -> Option<Vec<u16>> {
     Some(home.encode_wide().chain(std::iter::once(0)).collect())
 }
 
-/// `CreateProcessW` with `lpApplicationName = NULL`, so Windows searches the PATH
-/// for the first word of `command_line`.  `hide_console` suppresses the console
-/// window of a console program (used for the shell that runs a `spawn-sh`
-/// command; a program the user asked for with `spawn` gets its own window).
-fn create_process(command_line: &str, hide_console: bool) -> Result<u32> {
-    let mut command_wide: Vec<u16> = OsStr::new(command_line)
+/// Explicit executable + Unicode environment avoids Windows' implicit lookup
+/// using the parent's PATH. `spawn-sh` hides its console; direct `spawn` does not.
+fn create_process(
+    application: &Path,
+    command_line: &OsStr,
+    hide_console: bool,
+    environment: &ChildEnvironment,
+) -> Result<u32> {
+    if command_line.encode_wide().any(|c| c == 0)
+        || application.as_os_str().encode_wide().any(|c| c == 0)
+    {
+        anyhow::bail!("application or command line contains NUL");
+    }
+    let application_wide: Vec<u16> = application
+        .as_os_str()
         .encode_wide()
-        .chain(std::iter::once(0))
+        .chain(Some(0))
         .collect();
+    let environment_block = environment.to_block();
+    let mut command_wide: Vec<u16> = command_line.encode_wide().chain(Some(0)).collect();
     let cwd = spawn_working_directory();
     let cwd_ptr = match &cwd {
         Some(wide) => PCWSTR::from_raw(wide.as_ptr()),
@@ -363,18 +457,18 @@ fn create_process(command_line: &str, hide_console: bool) -> Result<u32> {
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut pi = PROCESS_INFORMATION::default();
         CreateProcessW(
-            PCWSTR::null(),
+            PCWSTR::from_raw(application_wide.as_ptr()),
             PWSTR::from_raw(command_wide.as_mut_ptr()),
             None,
             None,
             BOOL::from(false),
             flags,
-            None,
+            Some(environment_block.as_ptr().cast()),
             cwd_ptr,
             &mut si,
             &mut pi,
         )
-        .with_context(|| format!("CreateProcessW failed for {}", command_line))?;
+        .with_context(|| format!("CreateProcessW failed for {:?}", command_line))?;
         let pid = pi.dwProcessId;
         // Only the PID is needed; the child runs on its own.
         let _ = CloseHandle(pi.hProcess);
@@ -399,44 +493,48 @@ pub fn spawn_command_argv(command: &str, args: &[String]) -> Vec<String> {
 /// Start the program `argv[0]` with the arguments `argv[1..]`, each passed
 /// through intact.  Returns the process id.
 pub fn spawn_argv(argv: &[String]) -> Result<u32> {
+    spawn_argv_in(argv, &ChildEnvironment::capture())
+}
+
+fn spawn_argv_in(argv: &[String], environment: &ChildEnvironment) -> Result<u32> {
     let expanded = crate::input::system_actions::expand_spawn_argv(argv);
     let argv = expanded.as_slice();
     if argv.is_empty() || argv[0].trim().is_empty() {
         anyhow::bail!("nothing to run: the command is empty");
     }
-    let first_error = match create_process(&build_command_line(argv), false) {
-        Ok(pid) => return Ok(pid),
-        Err(e) => e,
-    };
-    // Windows could not find it.  Search PATH with PATHEXT ourselves: that finds
-    // `.cmd` / `.bat` launchers, which CreateProcess does not try.
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    let Some(resolved) = find_program(&argv[0], &path_var, &pathext, &real_file_exists) else {
-        return Err(first_error);
-    };
-    if is_batch_script(&resolved) {
-        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-        let line = batch_script_command_line(&resolved, &argv[1..], &comspec)?;
-        return create_process(&line, true);
+    if argv.iter().any(|arg| arg.contains('\0')) {
+        anyhow::bail!("spawn argument contains NUL");
     }
-    let mut retry: Vec<String> = vec![resolved.to_string_lossy().into_owned()];
-    retry.extend(argv[1..].iter().cloned());
-    create_process(&build_command_line(&retry), false).map_err(|_| first_error)
+    let resolved = resolve_program(OsStr::new(&argv[0]), environment)
+        .with_context(|| format!("program {:?} not found on the child PATH/PATHEXT", argv[0]))?;
+    if is_batch_script(&resolved) {
+        let comspec = resolve_comspec(environment)?;
+        let line = batch_script_command_line_os(&resolved, &argv[1..], comspec.as_os_str())?;
+        return create_process(&comspec, &line, true, environment);
+    }
+    create_process(
+        &resolved,
+        OsStr::new(&build_command_line(argv)),
+        false,
+        environment,
+    )
 }
 
 /// Run `command` through the command interpreter: `cmd.exe /d /s /c "<command>"`
 /// (niri `spawn-sh`).  Environment variables, `start`, `&&` and redirection work;
-/// the interpreter itself runs without a console window.
+/// the interpreter itself runs without a console window. The child COMSPEC is
+/// resolved using the same snapshot as its PATH/PATHEXT and environment block.
 pub fn spawn_shell(command: &str) -> Result<u32> {
     if command.trim().is_empty() {
         anyhow::bail!("nothing to run: the shell command is empty");
     }
-    let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-    create_process(
-        &format!("{} /d /s /c \"{}\"", quote_arg(&comspec), command),
-        true,
-    )
+    if command.contains('\0') {
+        anyhow::bail!("shell command contains NUL");
+    }
+    let environment = ChildEnvironment::capture();
+    let comspec = resolve_comspec(&environment)?;
+    let line = shell_command_line(comspec.as_os_str(), OsStr::new(command));
+    create_process(&comspec, &line, true, &environment)
 }
 
 /// Low-level helper: capture a single window into a 32-bit bottom-up BMP file.
@@ -1110,6 +1208,71 @@ mod spawn_tests {
         // Arguments the shell would interpret are refused rather than mangled.
         assert!(batch_script_command_line(Path::new("x.cmd"), &v(&["50%"]), "cmd.exe").is_err());
         assert!(batch_script_command_line(Path::new("x.cmd"), &v(&["a\"b"]), "cmd.exe").is_err());
+    }
+
+    #[test]
+    fn inherited_utf16_lookup_and_shell_quoting_are_lossless() {
+        let mut directory = OsString::from(r"C:\tools ");
+        directory.push(OsString::from_wide(&[0xd800]));
+        let expected = PathBuf::from(&directory).join("tool.CMD");
+        assert_eq!(
+            find_program_os(
+                OsStr::new("tool"),
+                &directory,
+                OsStr::new(".CMD"),
+                &|path| path == expected,
+            ),
+            Some(expected)
+        );
+        let mut comspec = directory;
+        comspec.push(r"\cmd.exe");
+        let line = shell_command_line(&comspec, OsStr::new("echo hello"));
+        let mut expected = OsString::from("\"");
+        expected.push(&comspec);
+        expected.push("\" /d /s /c \"echo hello\"");
+        assert_eq!(line, expected);
+        for arg in ["", "plain", "a b", "a\"b", "trailing space \\", "🦀"] {
+            assert_eq!(
+                quote_os_arg(OsStr::new(arg)),
+                OsString::from(quote_arg(arg))
+            );
+        }
+    }
+
+    #[test]
+    fn resolvers_use_child_environment_not_parent_lookup() {
+        let program = std::env::current_exe().unwrap();
+        let parent = program.parent().unwrap();
+        let child = ChildEnvironment::from_entries(
+            [
+                (OsString::from("Path"), parent.as_os_str().to_owned()),
+                (OsString::from("PATHEXT"), OsString::from(".EXE")),
+                (
+                    OsString::from("ComSpec"),
+                    program.file_name().unwrap().to_owned(),
+                ),
+            ],
+            &[],
+            &Default::default(),
+        );
+        assert_eq!(
+            resolve_program(program.file_name().unwrap(), &child),
+            Some(program.clone())
+        );
+        assert_eq!(resolve_comspec(&child).unwrap(), program.clone());
+        let missing = ChildEnvironment::from_entries(
+            [(
+                OsString::from("COMSPEC"),
+                OsString::from("wiri-no-such-shell.exe"),
+            )],
+            &[],
+            &Default::default(),
+        );
+        assert!(resolve_program(program.file_name().unwrap(), &missing).is_none());
+        assert!(resolve_comspec(&missing).is_err());
+        let empty = ChildEnvironment::from_entries([], &[], &Default::default());
+        assert_eq!(resolve_program(program.as_os_str(), &empty), Some(program));
+        assert!(resolve_comspec(&empty).unwrap().is_absolute());
     }
 
     #[test]
