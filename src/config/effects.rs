@@ -322,14 +322,23 @@ pub fn color_text(c: Rgba8) -> String {
     }
 }
 
-/// The colour space a gradient is interpolated in.  Only `Srgb` is drawn exactly; the others
-/// are read (so a niri config loads) and drawn as `Srgb`.
+/// The colour space a gradient is interpolated in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GradientSpace {
     Srgb,
     SrgbLinear,
     Oklab,
     Oklch,
+}
+
+/// The direction around the hue circle for an OKLCH gradient.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GradientHue {
+    #[default]
+    Shorter,
+    Longer,
+    Increasing,
+    Decreasing,
 }
 
 /// niri's `active-gradient from="#80c8ff" to="#bbddff" angle=45 relative-to="workspace-view"`:
@@ -343,6 +352,8 @@ pub struct GradientStyle {
     /// Measured against the whole view of the workspace instead of the window.
     pub relative_to_view: bool,
     pub space: GradientSpace,
+    /// Only used in OKLCH; niri defaults to the shorter hue path.
+    pub hue: GradientHue,
 }
 
 /// A colour or a gradient.

@@ -915,6 +915,10 @@ async fn main() -> Result<()> {
     animation_worker.abort();
     let _ = animation_worker.await;
 
+    // Cancel and drain interactive previews before final restoration; a late
+    // move cleanup must not re-tile or re-clip a window after restore_all.
+    stop_mouse_hook();
+
     // Restore tiled windows to their original positions and styles so the
     // user doesn't lose their layout on quit.
     info!("Restoring windows...");
@@ -923,7 +927,6 @@ async fn main() -> Result<()> {
     // be picked up before the process (and our hooks) go away.
     std::thread::sleep(Duration::from_millis(100));
 
-    stop_mouse_hook();
     wiri::hooks::clear_backend();
     info!("Goodbye!");
     Ok(())

@@ -472,12 +472,15 @@ fn gradient_of(g: &GradientStyle, accent: Option<[u8; 4]>) -> Option<Gradient> {
         to: colour_of(&g.to, accent)?,
         angle: g.angle as f32,
         relative_to_view: g.relative_to_view,
+        space: g.space,
+        hue: g.hue,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::effects::{GradientHue, GradientSpace};
 
     const RED: Paint = Paint::Solid(Rgba::new(255, 0, 0, 255));
     const BLUE: Paint = Paint::Solid(Rgba::new(0, 0, 255, 255));
@@ -634,6 +637,8 @@ mod tests {
             to: Rgba::new(0, 0, 255, 255),
             angle: 90.0,
             relative_to_view: true,
+            space: GradientSpace::Srgb,
+            hue: GradientHue::Shorter,
         });
         let mut f1 = frame(Rect::new(100, 50, 400, 300));
         f1.ring = Some(g);
@@ -791,13 +796,16 @@ mod tests {
             to: "blue".to_string(),
             angle: 45.0,
             relative_to_view: true,
-            space: crate::config::GradientSpace::Srgb,
+            space: GradientSpace::Oklch,
+            hue: GradientHue::Longer,
         };
         match paint_of(&PaintStyle::Gradient(g), None) {
             Some(Paint::Gradient(grad)) => {
                 assert_eq!(grad.to, Rgba::new(0, 0, 255, 255));
                 assert_eq!(grad.angle, 45.0);
                 assert!(grad.relative_to_view);
+                assert_eq!(grad.space, GradientSpace::Oklch);
+                assert_eq!(grad.hue, GradientHue::Longer);
             }
             other => panic!("expected a gradient, got {:?}", other),
         }

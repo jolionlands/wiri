@@ -21,6 +21,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add foreground keyboard-layout switching, managed-window urgency actions without focus changes, asynchronous quit confirmation with an explicit skip flag, active config-file switching, monitor power controls and suspend. Spawn expands only a leading home component in its executable, never the other arguments.
 - Add pure parser, typed-wire, layout-selection, quit-property and urgency tests. Typed IPC reaches every system-action executor; urgency flashes the taskbar without activation and clears on foreground before the separate hook event arrives. Legacy management `wiri-ctl quit` remains immediate; action/bind quit confirms unless skipped.
 - H48/H49 checks record events, config-file reload, literal spawn arguments, confirmation and dry-run power audits. Fix their missing F10 mapping and avoid serializing provider-decorated file strings. The interrupted run recorded 18/21 Lane S gates passing; its three failures have targeted corrections but no permitted rerun. See `docs/parity/lane-s-report.md`; no complete live pass is claimed.
+### Lane W — gradients and interactive insertion
+- Render all niri gradient spaces and OKLCH hue paths with strict syntax, premultiplied alpha and workspace-view coordinates. General Mod+left-drag shares its insertion-slot calculation with the lazy hint after niri's logical pull-out threshold; clicks stay put, release inserts a tile, and Escape/Mod release restores the untouched source. No new dependency, timer or thread.
+
 ### Lane W — policy event delivery
 - Queue tagged wheel replacements after the low-level hook returns, avoiding duplicate original-plus-scaled delivery. Clear rejected late foreground flashes in the native urgency registry so the next background request is not lost. Both fixes use existing event pumps only; no added timer or thread.
 

@@ -7,11 +7,96 @@
 
 use super::{norm, Decoder};
 use crate::config::effects::{
-    color_text, GradientSpace, GradientStyle, InsertHintStyle, PaintStyle, RingStyle, ShadowStyle,
-    TabIndicatorStyle, TabPosition,
+    color_text, GradientHue, GradientSpace, GradientStyle, InsertHintStyle, PaintStyle, RingStyle,
+    ShadowStyle, TabIndicatorStyle, TabPosition,
 };
 use crate::config::kdl::{Node, Pos};
 use crate::config::types::LayoutConfigPartial;
+
+/// niri appearance::GradientInterpolation: only OKLCH accepts a hue path,
+/// and every token must be consumed (never silently accept a misspelling).
+fn gradient_interpolation(text: &str) -> Result<(GradientSpace, GradientHue), &'static str> {
+    let mut words = text.split_whitespace();
+    let space = match words.next() {
+        Some("srgb") => GradientSpace::Srgb,
+        Some("srgb-linear") => GradientSpace::SrgbLinear,
+        Some("oklab") => GradientSpace::Oklab,
+        Some("oklch") => GradientSpace::Oklch,
+        _ => return Err("'in' needs srgb, srgb-linear, oklab or oklch"),
+    };
+    let Some(path) = words.next() else {
+        return Ok((space, GradientHue::Shorter));
+    };
+    if space != GradientSpace::Oklch {
+        return Err("only oklch accepts hue interpolation");
+    }
+    let hue = match path {
+        "shorter" => GradientHue::Shorter,
+        "longer" => GradientHue::Longer,
+        "increasing" => GradientHue::Increasing,
+        "decreasing" => GradientHue::Decreasing,
+        _ => return Err("hue path is shorter, longer, increasing or decreasing"),
+    };
+    if words.next() != Some("hue") || words.next().is_some() {
+        return Err("hue interpolation must end with hue, e.g. oklch shorter hue");
+    }
+    Ok((space, hue))
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+    use crate::config::parse::{parse_kdl_config, validate_kdl_config};
+
+    #[test]
+    fn all_interpolation_names_and_hue_paths_decode_without_warnings() {
+        for text in [
+            "srgb",
+            "srgb-linear",
+            "oklab",
+            "oklch",
+            "oklch shorter hue",
+            "oklch longer hue",
+            "oklch increasing hue",
+            "oklch decreasing hue",
+        ] {
+            let config = format!("window-rule {{ border {{ active-gradient from=\"red\" to=\"blue\" in=\"{text}\"; }} }}");
+            assert!(validate_kdl_config(&config).is_empty(), "{text}");
+            let cfg = parse_kdl_config(&config).unwrap();
+            let paint = cfg.window_rules[0].effects.border.active.as_ref().unwrap();
+            let PaintStyle::Gradient(g) = paint else {
+                panic!("lost gradient")
+            };
+            assert_eq!((g.space, g.hue), gradient_interpolation(text).unwrap());
+        }
+    }
+
+    #[test]
+    fn malformed_interpolation_is_located_error_not_a_silent_srgb_fallback() {
+        for text in [
+            "",
+            "sRGB",
+            "srgb garbage",
+            "srgb longer hue",
+            "oklab shorter hue",
+            "oklch longer",
+            "oklch longest hue",
+            "oklch hue",
+            "oklch longer hue extra",
+        ] {
+            let config = format!("layout {{\n border {{\n active-gradient from=\"red\" to=\"blue\" in=\"{text}\"\n }}\n}}");
+            let issues = validate_kdl_config(&config);
+            assert_eq!(issues.len(), 1, "{text}: {issues:?}");
+            assert_eq!(issues[0].line, 3);
+            assert!(issues[0].column > 30);
+            assert_eq!(
+                issues[0].severity,
+                crate::config::parse::ValidationSeverity::Error
+            );
+            assert!(parse_kdl_config(&config).is_err());
+        }
+    }
+}
 
 impl Decoder {
     /// A colour node: `active-color "#7fc8ff"`, a CSS name, `rgb(...)`, or niri's deprecated
@@ -47,6 +132,7 @@ impl Decoder {
         let mut angle = 180.0;
         let mut relative_to_view = false;
         let mut space = GradientSpace::Srgb;
+        let mut hue = GradientHue::Shorter;
         let mut ok = true;
         for prop in &node.props {
             match prop.key.as_str() {
@@ -74,31 +160,16 @@ impl Decoder {
                     }
                 },
                 "in" => match prop.value.as_str() {
-                    Some(text) => {
-                        let first = text.split_whitespace().next().unwrap_or("");
-                        match first {
-                            "srgb" => space = GradientSpace::Srgb,
-                            "srgb-linear" => space = GradientSpace::SrgbLinear,
-                            "oklab" => space = GradientSpace::Oklab,
-                            "oklch" => space = GradientSpace::Oklch,
-                            _ => {
-                                self.error(
-                                    prop.value.pos,
-                                    "'in' is \"srgb\", \"srgb-linear\", \"oklab\" or \"oklch\"",
-                                );
-                                ok = false;
-                            }
+                    Some(text) => match gradient_interpolation(text) {
+                        Ok((s, h)) => {
+                            space = s;
+                            hue = h;
                         }
-                        if space != GradientSpace::Srgb && ok {
-                            self.warn(
-                                prop.value.pos,
-                                format!(
-                                    "gradient colour space \"{}\" is drawn as srgb by wiri",
-                                    text
-                                ),
-                            );
+                        Err(message) => {
+                            self.error(prop.value.pos, message);
+                            ok = false;
                         }
-                    }
+                    },
                     None => {
                         self.error(prop.value.pos, "'in' expects text");
                         ok = false;
@@ -129,6 +200,7 @@ impl Decoder {
             angle,
             relative_to_view,
             space,
+            hue,
         })
     }
 

@@ -2,6 +2,7 @@
 //! decorations (focus ring, border, shadow, tab indicator, insert hint) around windows that
 //! belong to other programs.
 //!
+//! * [`gradient`]: linear-gradient coordinates and interpolation matching niri's shader.
 //! * [`paint`]: a small software rasterizer (rounded shapes, rings, gaussian shadows, linear
 //!   gradients) into a premultiplied BGRA surface.  Pure, tested pixel by pixel.
 //! * [`spec`]: what to draw, as plain data, and how to paint it.  Pure.
@@ -12,6 +13,7 @@
 //! (`layout/engine/decor.rs`) and hands them to a [`DecorSink`]: the real layer in the
 //! daemon, a recording one in tests.
 
+pub mod gradient;
 pub mod paint;
 pub mod spec;
 

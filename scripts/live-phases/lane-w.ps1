@@ -1,4 +1,4 @@
-# Lane W / H50-H53. Dot-source after $summary exists, under live-test.ps1's desktop mutex:
+# Lane W / H50-H54. Dot-source after $summary exists, under live-test.ps1's desktop mutex:
 # . (Join-Path $PSScriptRoot 'live-phases\lane-w.ps1')
 # Only the parent adds that line and runs the FINAL FULL SUITE; this file is not a standalone runner.
 # References: DOCUMENTATION.md (input/layout/window-rule), IPC_PROTOCOL.md section 4.11,
@@ -13,11 +13,13 @@
     $wSavedConfig = $env:WIRI_CONFIG
     $wOwned = New-Object 'System.Collections.Generic.List[System.Diagnostics.Process]'
     $wForms = New-Object 'System.Collections.Generic.List[System.IntPtr]'
-    $wState = @{ daemon = $null; cursorRestored = $true }
-    $wPhases = @('h50', 'h51', 'h51-scroll', 'h52', 'h52-activation', 'h53')
+    $wState = @{ daemon = $null; cursorRestored = $true; inputRestored = $true }
+    $wPhases = @('h50', 'h51', 'h51-scroll', 'h52', 'h52-activation', 'h53', 'h53-spaces', 'h54-drop', 'h54-escape', 'h54-mod-up', 'h54-stationary', 'h54-subthreshold')
     $wDetails = [ordered]@{
         gates = [ordered]@{}; errors = [ordered]@{}; screenshots = [ordered]@{}
         daemons = @(); cleanup = [ordered]@{}
+        insert = [ordered]@{}; gradients = [ordered]@{}
+        pureOnly = @('Gradient workspace-view coordinates, OKLab/OKLCH/hue/alpha combinations; H54 cross-output, floating/tabbed/fullscreen/invalid-destination permutations are not live-covered here.')
         assumptions = @(
             'Interactive unlocked SDR desktop; colour tolerance 12/255; straight-edge width tolerance 1 px.',
             'Pixel oracles read saved SCREENSHOT PNGs, not config values or decoration-window metadata.',
@@ -28,7 +30,11 @@
             'Windows activation requests here mean actual own-application FlashWindowEx -> shell flash/ALERT, never synthetic NotifyWinEvent.',
             'Windows cannot veto an already-granted foreground or supply a Wayland activation serial; explicit focus is not an application request.',
             'Activation policy is latched at admission; the unmatched default is set-urgent.',
-            'No output setters; floating offsets are measured against the parent work area ($swa).'
+            'No output setters; floating offsets and all drag points use the parent work area ($swa).',
+            'H54 refuses pre-held input; only its accepted SendInput downs are released in finally. Cursor restoration requires unchanged harness position and owned foreground.',
+            'layer.rs uses class WiriDecor, title WiriDecor Hint 0 (not a wiri.Decor.Hint class); hidden hint HWNDs also count as leaks.',
+            'H54 waits only observe events already injected: no product timer, IPC insertion action, or SetCursorPos-only motion oracle.',
+            'srgb-linear midpoint is gamma-2.2 encoded (~186), compared with saved srgb pixels (~128); angle=180 is separately sampled top-to-bottom.'
         )
     }
     $wGates = @(
@@ -45,7 +51,13 @@
         'h52_activation_focus_promotes_own_target', 'h52_default_activation_is_set_urgent',
         'h52_activation_policy_is_latched_across_title_change', 'h52_explicit_focus_is_not_an_activation_request',
         'h53_rule_border_gradient_has_red_blue_endpoints', 'h53_rule_focus_ring_gradient_has_red_blue_endpoints',
-        'h53_gradient_midpoints_and_unmatched_control', 'h53_owned_cleanup_complete'
+        'h53_gradient_midpoints_and_unmatched_control', 'h53_owned_cleanup_complete',
+        'h53_srgb_linear_midpoint_distinct_from_srgb', 'h53_gradient_angle_180_top_to_bottom',
+        'h54_mod_lmb_hint_visible_during_motion', 'h54_drop_inserts_into_same_column_stack',
+        'h54_release_tears_down_hint', 'h54_escape_cancels_preserving_source',
+        'h54_mod_up_cancels_preserving_source', 'h54_no_passive_hint_resting_hwnd_leak',
+        'h54_owned_input_and_cursor_restored', 'h54_stationary_click_preserves_source',
+        'h54_subthreshold_move_preserves_source'
     )
     foreach ($gate in $wGates) {
         $summary[$gate] = $false
@@ -90,6 +102,9 @@
         return $entries[0]
     }
     function WFocus([IntPtr]$h) {
+        if (('LaneWNative' -as [type]) -and [LaneWNative]::DragInputPending()) {
+            throw 'Refuse helper focus/close while harness-owned drag input remains held'
+        }
         if (-not $wForms.Contains($h) -or -not [LT]::IsWindow($h) -or [LT]::Pid($h) -ne $PID) {
             throw "Refuse focus of a non-owned form: $h"
         }
@@ -187,7 +202,7 @@
             [LT]::GetForegroundWindow() -eq $control)
         if (-not $baseline) { throw "Activation probe lacks settled own background target: $tag" }
         WAssertDaemon
-        $previousFlash = [LaneWNative]::FlashOwn($target,$true)
+        $captionWasActive = [LaneWNative]::FlashOwn($target,$true)
         $attempts = @(); $pass = $false; $safe = $true; $stable = 0
         try {
             for ($attempt=0; $attempt -lt 12; $attempt++) {
@@ -228,11 +243,11 @@
             [LT]::GetForegroundWindow() -eq $control)
         return [pscustomobject]@{
             pass=[bool]($baseline -and $safe -and $pass); explicitFocus=[bool]$explicit; policy=$policy
-            previousFlash=$previousFlash; initialActive=$initialActive; before=$before; controlBefore=$controlBefore
+            captionWasActive=$captionWasActive; initialActive=$initialActive; before=$before; controlBefore=$controlBefore
             attempts=$attempts; after=@($explicitActive,$explicitInactive,$explicitControl); windows=@(WWindows ($tag+'-windows'))
         }
     }
-    function WStart([string]$phase, [string]$rules) {
+    function WStart([string]$phase, [string]$rules, [string]$extraLayout = '', [string]$extraBinds = '') {
         if (@($wForms | Where-Object { [LT]::IsWindow($_) }).Count -ne 0) {
             throw 'Lane W refuses a new scenario while previous owned forms remain unclosed'
         }
@@ -260,11 +275,13 @@ layout {
     focus-ring { on; width 3; gap 2; active-color "#b0b0b0"; inactive-color "#606060"; urgent-color "#ff8800"; }
     shadow { off; }
     border-radius 0
+    $extraLayout
 }
 // CloseFocused intentionally uses Ctrl+Alt+Q, independently of Mod=Alt.
 binds {
     extend-defaults false
     Ctrl+Alt+Q { close-window; }
+    $extraBinds
 }
 window-rule { open-on-workspace "lane-w-outside"; }
 window-rule {
@@ -344,6 +361,259 @@ $rules
         return [pscustomobject]@{ endpoints=[bool]$ends; midpoint=[bool]$middle; png=$shot.path; rect=$r; distance=$distance; rows=$rows }
     }
 
+    function WVerticalGradient($shot, $r, [int]$distance) {
+        # Independent angle=180 oracle: left/right straight edges, top -> bottom.
+        $inset = [int][Math]::Max(16, [Math]::Round($r.H*0.04))
+        $ys = @(($r.T+$inset), ([int][Math]::Floor(($r.T+$r.B)/2)), ($r.B-1-$inset))
+        $columns = @(); $ends = $true; $middle = $true
+        foreach ($x in @(($r.L-$distance), ($r.R+$distance-1))) {
+            $samples = @()
+            foreach ($y in $ys) { $samples += [pscustomobject]@{ x=$x; y=$y; rgb=[LaneWNative]::Patch($shot.path,$shot.left,$shot.top,$x,$y) } }
+            $red=$samples[0].rgb; $purple=$samples[1].rgb; $blue=$samples[2].rgb
+            $ends = $ends -and ($red[0] -ge 220 -and $red[1] -le 20 -and $red[2] -le 40) -and
+                ($blue[2] -ge 220 -and $blue[1] -le 20 -and $blue[0] -le 40)
+            $middle = $middle -and ($purple[0] -ge 90 -and $purple[0] -le 165 -and $purple[1] -le 20 -and
+                $purple[2] -ge 90 -and $purple[2] -le 165 -and [Math]::Abs($purple[0]-$purple[2]) -le 30)
+            $columns += ,$samples
+        }
+        return [pscustomobject]@{ endpoints=[bool]$ends; midpoint=[bool]$middle; png=$shot.path; rect=$r; distance=$distance; columns=$columns }
+    }
+    function WDecorRows {
+        # Enumeration is read-only and includes hidden HWNDs; never focus/close a host.
+        $daemonPid = $wState.daemon.Id
+        foreach ($h in [LT]::TopLevel()) {
+            if ([LT]::Pid($h) -eq $daemonPid -and [LT]::Class($h) -eq 'WiriDecor') {
+                [pscustomobject]@{
+                    hwnd=[int64]$h; pid=[LT]::Pid($h); class=[LT]::Class($h); title=[LT]::Title($h)
+                    visible=[LT]::IsWindowVisible($h); cloaked=[LT]::Cloaked($h); rect=(Rc $h)
+                    exStyle=[LaneWNative]::ExStyle($h,-20); passive=[LT]::IsPassiveDecoration($h)
+                }
+            }
+        }
+    }
+    function WInsertSnapshot([string]$tag, [IntPtr[]]$handles, [bool]$wantHint) {
+        WAssertDaemon
+        $wait = @(); $stable = 0; $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $decor = @(WDecorRows)
+            $hints = @($decor | Where-Object { $_.title -like 'WiriDecor Hint*' })
+            $ready = ($hints.Count -eq 0)
+            if ($wantHint) { $ready = ($hints.Count -eq 1 -and $hints[0].title -eq 'WiriDecor Hint 0' -and $hints[0].visible -and $hints[0].cloaked -eq 0) }
+            $wait += [ordered]@{ ms=$clock.ElapsedMilliseconds; ready=$ready; decor=$decor }
+            if ($ready) { $stable++ } else { $stable=0 }
+            if ($stable -ge 3) { break }
+            Start-Sleep -Milliseconds 100
+        } while ($clock.ElapsedMilliseconds -lt 2500)
+        # No motion or key/button edges in this wait: observe the injected event alone.
+        $shot = WShot $tag
+        $list = @(WWindows ($tag+'-windows'))
+        $decor = @(WDecorRows)
+        $hints = @($decor | Where-Object { $_.title -like 'WiriDecor Hint*' })
+        $frames = @($decor | Where-Object { $_.title -like 'WiriDecor Frame *' })
+        $frameSafe = ($frames.Count -eq $handles.Count -and $decor.Count -eq ($frames.Count+$hints.Count) -and
+            @($list | Where-Object { $_.class_name -eq 'WiriDecor' -or $_.process_id -eq $wState.daemon.Id }).Count -eq 0)
+        $rects = @()
+        foreach ($h in $handles) {
+            if (-not $wForms.Contains($h) -or [LT]::Pid($h) -ne $PID) { throw 'Insert snapshot lost its owned probe HWND/PID' }
+            $null = WEntry $list $h
+            $rects += [pscustomobject]@{ hwnd=[int64]$h; rect=(Rc $h); visible=(WVisible $h) }
+            $frameHost = @($frames | Where-Object { $_.title -eq ('WiriDecor Frame '+[int64]$h) })
+            $frameSafe = $frameSafe -and ($frameHost.Count -eq 1 -and $frameHost[0].passive -and $frameHost[0].pid -eq $wState.daemon.Id -and $frameHost[0].visible)
+        }
+        $pixels = @(); $paint = ($hints.Count -eq 1)
+        if ($paint) {
+            $hint=$hints[0]; $hr=$hint.rect
+            $paint = ($hint.title -eq 'WiriDecor Hint 0' -and $hint.passive -and $hint.visible -and $hint.cloaked -eq 0 -and $hint.pid -eq $wState.daemon.Id)
+            # The moved foreground client may cover the hint, as in niri. Score
+            # two SCREENSHOT pixels in its uncovered interior, never source pixels.
+            $y=[int][Math]::Floor(($hr.T+$hr.B)/2)
+            $sampleLeft=$hr.L+4; $sampleRight=$hr.R-4
+            $dragRect=$rects[0].rect
+            if ($y -ge $dragRect.T -and $y -lt $dragRect.B) {
+                $rightStart=[Math]::Max($sampleLeft,($dragRect.R+4))
+                $leftEnd=[Math]::Min($sampleRight,($dragRect.L-4))
+                if (($sampleRight-$rightStart) -ge ($leftEnd-$sampleLeft)) { $sampleLeft=$rightStart }
+                else { $sampleRight=$leftEnd }
+            }
+            $paint = $paint -and ($sampleRight -gt $sampleLeft)
+            if ($sampleRight -gt $sampleLeft) {
+                foreach ($fraction in @(0.25,0.75)) {
+                    $x=[int][Math]::Floor($sampleLeft+($sampleRight-$sampleLeft)*$fraction)
+                    $rgb=[LaneWNative]::Patch($shot.path,$shot.left,$shot.top,$x,$y)
+                    $pixels += [ordered]@{ x=$x; y=$y; rgb=$rgb; uncoveredLeft=$sampleLeft; uncoveredRight=$sampleRight; source=$dragRect }
+                    $paint = $paint -and ([Math]::Abs($rgb[0]-240) -le 12 -and [Math]::Abs($rgb[1]-16) -le 12 -and [Math]::Abs($rgb[2]-192) -le 12)
+                }
+            }
+        }
+        return [pscustomobject]@{
+            windows=$list; rects=$rects; foreground=[int64][LT]::GetForegroundWindow(); cursor=[LaneWNative]::Cursor()
+            decor=$decor; hints=$hints; framesSafe=[bool]$frameSafe; hintPaint=[bool]($paint -and $stable -ge 3)
+            noHint=[bool]($hints.Count -eq 0 -and $stable -ge 3); pixels=$pixels; wait=$wait; png=$shot.path
+        }
+    }
+    function WInsertSame($before, $after, [IntPtr[]]$handles, [bool]$geometry) {
+        foreach ($h in $handles) {
+            $a=WEntry $before.windows $h; $b=WEntry $after.windows $h
+            foreach ($field in @('process_id','title','workspace','column','tile','floating','minimized','fullscreen','maximized')) {
+                if ($null -eq $a.$field -or $null -eq $b.$field -or $a.$field -cne $b.$field) { return $false }
+            }
+            if ($geometry) {
+                $ar=@($before.rects | Where-Object { $_.hwnd -eq [int64]$h })
+                $br=@($after.rects | Where-Object { $_.hwnd -eq [int64]$h })
+                if ($ar.Count -ne 1 -or $br.Count -ne 1 -or -not $br[0].visible -or -not (WSameRect $ar[0].rect $br[0].rect)) { return $false }
+            }
+        }
+        return $true
+    }
+    function WInsertProbe([string]$mode) {
+        $audit = [ordered]@{ mode=$mode; preview=$false; inserted=$false; cancelled=$false; teardown=$false; noRest=$false; cleanupComplete=$false; snapshots=[ordered]@{} }
+        $wDetails.insert[$mode] = $audit # Keep partial/raw evidence even if an assertion/injection throws.
+        $session=$null; $priorCursor=$wState.cursorRestored; $priorInput=$wState.inputRestored
+        try {
+            $top=WOpen ('h54-'+$mode+'-stack-a'); $bottom=WOpen ('h54-'+$mode+'-stack-b')
+            WFocus $top
+            WAction ('h54-'+$mode+'-setup-stack') @('consume-window-into-column')
+            if ((Rc $top).T -gt (Rc $bottom).T) { $swap=$top; $top=$bottom; $bottom=$swap }
+            $source=WOpen ('h54-'+$mode+'-source')
+            WFocus $source
+            if ($mode -in @('stationary','subthreshold')) {
+                # Removing this left-hand singleton in a planning copy shifts the
+                # stack underneath the click: a premature drop can wrongly merge it.
+                WAction ('h54-'+$mode+'-source-first') @('move-column-left')
+            }
+            $handles=[IntPtr[]]@($source,$top,$bottom)
+            $before=WInsertSnapshot ('h54-'+$mode+'-before') $handles $false
+            $audit.snapshots.before=$before
+            $se=WEntry $before.windows $source; $te=WEntry $before.windows $top; $be=WEntry $before.windows $bottom
+            $sr=Rc $source; $tr=Rc $top; $br=Rc $bottom
+            $baseline = ($before.noHint -and $before.framesSafe -and $before.foreground -eq [int64]$source -and
+                $null -ne $se.column -and $null -ne $te.column -and $se.column -ge 0 -and $te.column -ge 0 -and
+                $te.column -eq $be.column -and $se.column -ne $te.column -and $se.tile -eq 0 -and $te.tile -eq 0 -and $be.tile -eq 1 -and
+                $se.workspace -eq 2 -and $te.workspace -eq $se.workspace -and $be.workspace -eq $se.workspace -and
+                (Near $tr.L $br.L 2) -and (Near $tr.W $br.W 2) -and $tr.B -le $br.T)
+            foreach ($h in $handles) {
+                $e=WEntry $before.windows $h; $r=Rc $h
+                $baseline = $baseline -and ($e.process_id -eq $PID -and $e.floating -eq $false -and $e.minimized -eq $false -and
+                    $e.fullscreen -eq $false -and $e.maximized -eq $false -and (WVisible $h) -and
+                    $r.L -ge $swa.Left -and $r.T -ge $swa.Top -and $r.R -le $swa.Right -and $r.B -le $swa.Bottom)
+            }
+            $audit['baseline']=[bool]$baseline
+            if (-not $baseline) { throw 'H54 requires an on-screen two-tile target stack and distinct intact source column' }
+            $x=[int][Math]::Floor(($br.L+$br.R)/2)
+            $ya=$tr.T+[int][Math]::Min(32,[Math]::Floor($tr.H*0.10))
+            $yb=$br.T+[int][Math]::Min(32,[Math]::Floor($br.H*0.10))
+            # Points are measured from live geometry inside $swa. A vertical slot must
+            # be nearer than either column boundary; otherwise refuse instead of mis-dropping.
+            if ($x -le $swa.Left -or $x -ge $swa.Right -or $ya -le $swa.Top -or $yb -ge $swa.Bottom -or
+                ($yb-$tr.B) -ge ($br.W/2) -or $yb -le $ya) { throw 'Insufficient work-area geometry for an unambiguous in-column insert' }
+            $audit['points']=[ordered]@{ startX=($sr.L+[int]($sr.W*0.65)); startY=($sr.T+[int]($sr.H*0.65)); x=$x; firstY=$ya; finalY=$yb }
+            WAssertDaemon
+            if (-not (WaitForeground $source 100 2500)) { throw 'H54 refuses input without source foreground' }
+            $session=[LaneWNative]::PrepareDragOwn($source,$bottom)
+            $audit['input']=$session
+            $wState.cursorRestored=$false; $wState.inputRestored=$false
+            WAssertDaemon
+            [LaneWNative]::DragMoveOwn($session,$audit.points.startX,$audit.points.startY)
+            Start-Sleep -Milliseconds 150
+            WAssertDaemon
+            [LaneWNative]::DragDownOwn($session)
+            Start-Sleep -Milliseconds 150
+            if ($mode -in @('stationary','subthreshold')) {
+                if ($mode -eq 'subthreshold') {
+                    $smallX=$audit.points.startX+[int][Math]::Min(16,[Math]::Floor($sr.W*0.02))
+                    WAssertDaemon
+                    [LaneWNative]::DragMoveOwn($session,$smallX,$audit.points.startY)
+                }
+                $during=WInsertSnapshot ('h54-'+$mode+'-held') $handles $false
+                $audit.snapshots.held=$during
+                WAssertDaemon
+                [LaneWNative]::DragLeftUpOwn($session)
+                $after=WInsertSnapshot ('h54-'+$mode+'-after-lmb-up') $handles $false
+                $audit.snapshots['after-release']=$after
+                $audit.cancelled=($during.noHint -and $after.noHint -and $during.framesSafe -and $after.framesSafe -and
+                    $after.foreground -eq [int64]$source -and (WInsertSame $before $during $handles $true) -and
+                    (WInsertSame $before $after $handles $true))
+                WAssertDaemon
+                [LaneWNative]::DragModUpOwn($session)
+                $rest=WInsertSnapshot ('h54-'+$mode+'-rest') $handles $false
+                $audit.snapshots.rest=$rest
+                $audit.noRest=($before.noHint -and $during.noHint -and $after.noHint -and $rest.noHint -and $rest.framesSafe)
+                $audit.cancelled=$audit.cancelled -and $audit.noRest -and (WInsertSame $before $rest $handles $true)
+                return $audit
+            }
+            WAssertDaemon
+            [LaneWNative]::DragMoveOwn($session,$x,$ya)
+            $a=WInsertSnapshot ('h54-'+$mode+'-motion-a') $handles $true
+            $audit.snapshots['motion-a']=$a
+            WAssertDaemon
+            [LaneWNative]::DragMoveOwn($session,$x,$yb)
+            $b=WInsertSnapshot ('h54-'+$mode+'-motion-b') $handles $true
+            $audit.snapshots['motion-b']=$b
+            $preview = ($a.hintPaint -and $b.hintPaint -and $a.framesSafe -and $b.framesSafe -and
+                $a.foreground -eq [int64]$source -and $b.foreground -eq [int64]$source -and
+                (Near $a.cursor.X $x 2) -and (Near $a.cursor.Y $ya 2) -and (Near $b.cursor.X $x 2) -and (Near $b.cursor.Y $yb 2) -and
+                -not (WSameRect $before.rects[0].rect $a.rects[0].rect) -and -not (WSameRect $a.rects[0].rect $b.rects[0].rect) -and
+                (WInsertSame $before $a $handles $false) -and (WInsertSame $before $b $handles $false))
+            if ($preview) { $preview = -not (WSameRect $a.hints[0].rect $b.hints[0].rect) }
+            $audit.preview=[bool]$preview
+            if (-not $preview) { throw 'H54 lacks a painted passive hint following real motion with source slots intact' }
+            if ($mode -ne 'drop') {
+                WAssertDaemon
+                if ($mode -eq 'escape') { [LaneWNative]::DragEscapeOwn($session) }
+                elseif ($mode -eq 'mod-up') { [LaneWNative]::DragModUpOwn($session) }
+                else { throw 'Unknown H54 cancellation edge' }
+                $audit['atCancellation']=[ordered]@{ leftOwned=$session.LeftOwned; altOwned=$session.AltOwned; edge=$mode }
+                # Check BEFORE any next mouse event or LMB-up: keyboard event itself
+                # must tear down the hint and restore all native rectangles and slots.
+                $cancel=WInsertSnapshot ('h54-'+$mode+'-cancel-before-release') $handles $false
+                $audit.snapshots.cancelled=$cancel
+                WAssertDaemon
+                [LaneWNative]::DragMoveOwn($session,($x+3),$yb)
+                $late=WInsertSnapshot ('h54-'+$mode+'-cancel-late-motion') $handles $false
+                $audit.snapshots['cancel-late-motion']=$late
+                $audit.cancelled = ($session.LeftOwned -and $cancel.noHint -and $late.noHint -and $cancel.framesSafe -and $late.framesSafe -and
+                    $cancel.foreground -eq [int64]$source -and $late.foreground -eq [int64]$source -and
+                    (WInsertSame $before $cancel $handles $true) -and (WInsertSame $before $late $handles $true))
+            }
+            WAssertDaemon
+            [LaneWNative]::DragLeftUpOwn($session)
+            $after=WInsertSnapshot ('h54-'+$mode+'-after-lmb-up') $handles $false
+            $audit.snapshots['after-release']=$after
+            $audit.teardown=($preview -and $after.noHint -and $after.framesSafe)
+            if ($mode -eq 'drop') {
+                $se=WEntry $after.windows $source; $te=WEntry $after.windows $top; $be=WEntry $after.windows $bottom
+                $sr=Rc $source; $tr=Rc $top; $br=Rc $bottom
+                $inserted = ($null -ne $se.column -and $se.column -ge 0 -and $se.column -eq $te.column -and $se.column -eq $be.column -and
+                    $te.tile -eq 0 -and $se.tile -eq 1 -and $be.tile -eq 2 -and $after.foreground -eq [int64]$source -and
+                    $tr.B -le $sr.T -and $sr.B -le $br.T -and (Near $tr.L $sr.L 2) -and (Near $sr.L $br.L 2))
+                foreach ($h in $handles) {
+                    $e=WEntry $after.windows $h
+                    $inserted = $inserted -and ($e.process_id -eq $PID -and $e.workspace -eq 2 -and $e.floating -eq $false -and $e.minimized -eq $false -and (WVisible $h))
+                }
+                $audit.inserted=[bool]($preview -and $audit.teardown -and $inserted)
+            } else {
+                $audit.cancelled = $audit.cancelled -and $audit.teardown -and $after.foreground -eq [int64]$source -and (WInsertSame $before $after $handles $true)
+            }
+            # Drop teardown was checked while Mod was STILL down, not masked by Mod-up.
+            $audit['afterReleaseHeld']=[ordered]@{ leftOwned=$session.LeftOwned; altOwned=$session.AltOwned }
+            if ($session.AltOwned) { WAssertDaemon; [LaneWNative]::DragModUpOwn($session) }
+            Start-Sleep -Milliseconds 500
+            $rest=WInsertSnapshot ('h54-'+$mode+'-rest') $handles $false
+            $audit.snapshots.rest=$rest
+            $audit.noRest=($before.noHint -and $before.framesSafe -and $after.noHint -and $after.framesSafe -and $rest.noHint -and $rest.framesSafe)
+            if ($mode -ne 'drop') { $audit.cancelled=$audit.cancelled -and $rest.foreground -eq [int64]$source -and (WInsertSame $before $rest $handles $true) }
+            return $audit
+        } finally {
+            if ($null -ne $session) {
+                try {
+                    $audit.cleanupComplete=[LaneWNative]::EndDragOwn($session)
+                    $wState.cursorRestored=$priorCursor -and $session.CursorRestored
+                    $wState.inputRestored=$priorInput -and $session.Released
+                } catch { WError ('h54-'+$mode+'-input-restore') $_ }
+            }
+        }
+    }
+
     try {
         if (@(Get-Process -Name wiri -ErrorAction SilentlyContinue).Count -ne 0) { throw 'Lane W refuses a foreign daemon' }
         if (-not ('LaneWNative' -as [type])) {
@@ -382,6 +652,17 @@ public sealed class LaneWWheelInput {
     public long ExtraInfo;
 }
 [StructLayout(LayoutKind.Sequential)] public struct LaneWPoint { public int X, Y; }
+public sealed class LaneWDragInput {
+    internal IntPtr Source, Target;
+    internal bool Started, CursorOwned;
+    public LaneWPoint SavedCursor, ExpectedCursor;
+    public bool AltOwned { get; internal set; }
+    public bool LeftOwned { get; internal set; }
+    public bool EscapeOwned { get; internal set; }
+    public bool Released { get; internal set; }
+    public bool CursorRestored { get; internal set; }
+    public readonly List<string> Events = new List<string>();
+}
 sealed class LaneWProbeForm : Form {
     internal LaneWRegion InitialRegion;
     readonly object sync = new object();
@@ -448,6 +729,7 @@ public static class LaneWForms {
         if (error!=null) throw new InvalidOperationException("Lane W probe failed",error);
         return handle;
     }
+    public static void RequireProbe(IntPtr h) { Own(h); }
     public static LaneWRegion OriginalRegion(IntPtr h) { return Own(h).InitialRegion; }
     public static void ResetWheel(IntPtr h) { Own(h).ResetWheel(); }
     public static LaneWWheelLog WheelLog(IntPtr h) { return Own(h).WheelLog(); }
@@ -483,6 +765,8 @@ public static class LaneWNative {
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h,ref LaneWPoint point);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(LaneWPoint point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h,uint flags);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongW")] public static extern int ExStyle(IntPtr h,int index);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out LaneWPoint point);
     [DllImport("user32.dll", SetLastError=true)] static extern bool SetCursorPos(int x,int y);
@@ -495,7 +779,13 @@ public static class LaneWNative {
     [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT {
         public int dx,dy; public uint mouseData,flags,time; public UIntPtr extra;
     }
-    [StructLayout(LayoutKind.Explicit)] struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mouse; }
+    [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT {
+        public ushort vk,scan; public uint flags,time; public UIntPtr extra;
+    }
+    [StructLayout(LayoutKind.Explicit)] struct INPUTUNION {
+        [FieldOffset(0)] public MOUSEINPUT mouse;
+        [FieldOffset(0)] public KEYBDINPUT key;
+    }
     [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public INPUTUNION data; }
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count,INPUT[] input,int size);
     public static bool LiveOwn(IntPtr h) {
@@ -561,6 +851,128 @@ public static class LaneWNative {
         try { if (!SetCursorPos(point.X,point.Y)) throw new Win32Exception(Marshal.GetLastWin32Error()); }
         finally { RestoreCoordinates(old); }
     }
+    // One harness-owned session. Never release keys/buttons which were already held,
+    // and never inject another down after ownership, foreground or cursor interference.
+    const uint LaneTag=0x4c414e57; // NOT Wiri's replay marker 0x57495257.
+    static LaneWDragInput activeDrag;
+    public static bool DragInputPending() {
+        var s=activeDrag; return s!=null && (s.AltOwned || s.LeftOwned || s.EscapeOwned);
+    }
+    static bool UnownedHeld(LaneWDragInput s) {
+        for (int vk=1;vk<255;vk++) {
+            if ((GetAsyncKeyState(vk)&0x8000)==0) continue;
+            if (s!=null && ((s.AltOwned && (vk==0x12 || vk==0xa4)) ||
+                (s.LeftOwned && vk==1) || (s.EscapeOwned && vk==0x1b))) continue;
+            return true;
+        }
+        return false;
+    }
+    static bool OwnForeground(LaneWDragInput s) {
+        IntPtr fg=GetForegroundWindow(); return fg==s.Source || fg==s.Target;
+    }
+    static bool CursorUnchanged(LaneWDragInput s) {
+        LaneWPoint p=Cursor();
+        return Math.Abs(p.X-s.ExpectedCursor.X)<=2 && Math.Abs(p.Y-s.ExpectedCursor.Y)<=2;
+    }
+    static void CheckDrag(LaneWDragInput s) {
+        if (s==null || !Object.ReferenceEquals(s,activeDrag)) throw new InvalidOperationException("No owned drag session");
+        LaneWForms.RequireProbe(s.Source); LaneWForms.RequireProbe(s.Target);
+        if (!OwnForeground(s) || UnownedHeld(s)) throw new InvalidOperationException("Drag foreground/input interference");
+        if (s.CursorOwned) {
+            if (!CursorUnchanged(s)) throw new InvalidOperationException("Drag cursor interference; refuse new input");
+            IntPtr root=GetAncestor(WindowFromPoint(Cursor()),2);
+            if (root!=s.Source && root!=s.Target) throw new InvalidOperationException("Drag pointer is not over an owned probe");
+        }
+    }
+    static void SendOne(INPUT input,LaneWDragInput s,string description) {
+        uint count=SendInput(1,new INPUT[] { input },Marshal.SizeOf(typeof(INPUT)));
+        s.Events.Add("0x4c414e57 "+description+" inserted="+count);
+        if (count!=1) throw new Win32Exception(Marshal.GetLastWin32Error(),"Lane W SendInput refused");
+    }
+    static void DragKey(LaneWDragInput s,ushort vk,bool up) {
+        INPUT input=new INPUT(); input.type=1;
+        input.data.key.vk=vk; input.data.key.flags=up ? 2u : 0u;
+        input.data.key.extra=new UIntPtr(LaneTag);
+        SendOne(input,s,"key="+vk+" up="+up);
+    }
+    static void DragButton(LaneWDragInput s,bool up) {
+        INPUT input=new INPUT(); input.data.mouse.flags=up ? 4u : 2u;
+        input.data.mouse.extra=new UIntPtr(LaneTag);
+        SendOne(input,s,"LMB up="+up);
+    }
+    public static LaneWDragInput PrepareDragOwn(IntPtr source,IntPtr target) {
+        if (activeDrag!=null) throw new InvalidOperationException("Previous drag has not released its owned input");
+        LaneWForms.RequireProbe(source); LaneWForms.RequireProbe(target);
+        if (source==target || GetForegroundWindow()!=source || UnownedHeld(null))
+            throw new InvalidOperationException("Refuse drag without own foreground and entirely idle input");
+        var s=new LaneWDragInput { Source=source, Target=target, SavedCursor=Cursor() };
+        s.ExpectedCursor=s.SavedCursor; activeDrag=s;
+        s.Events.Add("prepared own source="+source.ToInt64()+" target="+target.ToInt64()+"; held input empty; cursor="+s.SavedCursor.X+","+s.SavedCursor.Y);
+        return s; // Caller retains this BEFORE the first injection, including partial failures.
+    }
+    public static void DragMoveOwn(LaneWDragInput s,int x,int y) {
+        CheckDrag(s);
+        IntPtr old=PhysicalCoordinates();
+        try {
+            Rectangle area=Screen.FromHandle(s.Target).WorkingArea;
+            Rectangle screen=SystemInformation.VirtualScreen;
+            if (!area.Contains(x,y) || !screen.Contains(x,y)) throw new InvalidOperationException("Drag point outside owned work area");
+            INPUT input=new INPUT();
+            input.data.mouse.dx=(int)(((long)(x-screen.Left)*65536+32768)/screen.Width);
+            input.data.mouse.dy=(int)(((long)(y-screen.Top)*65536+32768)/screen.Height);
+            // Absolute, virtual-desktop, uncoalesced REAL LL-hook motion, not SetCursorPos.
+            input.data.mouse.flags=0xe001; input.data.mouse.extra=new UIntPtr(LaneTag);
+            SendOne(input,s,"move x="+x+" y="+y);
+            s.CursorOwned=true; s.ExpectedCursor=new LaneWPoint { X=x, Y=y };
+        } finally { RestoreCoordinates(old); }
+    }
+    public static void DragDownOwn(LaneWDragInput s) {
+        CheckDrag(s);
+        if (s.Started || GetForegroundWindow()!=s.Source || GetAncestor(WindowFromPoint(Cursor()),2)!=s.Source)
+            throw new InvalidOperationException("Refuse Mod+LMB without the source under the pointer");
+        DragKey(s,0xa4,false); s.AltOwned=true; // WStart's Mod is LEFT ALT, never Ctrl+Alt reorder.
+        CheckDrag(s);
+        DragButton(s,false); s.LeftOwned=true; s.Started=true;
+    }
+    public static void DragLeftUpOwn(LaneWDragInput s) {
+        CheckDrag(s);
+        if (!s.LeftOwned) throw new InvalidOperationException("No harness-owned LMB down");
+        DragButton(s,true); s.LeftOwned=false;
+    }
+    public static void DragModUpOwn(LaneWDragInput s) {
+        CheckDrag(s);
+        if (!s.AltOwned) throw new InvalidOperationException("No harness-owned Mod down");
+        DragKey(s,0xa4,true); s.AltOwned=false;
+    }
+    public static void DragEscapeOwn(LaneWDragInput s) {
+        CheckDrag(s);
+        if (!s.Started || !s.LeftOwned || !s.AltOwned) throw new InvalidOperationException("Escape needs an active owned Mod+LMB grab");
+        DragKey(s,0x1b,false); s.EscapeOwned=true;
+        CheckDrag(s);
+        DragKey(s,0x1b,true); s.EscapeOwned=false;
+    }
+    public static bool EndDragOwn(LaneWDragInput s) {
+        if (s==null || !Object.ReferenceEquals(s,activeDrag)) throw new InvalidOperationException("Refuse cleanup of an unowned input session");
+        // Only matching ups for accepted harness downs are allowed even on daemon/focus
+        // loss. Do not strand synthetic held input, or clear any pre-existing user input.
+        // Mod-up precedes a pending LMB-up so exception cleanup CANCELS, never drops.
+        try { if (s.EscapeOwned) { DragKey(s,0x1b,true); s.EscapeOwned=false; } }
+        catch (Exception e) { s.Events.Add("Escape cleanup: "+e.Message); }
+        try { if (s.AltOwned) { DragKey(s,0xa4,true); s.AltOwned=false; } }
+        catch (Exception e) { s.Events.Add("Mod cleanup: "+e.Message); }
+        try { if (s.LeftOwned) { DragButton(s,true); s.LeftOwned=false; } }
+        catch (Exception e) { s.Events.Add("LMB cleanup: "+e.Message); }
+        s.Released=!s.EscapeOwned && !s.AltOwned && !s.LeftOwned;
+        Thread.Sleep(60); // Harness-only input drain; no product clock or timer.
+        bool safe=LiveOwn(s.Source) && LiveOwn(s.Target) && OwnForeground(s) && !UnownedHeld(null);
+        if (!s.CursorOwned) s.CursorRestored=true;
+        else if (s.Released && safe && CursorUnchanged(s)) {
+            RestoreCursor(s.SavedCursor);
+            LaneWPoint p=Cursor(); s.CursorRestored=p.X==s.SavedCursor.X && p.Y==s.SavedCursor.Y;
+        } else s.Events.Add("cursor restore refused: ownership/foreground/input/position changed");
+        if (s.Released) activeDrag=null;
+        return s.Released && s.CursorRestored;
+    }
     public static LaneWWheelInput WheelOwn(IntPtr h,int delta,bool horizontal) {
         IntPtr old=PhysicalCoordinates();
         try { return PhysicalWheelOwn(h,delta,horizontal); }
@@ -602,7 +1014,7 @@ public static class LaneWNative {
         FLASHWINFO info=new FLASHWINFO(); info.cbSize=(uint)Marshal.SizeOf(typeof(FLASHWINFO)); info.hwnd=h;
         info.flags=start ? 15u : 0u; // FLASHW_ALL | FLASHW_TIMERNOFG; otherwise FLASHW_STOP.
         info.count=start ? 8u : 0u; info.timeout=500;
-        // The return value is the PREVIOUS flashing state, not a success flag.
+        // The return value is the PREVIOUS active-caption appearance, not success.
         return FlashWindowEx(ref info);
     }
     static void OwnedPipe(string name, int pid, bool quit) {
@@ -706,7 +1118,7 @@ window-rule {
             # Flash only this process's OWN background test form. No IPC mark-urgent or
             # NotifyWinEvent shortcut: the application -> Windows -> wiri path must work.
             if (-not (WaitForeground $control 0 1000)) { throw 'Refuse flash without owned control foreground' }
-            $previousFlash = [LaneWNative]::FlashOwn($target,$true)
+            $captionWasActive = [LaneWNative]::FlashOwn($target,$true)
             $urgent = $null; $urgentShots = @()
             for ($attempt=0; $attempt -lt 10; $attempt++) {
                 Start-Sleep -Milliseconds 350
@@ -716,7 +1128,7 @@ window-rule {
                 if ($urgent.pass) { break }
             }
             $stillControl = WBand $shot (Rc $control) '#40b080' 2 0 2
-            WGate 'h50_own_flashwindowex_makes_urgent_border_red' ($inactiveBorder.pass -and $urgent.pass -and $stillControl.pass -and [LT]::GetForegroundWindow() -eq $control) ([ordered]@{ previousFlash=$previousFlash; attempts=$urgentShots; target=$urgent; control=$stillControl; windows=@(WWindows 'h50-urgent-windows') })
+            WGate 'h50_own_flashwindowex_makes_urgent_border_red' ($inactiveBorder.pass -and $urgent.pass -and $stillControl.pass -and [LT]::GetForegroundWindow() -eq $control) ([ordered]@{ captionWasActive=$captionWasActive; attempts=$urgentShots; target=$urgent; control=$stillControl; windows=@(WWindows 'h50-urgent-windows') })
             # TIMERNOFG must stop on focus, and wiri must clear its own urgent state.
             # Do not call FLASHW_STOP first: that could mask a broken foreground-clear path.
             WFocus $target
@@ -951,6 +1363,102 @@ window-rule {
             WGate 'h53_gradient_midpoints_and_unmatched_control' ($border.midpoint -and $ring.midpoint -and $controlInactive.pass -and $controlBorder.pass -and $controlRing.pass) ([ordered]@{ border=$border; ring=$ring; control=@($controlInactive,$controlBorder,$controlRing); windows=@(WWindows 'h53-windows') })
         } catch { WError 'h53' $_ }
         finally { WFinish 'h53' }
+
+        # Additional H53 pixel oracles; the original three gradient gates above are unchanged.
+        try {
+            $gradientRules = ''
+            foreach ($space in @('srgb','srgb-linear')) {
+                $gradientRules += @"
+window-rule {
+    match title="^lane-w-h53-space-$space`$"
+    border { on; width 8; active-gradient from="#ff0000" to="#0000ff" angle=90 in="$space"; }
+    focus-ring { on; width 6; active-gradient from="#ff0000" to="#0000ff" angle=90 in="$space"; }
+}
+
+"@
+            }
+            $gradientRules += @'
+window-rule {
+    match title="^lane-w-h53-space-angle$"
+    border { on; width 8; active-gradient from="#ff0000" to="#0000ff" angle=180 in="srgb"; }
+    focus-ring { on; width 6; active-gradient from="#ff0000" to="#0000ff" angle=180 in="srgb"; }
+}
+'@
+            WStart 'h53-spaces' $gradientRules
+            $control=WOpen 'h53-space-control'
+            $spaces=[ordered]@{}; $wDetails.gradients['spaces']=$spaces
+            foreach ($space in @('srgb','srgb-linear')) {
+                $target=WOpen ('h53-space-'+$space)
+                WFocus $target
+                $shot=WShot ('h53-space-'+$space); $r=Rc $target
+                $spaces[$space]=[ordered]@{ border=(WGradient $shot $r 4); ring=(WGradient $shot $r 13); windows=@(WWindows ('h53-space-'+$space+'-windows')) }
+                WClose $target ('h53-space-'+$space)
+            }
+            $linearPass=($spaces.srgb.border.endpoints -and $spaces.srgb.ring.endpoints -and $spaces.srgb.border.midpoint -and $spaces.srgb.ring.midpoint)
+            $comparisons=@()
+            foreach ($part in @('border','ring')) {
+                $s=$spaces.srgb[$part]; $l=$spaces['srgb-linear'][$part]
+                $linearPass=$linearPass -and ($s.rows.Count -eq 2 -and $l.rows.Count -eq 2)
+                # Border shape is the visible window outset by 8; ring extends 6 more.
+                $outset=8; if ($part -eq 'ring') { $outset=14 }
+                for ($row=0; $row -lt 2; $row++) {
+                    for ($sample=0; $sample -lt 3; $sample++) {
+                        $p=$l.rows[$row][$sample]; $rgb=$p.rgb
+                        # Force the double overload: integer 0/1 silently rounds t.
+                        $t=[Math]::Max(0.0,[Math]::Min(1.0,($p.x+0.5-$l.rect.L+$outset)/($l.rect.W+2*$outset)))
+                        $expected=@((255*[Math]::Pow((1-$t),(1.0/2.2))),0,(255*[Math]::Pow($t,(1.0/2.2))))
+                        $ok=([Math]::Abs($rgb[0]-$expected[0]) -le 12 -and $rgb[1] -le 12 -and [Math]::Abs($rgb[2]-$expected[2]) -le 12)
+                        $srgb=$s.rows[$row][$sample].rgb
+                        if ($sample -eq 1) {
+                            # ~186 must be distinctly brighter than the REAL srgb ~128,
+                            # not just a non-solid paint or a config/metadata readback.
+                            $ok=$ok -and ([Math]::Abs($rgb[0]-186) -le 12 -and [Math]::Abs($rgb[2]-186) -le 12 -and
+                                ($rgb[0]-$srgb[0]) -ge 38 -and ($rgb[2]-$srgb[2]) -ge 38)
+                        }
+                        $comparisons += [ordered]@{ part=$part; row=$row; sample=$sample; x=$p.x; y=$p.y; t=$t; expectedGamma22=$expected; srgb=$srgb; linear=$rgb; pass=$ok }
+                        $linearPass=$linearPass -and $ok
+                    }
+                }
+            }
+            $wDetails.gradients['linear-comparisons']=$comparisons
+            WGate 'h53_srgb_linear_midpoint_distinct_from_srgb' $linearPass ([ordered]@{ paints=$spaces; comparisons=$comparisons })
+            $target=WOpen 'h53-space-angle'
+            WFocus $target
+            $shot=WShot 'h53-space-angle-180'; $r=Rc $target
+            $verticalBorder=WVerticalGradient $shot $r 4; $verticalRing=WVerticalGradient $shot $r 13
+            WGate 'h53_gradient_angle_180_top_to_bottom' ($verticalBorder.endpoints -and $verticalBorder.midpoint -and $verticalRing.endpoints -and $verticalRing.midpoint) ([ordered]@{
+                border=$verticalBorder; ring=$verticalRing; windows=@(WWindows 'h53-angle-windows')
+            })
+        } catch { WError 'h53-spaces' $_ }
+        finally { WFinish 'h53-spaces' }
+
+        # H54 uses only our own probe Forms and the built-in Mod=Alt + LMB move
+        # grab. Ctrl is NEVER pressed (that would exercise H16 column swap instead).
+        foreach ($mode in @('drop','escape','mod-up','stationary','subthreshold')) {
+            try {
+                # cancel_move_on_key runs before binds. Consume Alt+Escape afterwards
+                # so this cancellation probe cannot invoke Windows' Alt+Esc task cycling.
+                WStart ('h54-'+$mode) '' 'insert-hint { on; color "#f010c0"; }' 'Alt+Escape { overview-exit; }'
+                $probe=WInsertProbe $mode
+                if ($mode -eq 'drop') {
+                    WGate 'h54_mod_lmb_hint_visible_during_motion' $probe.preview $probe
+                    WGate 'h54_drop_inserts_into_same_column_stack' $probe.inserted $probe
+                    WGate 'h54_release_tears_down_hint' ($probe.teardown -and $probe.afterReleaseHeld.altOwned -and -not $probe.afterReleaseHeld.leftOwned) $probe
+                } elseif ($mode -eq 'escape') {
+                    WGate 'h54_escape_cancels_preserving_source' ($probe.preview -and $probe.cancelled -and $probe.atCancellation.leftOwned -and $probe.atCancellation.altOwned) $probe
+                } elseif ($mode -eq 'mod-up') {
+                    WGate 'h54_mod_up_cancels_preserving_source' ($probe.preview -and $probe.cancelled -and $probe.atCancellation.leftOwned -and -not $probe.atCancellation.altOwned) $probe
+                } else {
+                    $clickGate=if ($mode -eq 'stationary') { 'h54_stationary_click_preserves_source' } else { 'h54_subthreshold_move_preserves_source' }
+                    WGate $clickGate ($probe.cancelled -and $probe.noRest) $probe
+                }
+            } catch { WError ('h54-'+$mode) $_ }
+            finally { WFinish ('h54-'+$mode) }
+        }
+        $insertCases=@($wDetails.insert.Values)
+        WGate 'h54_no_passive_hint_resting_hwnd_leak' ($insertCases.Count -eq 5 -and @($insertCases | Where-Object {
+            -not $_.noRest -or ($_.mode -in @('drop','escape','mod-up') -and -not $_.preview)
+        }).Count -eq 0) $wDetails.insert
     } catch { WError 'lane-w' $_ }
     finally {
         try {
@@ -967,9 +1475,18 @@ window-rule {
             $remainingDaemons = @($wOwned | Where-Object { -not $_.HasExited } | ForEach-Object { $_.Id })
             $actualPhases = @($wDetails.daemons | ForEach-Object { $_.phase })
             $allPhases = ($actualPhases.Count -eq $wPhases.Count -and @($wPhases | Where-Object { $actualPhases -notcontains $_ }).Count -eq 0)
-            WGate 'h53_owned_cleanup_complete' ($remainingForms.Count -eq 0 -and $remainingDaemons.Count -eq 0 -and $allPhases -and $restored -and $wState.cursorRestored) ([ordered]@{
+            $insertCases=@($wDetails.insert.Values)
+            $pendingInput=$false
+            if ('LaneWNative' -as [type]) { $pendingInput=[LaneWNative]::DragInputPending() }
+            WGate 'h54_owned_input_and_cursor_restored' ($insertCases.Count -eq 5 -and
+                @($insertCases | Where-Object { -not $_.cleanupComplete }).Count -eq 0 -and
+                -not $pendingInput -and $wState.inputRestored -and $wState.cursorRestored) ([ordered]@{
+                    cases=$wDetails.insert; pendingInput=$pendingInput; inputRestored=$wState.inputRestored; cursorRestored=$wState.cursorRestored
+                })
+            WGate 'h53_owned_cleanup_complete' ($remainingForms.Count -eq 0 -and $remainingDaemons.Count -eq 0 -and $allPhases -and $restored -and $wState.cursorRestored -and $wState.inputRestored -and -not $pendingInput) ([ordered]@{
                 remainingForms=$remainingForms; remainingDaemons=$remainingDaemons; started=$wOwned.Count
                 plannedPhases=$wPhases; actualPhases=$actualPhases; envRestored=$restored; cursorRestored=$wState.cursorRestored
+                inputRestored=$wState.inputRestored; pendingInput=$pendingInput
             })
             try {
                 $wDetails | ConvertTo-Json -Depth 18 | Set-Content -Encoding UTF8 (Join-Path $D 'evidence.json')
