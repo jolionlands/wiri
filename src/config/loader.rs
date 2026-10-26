@@ -79,8 +79,12 @@ fn log_issues(path: &Path, issues: &[ValidationIssue]) {
     let label = path.display().to_string();
     for issue in issues {
         match issue.severity {
-            ValidationSeverity::Error => tracing::error!("config {}", issue.located(&label)),
-            ValidationSeverity::Warning => tracing::warn!("config {}", issue.located(&label)),
+            ValidationSeverity::Error => {
+                tracing::error!("config {}", super::diagnostics::render(issue, &label))
+            }
+            ValidationSeverity::Warning => {
+                tracing::warn!("config {}", super::diagnostics::render(issue, &label))
+            }
         }
     }
 }
@@ -354,43 +358,11 @@ impl Config {
     }
 }
 
-/// Return the first existing config file from the standard search order:
-///   1. `$WIRI_CONFIG` env var (explicit override)
-///   2. `%APPDATA%\wiri\config.kdl`            — Windows conventional location
-///   3. `%USERPROFILE%\.config\wiri\config.kdl` — XDG-style fallback
-///
-/// Returns `None` when none of those paths exist; callers should fall back to
-/// the bundled `default_config_path_for_creation()` location or
-/// `Config::default()` and treat the absence as a fresh install.
+/// Select the explicit environment override even when missing; otherwise return
+/// the existing Windows user config. Creation is reserved for implicit startup.
 pub fn default_config_path() -> Option<PathBuf> {
-    // 1. Explicit override via environment variable.
-    if let Ok(p) = std::env::var("WIRI_CONFIG") {
-        let pb = PathBuf::from(&p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-
-    // 2. %APPDATA%\wiri\config.kdl  (Windows conventional location)
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let pb = PathBuf::from(appdata).join("wiri").join("config.kdl");
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-
-    // 3. %USERPROFILE%\.config\wiri\config.kdl  (XDG-style fallback)
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(home)
-            .join(".config")
-            .join("wiri")
-            .join("config.kdl");
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-
-    None
+    let selected = super::search::resolve(None);
+    (selected.explicit || selected.path.exists()).then_some(selected.path)
 }
 
 /// Return the canonical wiri config directory (`%APPDATA%\wiri\`).  Unlike

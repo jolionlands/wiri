@@ -876,6 +876,7 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
                     "line": i.line,
                     "column": i.column,
                     "message": i.message,
+                    "diagnostic": wiri::config::diagnostics::render(i, &root),
                 })
             })
             .collect();
@@ -894,7 +895,7 @@ fn validate_config_subcommand(path: Option<&str>, json: bool) -> Result<()> {
             for issue in &issues {
                 // Format mirrors common compiler output: `path:line:col: sev: msg`; an issue
                 // in an included file names that file.
-                outln!("{}", issue.located(&path_str));
+                outln!("{}", wiri::config::diagnostics::render(issue, &path_str));
             }
             outln!(
                 "{}: {} error(s), {} warning(s)",

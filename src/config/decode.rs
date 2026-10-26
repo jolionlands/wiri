@@ -57,6 +57,7 @@ pub struct ValidationIssue {
     pub column: usize,
     pub message: String,
     pub file: String,
+    pub context: super::diagnostics::DiagnosticContext,
 }
 
 impl fmt::Display for ValidationIssue {
@@ -145,6 +146,7 @@ pub fn decode_file(path: &Path) -> Decoded {
                 column: 1,
                 message: format!("cannot read the config file: {}", e),
                 file: label,
+                context: Default::default(),
             }],
             includes: Vec::new(),
         },
@@ -159,6 +161,8 @@ fn run(text: &str, file: &str, base_dir: Option<&Path>, root: Option<PathBuf>) -
         base_dir: base_dir.map(|p| p.to_path_buf()),
         stack: Vec::new(),
         depth: 0,
+        source: String::new(),
+        include_trace: Vec::new(),
     };
     if let Some(root) = root {
         decoder.stack.push(root);
@@ -526,6 +530,8 @@ struct Decoder {
     /// Canonical paths of the files being decoded, outermost first (cycle detection).
     stack: Vec<PathBuf>,
     depth: u8,
+    source: String,
+    include_trace: Vec<super::diagnostics::SourceLabel>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -545,6 +551,16 @@ impl Decoder {
             column: pos.col as usize,
             message,
             file: self.file.clone(),
+            context: super::diagnostics::DiagnosticContext {
+                source_line: self
+                    .source
+                    .lines()
+                    .nth(pos.line.saturating_sub(1) as usize)
+                    .unwrap_or("")
+                    .to_string(),
+                includes: self.include_trace.clone(),
+                ..Default::default()
+            },
         });
     }
 
@@ -714,7 +730,14 @@ impl Decoder {
 
     fn arg_u32(&mut self, node: &Node, max: u32) -> Option<u32> {
         let n = self.arg_number(node, 0.0, max as f64)?;
-        Some(n.round() as u32)
+        if n.fract() != 0.0 {
+            self.error(
+                node.args[0].pos,
+                format!("'{}' expects an integer", node.name),
+            );
+            return None;
+        }
+        Some(n as u32)
     }
 
     fn arg_i32(&mut self, node: &Node) -> Option<i32> {
@@ -805,10 +828,19 @@ impl Decoder {
     // ---- documents and includes ------------------------------------------------------
 
     fn decode_source(&mut self, text: &str, cfg: &mut Config) {
+        let saved = std::mem::replace(&mut self.source, text.to_string());
         match kdl::parse(text) {
-            Ok(doc) => self.decode_nodes(&doc.nodes, cfg),
+            Ok(doc) => {
+                let mut structural = super::validation::check(&doc.nodes, &self.file, text);
+                for issue in &mut structural {
+                    issue.context.includes = self.include_trace.clone();
+                }
+                self.issues.extend(structural);
+                self.decode_nodes(&doc.nodes, cfg);
+            }
             Err(e) => self.error(e.pos, e.message),
         }
+        self.source = saved;
     }
 
     fn decode_nodes(&mut self, nodes: &[Node], cfg: &mut Config) {
@@ -816,6 +848,18 @@ impl Decoder {
             let key = norm(&node.name);
             match key.as_str() {
                 "version" => {}
+                "config-notification" => {
+                    self.section(node);
+                    for child in node.kids() {
+                        if norm(&child.name) == "disable-failed" {
+                            if let Some(v) = self.flag(child) {
+                                cfg.disable_failed_config_notification = v;
+                            }
+                        } else {
+                            self.unknown(child, "'config-notification'", &["disable-failed"]);
+                        }
+                    }
+                }
                 "input" => self.decode_input(node, cfg),
                 "output" => self.decode_output(node, cfg),
                 "layout" => {
@@ -957,6 +1001,12 @@ impl Decoder {
         }
         match read_config_text(&path) {
             Ok(text) => {
+                self.include_trace.push(super::diagnostics::SourceLabel::at(
+                    &self.file,
+                    &self.source,
+                    node.pos,
+                    "included here",
+                ));
                 let saved_file = std::mem::replace(&mut self.file, path.display().to_string());
                 let saved_base =
                     std::mem::replace(&mut self.base_dir, path.parent().map(|p| p.to_path_buf()));
@@ -967,6 +1017,7 @@ impl Decoder {
                 self.stack.pop();
                 self.file = saved_file;
                 self.base_dir = saved_base;
+                self.include_trace.pop();
             }
             Err(e) => {
                 if optional && e.kind() == std::io::ErrorKind::NotFound {
@@ -2020,17 +2071,8 @@ impl Decoder {
                     }
                 }
                 "opacity" => {
-                    if let Some(v) = self.arg_number(child, -1000.0, 1000.0) {
-                        if !(0.0..=1.0).contains(&v) {
-                            let c = v.clamp(0.0, 1.0);
-                            self.warn(
-                                child.args[0].pos,
-                                format!("window-rule opacity {} is outside 0 to 1; using {}", v, c),
-                            );
-                            rule.opacity = Some(c);
-                        } else {
-                            rule.opacity = Some(v);
-                        }
+                    if let Some(v) = self.arg_number(child, 0.0, 1.0) {
+                        rule.opacity = Some(v);
                     }
                 }
                 "open-max-bounds" => {
@@ -2784,8 +2826,10 @@ mod tests {
         assert!(!cfg.input.touch_tap_to_click);
         assert!((cfg.input.touch_scroll_speed - 1.75).abs() < 1e-9);
         assert!(cfg.input.numlock);
-        // Quoted booleans and a repeated section are fine, as before.
-        let cfg = clean("input { natural-scroll \"true\" }\ninput { repeat-delay 500 }\ninput { mouse { natural-scroll true } }\n");
+        // Legacy spellings and quoted booleans remain valid within one section.
+        let cfg = clean(
+            "input { natural-scroll \"true\"; repeat-delay 500; mouse { natural-scroll true; } }\n",
+        );
         assert!(cfg.input.natural_scroll);
         assert_eq!(cfg.input.repeat_delay, 500);
     }
@@ -3262,11 +3306,11 @@ mod tests {
             is_active_in_column: false,
         };
         assert!(r.matches(&ctx));
-        // Opacity out of range is clamped with a warning, as before.
+        // An out-of-range value must not silently alter the requested rule.
         let d = load("window-rule { class-name \"Bright\"\n opacity 2.5 }\n");
-        assert!(errors(&d).is_empty());
-        assert_eq!(d.config.window_rules[0].opacity, Some(1.0));
-        assert_eq!(warnings(&d).len(), 1);
+        assert_eq!(errors(&d).len(), 1);
+        assert_eq!(d.config.window_rules[0].opacity, None);
+        assert!(warnings(&d).is_empty());
     }
 
     #[test]

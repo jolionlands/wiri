@@ -16,6 +16,8 @@ pub struct Config {
     /// Shell command lines to run at startup (`spawn-sh-at-startup "cmd"`), each through
     /// `cmd.exe /d /s /c` like the `spawn-sh` bind.
     pub spawn_sh_at_startup: Vec<String>,
+    /// Suppress failed-load balloons, not diagnostics or ConfigLoaded events.
+    pub disable_failed_config_notification: bool,
 }
 
 impl Default for Config {
@@ -47,6 +49,7 @@ impl Default for Config {
             screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
             spawn_sh_at_startup: Vec::new(),
+            disable_failed_config_notification: false,
         }
     }
 }
@@ -735,6 +738,11 @@ pub struct WorkspaceConfig {
     pub layout: String,
     pub monitor: String,
     pub follow_on_focus: bool,
+    /// Workspace-local layout, applied after the global and output layouts.
+    pub layout_override: Option<LayoutConfigPartial>,
+    /// Preferred outputs in declaration order; the first connected one wins.
+    /// `monitor` remains the legacy single-output fallback when this is empty.
+    pub open_on_outputs: Vec<String>,
 }
 
 impl WorkspaceConfig {
@@ -1271,12 +1279,8 @@ impl WindowRule {
 #[derive(Debug, Clone)]
 pub struct BindsConfig {
     pub hotkeys: Vec<HotkeyBinding>,
-    /// niri-style "extend the built-in default keybindings instead of
-    /// replacing them".  Default `true` — the user's `binds { … }` block
-    /// is folded on top of the shipped defaults so newly-added actions
-    /// stay available without a config edit.  Set to `false` (via
-    /// `binds { extend-defaults false … }`) to get the pre-2026-05-18
-    /// "replace everything" behaviour.
+    /// Wiri extension: explicitly opt into built-in keybindings. Defaults to
+    /// false: niri never fills in missing binds (even an empty binds block).
     pub extend_defaults: bool,
 }
 
@@ -1284,7 +1288,7 @@ impl Default for BindsConfig {
     fn default() -> Self {
         Self {
             hotkeys: Vec::new(),
-            extend_defaults: true,
+            extend_defaults: false,
         }
     }
 }
@@ -1355,11 +1359,11 @@ impl HotkeyBinding {
         crate::input::parse_action_flagged(&self.command, &self.args, &self.args_quoted)
     }
 
-    /// Parse modifier strings to Windows MOD flags.
-    ///
-    /// Lenient: a modifier it does not know is skipped, and `Mod` is not
-    /// understood.  Registering hotkeys must use [`Self::resolve_modifiers`],
-    /// which refuses such binds instead of turning them into a bare key.
+    /// Legacy lenient Windows modifier mask; unknown names, `Mod`, and
+    /// hook-only AltGr are skipped. Never use this for bind matching or
+    /// registration: use [`Self::resolve_modifiers`] so unsupported names cannot
+    /// silently weaken a chord, then `keynames::register_hotkey_modifiers` to
+    /// decide whether Win32 fallback is possible.
     pub fn mod_flags(&self) -> u32 {
         crate::input::parse_modifiers(&self.modifiers)
     }
