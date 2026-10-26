@@ -507,6 +507,22 @@ pub fn is_urgent_hwnd(hwnd: isize) -> bool {
     URGENT_WINDOWS.lock().contains(&hwnd)
 }
 
+/// Resolve a queued attention event against foreground state. A late shell
+/// flash can arrive after foreground clearing; rejecting it must also clear the
+/// native registry, or the next background flash is deduplicated and lost.
+pub(crate) fn resolve_attention(hwnd: isize, foreground: bool) -> bool {
+    pending_attention(&mut URGENT_WINDOWS.lock(), hwnd, foreground)
+}
+
+fn pending_attention(urgent: &mut HashSet<isize>, hwnd: isize, foreground: bool) -> bool {
+    if foreground {
+        urgent.remove(&hwnd);
+        false
+    } else {
+        urgent.contains(&hwnd)
+    }
+}
+
 /// Returns a snapshot of all HWNDs currently flagged as urgent.
 pub fn urgent_hwnds() -> Vec<isize> {
     URGENT_WINDOWS.lock().iter().copied().collect()
@@ -548,6 +564,24 @@ mod tests {
         set_urgent(hwnd, true);
         clear_urgent(hwnd);
         assert!(!is_urgent_hwnd(hwnd));
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    #[test]
+    fn late_foreground_flash_does_not_swallow_the_next_background_request() {
+        let mut urgent = HashSet::from([7, 9]);
+        assert!(!pending_attention(&mut urgent, 7, true));
+        assert!(!urgent.contains(&7));
+        assert!(urgent.contains(&9));
+        // The next shell flash must produce a fresh insertion / engine event.
+        assert!(urgent.insert(7));
+        assert!(pending_attention(&mut urgent, 7, false));
+        assert!(urgent.contains(&7));
+        assert!(!pending_attention(&mut urgent, 8, false));
     }
 }
 
