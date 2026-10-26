@@ -5,6 +5,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane V item 2 — overview pointer and normal actions
+- Add captured click/drag handling, workspace/new-workspace drops above/between/below, drag dwell, high-resolution wheel workspace navigation and right-drag scrolling. Keep normal actions live and refresh DWM sources after model changes; floating previews participate too.
+- Cover pure hit/drag/scroll/insertion/source lifecycle logic and add H62/H63 desktop checks; live results remain explicitly pending in the Lane V report.
+
 ### Lane V item 1 — configured overview camera
 - Implement niri's overview zoom, backdrop colour and workspace shadow, with a reversible open/close spring on the existing Phase 2B timeline/notifier. `overview-open-close` animation overrides, global off and slowdown apply; no frame clock runs after settling.
 - Add pure config, shadow-pixel and camera-lifecycle regressions. Desktop acceptance and compositor limits are recorded in `docs/parity/lane-v-report.md`.
