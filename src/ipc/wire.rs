@@ -109,6 +109,9 @@ fn action(value: Value) -> Result<Value, String> {
     let fields = fields
         .as_object()
         .ok_or("an action's fields must be an object")?;
+    if let Some(request) = super::action_options::screenshot(&variant, fields)? {
+        return Ok(request);
+    }
     if fields.get("focus") == Some(&Value::Bool(false)) {
         return Err("focus=false is not supported by this Windows action executor".into());
     }

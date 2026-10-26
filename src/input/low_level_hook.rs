@@ -330,6 +330,25 @@ unsafe extern "system" fn keyboard_hook_callback(
         return LRESULT(1);
     }
     let now = Instant::now();
+    let modal_modifiers = crate::input::keyboard::ENGINE.lock().modifiers();
+    if let Some(consumed) = crate::overlay::screenshot_ui::key_event(
+        vk,
+        pressed,
+        kb.flags.0 & LLKHF_INJECTED.0 != 0,
+        modal_modifiers,
+    ) {
+        crate::input::recent::consumed_key_event(vk, pressed, !pressed);
+        let mut keyboard = crate::input::keyboard::ENGINE.lock();
+        let captured = keyboard.modal_event(vk, pressed);
+        DOUBLE_ALT
+            .lock()
+            .event(vk, pressed, keyboard.modifiers(), now, false);
+        return if consumed || captured {
+            LRESULT(1)
+        } else {
+            CallNextHookEx(None, n_code, w_param, l_param)
+        };
+    }
     if crate::overlay::bindings_cheatsheet::dismiss_on_key(vk, pressed) {
         crate::input::recent::consumed_key_event(vk, pressed, !pressed);
         let mut keyboard = crate::input::keyboard::ENGINE.lock();
@@ -493,6 +512,11 @@ unsafe extern "system" fn mouse_hook_callback(
     let cursor = Point::new(event.pt.x, event.pt.y);
     if crate::ipc::pick::mouse_event(msg, cursor, event.flags & LLMHF_INJECTED != 0) {
         return LRESULT(1);
+    }
+    // A screenshot session owns pointer interactions, including Mod+drag. Let
+    // Windows deliver them to its host, never the ordinary bind/grab dispatcher.
+    if crate::overlay::screenshot_ui::is_active() {
+        return CallNextHookEx(None, n_code, w_param, l_param);
     }
     if msg == WM_MOUSEMOVE {
         crate::input::focus::on_mouse_move(cursor);

@@ -1337,6 +1337,18 @@ impl HotkeyBinding {
             }
             return None;
         }
+        // Implemented action properties use the very same argv validator as CLI
+        // and typed IPC, rather than being stored as inert configuration text.
+        if self.command == "screenshot" {
+            let mut words = self.args.clone();
+            let mut quoted = self.args_quoted.clone();
+            quoted.resize(words.len(), false);
+            for (name, value) in &self.action_props {
+                words.extend([format!("--{name}"), value.clone()]);
+                quoted.extend([false, true]);
+            }
+            return crate::input::parse_action_flagged(&self.command, &words, &quoted);
+        }
         crate::input::parse_action_flagged(&self.command, &self.args, &self.args_quoted)
     }
 

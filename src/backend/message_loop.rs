@@ -849,6 +849,7 @@ impl MessageLoop {
 
     pub fn stop(&self) {
         *self.running.lock() = false;
+        crate::overlay::screenshot_ui::cancel();
         crate::input::stop_keyboard_hook();
         let state = HOTKEY_THREAD.lock();
         if let Some(s) = &*state {
@@ -944,6 +945,8 @@ pub(crate) fn perform_action_on(
         | Action::Spawn(_)
         | Action::SpawnCmd(_)
         | Action::Screenshot
+        | Action::ScreenshotUi(_)
+        | Action::ScreenshotScreen
         | Action::WindowScreenshot
         | Action::ScreenshotWindow
         | Action::ShowKeyBindings
@@ -1356,8 +1359,16 @@ pub(crate) fn perform_action_on(
             engine.write().apply_all(backend);
         }
         Action::Screenshot => {
-            take_screenshot();
+            if let Err(error) = crate::overlay::screenshot_ui::open(Default::default()) {
+                warn!("Screenshot UI: {error:#}");
+            }
         }
+        Action::ScreenshotUi(options) => {
+            if let Err(error) = crate::overlay::screenshot_ui::open(options.clone()) {
+                warn!("Screenshot UI: {error:#}");
+            }
+        }
+        Action::ScreenshotScreen => take_screenshot(),
         // The column operations belong to the strip: a floating window has no column
         // (niri does nothing for it either).
         Action::ConsumeWindowIntoColumn => {

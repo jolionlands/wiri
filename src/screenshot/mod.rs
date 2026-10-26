@@ -2,7 +2,9 @@
 mod clipboard;
 mod encode;
 mod gdi;
+pub mod interactive;
 pub mod path;
+mod pointer;
 mod wgc;
 
 use anyhow::{ensure, Context, Result};
@@ -35,6 +37,7 @@ pub(crate) fn set_event_sender(tx: tokio::sync::broadcast::Sender<IpcEvent>) {
     *EVENT_TX.lock() = Some(tx);
 }
 
+#[derive(Clone)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -82,11 +85,35 @@ pub fn capture(window: Option<isize>, explicit_path: Option<&Path>) -> Result<Op
             gdi::screen(rect)?
         }
     };
-    let png = encode::png(&image)?;
-    clipboard::copy(&image, &png).context("copying screenshot to clipboard")?;
-    let path = match explicit_path {
-        Some(path) => Some(path.to_path_buf()),
-        None => path::resolve(&SETTING.read())?,
+    save_image_inner(&image, true, explicit_path)
+}
+
+/// Save a frozen image, never recapturing the desktop after the UI has opened.
+/// Clipboard-only overrides both a configured destination and an explicit path.
+pub fn save_image(
+    image: &Image,
+    write_to_disk: bool,
+    explicit_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let _capture = CAPTURE.lock();
+    let _com = encode::ComScope::new()?;
+    save_image_inner(image, write_to_disk, explicit_path)
+}
+
+fn save_image_inner(
+    image: &Image,
+    write_to_disk: bool,
+    explicit_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let png = encode::png(image)?;
+    clipboard::copy(image, &png).context("copying screenshot to clipboard")?;
+    let path = if !write_to_disk {
+        None
+    } else {
+        match explicit_path {
+            Some(path) => Some(path.to_path_buf()),
+            None => path::resolve(&SETTING.read())?,
+        }
     };
     let saved = if let Some(path) = path {
         let result = (|| -> Result<()> {

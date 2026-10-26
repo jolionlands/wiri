@@ -4,6 +4,8 @@ pub mod decor;
 pub mod hotkey_rows;
 pub mod overview_banner;
 pub mod recent_windows;
+pub mod screenshot_selection;
+pub mod screenshot_ui;
 pub mod status_bar;
 pub mod thumbnail_overview;
 pub mod workspace_indicator;

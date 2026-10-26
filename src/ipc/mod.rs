@@ -1,3 +1,4 @@
+mod action_options;
 pub mod client;
 pub mod codec;
 pub mod keyboard;

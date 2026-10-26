@@ -110,10 +110,12 @@ pub enum Action {
     FocusWorkspaceNamed(String),
     /// Set auto-tile threshold (None disables)
     SetAutoTileThreshold(Option<usize>),
-    /// Capture the full virtual desktop to a BMP file under
-    /// `%USERPROFILE%\Pictures\wiri-<timestamp>.bmp` (or the current working
-    /// directory if Pictures isn't writable).
+    /// Open the frozen focused-output screenshot selector.
     Screenshot,
+    /// Capture the focused output immediately, without the selector.
+    ScreenshotScreen,
+    /// Interactive screenshot with niri's pointer and destination options.
+    ScreenshotUi(crate::overlay::screenshot_ui::Options),
     /// Set the focused column to 1/4 of the work-area width.
     ColumnWidthPresetQuarter,
     /// Set the focused column to 3/4 of the work-area width.
@@ -374,6 +376,15 @@ pub fn action_name_known(name: &str) -> bool {
 /// the actions and wiri's own older spellings are understood.
 pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
     let is_quoted = |i: usize| quoted.get(i).copied().unwrap_or(false);
+    if matches!(name, "screenshot" | "take-screenshot" | "capture-screen") {
+        return crate::overlay::screenshot_ui::Options::parse(args).map(|options| {
+            if options == crate::overlay::screenshot_ui::Options::default() {
+                Action::Screenshot
+            } else {
+                Action::ScreenshotUi(options)
+            }
+        });
+    }
     match name {
         "toggle-keyboard-shortcuts-inhibit" => Some(Action::ToggleKeyboardShortcutsInhibit),
         "focus-column-left" | "focus-left" => Some(Action::FocusColumnLeft),
@@ -511,9 +522,7 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         }
         "toggle-always-on-top" | "always-on-top" | "topmost" => Some(Action::ToggleAlwaysOnTop),
         "focus-workspace-named" => args.first().map(|s| Action::FocusWorkspaceNamed(s.clone())),
-        "screenshot" | "take-screenshot" | "capture-screen" | "screenshot-screen" => {
-            Some(Action::Screenshot)
-        }
+        "screenshot-screen" if args.is_empty() => Some(Action::ScreenshotScreen),
         "window-screenshot" | "capture-window" => Some(Action::WindowScreenshot),
         "enter-resize-mode" | "resize-mode" | "interactive-resize" => Some(Action::EnterResizeMode),
         "move-column-to-workspace-up" | "move-column-up" | "move-column-to-workspace-above" => {
@@ -1520,7 +1529,7 @@ mod tests {
             ("focus-workspace-down", Action::FocusWorkspaceNext),
             ("focus-workspace-up", Action::FocusWorkspacePrevious),
             ("focus-workspace-previous", Action::FocusWorkspaceLast),
-            ("screenshot-screen", Action::Screenshot),
+            ("screenshot-screen", Action::ScreenshotScreen),
             ("show-hotkey-overlay", Action::ShowKeyBindings),
             ("center-column", Action::CenterColumn),
             ("center-window", Action::CenterWindow),
