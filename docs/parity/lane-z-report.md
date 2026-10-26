@@ -136,6 +136,26 @@ stress or soak test was run.
 - Early diagnostic/incomplete harness attempts are retained separately, not pooled
   into the comparison or represented as complete full-suite passes.
 
+## Interrupted-baseline cleanup handoff — pending tool access
+
+The completed `.live` run quit cleanly and left no recovery journal. However, the
+earlier timed-out baseline retained
+`.scratch/evidence/before/profile/local/wiri/hidden.json`; its original contents
+are also backed up as `.scratch/evidence/before/hidden.before-recovery.json`.
+A final read-only check found 18 recorded HWNDs still live and hidden (one gone).
+Their PID/class identity must be validated by normal recovery, not assumed from
+HWND existence. **Recovery of this interrupted baseline is still pending.**
+
+The attempted safe cleanup acquires `Global\\wiri-live-test`, refuses foreign
+daemons, starts an owned daemon with the saved in-worktree profile and unique
+`WIRI_PIPE`, and quits only that child. Command review refused the first commands
+as truncated; the shorter complete command was refused because the scope checker
+treated `$r/profile/roaming` as outside the worktree. No recovery daemon was
+started. A narrow access request for the saved profile directories was recorded;
+the refusal was not bypassed. An operator must complete identity-validated recovery
+under the desktop lock before discarding this journal. No foreign daemon or
+window should be forcibly stopped to do so.
+
 ## Remaining limits
 
 This is eventual event-driven Win32 stacking, not compositor-atomic stacking:
