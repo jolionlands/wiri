@@ -96,6 +96,14 @@ H30–H34 exercise CLI and typed IPC on the single-display desktop; cross-output
 EDID preferences and hotplug are unit-tested only. Named fallback placement and nested
 workspace layout overrides remain open. The saved desktop run has 519 pass / 15 fail;
 the final floating-memory/target fixes and revised harness remain unvalidated live (see report).
+**Lane K, provisional ([report](lane-k-report.md)):** on-demand DWM thumbnail open,
+close, two-sided workspace and resize effects reuse the existing input pump/active-only
+driver. The saved lane-local run at `267a612` has **497 pass / 6 fail**, with all ten
+H54–H57 checks passing; the six H22 checks were not reached after another Terminal
+took foreground. This is not integrated sign-off. Section 14 records the implemented
+Windows approximations and remaining partial rows; matrix status totals are unchanged.
+[PERF.md](../PERF.md#lane-k-transient-compositor-checkpoint-2026-10-26) records individual
+animation samples and same-process idle endpoints, not a zero-cost or leak-free claim.
 
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
 ARM64 release builds, docs and a demo. Lane D fixed always-quoted Run autostart command

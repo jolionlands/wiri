@@ -32,6 +32,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Lane W — per-window appearance
 - Add sparse niri window-rule focus-ring, border, shadow and tab paints, four-corner geometry and opt-in native clipping with original-region restoration. Attention uses shell flashes/ALERT, not generic accessibility state changes. Changes follow existing rule/focus/resize events; no resting timer or thread. Foreign-HWND clipping is binary and can suppress DWM shadows; compositor blur remains unsupported.
+### Lane K — measured evidence and H22 diagnosis
+- Record the saved lane-local result (497 pass / 6 fail; all ten H54–H57 checks pass), animation CPU/frame samples and before/after idle/resources in the parity report and PERF.md. Cite the Terminal foreground takeover that aborted H22 and the separate stale shutdown-helper pipe; no code or gate changed. Keep Windows approximations and unmeasured costs explicit; integrated verification remains pending.
+
 ### Lane K — desktop acceptance checks
 - Add H54–H57 lifecycle, two-frame workspace PNG, cancellation, cross-fade and global-off checks plus before/after 30-second idle/resource observations. H17 now observes the moving thumbnail rather than the already-final cloaked HWND; its unsupported-options fixture retains the unimplemented overlay warnings and separately requires open/close blocks to validate without warnings.
 

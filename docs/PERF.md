@@ -249,6 +249,65 @@ measurements are **not pooled** with this baseline. `af3eb30` fixes the collecto
 not wiri's runtime. Independent repeated normal runs and an ARM64 measurement remain
 necessary before claiming stable budgets.
 
+## Lane K transient compositor checkpoint (2026-10-26)
+
+This is a separate lane-local observation at `267a612`, **not a replacement for
+the historical baseline or integrated sign-off**. The completed run is preserved
+at `.scratch/lane-k-first-live`; raw values and binary SHA-256 are in
+`lane-k/measurement.json`, with per-transition lines in `lane-k/wiri.stderr.log`.
+The binary hash is `EEEF13856581E245474AADD26EE3DFD28DFBD74FF8681FCFD5F5E3173632AFE1`.
+TRIDARIS x64, one 1366×768 display at 96 DPI, release build with warnings denied.
+The saved report has **497 pass / 6 fail**, including all ten H54–H57 passes;
+[the Lane K report](parity/lane-k-report.md) explains the H22 foreground abort.
+No additional live run was made for this documentation update.
+
+### Animation observations
+
+| Transition | Renderer frame updates | Layer lifetime (ms) | Whole-process CPU delta (ms) | Live thumbnails |
+| --- | ---: | ---: | ---: | ---: |
+| Default open | 4 | 151.664 | 0 | 1 |
+| Default resize | 13 | 432.923 | 15.625 | 1 |
+| Default close (copied snapshot) | 5 | 162.423 | 0 | 0 |
+| Default workspace return | 12 | 392.401 | 0 | 1 |
+| Slowdown-10 workspace, two window sets | 49 | 1555.345 | 15.625 | 2 |
+
+These are individual log samples, not averages, renderer-only CPU, GPU time,
+key-to-photon latency or DWM presentation timestamps. `cpu_ms` is the process
+kernel+user delta over the layer's lifetime, quantized here in 15.625 ms units;
+**0 ms does not mean zero work**. Frame updates are not monitor presents and do
+not establish 60 Hz or hardware-vsync pacing. The two slowed-workspace PNGs
+show outgoing red and incoming blue content moving together (report H56).
+
+### Idle and resources before/after the transition sequence
+
+Both endpoints use the **same enabled process/configuration**, not different code
+versions. Each idle sample is one 30 s sleep without harness input or IPC. Input
+ticks were unchanged within each sample. The fixture population is not identical:
+no Lane K fixture at the first endpoint, one retained fixture at the second.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Idle elapsed seconds | 30.0133894 | 30.0124899 |
+| Process CPU ms | 93.75 | 62.5 |
+| Percent of one core | 0.312361% | 0.208247% |
+| Endpoint-counted context switches/s (lower bound) | 270.645874 | 271.387013 |
+| Endpoint-visible new / exited threads during idle | 2 / 3 | 0 / 2 |
+| Private bytes | 3,723,264 | 4,734,976 |
+| Working-set bytes | 16,375,808 | 20,303,872 |
+| Threads at resource endpoint | 21 | 22 |
+| Handles | 234 | 277 |
+| GDI / USER objects | 2 / 34 | 2 / 35 |
+
+H57 observed no animation layer at rest and stable fixture geometry. Source
+inspection finds the compositor reuses the existing input pump and active-only
+frame driver, destroying its layer/thumbnails/snapshots at completion; no added
+idle thread, timer or clock is present. This does **not** prove unchanged overall
+resource usage, zero idle wakeups, a leak plateau or a causal CPU improvement.
+Existing desktop events, pollers, lazy runtime workers and scheduling remain
+uncontrolled. Both CPU samples exceed the proposed 0.10%-of-one-core budget;
+context switches are not timer wakeups. No load/stress/soak test was run. ARM64,
+multiple displays, non-96-DPI and isolated GPU/frame-pacing costs remain unmeasured.
+
 ## Polling/timer inventory at source baseline `d84f04b`
 
 The Rust tree is unchanged from `d84f04b4b56107f86c4af6eb1016288b583016f5`.

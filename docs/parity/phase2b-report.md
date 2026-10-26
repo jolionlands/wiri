@@ -1,5 +1,11 @@
 # Phase 2B Lane A: look and feel
 
+Later Lane K work supersedes the open/close, outgoing-workspace and content-crossfade
+limitations below for eligible sources; see [its provisional report](lane-k-report.md)
+and matrix section 14. Its separate lane-local run has ten H54–H57 passes but six
+unreached H22 gates after foreground interference, not integrated sign-off. The Phase
+2B counts and measurements below remain historical and are not pooled with Lane K.
+
 ## A2 integrated-branch validation — complete
 
 Branch `meylin/sa-f9cbe-6b716`, base `df229cd`; final tested source/binary **`bd71c96`**.
