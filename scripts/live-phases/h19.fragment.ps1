@@ -54,8 +54,11 @@ function H19Key([byte]$vk) {
 function H19Rect($h) { return @(H19Prop $h 'FocusX'; H19Prop $h 'FocusY'; H19Prop $h 'FocusW'; H19Prop $h 'FocusH') }
 $h19Proc = $null; $h19A = [IntPtr]::Zero; $h19B = [IntPtr]::Zero; $h19C = [IntPtr]::Zero
 try {
-    $null = Ctl 'h19-preflight-quit' @('quit')
-    Start-Sleep -Milliseconds 1200
+    # Stop the wiri of the previous phase, if one still runs (a quit with none running is a failed step).
+    if (Get-Process wiri -ErrorAction SilentlyContinue) {
+        $null = Ctl 'h19-preflight-quit' @('quit')
+        Start-Sleep -Milliseconds 1200
+    }
     $h19Proc = Start-WiriWithConfig @'
 input {
     mod-key "ctrl-alt"

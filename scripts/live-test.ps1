@@ -488,6 +488,20 @@ function WaitForeground($h, [int]$minMs, [int]$maxMs) {
     }
     return ([LT]::GetForegroundWindow() -eq $h)
 }
+# Press wiri's close chord only while $h is the foreground window (asking wiri to focus it once more first): a
+# close that lands elsewhere closes the wrong window, such as a prompt that took the foreground or the terminal of
+# the CI runner itself (two hosted ARM64 runs died about 4m45s in, at these presses).  Returns whether it pressed.
+function CloseFocused($h, [string]$tag) {
+    if (-not (WaitForeground $h 0 3000)) {
+        $null = Ctl "$tag-refocus" @('focus-window', [string][int64]$h)
+        if (-not (WaitForeground $h 300 3000)) {
+            Add-Content (Join-Path $D 'close-skipped.txt') "${tag}: foreground $([int64][LT]::GetForegroundWindow()), wanted $([int64]$h)"
+            return $false
+        }
+    }
+    Chord 'ctrl+alt+q'
+    return $true
+}
 # The pipe of this user in this session (WIRI_PIPE overrides the name).
 function WiriPipeName {
     if ($env:WIRI_PIPE) { return ($env:WIRI_PIPE -replace '^\\\\\.\\pipe\\', '') }
@@ -959,7 +973,7 @@ Start-Sleep -Milliseconds 1200
 $r5 = Rc $fa
 $h3IpcCenters = (Near (($r5.L + $r5.R) / 2) (($swa.Left + $swa.Right) / 2) 6) -and (Near (($r5.T + $r5.B) / 2) (($swa.Top + $swa.Bottom) / 2) 6) -and (Near $r5.W $r4.W 4)
 $tilesBefore = AliveCount $forms
-Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 2000
+$null = CloseFocused $fa 'h3-close-float'; Start-Sleep -Milliseconds 2000
 $h3FloatClosed = -not [LT]::IsWindow($fa)
 $h3TilesSurviveFloatClose = ((AliveCount $forms) -eq $tilesBefore)
 Shot 'h3-05-float-closed'
@@ -971,7 +985,7 @@ $dlg = [TestForms]::OpenOwned($fb, 'wiri-h3-dialog')
 Start-Sleep -Milliseconds 1500
 $h3DialogForeground = ($dlg -ne [IntPtr]::Zero) -and ([LT]::GetForegroundWindow() -eq $dlg)
 Shot 'h3-06-dialog'
-Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 2000
+$null = CloseFocused $dlg 'h3-close-dialog'; Start-Sleep -Milliseconds 2000
 $h3DialogClosed = ($dlg -ne [IntPtr]::Zero) -and -not [LT]::IsWindow($dlg)
 $h3OwnerSurvives = [LT]::IsWindow($fb)
 
@@ -980,8 +994,9 @@ $tool = [TestForms]::OpenTool('wiri-h3-tool')
 Start-Sleep -Milliseconds 1500
 $h3ToolForeground = ([LT]::GetForegroundWindow() -eq $tool)
 $aliveBefore = AliveCount (@($forms) + @($fb, $tool))
-Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 2000
-$h3CloseRefusedOnUnmanaged = ((AliveCount (@($forms) + @($fb, $tool))) -eq $aliveBefore)
+$h3ToolClosePressed = CloseFocused $tool 'h3-close-tool'; Start-Sleep -Milliseconds 2000
+# (only a press with the tool window in front says anything: no press is not a refusal)
+$h3CloseRefusedOnUnmanaged = $h3ToolClosePressed -and ((AliveCount (@($forms) + @($fb, $tool))) -eq $aliveBefore)
 Shot 'h3-07-unmanaged-foreground'
 [TestForms]::CloseForm($tool)
 [TestForms]::CloseForm($fb)
@@ -1117,7 +1132,7 @@ Chord 'ctrl+alt+shift+1'; Start-Sleep -Milliseconds 1500
 Chord 'ctrl+alt+1'; Start-Sleep -Milliseconds 1500
 $null = Ctl 'h5-focus-float-again' @('focus-window', [string][int64]$ff)
 Start-Sleep -Milliseconds 1200
-Chord 'ctrl+alt+q'; Start-Sleep -Milliseconds 1800
+$null = CloseFocused $ff 'h5-close-float'; Start-Sleep -Milliseconds 1800
 $h5Closed = -not [LT]::IsWindow($ff)
 
 # ---- H6: the niri column keymap behaves like niri, driven by the shipped default binds --------------------------
