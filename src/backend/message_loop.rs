@@ -667,6 +667,7 @@ impl MessageLoop {
         crate::overlay::decor::layer::attach_message_thread();
         crate::overlay::compositor::attach_message_thread();
         crate::ipc::keyboard_notify::initialize(hwnd);
+        let switch_events = crate::hooks::switch_events::attach(hwnd, backend_handle.clone());
 
         // Store thread state for hot-reload support
         *HOTKEY_THREAD.lock() = Some(HotkeyThreadState {
@@ -820,6 +821,7 @@ impl MessageLoop {
             }
         }
 
+        drop(switch_events); // Unregister power notifications on this pump, before DestroyWindow.
         unregister_hotkeys(hwnd, &registered_ids);
         crate::ipc::keyboard_notify::shutdown(hwnd);
         crate::input::stop_keyboard_hook();
@@ -847,6 +849,10 @@ impl MessageLoop {
         lparam: LPARAM,
     ) -> LRESULT {
         crate::ipc::keyboard_notify::observe_message(msg, wparam.0, lparam.0);
+        if let Some(result) = crate::hooks::switch_events::handle_message(hwnd, msg, wparam, lparam)
+        {
+            return result;
+        }
         match msg {
             WM_DESTROY => {
                 PostQuitMessage(0);
