@@ -7,6 +7,8 @@ pub(super) fn screenshot(
 ) -> Result<Option<Value>, String> {
     let name = match variant {
         "Screenshot" => "screenshot",
+        "ScreenshotScreen" => "screenshot-screen",
+        "ScreenshotWindow" => "screenshot-window",
         _ => return Ok(None),
     };
     let mut args = Vec::<String>::new();
@@ -54,6 +56,18 @@ mod tests {
         let words: Vec<String> = serde_json::from_value(value["data"]["args"].clone()).unwrap();
         let action = crate::input::parse_action_name("screenshot", &words).unwrap();
         assert!(matches!(action, crate::input::Action::ScreenshotUi(_)));
+    }
+    #[test]
+    fn typed_window_capture_preserves_nonfocusing_id_and_boolean_flags() {
+        let fields =
+            json!({"id":42,"write_to_disk":false,"show_pointer":true,"path":r"C:\shots\x.png"});
+        let value = screenshot("ScreenshotWindow", fields.as_object().unwrap())
+            .unwrap()
+            .unwrap();
+        let words: Vec<String> = serde_json::from_value(value["data"]["args"].clone()).unwrap();
+        let options = crate::screenshot::action::CaptureAction::parse(true, &words).unwrap();
+        assert_eq!(options.id, Some(42));
+        assert!(!options.write_to_disk && options.show_pointer);
     }
     #[test]
     fn typed_known_options_never_silently_coerce_wrong_types() {

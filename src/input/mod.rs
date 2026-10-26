@@ -404,12 +404,21 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
             }
         });
     }
-    if matches!(name, "screenshot-screen" | "screenshot-window" | "screenshot-focused") {
+    if matches!(
+        name,
+        "screenshot-screen" | "screenshot-window" | "screenshot-focused"
+    ) {
         let window = name != "screenshot-screen";
         return crate::screenshot::action::CaptureAction::parse(window, args).map(|options| {
             if options == crate::screenshot::action::CaptureAction::defaults(window) {
-                if window { Action::ScreenshotWindow } else { Action::ScreenshotScreen }
-            } else { Action::Capture(options) }
+                if window {
+                    Action::ScreenshotWindow
+                } else {
+                    Action::ScreenshotScreen
+                }
+            } else {
+                Action::Capture(options)
+            }
         });
     }
     match name {

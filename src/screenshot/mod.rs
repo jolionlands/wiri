@@ -1,4 +1,5 @@
 //! On-demand screenshots. No persistent windows, codecs, devices, workers or clock.
+pub mod action;
 mod clipboard;
 mod encode;
 mod gdi;
@@ -63,9 +64,19 @@ fn pixel_len(width: i32, height: i32) -> Result<usize> {
 /// None captures only the output containing the foreground window, never the virtual desktop.
 /// An explicit path is used by the older CaptureWindow/ScreenshotWindow IPC requests.
 pub fn capture(window: Option<isize>, explicit_path: Option<&Path>) -> Result<Option<String>> {
+    capture_with_options(window, explicit_path, true, window.is_none())
+}
+
+pub fn capture_with_options(
+    window: Option<isize>,
+    explicit_path: Option<&Path>,
+    write_to_disk: bool,
+    show_pointer: bool,
+) -> Result<Option<String>> {
     let _capture = CAPTURE.lock();
     let _com = encode::ComScope::new()?;
-    let image = match window {
+    let output_bounds = window.is_none().then(focused_output_rect).transpose()?;
+    let mut image = match window {
         Some(raw) => {
             ensure!(raw != 0, "no focused window to capture");
             let hwnd = HWND(raw as *mut _);
@@ -80,12 +91,39 @@ pub fn capture(window: Option<isize>, explicit_path: Option<&Path>) -> Result<Op
                 }
             }
         }
-        None => {
-            let rect = focused_output_rect()?;
-            gdi::screen(rect)?
-        }
+        None => gdi::screen(output_bounds.context("no focused output")?)?,
     };
-    save_image_inner(&image, true, explicit_path)
+    if show_pointer {
+        let (bounds, receiver) = if let Some(raw) = window {
+            let hwnd = HWND(raw as *mut _);
+            let mut bounds = RECT::default();
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut bounds)?;
+            }
+            // WGC excludes invisible resize margins; PrintWindow generally does not.
+            let mut visible = RECT::default();
+            let visible_ok = unsafe {
+                windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+                    hwnd,
+                    windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS,
+                    (&mut visible as *mut RECT).cast(),
+                    std::mem::size_of::<RECT>() as u32,
+                )
+            }
+            .is_ok();
+            if visible_ok
+                && visible.right - visible.left == image.width as i32
+                && visible.bottom - visible.top == image.height as i32
+            {
+                bounds = visible;
+            }
+            (bounds, Some(hwnd))
+        } else {
+            (output_bounds.context("no focused output")?, None)
+        };
+        pointer::draw(&mut image, bounds, receiver)?;
+    }
+    save_image_inner(&image, write_to_disk, explicit_path)
 }
 
 /// Save a frozen image, never recapturing the desktop after the UI has opened.

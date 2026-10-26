@@ -1394,7 +1394,9 @@ pub(crate) fn perform_action_on(
         }
         Action::ScreenshotScreen => take_screenshot(),
         Action::Capture(options) => {
-            if let Err(error) = options.run() { warn!("Screenshot failed: {error:#}"); }
+            if let Err(error) = options.run() {
+                warn!("Screenshot failed: {error:#}");
+            }
         }
         // The column operations belong to the strip: a floating window has no column
         // (niri does nothing for it either).

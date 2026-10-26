@@ -1339,7 +1339,10 @@ impl HotkeyBinding {
         }
         // Implemented action properties use the very same argv validator as CLI
         // and typed IPC, rather than being stored as inert configuration text.
-        if self.command == "screenshot" {
+        if matches!(
+            self.command.as_str(),
+            "screenshot" | "screenshot-screen" | "screenshot-window"
+        ) {
             let mut words = self.args.clone();
             let mut quoted = self.args_quoted.clone();
             quoted.resize(words.len(), false);

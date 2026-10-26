@@ -12,6 +12,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add an on-demand focused-output screenshot UI with selection/Space-drag, pointer toggle, save/copy/cancel and absolute destinations through binds, CLI and typed IPC. Frames are frozen before the initially nonactivating host is shown; UI pixels never enter the saved crop.
 - Add pure geometry/options tests and H46 locked desktop checks (validation pending). No new crate, timer or idle worker.
 
+### Lane S item 2 — screenshot action options
+- Screen/window captures accept niri disk/pointer flags and absolute paths through binds, CLI and typed IPC. Explicit managed-window ids capture without activation; copy-only overrides a supplied destination.
+- Share the existing PNG/clipboard/event pipeline and composite the pointer only for its receiving window. Add six action tests and typed-wire coverage; H47 desktop validation follows.
+
 ### Lane S item 3 — non-layout system actions
 - Add foreground keyboard-layout switching, managed-window urgency actions without focus changes, asynchronous quit confirmation with an explicit skip flag, active config-file switching, monitor power controls and suspend. Spawn expands only a leading home component in its executable, never the other arguments.
 - Add pure parser, typed-wire, layout-selection and urgency tests. Power actions support the `WIRI_SYSTEM_ACTIONS_DRY_RUN` audit-file hook; unit tests never change power state or display quit dialogs. Integration validation is pending; no new pass totals are claimed.
