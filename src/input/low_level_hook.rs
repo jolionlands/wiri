@@ -74,6 +74,17 @@ impl Default for GrabState {
     }
 }
 
+impl GrabState {
+    fn window_id(&self) -> Option<WindowId> {
+        match self {
+            Self::Move(g) => Some(g.window_id),
+            Self::Resize(g) => Some(g.window_id),
+            Self::ColumnReorder(g) => Some(g.window_id),
+            Self::None => None,
+        }
+    }
+}
+
 /// Wrapper to make HHOOK Send-safe (it's just a pointer we pass to Win32 API)
 #[derive(Clone, Copy)]
 struct SendHook(HHOOK);
@@ -91,13 +102,77 @@ const WM_STOP_HOOK_LOOP: u32 = WM_USER + 301;
 /// Shared state accessible from the mouse hook callback
 struct HookState {
     grab: GrabState,
+    accepting_grabs: bool,
+    /// Keep the token reachable through queued release/cancellation cleanup. A
+    /// lifecycle event must still invalidate it after the button has gone up.
+    pending_move: Option<MoveGrab>,
     engine: Option<Arc<parking_lot::RwLock<TilingEngine>>>,
     backend: Option<BackendHandle>,
+}
+
+impl HookState {
+    fn try_begin_grab(&mut self, grab: GrabState) -> bool {
+        if !self.accepting_grabs
+            || !matches!(self.grab, GrabState::None)
+            || self.pending_move.is_some()
+        {
+            return false;
+        }
+        if let GrabState::Move(g) = &grab {
+            if g.is_cancelled() {
+                return false;
+            }
+            self.pending_move = Some(g.clone());
+        }
+        self.grab = grab;
+        true
+    }
+
+    fn owns_move(&self, grab: &MoveGrab) -> bool {
+        self.pending_move
+            .as_ref()
+            .is_some_and(|pending| pending.same_gesture(grab))
+    }
+
+    fn finish_move(&mut self, grab: &MoveGrab) {
+        if self.owns_move(grab) {
+            if matches!(&self.grab, GrabState::Move(g) if g.same_gesture(grab)) {
+                self.grab = GrabState::None;
+            }
+            self.pending_move = None;
+        }
+    }
+
+    fn grab_for_cancel(&self) -> GrabState {
+        if matches!(self.grab, GrabState::None) {
+            self.pending_move
+                .clone()
+                .map(GrabState::Move)
+                .unwrap_or(GrabState::None)
+        } else {
+            self.grab.clone()
+        }
+    }
+
+    fn take_cancelled_grab(&mut self, invalidate_source: bool) -> GrabState {
+        let grab = self.grab_for_cancel();
+        self.grab = GrabState::None;
+        if let GrabState::Move(g) = &grab {
+            if invalidate_source {
+                g.invalidate_source();
+            } else {
+                g.cancel();
+            }
+        }
+        grab
+    }
 }
 
 static HOOK_STATE: LazyLock<Mutex<HookState>> = LazyLock::new(|| {
     Mutex::new(HookState {
         grab: GrabState::None,
+        accepting_grabs: false,
+        pending_move: None,
         engine: None,
         backend: None,
     })
@@ -154,7 +229,22 @@ fn take_hook_for_thread(
     let mut guard = hook_slot.lock();
     if guard.as_ref().map(|h| h.thread_id) == Some(thread_id) {
         crate::ipc::pick::hooks_unavailable();
-        guard.take()
+        // Snapshot cancellation before making the slot available to a restart.
+        let cleanup = {
+            let mut state = HOOK_STATE.lock();
+            state.accepting_grabs = false;
+            if matches!(state.grab_for_cancel(), GrabState::None) {
+                None
+            } else {
+                Some(cancelled_grab_cleanup(&mut state, false))
+            }
+        };
+        let hook = guard.take();
+        drop(guard);
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
+        hook
     } else {
         None
     }
@@ -198,6 +288,7 @@ pub fn start_mouse_hook(
                         hook: SendHook(h),
                         thread_id,
                     });
+                    HOOK_STATE.lock().accepting_grabs = true;
                     info!("Low-level mouse hook installed");
                     let _ = ready_tx.send(Ok(()));
                     run_hook_message_loop("mouse");
@@ -226,6 +317,8 @@ pub fn start_mouse_hook(
 
 /// Stop the low-level mouse hook
 pub fn stop_mouse_hook() {
+    HOOK_STATE.lock().accepting_grabs = false;
+    cancel_grab_on_shutdown();
     if let Some(hook_thread) = HOOK_HANDLE.lock().take() {
         crate::ipc::pick::hooks_unavailable();
         unsafe {
@@ -269,6 +362,7 @@ pub fn start_keyboard_hook() -> Result<(), String> {
 }
 
 pub fn stop_keyboard_hook() {
+    cancel_grab_on_shutdown();
     if let Some(h) = KB_HOOK_HANDLE.lock().take() {
         crate::ipc::pick::hooks_unavailable();
         unsafe {
@@ -326,6 +420,7 @@ unsafe extern "system" fn keyboard_hook_callback(
         let old = KEY_IS_DOWN[slot].swap(pressed, Ordering::Relaxed);
         KEY_PRESS_WAS_REPEAT[slot].store(pressed && old, Ordering::Relaxed);
     }
+    cancel_move_on_key(vk, pressed);
     if crate::ipc::pick::keyboard_event(vk, pressed, kb.flags.0 & LLKHF_INJECTED.0 != 0) {
         return LRESULT(1);
     }
@@ -404,40 +499,157 @@ unsafe extern "system" fn keyboard_hook_callback(
     }
 }
 
-/// Start a move grab (called when Alt+LButton is pressed on a tiled window)
-pub fn begin_move_grab(grab: MoveGrab) {
+/// Start a move grab (called when Mod+LButton is pressed on a tiled or floating window).
+pub fn begin_move_grab(mut grab: MoveGrab) {
+    grab = grab.with_modifiers(crate::input::pointer::ENGINE.lock().mod_key);
+    let mut state = HOOK_STATE.lock();
+    if !state.try_begin_grab(GrabState::Move(grab.clone())) {
+        return;
+    }
     info!("Starting move grab for window {:?}", grab.window_id);
-    HOOK_STATE.lock().grab = GrabState::Move(grab);
+    if let Some(engine) = state.engine.clone() {
+        queue_move_start(grab, engine);
+    }
+}
+
+fn queue_move_start(grab: MoveGrab, engine: Arc<parking_lot::RwLock<TilingEngine>>) {
+    crate::input::dispatch::send_work(Box::new(move || {
+        let mut eng = engine.write();
+        if !validate_move(&grab, &mut eng) {
+            return;
+        }
+        // Tiled clicks remain in their slot until the pull-out threshold. Floating
+        // moves have no such threshold, matching niri's Starting transition.
+        if eng.is_floating(grab.window_id) && !grab.is_cancelled() {
+            eng.native_move_resize_start(grab.window_id);
+        }
+    }));
 }
 
 /// Start a resize grab (called when Alt+RButton is pressed on a window edge)
 pub fn begin_resize_grab(grab: ResizeGrab) {
-    info!("Starting resize grab for window {:?}", grab.window_id);
-    HOOK_STATE.lock().grab = GrabState::Resize(grab);
+    let mut state = HOOK_STATE.lock();
+    if state.try_begin_grab(GrabState::Resize(grab.clone())) {
+        info!("Starting resize grab for window {:?}", grab.window_id);
+    }
 }
 
 /// Start a column-reorder grab (called when Ctrl+Alt+LButton is pressed on
 /// the top strip of a tiled window).
 pub fn begin_column_reorder_grab(grab: ColumnReorderGrab) {
-    info!(
-        "Starting column-reorder grab for window {:?} (source col {})",
-        grab.window_id, grab.source_col
-    );
-    HOOK_STATE.lock().grab = GrabState::ColumnReorder(grab);
+    let mut state = HOOK_STATE.lock();
+    if state.try_begin_grab(GrabState::ColumnReorder(grab.clone())) {
+        info!(
+            "Starting column-reorder grab for window {:?} (source col {})",
+            grab.window_id, grab.source_col
+        );
+    }
 }
 
-/// Cancel any active grab
+/// Cancel any active or queued-release grab. Move previews leave their source layout intact.
 pub fn cancel_grab() {
     let mut state = HOOK_STATE.lock();
-    if !matches!(state.grab, GrabState::None) {
-        info!("Cancelling active grab");
-        state.grab = GrabState::None;
-        if let Some(engine) = state.engine.clone() {
-            crate::input::dispatch::send_work(Box::new(move || {
-                engine.read().update_insert_hint(None)
-            }));
-        }
+    if !matches!(state.grab_for_cancel(), GrabState::None) {
+        let cleanup = cancelled_grab_cleanup(&mut state, false);
+        crate::input::dispatch::send_work(cleanup);
     }
+}
+
+/// Invalidate a window before minimize/removal while holding the engine lock.
+/// This never takes that lock or repositions the HWND in the lifecycle caller.
+/// A queued cancellation must not restore a destroyed/reused handle either.
+pub fn cancel_window_grab(window: WindowId) {
+    let mut state = HOOK_STATE.lock();
+    if state.grab_for_cancel().window_id() == Some(window) {
+        let cleanup = cancelled_grab_cleanup(&mut state, true);
+        crate::input::dispatch::send_work(cleanup);
+    }
+}
+
+fn cancel_grab_if(should_cancel: impl FnOnce(&GrabState) -> bool) {
+    let mut state = HOOK_STATE.lock();
+    // Mod/Escape only cancel a held gesture, not a valid button-up awaiting dispatch.
+    if should_cancel(&state.grab) {
+        let cleanup = cancelled_grab_cleanup(&mut state, false);
+        crate::input::dispatch::send_work(cleanup);
+    }
+}
+
+fn cancelled_grab_cleanup(
+    state: &mut HookState,
+    invalidate_source: bool,
+) -> Box<dyn FnOnce() + Send> {
+    info!("Cancelling active or pending grab");
+    let grab = state.take_cancelled_grab(invalidate_source);
+    let engine = state.engine.clone();
+    let backend = state.backend.clone();
+    Box::new(move || match grab {
+        GrabState::Move(g) => {
+            if let Some(engine) = engine {
+                let mut eng = engine.write();
+                if !HOOK_STATE.lock().owns_move(&g) {
+                    return;
+                }
+                clear_move_guides();
+                if !g.can_restore_source() {
+                    // Lifecycle owns synchronous source cleanup. Do not clear a
+                    // new window's native-move/cache state if this HWND was reused.
+                    eng.update_window_insert_hint(g.window_id, None);
+                } else if eng.tiled_windows().contains_key(&g.window_id)
+                    && !eng.is_minimized(g.window_id)
+                {
+                    if let Some(backend) = backend {
+                        eng.cancel_window_insert(g.window_id, &backend);
+                    } else {
+                        eng.clear_window_insert(g.window_id);
+                    }
+                } else {
+                    eng.clear_window_insert(g.window_id);
+                }
+            } else {
+                clear_move_guides();
+            }
+            HOOK_STATE.lock().finish_move(&g);
+        }
+        _ => {
+            if let Some(engine) = engine {
+                engine.read().update_insert_hint(None);
+            }
+        }
+    })
+}
+
+/// Hook teardown cannot depend on a dispatch queue that may be shutting down.
+/// Unlike the LL callbacks, these callers may wait for layout/backend cleanup;
+/// stop_mouse_hook/stop_keyboard_hook must be called without an engine guard.
+fn cancel_grab_on_shutdown() {
+    let cleanup = {
+        let mut state = HOOK_STATE.lock();
+        if matches!(state.grab_for_cancel(), GrabState::None) {
+            return;
+        }
+        cancelled_grab_cleanup(&mut state, false)
+    };
+    cleanup();
+}
+
+/// Observe only Move ownership here; resize and Ctrl+Alt column swap keep their
+/// existing input semantics. Called before modal key handlers can consume Escape/up.
+fn cancel_move_on_key(vk: u32, pressed: bool) {
+    let escape = pressed && vk == VK_ESCAPE;
+    if !escape && (pressed || crate::input::keyboard::modifier(vk) == 0) {
+        return;
+    }
+    let modifiers = KEY_IS_DOWN.iter().enumerate().fold(0, |mods, (vk, down)| {
+        if down.load(std::sync::atomic::Ordering::Relaxed) {
+            mods | crate::input::keyboard::modifier(vk as u32)
+        } else {
+            mods
+        }
+    });
+    cancel_grab_if(
+        |grab| matches!(grab, GrabState::Move(g) if escape || g.modifiers_released(modifiers)),
+    );
 }
 
 /// Check if a grab is currently active
@@ -528,15 +740,30 @@ unsafe extern "system" fn mouse_hook_callback(
     }
     // This mutex protects only a snapshot; no layout work holds it. Do not let
     // contention leak the release of a button whose down was consumed.
-    let grab = HOOK_STATE.lock().grab.clone();
+    if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONUP) {
+        // Event-driven fallback when a keyboard hook could not observe Mod-up.
+        let modifiers = pointer_modifiers();
+        cancel_grab_if(
+            |grab| matches!(grab, GrabState::Move(g) if g.modifiers_released(modifiers)),
+        );
+    }
+    let (grab, disposition, engine, backend) = {
+        let mut state = HOOK_STATE.lock();
+        let grab = state.grab.clone();
+        let disposition = grab_message(&grab, msg);
+        if disposition.is_some() && msg != WM_MOUSEMOVE {
+            state.grab = GrabState::None;
+        }
+        (
+            grab,
+            disposition,
+            state.engine.clone(),
+            state.backend.clone(),
+        )
+    };
     if !matches!(grab, GrabState::None) {
-        if let Some(consume) = grab_message(&grab, msg) {
-            let (engine, backend) = {
-                let s = HOOK_STATE.lock();
-                (s.engine.clone(), s.backend.clone())
-            };
+        if let Some(consume) = disposition {
             if msg != WM_MOUSEMOVE {
-                HOOK_STATE.lock().grab = GrabState::None;
                 crate::input::pointer::ENGINE.lock().button(
                     0,
                     if msg == WM_LBUTTONUP { 0 } else { 1 },
@@ -624,7 +851,7 @@ unsafe extern "system" fn mouse_hook_callback(
             if let (Some(engine), Some(backend)) = (engine, backend) {
                 if let Some(eng) = engine.try_read() {
                     if let Some(info) = eng.tiled_windows().get(&wid) {
-                        if eng.is_fullscreen(wid) {
+                        if eng.is_fullscreen(wid) || eng.is_minimized(wid) {
                             return CallNextHookEx(None, n_code, w_param, l_param);
                         }
                         let bounds = backend
@@ -643,13 +870,10 @@ unsafe extern "system" fn mouse_hook_callback(
                             {
                                 GrabState::ColumnReorder(ColumnReorderGrab::new(wid, col, cursor))
                             } else {
-                                GrabState::Move(MoveGrab::new(
-                                    wid,
-                                    cursor,
-                                    bounds.loc,
-                                    bounds.size,
-                                    col,
-                                ))
+                                GrabState::Move(
+                                    MoveGrab::new(wid, cursor, bounds.loc, bounds.size, col)
+                                        .with_modifiers(mod_key),
+                                )
                             }
                         } else if let Some(edge) = crate::input::grab::resize_edge_or_quadrant(
                             cursor,
@@ -662,12 +886,24 @@ unsafe extern "system" fn mouse_hook_callback(
                         };
                         drop(eng);
                         let hint = matches!(&next, GrabState::ColumnReorder(_));
-                        HOOK_STATE.lock().grab = next;
-                        if hint {
-                            let engine = engine.clone();
-                            crate::input::dispatch::send_work(Box::new(move || {
-                                engine.read().update_insert_hint(Some(cursor.x))
-                            }));
+                        let move_hint = match &next {
+                            GrabState::Move(g) => Some(g.clone()),
+                            _ => None,
+                        };
+                        {
+                            let mut state = HOOK_STATE.lock();
+                            if !state.try_begin_grab(next) {
+                                return CallNextHookEx(None, n_code, w_param, l_param);
+                            }
+                            if let Some(g) = move_hint {
+                                queue_move_start(g, engine.clone());
+                            }
+                            if hint {
+                                let engine = engine.clone();
+                                crate::input::dispatch::send_work(Box::new(move || {
+                                    engine.read().update_insert_hint(Some(cursor.x))
+                                }));
+                            }
                         }
                         crate::input::pointer::ENGINE
                             .lock()
@@ -696,6 +932,29 @@ fn preview_rect(wid: WindowId, rect: Rect, backend: &BackendHandle) {
     );
 }
 
+fn clear_move_guides() {
+    crate::input::snap_guide::note_snap_x(None);
+    crate::input::snap_guide::hide_if_created();
+}
+
+/// Engine state and the token must be checked together, after acquiring its lock.
+/// In particular, never preview a minimized/untracked HWND, even from an old queue.
+fn validate_move(grab: &MoveGrab, engine: &mut TilingEngine) -> bool {
+    if grab.can_process(
+        engine.tiled_windows().contains_key(&grab.window_id),
+        engine.is_minimized(grab.window_id),
+    ) {
+        return true;
+    }
+    if !grab.is_cancelled() {
+        grab.invalidate_source();
+        clear_move_guides();
+        engine.clear_window_insert(grab.window_id);
+        HOOK_STATE.lock().finish_move(grab);
+    }
+    false
+}
+
 /// Slow layout/backend work never runs inside the global low-level callback.
 fn process_grab(
     grab: GrabState,
@@ -706,12 +965,30 @@ fn process_grab(
 ) {
     match grab {
         GrabState::Move(g) => {
+            // Keep lifecycle changes excluded through the backend write, not just
+            // through the initial validation of this queued snapshot.
+            let mut eng = engine.write();
+            if !validate_move(&g, &mut eng) {
+                return;
+            }
+            let floating = eng.is_floating(g.window_id);
+            let source_scale = eng
+                .monitors()
+                .iter()
+                .find(|(_, m)| m.bounds.contains_point(g.initial_cursor))
+                .map_or(1.0, |(_, m)| m.scale_factor);
+            let dragging = floating || g.tiled_drag_started(cursor, source_scale);
             let mut pos = g.new_position(cursor);
             if msg == WM_MOUSEMOVE {
+                if !dragging {
+                    return;
+                }
+                eng.native_move_resize_start(g.window_id);
+                let hint = (!eng.is_floating(g.window_id)).then_some(cursor);
+                eng.update_window_insert_hint(g.window_id, hint);
                 let cfg = crate::input::snap_guide::snap_config();
                 let mut overlay = None;
                 if cfg.enabled {
-                    let eng = engine.read();
                     if let Some(m) = eng.focused_output().and_then(|o| eng.monitors().get(&o)) {
                         let mut lefts = vec![];
                         let mut rights = vec![];
@@ -739,6 +1016,9 @@ fn process_grab(
                         }
                     }
                 }
+                if g.is_cancelled() {
+                    return;
+                }
                 preview_rect(
                     g.window_id,
                     Rect::new(pos.x, pos.y, g.initial_size.w, g.initial_size.h),
@@ -751,41 +1031,31 @@ fn process_grab(
                     }
                 }
             } else {
-                crate::input::snap_guide::note_snap_x(None);
+                if g.is_cancelled() {
+                    return;
+                }
                 // Do not create the guide just to hide it on a drag with no snap.
-                crate::input::snap_guide::hide_if_created();
-                let mut eng = engine.write();
+                clear_move_guides();
                 if eng.is_floating(g.window_id) {
+                    // Ordinary floating drags (including a click without motion)
+                    // remain floating. Only a separate toggle action changes layer.
+                    // Clear native_moves first: place_float refuses native-owned HWNDs.
+                    eng.clear_window_insert(g.window_id);
                     eng.place_float_from_pointer(
                         g.window_id,
                         Rect::new(pos.x, pos.y, g.initial_size.w, g.initial_size.h),
                         backend,
                     );
+                    crate::ipc::notify_state_changed();
+                } else if !dragging {
+                    eng.cancel_window_insert(g.window_id, backend);
+                } else if eng.finish_window_insert(g.window_id, cursor, backend) {
+                    crate::ipc::notify_state_changed();
                 } else {
-                    let oid = eng.monitors().iter().find_map(|(o, m)| {
-                        m.workspace()
-                            .and_then(|w| w.find_window_column(g.window_id))
-                            .map(|_| *o)
-                    });
-                    if let Some(o) = oid {
-                        let gap = eng.config().column_gap;
-                        if let Some(w) = eng
-                            .monitors_mut()
-                            .get_mut(&o)
-                            .and_then(|m| m.workspace_mut())
-                        {
-                            let target = g.target_column(
-                                cursor,
-                                g.initial_size.w as i32,
-                                gap,
-                                w.columns.len().max(1),
-                            );
-                            let _ = w.move_window(g.window_id, target, 0);
-                        }
-                        eng.apply_layout_for_monitor(o, backend);
-                    }
+                    eng.cancel_window_insert(g.window_id, backend);
                 }
-                crate::ipc::notify_state_changed();
+                g.cancel();
+                HOOK_STATE.lock().finish_move(&g);
             }
         }
         GrabState::Resize(g) => {
@@ -842,6 +1112,89 @@ fn process_grab(
 #[cfg(test)]
 mod motion_tests {
     use super::*;
+
+    fn hook_state() -> HookState {
+        HookState {
+            grab: GrabState::None,
+            accepting_grabs: true,
+            pending_move: None,
+            engine: None,
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn competing_grabs_cannot_replace_a_move_or_its_queued_release() {
+        let cursor = Point::new(200, 200);
+        let rect = Rect::new(100, 100, 400, 300);
+        let window = WindowId::new(1);
+        let grab = MoveGrab::new(window, cursor, rect.loc, rect.size, 0);
+        let mut state = hook_state();
+        assert!(state.try_begin_grab(GrabState::Move(grab.clone())));
+        let competitors = [
+            GrabState::Move(MoveGrab::new(window, cursor, rect.loc, rect.size, 0)),
+            GrabState::Resize(ResizeGrab::new(
+                window,
+                crate::input::grab::ResizeEdge::Right,
+                cursor,
+                rect,
+            )),
+            GrabState::ColumnReorder(ColumnReorderGrab::new(window, 0, cursor)),
+        ];
+        for next in competitors {
+            assert!(!state.try_begin_grab(next));
+            assert!(state.owns_move(&grab));
+            assert!(!grab.is_cancelled());
+        }
+        state.grab = GrabState::None; // Button-up queued, but not processed yet.
+        assert!(!state.try_begin_grab(GrabState::Move(grab.clone())));
+        state.finish_move(&grab);
+        let next = MoveGrab::new(window, cursor, rect.loc, rect.size, 0);
+        assert!(state.try_begin_grab(GrabState::Move(next.clone())));
+        state.finish_move(&grab);
+        assert!(
+            state.owns_move(&next),
+            "stale cleanup cannot retire the new grab"
+        );
+    }
+
+    #[test]
+    fn stopped_hooks_and_cancelled_tokens_cannot_begin_a_grab() {
+        let rect = Rect::new(100, 100, 400, 300);
+        let grab = MoveGrab::new(WindowId::new(1), rect.loc, rect.loc, rect.size, 0);
+        let mut state = hook_state();
+        state.accepting_grabs = false;
+        assert!(!state.try_begin_grab(GrabState::Move(grab.clone())));
+        state.accepting_grabs = true;
+        grab.cancel();
+        assert!(!state.try_begin_grab(GrabState::Move(grab)));
+        assert!(matches!(state.grab_for_cancel(), GrabState::None));
+    }
+
+    #[test]
+    fn lifecycle_invalidation_reaches_queued_release_and_escape_cleanup() {
+        let cursor = Point::new(200, 200);
+        let rect = Rect::new(100, 100, 400, 300);
+        for after_escape in [false, true] {
+            let grab = MoveGrab::new(WindowId::new(1), cursor, rect.loc, rect.size, 0);
+            let queued = grab.clone();
+            let mut state = hook_state();
+            assert!(state.try_begin_grab(GrabState::Move(grab.clone())));
+            if after_escape {
+                state.take_cancelled_grab(false);
+                assert!(queued.can_restore_source());
+            } else {
+                state.grab = GrabState::None;
+            }
+            assert_eq!(state.grab_for_cancel().window_id(), Some(grab.window_id));
+            state.take_cancelled_grab(true);
+            assert!(queued.is_cancelled());
+            assert!(!queued.can_restore_source());
+            assert!(state.owns_move(&queued));
+            state.finish_move(&queued);
+            assert!(matches!(state.grab_for_cancel(), GrabState::None));
+        }
+    }
 
     #[test]
     fn grab_motion_never_consumes_the_system_cursor_update() {

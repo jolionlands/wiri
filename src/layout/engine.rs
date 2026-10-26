@@ -20,6 +20,7 @@ mod sizing;
 use super::strip::CenterFocusedColumn;
 use sizing::DrawMode;
 // The windows and workspaces as the IPC event stream describes them (niri's `Window` and `Workspace`).
+mod insert_move;
 mod ipcview;
 // What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
 mod decor;
@@ -1824,6 +1825,7 @@ impl TilingEngine {
     }
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        crate::input::low_level_hook::cancel_window_grab(window_id);
         self.native_clips.remove(window_id);
         self.native_moves.remove(&window_id);
         self.animating_rects.remove(&window_id);
@@ -1941,6 +1943,12 @@ impl TilingEngine {
     /// of a tile is the larger of what the window says and what its rule says; the limits
     /// of a rule are for the window, so the border around it comes on top.
     fn sync_min_widths(&mut self) {
+        self.sync_tile_limits(true);
+    }
+
+    /// Structural transfers refresh output-relative limits without erasing native/user
+    /// preferred heights. Rule/config updates retain their existing reset semantics.
+    fn sync_tile_limits(&mut self, reset_heights: bool) {
         let known = &self.window_min_widths;
         let limits = &self.rule_limits;
         let heights = &self.rule_heights;
@@ -1972,7 +1980,9 @@ impl TilingEngine {
                         tile.max_width = rules::RuleLimits::for_tile(rule.max_width, border);
                         tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
                         tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
-                        tile.preferred_height = heights.get(&tile.window_id).copied();
+                        if reset_heights || tile.preferred_height.is_none() {
+                            tile.preferred_height = heights.get(&tile.window_id).copied();
+                        }
                     }
                 }
             }
@@ -2027,6 +2037,10 @@ impl TilingEngine {
     pub fn minimize_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
         if !self.tiled_windows.contains_key(&window_id) || self.minimized.contains_key(&window_id) {
             return;
+        }
+        crate::input::low_level_hook::cancel_window_grab(window_id);
+        if self.native_moves.contains_key(&window_id) {
+            self.clear_window_insert(window_id);
         }
         let was_fullscreen = self.fullscreen_windows.contains(&window_id);
         // A minimized window is not fullscreen (the taskbar must come back), does not hold its

@@ -11,6 +11,9 @@
 
 use crate::utils::Rect;
 
+use super::gradient::GradientColors;
+pub use super::gradient::{gradient_position, Gradient};
+
 /// A colour with straight (not premultiplied) 8-bit channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgba {
@@ -56,17 +59,6 @@ impl Rgba {
     }
 }
 
-/// CSS `linear-gradient(angle, from, to)`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Gradient {
-    pub from: Rgba,
-    pub to: Rgba,
-    /// Degrees: 0 points up, 90 right, 180 down.
-    pub angle: f32,
-    /// Measured against the workspace view instead of the shape that is painted.
-    pub relative_to_view: bool,
-}
-
 /// What a shape is filled with.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Paint {
@@ -95,41 +87,37 @@ impl Paint {
         }
     }
 
-    /// The premultiplied colour at the pixel centre `(x, y)`, in the coordinates of the
-    /// surface.  `shape` is the rectangle the gradient is measured against when it is
-    /// relative to the shape, `view` the one it is measured against otherwise.
-    fn sample(&self, x: f32, y: f32, shape: &RRect, view: &RRect) -> [f32; 4] {
+    fn sampler(&self) -> PaintSampler<'_> {
         match self {
-            Paint::Solid(c) => c.premultiplied(),
-            Paint::Gradient(g) => {
-                let area = if g.relative_to_view { view } else { shape };
-                let t = gradient_position(g.angle, area, x, y);
-                let a = g.from.premultiplied();
-                let b = g.to.premultiplied();
-                [
-                    a[0] + (b[0] - a[0]) * t,
-                    a[1] + (b[1] - a[1]) * t,
-                    a[2] + (b[2] - a[2]) * t,
-                    a[3] + (b[3] - a[3]) * t,
-                ]
-            }
+            Paint::Solid(c) => PaintSampler::Solid(c.premultiplied()),
+            Paint::Gradient(g) => PaintSampler::Gradient(g, GradientColors::new(g)),
         }
+    }
+
+    #[cfg(test)]
+    fn sample(&self, x: f32, y: f32, shape: &RRect, view: &RRect) -> [f32; 4] {
+        self.sampler().sample(x, y, shape, view)
     }
 }
 
-/// Where `(x, y)` falls along the gradient line of a CSS `linear-gradient(angle, ...)` over
-/// `area`, 0 at the start and 1 at the end (clamped).
-pub fn gradient_position(angle_deg: f32, area: &RRect, x: f32, y: f32) -> f32 {
-    let a = angle_deg.to_radians();
-    let (dx, dy) = (a.sin(), -a.cos());
-    // The gradient line is as long as the projection of the box on its direction.
-    let length = (area.w * dx).abs() + (area.h * dy).abs();
-    if length <= f32::EPSILON {
-        return 0.0;
+/// Converted endpoints are shared by every pixel of a paint operation.
+enum PaintSampler<'a> {
+    Solid([f32; 4]),
+    Gradient(&'a Gradient, GradientColors),
+}
+
+impl PaintSampler<'_> {
+    /// Premultiplied colour at the pixel centre `(x, y)`, in surface coordinates. `shape`
+    /// measures window-relative gradients; `view` measures workspace-view gradients.
+    fn sample(&self, x: f32, y: f32, shape: &RRect, view: &RRect) -> [f32; 4] {
+        match self {
+            Self::Solid(c) => *c,
+            Self::Gradient(g, colors) => {
+                let area = if g.relative_to_view { view } else { shape };
+                colors.sample(gradient_position(g.angle, area, x, y))
+            }
+        }
     }
-    let cx = area.x + area.w / 2.0;
-    let cy = area.y + area.h / 2.0;
-    (((x - cx) * dx + (y - cy) * dy) / length + 0.5).clamp(0.0, 1.0)
 }
 
 /// A rectangle with a radius for each corner, in surface coordinates.
@@ -389,6 +377,8 @@ pub fn draw_frame(surf: &mut Surface, f: &FramePaint) {
     if outer.w <= 0.0 || outer.h <= 0.0 {
         return;
     }
+    let ring_paint = f.ring.map(|(_, paint)| paint.sampler());
+    let border_paint = f.border.map(Paint::sampler);
     let mut cells: Vec<(i32, i32, [f32; 4])> = Vec::new();
     visit_rows(surf, &outer, Some(&f.window), |x, y| {
         let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -399,7 +389,7 @@ pub fn draw_frame(surf: &mut Surface, f: &FramePaint) {
         let cov_tile = f.tile.coverage(px, py);
         let cov_win = f.window.coverage(px, py);
         let mut color = [0.0f32; 4];
-        if let Some((_, ring)) = f.ring {
+        if let Some(ring) = &ring_paint {
             let share = (cov_out - cov_tile).max(0.0);
             if share > 0.0 {
                 let c = ring.sample(px, py, &outer, &f.view);
@@ -408,7 +398,7 @@ pub fn draw_frame(surf: &mut Surface, f: &FramePaint) {
                 }
             }
         }
-        if let Some(border) = f.border {
+        if let Some(border) = &border_paint {
             let share = (cov_tile - cov_win).max(0.0);
             if share > 0.0 {
                 let c = border.sample(px, py, &f.tile, &f.view);
@@ -468,6 +458,7 @@ pub fn fill(surf: &mut Surface, shape: &RRect, paint: &Paint, view: &RRect) {
     if paint.is_invisible() {
         return;
     }
+    let paint = paint.sampler();
     let mut cells: Vec<(i32, i32, [f32; 4])> = Vec::new();
     visit_rows(surf, shape, None, |x, y| {
         let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -485,6 +476,7 @@ pub fn fill(surf: &mut Surface, shape: &RRect, paint: &Paint, view: &RRect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::effects::{GradientHue, GradientSpace};
 
     const RED: Rgba = Rgba::new(255, 0, 0, 255);
     const BLUE: Rgba = Rgba::new(0, 0, 255, 255);
@@ -648,6 +640,8 @@ mod tests {
             to: Rgba::new(10, 20, 255, 90),
             angle: 45.0,
             relative_to_view: false,
+            space: GradientSpace::Srgb,
+            hue: GradientHue::Shorter,
         });
         let frame = FramePaint {
             tile,
@@ -775,6 +769,8 @@ mod tests {
             to: BLUE,
             angle: 90.0,
             relative_to_view: false,
+            space: GradientSpace::Srgb,
+            hue: GradientHue::Shorter,
         });
         let frame = FramePaint {
             tile: window,
@@ -798,11 +794,98 @@ mod tests {
             to: BLUE,
             angle: 90.0,
             relative_to_view: true,
+            space: GradientSpace::Srgb,
+            hue: GradientHue::Shorter,
         });
         let small = RRect::of(Rect::new(150, 10, 30, 30), (0, 0), 0.0);
         let c = g.sample(165.0, 25.0, &small, &view);
         // 165 of 200 along the view: mostly blue.
         assert!(c[2] > c[0], "{:?}", c);
+    }
+
+    #[test]
+    fn rasterized_gradients_use_every_interpolation_space_and_hue() {
+        for space in [
+            GradientSpace::Srgb,
+            GradientSpace::SrgbLinear,
+            GradientSpace::Oklab,
+            GradientSpace::Oklch,
+        ] {
+            for hue in [
+                GradientHue::Shorter,
+                GradientHue::Longer,
+                GradientHue::Increasing,
+                GradientHue::Decreasing,
+            ] {
+                let g = Gradient {
+                    from: Rgba::new(255, 0, 0, 128),
+                    to: Rgba::new(0, 255, 255, 64),
+                    angle: 90.0,
+                    relative_to_view: false,
+                    space,
+                    hue,
+                };
+                let mut pixels = canvas(101, 1);
+                let mut surf = Surface::new(101, 1, &mut pixels);
+                let shape = RRect::of(Rect::new(0, 0, 101, 1), (0, 0), 0.0);
+                fill(&mut surf, &shape, &Paint::Gradient(g), &shape);
+                // The middle pixel is exactly halfway along the gradient.
+                let expected = g.color_at(0.5).map(|c| (c * 255.0).round() as u8);
+                assert_eq!(surf.get(50, 0), expected, "{space:?}, {hue:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_gradients_are_independent_of_shape_and_surface_origin() {
+        let view = Rect::new(-400, 40, 800, 400);
+        let shape = Rect::new(-200, 80, 100, 100);
+        let other = RRect::of(Rect::new(100, 300, 200, 50), (0, 0), 0.0);
+        let paint = Paint::Gradient(Gradient {
+            from: RED,
+            to: BLUE,
+            angle: 27.0,
+            relative_to_view: true,
+            space: GradientSpace::Oklch,
+            hue: GradientHue::Increasing,
+        });
+        let original = paint.sample(
+            50.0,
+            120.0,
+            &RRect::of(shape, (0, 0), 0.0),
+            &RRect::of(view, (0, 0), 0.0),
+        );
+        let different_shape = paint.sample(50.0, 120.0, &other, &RRect::of(view, (0, 0), 0.0));
+        let different_origin = paint.sample(
+            10.0,
+            150.0,
+            &RRect::of(shape, (40, -30), 0.0),
+            &RRect::of(view, (40, -30), 0.0),
+        );
+        assert_eq!(original, different_shape);
+        for (a, b) in original.into_iter().zip(different_origin) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn fading_a_gradient_keeps_its_interpolation_options() {
+        let gradient = Gradient {
+            from: Rgba::new(255, 0, 0, 200),
+            to: Rgba::new(0, 0, 255, 100),
+            angle: 45.0,
+            relative_to_view: true,
+            space: GradientSpace::Oklch,
+            hue: GradientHue::Longer,
+        };
+        assert_eq!(
+            Paint::Gradient(gradient).faded(0.5),
+            Paint::Gradient(Gradient {
+                from: Rgba::new(255, 0, 0, 100),
+                to: Rgba::new(0, 0, 255, 50),
+                ..gradient
+            }),
+        );
     }
 
     #[test]

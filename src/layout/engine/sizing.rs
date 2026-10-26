@@ -503,7 +503,14 @@ impl TilingEngine {
             }
             SizeReaction::SetMaximized(wanted) => {
                 self.unzoom_pending.remove(&window_id);
+                let unchanged = self.maximized_edges.contains(&window_id) == wanted;
+                self.applied_state.remove(&window_id);
                 self.set_maximized_to_edges(window_id, wanted, backend);
+                // A normalized interactive drop can already have the wanted state,
+                // but the application's async restore still invalidates its rectangle.
+                if unchanged {
+                    self.apply_layout_for_monitor(output, backend);
+                }
             }
             SizeReaction::EnterFullscreen => {
                 self.set_fullscreen(window_id, true, true, backend);

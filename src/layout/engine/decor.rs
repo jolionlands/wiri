@@ -657,6 +657,7 @@ mod tests {
             angle: 45.0,
             relative_to_view: true,
             space: crate::config::GradientSpace::Srgb,
+            hue: crate::config::effects::GradientHue::Shorter,
         });
         let cfg = cfg_with(fx);
         let urgent = HashSet::new();
