@@ -1,15 +1,17 @@
 use anyhow::Result;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_USER,
 };
 
-use super::{BackendHandle, WindowInfo};
+use super::{BackendHandle, ForegroundStamp, WindowInfo};
 use crate::backend::BackendEvent;
 
 // Event constants for SetWinEventHook
@@ -30,6 +32,9 @@ const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 const WM_STOP_WINEVENT_LOOP: u32 = WM_USER + 401;
+// The one existing foreground hook delivers occurrences in order. Retain that
+// order even when several foreground transitions share a native millisecond.
+static FOREGROUND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct WinEventHook {
@@ -191,7 +196,7 @@ unsafe extern "system" fn winevent_proc(
     id_object: i32,
     id_child: i32,
     _id_thread: u32,
-    _timestamp: u32,
+    timestamp: u32,
 ) {
     if !window_event_object(event_type, id_object, id_child) {
         return;
@@ -219,7 +224,15 @@ unsafe extern "system" fn winevent_proc(
             });
         }
         0x0003 => {
-            // EVENT_SYSTEM_FOREGROUND
+            // EVENT_SYSTEM_FOREGROUND. Preserve occurrence time before any other
+            // work; callback delivery and the backend consumer can both lag.
+            let stamp = ForegroundStamp::from_win_event(
+                timestamp,
+                // SAFETY: GetTickCount64 only reads uptime; it takes no pointers
+                // or handles and is valid on the existing WinEvent callback thread.
+                unsafe { GetTickCount64() },
+                FOREGROUND_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            );
             // Bringing a window to the foreground implicitly clears its urgent state
             // — the user is now looking at it, no need to keep nagging.
             let hwnd_isize = hwnd.0 as isize;
@@ -228,7 +241,10 @@ unsafe extern "system" fn winevent_proc(
                 // Emit the cleared signal so the engine can un-highlight the border.
                 backend.send_event(BackendEvent::WindowUrgentCleared { hwnd: hwnd_isize });
             }
-            backend.send_event(BackendEvent::ForegroundChanged { hwnd: hwnd_isize });
+            backend.send_event(BackendEvent::ForegroundChanged {
+                hwnd: hwnd_isize,
+                stamp,
+            });
             // The window came to the front: whatever is drawn around it goes directly below it.
             if let Some(decor) = crate::overlay::decor::global() {
                 decor.restack(hwnd_isize);

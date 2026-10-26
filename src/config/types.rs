@@ -734,7 +734,15 @@ pub struct WorkspaceConfig {
     pub name: String,
     pub layout: String,
     pub monitor: String,
+    /// Ordered niri output preferences; `monitor` remains the legacy fallback.
+    pub open_on_outputs: Vec<String>,
     pub follow_on_focus: bool,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self::default_config()
+    }
 }
 
 impl WorkspaceConfig {
@@ -743,6 +751,7 @@ impl WorkspaceConfig {
             name: String::new(),
             layout: "tile".to_string(),
             monitor: String::new(),
+            open_on_outputs: Vec::new(),
             follow_on_focus: true,
         }
     }

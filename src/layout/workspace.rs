@@ -451,6 +451,8 @@ pub struct Workspace {
     pub columns: Vec<Column>,
     /// The active column is anchored by its remembered active window.
     pub active_window: Option<WindowId>,
+    /// Last-focused floating layer selection; tiled focus clears this marker.
+    pub active_float: Option<WindowId>,
     pub scroll_offset: Point,
     /// Per-workspace layout algorithm; defaults to `Scrolling`.
     pub layout_mode: WorkspaceLayout,
@@ -470,6 +472,7 @@ impl Workspace {
             name: None,
             columns: Vec::new(),
             active_window: None,
+            active_float: None,
             scroll_offset: Point::default(),
             layout_mode,
         }
@@ -566,6 +569,9 @@ impl Workspace {
 
     /// Remove a window from the workspace
     pub fn remove_window(&mut self, window_id: WindowId) -> Option<(usize, Tile)> {
+        if self.active_float == Some(window_id) {
+            self.active_float = None;
+        }
         for (col_idx, column) in self.columns.iter_mut().enumerate() {
             if let Some(tile) = column.remove_tile(window_id) {
                 // Remove empty columns

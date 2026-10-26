@@ -18,13 +18,6 @@ struct Place {
     slot: Option<(usize, usize)>,
 }
 
-/// The workspace ids event-stream clients see are unique among all monitors and small enough
-/// for a JavaScript number (below 2^53): a tag of the monitor in the upper bits and the
-/// workspace id of the monitor in the lower 32 bits.
-fn workspace_ipc_id(tag: u64, workspace: i32) -> u64 {
-    (tag << 32) | u64::from(workspace as u32)
-}
-
 fn layout_geometry(rect: Rect, output: Rect, scale: f64, inset: i32) -> WindowLayoutIpc {
     WindowLayoutIpc {
         pos_in_scrolling_layout: None,
@@ -39,29 +32,6 @@ fn layout_geometry(rect: Rect, output: Rect, scale: f64, inset: i32) -> WindowLa
         )),
         window_offset_in_tile: (inset as f64 / scale, inset as f64 / scale),
     }
-}
-
-/// A tag from 1 to 0xFFFFF for each id, in the order given.  An id that would get a tag
-/// that is taken gets the next free one.
-fn tags_for(ids: &[u64]) -> Vec<u64> {
-    const TAGS: u64 = 0xF_FFFF;
-    let mut used = HashSet::new();
-    ids.iter()
-        .map(|id| {
-            let mut tag = id % TAGS + 1;
-            while !used.insert(tag) {
-                tag = tag % TAGS + 1;
-            }
-            tag
-        })
-        .collect()
-}
-
-/// The tag of each monitor, taken from its id.  The monitors are given in the order of
-/// their names, so that it is always the same one that moves on when two have the same tag.
-fn output_tags(outputs: &[OutputId]) -> HashMap<OutputId, u64> {
-    let ids: Vec<u64> = outputs.iter().map(|o| o.as_u64()).collect();
-    outputs.iter().copied().zip(tags_for(&ids)).collect()
 }
 
 impl TilingEngine {
@@ -184,7 +154,7 @@ impl TilingEngine {
 
     /// The window that is the active one of a workspace (niri's `active_window_id`): the
     /// monitor's focused window when the workspace is the active one and has it, otherwise
-    /// the window that was focused most recently on the workspace, otherwise its first tile.
+    /// its remembered active window, then the most recently focused window or its first tile.
     fn ipc_active_window(
         &self,
         monitor: &Monitor,
@@ -200,6 +170,18 @@ impl TilingEngine {
             if let Some(focused) = monitor.focus_window.filter(|w| on_workspace(w)) {
                 return Some(focused);
             }
+        }
+        if let Some(remembered) = monitor
+            .workspaces
+            .get(&workspace)
+            .and_then(|ws| {
+                ws.active_float
+                    .filter(|w| !self.minimized.contains_key(w) && on_workspace(w))
+                    .or(ws.active_window)
+            })
+            .filter(|w| on_workspace(w))
+        {
+            return Some(remembered);
         }
         if let Some(recent) = monitor
             .focus_ring
@@ -228,7 +210,6 @@ impl TilingEngine {
             .map(|(output, _)| (self.ipc_output_name(*output), *output))
             .collect();
         outputs.sort_by(|a, b| (&a.0, a.1.as_u64()).cmp(&(&b.0, b.1.as_u64())));
-        let tags = output_tags(&outputs.iter().map(|(_, o)| *o).collect::<Vec<_>>());
         let names: HashMap<OutputId, &String> = outputs.iter().map(|(n, o)| (*o, n)).collect();
 
         let places = self.ipc_places();
@@ -251,13 +232,12 @@ impl TilingEngine {
             let Some(monitor) = self.monitors.get(output) else {
                 continue;
             };
-            let tag = tags[output];
             for workspace in monitor.workspace_ids() {
                 let is_active = monitor.active_workspace == workspace;
                 workspaces.push(WorkspaceIpc {
-                    id: workspace_ipc_id(tag, workspace),
+                    id: monitor.workspaces[&workspace].ipc_id,
                     idx: monitor.workspace_number_of(workspace).unwrap_or(1).max(1) as u32,
-                    name: self.workspace_name(workspace),
+                    name: self.workspace_name_on(*output, workspace),
                     output: Some(names[output].clone()),
                     is_urgent: urgent_workspaces.contains(&(*output, workspace)),
                     is_active,
@@ -303,8 +283,11 @@ impl TilingEngine {
                 pid: (info.process_id != 0).then_some(info.process_id),
                 // A floating window of a monitor that is away has no workspace to name.
                 workspace_id: place.and_then(|p| {
-                    tags.get(&p.output)
-                        .map(|tag| workspace_ipc_id(*tag, p.workspace))
+                    self.monitors
+                        .get(&p.output)?
+                        .workspaces
+                        .get(&p.workspace)
+                        .map(|ws| ws.ipc_id)
                 }),
                 is_focused: focused_window == Some(*window),
                 is_floating: self.floating_windows.contains(window),
@@ -501,20 +484,110 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_small_distinct_and_never_zero() {
-        const TAGS: u64 = 0xF_FFFF;
-        assert_eq!(tags_for(&[0, 1, 2]), vec![1, 2, 3]);
-        // The same tag asked twice: the next free one.
-        assert_eq!(tags_for(&[5, 5 + TAGS]), vec![6, 7]);
-        // The last tag wraps to the first.
-        assert_eq!(tags_for(&[TAGS - 1, TAGS - 1 + TAGS]), vec![TAGS, 1]);
-        for tag in tags_for(&[u64::MAX, 0, 12345, TAGS]) {
-            assert!((1..=TAGS).contains(&tag), "{}", tag);
-        }
-        // A workspace id is below 2^53 whatever the workspace.
-        assert!(workspace_ipc_id(TAGS, i32::MAX) < (1u64 << 53));
-        assert_ne!(workspace_ipc_id(1, 0), workspace_ipc_id(2, 0));
-        assert_ne!(workspace_ipc_id(1, 0), workspace_ipc_id(1, 1));
+    fn workspace_identity_is_allocated_once_and_survives_reparenting() {
+        use crate::layout::Workspace;
+
+        let mut workspace = Workspace::new();
+        let id = workspace.ipc_id;
+        assert!(id > 0 && id < (1 << 53));
+        assert_ne!(id, Workspace::new().ipc_id);
+        workspace.scroll_offset.x = 40;
+        let copy = workspace.clone();
+        assert_eq!(copy.ipc_id, id);
+        let mut first = Monitor::new(
+            OutputId::from_name("identity-a"),
+            Rect::new(0, 0, 800, 600),
+            Rect::new(0, 0, 800, 600),
+        );
+        let mut second = Monitor::new(
+            OutputId::from_name("identity-b"),
+            Rect::new(800, 0, 800, 600),
+            Rect::new(800, 0, 800, 600),
+        );
+        first.insert_workspace(17, workspace);
+        second.insert_workspace(31, first.remove_workspace(17).unwrap());
+        assert_eq!(second.workspaces[&31].ipc_id, id);
+    }
+
+    #[test]
+    fn snapshot_uses_source_workspace_identity_and_output_qualified_names() {
+        let (mut engine, _backend) = engine_with(&[100]);
+        let first = OutputId::from_name("TestMonitor");
+        let second = OutputId::from_name("identity-destination");
+        engine.register_monitor(
+            second,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
+        engine.set_output_name(first, "DISPLAY1");
+        engine.set_output_name(second, "DISPLAY2");
+        let source_id = {
+            let workspace = engine
+                .monitors
+                .get_mut(&first)
+                .unwrap()
+                .workspaces
+                .get_mut(&0)
+                .unwrap();
+            workspace.name = Some("source".to_string());
+            workspace.ipc_id
+        };
+        let other_id = {
+            let workspace = engine
+                .monitors
+                .get_mut(&second)
+                .unwrap()
+                .workspaces
+                .get_mut(&0)
+                .unwrap();
+            workspace.name = Some("other".to_string());
+            workspace.ipc_id
+        };
+        assert_ne!(
+            source_id, other_id,
+            "local key 0 does not identify a workspace globally"
+        );
+        engine.maintain_empty_workspace(second);
+        let before = engine.ipc_snapshot();
+        assert_eq!(window_of(&before, 100).workspace_id, Some(source_id));
+        assert_eq!(
+            before
+                .workspaces
+                .iter()
+                .find(|ws| ws.id == other_id)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("other")
+        );
+
+        let moved = {
+            let monitor = engine.monitors.get_mut(&first).unwrap();
+            let moved = monitor.remove_workspace(0).unwrap();
+            monitor.active_workspace = monitor.workspace_ids()[0];
+            monitor.focus_window = None;
+            monitor.focus_column = None;
+            moved
+        };
+        engine
+            .monitors
+            .get_mut(&second)
+            .unwrap()
+            .insert_workspace(31, moved);
+        engine.maintain_empty_workspace(second);
+        let after = engine.ipc_snapshot();
+        assert_eq!(window_of(&after, 100).workspace_id, Some(source_id));
+        let workspace = after
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == source_id)
+            .unwrap();
+        assert_eq!(workspace.name.as_deref(), Some("source"));
+        assert_eq!(workspace.output.as_deref(), Some("DISPLAY2"));
+        assert_eq!(
+            workspace.idx, 2,
+            "the position changed, not the source identity"
+        );
     }
 
     #[test]

@@ -287,6 +287,15 @@ impl TilingEngine {
         self.output_names.insert(output, name.to_string());
     }
 
+    /// Reuse the output registration pass's CCD/EDID snapshot for action and
+    /// named-workspace lookup. Matching an action never queries Windows.
+    pub fn set_output_identities(
+        &mut self,
+        identities: Vec<crate::backend::outputs::OutputIdentity>,
+    ) {
+        self.output_identities = identities;
+    }
+
     /// The device name of a monitor, when the engine was told.
     pub fn output_name(&self, output: OutputId) -> Option<&str> {
         self.output_names.get(&output).map(String::as_str)
@@ -311,6 +320,17 @@ impl TilingEngine {
             .find(|(output, device)| self.monitors.contains_key(output) && short(device) == wanted)
         {
             return Some(*output);
+        }
+        if let Some(output) = self.monitors.iter().find_map(|(output, _)| {
+            let device = self.output_names.get(output)?;
+            self.output_identities
+                .iter()
+                .any(|identity| {
+                    short(&identity.connector) == short(device) && identity.matches(name)
+                })
+                .then_some(*output)
+        }) {
+            return Some(output);
         }
         // A monitor registered without a name (a test): the id is a hash of the device name.
         let hashed = OutputId::from_name(name.trim());
@@ -438,22 +458,26 @@ impl TilingEngine {
             found
         });
         let output = named.unwrap_or_else(|| self.get_target_output(window));
-        let workspace = if let Some(name) = rules.open_on_workspace.as_deref() {
-            let found = self.workspace_id_by_name(name);
-            if found.is_none() {
-                debug!(
-                    "window rule: no workspace is named {:?}; the rule is ignored",
-                    name
-                );
+        if let Some(name) = rules.open_on_workspace.as_deref() {
+            if let Some((destination, workspace)) = self.resolve_workspace_reference(
+                output,
+                &crate::input::WorkspaceRef::Name(name.to_string()),
+            ) {
+                // Names are global; a local key alone can select an unrelated
+                // workspace with the same key on the initially chosen output.
+                return (destination, Some(workspace));
             }
-            found
-        } else if let Some(number) = rules.open_in_workspace {
+            debug!(
+                "window rule: no workspace is named {:?}; the rule is ignored",
+                name
+            );
+            return (output, None);
+        }
+        let workspace = rules.open_in_workspace.and_then(|number| {
             self.monitors
                 .get(&output)
                 .map(|m| m.workspace_id_for_number(number))
-        } else {
-            None
-        };
+        });
         (output, workspace)
     }
 
@@ -1366,6 +1390,65 @@ mod tests {
         // A name no workspace has: the rule is ignored, the window opens where the user is.
         engine.add_window(window(3, "lost"), &be());
         assert_eq!(place_of(&engine, 3).map(|(ws, _)| ws), Some(0));
+    }
+
+    #[test]
+    fn named_workspace_placement_carries_its_output_when_local_keys_collide() {
+        let mut engine = engine();
+        let source = OutputId::from_name("M");
+        let destination = OutputId::from_name("other");
+        engine.set_output_name(source, "\\\\.\\DISPLAY1");
+        engine.register_monitor(
+            destination,
+            Rect::new(2000, 0, 1920, 1080),
+            Rect::new(2000, 0, 1920, 1040),
+        );
+        engine.set_output_name(destination, "\\\\.\\DISPLAY2");
+        engine
+            .monitors
+            .get_mut(&source)
+            .unwrap()
+            .workspaces
+            .get_mut(&0)
+            .unwrap()
+            .name = Some("local".to_string());
+        engine
+            .monitors
+            .get_mut(&destination)
+            .unwrap()
+            .workspaces
+            .get_mut(&0)
+            .unwrap()
+            .name = Some("remote".to_string());
+
+        for output in [None, Some("DISPLAY1".to_string())] {
+            let rules = ResolvedWindowRules {
+                open_on_output: output,
+                open_on_workspace: Some("remote".to_string()),
+                ..ResolvedWindowRules::default()
+            };
+            assert_eq!(
+                engine.rule_placement(&window(2, "remote"), &rules),
+                (destination, Some(0)),
+                "a global workspace name selects its owning output"
+            );
+        }
+        engine.set_window_rules(vec![title_rule(
+            "^remote",
+            WindowRule {
+                open_on_output: Some("DISPLAY1".to_string()),
+                open_on_workspace: Some("remote".to_string()),
+                ..WindowRule::default()
+            },
+        )]);
+        engine.add_window(window(2, "remote"), &be());
+        assert_eq!(
+            engine.locate_window(WindowId::new(2)),
+            Some((destination, 0, 0))
+        );
+        assert!(engine.monitors.get(&source).unwrap().workspaces[&0]
+            .columns
+            .is_empty());
     }
 
     #[test]

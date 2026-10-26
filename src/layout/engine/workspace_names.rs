@@ -31,7 +31,12 @@ impl TilingEngine {
                 continue;
             };
             for id in monitor.workspace_ids() {
-                if monitor.workspaces.get(&id).and_then(|ws| ws.name.as_deref()) == Some(name) {
+                if monitor
+                    .workspaces
+                    .get(&id)
+                    .and_then(|ws| ws.name.as_deref())
+                    == Some(name)
+                {
                     return Some(id);
                 }
             }
@@ -47,7 +52,12 @@ impl TilingEngine {
     pub fn workspace_number_on(&self, output: OutputId, id: i32) -> i32 {
         self.monitors
             .get(&output)
-            .and_then(|monitor| monitor.workspace_ids().iter().position(|candidate| *candidate == id))
+            .and_then(|monitor| {
+                monitor
+                    .workspace_ids()
+                    .iter()
+                    .position(|candidate| *candidate == id)
+            })
             .map(|position| position as i32 + 1)
             .unwrap_or_else(|| crate::layout::workspace_number(id))
     }
@@ -153,7 +163,10 @@ impl TilingEngine {
         if let Some(config) = self.full_config.as_ref() {
             for candidate in old_name.iter().chain(name.iter()) {
                 if !candidate.is_empty()
-                    && config.workspace.iter().any(|entry| entry.name == *candidate)
+                    && config
+                        .workspace
+                        .iter()
+                        .any(|entry| entry.name == *candidate)
                 {
                     self.configured_workspace_names.insert(candidate.clone());
                 }
@@ -166,7 +179,10 @@ impl TilingEngine {
     fn workspace_name_exists(&self, name: &str) -> bool {
         self.monitors.keys().any(|output| {
             self.monitors.get(output).is_some_and(|monitor| {
-                monitor.workspaces.values().any(|workspace| workspace.name.as_deref() == Some(name))
+                monitor
+                    .workspaces
+                    .values()
+                    .any(|workspace| workspace.name.as_deref() == Some(name))
             })
         }) || self.unplugged.values().any(|unplugged| {
             unplugged
@@ -184,18 +200,20 @@ impl TilingEngine {
             .is_some_and(|workspace| {
                 workspace.columns.is_empty()
                     && workspace.name.as_deref().unwrap_or("").is_empty()
-                    && !self.float_homes.values().any(|home| {
-                        home.output == output && home.workspace == id
-                    })
-                    && !self.minimized.values().any(|home| {
-                        home.output == output && home.workspace == id
-                    })
+                    && !self
+                        .float_homes
+                        .values()
+                        .any(|home| home.output == output && home.workspace == id)
+                    && !self
+                        .minimized
+                        .values()
+                        .any(|home| home.output == output && home.workspace == id)
             })
     }
 
     /// Apply each configured name once per session, in declaration order. Missing
     /// outputs remain pending, and config reloads never undo runtime renames/unsets.
-    pub(super) fn ensure_named_workspaces(&mut self) {
+    pub(crate) fn ensure_named_workspaces(&mut self) {
         let declarations: Vec<_> = self
             .full_config
             .as_ref()
@@ -234,7 +252,9 @@ impl TilingEngine {
             let output = if outputs.is_empty() {
                 first_output
             } else {
-                outputs.iter().find_map(|name| self.find_output_by_name(name))
+                outputs
+                    .iter()
+                    .find_map(|name| self.find_output_by_name(name))
             };
             let Some(output) = output else {
                 continue;

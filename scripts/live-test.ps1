@@ -2563,10 +2563,37 @@ $null = Ctl 'h15-ws1-again' @('action', 'focus-workspace', '1'); Start-Sleep -Mi
 # (j) --id names the window to act on: fullscreen-window --id <a window that is not focused>.  The window is focused first
 # (niri leaves the focus; wiri's documented approximation), then it is fullscreen
 FocusForm $k1
+# Native focus alone is not the event-stream precondition. Otherwise a setup
+# observation still in flight can leave the stream on k3 and dedup its return.
+$h15IdSetupClock = [Diagnostics.Stopwatch]::StartNew()
+$h15IdSetup = $false
+$h15IdSetupSamples = New-Object System.Collections.Generic.List[object]
+do {
+    $streamFocus = $null
+    $setupEvents = @(EvList $evAll)
+    foreach ($event in $setupEvents) {
+        if ($event.type -eq 'windows_changed') {
+            $focused = @($event.data.windows | Where-Object { $_.is_focused })
+            $streamFocus = if ($focused.Count -eq 1) { $focused[0].id } else { $null }
+        } elseif ($event.type -eq 'window_focus_changed') {
+            $streamFocus = $event.data.id
+        }
+    }
+    $query = PipeRequest '{"type":"focused_window"}' | ConvertFrom-Json
+    $nativeFocus = [int64][LT]::GetForegroundWindow()
+    $managedFocus = $query.result.focused_window.id
+    [void]$h15IdSetupSamples.Add([pscustomobject]@{ ms=$h15IdSetupClock.ElapsedMilliseconds; native=$nativeFocus; managed=$managedFocus; stream=$streamFocus; events=$setupEvents.Count })
+    $h15IdSetup = ($query.success -and $nativeFocus -eq [int64]$k1 -and $null -ne $managedFocus -and [int64]$managedFocus -eq [int64]$k1 -and $null -ne $streamFocus -and [int64]$streamFocus -eq [int64]$k1)
+    if ($h15IdSetup) { break }
+    Start-Sleep -Milliseconds 40
+} while ($h15IdSetupClock.ElapsedMilliseconds -lt 3000)
+$h15IdMark = @(EvList $evAll).Count
 $new = @(H15Step { $null = Ctl 'h15-fullscreen-id' @('action', 'fullscreen-window', '--id', [string][int64]$k3) } 2400)
 $h15IdFs = @(EvWindow $new 'window_opened_or_changed' $k3)
 $h15IdFocus = @(EvOf $new 'window_focus_changed' | Where-Object { [int64]$_.data.id -eq [int64]$k3 })
-$h15IdActs = ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 1) -and ([int64][LT]::GetForegroundWindow() -eq [int64]$k3)
+$h15IdForeground = [int64][LT]::GetForegroundWindow()
+$h15IdActs = $h15IdSetup -and ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 1) -and ($h15IdForeground -eq [int64]$k3)
+[pscustomobject]@{ setup_pass=$h15IdSetup; setup_expected=[int64]$k1; setup_samples=$h15IdSetupSamples.ToArray(); event_mark=$h15IdMark; expected=[int64]$k3; fullscreen_change_count=$h15IdFs.Count; focus_change_count=$h15IdFocus.Count; foreground_after=$h15IdForeground; pass=$h15IdActs; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-fullscreen-id.evidence.json')
 $null = Ctl 'h15-fullscreen-id-off' @('action', 'fullscreen-window', '--id', [string][int64]$k3); Start-Sleep -Milliseconds 2200
 # close-window --id closes that window and leaves the focus where it is
 $h15FgBeforeClose = [int64][LT]::GetForegroundWindow()

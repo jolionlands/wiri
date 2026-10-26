@@ -261,10 +261,13 @@ impl<'a> Words<'a> {
                     (value, false)
                 } else {
                     i += 1;
-                    (
-                        args.get(i)?.as_str(),
-                        quoted.get(i).copied().unwrap_or(false),
-                    )
+                    let value = args.get(i)?.as_str();
+                    let value_quoted = quoted.get(i).copied().unwrap_or(false);
+                    // An unquoted flag starts another option, not this option's value.
+                    if !value_quoted && value.starts_with("--") {
+                        return None;
+                    }
+                    (value, value_quoted)
                 };
                 match flag {
                     "--focus" if words.focus.is_none() => {
@@ -672,6 +675,104 @@ mod tests {
                 "{name} {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_option_requires_a_value_not_an_unquoted_flag() {
+        for args in [
+            vec!["--workspace"],
+            vec!["--workspace", "--bogus"],
+            vec!["--workspace", "--workspace=2"],
+        ] {
+            assert_eq!(
+                parse_action_name("unset-workspace-name", &words(&args)),
+                None,
+                "{args:?}"
+            );
+        }
+        let expected = Some(Action::WorkspaceAction(WorkspaceAction::UnsetName {
+            workspace: Some(WorkspaceRef::Name("--bogus".into())),
+        }));
+        assert_eq!(
+            parse_action_flagged(
+                "unset-workspace-name",
+                &words(&["--workspace", "--bogus"]),
+                &[false, true]
+            ),
+            expected
+        );
+        assert_eq!(
+            parse_action_name("unset-workspace-name", &words(&["--workspace=--bogus"])),
+            expected
+        );
+    }
+
+    #[test]
+    fn zero_layout_indices_mean_first_but_quoted_workspaces_remain_names() {
+        for (name, expected) in [
+            ("focus-column", Action::LayoutFocus(FocusAction::Column(1))),
+            (
+                "focus-window-in-column",
+                Action::LayoutFocus(FocusAction::WindowInColumn(1)),
+            ),
+            (
+                "move-workspace-to-index",
+                Action::WorkspaceAction(WorkspaceAction::MoveToIndex {
+                    index: 1,
+                    workspace: None,
+                }),
+            ),
+            ("focus-workspace", Action::FocusWorkspace(1)),
+            (
+                "move-window-to-workspace",
+                Action::WorkspaceAction(WorkspaceAction::MoveWindow {
+                    window: None,
+                    reference: WorkspaceRef::Index(1),
+                    focus: true,
+                }),
+            ),
+            (
+                "move-column-to-workspace",
+                Action::WorkspaceAction(WorkspaceAction::MoveColumn {
+                    reference: WorkspaceRef::Index(1),
+                    focus: true,
+                }),
+            ),
+        ] {
+            assert_eq!(
+                parse_action_name(name, &words(&["0"])),
+                Some(expected),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            parse_action_flagged("focus-workspace", &words(&["0"]), &[true]),
+            Some(Action::FocusWorkspaceNamed("0".into()))
+        );
+        for (quoted, reference) in [
+            (false, WorkspaceRef::Index(1)),
+            (true, WorkspaceRef::Name("0".into())),
+        ] {
+            assert_eq!(
+                parse_action_flagged(
+                    "unset-workspace-name",
+                    &words(&["--workspace", "0"]),
+                    &[false, quoted]
+                ),
+                Some(Action::WorkspaceAction(WorkspaceAction::UnsetName {
+                    workspace: Some(reference)
+                }))
+            );
+        }
+        // Legacy transports retain their existing zero value.
+        assert_eq!(
+            parse_action_name("switch-workspace", &words(&["0"])),
+            Some(Action::FocusWorkspace(0))
+        );
+        assert_eq!(
+            parse_action_name("move-to-workspace", &words(&["0"])),
+            Some(Action::MoveToWorkspace(0))
+        );
     }
 
     #[test]

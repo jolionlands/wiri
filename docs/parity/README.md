@@ -85,6 +85,15 @@ system actions are implemented. Warning-denied release build/check and 1241 libr
 H49 gates unreached. No full summary or new integrated gate total is claimed. The
 formatter and locked rerun still require runner permission; real power mutations are
 never part of validation.
+**Phase 2C Lane F2 ([report](phase2c-lane-f-report.md)):** structured focus,
+workspace and monitor actions are connected to the integrated B/2B dispatcher and H IPC,
+retaining G's width intent, strip/strut policy and remembered tile/column selection.
+Workspace names, visible order and stable IPC identity are independent; native occurrence
+history drives debounced previous-window focus without a retry timer or stale focus replay.
+H30–H34 exercise CLI and typed IPC on the single-display desktop; cross-output actions,
+EDID preferences and hotplug are unit-tested only. Named fallback placement and nested
+workspace layout overrides remain open. The saved desktop run has 519 pass / 15 fail;
+the final floating-memory/target fixes and revised harness remain unvalidated live (see report).
 
 **Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
 ARM64 release builds, docs and a demo. Lane D fixed always-quoted Run autostart command

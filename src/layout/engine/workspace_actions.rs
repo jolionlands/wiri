@@ -5,7 +5,7 @@ use crate::input::WorkspaceRef;
 use crate::layout::{Column, Workspace};
 
 impl TilingEngine {
-    pub(super) fn resolve_workspace_reference(
+    pub(crate) fn resolve_workspace_reference(
         &self,
         source_output: OutputId,
         reference: &WorkspaceRef,

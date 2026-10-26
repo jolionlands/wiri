@@ -74,8 +74,7 @@ impl TilingEngine {
         let Some(monitor) = self.monitors.get(&output) else {
             return Vec::new();
         };
-        let mut ids: Vec<_> = monitor.workspaces.keys().copied().collect();
-        ids.sort_unstable();
+        let ids = monitor.workspace_ids();
         let active = ids
             .iter()
             .position(|id| *id == monitor.active_workspace)
@@ -141,8 +140,7 @@ impl TilingEngine {
                     return;
                 };
                 if let Some(m) = self.monitors.get_mut(&output) {
-                    let mut ids: Vec<_> = m.workspaces.keys().copied().collect();
-                    ids.sort_unstable();
+                    let ids = m.workspace_ids();
                     let index = ids
                         .iter()
                         .position(|id| *id == m.active_workspace)

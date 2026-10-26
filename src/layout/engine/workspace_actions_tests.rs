@@ -375,7 +375,10 @@ fn transfer_keeps_inactive_workspace_selection_beyond_the_mru_ring() {
     );
 
     assert_eq!(cursor(&engine, output), before);
-    assert_eq!(columns_on(&engine, output, 7), vec![vec![110, 111], vec![101]]);
+    assert_eq!(
+        columns_on(&engine, output, 7),
+        vec![vec![110, 111], vec![101]]
+    );
     let monitor = engine.monitors.get_mut(&output).unwrap();
     assert_eq!(
         monitor.workspaces[&7].remembered_focus(),
@@ -397,12 +400,10 @@ fn splitting_a_stack_preserves_width_intent_on_an_inactive_output_workspace() {
         let window = WindowId::new(102);
         engine.tiled_windows.insert(window, window_info(102));
         let source_cfg = engine.effective_config(left).clone();
-        let source_view = TilingEngine::tiling_work_rect(
-            engine.monitors.get(&left).unwrap(),
-            &source_cfg,
-        )
-        .size
-        .w as i32;
+        let source_view =
+            TilingEngine::tiling_work_rect(engine.monitors.get(&left).unwrap(), &source_cfg)
+                .size
+                .w as i32;
         {
             let monitor = engine.monitors.get_mut(&left).unwrap();
             let column = &mut monitor.workspaces.get_mut(&40).unwrap().columns[0];
@@ -422,12 +423,12 @@ fn splitting_a_stack_preserves_width_intent_on_an_inactive_output_workspace() {
             column_gap: 24,
             ..engine.config.clone()
         };
-        engine.config_per_monitor.insert(right, destination_cfg.clone());
+        engine
+            .config_per_monitor
+            .insert(right, destination_cfg.clone());
         engine.monitors.get_mut(&right).unwrap().scale_factor = 1.5;
-        let destination_view = TilingEngine::tiling_work_rect(
-            engine.monitors.get(&right).unwrap(),
-            &destination_cfg,
-        );
+        let destination_view =
+            TilingEngine::tiling_work_rect(engine.monitors.get(&right).unwrap(), &destination_cfg);
         assert_eq!(destination_view.size.w, 1190);
         let left_before = cursor(&engine, left);
         let right_before = cursor(&engine, right);
@@ -602,7 +603,10 @@ fn relative_moves_into_the_empty_tail_are_not_bottom_boundary_noops() {
                 if focus { destination } else { 25 }
             );
             let trailing = assert_trailing_empty(&engine, output);
-            assert_ne!(trailing, destination, "the occupied tail gets a new empty tail");
+            assert_ne!(
+                trailing, destination,
+                "the occupied tail gets a new empty tail"
+            );
             engine.maintain_empty_workspace(output);
             assert_eq!(assert_trailing_empty(&engine, output), trailing);
         }
@@ -653,7 +657,10 @@ fn column_move_preserves_metadata_and_inserts_after_target_active_column() {
         &backend,
     );
 
-    assert_eq!(columns_on(&engine, left, 40), vec![vec![100], vec![103, 104]]);
+    assert_eq!(
+        columns_on(&engine, left, 40),
+        vec![vec![100], vec![103, 104]]
+    );
     assert_eq!(
         columns_on(&engine, right, 7),
         vec![vec![200], vec![201], vec![101, 102], vec![202]]

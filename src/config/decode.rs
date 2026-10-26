@@ -1957,9 +1957,7 @@ impl Decoder {
         };
         let mut ws = WorkspaceConfig {
             name,
-            layout: "tile".to_string(),
-            monitor: String::new(),
-            follow_on_focus: true,
+            ..Default::default()
         };
         for child in node.kids() {
             match norm(&child.name).as_str() {
@@ -1978,8 +1976,9 @@ impl Decoder {
                 "open-on-output" => {
                     if let Some(v) = self.arg_text(child) {
                         if ws.monitor.is_empty() {
-                            ws.monitor = v;
+                            ws.monitor = v.clone();
                         }
+                        ws.open_on_outputs.push(v);
                     }
                 }
                 "follow-on-focus" => {
@@ -3016,6 +3015,17 @@ mod tests {
     }
 
     #[test]
+    fn workspace_output_preferences_preserve_order_and_legacy_monitor() {
+        let cfg = clean("workspace \"dev\" {\n    open-on-output \"DP-2\"\n    open-on-output \"HDMI-1\"\n}\nworkspace \"legacy\" {\n    monitor \"DP-1\"\n    open-on-output \"HDMI-2\"\n    open-on-output \"DP-3\"\n}\nworkspace \"plain\"\n");
+        assert_eq!(cfg.workspace[0].open_on_outputs, vec!["DP-2", "HDMI-1"]);
+        assert_eq!(cfg.workspace[0].monitor, "DP-2");
+        assert_eq!(cfg.workspace[1].open_on_outputs, vec!["HDMI-2", "DP-3"]);
+        assert_eq!(cfg.workspace[1].monitor, "DP-1");
+        assert!(cfg.workspace[2].open_on_outputs.is_empty());
+        assert!(cfg.workspace[2].monitor.is_empty());
+    }
+
+    #[test]
     fn animations_in_both_spellings() {
         let cfg = clean("animations {\n    enable true\n    duration 250\n    easing \"ease-out-cubic\"\n    workspace-transition false\n}\n");
         assert!(cfg.animations.enabled);
@@ -3122,6 +3132,37 @@ mod tests {
         let cfg = clean("binds {\n    Mod+F1 set-column-width \"50%\"\n    Mod+3 focus-workspace \"2\"\n    Mod+2 focus-workspace 2\n    Mod+T { toggle-window-floating; }\n}\n");
         assert_eq!(cfg.binds.hotkeys[1].args_quoted, vec![true]);
         assert_eq!(cfg.binds.hotkeys[2].args_quoted, vec![false]);
+    }
+
+    #[test]
+    fn workspace_action_properties_preserve_numeric_quotation_and_zero_indices() {
+        use crate::input::{Action, WorkspaceAction, WorkspaceRef};
+        for (value, quoted, reference) in [
+            ("\"2\"", true, WorkspaceRef::Name("2".into())),
+            ("2", false, WorkspaceRef::Index(2)),
+            ("\"0\"", true, WorkspaceRef::Name("0".into())),
+            ("0", false, WorkspaceRef::Index(1)),
+            ("\"--bogus\"", true, WorkspaceRef::Name("--bogus".into())),
+        ] {
+            let cfg = clean(&format!(
+                "binds {{\n    Mod+F1 {{ move-workspace-to-index 0 workspace={value}; }}\n}}\n"
+            ));
+            let bind = &cfg.binds.hotkeys[0];
+            assert_eq!(bind.args, vec!["0", "--workspace", reference_word(value)]);
+            assert_eq!(bind.args_quoted, vec![false, false, quoted]);
+            assert_eq!(
+                bind.parse_action(),
+                Some(Action::WorkspaceAction(WorkspaceAction::MoveToIndex {
+                    index: 1,
+                    workspace: Some(reference),
+                })),
+                "workspace={value}"
+            );
+        }
+
+        fn reference_word(value: &str) -> &str {
+            value.trim_matches('"')
+        }
     }
 
     #[test]

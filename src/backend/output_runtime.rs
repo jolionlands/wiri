@@ -42,6 +42,7 @@ pub fn refresh(handle: &BackendHandle) {
 pub fn sync(config: &Config, handle: &BackendHandle, engine: &mut TilingEngine) {
     let monitors = handle.get_monitors();
     let matcher = super::outputs::OutputMatcher::snapshot();
+    engine.set_output_identities(matcher.identities.clone());
     let live: Vec<OutputId> = monitors
         .iter()
         .filter_map(|monitor| {
@@ -64,6 +65,8 @@ pub fn sync(config: &Config, handle: &BackendHandle, engine: &mut TilingEngine) 
     for id in gone {
         engine.unregister_monitor(&id);
     }
+    // Connector names are now available for pending workspace declarations.
+    engine.ensure_named_workspaces();
 }
 
 /// Initial focus is chosen once. Reloading config must not steal the user's focus.

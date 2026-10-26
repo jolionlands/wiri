@@ -90,6 +90,28 @@ pub enum WindowState {
     Fullscreen,
 }
 
+/// Native occurrence time of a foreground WinEvent, not its eventual handling time.
+/// `sequence` orders distinct notifications within the same millisecond. Only the
+/// existing foreground hook produces these stamps; action requests are not observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundStamp {
+    pub uptime_ms: u64,
+    pub sequence: u64,
+}
+
+impl ForegroundStamp {
+    /// Extend WinEvent's wrapping 32-bit tick count using uptime at capture. A
+    /// notification must be less than one complete tick-count rollover old
+    /// (about 49.7 days); the native API cannot disambiguate older notifications.
+    pub(crate) fn from_win_event(timestamp: u32, captured_uptime_ms: u64, sequence: u64) -> Self {
+        let age_ms = (captured_uptime_ms as u32).wrapping_sub(timestamp);
+        Self {
+            uptime_ms: captured_uptime_ms.saturating_sub(u64::from(age_ms)),
+            sequence,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     WindowCreated {
@@ -120,6 +142,7 @@ pub enum BackendEvent {
     },
     ForegroundChanged {
         hwnd: isize,
+        stamp: ForegroundStamp,
     },
     /// Actual native z-order changed (often reported on the desktop client).
     ZOrderChanged,

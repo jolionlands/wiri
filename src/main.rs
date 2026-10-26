@@ -455,9 +455,14 @@ async fn main() -> Result<()> {
             // the enumeration happened to list last.
             let foreground =
                 unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-            if !foreground.0.is_null() {
-                eng.sync_os_foreground(WindowId::new(foreground.0 as isize), &backend_handle);
-            }
+            let hwnd = foreground.0 as isize;
+            eng.seed_native_foreground(
+                hwnd,
+                wiri::layout::engine::root_owner_of(hwnd),
+                // SAFETY: GetTickCount64 reads uptime and accepts no pointers or handles.
+                unsafe { windows::Win32::System::SystemInformation::GetTickCount64() },
+                &backend_handle,
+            );
             // Lane D: an explicit startup focus takes precedence over enumeration/OS focus.
             wiri::backend::output_runtime::focus_at_startup(&config, &backend_handle, &mut eng);
             eng.reveal_focused();
@@ -613,7 +618,7 @@ async fn main() -> Result<()> {
                         .focused_id()
                         .and_then(|oid| {
                             let ws_id = eng.monitors().get(&oid)?.active_workspace_id();
-                            Some(eng.workspace_name(ws_id).unwrap_or_else(|| {
+                            Some(eng.workspace_name_on(oid, ws_id).unwrap_or_else(|| {
                                 format!("[{}]", eng.workspace_number_on(oid, ws_id))
                             }))
                         })
@@ -1112,9 +1117,11 @@ fn sync_monitors_from_backend(
     // Lane D: refresh the backend snapshot before diffing a display change.
     wiri::backend::output_runtime::refresh(handle);
     let backend_monitors = handle.get_monitors();
+    let output_identities = wiri::backend::outputs::OutputMatcher::snapshot().identities;
     let config = engine.read().full_config().cloned();
     {
         let mut engine = engine.write();
+        engine.set_output_identities(output_identities);
         let detected_ids: Vec<_> = backend_monitors.iter().map(|m| m.id).collect();
         let to_remove: Vec<_> = engine
             .monitors()
@@ -1260,36 +1267,49 @@ fn handle_backend_event(
         BackendEvent::MonitorConnected { .. } | BackendEvent::MonitorDisconnected { .. } => {
             sync_monitors_from_backend(handle, engine, ipc_server);
         }
-        BackendEvent::ForegroundChanged { hwnd } => {
+        BackendEvent::ForegroundChanged { hwnd, stamp } => {
             let window_id = WindowId::new(hwnd);
             let was_managed = engine.read().tiled_windows().contains_key(&window_id);
             debug!("foreground: hwnd={} managed={}", hwnd, was_managed);
-            add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
-            // A window that was too busy to say how narrow it can be (it had just been
-            // created) is asked again when it takes the focus, at most twice.  Not in the
-            // event that added it: it has just been asked.
-            if was_managed && engine.read().min_width_query_wanted(window_id) {
-                let answer = handle.min_track_width(hwnd);
-                engine.write().learn_min_width(window_id, answer, handle);
+            // SAFETY: GetForegroundWindow has no arguments; the returned handle is
+            // only compared, not dereferenced or assumed to remain foreground.
+            let current_before_retry = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize == hwnd
+            };
+            if current_before_retry {
+                add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
+                // Ask outside the engine lock, retaining the existing per-window retry cap.
+                // Stale notices must not admit/activate an old foreground through this path.
+                if was_managed && engine.read().min_width_query_wanted(window_id) {
+                    let answer = handle.min_track_width(hwnd);
+                    engine.write().learn_min_width(window_id, answer, handle);
+                }
             }
-            ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
-            // The OS already activated this window; only mirror that into the
-            // engine's focus state (no activation request of our own, which
-            // would hand the focus back and forth between windows of one app).
-            let synced = engine.write().sync_os_foreground(window_id, handle);
-            if let Some((col_idx, ws_id)) = synced {
-                let number = {
-                    let eng = engine.read();
-                    match eng.locate_window(window_id) {
+            let owner = wiri::layout::engine::root_owner_of(hwnd);
+            let mut eng = engine.write();
+            let managed = eng.managed_window_for(hwnd, owner);
+            // Native occurrences always finish history visits, even if delivered late.
+            // Only a fresh raw HWND comparison permits changing live state or IPC.
+            // SAFETY: GetForegroundWindow accepts no pointers/handles. Its result
+            // is compared immediately under the engine lock, not dereferenced.
+            let is_current = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize == hwnd
+            };
+            let (live, location) =
+                eng.observe_native_foreground(hwnd, owner, stamp, is_current, handle);
+            if live {
+                ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
+                if let Some((col_idx, ws_id)) = location {
+                    let number = match managed.and_then(|w| eng.locate_window(w)) {
                         Some((oid, _, _)) => eng.workspace_number_on(oid, ws_id),
                         None => wiri::layout::workspace_number(ws_id),
-                    }
-                };
-                ipc_server.broadcast_event(IpcEvent::ColumnFocused {
-                    window_hwnd: hwnd,
-                    column_index: col_idx,
-                    workspace_id: number,
-                });
+                    };
+                    ipc_server.broadcast_event(IpcEvent::ColumnFocused {
+                        window_hwnd: hwnd,
+                        column_index: col_idx,
+                        workspace_id: number,
+                    });
+                }
             }
         }
         BackendEvent::ZOrderChanged => {

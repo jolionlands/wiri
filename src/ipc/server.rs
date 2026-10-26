@@ -1024,18 +1024,35 @@ impl IpcServer {
                         }
                         // Optional workspace move (by name or numeric id).
                         if let Some(name) = target_workspace.as_deref() {
-                            let target_id = name
+                            let reference = name
                                 .parse::<i32>()
                                 .ok()
-                                .map(|number| engine.read().workspace_id_for_number(number))
-                                .or_else(|| engine.read().workspace_id_by_name(name));
-                            let Some(target_id) = target_id else {
+                                .map(|number| {
+                                    crate::input::WorkspaceRef::Index(number.max(1) as u32)
+                                })
+                                .unwrap_or_else(|| {
+                                    crate::input::WorkspaceRef::Name(name.to_string())
+                                });
+                            let destination = {
+                                let eng = engine.read();
+                                eng.monitors().focused_id().and_then(|output| {
+                                    eng.resolve_workspace_reference(output, &reference)
+                                })
+                            };
+                            if destination.is_none() {
                                 return serde_json::json!({
                                     "success": false,
                                     "error": format!("Unknown workspace: {}", name)
                                 });
-                            };
-                            engine.write().move_window_to_workspace(target_id, backend);
+                            }
+                            // The F transfer resolves and carries (output, key).
+                            // Never replay a global name's local key on this output.
+                            engine.write().move_window_to_workspace_ref(
+                                Some(wid),
+                                reference,
+                                false,
+                                backend,
+                            );
                         }
                         engine.write().apply_all(backend);
                         serde_json::json!({"success": true, "result": {"hwnd": window_hwnd}})
@@ -1813,7 +1830,7 @@ impl IpcServer {
                                 ws.columns.iter().map(|c| c.tiles.len()).sum();
                             let number = eng.workspace_number_on(*oid, ws_id);
                             let name = eng
-                                .workspace_name(ws_id)
+                                .workspace_name_on(*oid, ws_id)
                                 .unwrap_or_else(|| format!("workspace-{}", number));
                             workspaces.push(serde_json::json!({
                                 "id": number,
@@ -2095,7 +2112,9 @@ fn split_window_target(
     let mut i = 0;
     while i < args.len() {
         let word = args[i].as_str();
-        let value = if let Some(v) = word
+        let value = if quoted.get(i).copied().unwrap_or(false) {
+            None
+        } else if let Some(v) = word
             .strip_prefix("--id=")
             .or_else(|| word.strip_prefix("--window-id="))
         {
@@ -2112,6 +2131,9 @@ fn split_window_target(
         };
         match value {
             Some(value) => {
+                if target.is_some() {
+                    return Err("window id specified more than once".to_string());
+                }
                 let id: isize = value.trim().parse().map_err(|_| {
                     format!(
                         "`{}` is not a window id (the number that `wiri-ctl windows` shows as hwnd)",
@@ -2128,6 +2150,69 @@ fn split_window_target(
         }
     }
     Ok((rest, rest_quoted, target))
+}
+
+#[cfg(test)]
+mod window_target_tests {
+    use super::split_window_target;
+    use crate::input::{parse_action_flagged, Action, WorkspaceAction, WorkspaceRef};
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn duplicate_window_targets_are_rejected_across_aliases_and_syntaxes() {
+        for args in [
+            vec!["2", "--id", "100", "--id", "101"],
+            vec!["--id=100", "--id=101"],
+            vec!["--window-id", "100", "--id=101"],
+            vec!["--id=100", "--window-id", "101"],
+            vec!["--window-id=100", "--window-id=100"],
+        ] {
+            assert!(split_window_target(&words(&args), &[]).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn single_window_target_preserves_other_arguments_and_quote_bits() {
+        for target in [
+            vec!["--id", "100"],
+            vec!["--id=100"],
+            vec!["--window-id", "100"],
+            vec!["--window-id=100"],
+        ] {
+            let mut args = words(&["2"]);
+            args.extend(words(&target));
+            let (rest, quoted, id) = split_window_target(&args, &[true]).unwrap();
+            assert_eq!(rest, words(&["2"]));
+            assert_eq!(quoted, vec![true]);
+            assert_eq!(id, Some(100));
+        }
+    }
+
+    #[test]
+    fn quoted_target_spelling_remains_a_literal_workspace_name() {
+        for name in ["--id=100", "--id", "--window-id=100", "--window-id"] {
+            let args = words(&["3", "--workspace", name]);
+            let (rest, quoted, target) = split_window_target(&args, &[false, false, true]).unwrap();
+            assert_eq!(rest, args);
+            assert_eq!(quoted, vec![false, false, true]);
+            assert_eq!(target, None);
+            assert_eq!(
+                parse_action_flagged("move-workspace-to-index", &rest, &quoted),
+                Some(Action::WorkspaceAction(WorkspaceAction::MoveToIndex {
+                    index: 3,
+                    workspace: Some(WorkspaceRef::Name(name.to_string())),
+                }))
+            );
+        }
+        let args = words(&["--id=100", "--id=101"]);
+        assert_eq!(
+            split_window_target(&args, &[true, false]).unwrap(),
+            (words(&["--id=100"]), vec![true], Some(101))
+        );
+    }
 }
 
 /// Write one event to a subscriber as a line of JSON, when its filter lets the type through.
@@ -2585,6 +2670,53 @@ mod tests {
             second,
             "a name that no workspace has does not switch anything"
         );
+    }
+
+    #[test]
+    fn tile_request_named_workspace_keeps_the_destination_output() {
+        let (mut server, engine) = server_with_windows(&[100]);
+        server.set_backend(BackendHandle::default_for_test());
+        let source = OutputId::from_name("TestMonitor");
+        let destination = OutputId::from_name("other-monitor");
+        let (source_id, destination_id) = {
+            let mut eng = engine.write();
+            eng.register_monitor(
+                destination,
+                Rect::new(1920, 0, 1920, 1080),
+                Rect::new(1920, 0, 1920, 1040),
+            );
+            eng.set_output_name(source, "DISPLAY1");
+            eng.set_output_name(destination, "DISPLAY2");
+            let source_id = eng.monitors().get(&source).unwrap().workspaces[&0].ipc_id;
+            let workspace = eng
+                .monitors_mut()
+                .get_mut(&destination)
+                .unwrap()
+                .workspaces
+                .get_mut(&0)
+                .unwrap();
+            workspace.name = Some("remote".to_string());
+            (source_id, workspace.ipc_id)
+        };
+        assert_ne!(source_id, destination_id);
+        let reply = server.process_message(IpcMessage::TileRequest {
+            window_hwnd: 100,
+            target_workspace: Some("remote".to_string()),
+        });
+        assert_eq!(reply["success"], true, "{reply}");
+        let eng = engine.read();
+        let snapshot = eng.ipc_snapshot();
+        let window = snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == 100)
+            .unwrap();
+        assert_eq!(window.workspace_id, Some(destination_id));
+        assert_eq!(window.output.as_deref(), Some("DISPLAY2"));
+        assert_eq!(eng.monitors().focused_id(), Some(source));
+        assert!(eng.monitors().get(&source).unwrap().workspaces[&0]
+            .columns
+            .is_empty());
     }
 
     // ---- the event stream's state ----------------------------------------------------------

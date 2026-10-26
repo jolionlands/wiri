@@ -21,7 +21,20 @@ use super::strip::CenterFocusedColumn;
 use sizing::DrawMode;
 // The windows and workspaces as the IPC event stream describes them (niri's `Window` and `Workspace`).
 mod insert_move;
+mod action_dispatch;
+mod focus_actions;
+mod foreground;
+mod foreground_runtime;
 mod ipcview;
+#[cfg(test)]
+mod lane_f_integration_tests;
+mod monitor_actions;
+#[cfg(test)]
+mod monitor_actions_tests;
+mod workspace_actions;
+#[cfg(test)]
+mod workspace_actions_tests;
+mod workspace_names;
 // What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
 mod decor;
 mod float_stack;
@@ -638,6 +651,8 @@ pub struct TilingEngine {
     unfocused_opens: HashMap<WindowId, rules::UnfocusedOpen>,
     /// The device name of each monitor (`\\.\DISPLAY1`), as told by `set_output_name`.
     output_names: HashMap<OutputId, String>,
+    /// Existing startup/reload output identities, reused without querying Windows.
+    output_identities: Vec<crate::backend::outputs::OutputIdentity>,
     /// Windows maximized to the edges of the work area (niri `maximize-window-to-edges`).
     maximized_edges: HashSet<WindowId>,
     /// The windows of `fullscreen_windows` that went fullscreen on their own (a video player,
@@ -745,6 +760,9 @@ pub struct TilingEngine {
     /// intercepted by the WM_HOTKEY dispatcher to grow/shrink the focused
     /// column / tile, and Escape exits the mode.  Defaults to `false`.
     pub resize_mode: bool,
+    focus_history: focus_actions::FocusHistory,
+    foreground_observations: foreground::ForegroundReducer,
+    pending_previous: Option<(WindowId, u64)>,
     // ---- Item 1: per-window animation-to-target rects ----
     /// Per-window in-flight position animations: (start_rect, target_rect, start_time, duration).
     /// Populated by `apply_layout_for_monitor` when a tile's target rect differs from its
@@ -758,10 +776,8 @@ pub struct TilingEngine {
     /// Windows marked sticky by the user; they float above all workspaces and
     /// are never hidden during workspace switches.
     sticky_windows: HashSet<WindowId>,
-    // ---- Item 4: workspace rename side-table ----
-    /// User-supplied names for workspaces, keyed by workspace id.
-    /// Consulted first by `workspace_name(id)`; falls through to config when absent.
-    workspace_names: HashMap<i32, String>,
+    /// Names reconciled this session; runtime names belong to workspace objects.
+    configured_workspace_names: HashSet<String>,
     /// Counter tracking how many Win32 calls were actually issued (for testing).
     #[cfg(test)]
     pub win32_call_count: u32,
@@ -791,6 +807,7 @@ impl TilingEngine {
             rule_heights: HashMap::new(),
             unfocused_opens: HashMap::new(),
             output_names: HashMap::new(),
+            output_identities: Vec::new(),
             maximized_edges: HashSet::new(),
             app_fullscreen: HashSet::new(),
             slot_forced: HashSet::new(),
@@ -831,7 +848,10 @@ impl TilingEngine {
             frame_in_progress: false,
             transitions: Default::default(),
             sticky_windows: HashSet::new(),
-            workspace_names: HashMap::new(),
+            focus_history: focus_actions::FocusHistory::default(),
+            foreground_observations: foreground::ForegroundReducer::default(),
+            pending_previous: None,
+            configured_workspace_names: HashSet::new(),
             #[cfg(test)]
             win32_call_count: 0,
         }
@@ -906,108 +926,6 @@ impl TilingEngine {
     // Item 4 — Workspace renaming
     // =========================================================================
 
-    /// Return the display name for workspace `id`.
-    ///
-    /// Checks the side-table set by `rename_workspace` first; falls back to the
-    /// name stored in the first matching `WorkspaceConfig` in `full_config`.
-    /// Returns `None` when no name has been set for this workspace.
-    pub fn workspace_name(&self, id: i32) -> Option<String> {
-        // Side-table wins over config.  An empty name there says "no name": the
-        // workspace the config names was moved away from this place.
-        if let Some(name) = self.workspace_names.get(&id) {
-            return if name.is_empty() {
-                None
-            } else {
-                Some(name.clone())
-            };
-        }
-        // Fall through to full_config.workspace[].name
-        self.full_config.as_ref().and_then(|cfg| {
-            cfg.workspace
-                .iter()
-                .enumerate()
-                .find(|(pos, _ws)| *pos as i32 == id)
-                .and_then(|(_, ws)| {
-                    if ws.name.is_empty() {
-                        None
-                    } else {
-                        Some(ws.name.clone())
-                    }
-                })
-        })
-    }
-
-    pub fn workspace_id_by_name(&self, name: &str) -> Option<i32> {
-        if name.is_empty() {
-            return None;
-        }
-        self.workspace_names
-            .iter()
-            .find_map(|(id, ws_name)| (ws_name == name).then_some(*id))
-            .or_else(|| {
-                self.full_config.as_ref().and_then(|cfg| {
-                    cfg.workspace.iter().enumerate().find_map(|(idx, ws_cfg)| {
-                        // A name in the side-table (renamed, or moved away) replaces the
-                        // config's name for that place.
-                        (ws_cfg.name == name && !self.workspace_names.contains_key(&(idx as i32)))
-                            .then_some(idx as i32)
-                    })
-                })
-            })
-    }
-
-    /// The text a status display shows for workspace `id` of `output`: its name, or
-    /// `Workspace N` with N its position from the top.
-    pub fn workspace_label(&self, output: OutputId, id: i32) -> String {
-        self.workspace_name(id)
-            .unwrap_or_else(|| format!("Workspace {}", self.workspace_number_on(output, id)))
-    }
-
-    /// The number users see for workspace `id` of `output`: its 1-based position from
-    /// the top (the ids themselves have gaps once an empty workspace in the middle has
-    /// gone).
-    pub fn workspace_number_on(&self, output: OutputId, id: i32) -> i32 {
-        self.monitors
-            .get(&output)
-            .and_then(|m| m.workspace_number_of(id))
-            .unwrap_or_else(|| crate::layout::workspace_number(id))
-    }
-
-    /// The id of the workspace that `number` (1-based, as in `focus-workspace 2`) means
-    /// on the focused monitor; a number past the last workspace is the last one.
-    pub fn workspace_id_for_number(&self, number: i32) -> i32 {
-        match self.monitors.focused() {
-            Some(monitor) => monitor.workspace_id_for_number(number),
-            None => crate::layout::workspace_id_from_number(number),
-        }
-    }
-
-    /// The workspaces the config names always exist, even when they are empty (niri's
-    /// named workspaces).  The n-th `workspace "name"` block is the n-th workspace
-    /// from the top of every monitor.  Called when the config is set and when a
-    /// monitor appears.
-    fn ensure_named_workspaces(&mut self) {
-        let count = self.full_config.as_ref().map_or(0, |c| c.workspace.len()) as i32;
-        let named: Vec<i32> = (0..count)
-            .filter(|id| self.workspace_name(*id).is_some())
-            .collect();
-        if named.is_empty() {
-            return;
-        }
-        let outputs: Vec<OutputId> = self.monitors.keys().copied().collect();
-        for output in outputs {
-            if let Some(monitor) = self.monitors.get_mut(&output) {
-                for id in &named {
-                    monitor
-                        .workspaces
-                        .entry(*id)
-                        .or_insert_with(crate::layout::Workspace::new);
-                }
-            }
-            self.maintain_empty_workspace(output);
-        }
-    }
-
     /// Set the focused monitor's active workspace layout mode.
     ///
     /// Accepted modes are `scrolling`, `bstack`/`bottom-stack`, and `spiral`.
@@ -1044,48 +962,6 @@ impl TilingEngine {
             "Workspace {} on monitor {} layout set to {:?}",
             workspace_id, focused_output, layout_mode
         );
-        Ok(())
-    }
-
-    /// Assign a display name to workspace `workspace_id` on the focused monitor.
-    ///
-    /// The name is stored in a side-table (`workspace_names`) which
-    /// `workspace_name(id)` consults first.  If `full_config` has a
-    /// `WorkspaceConfig` entry whose positional index matches the id the
-    /// config entry is also updated in-place for consistency; otherwise the
-    /// side-table entry is the sole source of truth until the next
-    /// config reload.
-    ///
-    /// Returns `Err` if the focused monitor has no workspace with the given id.
-    pub fn rename_workspace(&mut self, workspace_id: i32, new_name: &str) -> Result<(), String> {
-        // Validate: the workspace must exist on the focused monitor.
-        let focused_output = self
-            .monitors
-            .focused_id()
-            .ok_or_else(|| "no focused monitor".to_string())?;
-        let monitor = self
-            .monitors
-            .get(&focused_output)
-            .ok_or_else(|| format!("monitor {:?} not found", focused_output))?;
-        if !monitor.workspaces.contains_key(&workspace_id) {
-            return Err(format!(
-                "workspace {} does not exist on the focused monitor",
-                workspace_id
-            ));
-        }
-
-        // Update the side-table.
-        self.workspace_names
-            .insert(workspace_id, new_name.to_string());
-
-        // Best-effort: sync to full_config when a matching entry exists.
-        if let Some(cfg) = self.full_config.as_mut() {
-            if let Some(entry) = cfg.workspace.get_mut(workspace_id as usize) {
-                entry.name = new_name.to_string();
-            }
-        }
-
-        info!("Workspace {} renamed to {:?}", workspace_id, new_name);
         Ok(())
     }
 
@@ -1230,7 +1106,10 @@ impl TilingEngine {
             minimized: HashMap::new(),
         };
         match host {
-            Some(host) => self.move_workspaces_to(&mut kept, host),
+            Some(host) => {
+                self.move_workspaces_to(&mut kept, host);
+                self.rebind_unplugged_host(*output_id, host);
+            }
             None => tracing::warn!(
                 "Monitor {} went and no monitor is left: its windows wait for the next one",
                 output_id
@@ -1239,10 +1118,72 @@ impl TilingEngine {
         self.unplugged.insert(*output_id, kept);
     }
 
+    /// A host went away too. Earlier unplug records must follow the live copy of
+    /// their workspace to the new host, or reconnecting their monitor would recreate
+    /// the same IPC identity/name that still exists on the new host.
+    fn rebind_unplugged_host(&mut self, old_host: OutputId, new_host: OutputId) {
+        let live: Vec<(u64, i32)> = self
+            .monitors
+            .get(&new_host)
+            .map(|monitor| {
+                monitor
+                    .workspace_ids()
+                    .into_iter()
+                    .filter_map(|id| {
+                        monitor
+                            .workspaces
+                            .get(&id)
+                            .map(|workspace| (workspace.ipc_id, id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (gone, kept) in self.unplugged.iter_mut() {
+            if *gone == old_host || kept.host != Some(old_host) {
+                continue;
+            }
+            kept.host = Some(new_host);
+            let mut remap = HashMap::new();
+            let previous = std::mem::take(&mut kept.moved);
+            for (from, to) in previous {
+                let Some(ipc_id) = kept
+                    .monitor
+                    .workspaces
+                    .get(&from)
+                    .map(|workspace| workspace.ipc_id)
+                else {
+                    continue;
+                };
+                if let Some((_, new_key)) = live.iter().find(|(id, _)| *id == ipc_id) {
+                    remap.insert(to, *new_key);
+                    kept.moved.push((from, *new_key));
+                }
+            }
+            for window in kept.floats.keys() {
+                if let Some(home) = self.float_homes.get_mut(window) {
+                    if home.output == new_host {
+                        if let Some(new_key) = remap.get(&home.workspace) {
+                            home.workspace = *new_key;
+                        }
+                    }
+                }
+            }
+            for window in kept.minimized.keys() {
+                if let Some(minimized) = self.minimized.get_mut(window) {
+                    if minimized.output == new_host {
+                        if let Some(new_key) = remap.get(&minimized.workspace) {
+                            minimized.workspace = *new_key;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Move what an unplugged monitor held to `host`: every workspace with a window, a
-    /// floating or a minimized window in it.  A named workspace joins the host's workspace of
-    /// that name (the columns are appended); the others are appended below the host's
-    /// workspaces, in their order.
+    /// floating or a minimized window in it. Globally named workspaces move as objects too;
+    /// every migrated object retains its IPC identity and precedes the host's trailing empty
+    /// workspace, in its original order.
     fn move_workspaces_to(&mut self, kept: &mut UnpluggedMonitor, host: OutputId) {
         let gone = kept.monitor.output_id;
         let Some(host_work) = self.monitors.get(&host).map(|m| m.work_area) else {
@@ -1262,29 +1203,39 @@ impl TilingEngine {
                 .filter(|(_, m)| m.output == gone && m.workspace == from)
                 .map(|(window, _)| *window)
                 .collect();
-            let named = self.workspace_name(from).is_some();
             let Some(workspace) = kept.monitor.workspaces.get(&from) else {
                 continue;
             };
-            if workspace.columns.is_empty() && floats.is_empty() && minimized.is_empty() {
-                // Nothing to keep (a named workspace exists on the host anyway).
+            if workspace.name.is_none()
+                && workspace.columns.is_empty()
+                && floats.is_empty()
+                && minimized.is_empty()
+            {
                 continue;
             }
-            let Some(target) = self.monitors.get_mut(&host) else {
+            let Some(target) = self.monitors.get(&host) else {
                 return;
             };
-            let to = if named {
-                let dest = target
+            let ids = target.workspace_ids();
+            let trailing = ids.last().filter(|id| {
+                target
                     .workspaces
-                    .entry(from)
-                    .or_insert_with(crate::layout::Workspace::new);
-                dest.columns.extend(workspace.columns.iter().cloned());
-                from
-            } else {
-                let id = target.workspaces.keys().copied().max().map_or(0, |m| m + 1);
-                target.workspaces.insert(id, workspace.clone());
-                id
-            };
+                    .get(id)
+                    .is_some_and(|ws| ws.columns.is_empty() && ws.name.is_none())
+                    && !self
+                        .float_homes
+                        .values()
+                        .any(|home| home.output == host && home.workspace == **id)
+                    && !self
+                        .minimized
+                        .values()
+                        .any(|home| home.output == host && home.workspace == **id)
+            });
+            let position = ids.len().saturating_sub(usize::from(trailing.is_some()));
+            let target = self.monitors.get_mut(&host).expect("available host");
+            let to = target.next_workspace_id();
+            target.insert_workspace(to, workspace.clone());
+            target.move_workspace_to_position(to, position);
             kept.moved.push((from, to));
             for (window, rect) in floats {
                 if let Some(home) = self.float_homes.get_mut(&window) {
@@ -1345,6 +1296,30 @@ impl TilingEngine {
                     let Some(old_ws) = old.workspaces.get(from) else {
                         continue;
                     };
+                    // The migrated workspace is one live object, not a second copy
+                    // of its name/identity. Bring its current contents back, including
+                    // windows opened and metadata edited while this output was away.
+                    let same_object = self
+                        .monitors
+                        .get(&host)
+                        .and_then(|monitor| monitor.workspaces.get(to))
+                        .is_some_and(|workspace| workspace.ipc_id == old_ws.ipc_id);
+                    if same_object {
+                        if let Some(monitor) = self.monitors.get_mut(&host) {
+                            if let Some(mut workspace) = monitor.remove_workspace(*to) {
+                                for tile in workspace
+                                    .columns
+                                    .iter_mut()
+                                    .flat_map(|column| &mut column.tiles)
+                                {
+                                    tile.cached_bounds = Rect::default();
+                                    monitor.focus_ring.remove(tile.window_id);
+                                }
+                                restored.insert(*from, workspace);
+                            }
+                        }
+                        continue;
+                    }
                     let mut columns = Vec::new();
                     for col in &old_ws.columns {
                         let mut back = col.clone();
@@ -1395,6 +1370,30 @@ impl TilingEngine {
                             m.output = output;
                             m.workspace = *from;
                         }
+                    }
+                }
+                // Floating/minimized windows admitted to a migrated object after
+                // unplug also belong to that object when it returns.
+                for (from, to) in &moved {
+                    if !restored.contains_key(from) {
+                        continue;
+                    }
+                    for home in self
+                        .float_homes
+                        .values_mut()
+                        .filter(|home| home.output == host && home.workspace == *to)
+                    {
+                        home.output = output;
+                        home.workspace = *from;
+                        home.rect = Self::fit_rect_into(home.rect, work_area);
+                    }
+                    for home in self
+                        .minimized
+                        .values_mut()
+                        .filter(|home| home.output == host && home.workspace == *to)
+                    {
+                        home.output = output;
+                        home.workspace = *from;
                     }
                 }
                 restored
@@ -1448,11 +1447,16 @@ impl TilingEngine {
             .filter(|(id, kept)| kept.host.is_none() && **id != host)
             .map(|(id, _)| *id)
             .collect();
-        for gone in homeless {
-            if let Some(mut kept) = self.unplugged.remove(&gone) {
+        for gone in &homeless {
+            if let Some(mut kept) = self.unplugged.remove(gone) {
                 self.move_workspaces_to(&mut kept, host);
-                self.unplugged.insert(gone, kept);
+                self.unplugged.insert(*gone, kept);
             }
+        }
+        // Records that were hosted by any of the just-adopted monitors follow the
+        // live copies to the new host as well.
+        for gone in homeless {
+            self.rebind_unplugged_host(gone, host);
         }
     }
 
@@ -1834,6 +1838,7 @@ impl TilingEngine {
         self.native_moves.remove(&window_id);
         self.animating_rects.remove(&window_id);
         self.forget_rule_state(window_id);
+        self.forget_native_foreground(window_id);
         self.focus_timestamps.remove(&window_id);
         self.forget_sizing(window_id);
         self.fullscreen_windows.remove(&window_id);
@@ -2212,11 +2217,7 @@ impl TilingEngine {
     }
 
     fn view_width_for_monitor(monitor: &Monitor, config: &LayoutConfig) -> i32 {
-        monitor.work_area.size.w as i32
-            - config.outer_gaps.1
-            - config.outer_gaps.3
-            - config.reserve_left as i32
-            - config.reserve_right as i32
+        Self::tiling_work_rect(monitor, config).size.w as i32
     }
 
     /// Y coordinate just below the bottom edge of every monitor: the parking
@@ -2668,10 +2669,8 @@ impl TilingEngine {
         } else if overview_active {
             let monitor = self.monitors.get(&output_id).unwrap();
             let mut out: Vec<(WindowId, Rect)> = Vec::new();
-            // Sort by workspace id so the on-screen stack matches the
-            // numerical "Workspace 1, Workspace 2, …" labels.
-            let mut ws_ids: Vec<i32> = monitor.workspaces.keys().copied().collect();
-            ws_ids.sort();
+            // Visible order, not stable keys, supplies workspace numbers.
+            let ws_ids = monitor.workspace_ids();
             // Per-workspace section height + gap come from `OverviewState`.
             let zoom = self.overview_zoom();
             const INTER_WORKSPACE_GAP: i32 = 50;
@@ -3280,6 +3279,7 @@ impl TilingEngine {
     /// focus target, from the layout pass.  A refusal (foreground lock) is
     /// logged once here and never retried until the focus target changes again.
     fn activate_now(&mut self, wid: WindowId, backend: &BackendHandle) {
+        self.remember_action_focus(wid);
         self.last_activated = Some(wid);
         if let Err(e) = backend.activate_window(wid.as_isize()) {
             tracing::warn!(
@@ -3350,6 +3350,7 @@ impl TilingEngine {
                 .map_or(true, |s| s.visible);
             if !(on_inactive_workspace || hidden_by_wiri) {
                 self.touch_float(window_id);
+                self.remember_action_focus(window_id);
             }
             return None;
         }
@@ -3403,6 +3404,8 @@ impl TilingEngine {
         {
             return None;
         }
+
+        self.remember_action_focus(window_id);
 
         // The OS is the authority on who is activated: remember it so the
         // layout pass does not try to "fix" the focus it just reported.
@@ -3844,58 +3847,22 @@ impl TilingEngine {
 
     /// Focus the window to the left. Returns the newly focused WindowId.
     pub fn focus_left(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.focus_left();
-            }
-        }
-        self.scroll_to_focused_column(focused_output, backend)
+        self.focus_step(focus_actions::FocusStep::Left, backend)
     }
 
     /// Focus the window to the right. Returns the newly focused WindowId.
     pub fn focus_right(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.focus_right();
-            }
-        }
-        self.scroll_to_focused_column(focused_output, backend)
+        self.focus_step(focus_actions::FocusStep::Right, backend)
     }
 
     /// Focus the window above. Returns the newly focused WindowId.
     pub fn focus_up(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        let focused_wid = {
-            let monitor = self.monitors.get_mut(&focused_output)?;
-            monitor.focus_up();
-            monitor.focus_window
-        };
-        if let Some(wid) = focused_wid {
-            self.apply_layout_for_monitor(focused_output, backend);
-            if self.tiled_windows.contains_key(&wid) {
-                self.activate_now(wid, backend);
-            }
-        }
-        focused_wid
+        self.focus_step(focus_actions::FocusStep::Up, backend)
     }
 
     /// Focus the window below. Returns the newly focused WindowId.
     pub fn focus_down(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        let focused_wid = {
-            let monitor = self.monitors.get_mut(&focused_output)?;
-            monitor.focus_down();
-            monitor.focus_window
-        };
-        if let Some(wid) = focused_wid {
-            self.apply_layout_for_monitor(focused_output, backend);
-            if self.tiled_windows.contains_key(&wid) {
-                self.activate_now(wid, backend);
-            }
-        }
-        focused_wid
+        self.focus_step(focus_actions::FocusStep::Down, backend)
     }
 
     /// Scroll workspace to make the focused column visible, then activate and re-apply layout
@@ -3906,6 +3873,9 @@ impl TilingEngine {
     ) -> Option<WindowId> {
         // Steps 1-2: scroll the workspace to show the focused column.
         self.reveal_focused_column(focused_output);
+
+        // Show a newly selected tab before attempting native activation.
+        self.apply_layout_for_monitor(focused_output, backend);
 
         // Step 3: Activate the focused window
         let window_to_activate = self
@@ -3918,8 +3888,6 @@ impl TilingEngine {
             self.activate_now(wid, backend);
         }
 
-        // Step 4: Apply layout
-        self.apply_layout_for_monitor(focused_output, backend);
         self.monitors
             .get(&focused_output)
             .and_then(|m| m.focus_window)
@@ -3941,11 +3909,19 @@ impl TilingEngine {
         // end at 0); going to a lower-numbered workspace, it slides in from
         // ABOVE (start at -work_area_height).  When animations are disabled
         // or this is the same workspace we skip the call (no-op).
-        let (prev_ws_id, work_area_h) = self
+        let (prev_ws_id, work_area_h, moves_down) = self
             .monitors
             .get(&focused_output)
-            .map(|m| (m.active_workspace, m.work_area.size.h as i32))
-            .unwrap_or((workspace_id, 0));
+            .map(|m| {
+                let from = m.workspace_number_of(m.active_workspace);
+                let to = m.workspace_number_of(workspace_id);
+                (
+                    m.active_workspace,
+                    m.work_area.size.h as i32,
+                    to.unwrap_or(i32::MAX) > from.unwrap_or(0),
+                )
+            })
+            .unwrap_or((workspace_id, 0, false));
         let want_slide = self.animation.is_enabled()
             && self
                 .full_config
@@ -3989,6 +3965,22 @@ impl TilingEngine {
             self.note_hidden(wid);
         }
 
+        let remembered_float = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.workspace())
+            .and_then(|ws| ws.active_float)
+            .filter(|window| {
+                self.float_location(*window) == Some((focused_output, workspace_id))
+                    && !self.minimized.contains_key(window)
+            });
+        if let Some(window) = remembered_float {
+            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+                monitor.focus_window = Some(window);
+                monitor.focus_column = None;
+            }
+        }
+
         let mut shown: Vec<WindowId> = Vec::new();
         if let Some(monitor) = self.monitors.get(&focused_output) {
             if let Some(workspace) = monitor.workspace() {
@@ -4012,7 +4004,7 @@ impl TilingEngine {
         // `workspace_slide_offset(oid)` and bias every tile's Y position by
         // the returned value, producing the slide in/out effect.
         if want_slide {
-            let from_offset = if workspace_id > prev_ws_id {
+            let from_offset = if moves_down {
                 work_area_h as f64
             } else {
                 -(work_area_h as f64)
@@ -4127,7 +4119,11 @@ impl TilingEngine {
             .and_then(|m| m.focus_window)
             .filter(|w| self.tiled_windows.contains_key(w))
         {
-            return Some(ActionTarget::tile(wid));
+            return Some(if self.floating_windows.contains(&wid) {
+                ActionTarget::float(wid)
+            } else {
+                ActionTarget::tile(wid)
+            });
         }
         self.floating_windows
             .iter()
@@ -4200,6 +4196,9 @@ impl TilingEngine {
     /// bookkeeping (it predates it, or a test filled the set directly) lives on the
     /// focused monitor's active workspace.
     fn float_location(&self, window_id: WindowId) -> Option<(OutputId, i32)> {
+        if !self.floating_windows.contains(&window_id) {
+            return None;
+        }
         if let Some(home) = self.float_homes.get(&window_id) {
             return Some((home.output, home.workspace));
         }
@@ -4389,6 +4388,24 @@ impl TilingEngine {
         };
         if let Some(monitor) = self.monitors.get_mut(&output) {
             monitor.remove_window(window_id);
+            // The tile memory must not keep pointing at a window that now floats:
+            // otherwise returning to this workspace falls back to the bounded MRU
+            // ring (and finally to the first tile) instead of the last tile.
+            let next_tile = monitor.focus_window;
+            if let Some(workspace) = monitor.workspaces.get_mut(&workspace) {
+                if workspace.active_window == Some(window_id) {
+                    let replacement = next_tile.or_else(|| {
+                        workspace.columns.iter().find_map(|column| {
+                            column
+                                .active_window
+                                .filter(|window| column.index_of(*window).is_some())
+                                .or_else(|| column.tiles.first().map(|tile| tile.window_id))
+                        })
+                    });
+                    workspace.active_window = replacement
+                        .filter(|window| workspace.find_window_column(*window).is_some());
+                }
+            }
         }
         self.window_sizing.insert(window_id, SizingMode::Normal);
         self.register_float(window_id, output, workspace, rect);
@@ -4396,6 +4413,9 @@ impl TilingEngine {
         // would hand the foreground to the next tile, which then also takes the next
         // toggle-floating; pretend that tile is already activated.
         if self.os_foreground == Some(window_id) {
+            // Conversion preserves native focus without another foreground event.
+            // Remember the new layer now, including for floating-only workspaces.
+            self.remember_action_focus(window_id);
             self.last_activated = self.monitors.get(&output).and_then(|m| m.focus_window);
         }
         let on_active_workspace = self
@@ -4437,6 +4457,15 @@ impl TilingEngine {
         }
         self.float_homes.remove(&window_id);
         self.floating_windows.remove(&window_id);
+        if let Some(ws) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspaces.get_mut(&workspace))
+        {
+            if ws.active_float == Some(window_id) {
+                ws.active_float = None;
+            }
+        }
         self.window_sizing.insert(window_id, SizingMode::Normal);
         // Whatever the layout cache knows about the window is stale: it was moved around as a
         // float.  The next layout pass places it from scratch.
@@ -6483,57 +6512,6 @@ impl TilingEngine {
     // Item 1 — move_window_to_workspace
     // -------------------------------------------------------------------------
 
-    /// Move the focused window to the given workspace (on the same monitor).
-    /// The active workspace does not change — the window silently migrates.
-    pub fn move_window_to_workspace(&mut self, workspace_id: i32, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        let (window_id, src_ws_id) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            let wid = match monitor.focus_window {
-                Some(id) => id,
-                None => {
-                    debug!("move_window_to_workspace: no focused window");
-                    return;
-                }
-            };
-            (wid, monitor.active_workspace)
-        };
-
-        if workspace_id == src_ws_id {
-            return; // no-op — already on that workspace
-        }
-
-        let Some(slot) = self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.workspace())
-            .and_then(|w| w.slot_of(window_id))
-        else {
-            return;
-        };
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            monitor.remove_window(window_id);
-            monitor
-                .workspaces
-                .entry(workspace_id)
-                .or_insert_with(crate::layout::Workspace::new)
-                .insert_slot_after_active(slot);
-            monitor.focus_ring.push_back(window_id);
-        }
-
-        self.sync_min_widths();
-        self.maintain_empty_workspace(focused_output);
-        let _ = backend.show_window(window_id.as_isize(), false);
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
     // -------------------------------------------------------------------------
     // Item 2 — move_window_to_monitor
     // -------------------------------------------------------------------------
@@ -6541,82 +6519,11 @@ impl TilingEngine {
     /// Move the focused window to the monitor in the given direction (Left/Right),
     /// ordered by the monitor's left edge (bounds.loc.x).
     pub fn move_window_to_monitor(&mut self, direction: ScrollDirection, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
+        let target = match direction {
+            ScrollDirection::Left => monitor_actions::MonitorTarget::Left,
+            ScrollDirection::Right => monitor_actions::MonitorTarget::Right,
         };
-
-        let window_id = match self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.focus_window)
-        {
-            Some(id) => id,
-            None => {
-                debug!("move_window_to_monitor: no focused window");
-                return;
-            }
-        };
-
-        // Build sorted list of (x_position, output_id)
-        let mut monitor_order: Vec<(i32, OutputId)> = self
-            .monitors
-            .iter()
-            .map(|(&oid, m)| (m.bounds.loc.x, oid))
-            .collect();
-        monitor_order.sort_by_key(|(x, _)| *x);
-
-        let src_pos = monitor_order
-            .iter()
-            .position(|(_, oid)| *oid == focused_output);
-        let src_pos = match src_pos {
-            Some(p) => p,
-            None => return,
-        };
-
-        let target_pos: Option<usize> = match direction {
-            ScrollDirection::Left => src_pos.checked_sub(1),
-            ScrollDirection::Right => {
-                let next = src_pos + 1;
-                if next < monitor_order.len() {
-                    Some(next)
-                } else {
-                    None
-                }
-            }
-        };
-
-        let target_output = match target_pos {
-            Some(p) => monitor_order[p].1,
-            None => return, // no monitor in that direction
-        };
-
-        let Some(slot) = self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.workspace())
-            .and_then(|w| w.slot_of(window_id))
-        else {
-            return;
-        };
-        if let Some(src_monitor) = self.monitors.get_mut(&focused_output) {
-            src_monitor.remove_window(window_id);
-        }
-        if let Some(dst_monitor) = self.monitors.get_mut(&target_output) {
-            if let Some(strip) = dst_monitor.workspace_mut() {
-                strip.insert_slot_after_active(slot);
-            }
-            dst_monitor.set_focus(window_id);
-        }
-        self.sync_min_widths();
-
-        // Maintain trailing empty workspaces on both monitors
-        self.maintain_empty_workspace(focused_output);
-        self.maintain_empty_workspace(target_output);
-
-        // Apply layout to both monitors
-        self.apply_layout_for_monitor(focused_output, backend);
-        self.apply_layout_for_monitor(target_output, backend);
+        self.move_window_to_monitor_action(None, &target, backend);
     }
 
     // -------------------------------------------------------------------------
@@ -7013,38 +6920,13 @@ impl TilingEngine {
         direction: ScrollDirection,
         backend: &BackendHandle,
     ) -> bool {
-        let Some(current) = self.monitors.focused_id() else {
-            return false;
-        };
-        let mut order: Vec<(i32, i32, OutputId)> = self
-            .monitors
-            .iter()
-            .map(|(&oid, m)| (m.bounds.loc.x, m.bounds.loc.y, oid))
-            .collect();
-        order.sort_by_key(|(x, y, _)| (*x, *y));
-        let Some(pos) = order.iter().position(|(_, _, oid)| *oid == current) else {
-            return false;
-        };
+        let before = self.monitors.focused_id();
         let target = match direction {
-            ScrollDirection::Left => pos.checked_sub(1),
-            ScrollDirection::Right => (pos + 1 < order.len()).then_some(pos + 1),
+            ScrollDirection::Left => monitor_actions::MonitorTarget::Left,
+            ScrollDirection::Right => monitor_actions::MonitorTarget::Right,
         };
-        let Some(target) = target.map(|p| order[p].2) else {
-            return false;
-        };
-        self.set_focused_output(target);
-        let window = self
-            .monitors
-            .get(&target)
-            .and_then(|m| m.focus_window)
-            .filter(|w| self.tiled_windows.contains_key(w));
-        if let Some(window) = window {
-            self.activate_now(window, backend);
-        }
-        // Only the two monitors involved change (their focus borders).
-        self.apply_layout_for_monitor(current, backend);
-        self.apply_layout_for_monitor(target, backend);
-        true
+        self.focus_monitor_action(&target, backend);
+        before != self.monitors.focused_id()
     }
 
     // -------------------------------------------------------------------------
@@ -7236,16 +7118,12 @@ impl TilingEngine {
 
     /// niri `focus-column-first`.
     pub fn focus_column_first(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let output = self.monitors.focused_id()?;
-        self.monitors.get_mut(&output)?.focus_column_first();
-        self.scroll_to_focused_column(output, backend)
+        self.focus_step(focus_actions::FocusStep::FirstColumn, backend)
     }
 
     /// niri `focus-column-last`.
     pub fn focus_column_last(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let output = self.monitors.focused_id()?;
-        self.monitors.get_mut(&output)?.focus_column_last();
-        self.scroll_to_focused_column(output, backend)
+        self.focus_step(focus_actions::FocusStep::LastColumn, backend)
     }
 
     /// niri `move-column-to-first` / `move-column-to-last`: the focused column
@@ -7520,283 +7398,20 @@ impl TilingEngine {
     /// both monitors are re-laid out. No-op when no monitor exists in the
     /// requested direction.
     pub fn move_column_to_monitor(&mut self, direction: ScrollDirection, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else {
-            return;
+        let target = match direction {
+            ScrollDirection::Left => monitor_actions::MonitorTarget::Left,
+            ScrollDirection::Right => monitor_actions::MonitorTarget::Right,
         };
-
-        let focus_col_idx = match self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.focus_column)
-        {
-            Some(i) => i,
-            None => return,
-        };
-
-        // Build sorted list of (x_position, output_id)
-        let mut monitor_order: Vec<(i32, OutputId)> = self
-            .monitors
-            .iter()
-            .map(|(&oid, m)| (m.bounds.loc.x, oid))
-            .collect();
-        monitor_order.sort_by_key(|(x, _)| *x);
-
-        let src_pos = monitor_order
-            .iter()
-            .position(|(_, oid)| *oid == focused_output);
-        let src_pos = match src_pos {
-            Some(p) => p,
-            None => return,
-        };
-
-        let target_pos: Option<usize> = match direction {
-            ScrollDirection::Left => src_pos.checked_sub(1),
-            ScrollDirection::Right => {
-                let next = src_pos + 1;
-                if next < monitor_order.len() {
-                    Some(next)
-                } else {
-                    None
-                }
-            }
-        };
-
-        let target_output = match target_pos {
-            Some(p) => monitor_order[p].1,
-            None => return, // no monitor in that direction
-        };
-
-        // Extract the column wholesale.
-        let column_taken = {
-            let Some(src_monitor) = self.monitors.get_mut(&focused_output) else {
-                return;
-            };
-            let Some(src_ws) = src_monitor.workspace_mut() else {
-                return;
-            };
-            if focus_col_idx >= src_ws.columns.len() {
-                return;
-            }
-            let col = src_ws.columns.remove(focus_col_idx);
-            // Clear focus on source monitor (will be re-applied on dst).
-            src_monitor.focus_column = None;
-            src_monitor.focus_window = None;
-            col
-        };
-
-        // Capture the window ids (for MRU bookkeeping + post-move focus).
-        let moved_wids: Vec<WindowId> = column_taken.tiles.iter().map(|t| t.window_id).collect();
-
-        // Drop tracking on the source MRU ring.
-        if let Some(src_monitor) = self.monitors.get_mut(&focused_output) {
-            for wid in &moved_wids {
-                src_monitor.focus_ring.remove(*wid);
-            }
-        }
-
-        // Append to destination active workspace.
-        if let Some(dst_monitor) = self.monitors.get_mut(&target_output) {
-            if let Some(dst_ws) = dst_monitor.workspace_mut() {
-                dst_ws.columns.push(column_taken);
-                let new_col_idx = dst_ws.columns.len() - 1;
-                dst_monitor.focus_column = Some(new_col_idx);
-                // Focus the first tile in the moved column.
-                if let Some(first) = moved_wids.first().copied() {
-                    dst_monitor.focus_window = Some(first);
-                    dst_monitor.focus_ring.push(first);
-                }
-            }
-        }
-
-        // Make the destination the focused monitor.
-        self.monitors.set_focused(target_output);
-
-        // Maintain trailing empty workspaces + re-tile both monitors.
-        self.maintain_empty_workspace(focused_output);
-        self.maintain_empty_workspace(target_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-        self.apply_layout_for_monitor(target_output, backend);
+        self.move_column_to_monitor_action(&target, backend);
     }
 
     // -------------------------------------------------------------------------
     // Niri-parity: move the focused column vertically between workspaces
     // -------------------------------------------------------------------------
 
-    /// Move every tile in the focused column out of the current workspace and
-    /// append them as a single new column to the workspace below (`delta > 0`) or
-    /// above (`delta < 0`) the current one.  No-op when the focused monitor has no
-    /// focused column or there is no workspace in that direction.  Focus follows the
-    /// moved column to the destination.
-    ///
-    /// Used by `Action::MoveColumnToWorkspaceUp` (delta = -1) and
-    /// `Action::MoveColumnToWorkspaceDown` (delta = +1).
-    pub fn move_focused_column_to_workspace(&mut self, delta: i32, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else {
-            return;
-        };
-
-        // Resolve focused column index + source workspace id up-front.
-        let (focus_col_idx, src_ws_id) = match self.monitors.get(&focused_output) {
-            Some(m) => match m.focus_column {
-                Some(i) => (i, m.active_workspace),
-                None => return,
-            },
-            None => return,
-        };
-        // The workspace below / above the active one (nothing at the top or the bottom;
-        // the empty workspace at the bottom is where a column goes to open a new one).
-        if delta == 0 {
-            return;
-        }
-        let Some(dst_ws_id) = self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.workspace_next_to(src_ws_id, delta > 0))
-        else {
-            return;
-        };
-
-        // Take the column from the source workspace.
-        let column_taken = {
-            let Some(monitor) = self.monitors.get_mut(&focused_output) else {
-                return;
-            };
-            let Some(src_ws) = monitor.workspaces.get_mut(&src_ws_id) else {
-                return;
-            };
-            if focus_col_idx >= src_ws.columns.len() {
-                return;
-            }
-            let col = src_ws.columns.remove(focus_col_idx);
-            // Clear focus on the source workspace; it will be re-anchored
-            // either to whatever is still here, or to the destination below.
-            monitor.focus_column = None;
-            monitor.focus_window = None;
-            col
-        };
-
-        let moved_wids: Vec<WindowId> = column_taken.tiles.iter().map(|t| t.window_id).collect();
-
-        // Append the column to the destination workspace (creating it if
-        // necessary).  After the append, point focus at the new column on the
-        // destination workspace and switch the monitor's active workspace to
-        // match so the user follows their tiles.
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            let dst_ws = monitor
-                .workspaces
-                .entry(dst_ws_id)
-                .or_insert_with(crate::layout::Workspace::new);
-            dst_ws.columns.push(column_taken);
-            let new_col_idx = dst_ws.columns.len() - 1;
-            monitor.active_workspace = dst_ws_id;
-            monitor.focus_column = Some(new_col_idx);
-            if let Some(first) = moved_wids.first().copied() {
-                monitor.focus_window = Some(first);
-                monitor.focus_ring.push(first);
-            }
-        }
-
-        self.maintain_empty_workspace(focused_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
     // -------------------------------------------------------------------------
     // Niri-parity: workspace move/swap (reorder the workspace stack)
     // -------------------------------------------------------------------------
-
-    /// niri `move-workspace-up` (`delta < 0`) / `move-workspace-down`: the active
-    /// workspace changes places with the one above / below it and the user stays on
-    /// it.  Its floating windows, its minimized windows and (with a single monitor) its
-    /// name go along.  Nothing happens at the top and at the bottom.
-    pub fn move_active_workspace(&mut self, delta: i32, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else {
-            return;
-        };
-        if delta == 0 {
-            return;
-        }
-        let (src_ws_id, dst_ws_id) = {
-            let Some(monitor) = self.monitors.get(&focused_output) else {
-                return;
-            };
-            let src = monitor.active_workspace;
-            let Some(dst) = monitor.workspace_next_to(src, delta > 0) else {
-                return;
-            };
-            (src, dst)
-        };
-
-        // The two workspaces trade places: an id is a place counted from the top.
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            let src_ws = monitor
-                .workspaces
-                .remove(&src_ws_id)
-                .unwrap_or_else(crate::layout::Workspace::new);
-            let dst_ws = monitor
-                .workspaces
-                .remove(&dst_ws_id)
-                .unwrap_or_else(crate::layout::Workspace::new);
-            monitor.workspaces.insert(dst_ws_id, src_ws);
-            monitor.workspaces.insert(src_ws_id, dst_ws);
-            // The user stays on the workspace that moved.
-            monitor.active_workspace = dst_ws_id;
-            monitor.previous_workspace = match monitor.previous_workspace {
-                Some(p) if p == src_ws_id => Some(dst_ws_id),
-                Some(p) if p == dst_ws_id => Some(src_ws_id),
-                other => other,
-            };
-            // Anchor focus_column to the first column of the relocated
-            // workspace (or None when it has no columns).
-            let new_focus = monitor.workspaces.get(&dst_ws_id).and_then(|w| {
-                w.columns
-                    .first()
-                    .and_then(|c| c.tiles.first())
-                    .map(|t| (0usize, t.window_id))
-            });
-            match new_focus {
-                Some((col_idx, wid)) => {
-                    monitor.focus_column = Some(col_idx);
-                    monitor.focus_window = Some(wid);
-                    monitor.focus_ring.push(wid);
-                }
-                None => {
-                    monitor.focus_column = None;
-                    monitor.focus_window = None;
-                }
-            }
-        }
-        self.swap_workspace_ties(focused_output, src_ws_id, dst_ws_id);
-
-        self.maintain_empty_workspace(focused_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
-    /// Everything that belongs to a workspace but is not stored in it follows it when
-    /// two workspaces of `output` trade places: floating windows, minimized windows
-    /// and, when there is a single monitor (names are shared by all monitors), the names.
-    fn swap_workspace_ties(&mut self, output: OutputId, a: i32, b: i32) {
-        let swap = |id: &mut i32| {
-            if *id == a {
-                *id = b;
-            } else if *id == b {
-                *id = a;
-            }
-        };
-        for home in self.float_homes.values_mut().filter(|h| h.output == output) {
-            swap(&mut home.workspace);
-        }
-        for minimized in self.minimized.values_mut().filter(|m| m.output == output) {
-            swap(&mut minimized.workspace);
-        }
-        if self.monitors.keys().count() == 1 {
-            // An empty name says "no name", so the config's name for a place does not
-            // apply to the workspace that now sits there.
-            let name_a = self.workspace_name(a).unwrap_or_default();
-            let name_b = self.workspace_name(b).unwrap_or_default();
-            self.workspace_names.insert(a, name_b);
-            self.workspace_names.insert(b, name_a);
-        }
-    }
 
     // -------------------------------------------------------------------------
     // Item 6 — focus_workspace_relative
@@ -7824,70 +7439,6 @@ impl TilingEngine {
     // -------------------------------------------------------------------------
     // Item 7 — maintain_empty_workspace
     // -------------------------------------------------------------------------
-
-    /// Keep the workspaces of `monitor_id` the way niri does: one empty workspace
-    /// below the last occupied one, no other empty workspace except the one the user
-    /// is on.  A workspace is occupied when it holds a window, a floating window or a
-    /// name (the config's named workspaces always exist).
-    pub fn maintain_empty_workspace(&mut self, monitor_id: OutputId) {
-        // A workspace that holds only floating windows is not empty: it must survive
-        // (and count towards the trailing empty one) or its floats would lose their home.
-        let mut occupied_without_windows: HashSet<i32> = self
-            .float_homes
-            .values()
-            .filter(|home| home.output == monitor_id)
-            .map(|home| home.workspace)
-            .collect();
-        if let Some(monitor) = self.monitors.get(&monitor_id) {
-            occupied_without_windows.extend(
-                monitor
-                    .workspaces
-                    .keys()
-                    .copied()
-                    .filter(|id| self.workspace_name(*id).is_some()),
-            );
-        }
-        let monitor = match self.monitors.get_mut(&monitor_id) {
-            Some(m) => m,
-            None => return,
-        };
-
-        let active_ws = monitor.active_workspace;
-
-        // Find the last workspace that is occupied.
-        let highest_occupied: i32 = monitor
-            .workspaces
-            .iter()
-            .filter(|(id, ws)| !ws.columns.is_empty() || occupied_without_windows.contains(*id))
-            .map(|(&id, _)| id)
-            .max()
-            .unwrap_or(-1);
-
-        let trailing_id = highest_occupied + 1;
-
-        // Ensure the trailing empty workspace exists.
-        monitor
-            .workspaces
-            .entry(trailing_id)
-            .or_insert_with(crate::layout::Workspace::new);
-
-        // Remove surplus empty workspaces (anything empty that isn't the trailing one,
-        // isn't what the user is currently looking at and holds nothing that must stay).
-        let to_remove: Vec<i32> = monitor
-            .workspaces
-            .iter()
-            .filter(|(&id, ws)| {
-                ws.columns.is_empty()
-                    && id != trailing_id
-                    && id != active_ws
-                    && !occupied_without_windows.contains(&id)
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        for id in to_remove {
-            monitor.workspaces.remove(&id);
-        }
-    }
 
     /// Restore all tiled windows to their original positions and styles.
     /// Called on graceful shutdown so the user gets their layout back instead
@@ -8005,50 +7556,7 @@ impl TilingEngine {
     /// Reads `focus_ring.previous()` from the focused monitor, locates that window
     /// across all workspaces, updates focus state, and re-applies layout.
     pub fn focus_previous_window(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // Peek at the previous window without modifying the ring yet.
-        let prev_wid = match self
-            .monitors
-            .get(&focused_output)
-            .and_then(|m| m.focus_ring.previous())
-        {
-            Some(wid) => wid,
-            None => return, // no previous — no-op
-        };
-
-        // Find which monitor + workspace + column hosts that window.
-        // It might be on a different workspace (though the MRU ring is per-monitor).
-        let location: Option<(OutputId, i32, usize)> =
-            self.monitors.iter().find_map(|(&oid, monitor)| {
-                monitor.workspaces.iter().find_map(|(&ws_id, ws)| {
-                    ws.find_window_column(prev_wid)
-                        .map(|col_idx| (oid, ws_id, col_idx))
-                })
-            });
-
-        let (target_output, _ws_id, col_idx) = match location {
-            Some(loc) => loc,
-            None => return, // window no longer alive — no-op
-        };
-
-        // Update focus on the target monitor.
-        if let Some(monitor) = self.monitors.get_mut(&target_output) {
-            monitor.focus_window = Some(prev_wid);
-            monitor.focus_column = Some(col_idx);
-            monitor.focus_ring.push(prev_wid);
-        }
-
-        // Activate the window at the OS level.
-        if self.tiled_windows.contains_key(&prev_wid) {
-            self.activate_now(prev_wid, backend);
-        }
-
-        self.reveal_focused_column(target_output);
-        self.apply_layout_for_monitor(target_output, backend);
+        self.focus_previous_with_debounce(750, backend);
     }
 
     // -------------------------------------------------------------------------
@@ -8228,19 +7736,59 @@ impl TilingEngine {
     // Item 4 — focus_workspace_named
     // -------------------------------------------------------------------------
 
-    /// Switch to a workspace identified by its KDL config name.
-    /// The index of the matching `WorkspaceConfig` entry is used as the workspace ID
-    /// (consistent with how workspaces are created from config at startup).
+    /// Switch to a workspace identified by its KDL config name. Names are global,
+    /// so the destination keeps its own output: a local key is never replayed on
+    /// the monitor that happened to be focused.
     /// Logs a warning and returns silently when the name is not found.
     pub fn focus_workspace_named(&mut self, name: &str, backend: &BackendHandle) {
         use tracing::warn;
-        match self.workspace_id_by_name(name) {
-            Some(id) => {
-                let id = self.auto_back_and_forth(id);
-                self.switch_workspace(id, backend)
+        let Some(source) = self.monitors.focused_id() else {
+            return;
+        };
+        let Some((output, id)) = self.resolve_workspace_reference(
+            source,
+            &crate::input::WorkspaceRef::Name(name.to_string()),
+        ) else {
+            warn!("workspace name not found: {}", name);
+            return;
+        };
+        let same_output = source == output;
+        let id = if same_output {
+            self.auto_back_and_forth(id)
+        } else {
+            id
+        };
+        if !same_output {
+            self.set_focused_output(output);
+            let window = self
+                .monitors
+                .get(&output)
+                .and_then(|monitor| monitor.workspaces.get(&id))
+                .and_then(|workspace| {
+                    workspace
+                        .active_window
+                        .filter(|window| workspace.find_window_column(*window).is_some())
+                        .or_else(|| {
+                            workspace
+                                .columns
+                                .iter()
+                                .find_map(|column| column.tiles.first())
+                                .map(|tile| tile.window_id)
+                        })
+                })
+                .or_else(|| {
+                    self.float_homes
+                        .iter()
+                        .filter(|(_, home)| home.output == output && home.workspace == id)
+                        .max_by_key(|(_, home)| home.seq)
+                        .map(|(window, _)| *window)
+                });
+            if let Some(window) = window {
+                self.focus_action_window(window, backend);
+                return;
             }
-            None => warn!("workspace name not found: {}", name),
         }
+        self.switch_workspace(id, backend);
     }
 
     /// niri `focus-workspace N` (1-based; a number past the last workspace is the
@@ -12064,7 +11612,12 @@ mod tests {
     fn test_an_empty_workspace_in_the_middle_goes_when_it_is_left() {
         let be = BackendHandle::default_for_test();
         let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
-        engine.switch_workspace(1, &be); // an empty one in the middle, now active
+        // Keys are not positions. Explicitly insert an empty workspace between the
+        // occupied ones rather than relying on numeric key sorting.
+        let monitor = engine.monitors.get_mut(&oid).unwrap();
+        monitor.insert_workspace(1, crate::layout::Workspace::new());
+        monitor.move_workspace_to_position(1, 1);
+        engine.switch_workspace(1, &be);
         assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2, 3]);
         engine.focus_workspace_number(1, &be);
         assert_eq!(
@@ -12137,9 +11690,8 @@ mod tests {
             .iter()
             .map(|name| crate::config::types::WorkspaceConfig {
                 name: name.to_string(),
-                layout: "tile".to_string(),
-                monitor: String::new(),
                 follow_on_focus: false,
+                ..Default::default()
             })
             .collect();
         config
@@ -12194,41 +11746,43 @@ mod tests {
             Rect::new(1920, 0, 1920, 1080),
             Rect::new(1920, 0, 1920, 1040),
         );
-        assert_eq!(workspace_ids_of(&engine, second), vec![0, 1]);
+        // Configured names are globally unique objects, not cloned per output.
+        assert_eq!(workspace_ids_of(&engine, second), vec![0]);
+        assert_eq!(engine.workspace_name_on(oid, 0).as_deref(), Some("web"));
+        assert_eq!(engine.workspace_name_on(second, 0), None);
     }
 
     #[test]
     fn test_moving_a_workspace_takes_its_floats_and_its_name_along() {
         let be = BackendHandle::default_for_test();
         let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
-        engine.set_full_config(named_workspaces_config(&["web"]));
+        engine.rename_workspace(0, "web").unwrap();
         let float = WindowId::new(100);
         engine.toggle_floating_for(float, &be); // workspace 0 now holds only a float
         assert_eq!(engine.float_workspace(float), Some(0));
         assert_eq!(engine.workspace_name(0).as_deref(), Some("web"));
+        let identity = engine.monitors.get(&oid).unwrap().workspaces[&0].ipc_id;
 
         engine.move_active_workspace(1, &be);
         assert_eq!(
             active_workspace_of(&engine, oid),
-            1,
-            "the user stays on the workspace that moved"
+            0,
+            "the object key is stable"
         );
         assert_eq!(
             engine.float_workspace(float),
-            Some(1),
-            "the float went along"
+            Some(0),
+            "the float stays on its object"
         );
-        assert_eq!(
-            engine.workspace_name(1).as_deref(),
-            Some("web"),
-            "the name went along"
-        );
-        assert_eq!(engine.workspace_name(0), None);
-        assert_eq!(engine.workspace_id_by_name("web"), Some(1));
-        // The window that was on the second workspace is on the first now.
+        assert_eq!(engine.workspace_name(0).as_deref(), Some("web"));
+        assert_eq!(engine.workspace_name(1), None);
+        assert_eq!(engine.workspace_id_by_name("web"), Some(0));
+        // Workspace 1 is first now, without changing its identity or tiles.
         let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.workspace_ids(), vec![1, 0, 2]);
+        assert_eq!(monitor.workspaces[&0].ipc_id, identity);
         assert_eq!(
-            monitor.workspaces.get(&0).unwrap().columns[0].tiles[0].window_id,
+            monitor.workspaces.get(&1).unwrap().columns[0].tiles[0].window_id,
             WindowId::new(101)
         );
         // It is the second workspace now.  Moved into the empty one at the bottom it is
@@ -12463,14 +12017,21 @@ mod tests {
     #[test]
     fn test_focus_previous_window_basic() {
         let mut engine = make_engine();
-        // Add two windows: w1 then w2. Focus ring: [w2, w1].
-        engine.add_window(
-            make_window(100, 500, 400),
-            &BackendHandle::default_for_test(),
-        );
-        engine.add_window(
-            make_window(101, 600, 400),
-            &BackendHandle::default_for_test(),
+        // History records actual focus visits, not merely window admission.
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 500, 400), &backend);
+        engine.seed_native_foreground(100, 100, 0, &backend);
+        engine.add_window(make_window(101, 600, 400), &backend);
+        engine.observe_native_foreground_at(
+            101,
+            101,
+            crate::backend::ForegroundStamp {
+                uptime_ms: 1000,
+                sequence: 1,
+            },
+            true,
+            1000,
+            &backend,
         );
 
         let oid = engine.focused_output().unwrap();
@@ -12480,8 +12041,8 @@ mod tests {
             Some(WindowId::new(101))
         );
 
-        // Calling focus_previous_window should shift focus to w1 (WindowId 100).
-        engine.focus_previous_window(&BackendHandle::default_for_test());
+        // Immediate switching is opt-in: the default ignores visits under 750 ms.
+        engine.focus_previous_for_at(WindowId::new(101), 0, 1010, &backend);
         assert_eq!(
             engine.monitors().get(&oid).unwrap().focus_window,
             Some(WindowId::new(100))
@@ -12571,15 +12132,13 @@ mod tests {
         config.workspace = vec![
             crate::config::types::WorkspaceConfig {
                 name: "web".to_string(),
-                layout: "tile".to_string(),
-                monitor: String::new(),
                 follow_on_focus: false,
+                ..Default::default()
             },
             crate::config::types::WorkspaceConfig {
                 name: "code".to_string(),
-                layout: "tile".to_string(),
-                monitor: String::new(),
                 follow_on_focus: false,
+                ..Default::default()
             },
         ];
         engine.set_full_config(config);
@@ -12617,9 +12176,8 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace = vec![crate::config::types::WorkspaceConfig {
             name: "web".to_string(),
-            layout: "tile".to_string(),
-            monitor: String::new(),
             follow_on_focus: false,
+            ..Default::default()
         }];
         engine.set_full_config(config);
         assert_eq!(engine.workspace_id_by_name("web"), Some(0));
@@ -14196,8 +13754,8 @@ mod tests {
         assert_eq!(dst.columns[1].tiles[0].window_id, WindowId::new(200));
         assert_eq!(
             m.workspace_ids(),
-            vec![0, 1],
-            "the emptied workspace is gone, the empty one below the last is all that is left"
+            vec![0, 2],
+            "the emptied workspace itself is retained as the trailing empty object"
         );
     }
 
@@ -14250,14 +13808,14 @@ mod tests {
         engine.move_active_workspace(1, &BackendHandle::default_for_test());
 
         let m = engine.monitors().get(&oid).unwrap();
-        // Focus follows the moved workspace.
-        assert_eq!(m.active_workspace, 1, "focus relocates to ws 1");
+        // Focus follows the same object to position 2; keys and windows do not swap.
+        assert_eq!(m.active_workspace, 0);
+        assert_eq!(m.workspace_ids(), vec![1, 0, 2]);
+        assert_eq!(m.workspace_number_of(m.active_workspace), Some(2));
         let ws0 = m.workspaces.get(&0).expect("ws 0 still exists");
         let ws1 = m.workspaces.get(&1).expect("ws 1 still exists");
-        // ws 1 should now host the originally-on-ws-0 window 100.
-        assert_eq!(ws1.columns[0].tiles[0].window_id, WindowId::new(100));
-        // ws 0 should now host the originally-on-ws-1 window 200.
-        assert_eq!(ws0.columns[0].tiles[0].window_id, WindowId::new(200));
+        assert_eq!(ws0.columns[0].tiles[0].window_id, WindowId::new(100));
+        assert_eq!(ws1.columns[0].tiles[0].window_id, WindowId::new(200));
     }
 
     #[test]
@@ -14297,8 +13855,9 @@ mod tests {
         engine.move_active_workspace(1, &BackendHandle::default_for_test());
 
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!(m.active_workspace, 1);
-        // Focused window stays the same after the swap.
+        assert_eq!(m.active_workspace, 0);
+        assert_eq!(m.workspace_number_of(m.active_workspace), Some(1));
+        // A lone occupied workspace cannot move below the trailing empty one.
         assert_eq!(m.focus_window, Some(WindowId::new(100)));
     }
 
@@ -15819,7 +15378,8 @@ mod tests {
         assert_eq!((col_first, col_second), (0, 1), "in their old order");
         assert_eq!(
             workspace_ids_of(&engine, a),
-            vec![0, ws_first, ws_first + 1]
+            vec![0, ws_first, 1],
+            "the host's original trailing empty object is retained"
         );
         assert_eq!(
             active_workspace_of(&engine, a),
@@ -15979,39 +15539,60 @@ mod tests {
     }
 
     #[test]
-    fn test_a_named_workspace_of_the_unplugged_monitor_joins_the_one_of_that_name() {
-        let mut engine = TilingEngine::new(LayoutConfig::default());
-        engine.set_full_config(named_workspaces_config(&["mail"]));
-        let a = OutputId::from_name("A");
-        let b = OutputId::from_name("B");
-        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
-        engine.register_monitor(
-            b,
-            Rect::new(1920, 0, 1920, 1080),
-            Rect::new(1920, 0, 1920, 1040),
-        );
+    fn test_a_named_workspace_keeps_one_live_identity_across_unplug_and_return() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        engine.set_focused_output(b);
+        engine.rename_workspace(0, "mail").unwrap();
+        let identity = engine.monitors.get(&b).unwrap().workspaces[&0].ipc_id;
         put_on(&mut engine, 101, a);
         put_on(&mut engine, 201, b);
 
         engine.unregister_monitor(&b);
-        // Both windows are on A's "mail" workspace now, B's after A's.
-        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
-        assert_eq!(where_is(&engine, 201), Some((a, 0, 1)));
-        assert_eq!(
-            workspace_ids_of(&engine, a),
-            vec![0, 1],
-            "no workspace was added"
+        let (_, migrated, _) = where_is(&engine, 201).unwrap();
+        assert_ne!(
+            migrated, 0,
+            "globally unique names never merge by local key"
         );
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(
+            engine.monitors.get(&a).unwrap().workspaces[&migrated].ipc_id,
+            identity
+        );
+        assert_eq!(
+            engine.workspace_name_on(a, migrated).as_deref(),
+            Some("mail")
+        );
+        // Changes made to the live object while away return with it, not an old clone.
+        engine.switch_workspace(migrated, &be);
+        engine.add_window(make_window(202, 0, 0), &be);
+        engine.add_window(make_window(203, 0, 0), &be);
+        engine.toggle_floating_for(WindowId::new(203), &be);
 
         plug_b_in_again(&mut engine, b);
-        assert_eq!(
-            where_is(&engine, 201),
-            Some((b, 0, 0)),
-            "back on B's own \"mail\""
-        );
+        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)));
+        assert_eq!(where_is(&engine, 202), Some((b, 0, 1)));
+        assert_eq!(engine.float_location(WindowId::new(203)), Some((b, 0)));
         assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
-        assert_eq!(workspace_ids_of(&engine, a), vec![0, 1]);
-        assert_eq!(workspace_ids_of(&engine, b), vec![0, 1]);
+        assert_eq!(engine.workspace_name_on(b, 0).as_deref(), Some("mail"));
+        assert_eq!(engine.workspace_name_on(a, 0), None);
+        let snapshot = engine.ipc_snapshot();
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|ws| ws.id == identity)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|ws| ws.name.as_deref() == Some("mail"))
+                .count(),
+            1
+        );
     }
 
     #[test]

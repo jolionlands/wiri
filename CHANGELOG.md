@@ -43,6 +43,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Lane K — animation configuration
 - Decode niri's `window-open` and `window-close` blocks as independent easing/spring/off timelines, including global off/slowdown and legacy overrides. Defaults are 150 ms ease-out-expo for opening and 150 ms ease-out-quad for closing; absent animations remain disabled for wiri compatibility. Pure tests cover defaults, precedence and invalid/duplicate settings.
+### Lane F2 — integrated focus, workspaces and monitor actions
+- Connect the lane-F executors through the existing B/2B input and H IPC paths; preserve G's column/tile selection, logical width intent, tab visibility, effective view/struts and float geometry. Workspace identity, names and visible order survive reordering and synthetic hotplug/whole-workspace moves.
+- Previous-window focus uses stamped native occurrence order, not delayed delivery or requested activation time. Stale notices finish dwell history without undoing live focus; unconfirmed previous commands resume on observation, preserving exact cross-workspace endpoints without a retry timer.
+- Add fail-closed H30–H34 desktop checks through both CLI and typed IPC, plus pure queued-event, rollover, float-memory and visible-order regressions. The Lane F2 parity report separates desktop evidence, multi-monitor unit coverage and remaining gaps.
+
 ### Lane F2 — ordered workspace foundation
 - Separate workspace order, monitor-local keys and session-stable IPC identities; runtime names belong to workspace objects. Retain Lane G's existing column/tile focus memory rather than adding duplicate state. Mutation executors are connected in the next part.
 

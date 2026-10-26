@@ -186,14 +186,16 @@
         if (-not $fHandles.Contains($handle) -or -not [LT]::IsWindow($handle)) { throw "Not a live owned Lane F HWND: $handle" }
         $fRuntime.serial++
         $null = FCheckedCtl ('lane-f-{0:D3}-focus-owned' -f $fRuntime.serial) @('focus-window',[string][int64]$handle)
-        $null = FWaitFocus ([int64]$handle) $timeout
+        $settled = FWaitFocus ([int64]$handle) $timeout
+        $null = WaitForeground $handle 0 $timeout
         Start-Sleep -Milliseconds 20
         $actual = [int64][LT]::GetForegroundWindow()
-        [void]$fChecks.Add([pscustomobject]@{ gate='fixture-focus'; pass=($actual -eq [int64]$handle); expected_hwnd=[int64]$handle; actual_hwnd=$actual })
-        if ($actual -ne [int64]$handle) { throw "Fixture focus expected $handle, got $actual" }
+        [void]$fChecks.Add([pscustomobject]@{ gate='fixture-focus'; pass=($settled -and $actual -eq [int64]$handle); expected_hwnd=[int64]$handle; actual_hwnd=$actual; managed_focus_settled=$settled })
+        if (-not $settled -or $actual -ne [int64]$handle) { throw "Fixture focus expected managed/native $handle, got native $actual (managed settled: $settled)" }
     }
     function FHoldFocus([IntPtr]$handle, [int]$minimum = 1150) {
         FFocus $handle
+        FocusForm $handle # Ordinary settled focus uses the shared harness helper.
         if (-not (FWaitFocus ([int64]$handle) 700)) { throw "Unsettled Lane F focus before hold: $handle" }
         $clock = [Diagnostics.Stopwatch]::StartNew()
         do {
@@ -312,7 +314,10 @@
         FFocus $fC
         FQuick 'consume-window-into-column'
         FFocus $fA
-        $state = FState 'lane-f-fixture'
+        $fRuntime.serial++
+        $fixtureTag = 'lane-f-{0:D3}-fixture' -f $fRuntime.serial
+        $state = FState $fixtureTag
+        $state | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $fDir "$fixtureTag.json")
         $source = FWorkspace $state $fSource
         $target = FWorkspace $state $fTarget
         $expected = @(@($fA,0,0),@($fB,0,1),@($fC,1,0),@($fD,1,1))
@@ -780,12 +785,14 @@ window-rule {
                     $window = $_
                     if (-not $foreignOnly -or $fHandles.ToArray() -notcontains [IntPtr][int64]$window.id) {
                         $entry = WinOf $state.list ([IntPtr][int64]$window.id)
-                        '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $window.id,$window.workspace_id,$entry.monitor,$entry.column,$entry.tile,$entry.floating,$entry.fullscreen
+                        '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $window.id,$window.workspace_id,$window.output,$entry.column,$entry.tile,$entry.floating,$entry.fullscreen
                     }
                 }) -join ';')
             }
             function F34Destination($state, [string]$route) {
-                $ordered = @($state.monitors | Sort-Object bounds_x,bounds_y,name)
+                # Cycle in cached output-id order; directions prefer overlapping
+                # cross-axis spans, then nearest edges/centres, just as the resolver.
+                $ordered = @($state.monitors | Sort-Object { [uint64]$_.output_id })
                 $fHomeMonitor = @($ordered | Where-Object { $_.name -ceq $fHome })[0]
                 if ($route -eq 'name') {
                     $other = @($ordered | Where-Object { $_.name -cne $fHome })
@@ -795,22 +802,29 @@ window-rule {
                 $index = 0
                 for ($i=0; $i -lt $ordered.Count; $i++) { if ($ordered[$i].name -ceq $fHome) { $index=$i; break } }
                 switch ($route) {
-                    'left' { if ($index -gt 0) { return [string]$ordered[$index-1].name }; return $fHome }
-                    'right' { if ($index+1 -lt $ordered.Count) { return [string]$ordered[$index+1].name }; return $fHome }
                     'previous' { return [string]$ordered[($index+$ordered.Count-1)%$ordered.Count].name }
                     'next' { return [string]$ordered[($index+1)%$ordered.Count].name }
                 }
-                # Vertical directions use center half-planes and squared distance;
-                # retain an explicit output-id tie break, not enumeration order.
-                $cx = [double]$fHomeMonitor.bounds_x + [double]$fHomeMonitor.bounds_width/2
-                $cy = [double]$fHomeMonitor.bounds_y + [double]$fHomeMonitor.bounds_height/2
+                $ax=[long]$fHomeMonitor.bounds_x; $ay=[long]$fHomeMonitor.bounds_y
+                $ar=$ax+[long]$fHomeMonitor.bounds_width; $ab=$ay+[long]$fHomeMonitor.bounds_height
                 $candidates = @($ordered | Where-Object { $_.name -cne $fHome } | ForEach-Object {
-                    $dx = ([double]$_.bounds_x + [double]$_.bounds_width/2) - $cx
-                    $dy = ([double]$_.bounds_y + [double]$_.bounds_height/2) - $cy
-                    if (($route -eq 'up' -and $dy -lt 0) -or ($route -eq 'down' -and $dy -gt 0)) {
-                        [pscustomobject]@{name=$_.name;distance=($dx*$dx+$dy*$dy);id=[uint64]$_.output_id}
+                    $bx=[long]$_.bounds_x; $by=[long]$_.bounds_y
+                    $br=$bx+[long]$_.bounds_width; $bb=$by+[long]$_.bounds_height
+                    $horizontal=($route -eq 'left' -or $route -eq 'right')
+                    $ahead=switch ($route) {
+                        'left' { $bx+$br -lt $ax+$ar }; 'right' { $bx+$br -gt $ax+$ar }
+                        'up' { $by+$bb -lt $ay+$ab }; 'down' { $by+$bb -gt $ay+$ab }
                     }
-                } | Sort-Object distance,id)
+                    if ($ahead) {
+                        $gap=switch ($route) {
+                            'left' { [Math]::Max(0,$ax-$br) }; 'right' { [Math]::Max(0,$bx-$ar) }
+                            'up' { [Math]::Max(0,$ay-$bb) }; 'down' { [Math]::Max(0,$by-$ab) }
+                        }
+                        $crossGap=if ($horizontal) { [Math]::Max(0,[Math]::Max($ay-$bb,$by-$ab)) } else { [Math]::Max(0,[Math]::Max($ax-$br,$bx-$ar)) }
+                        $crossCenter=if ($horizontal) { [Math]::Abs($by+$bb-$ay-$ab) } else { [Math]::Abs($bx+$br-$ax-$ar) }
+                        [pscustomobject]@{name=$_.name;off_axis=($crossGap -gt 0);distance=([double]$gap*$gap+[double]$crossGap*$crossGap);cross_center=$crossCenter;id=[uint64]$_.output_id}
+                    }
+                } | Sort-Object off_axis,distance,cross_center,id)
                 if ($candidates.Count -gt 0) { return [string]$candidates[0].name }
                 return $fHome
             }
@@ -855,7 +869,6 @@ window-rule {
             }
             $fState = F34Prepare
             $fMonitorTopology = F34Topology $fState
-            $fForeignPlaces = F34Places $fState $true
             foreach ($fTransport in @('cli','raw')) {
                 foreach ($fFamily in @('focus-monitor','move-window-to-monitor','move-column-to-monitor','move-workspace-to-monitor')) {
                     foreach ($fRoute in @('left','right','up','down','previous','next','name')) {
@@ -880,18 +893,18 @@ window-rule {
                                 if ($fAway) { $fExpected=[IntPtr]::Zero; $fExpectedOutput=$fDestination }
                             }
                             'move-window-to-monitor' {
-                                # Alternate implicit foreground and nonfocused numeric
-                                # HWND targets. The legacy window move does not follow.
+                                # Alternate foreground and inactive numeric targets.
+                                # Only the selected/foreground window follows its move.
                                 if ($fRoute -in @('left','up','previous','name')) {
                                     $fMoving=@($fD); $fArgs += @('--id',[int64]$fD)
                                 } else {
                                     $fMoving=@($fB)
-                                    if ($fAway) { $fExpected=$fA }
+                                    if ($fAway) { $fExpectedOutput=$fDestination }
                                 }
                             }
                             'move-column-to-monitor' {
                                 $fMoving=@($fA,$fB)
-                                if ($fAway) { $fExpected=$fA; $fExpectedOutput=$fDestination }
+                                if ($fAway) { $fExpectedOutput=$fDestination }
                             }
                             'move-workspace-to-monitor' {
                                 $fMoving=@($fA,$fB,$fC,$fD)
@@ -905,9 +918,11 @@ window-rule {
                             }
                         }
                         $fRecord = FRun "h34-$fFamily-$fRoute-$fTransport" $fTransport $fAction $fArgs ([int64]$fExpected)
+                        # Compare each action with its own precondition, not a phase
+                        # baseline that can outlive unrelated application windows.
                         $fValid = ($fRecord.pass -and (F34Output $fRecord.after) -ceq $fExpectedOutput -and
                             (F34Topology $fRecord.after) -ceq $fMonitorTopology -and
-                            (F34Places $fRecord.after $true) -ceq $fForeignPlaces)
+                            (F34Places $fRecord.before $true) -ceq (F34Places $fRecord.after $true))
                         if ($fFamily -eq 'focus-monitor' -or -not $fAway) {
                             $fValid = ($fValid -and (F34Places $fRecord.before) -ceq (F34Places $fRecord.after))
                         } elseif ($fFamily -eq 'move-workspace-to-monitor') {
@@ -1015,12 +1030,11 @@ window-rule {
                 $fCrossBConfirmed=$fVisitClock.ElapsedMilliseconds
                 FFocus $fD 40
                 $fCrossDConfirmed=$fVisitClock.ElapsedMilliseconds
-                # Drain asynchronous foreground notifications without permitting
-                # the intermediate visit to reach the 750ms debounce threshold.
-                Start-Sleep -Milliseconds 150
+                # Dispatch immediately; the product must handle queued native focus
+                # observations without a fixture sleep masking that ordering race.
                 $fCrossShort=$fVisitClock.ElapsedMilliseconds
                 $fRecord=FRun "h31-cross-workspace-back-$fTransport" $fTransport 'focus-window-previous' @('--debounce-ms',750) ([int64]$fA) -shortVisitClock $fVisitClock
-                FCheck 'h31_history_crosses_workspaces' ($fCrossShort -lt 750 -and $fRecord.short_visit_until_dispatch_upper_bound_ms -lt 750 -and (FFocusIs $fRecord.before ([int64]$fD)) -and $fRecord.pass -and (FWorkspace $fRecord.after $fSource).is_active) @{record=$fRecord;short_visit_upper_bound_ms=$fCrossShort;b_confirmed_ms=$fCrossBConfirmed;d_confirmed_ms=$fCrossDConfirmed;focus_event_drain_ms=150;settled_a_ms=$fSettledA;debounce_ms=750}
+                FCheck 'h31_history_crosses_workspaces' ($fCrossShort -lt 750 -and $fRecord.short_visit_until_dispatch_upper_bound_ms -lt 750 -and (FFocusIs $fRecord.before ([int64]$fD)) -and $fRecord.pass -and (FWorkspace $fRecord.after $fSource).is_active) @{record=$fRecord;short_visit_upper_bound_ms=$fCrossShort;b_confirmed_ms=$fCrossBConfirmed;d_confirmed_ms=$fCrossDConfirmed;focus_event_drain_ms=0;settled_a_ms=$fSettledA;debounce_ms=750}
                 $fCrossPass=$fRecord.pass
                 $fRecord=FRun "h31-cross-workspace-forward-$fTransport" $fTransport 'focus-window-previous' @('--debounce-ms',750) ([int64]$fD)
                 $fCrossPass=($fCrossPass -and $fRecord.pass -and (FWorkspace $fRecord.after $fTarget).is_active)

@@ -1033,10 +1033,9 @@ pub(crate) fn perform_action_on(
         Action::System(_) => {
             unreachable!("system actions dispatched before layout target resolution")
         }
-        Action::LayoutFocus(_) | Action::WorkspaceAction(_) | Action::MonitorAction(_) => {
-            // Transport lands before the engine executors in the integration series.
-            warn!("Structured layout executor not installed: {:?}", action);
-        }
+        Action::LayoutFocus(action) => engine.write().focus_layout_action(action, backend),
+        Action::WorkspaceAction(action) => engine.write().workspace_layout_action(action, backend),
+        Action::MonitorAction(action) => engine.write().monitor_layout_action(action, backend),
         Action::ToggleKeyboardShortcutsInhibit => {
             keyboard::ENGINE.lock().toggle_inhibit();
             info!(
@@ -1191,37 +1190,10 @@ pub(crate) fn perform_action_on(
                 engine.write().apply_all(backend);
             }
         },
-        Action::SwitchMonitor => {
-            // Generic "switch monitor" — cycle focus to the next monitor in
-            // x-order, wrapping around. Distinct from MoveToMonitorLeft/Right,
-            // which move the focused window across monitors.
-            let mut engine_w = engine.write();
-            let order: Vec<_> = {
-                let mut v: Vec<_> = engine_w
-                    .monitors()
-                    .iter()
-                    .map(|(oid, m)| (m.bounds.loc.x, *oid))
-                    .collect();
-                v.sort_by_key(|(x, _)| *x);
-                v
-            };
-            if order.is_empty() {
-                return;
-            }
-            let cur = engine_w.focused_output();
-            let next_idx = match cur {
-                Some(oid) => order
-                    .iter()
-                    .position(|(_, o)| *o == oid)
-                    .map(|i| (i + 1) % order.len())
-                    .unwrap_or(0),
-                None => 0,
-            };
-            let target = order[next_idx].1;
-            engine_w.set_focused_output(target);
-            engine_w.apply_all(backend);
-            info!("SwitchMonitor: focused {:?}", target);
-        }
+        Action::SwitchMonitor => engine.write().monitor_layout_action(
+            &crate::input::MonitorAction::Focus(crate::input::MonitorTarget::Next),
+            backend,
+        ),
         Action::MoveWorkspace(target_number) => {
             // Move the focused window to workspace number `target_number` (no switch).
             let workspace = engine.read().workspace_id_for_number(*target_number);
@@ -1552,19 +1524,13 @@ pub(crate) fn perform_action_on(
                 Err(err) => warn!("SetWorkspaceLayout({}): {}", mode, err),
             }
         }
-        Action::RenameWorkspace(name) => {
-            // Rename the currently-focused workspace.
-            let id = {
-                let eng = engine.read();
-                eng.focused_output()
-                    .and_then(|oid| eng.monitors().get(&oid))
-                    .map(|m| m.active_workspace_id())
-                    .unwrap_or(0)
-            };
-            if let Err(e) = engine.write().rename_workspace(id, name.as_str()) {
-                warn!("rename_workspace({:?}): {}", name, e);
-            }
-        }
+        Action::RenameWorkspace(name) => engine.write().workspace_layout_action(
+            &crate::input::WorkspaceAction::SetName {
+                name: name.clone(),
+                workspace: None,
+            },
+            backend,
+        ),
         Action::ScreenshotWindow => {
             take_window_screenshot();
         }
