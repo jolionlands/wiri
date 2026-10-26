@@ -19,6 +19,7 @@ impl TilingEngine {
         self.animation.set_kind(options.workspace_kind());
         self.animation.set_slowdown(options.slowdown);
         self.motion = options.clone();
+        self.reconfigure_overview_camera();
         // A reload can interrupt a frame. Reconcile from layout, not cached targets.
         for state in self.applied_state.values_mut() {
             state.rect = Rect::new(0, 0, 0, 0);
@@ -117,6 +118,7 @@ impl TilingEngine {
             self.apply_layout_for_monitor(output, backend);
         }
         self.frame_in_progress = false;
+        self.tick_overview_camera(delta_ms, backend);
         self.has_active_animations()
     }
 

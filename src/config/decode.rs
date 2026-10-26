@@ -23,6 +23,8 @@ use super::types::*;
 #[path = "decode/animations_decode.rs"]
 mod animations_decode;
 mod effects_decode;
+#[path = "decode/overview_decode.rs"]
+mod overview_decode;
 #[path = "decode/recent_windows_decode.rs"]
 mod recent_windows_decode;
 
@@ -298,7 +300,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
         "gestures" => Some("not implemented yet"),
-        "overview" => Some("not implemented yet"),
         "environment" => Some("not implemented yet"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
         "switch-events" => Some("Windows has no lid or tablet-mode switch events"),
@@ -851,6 +852,7 @@ impl Decoder {
                         }
                     }
                 }
+                "overview" => self.decode_overview(node, &mut cfg.overview),
                 "include" => self.decode_include(node, cfg),
                 other => match top_level_unsupported(other) {
                     Some(why) => self.unsupported(node, why),

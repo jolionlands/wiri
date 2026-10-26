@@ -3,6 +3,7 @@ pub mod effects;
 pub mod error;
 pub mod kdl;
 pub mod loader;
+pub mod overview_config;
 pub mod parse;
 pub mod recent_windows_config;
 pub mod types;

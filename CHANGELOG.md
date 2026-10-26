@@ -5,6 +5,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane V item 1 — configured overview camera
+- Implement niri's overview zoom, backdrop colour and workspace shadow, with a reversible open/close spring on the existing Phase 2B timeline/notifier. `overview-open-close` animation overrides, global off and slowdown apply; no frame clock runs after settling.
+- Add pure config, shadow-pixel and camera-lifecycle regressions. Desktop acceptance and compositor limits are recorded in `docs/parity/lane-v-report.md`.
+
 ### Lane Z — floating layer survives delayed native raises
 - Repair actual workspace z-order inversions on native REORDER events, not only on focus/layout. Correct the SHOW/HIDE WinEvent IDs so REORDER is no longer misclassified as HIDE. Keep float MRU and tile keyboard focus with asynchronous relative-HWND placement, without TOPMOST, global float promotion, idle timers or new threads.
 - Add deterministic H45 delayed-raise coverage and opt-in repeated H3/H5/H45 evidence. The delayed-layer check fails 3/3 before and passes 4/4 after; the complete release desktop run passes 500 gates. Release validation passes 1210 library + 14 CLI tests. Record repeat pass rates, one unrelated Terminal focus interruption, measured resting cost and limits in `docs/parity/lane-z-report.md`.

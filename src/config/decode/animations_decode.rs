@@ -20,6 +20,7 @@ impl Decoder {
                 | "slowdown"
                 | "workspace-switch"
                 | "horizontal-view-movement"
+                | "overview-open-close"
                 | "window-movement" => Some(name.as_str()),
                 "window-resize" if child.children.is_some() => Some("window-resize"),
                 _ => None,
@@ -36,11 +37,13 @@ impl Decoder {
                 "enabled" | "enable" | "on" => {
                     if let Some(v) = self.flag(child) {
                         cfg.enabled = v;
+                        cfg.overview_enabled = v;
                     }
                 }
                 "off" => {
                     if let Some(v) = self.flag(child) {
                         cfg.enabled = !v;
+                        cfg.overview_enabled = !v;
                     }
                 }
                 "slowdown" => {
@@ -63,7 +66,10 @@ impl Decoder {
                 "spring" => {
                     cfg.default_kind = self.animation_spring(child).map(AnimationKind::Spring);
                 }
-                "workspace-switch" | "horizontal-view-movement" | "window-movement" => {
+                "workspace-switch"
+                | "horizontal-view-movement"
+                | "window-movement"
+                | "overview-open-close" => {
                     blocks.push(child);
                 }
                 "window-resize" if child.children.is_some() => {
@@ -104,7 +110,6 @@ impl Decoder {
                 | "config-notification-open-close"
                 | "exit-confirmation-open-close"
                 | "screenshot-ui-open"
-                | "overview-open-close"
                 | "recent-windows-close" => {
                     self.unsupported(child, "composited open/close animations (only geometry transitions are implemented)");
                 }
@@ -138,6 +143,7 @@ impl Decoder {
                 "horizontal-view-movement" => cfg.horizontal_view_movement = kind,
                 "window-movement" => cfg.window_movement = kind,
                 "window-resize" => cfg.resize = kind,
+                "overview-open-close" => cfg.overview_open_close = kind,
                 _ => unreachable!(),
             }
         }

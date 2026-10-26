@@ -4,21 +4,114 @@ use super::{AppliedState, BackendHandle, LayoutConfig, OverviewState, TilingEngi
 use crate::overlay::thumbnail_overview::{OverviewCommand, OverviewContext, OverviewWorkspace};
 use crate::utils::{OutputId, Rect, WindowId};
 
-const ZOOM: f64 = 0.5;
+use crate::layout::animation::Animation;
+
 const WORKSPACE_GAP: i32 = 50;
 
-fn zoom_rect(rect: Rect, view: Rect, section_y: i32) -> Rect {
+#[derive(Default)]
+pub(super) struct OverviewCamera {
+    pub timeline: Option<Animation>,
+    pub closing: bool,
+    pub output: Option<OutputId>,
+}
+impl OverviewCamera {
+    pub fn animating(&self) -> bool {
+        self.timeline.as_ref().is_some_and(|a| !a.is_finished())
+    }
+}
+
+fn zoom_rect(rect: Rect, view: Rect, section_y: i32, zoom: f64) -> Rect {
     Rect::new(
         view.loc.x
-            + (view.size.w as f64 * (1.0 - ZOOM) / 2.0).round() as i32
-            + ((rect.loc.x - view.loc.x) as f64 * ZOOM).round() as i32,
-        section_y + ((rect.loc.y - view.loc.y) as f64 * ZOOM).round() as i32,
-        (rect.size.w as f64 * ZOOM).round().max(1.0) as u32,
-        (rect.size.h as f64 * ZOOM).round().max(1.0) as u32,
+            + (view.size.w as f64 * (1.0 - zoom) / 2.0).round() as i32
+            + ((rect.loc.x - view.loc.x) as f64 * zoom).round() as i32,
+        section_y + ((rect.loc.y - view.loc.y) as f64 * zoom).round() as i32,
+        (rect.size.w as f64 * zoom).round().max(1.0) as u32,
+        (rect.size.h as f64 * zoom).round().max(1.0) as u32,
     )
 }
 
 impl TilingEngine {
+    fn overview_options(&self) -> crate::config::overview_config::OverviewConfig {
+        self.full_config
+            .as_ref()
+            .map(|c| c.overview)
+            .unwrap_or_default()
+    }
+
+    fn start_overview_camera(&mut self, target: f64) {
+        let from = self.overview_zoom();
+        let kind = if self.animation_wake.is_some() {
+            self.motion.overview_kind()
+        } else {
+            crate::layout::animation::AnimationKind::Off
+        };
+        if let Some(a) = &mut self.overview_camera.timeline {
+            a.retarget(target, kind, self.motion.slowdown);
+        } else {
+            self.overview_camera.timeline = Some(Animation::with_kind(
+                from,
+                target,
+                kind,
+                self.motion.slowdown,
+            ));
+        }
+        let a = self.overview_camera.timeline.as_ref().unwrap();
+        if let Some(state) = &mut self.overview {
+            state.zoom = a.current();
+        }
+        if let Some(wake) = &self.animation_wake {
+            wake.notify_one();
+        }
+    }
+
+    pub(super) fn reconfigure_overview_camera(&mut self) {
+        if self.overview.is_some() && self.thumbnail_overview.is_some() {
+            let target = if self.overview_camera.closing {
+                1.0
+            } else {
+                self.overview_options().zoom
+            };
+            self.start_overview_camera(target);
+            // Even an Off retarget needs one frame to retire a closing host.
+            if self.overview_camera.closing && !self.overview_camera.animating() {
+                self.overview_camera.timeline =
+                    Some(Animation::new(0.0, 1.0, 1, crate::layout::Easing::Linear));
+            }
+        }
+    }
+
+    pub(super) fn begin_overview_close(&mut self) -> bool {
+        if self.overview.is_none() || self.thumbnail_overview.is_none() {
+            return false;
+        }
+        if self.overview_camera.closing {
+            return true;
+        }
+        self.overview_camera.closing = true;
+        self.start_overview_camera(1.0);
+        self.overview_camera.animating()
+    }
+
+    pub(super) fn tick_overview_camera(&mut self, delta_ms: u32, backend: &BackendHandle) {
+        let Some(a) = &mut self.overview_camera.timeline else {
+            return;
+        };
+        if a.is_finished() {
+            return;
+        }
+        let zoom = a.tick(delta_ms).clamp(0.0, 1.0);
+        let finished = a.is_finished();
+        if let Some(state) = &mut self.overview {
+            state.zoom = zoom;
+        }
+        if finished && self.overview_camera.closing {
+            self.finish_overview_close(backend);
+        } else if let Some(output) = self.overview_camera.output {
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
     pub(super) fn enter_workspace_overview(&mut self, backend: &BackendHandle) {
         let Some(output) = self.monitors.focused_id() else {
             return;
@@ -26,6 +119,13 @@ impl TilingEngine {
         let Some(sink) = self.thumbnail_overview.clone() else {
             return;
         };
+        if self.overview.is_some() {
+            if self.overview_camera.closing {
+                self.overview_camera.closing = false;
+                self.start_overview_camera(self.overview_options().zoom);
+            }
+            return;
+        }
         // Stop in-flight geometry before opening the camera; source surfaces keep normal size.
         self.animation.cancel_all();
         for wid in self.animating_rects.keys() {
@@ -35,9 +135,11 @@ impl TilingEngine {
         }
         self.animating_rects.clear();
         self.overview = Some(OverviewState {
-            zoom: ZOOM,
+            zoom: 1.0,
             workspace_offsets: Vec::new(),
         });
+        self.overview_camera.output = Some(output);
+        self.start_overview_camera(self.overview_options().zoom);
         sink.enter();
         let sources: Vec<_> = self
             .monitors
@@ -79,8 +181,9 @@ impl TilingEngine {
             .iter()
             .position(|id| *id == monitor.active_workspace)
             .unwrap_or(0) as i32;
-        let height = (view.size.h as f64 * ZOOM).round() as i32;
-        let stride = height + (WORKSPACE_GAP as f64 * ZOOM).round() as i32;
+        let zoom = self.overview_zoom();
+        let height = (view.size.h as f64 * zoom).round() as i32;
+        let stride = height + (WORKSPACE_GAP as f64 * zoom).round() as i32;
         let center_y = view.loc.y + (view.size.h as i32 - height) / 2;
         let mut workspaces = Vec::new();
         let mut positions = Vec::new();
@@ -92,17 +195,18 @@ impl TilingEngine {
             workspaces.push(OverviewWorkspace {
                 id,
                 active: id == monitor.active_workspace,
-                rect: zoom_rect(view, view, y),
+                rect: zoom_rect(view, view, y, zoom),
             });
             let normal =
                 self.calculate_positions_at_zoom(ws, view, 0, view.size.h as i32, cfg, 1.0);
             positions.extend(
                 normal
                     .into_iter()
-                    .map(|(wid, rect)| (wid, zoom_rect(rect, view, y))),
+                    .map(|(wid, rect)| (wid, zoom_rect(rect, view, y, zoom))),
             );
         }
         if let Some(sink) = &self.thumbnail_overview {
+            sink.set_appearance(self.overview_options(), zoom);
             sink.set_context(OverviewContext {
                 bounds: monitor.bounds,
                 workspaces,
@@ -165,10 +269,52 @@ impl TilingEngine {
 mod tests {
     use super::*;
     #[test]
+    fn overview_camera_uses_shared_spring_and_retires_after_close() {
+        use crate::layout::{Column, Monitor, Tile};
+        use crate::overlay::MockThumbnailOverview;
+        use std::sync::Arc;
+        let output = OutputId::from_name("camera");
+        let mut e = TilingEngine::new(Default::default());
+        let mut m = Monitor::new(
+            output,
+            Rect::new(0, 0, 1366, 768),
+            Rect::new(0, 0, 1366, 728),
+        );
+        let mut col = Column::new();
+        col.add_tile(Tile::new(WindowId::new(0)));
+        m.workspace_mut().unwrap().columns.push(col);
+        e.monitors.insert(output, m);
+        e.monitors.set_focused(output);
+        let sink = MockThumbnailOverview::new();
+        e.thumbnail_overview = Some(sink.clone());
+        e.set_animation_notifier(Arc::new(tokio::sync::Notify::new()));
+        let backend = BackendHandle::default_for_test();
+        e.enter_overview(&backend);
+        assert_eq!(e.overview_zoom(), 1.0);
+        assert!(e.has_active_animations());
+        e.tick_animations_with_backend(50, &backend);
+        assert!(e.overview_zoom() > 0.5 && e.overview_zoom() < 1.0);
+        e.exit_overview(&backend);
+        let zoom = e.overview_zoom();
+        // Reversing preserves displayed position and the timeline's momentum.
+        assert_eq!(e.overview_zoom(), zoom);
+        e.tick_animations_with_backend(60_000, &backend);
+        assert!(!e.has_active_animations());
+        assert!(!e.is_overview());
+        assert_eq!(sink.exit_calls(), 1);
+    }
+
+    #[test]
     fn overview_scales_half_and_preserves_normal_aspect_and_negative_origins() {
         let view = Rect::new(-1366, 0, 1366, 728);
         let tile = Rect::new(-1358, 8, 500, 700);
-        assert_eq!(zoom_rect(tile, view, 182), Rect::new(-1020, 186, 250, 350));
-        assert_eq!(zoom_rect(view, view, 182), Rect::new(-1024, 182, 683, 364));
+        assert_eq!(
+            zoom_rect(tile, view, 182, 0.5),
+            Rect::new(-1020, 186, 250, 350)
+        );
+        assert_eq!(
+            zoom_rect(view, view, 182, 0.5),
+            Rect::new(-1024, 182, 683, 364)
+        );
     }
 }

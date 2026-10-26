@@ -10,7 +10,10 @@
 //! Mouse selections are delivered to `set_handler` on the overlay thread. The
 //! handler must route them through the engine, not activate source HWNDs directly.
 
+use crate::config::overview_config::OverviewConfig;
 use crate::utils::{Rect, WindowId};
+#[path = "overview_appearance.rs"]
+mod appearance;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,6 +55,7 @@ pub trait ThumbnailOverviewSink: Send + Sync {
     fn update_thumbnail(&self, window_id: WindowId, dst_rect: Rect);
     /// Default keeps existing/test sinks source-compatible.
     fn set_context(&self, _context: OverviewContext) {}
+    fn set_appearance(&self, _style: OverviewConfig, _zoom: f64) {}
     /// Asynchronous: safe while holding the engine lock.
     fn exit(&self);
     fn registered_count(&self) -> usize;
@@ -252,6 +256,8 @@ mod win {
     struct Scene {
         context: Option<OverviewContext>,
         tiles: HashMap<WindowId, Tile>,
+        appearance: OverviewConfig,
+        zoom: f64,
     }
     struct Session {
         scene: Mutex<Scene>,
@@ -349,6 +355,12 @@ mod win {
         fn set_context(&self, context: OverviewContext) {
             self.publish(|s| s.context = Some(context));
         }
+        fn set_appearance(&self, style: OverviewConfig, zoom: f64) {
+            self.publish(|s| {
+                s.appearance = style;
+                s.zoom = zoom;
+            });
+        }
         fn exit(&self) {
             if let Some(session) = self.session.lock().take() {
                 session.close();
@@ -378,6 +390,7 @@ mod win {
         bounds: Rect,
         thumbnails: HashMap<WindowId, Thumbnail>,
         hovered: Option<WindowId>,
+        background: Vec<u32>,
     }
     impl Drop for Host {
         fn drop(&mut self) {
@@ -476,16 +489,32 @@ mod win {
             property(hwnd, "WiriOverviewFocusY", rect.loc.y as isize);
             property(hwnd, "WiriOverviewFocusW", rect.size.w as isize);
             property(hwnd, "WiriOverviewFocusH", rect.size.h as isize);
+            self.background = appearance::background(
+                self.bounds,
+                self.scene
+                    .context
+                    .iter()
+                    .flat_map(|c| c.workspaces.iter().map(|ws| ws.rect)),
+                self.scene.appearance,
+                self.scene.zoom,
+            );
+            property(
+                hwnd,
+                "WiriOverviewZoomMillionths",
+                (self.scene.zoom * 1_000_000.0).round() as isize,
+            );
+            let [r, g, b, _] = self.scene.appearance.backdrop_color;
+            property(
+                hwnd,
+                "WiriOverviewBackdropRgb",
+                ((r as u32) << 16 | (g as u32) << 8 | b as u32) as isize,
+            );
             let _ = InvalidateRect(hwnd, None, false);
         }
         unsafe fn paint(&self, hwnd: HWND) {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut ps);
-            fill(
-                dc,
-                Rect::new(0, 0, self.bounds.size.w, self.bounds.size.h),
-                BACKDROP,
-            );
+            appearance::paint(dc, self.bounds, &self.background);
             if let Some(context) = &self.scene.context {
                 for ws in &context.workspaces {
                     let r = local(ws.rect, self.bounds);
@@ -624,6 +653,7 @@ mod win {
             bounds,
             thumbnails: HashMap::new(),
             hovered: None,
+            background: Vec::new(),
         });
         let Ok(hwnd) = CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,

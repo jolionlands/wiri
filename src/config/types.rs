@@ -8,6 +8,7 @@ pub struct Config {
     pub binds: BindsConfig,
     pub recent_windows: super::recent_windows_config::RecentWindowsConfig,
     pub animations: AnimationsConfig,
+    pub overview: super::overview_config::OverviewConfig,
     /// niri screenshot-path: Pictures default, a strftime template, or null (clipboard only).
     pub screenshot_path: crate::screenshot::path::ScreenshotPath,
     /// Programs to spawn at startup. Each entry is [program, arg1, arg2, …].
@@ -44,6 +45,7 @@ impl Default for Config {
             binds: BindsConfig::default(),
             recent_windows: super::recent_windows_config::RecentWindowsConfig::default(),
             animations: AnimationsConfig::default_config(),
+            overview: super::overview_config::OverviewConfig::default(),
             screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
             spawn_sh_at_startup: Vec::new(),
