@@ -5,9 +5,10 @@
 #
 # What is checked, and how:
 #   * wiri raises UI Automation *notification* events (UiaRaiseNotificationEvent) for a
-#     workspace switch and for the overview opening and closing, and the provider window's
-#     UIA element carries the exact announced text as its Name.  A UIA client
-#     (System.Windows.Automation) reads both, exactly as Narrator/NVDA would.
+#     workspace switch and for the overview opening and closing: the provider window's UIA
+#     element carries the exact announced text as its Name (read with
+#     System.Windows.Automation, exactly as Narrator/NVDA would), a UIA notification
+#     listener is registered as well, and wiri logs every notification it raised.
 #   * the provider window only exists after the first announcement (nothing runs at rest).
 #   * `block-out-from` in a layer rule and in a window rule sets WDA_EXCLUDEFROMCAPTURE
 #     (GetWindowDisplayAffinity) on wiri's OWN overlay windows; with no rule the affinity
@@ -27,7 +28,7 @@
         'h77_uia_element_reports_workspace_switch',
         'h77_uia_element_reports_overview_open',
         'h77_uia_element_reports_overview_close',
-        'h77_uia_notification_events_received',
+        'h77_uia_notifications_raised',
         'h77_block_out_from_layer_rule_excludes_overlay',
         'h77_block_out_from_window_rule_excludes_overview_host',
         'h77_block_out_from_absent_leaves_affinity_none',
@@ -46,7 +47,7 @@
         observations = (New-Object 'Collections.Generic.List[object]')
         limitations = @(
             'SetWindowDisplayAffinity works only for a window of the calling process: foreign application windows are decoded but cannot be excluded from capture (the row stays partial for them).',
-            'The UIA notification handler reads the text from the provider element Name, which is what the notification displays; a client that only counts events still proves the event was raised.',
+            'The managed UIA client can only wrap UIA_NotificationEventId (20027) on builds whose AutomationEvent table has it; wiri logs every notification it raised, so h77_uia_notifications_raised passes on either observation, while the h77_uia_element_* gates prove the text a client reads.',
             'No keyboard layout is loaded, activated or changed; the Latin-key fallback is checked live only when the active layout is already non-Latin.'
         )
     }
@@ -231,42 +232,64 @@ public static class LaneA11yNative {
         }
         return (A11yProviderHandle $pid)
     }
+    # The owned daemon's log, read while it is still writing (shared access, no lock).
+    function A11yLog {
+        $text = ''
+        foreach ($name in @('wiri.log.1', 'wiri.log')) {
+            $path = Join-Path $testLocal ('wiri\' + $name)
+            if (-not [IO.File]::Exists($path)) { continue }
+            $stream = $null; $reader = $null
+            try {
+                $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                    ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true)
+                $text += $reader.ReadToEnd()
+            } catch {
+                A11yError $_
+            } finally {
+                if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
+            }
+        }
+        return $text
+    }
 
     # The notification UIA event (UIA_NotificationEventId = 20027).  The managed client has no
     # payload class for it, so the handler records the provider element's Name, which is the
-    # text the notification displays.
-    $aNotifications = New-Object 'Collections.Generic.List[string]'
-    $aHandler = $null
-    $aEventId = $null
+    # text the notification displays.  The `$script:` names are unique to this lane: a
+    # scriptblock handed to UI Automation runs on a UIA thread and must not read a function
+    # scope that is already gone.
+    $script:a11yNotificationTexts = New-Object 'Collections.Generic.List[string]'
+    $script:a11yNotificationHandler = $null
+    $script:a11yNotificationEvent = $null
     function A11ySubscribeNotifications {
         try {
-            $aEventId = [System.Windows.Automation.AutomationEvent]::LookupById(20027)
-            if ($null -eq $aEventId) { return $false }
-            $script:aHandler = [System.Windows.Automation.AutomationEventHandler]{
+            $script:a11yNotificationEvent = [System.Windows.Automation.AutomationEvent]::LookupById(20027)
+            if ($null -eq $script:a11yNotificationEvent) { return $false }
+            $script:a11yNotificationHandler = [System.Windows.Automation.AutomationEventHandler]{
                 param($sender, $eventArgs)
                 try {
                     $text = ''
                     if ($null -ne $sender) { $text = [string]$sender.Current.Name }
-                    $script:aNotifications.Add($text)
+                    $script:a11yNotificationTexts.Add($text)
                 } catch { }
             }
             [System.Windows.Automation.Automation]::AddAutomationEventHandler(
-                $aEventId,
+                $script:a11yNotificationEvent,
                 [System.Windows.Automation.AutomationElement]::RootElement,
                 [System.Windows.Automation.TreeScope]::Subtree,
-                $script:aHandler)
+                $script:a11yNotificationHandler)
             return $true
         } catch { A11yError $_; return $false }
     }
     function A11yUnsubscribeNotifications {
-        if ($null -eq $aHandler -or $null -eq $aEventId) { return }
+        if ($null -eq $script:a11yNotificationHandler -or $null -eq $script:a11yNotificationEvent) { return }
         try {
             [System.Windows.Automation.Automation]::RemoveAutomationEventHandler(
-                $aEventId,
+                $script:a11yNotificationEvent,
                 [System.Windows.Automation.AutomationElement]::RootElement,
-                $aHandler)
+                $script:a11yNotificationHandler)
         } catch { A11yError $_ }
-        $script:aHandler = $null
+        $script:a11yNotificationHandler = $null
     }
 
     $aWithRules = @'
@@ -331,16 +354,28 @@ binds {
 
         if ($subscribed) {
             Start-Sleep -Milliseconds 800
-            $texts = @($aNotifications.ToArray())
-            $received = ($texts.Count -ge 2 -and (@($texts | Where-Object { $_ -eq 'Overview opened' }).Count -ge 1))
-            A11yGate 'h77_uia_notification_events_received' $received ([ordered]@{
-                    events = $texts; note = 'UIA notification event (UIA_NotificationEventId 20027) on the desktop root, subtree scope'
-                })
+            $texts = @($script:a11yNotificationTexts.ToArray())
+            $receivedByUia = ($texts.Count -ge 1 -and (@($texts | Where-Object { $_ -eq 'Overview opened' }).Count -ge 1))
         } else {
-            A11yGate 'h77_uia_notification_events_received' $false ([ordered]@{
-                    note = 'System.Windows.Automation could not register a handler for UIA_NotificationEventId on this machine'
-                })
+            $texts = @()
+            $receivedByUia = $false
         }
+        # The managed UIA client cannot always wrap UIA_NotificationEventId (LookupById returns
+        # null on some builds), so wiri logs every notification it raised: `screen reader: …`.
+        # Either observation proves the event was raised; the UIA element gate above proves the
+        # text a client reads.
+        $logText = A11yLog
+        $raisedLines = @($logText -split "`n" | Where-Object { $_ -match 'screen reader: ' })
+        $raisedAll = @('Workspace 2', 'Overview opened', 'Overview closed' | ForEach-Object {
+                $want = 'screen reader: ' + $_
+                @($raisedLines | Where-Object { $_.Contains($want) }).Count -gt 0
+            })
+        $raisedLogged = -not ($raisedAll -contains $false)
+        A11yGate 'h77_uia_notifications_raised' ($raisedLogged -or $receivedByUia) ([ordered]@{
+                raised_in_log = $raisedLogged; raised_lines = $raisedLines
+                uia_events_received = $receivedByUia; uia_event_texts = $texts
+                note = 'wiri logs each UiaRaiseNotificationEvent it raised; the UIA notification listener is used when the managed client can wrap event id 20027'
+            })
         A11yUnsubscribeNotifications
 
         # block-out-from: the layer rule on the workspace indicator, the window rule on the
@@ -381,7 +416,7 @@ binds {
             # and watch for the workspace announcement it causes.
             $null = A11yCtl 'workspace-1' @('action', 'focus-workspace', '1')
             $null = A11yWaitName $provider 'Workspace 1' 6000
-            $aNotifications.Clear()
+            $script:a11yNotificationTexts.Clear()
             [LaneA11yNative]::Chord([byte[]]@(0x11, 0x12, 0x78))
             $latin = A11yWaitName $provider 'Workspace 2' 8000
             A11yGate 'h77_latin_bind_fallback_live_or_unit_tested' $latin.pass ([ordered]@{

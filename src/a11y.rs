@@ -367,13 +367,19 @@ mod uia {
                 provider.activity.fetch_add(1, Ordering::Relaxed)
             ));
             let display = BSTR::from(text.as_str());
-            let _ = UiaRaiseNotificationEvent(
+            let raised = UiaRaiseNotificationEvent(
                 &element,
                 NotificationKind_ActionCompleted,
                 NotificationProcessing_ImportantMostRecent,
                 &display,
                 &activity,
             );
+            match raised {
+                // The log is how a user (and the `h77_*` gates) can tell that the
+                // notification really reached UI Automation.
+                Ok(()) => tracing::info!("screen reader: {}", text),
+                Err(error) => tracing::warn!(%error, "the screen reader was not told: {}", text),
+            }
         }
     }
 }
