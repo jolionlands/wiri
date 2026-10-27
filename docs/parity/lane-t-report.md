@@ -1,9 +1,17 @@
 # Lane T — gestures and interactive pointer operations
 
-Branch `meylin/sa-a9a93-6b957`, base `fb34b900`. Reference: pinned niri
+Original branch `meylin/sa-a9a93-6b957`, base `fb34b900`; ported in order onto
+integrated head `edb460a` on `meylin/sa-be85a-6b9ad`. Reference: pinned niri
 `e19df12cf8` Gestures, Configuration:-Gestures, Configuration:-Input,
 `spatial_movement_grab.rs`, `swipe_tracker.rs`, `rubber_band.rs`, and layout
 scrolling gesture code (freshly read through the source reader).
+
+**Live status: pending lead integration cycle.** Lane T behavior has only
+pure, recorded-frame or synthetic unit-test evidence; no H58-H61 gate result
+is claimed. The acceptance scripts are PowerShell-parse-checked only. The
+lead will run the official integrated desktop cycle; this follow-up did not
+run the harness. Cost statements below describe implementation structure,
+not measured live idle/performance results.
 
 ## 1. Spatial mouse gestures
 
@@ -34,9 +42,9 @@ Pure regressions cover threshold/axis lock, bounded history, backwards time,
 release pauses, projection, rubber-band symmetry/derivative, actual-width and
 centered/narrow strip snaps, camera displacement and spring velocity/termination.
 Initial required release tests: **1206 library + 14 CLI passed**, 0 failures;
-one ignored doc example. Final commands and desktop results will be recorded
-below; references to H58-H61 in the matrix identify the acceptance scripts,
-not a claim of a completed run before that evidence is recorded.
+one ignored doc example. Latest aggregate release results are in section 5.
+H58-H61 in the matrix identify planned, parse-checked acceptance scripts only;
+live status is **pending lead integration cycle**.
 
 ## Cost
 
@@ -58,10 +66,24 @@ variable-width, scrolled destination column rather than dividing by the source
 width. Right-click while moving toggles floating/tiling. Cancellation restores
 the original geometry and removes exclusion.
 
-Remaining approximation: tiled drops join an existing column; arbitrary new
-column insertion, cross-output drops and niri's insertion compositor are not
-implemented here. The move row stays partial. H59 covers actual edge actions
-and resize persistence; final live evidence is recorded below.
+Integrated port: W's `grab_for_cancel` / `cancelled_grab_cleanup` and shared
+Move disposition/token remain the single mouse-grab cancellation path. Move
+cancellation keeps W's source restoration and restores the initial floating
+rectangle; Resize cancellation restores its initial rectangle through native
+reconciliation. Resize start owns native-loop exclusion. Right-click floating
+toggles validate the same Move token before execution (an executed layer toggle
+is an explicit action, not undone by later cancellation).
+
+Mouse tiled drops retain W's transactional `finish_window_insert` destination,
+including source-removed geometry, new columns, vertical slots and cross-output
+insertion. Promoted touch/pen drops now use that same destination rather than
+T's old nearest cached-column heuristic. W alone owns the insert hint; no second
+hint/cancel owner was added. T's variable-width/scrolled destination regression
+was adapted to W's selector; H59 now aims at the destination's top tile slot
+rather than a centre point that W may correctly treat as a new-column request.
+Floating drops retain the existing source-output clamping. Niri's insertion
+compositor remains an approximation. H59 is a planned probe for edge actions
+and resize persistence; live status is **pending lead integration cycle**.
 
 ## 3. Precision Touchpad
 
@@ -83,8 +105,9 @@ pause and opt-in/off decoding.
 Bluetooth & devices → Touchpad → Three-finger gestures → Swipes: **Nothing**.
 Windows may otherwise also act on the same swipe. Raw Input does not suppress
 the shell's gestures. No physical three-finger/swipe or real device descriptor
-was exercised by automation; H61 verifies configured-only registration, HWND
-creation and removal, not hardware recognition. Devices that do not expose
+was exercised by automation. H61 is a planned probe for configured-only
+registration, HWND creation and removal, not hardware recognition; its live
+status is **pending lead integration cycle**. Devices that do not expose
 raw PTP reports cannot use this path. Two-finger pinch/hold remain untouched.
 
 ## 4. Drag-and-drop (Windows approximation)
@@ -111,8 +134,9 @@ No idle timer/thread. A message-only HWND exists only with the gestures block.
 
 Pure tests cover capture/held/grab/distance discrimination, speed/scale, delay
 and direction reset, and config/range validation. **No real OLE drag was
-performed** by this automated lane: unit-only evidence is explicit in H60.
-All DnD rows remain partial, not mislabelled as live-verified OLE parity.
+performed** by this automated lane. H60 plans configured-only HWND lifecycle
+checks and labels drag behavior unit-only; live status is **pending lead
+integration cycle**. All DnD rows remain partial, not live-verified OLE parity.
 
 ## 5. Promoted touch and tablet pen (synthetic-only)
 
@@ -134,6 +158,36 @@ input forwarding is installed. Mapping/calibration/pressure remain Windows-owned
 Five pure tests cover signature/type discrimination, primary/secondary pairing,
 release order, pen isolation, axis/mode selection and independent opt-in/off.
 There was no physical touchscreen or tablet pen test and no claim of hardware
-support. H61 explicitly records synthetic-only touch/pen evidence. The two rows
-stay partial. Item 5 required release tests: **1222 library + 14 CLI passed**,
-zero failures, one ignored doc example; warnings-denied all-target check passed.
+support. The planned H61 evidence field labels touch/pen synthetic-only; it
+does not exercise promoted-event behavior live. Live status is **pending lead
+integration cycle**. The two rows stay partial. Item 5 required release tests:
+**1222 library + 14 CLI passed**, zero failures, one ignored doc example;
+warnings-denied all-target check passed.
+
+## T2 integrated port verification
+
+On `edb460a` plus all seven ordered ports, with `RUSTFLAGS=-D warnings` and
+`-j 2`: `cargo build --release`, `cargo check --release --all-targets` and
+`cargo test --release` all passed. Tests: **1480 library + 14 CLI**, zero
+failures; main has no tests and one doc example remains ignored. Both changed
+PowerShell files (`scripts/live-test.ps1`, `scripts/live-phases/lane-t.ps1`)
+parsed with **zero errors**. No live harness, physical input-device test or
+shared-desktop probe was run. H58-H61 remain for the lead's official cycle.
+The matrix's existing aggregate totals are deliberately unchanged.
+
+Reapplication used local text three-way application because runner policy
+refused `git cherry-pick`. Overlap resolutions:
+
+- `CHANGELOG.md`: retain integrated entries and all T entries.
+- `src/input/low_level_hook.rs`: screenshot pass-through before captured middle
+  and promoted touch/pen processing; separate rule-wheel and Mod-middle blocks;
+  W cancellation/start/drop ownership retained as described in section 2.
+- `src/layout/engine.rs`: retain all integrated modules/fields and add T's
+  gestures, interactive and DnD modules/state.
+- `scripts/live-test.ps1`: retain every phase and add T immediately after F.
+
+Config, message-loop and action additions applied alongside the integrated
+System/LayoutFocus/WorkspaceAction/MonitorAction paths. Nothing from T was
+omitted; its old nearest-column drop is intentionally superseded by W, and its
+H59 target was adjusted accordingly. Physical hardware, OLE and compositor
+limitations above remain; no new live verification is implied.

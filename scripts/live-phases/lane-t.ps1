@@ -276,7 +276,9 @@ public static class LaneTNative {
         TAction 't-source-width' @('set-column-width','450')
         $c = TOpen 'destination'; TAction 't-target-width' @('set-column-width','350')
         $pt = TPoint $a 0.6 0.4; $target = Rc $c
-        TDrag $a 'L' $pt.X $pt.Y ([int]($target.L+$target.W/2)-$pt.X) 0
+        # W compares vertical tile slots with column boundaries. Aim just inside
+        # the target's top slot, not its centre (which may request a new column).
+        TDrag $a 'L' $pt.X $pt.Y ([int]($target.L+$target.W/2)-$pt.X) ($target.T+2-$pt.Y)
         $list = @((TCtl 't-drop-list' @('--json','window-list') | ConvertFrom-Json).result)
         TGate 'h59_move_drops_into_actual_destination_column' (((ColOf $list $a) -eq (ColOf $list $c)) -and ((ColOf $list $a) -ne (ColOf $list $b))) $list
         $pt = TPoint $a
