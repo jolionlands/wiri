@@ -692,6 +692,7 @@ impl MessageLoop {
         keyboard::ENGINE
             .lock()
             .configure(&current_hotkeys, &bind_options);
+        keyboard::configure_latin_fallback();
         let (mut registered_ids, _) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
         update_current_bindings_snapshot(
@@ -755,6 +756,7 @@ impl MessageLoop {
                     keyboard::ENGINE
                         .lock()
                         .configure(&new_hotkeys, &new_options);
+                    keyboard::configure_latin_fallback();
                     let (new_ids, _) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
                     update_current_bindings_snapshot(
@@ -1682,7 +1684,12 @@ pub fn show_hotkey_overlay(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> u
         hide_not_bound
     );
     let count = rows.len();
+    let was_visible = cs.is_visible();
     cs.toggle(rows);
+    // niri announces the hotkey list when it opens (not when it closes).
+    if !was_visible {
+        crate::a11y::announce_hotkey_list();
+    }
     count
 }
 

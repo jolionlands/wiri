@@ -9,6 +9,7 @@ pub mod hotkey;
 pub mod interactive;
 pub mod keyboard;
 pub mod keyboard_config;
+pub mod keylayout;
 pub mod keynames;
 pub mod layout_actions;
 pub mod low_level_hook;

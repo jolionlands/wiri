@@ -79,6 +79,8 @@ pub struct KeyboardEngine {
     // Snapshot on the first down: release binds don't depend on modifiers still held.
     captured: HashMap<u32, ((u32, u32), Binding)>,
     inhibited: bool,
+    /// niri's Latin-key fallback, consulted only when the observed key names no bind.
+    latin: Option<std::sync::Arc<dyn super::keylayout::LatinFallback>>,
 }
 impl Default for KeyboardEngine {
     fn default() -> Self {
@@ -87,10 +89,32 @@ impl Default for KeyboardEngine {
             down: [false; 256],
             captured: HashMap::new(),
             inhibited: false,
+            latin: None,
         }
     }
 }
 impl KeyboardEngine {
+    /// Install (or clear) the Latin-key fallback.  Called at startup and on every hotkey
+    /// reload; never per keystroke.
+    pub fn set_latin_fallback(
+        &mut self,
+        fallback: Option<std::sync::Arc<dyn super::keylayout::LatinFallback>>,
+    ) {
+        self.latin = fallback;
+    }
+
+    /// The bind an observed `(modifiers, virtual key)` names.
+    ///
+    /// Windows virtual keys are layout-independent for the letters on almost every layout,
+    /// so the key itself usually matches.  When it does not, the same physical key's Latin
+    /// (US) virtual key is tried — niri's Latin-key fallback (wiki:Configuration:-Key-Bindings).
+    fn bound_key(&self, mods: u32, vk: u32) -> Option<(u32, u32)> {
+        if self.bindings.contains_key(&(mods, vk)) {
+            return Some((mods, vk));
+        }
+        let latin = self.latin.as_ref()?.latin_key(vk)?;
+        (latin != vk && self.bindings.contains_key(&(mods, latin))).then_some((mods, latin))
+    }
     pub fn configure(
         &mut self,
         rows: &[(u32, u32, Action)],
@@ -204,7 +228,9 @@ impl KeyboardEngine {
             return Decision::default();
         }
         let mods = self.modifiers();
-        let key = (mods, vk);
+        let Some(key) = self.bound_key(mods, vk) else {
+            return Decision::default();
+        };
         if !self.active(key) {
             return Decision::default();
         }
@@ -234,9 +260,20 @@ impl KeyboardEngine {
 pub static ENGINE: LazyLock<Mutex<KeyboardEngine>> =
     LazyLock::new(|| Mutex::new(KeyboardEngine::default()));
 
+/// Install the Latin-key fallback for the layout that is active now.
+///
+/// Called at startup and on every hotkey reload — never per keystroke — so the hook only
+/// ever sees a cached virtual-key mapping.
+pub fn configure_latin_fallback() {
+    ENGINE
+        .lock()
+        .set_latin_fallback(super::keylayout::system_fallback());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::MOD_CTRL;
     fn engine(options: BindOptions) -> KeyboardEngine {
         let mut e = KeyboardEngine::default();
         e.configure(
@@ -516,5 +553,135 @@ mod tests {
             ..Default::default()
         });
         assert!(e.fallback((8, 0x54), false, t).is_none());
+    }
+
+    // ── niri's Latin-key fallback, with fake layouts ──────────────────────────────────
+
+    /// A layout whose observed virtual keys are not the Latin ones: `key` is what the hook
+    /// reports, `latin` the virtual key the same physical key has in the Latin (US) layout.
+    struct FakeLayout {
+        pairs: Vec<(u32, Option<u32>)>,
+    }
+
+    impl FakeLayout {
+        fn new(
+            pairs: &[(u32, Option<u32>)],
+        ) -> std::sync::Arc<dyn super::super::keylayout::LatinFallback> {
+            std::sync::Arc::new(Self {
+                pairs: pairs.to_vec(),
+            })
+        }
+    }
+
+    impl super::super::keylayout::LatinFallback for FakeLayout {
+        fn latin_key(&self, vk: u32) -> Option<u32> {
+            self.pairs
+                .iter()
+                .find(|(observed, _)| *observed == vk)
+                .and_then(|(_, latin)| *latin)
+        }
+    }
+
+    #[test]
+    fn a_latin_bind_fires_on_a_layout_that_reports_another_virtual_key() {
+        // The fake "Cyrillic" layout reports the extra key 0xE2 for the physical T key;
+        // en-US would say 0x54.
+        let t = Instant::now();
+        let mut e = KeyboardEngine::default();
+        e.configure(&[(MOD_CTRL, 0x54, Action::Refresh)], &HashMap::new());
+        e.set_latin_fallback(Some(FakeLayout::new(&[(0xE2, Some(0x54))])));
+        e.event(0x11, true, t); // Ctrl
+        let d = e.event(0xE2, true, t);
+        assert!(d.consume);
+        assert_eq!(d.action, Some(Action::Refresh));
+        // The pair still owns the key-up, so nothing leaks to the application.
+        assert!(e.event(0xE2, false, t).consume);
+        assert!(!e.event(0x11, false, t).consume);
+
+        // Without the fallback that layout's key names no bind at all.
+        let mut plain = KeyboardEngine::default();
+        plain.configure(&[(MOD_CTRL, 0x54, Action::Refresh)], &HashMap::new());
+        plain.event(0x11, true, t);
+        assert!(!plain.event(0xE2, true, t).consume);
+        assert!(!plain.event(0xE2, false, t).consume);
+    }
+
+    #[test]
+    fn the_latin_fallback_is_installed_and_cleared_like_a_reload() {
+        let t = Instant::now();
+        let mut e = KeyboardEngine::default();
+        e.configure(&[(MOD_CTRL, 0x54, Action::Refresh)], &HashMap::new());
+        e.set_latin_fallback(Some(FakeLayout::new(&[(0xE2, Some(0x54))])));
+        e.event(0x11, true, t);
+        assert_eq!(e.event(0xE2, true, t).action, Some(Action::Refresh));
+        e.event(0xE2, false, t);
+        // A reload that installs no fallback (Windows could not name the layout) matches
+        // the plain virtual keys only.
+        e.set_latin_fallback(None);
+        assert!(e.event(0xE2, true, t).action.is_none());
+        e.event(0xE2, false, t);
+        assert_eq!(e.event(0x54, true, t).action, Some(Action::Refresh));
+    }
+
+    #[test]
+    fn the_observed_key_wins_over_its_latin_twin_and_unmapped_keys_never_match() {
+        let t = Instant::now();
+        let mut e = KeyboardEngine::default();
+        // The "layout" maps the observed key onto a *different* bind than the key itself.
+        e.configure(
+            &[(MOD_CTRL, 0xE2, Action::Quit), (MOD_CTRL, 0x54, Action::Refresh)],
+            &HashMap::new(),
+        );
+        e.set_latin_fallback(Some(FakeLayout::new(&[
+            (0xE2, Some(0x54)),
+            (0xE3, None),
+        ])));
+        e.event(0x11, true, t);
+        // The layout-specific bind is what fires; the Latin twin is only a fallback.
+        assert_eq!(e.event(0xE2, true, t).action, Some(Action::Quit));
+        e.event(0xE2, false, t);
+        // A key the layout does not map, and a Latin twin that no bind names.
+        assert!(e.event(0xE3, true, t).action.is_none());
+        assert!(!e.event(0xE3, true, t).consume);
+        assert!(e.event(0xE4, true, t).action.is_none());
+        assert!(!e.event(0xE4, true, t).consume);
+    }
+
+    #[test]
+    fn a_latin_twin_that_is_the_same_key_is_not_tried_twice() {
+        let t = Instant::now();
+        let mut e = KeyboardEngine::default();
+        e.configure(&[(MOD_CTRL, 0x54, Action::Refresh)], &HashMap::new());
+        // Every Latin layout maps the key onto itself; the fallback must not change
+        // anything (and, in particular, must not fire a bind twice).
+        e.set_latin_fallback(Some(FakeLayout::new(&[(0x54, Some(0x54))])));
+        e.event(0x11, true, t);
+        let d = e.event(0x54, true, t);
+        assert!(d.consume);
+        assert_eq!(d.action, Some(Action::Refresh));
+        // A key that no bind names stays unbound.
+        assert!(!e.event(0x41, true, t).consume);
+    }
+
+    #[test]
+    fn a_release_bind_fires_through_the_latin_fallback_too() {
+        let t = Instant::now();
+        let mut e = KeyboardEngine::default();
+        e.configure(
+            &[(MOD_CTRL, 0x54, Action::Refresh)],
+            &HashMap::from([(
+                (MOD_CTRL, 0x54),
+                BindOptions {
+                    release: true,
+                    ..Default::default()
+                },
+            )]),
+        );
+        e.set_latin_fallback(Some(FakeLayout::new(&[(0xE2, Some(0x54))])));
+        e.event(0x11, true, t);
+        let down = e.event(0xE2, true, t);
+        assert!(down.consume && down.action.is_none());
+        e.event(0x11, false, t);
+        assert_eq!(e.event(0xE2, false, t).action, Some(Action::Refresh));
     }
 }
