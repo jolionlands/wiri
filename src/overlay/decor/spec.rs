@@ -1205,6 +1205,8 @@ mod tests {
                         to: Rgba::new(255, 255, 255, 255),
                         angle: if horizontal { 90.0 } else { 180.0 },
                         relative_to_view,
+                        space: GradientSpace::Srgb,
+                        hue: GradientHue::default(),
                     });
                     2
                 ];

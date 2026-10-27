@@ -82,40 +82,23 @@ impl TilingEngine {
         self.apply_layout_for_monitor(output, backend);
     }
 
-    /// Insert by rotating a new empty workspace through the existing ordered places.
-    /// This deliberately reuses the engine's workspace move/tie model (including floats,
-    /// minimized slots, remembered activity and single-output names).
+    /// Insert a new empty workspace at the visible place `before` names (`None`: below the
+    /// last one). Workspaces are stable objects: their names, IPC ids, floating homes,
+    /// minimized slots and remembered activity are all keyed by the workspace key, so
+    /// nothing is rotated. The new object gets a fresh key and only the visible order moves.
     fn insert_overview_workspace(&mut self, output: OutputId, before: Option<i32>) -> Option<i32> {
         let m = self.monitors.get_mut(&output)?;
-        let mut ids = m.workspace_ids();
-        let new_id = ids.last().copied().unwrap_or(-1).checked_add(1)?;
         let index = match before {
-            Some(id) => ids.iter().position(|w| *w == id)?,
-            None => ids.len(),
+            Some(id) => m.workspace_ids().iter().position(|w| *w == id)?,
+            None => m.workspace_ids().len(),
         };
-        m.workspaces.insert(new_id, crate::layout::Workspace::new());
-        ids.push(new_id);
-        for i in (index..ids.len() - 1).rev() {
-            let (a, b) = (ids[i], ids[i + 1]);
-            let m = self.monitors.get_mut(&output)?;
-            let left = m.workspaces.remove(&a)?;
-            let right = m.workspaces.remove(&b)?;
-            m.workspaces.insert(a, right);
-            m.workspaces.insert(b, left);
-            let swap = |id: i32| {
-                if id == a {
-                    b
-                } else if id == b {
-                    a
-                } else {
-                    id
-                }
-            };
-            m.active_workspace = swap(m.active_workspace);
-            m.previous_workspace = m.previous_workspace.map(swap);
-            self.swap_workspace_ties(output, a, b);
+        let id = m.next_workspace_id();
+        if m.workspaces.contains_key(&id) {
+            return None;
         }
-        ids.get(index).copied()
+        m.insert_workspace(id, crate::layout::Workspace::new());
+        m.move_workspace_to_position(id, index);
+        Some(id)
     }
 
     pub(super) fn overview_drop_window(
@@ -226,22 +209,30 @@ mod tests {
         assert_eq!(e.monitors.get(&o).unwrap().active_workspace, 1);
         assert!(e.is_overview());
     }
+    /// The visible 0-based place of the workspace `window` is on.
+    fn place_of(e: &TilingEngine, o: OutputId, window: u32) -> usize {
+        let (_, workspace, _) = e.locate_window(WindowId::new(window)).unwrap();
+        let ids = e.monitors.get(&o).unwrap().workspace_ids();
+        ids.iter().position(|id| *id == workspace).unwrap()
+    }
     #[test]
     fn insertion_above_between_and_below_preserves_order_and_selection() {
+        // The dropped window ends alone on the new workspace at the requested visible
+        // place; the old workspaces keep their keys and their relative order.
         for (before, expected) in [(Some(0), 0), (Some(1), 1), (None, 2)] {
             let (mut e, o) = engine();
             let b = BackendHandle::default_for_test();
             e.enter_overview(&b);
             e.overview_drop_window(WindowId::new(1), DropTarget::InsertBefore(before), &b);
-            assert_eq!(e.locate_window(WindowId::new(1)).unwrap().1, expected);
+            assert_eq!(place_of(&e, o, 1), expected);
             assert_eq!(
                 e.monitors.get(&o).unwrap().focus_window,
                 Some(WindowId::new(1))
             );
-            assert_eq!(
-                e.locate_window(WindowId::new(3)).unwrap().1,
-                if before.is_some() { 2 } else { 1 }
-            );
+            // Window 3 stays on workspace key 1; window 2 stays on workspace key 0.
+            assert_eq!(e.locate_window(WindowId::new(2)).unwrap().1, 0);
+            assert_eq!(e.locate_window(WindowId::new(3)).unwrap().1, 1);
+            assert_eq!(place_of(&e, o, 3), if before.is_some() { 2 } else { 1 });
             assert!(e.is_overview());
         }
     }
@@ -265,15 +256,29 @@ mod tests {
         assert!(e.is_overview());
     }
     #[test]
-    fn workspace_insertion_carries_names_with_their_content() {
+    fn workspace_insertion_keeps_names_ids_and_activity_with_their_workspace() {
         let (mut e, o) = engine();
-        e.workspace_names.insert(0, "first".into());
-        e.workspace_names.insert(1, "second".into());
-        assert_eq!(e.insert_overview_workspace(o, Some(0)), Some(0));
-        assert_eq!(e.workspace_name(0), None);
-        assert_eq!(e.workspace_name(1).as_deref(), Some("first"));
-        assert_eq!(e.workspace_name(2).as_deref(), Some("second"));
-        assert_eq!(e.monitors.get(&o).unwrap().active_workspace, 1);
+        for (id, name) in [(0, "first"), (1, "second")] {
+            let m = e.monitors.get_mut(&o).unwrap();
+            m.workspaces.get_mut(&id).unwrap().name = Some(name.into());
+        }
+        let (ipc0, ipc1) = {
+            let m = e.monitors.get(&o).unwrap();
+            (m.workspaces[&0].ipc_id, m.workspaces[&1].ipc_id)
+        };
+        let new = e.insert_overview_workspace(o, Some(0)).unwrap();
+        assert!(new != 0 && new != 1);
+        assert_eq!(e.workspace_name_on(o, new), None);
+        assert_eq!(e.workspace_name_on(o, 0).as_deref(), Some("first"));
+        assert_eq!(e.workspace_name_on(o, 1).as_deref(), Some("second"));
+        let m = e.monitors.get(&o).unwrap();
+        // Only the visible order changed; each workspace keeps its key and IPC id.
+        assert_eq!(m.workspace_ids(), vec![new, 0, 1]);
+        assert_eq!(m.workspaces[&0].ipc_id, ipc0);
+        assert_eq!(m.workspaces[&1].ipc_id, ipc1);
+        assert!(m.workspaces[&new].ipc_id != ipc0 && m.workspaces[&new].ipc_id != ipc1);
+        assert_eq!(m.active_workspace, 0);
+        assert_eq!(e.insert_overview_workspace(o, Some(99)), None);
     }
     #[test]
     fn right_scroll_and_normal_workspace_bind_keep_camera_open() {

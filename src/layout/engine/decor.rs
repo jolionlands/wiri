@@ -761,6 +761,7 @@ mod tests {
             focused_window,
             Rect::new(0, 0, 1366, 768),
             None,
+            None,
         )
         .into_iter()
         .map(|spec| match spec.content {
