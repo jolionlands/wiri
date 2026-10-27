@@ -272,8 +272,8 @@ pub fn configure_latin_fallback() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::MOD_CTRL;
+    use super::*;
     fn engine(options: BindOptions) -> KeyboardEngine {
         let mut e = KeyboardEngine::default();
         e.configure(
@@ -629,13 +629,13 @@ mod tests {
         let mut e = KeyboardEngine::default();
         // The "layout" maps the observed key onto a *different* bind than the key itself.
         e.configure(
-            &[(MOD_CTRL, 0xE2, Action::Quit), (MOD_CTRL, 0x54, Action::Refresh)],
+            &[
+                (MOD_CTRL, 0xE2, Action::Quit),
+                (MOD_CTRL, 0x54, Action::Refresh),
+            ],
             &HashMap::new(),
         );
-        e.set_latin_fallback(Some(FakeLayout::new(&[
-            (0xE2, Some(0x54)),
-            (0xE3, None),
-        ])));
+        e.set_latin_fallback(Some(FakeLayout::new(&[(0xE2, Some(0x54)), (0xE3, None)])));
         e.event(0x11, true, t);
         // The layout-specific bind is what fires; the Latin twin is only a fallback.
         assert_eq!(e.event(0xE2, true, t).action, Some(Action::Quit));

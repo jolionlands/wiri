@@ -2533,7 +2533,11 @@ impl Decoder {
                         cfg.accessibility = value;
                     }
                 }
-                _ => self.unknown(child, "'accessibility'", &["off", "enabled", "announcements"]),
+                _ => self.unknown(
+                    child,
+                    "'accessibility'",
+                    &["off", "enabled", "announcements"],
+                ),
             }
         }
     }
@@ -3422,7 +3426,10 @@ mod tests {
             errors(&bad)
         );
         // Without the key, nothing is blocked out.
-        assert_eq!(clean("window-rule { opacity 0.5; }").window_rules[0].block_out_from, None);
+        assert_eq!(
+            clean("window-rule { opacity 0.5; }").window_rules[0].block_out_from,
+            None
+        );
     }
 
     #[test]
@@ -3434,7 +3441,10 @@ mod tests {
             warnings.iter().any(|w| w.contains("shadow")),
             "{warnings:?}"
         );
-        assert!(errors(&load("layer-rule { match namespace=\"bar\"; shadow { on; } }")).is_empty());
+        assert!(errors(&load(
+            "layer-rule { match namespace=\"bar\"; shadow { on; } }"
+        ))
+        .is_empty());
     }
 
     #[test]

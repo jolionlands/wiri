@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(us_virtual_key(0x39), Some(0x20)); // space
         assert_eq!(us_virtual_key(0x3B), Some(0x70)); // F1
         assert_eq!(us_virtual_key(0x58), Some(0x7C)); // F12
-        // Nothing a bind can name.
+                                                      // Nothing a bind can name.
         assert_eq!(us_virtual_key(0x00), None);
         assert_eq!(us_virtual_key(0x60), None);
     }

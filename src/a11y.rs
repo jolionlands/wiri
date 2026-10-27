@@ -136,7 +136,11 @@ pub fn announce_workspace(name: Option<&str>, number: i32) {
 }
 
 pub fn announce_overview(opened: bool) {
-    announce(if opened { OVERVIEW_OPENED } else { OVERVIEW_CLOSED });
+    announce(if opened {
+        OVERVIEW_OPENED
+    } else {
+        OVERVIEW_CLOSED
+    });
 }
 
 pub fn announce_alt_tab(title: Option<&str>) {
@@ -177,8 +181,8 @@ mod uia {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Accessibility::{
-        UiaHostProviderFromHwnd, UiaRaiseNotificationEvent, UiaReturnRawElementProvider,
         NotificationKind_ActionCompleted, NotificationProcessing_ImportantMostRecent,
+        UiaHostProviderFromHwnd, UiaRaiseNotificationEvent, UiaReturnRawElementProvider,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW,
