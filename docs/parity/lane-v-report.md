@@ -41,6 +41,25 @@ wheel accumulation, scrolling, insertion/order/names and opening/closing sources
 H62/H63 exercise camera and pointer messages on the owned host, source lifecycle
 and guarded normal close bindings; no foreign app is clicked or closed.
 
+## Item 3: event-driven hot corners
+
+`input/hot_corner.rs` publishes coalesced coordinates/travel generations from the
+existing `WH_MOUSE_LL` callback, then does all policy/engine work on its existing
+message thread. Exact physical `rcMonitor` pixels (including negative origins),
+not work-area or logical coordinates, select the enabled corners. The default is
+top-left; explicit names replace it. Global and per-output blocks inherit/replace
+as pinned niri does. A 120 ms one-shot dwell toggles once per entry, is consumed
+before action, and cannot reopen after an IPC close while the cursor stays parked.
+Reload/hotplug park rather than synthesizing entry. Modal pick/screenshot/recent
+and window grabs suppress activation. No idle timer or additional thread exists.
+
+Pure tests cover config, physical corners, negative origins, coalesced leave/return,
+cancellation, suppression and parked reload. The isolated item-3 warning-denied
+release run passed 1281 library + 14 CLI tests (one doctest ignored).
+H64 uses physical cursor movements
+under the harness lock, restores the cursor/config and only stops its retained
+process. Multi-display isolation is unit-tested only on the one-display laptop.
+
 ## Validation ledger
 
 Full warning-denied release build/test/check, prescribed formatter, and the locked

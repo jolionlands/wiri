@@ -3,6 +3,7 @@ pub mod diagnostics;
 pub mod effects;
 pub mod error;
 pub mod gestures_config;
+pub mod hot_corner_config;
 pub mod kdl;
 pub mod loader;
 pub mod overview_config;

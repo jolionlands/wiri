@@ -4,17 +4,25 @@ use crate::config::kdl::Node;
 impl Decoder {
     pub(super) fn decode_gestures(&mut self, node: &Node, cfg: &mut GesturesConfig) {
         self.section(node);
-        cfg.enabled = true;
+        // The drag/capture adapter is opted into by an empty `gestures {}` or a drag block.
+        // A block holding only `hot-corners` configures the overview and leaves it off.
+        let drags = |c: &Node| {
+            matches!(
+                norm(&c.name).as_str(),
+                "dnd-edge-view-scroll" | "dnd-edge-workspace-switch"
+            )
+        };
+        if node.kids().is_empty() || node.kids().iter().any(drags) {
+            cfg.enabled = true;
+        }
         for child in node.kids() {
             let name = norm(&child.name);
             let (target, trigger) = match name.as_str() {
                 "dnd-edge-view-scroll" => (&mut cfg.view, "trigger-width"),
                 "dnd-edge-workspace-switch" => (&mut cfg.workspace, "trigger-height"),
+                // An explicit block replaces any earlier one (the default is top-left).
                 "hot-corners" => {
-                    self.unsupported(
-                        child,
-                        "hot corners are not implemented by this drag adapter",
-                    );
+                    cfg.hot_corners = self.decode_hot_corners(child);
                     continue;
                 }
                 _ => {
@@ -71,5 +79,23 @@ mod tests {
         assert!(
             decode("gestures { dnd-edge-workspace-switch { trigger-width 50; }; }").has_errors()
         );
+    }
+
+    #[test]
+    fn hot_corners_alone_do_not_opt_into_the_drag_adapter() {
+        let decode = |s| crate::config::decode::decode_text(s, "", None);
+        let only = decode("gestures { hot-corners { top-right; }; }");
+        assert!(only.issues.is_empty(), "{:?}", only.issues);
+        assert!(!only.config.gestures.enabled);
+        assert!(only.config.gestures.hot_corners.top_right);
+        // An empty block, or any drag block next to hot-corners, keeps T2's opt-in.
+        assert!(decode("gestures {}").config.gestures.enabled);
+        let both = decode(
+            "gestures { hot-corners { off; }; dnd-edge-view-scroll { delay-ms 50; }; }",
+        );
+        assert!(both.issues.is_empty(), "{:?}", both.issues);
+        assert!(both.config.gestures.enabled);
+        assert!(both.config.gestures.hot_corners.off);
+        assert_eq!(both.config.gestures.view.delay_ms, 50);
     }
 }

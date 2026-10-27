@@ -163,6 +163,11 @@ impl Runtime {
 }
 static PICK: LazyLock<Mutex<Runtime>> = LazyLock::new(|| Mutex::new(Runtime::default()));
 
+/// Read-only modal guard for message-thread pointer consumers.
+pub fn is_active() -> bool {
+    PICK.lock().input.active.is_some()
+}
+
 struct RequestGuard(u64);
 impl Drop for RequestGuard {
     fn drop(&mut self) {
