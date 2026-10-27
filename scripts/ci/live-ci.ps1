@@ -236,13 +236,17 @@ public static class WiriCiNoise {
                 foreach ($prop in $summary.PSObject.Properties) {
                     if ($prop.Name -like "${p}_*") { Write-Output ('  {0} = {1}' -f $prop.Name, (ConvertTo-Json $prop.Value -Compress -Depth 4)) }
                 }
-                $small = Get-ChildItem $evidence -Filter "$p-*" -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Extension -in '.json', '.txt' -and $_.Length -le 8192 } | Sort-Object LastWriteTime
-                foreach ($f in @($small)) {
-                    if ($printed + $f.Length -gt 65536) { Write-Output "---- (evidence output capped at 64 KB)"; break }
-                    $printed += $f.Length
+                # The purpose-built *.evidence.json files first; every file is cut to its first 3 KB.
+                $files = @(Get-ChildItem $evidence -Filter "$p-*" -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -in '.json', '.txt' -and $_.Length -gt 0 } |
+                    Sort-Object @{ Expression = { $_.Name -notlike '*.evidence.json' } }, LastWriteTime)
+                foreach ($f in $files) {
+                    $text = Get-Content $f.FullName -Raw
+                    if ($text.Length -gt 3072) { $text = $text.Substring(0, 3072) + "`n... ($($f.Length) bytes, truncated)" }
+                    if ($printed + $text.Length -gt 65536) { Write-Output '---- (evidence output capped at 64 KB)'; break }
+                    $printed += $text.Length
                     Write-Output "---- $($f.Name)"
-                    Write-Output (Get-Content $f.FullName -Raw)
+                    Write-Output $text
                 }
             }
         }
