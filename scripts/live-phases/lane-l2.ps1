@@ -375,6 +375,9 @@ public static class LaneL2Native {
         $badRc = [string]$bad.rc
         L2Gate 'h76_bad_arguments_rejected' (($badRc -ne '0') -and -not [string]::IsNullOrWhiteSpace($bad.text)) @{ rc = $badRc; output = $bad.text }
         L2Checkpoint 'gates-done'
+    } catch {
+        # A failed probe ends this lane only: its remaining gates stay false and the error is kept.
+        $l2Details['error'] = ($_ | Out-String).Trim()
     } finally {
         foreach ($h in $l2Forms) { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
         L2Stop 'lane-l2-quit'

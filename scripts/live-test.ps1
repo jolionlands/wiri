@@ -3110,36 +3110,38 @@ $summary = [ordered]@{
     h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
     steps = $steps
 }
-. (Join-Path $PSScriptRoot 'live-phases\lane-a.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-h.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-g.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-z.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-s.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-w.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-k.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-f.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-t.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-c2.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-c2-binds.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-c2-keyboard.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-c2-session.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-c2-workspaces.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-v.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-v-hot-corner.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-v-tabs.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-l2.ps1')
+# One lane's unexpected error must not end the run: its gates stay false and the error is recorded.
+function LanePhaseError([string]$lane, $err) { $summary["phase_error_$lane"] = ($err | Out-String).Trim() }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-a.ps1') } catch { LanePhaseError 'lane_a' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1') } catch { LanePhaseError 'lane_b' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1') } catch { LanePhaseError 'lane_d' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-h.ps1') } catch { LanePhaseError 'lane_h' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-g.ps1') } catch { LanePhaseError 'lane_g' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-z.ps1') } catch { LanePhaseError 'lane_z' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-s.ps1') } catch { LanePhaseError 'lane_s' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-w.ps1') } catch { LanePhaseError 'lane_w' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-k.ps1') } catch { LanePhaseError 'lane_k' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-f.ps1') } catch { LanePhaseError 'lane_f' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-t.ps1') } catch { LanePhaseError 'lane_t' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2.ps1') } catch { LanePhaseError 'lane_c2' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-binds.ps1') } catch { LanePhaseError 'lane_c2_binds' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-keyboard.ps1') } catch { LanePhaseError 'lane_c2_keyboard' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-session.ps1') } catch { LanePhaseError 'lane_c2_session' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-workspaces.ps1') } catch { LanePhaseError 'lane_c2_workspaces' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-v.ps1') } catch { LanePhaseError 'lane_v' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-hot-corner.ps1') } catch { LanePhaseError 'lane_v_hot_corner' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-tabs.ps1') } catch { LanePhaseError 'lane_v_tabs' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-l2.ps1') } catch { LanePhaseError 'lane_l2' $_ }
 # Lane P: pointer-device settings, the hotkey overlay's startup options and the
 # dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
 # so nothing here changes this machine's real pointer or touchpad settings.
-. (Join-Path $PSScriptRoot 'live-phases\lane-p.ps1')
-. (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1')
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-p.ps1') } catch { LanePhaseError 'lane_p' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1') } catch { LanePhaseError 'lane_a11y' $_ }
 # Lane LAST: niri's `cursor { hide-when-typing; hide-after-inactive-ms }` and the tablet
 # stylus binds.  hide-when-typing is checked only in lane P's dry-run mode; the inactivity
 # test starts one private daemon whose own explicit hide/restore is the only cursor change,
 # and its `finally` reloads the user's cursor scheme unconditionally.
-. (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1')
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1') } catch { LanePhaseError 'lane_last' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
@@ -3149,7 +3151,7 @@ if ($env:WIRI_LIVE_CI -eq '1') {
         }
     })
 }
-. (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') # p_* numeric information only; never pass/fail
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') } catch { LanePhaseError 'lane_e_perf' $_ } # p_* numeric information only; never pass/fail
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }
