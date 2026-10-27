@@ -28,7 +28,7 @@ impl TilingEngine {
 
     /// `layout { preset-window-heights }`, or niri's default thirds/half/two-thirds.
     pub(super) fn window_height_presets(&self, output: OutputId) -> Vec<SizeSpec> {
-        let configured = &self.effective_config(output).preset_window_heights;
+        let configured = &self.active_workspace_config(output).preset_window_heights;
         if configured.is_empty() {
             Self::PRESET_WINDOW_PROPORTIONS
                 .iter()
@@ -55,7 +55,7 @@ impl TilingEngine {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        let cfg = self.effective_config(output).clone();
+        let cfg = self.active_workspace_config(output).clone();
         let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
         // The column's room: the view height less the outer gaps, borders and the gaps
         // between the tiles — the same numbers the layout pass uses.

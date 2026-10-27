@@ -68,7 +68,7 @@ impl TilingEngine {
             return;
         };
         self.refresh_strip_widths(output);
-        let cfg = self.effective_config(output).clone();
+        let cfg = self.active_workspace_config(output).clone();
         let (view, default_width) = {
             let Some(monitor) = self.monitors.get(&output) else {
                 return;

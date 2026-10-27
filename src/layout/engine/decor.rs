@@ -440,7 +440,7 @@ impl TilingEngine {
         output_id: OutputId,
         view: Rect,
     ) -> Option<crate::overlay::decor::DecorSpec> {
-        let cfg = self.effective_config(output_id);
+        let cfg = self.active_workspace_config(output_id);
         let color = cfg
             .fullscreen_backdrop_color
             .as_deref()
