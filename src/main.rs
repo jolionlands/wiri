@@ -299,6 +299,9 @@ async fn main() -> Result<()> {
         let summary = wiri::config::failure_summary(&config_path, &startup_decoded.issues);
         startup_error = Some(summary.clone());
         warn!("Using defaults (config error: {})", summary);
+        // Narrator/NVDA hear the same error the balloon shows (niri announces config errors
+        // too); a config that failed to load cannot have turned announcements off.
+        wiri::a11y::announce_config_error(&summary);
         if !startup_decoded.config.disable_failed_config_notification {
             pending_balloon = Some((
                 "wiri: config error".to_string(),
@@ -315,6 +318,12 @@ async fn main() -> Result<()> {
         );
         startup_decoded.config
     };
+
+    // Screen-reader announcements and `block-out-from` come from the same config the rest
+    // of startup reads: announce only when `accessibility` allows it, and let wiri's own
+    // overlays follow the rules before any of them exists.
+    wiri::a11y::set_enabled(config.accessibility);
+    wiri::window::block_out::install(&config.layer_rules, &config.window_rules);
 
     // Start config file watcher for live-reload support. The watcher publishes the result of
     // each reload (the new `Config`, or what is wrong with the file) on the broadcast channel
@@ -812,6 +821,18 @@ async fn main() -> Result<()> {
                             None => format!("Workspace {}", ws_id + 1),
                         }
                     };
+                    // niri announces a workspace *switch*, not the state wiri starts in: a
+                    // screen reader hears "Workspace <name>" (or "Workspace <n>").
+                    if last.is_some() {
+                        let eng = engine.read();
+                        match eng.monitors().focused_id() {
+                            Some(oid) => wiri::a11y::announce_workspace(
+                                eng.workspace_name_on(oid, ws_id).as_deref(),
+                                eng.workspace_number_on(oid, ws_id),
+                            ),
+                            None => wiri::a11y::announce_workspace(None, ws_id + 1),
+                        }
+                    }
                     // Show the overlay centred over the focused monitor so it
                     // lands on the screen the user is looking at — falls back
                     // to the primary monitor if no focused monitor is set.
@@ -1067,6 +1088,7 @@ impl<'a> ReloadCtx<'a> {
     }
 
     fn apply(&self, config: Config, warnings: usize) {
+        configure_a11y_and_block_out(&config);
         apply_loaded_config(
             config,
             self.engine,
@@ -1094,6 +1116,9 @@ impl<'a> ReloadCtx<'a> {
             "Config reload failed - the last good config stays in use: {}",
             summary
         );
+        // A failed reload is announced even when the balloon is off: the screen reader
+        // user has no other way to learn about it.
+        wiri::a11y::announce_config_error(&summary);
         let text = balloon_text(&format!("{} - last good config kept.", summary));
         let disabled = self
             .engine
@@ -1126,6 +1151,13 @@ fn balloon_text(text: &str) -> String {
         cut.push('…');
         cut
     }
+}
+
+/// The two config-driven pieces that live outside the engine: screen-reader announcements
+/// and `block-out-from` on wiri's own overlays.
+fn configure_a11y_and_block_out(config: &Config) {
+    wiri::a11y::set_enabled(config.accessibility);
+    wiri::window::block_out::install(&config.layer_rules, &config.window_rules);
 }
 
 /// Publish only good configs. Spawns use child-only environment snapshots;

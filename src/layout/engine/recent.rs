@@ -17,6 +17,8 @@ pub(super) struct RecentState {
     engine: Weak<parking_lot::RwLock<TilingEngine>>,
     observed: Option<WindowId>,
     identities: HashMap<WindowId, String>,
+    /// The selection last announced to the screen reader (niri 25.11 announces each move).
+    announced: Option<WindowId>,
 }
 
 impl TilingEngine {
@@ -43,6 +45,7 @@ impl TilingEngine {
         self.recent.history.cancel_pending();
         self.recent.session = None;
         self.recent.observed = None;
+        self.recent.announced = None;
         if let Some(sink) = &self.recent.sink {
             sink.hide();
         }
@@ -203,7 +206,26 @@ impl TilingEngine {
         false
     }
 
-    fn recent_render(&self) {
+    /// Announce the Alt-Tab selection when it moved (niri 25.11 announces each move), and
+    /// remember what was announced so a repeat of the same selection stays silent.
+    fn announce_selection(&mut self, selected: Option<WindowId>) {
+        if self.recent.announced == selected {
+            return;
+        }
+        self.recent.announced = selected;
+        if let Some(id) = selected {
+            let title = self.tiled_windows.get(&id).map(|info| info.title.clone());
+            crate::a11y::announce_alt_tab(title.as_deref());
+        }
+    }
+
+    fn recent_render(&mut self) {
+        // niri 25.11 announces the Alt-Tab selection whenever it moves, so a screen reader
+        // user hears the window before committing to it.
+        if self.recent.session.is_some() && self.recent.sink.is_some() {
+            let selected = self.recent.session.as_ref().and_then(|s| s.selected());
+            self.announce_selection(selected);
+        }
         let (Some(session), Some(sink)) = (&self.recent.session, &self.recent.sink) else {
             return;
         };
@@ -296,5 +318,87 @@ impl TilingEngine {
             let outcome = session.prune(&alive);
             self.recent_outcome(outcome, backend);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{WindowInfo, WindowState};
+    use crate::utils::Rect;
+
+    fn window(id: isize, title: &str) -> (WindowId, WindowInfo) {
+        (
+            WindowId::new(id),
+            WindowInfo {
+                hwnd: id,
+                title: title.to_string(),
+                class_name: "WindowClass".to_string(),
+                process_id: 42,
+                bounds: Rect::default(),
+                state: WindowState::Normal,
+                is_visible: true,
+            },
+        )
+    }
+
+    #[test]
+    fn the_alt_tab_selection_is_announced_once_per_move() {
+        use crate::a11y::testing::contains_in_order;
+        let (sink, _guard) = crate::a11y::testing::record();
+        let mut engine = TilingEngine::new(Default::default());
+        let (firefox, firefox_info) = window(1, "Firefox — Mozilla");
+        let (terminal, terminal_info) = window(2, "Windows Terminal");
+        engine.tiled_windows.insert(firefox, firefox_info);
+        engine.tiled_windows.insert(terminal, terminal_info);
+
+        // The first render of a session announces what is selected.
+        engine.announce_selection(Some(firefox));
+        // A repeat of the same selection stays silent.
+        engine.announce_selection(Some(firefox));
+        // A move announces the new window.
+        engine.announce_selection(Some(terminal));
+        // A window wiri knows nothing about still gets an announcement.
+        engine.announce_selection(Some(WindowId::new(99)));
+        // A session that ends (no selection) says nothing; the next one starts clean.
+        engine.announce_selection(None);
+        engine.announce_selection(Some(firefox));
+
+        assert!(
+            contains_in_order(
+                &sink.texts(),
+                &[
+                    "Selected window: Firefox — Mozilla",
+                    "Selected window: Windows Terminal",
+                    "Selected window: untitled",
+                    "Selected window: Firefox — Mozilla",
+                ]
+            ),
+            "{:?}",
+            sink.texts()
+        );
+    }
+
+    #[test]
+    fn a_reset_forgets_the_announced_selection() {
+        use crate::a11y::testing::contains_in_order;
+        let (sink, _guard) = crate::a11y::testing::record();
+        let mut engine = TilingEngine::new(Default::default());
+        let (firefox, info) = window(1, "Firefox");
+        engine.tiled_windows.insert(firefox, info);
+        engine.announce_selection(Some(firefox));
+        assert_eq!(engine.recent.announced, Some(firefox));
+        engine.recent_reset();
+        assert_eq!(engine.recent.announced, None);
+        engine.announce_selection(Some(firefox));
+        // A new session announces the same window again: two identical texts in order.
+        assert!(
+            contains_in_order(
+                &sink.texts(),
+                &["Selected window: Firefox", "Selected window: Firefox"]
+            ),
+            "{:?}",
+            sink.texts()
+        );
     }
 }

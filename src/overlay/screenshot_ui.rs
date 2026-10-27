@@ -159,6 +159,8 @@ pub fn open(options: Options) -> Result<()> {
     let guard = SessionGuard;
     // Freeze before any UI HWND exists. Saving never recaptures the changing desktop.
     let (bounds, clean, pointed) = crate::screenshot::interactive::freeze()?;
+    // niri announces the screenshot UI; do it once the capture that fills it succeeded.
+    crate::a11y::announce_screenshot_ui();
     let previous = unsafe { GetForegroundWindow().0 as isize };
     std::thread::Builder::new()
         .name("wiri-screenshot-ui".into())
@@ -249,6 +251,10 @@ fn run(
             Some((&mut *state as *mut State).cast()),
         )?;
         HOST.store(hwnd.0 as isize, Ordering::Release);
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::ScreenshotUi,
+            hwnd.0 as isize,
+        );
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = InvalidateRect(hwnd, None, false);
         let mut msg = MSG::default();

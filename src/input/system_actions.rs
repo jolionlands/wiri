@@ -258,6 +258,9 @@ pub fn request_quit(skip: bool, quit: impl FnOnce() + Send + 'static) -> Result<
     Ok(())
 }
 fn confirm_quit() -> bool {
+    // niri announces the exit confirmation (wiki:Accessibility); the modal dialog itself
+    // has no accessible children of its own, so the announcement carries its text.
+    crate::a11y::announce_quit_dialog();
     if cfg!(test) {
         return false;
     }
@@ -690,6 +693,20 @@ mod tests {
         let called = quit.clone();
         request_quit(true, move || called.store(true, Ordering::Release)).unwrap();
         assert!(quit.load(Ordering::Acquire));
+    }
+    #[test]
+    fn the_exit_confirmation_is_announced_to_the_screen_reader() {
+        use crate::a11y::testing::contains_in_order;
+        let (sink, _guard) = crate::a11y::testing::record();
+        // In a test build the dialog itself is not shown; the announcement is what a screen
+        // reader user needs, and it must carry the dialog's own text.
+        assert!(!confirm_quit());
+        assert!(
+            contains_in_order(&sink.texts(), &[crate::a11y::QUIT_DIALOG]),
+            "{:?}",
+            sink.texts()
+        );
+        assert_eq!(crate::a11y::QUIT_DIALOG, "Quit wiri? Yes or No.");
     }
     #[test]
     fn power_is_safe_in_unit_tests() {

@@ -1,3 +1,4 @@
+pub mod a11y;
 pub mod backend;
 pub mod config;
 pub mod hooks;

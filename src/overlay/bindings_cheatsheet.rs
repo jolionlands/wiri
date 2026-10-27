@@ -251,6 +251,10 @@ unsafe fn run(session: Arc<Session>) {
         let _ = DestroyWindow(hwnd);
         return;
     }
+    crate::window::block_out::apply_to(
+        crate::window::block_out::Overlay::HotkeyList,
+        hwnd.0 as isize,
+    );
     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     let mut msg = MSG::default();

@@ -175,6 +175,7 @@ impl TilingEngine {
             if self.overview_camera.closing {
                 self.overview_camera.closing = false;
                 self.start_overview_camera(self.overview_options().zoom);
+                crate::a11y::announce_overview(true);
             }
             return;
         }
@@ -190,6 +191,7 @@ impl TilingEngine {
             zoom: 1.0,
             workspace_offsets: Vec::new(),
         });
+        crate::a11y::announce_overview(true);
         self.overview_camera.output = Some(output);
         self.start_overview_camera(self.overview_options().zoom);
         sink.enter();
@@ -598,6 +600,46 @@ mod tests {
         e.apply_layout_for_monitor(output, &backend);
         assert_eq!(sink.last_context().unwrap().bounds, hosted);
         assert_eq!(hosted, Rect::new(0, 0, 1366, 768));
+    }
+
+    #[test]
+    fn the_overview_opening_and_closing_are_announced_once_each() {
+        use crate::a11y::testing::contains_in_order;
+        let (sink, _guard) = crate::a11y::testing::record();
+        let (mut e, _output) = two_workspace_engine(0.35);
+        e.thumbnail_overview = Some(crate::overlay::MockThumbnailOverview::new());
+        e.set_animation_notifier(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let backend = BackendHandle::default_for_test();
+        e.enter_overview(&backend);
+        assert!(
+            contains_in_order(&sink.texts(), &[crate::a11y::OVERVIEW_OPENED]),
+            "{:?}",
+            sink.texts()
+        );
+        // A second enter while open is not a new announcement.
+        let openings_before = sink
+            .texts()
+            .iter()
+            .filter(|text| text.as_str() == crate::a11y::OVERVIEW_OPENED)
+            .count();
+        e.enter_overview(&backend);
+        let openings_after = sink
+            .texts()
+            .iter()
+            .filter(|text| text.as_str() == crate::a11y::OVERVIEW_OPENED)
+            .count();
+        assert_eq!(openings_after, openings_before);
+        // The close is announced when the camera has finished closing, as niri does.
+        e.exit_overview(&backend);
+        e.tick_animations_with_backend(60_000, &backend);
+        assert!(
+            contains_in_order(
+                &sink.texts(),
+                &[crate::a11y::OVERVIEW_OPENED, crate::a11y::OVERVIEW_CLOSED]
+            ),
+            "{:?}",
+            sink.texts()
+        );
     }
 
     #[test]

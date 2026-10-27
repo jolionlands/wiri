@@ -5764,6 +5764,7 @@ impl TilingEngine {
             zoom,
             workspace_offsets,
         });
+        crate::a11y::announce_overview(true);
 
         // niri-parity DWM-thumbnail overview.  When a sink is installed,
         // open a session and register a thumbnail for every visible
@@ -5829,6 +5830,7 @@ impl TilingEngine {
 
         info!("Exiting overview mode");
         self.overview = None;
+        crate::a11y::announce_overview(false);
         crate::overlay::overview_banner::global_hide();
         // niri-parity DWM-thumbnail overview: tear down the host window
         // and unregister every thumbnail.  No-op when no sink is wired.

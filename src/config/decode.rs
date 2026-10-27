@@ -293,6 +293,7 @@ const TOP_LEVEL: &[&str] = &[
     "layout",
     "workspace",
     "window-rule",
+    "layer-rule",
     "binds",
     "recent-windows",
     "animations",
@@ -303,6 +304,7 @@ const TOP_LEVEL: &[&str] = &[
     "overview",
     "spawn-at-startup",
     "spawn-sh-at-startup",
+    "accessibility",
     "include",
 ];
 
@@ -316,7 +318,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "blur" => Some("no compositor blur on Windows"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
         "debug" => Some("these are compositor debug options"),
-        "layer-rule" => Some("Windows has no layer shell"),
         _ => None,
     }
 }
@@ -1029,6 +1030,7 @@ impl Decoder {
                 }
                 "workspace" => self.decode_workspace(node, cfg),
                 "window-rule" => self.decode_window_rule(node, cfg),
+                "layer-rule" => self.decode_layer_rule(node, cfg),
                 "binds" => self.decode_binds(node, cfg),
                 "recent-windows" => self.decode_recent_windows(node, &mut cfg.recent_windows),
                 "hotkey-overlay" => self.decode_hotkey_overlay(node, cfg),
@@ -1057,6 +1059,7 @@ impl Decoder {
                     }
                 }
                 "overview" => self.decode_overview(node, &mut cfg.overview),
+                "accessibility" => self.decode_accessibility(node, cfg),
                 "include" => self.decode_include(node, cfg),
                 other => match top_level_unsupported(other) {
                     Some(why) => self.unsupported(node, why),
@@ -2506,6 +2509,143 @@ impl Decoder {
 
     // ---- window rules ----------------------------------------------------------------
 
+    /// `accessibility` — screen-reader announcements (wiri extension: niri's Accessibility
+    /// support has no config key and is always on).  A bare node means on, `false` turns it
+    /// off, and the section form accepts the same two spellings.
+    fn decode_accessibility(&mut self, node: &Node, cfg: &mut Config) {
+        let kids = node.kids();
+        if kids.is_empty() {
+            if let Some(value) = self.flag(node) {
+                cfg.accessibility = value;
+            }
+            return;
+        }
+        self.section(node);
+        for child in kids {
+            match norm(&child.name).as_str() {
+                "off" | "disable" | "disabled" => {
+                    if let Some(value) = self.flag(child) {
+                        cfg.accessibility = !value;
+                    }
+                }
+                "enabled" | "announcements" => {
+                    if let Some(value) = self.flag(child) {
+                        cfg.accessibility = value;
+                    }
+                }
+                _ => self.unknown(child, "'accessibility'", &["off", "enabled", "announcements"]),
+            }
+        }
+    }
+
+    /// `layer-rule { match namespace="…"; block-out-from "…"; }`
+    ///
+    /// Windows has no layer shell, so the only layer surfaces a rule can reach are wiri's
+    /// own overlay windows: `namespace` is the overlay's name (`workspace-indicator`,
+    /// `overview`, `status-bar`, `hotkeys`, `recent-windows`, `screenshot-ui`, `decor`,
+    /// `animation`, `overview-banner`) and `block-out-from` decides whether it is kept out
+    /// of screen capture.  Anything else in a layer rule is a warning, not an error, so an
+    /// niri config still loads.
+    fn decode_layer_rule(&mut self, node: &Node, cfg: &mut Config) {
+        self.section(node);
+        let mut rule = WindowRule::default();
+        for child in node.kids() {
+            let key = norm(&child.name);
+            match key.as_str() {
+                "match" => {
+                    if let Some(group) = self.decode_layer_match_group(child) {
+                        rule.match_groups.push(group);
+                    }
+                }
+                "exclude" => {
+                    if let Some(group) = self.decode_layer_match_group(child) {
+                        rule.exclude_groups.push(group);
+                    }
+                }
+                "block-out-from" => self.decode_block_out_from(child, &mut rule),
+                _ => self.unsupported(child, "layer rules"),
+            }
+        }
+        cfg.layer_rules.push(rule);
+    }
+
+    /// A layer rule's `match`/`exclude` line: `namespace` (a regular expression, as in
+    /// niri) and `at-startup`.
+    fn decode_layer_match_group(&mut self, node: &Node) -> Option<MatchGroup> {
+        let mut group = MatchGroup::default();
+        let mut ok = true;
+        for argument in &node.args {
+            self.error(
+                argument.pos,
+                format!(
+                    "'{}' takes properties like namespace=\"…\", not arguments",
+                    node.name
+                ),
+            );
+            ok = false;
+        }
+        for property in &node.props {
+            let key = norm(&property.key);
+            let value = &property.value;
+            match key.as_str() {
+                "namespace" | "title" => {
+                    let Some(text) = self.value_text(node, value) else {
+                        ok = false;
+                        continue;
+                    };
+                    match RegexPat::new(&text) {
+                        // wiri's overlays answer to their name as the title, so a layer
+                        // namespace is matched the same way a window title is.
+                        Ok(pattern) => group.conds.push(Matcher::TitleSearch(pattern)),
+                        Err(error) => {
+                            self.error(
+                                value.pos,
+                                format!(
+                                    "invalid regular expression for '{}': {}",
+                                    property.key, error
+                                ),
+                            );
+                            ok = false;
+                        }
+                    }
+                }
+                "at-startup" => match self.value_bool(node, value) {
+                    Some(true) => group.conds.push(Matcher::AtStartup),
+                    Some(false) => group.conds.push(Matcher::Not(Box::new(Matcher::AtStartup))),
+                    None => ok = false,
+                },
+                _ => {
+                    self.warn(
+                        property.key_pos,
+                        format!(
+                            "'{}' is not supported by wiri (layer rules match wiri's own \
+                             overlays only); ignored",
+                            property.key
+                        ),
+                    );
+                }
+            }
+        }
+        ok.then_some(group)
+    }
+
+    /// `block-out-from "screencast"` / `"screen-capture"`, in a window rule or a layer rule.
+    fn decode_block_out_from(&mut self, node: &Node, rule: &mut WindowRule) {
+        let Some(value) = self.arg_text(node) else {
+            return;
+        };
+        match crate::window::block_out::BlockOutFrom::parse(&value) {
+            Some(blocked) => rule.block_out_from = Some(blocked),
+            None => self.error(
+                node.args[0].pos,
+                format!(
+                    "'block-out-from' expects \"screencast\" or \"screen-capture\", \
+                     found \"{value}\""
+                ),
+            ),
+        }
+    }
+
     fn decode_window_rule(&mut self, node: &Node, cfg: &mut Config) {
         self.section(node);
         let mut rule = WindowRule::default();
@@ -2620,12 +2760,12 @@ impl Decoder {
                 }
                 "draw-border-with-background"
                 | "baba-is-float"
-                | "block-out-from"
                 | "variable-refresh-rate"
                 | "pinch-sensitivity"
                 | "tiled-state"
                 | "background-effect"
                 | "popups" => self.unsupported(child, "window rules"),
+                "block-out-from" => self.decode_block_out_from(child, &mut rule),
                 _ => self.unknown(
                     child,
                     "'window-rule'",
@@ -3242,6 +3382,62 @@ mod tests {
     }
 
     #[test]
+    fn accessibility_is_on_by_default_and_can_be_turned_off() {
+        assert!(clean("").accessibility);
+        assert!(!clean("accessibility false").accessibility);
+        assert!(!clean("accessibility off").accessibility);
+        assert!(!clean("accessibility { off; }").accessibility);
+        assert!(clean("accessibility { enabled true; }").accessibility);
+        assert!(clean("accessibility true").accessibility);
+        assert!(load("accessibility { maybe; }").has_errors());
+    }
+
+    #[test]
+    fn block_out_from_is_decoded_in_window_and_layer_rules() {
+        use crate::window::block_out::BlockOutFrom;
+        let cfg = clean(
+            "window-rule {\n    match title=\"video\"\n    block-out-from \"screencast\"\n}\n\
+             layer-rule {\n    match namespace=\"workspace-indicator\"\n    block-out-from \"screen-capture\"\n}\n",
+        );
+        assert_eq!(cfg.window_rules.len(), 1);
+        assert_eq!(
+            cfg.window_rules[0].block_out_from,
+            Some(BlockOutFrom::Screencast)
+        );
+        assert_eq!(cfg.layer_rules.len(), 1);
+        assert_eq!(
+            cfg.layer_rules[0].block_out_from,
+            Some(BlockOutFrom::ScreenCapture)
+        );
+        // The layer rule's namespace is the overlay name it matches.
+        assert_eq!(cfg.layer_rules[0].match_groups.len(), 1);
+        // A value niri does not have is an error that names both spellings.
+        let bad = load("window-rule { block-out-from \"screen\" }");
+        assert!(bad.has_errors());
+        assert!(
+            errors(&bad)
+                .iter()
+                .any(|e| e.contains("screencast") && e.contains("screen-capture")),
+            "{:?}",
+            errors(&bad)
+        );
+        // Without the key, nothing is blocked out.
+        assert_eq!(clean("window-rule { opacity 0.5; }").window_rules[0].block_out_from, None);
+    }
+
+    #[test]
+    fn a_layer_rule_warns_about_niri_properties_wiri_cannot_use() {
+        let warnings = warnings(&load(
+            "layer-rule { match namespace=\"bar\"; shadow { on; } }",
+        ));
+        assert!(
+            warnings.iter().any(|w| w.contains("shadow")),
+            "{warnings:?}"
+        );
+        assert!(errors(&load("layer-rule { match namespace=\"bar\"; shadow { on; } }")).is_empty());
+    }
+
+    #[test]
     fn screenshot_path_is_a_template_or_null() {
         use crate::screenshot::path::ScreenshotPath;
         assert_eq!(clean("").screenshot_path, ScreenshotPath::Pictures);
@@ -3810,8 +4006,9 @@ overview { backdrop-color \"#000000\" }",
     fn niri_only_sections_are_warnings() {
         let d = load("prefer-no-csd\nhotkey-overlay { skip-at-startup }\nscreenshot-path \"~/Pictures/x.png\"\ncursor { xcursor-size 24 }\nlayer-rule { match namespace=\"x\" }\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        // screenshot-path and (Lane P) hotkey-overlay are implemented on Windows.
-        assert_eq!(warnings(&d).len(), 3, "{:?}", warnings(&d));
+        // screenshot-path, hotkey-overlay (Lane P) and layer-rule (Lane A11Y: decoded into the
+        // rules wiri's own overlays follow; Windows has no layer shell) are implemented.
+        assert_eq!(warnings(&d).len(), 2, "{:?}", warnings(&d));
         assert!(d.config.hotkey_overlay.skip_at_startup);
     }
 

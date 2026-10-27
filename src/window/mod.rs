@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
 
+pub mod block_out;
 pub mod rule_effects;
 pub mod rule_policy;
 pub mod rules;

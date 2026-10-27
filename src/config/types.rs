@@ -5,6 +5,10 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub workspace: Vec<WorkspaceConfig>,
     pub window_rules: Vec<WindowRule>,
+    /// niri `layer-rule` sections.  Windows has no layer shell, so the only layer surface
+    /// wiri has is its own overlays; a layer rule's `namespace` is their name and its
+    /// `block-out-from` decides whether they are excluded from screen capture.
+    pub layer_rules: Vec<WindowRule>,
     pub binds: BindsConfig,
     pub recent_windows: super::recent_windows_config::RecentWindowsConfig,
     pub animations: AnimationsConfig,
@@ -25,6 +29,9 @@ pub struct Config {
     pub switch_events: SwitchEventsConfig,
     /// Suppress failed-load balloons, not diagnostics or ConfigLoaded events.
     pub disable_failed_config_notification: bool,
+    /// Screen-reader announcements (niri's Accessibility support).  On by default, as in
+    /// niri; `accessibility false` turns them off (wiri extension).
+    pub accessibility: bool,
 }
 
 impl Default for Config {
@@ -51,6 +58,7 @@ impl Default for Config {
             layout: LayoutConfig::default_config(),
             workspace: Vec::new(),
             window_rules: Vec::new(),
+            layer_rules: Vec::new(),
             binds: BindsConfig::default(),
             recent_windows: super::recent_windows_config::RecentWindowsConfig::default(),
             animations: AnimationsConfig::default_config(),
@@ -63,6 +71,7 @@ impl Default for Config {
             environment: Default::default(),
             switch_events: Default::default(),
             disable_failed_config_notification: false,
+            accessibility: true,
         }
     }
 }
@@ -1439,6 +1448,11 @@ pub struct WindowRule {
     /// Sparse per-window decoration and geometry overrides.
     pub effects: crate::window::rule_effects::RuleEffects,
     pub policy: crate::window::rule_policy::RulePolicy,
+    /// niri `block-out-from "screencast"` / `"screen-capture"`: keep the window out of
+    /// screen capture.  Windows only lets the owning process set that affinity, so wiri
+    /// applies it to its own overlays (see [`crate::window::block_out`]); foreign
+    /// application windows are decoded and kept but cannot be excluded.
+    pub block_out_from: Option<crate::window::block_out::BlockOutFrom>,
 }
 
 impl WindowRule {
