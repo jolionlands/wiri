@@ -87,6 +87,10 @@ pub enum Action {
     OverviewSelect,
     /// Toggle tabbed layout for the focused column
     ColumnToggleTabbed,
+    /// Set the focused column display explicitly (`false` means normal/stacked).
+    SetColumnDisplay {
+        tabbed: bool,
+    },
     /// Focus the next tab in the focused column
     TabNext,
     /// Focus the previous tab in the focused column
@@ -380,10 +384,10 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
 }
 
 /// True when `name` is an action wiri implements, whatever its arguments: the name is tried
-/// with a few typical argument lists (none, a number, a size, a word, two words).  Used to
+/// with a few typical argument lists (none, a number, a size, words, a display mode). Used to
 /// tell "bad arguments" from "wiri does not have this action" when a config is read.
 pub fn action_name_known(name: &str) -> bool {
-    const PROBES: [&[&str]; 5] = [&[], &["1"], &["50%"], &["a"], &["a", "b"]];
+    const PROBES: [&[&str]; 6] = [&[], &["1"], &["50%"], &["a"], &["a", "b"], &["normal"]];
     PROBES.iter().any(|args| {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         parse_action_flagged(name, &args, &[]).is_some()
@@ -505,6 +509,11 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         "overview-right" => Some(Action::OverviewRight),
         "overview-select" | "overview-accept" => Some(Action::OverviewSelect),
         "column-toggle-tabbed" | "toggle-column-tabbed-display" => Some(Action::ColumnToggleTabbed),
+        "set-column-display" => match args {
+            [display] if display == "normal" => Some(Action::SetColumnDisplay { tabbed: false }),
+            [display] if display == "tabbed" => Some(Action::SetColumnDisplay { tabbed: true }),
+            _ => None,
+        },
         "tab-next" => Some(Action::TabNext),
         "tab-prev" => Some(Action::TabPrev),
         "move-to-workspace" => args
@@ -1429,6 +1438,32 @@ mod tests {
             parse_action_name("reset-window-height", &[]),
             Some(Action::ResetWindowHeight)
         );
+    }
+
+    #[test]
+    fn set_column_display_requires_one_explicit_mode() {
+        for (display, tabbed) in [("normal", false), ("tabbed", true)] {
+            let expected = Some(Action::SetColumnDisplay { tabbed });
+            assert_eq!(
+                parse_action_name("set-column-display", &words(&[display])),
+                expected
+            );
+            assert_eq!(
+                parse_action_flagged("set-column-display", &words(&[display]), &[true]),
+                expected
+            );
+        }
+        for args in [
+            vec![],
+            words(&[""]),
+            words(&["stacked"]),
+            words(&["Normal"]),
+            words(&["toggle"]),
+            words(&["tabbed", "normal"]),
+        ] {
+            assert_eq!(parse_action_name("set-column-display", &args), None);
+        }
+        assert!(action_name_known("set-column-display"));
     }
 
     #[test]

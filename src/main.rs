@@ -420,6 +420,16 @@ async fn main() -> Result<()> {
         });
     }
 
+    let decor_layer = Arc::new(wiri::overlay::decor::layer::DecorLayer::new());
+    {
+        let weak_engine = Arc::downgrade(&engine);
+        let tab_backend = backend.handle();
+        decor_layer.set_tab_handler(Arc::new(move |window| {
+            if let Some(engine) = weak_engine.upgrade() {
+                engine.write().select_tab_window(window, &tab_backend);
+            }
+        }));
+    }
     {
         let mut engine = engine.write();
         // Lane D: screenshot settings are shared by hotkeys, tray and IPC captures.
@@ -432,8 +442,7 @@ async fn main() -> Result<()> {
         // The overlay layer draws niri's focus ring, border and shadow around the windows.
         // Windows are created on first use on the existing hotkey message pump.
         // No decoration thread, frame clock or recurring wake-up exists at rest.
-        let decor_layer: std::sync::Arc<dyn wiri::overlay::decor::DecorSink> =
-            std::sync::Arc::new(wiri::overlay::decor::layer::DecorLayer::new());
+        let decor_layer: Arc<dyn wiri::overlay::decor::DecorSink> = decor_layer;
         wiri::overlay::decor::install_global(decor_layer.clone());
         engine.install_decor_sink(decor_layer);
 

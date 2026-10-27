@@ -1,4 +1,4 @@
-//! The overlay layer: layered, click-through, never-activated windows that draw niri's window
+//! The overlay layer: layered, never-activated windows (click-through except on tabs) drawing niri's window
 //! decorations (focus ring, border, shadow, tab indicator, insert hint) around windows that
 //! belong to other programs.
 //!
@@ -39,7 +39,7 @@ pub trait DecorSink: Send + Sync {
     /// title bar): the frame around it follows.
     fn moved(&self, hwnd: isize);
 
-    /// The window `hwnd` came to the front: its decorations go directly below it again.
+    /// The window `hwnd` came to the front: frames go below it and clickable tabs above it.
     fn restack(&self, hwnd: isize);
 
     /// Remove every decoration and release its bitmap/window resources.

@@ -3115,6 +3115,7 @@ $summary = [ordered]@{
 . (Join-Path $PSScriptRoot 'live-phases\lane-c2-workspaces.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-v.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-v-hot-corner.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-v-tabs.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

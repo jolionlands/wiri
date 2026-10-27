@@ -146,7 +146,9 @@ impl ThumbnailOverviewSink for MockThumbnailOverview {
     }
     fn retain_windows(&self, windows: &[WindowId]) {
         let mut s = self.inner.lock();
+        let before = s.registered.len();
         s.registered.retain(|id, _| windows.contains(id));
+        s.unregister_calls += (before - s.registered.len()) as u32;
         s.last_dst_rect.retain(|id, _| windows.contains(id));
     }
     fn registered_count(&self) -> usize {

@@ -453,8 +453,20 @@ pub fn draw_shadow(
     }
 }
 
-/// Fill a rounded shape with a paint.
+/// Fill a rounded shape with a paint, measuring local gradients against that shape.
 pub fn fill(surf: &mut Surface, shape: &RRect, paint: &Paint, view: &RRect) {
+    fill_relative(surf, shape, paint, shape, view);
+}
+
+/// Fill `shape`, measuring local gradients against `relative` rather than the painted shape.
+/// View-relative gradients still use `view`; all rectangles are in surface coordinates.
+pub fn fill_relative(
+    surf: &mut Surface,
+    shape: &RRect,
+    paint: &Paint,
+    relative: &RRect,
+    view: &RRect,
+) {
     if paint.is_invisible() {
         return;
     }
@@ -464,7 +476,7 @@ pub fn fill(surf: &mut Surface, shape: &RRect, paint: &Paint, view: &RRect) {
         let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
         let cov = shape.coverage(px, py);
         if cov > 0.0 {
-            let c = paint.sample(px, py, shape, view);
+            let c = paint.sample(px, py, relative, view);
             cells.push((x, y, [c[0] * cov, c[1] * cov, c[2] * cov, c[3] * cov]));
         }
     });

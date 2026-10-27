@@ -60,10 +60,42 @@ H64 uses physical cursor movements
 under the harness lock, restores the cursor/config and only stops its retained
 process. Multi-display isolation is unit-tested only on the one-display laptop.
 
+## Item 4: tab display, input and sizing
+
+`set-column-display "normal"|"tabbed"` uses the shared strict parser for KDL binds,
+ctl/direct/msg actions and typed IPC. Typed `Normal`/`Tabbed` matches pinned niri's
+serialized `ColumnDisplay` enum. Selecting the current mode is a no-op, including
+tab selection/focus. `decor/spec.rs` shares indicator geometry between paint and
+hit-test: pinned-niri rounded extents, total-proportion length, signed gap,
+per-tab gap, corner radius, positions and colour/gradient states. Transparent
+margins/gaps pass through; rounded cutouts remain rectangular niri hit targets.
+The existing message thread queues and revalidates a selection, shows the hidden
+tab before focusing it and does not activate the `NOACTIVATE` host.
+
+Fullscreen and maximize-to-edges apply to the current tabbed column. Transitions
+are recorded for all members before native styling; hidden siblings defer style
+changes until selected, with asynchronous frame recalculation and a fresh settle
+interval. Restoration preserves current visibility. A hung selected HWND's
+`SetWindowLongW` remains the pre-existing Windows limitation, not a claim of fully
+nonblocking style calls. Column/slot provenance keeps forced-width restoration
+through admission, close, minimize and split, without undoing a manually maximized
+destination. Indicators
+and their reservation disappear until exit from either tab. Maximize-column is
+separate and retains indicators. Stacked/floating windows keep per-window sizing.
+
+Pure regressions cover bind/CLI/wire/dispatch idempotence, hit/paint/config geometry,
+sizing inheritance/removal/minimize/reentrancy, suppressed reservation and hidden
+visibility. H65 covers owned hidden-tab focus, four positions, reload/colours/
+gradients, signed gap, suppression and single-tab settings. Urgent paint remains
+unit-tested only; no foreign application's urgency is induced.
+
 ## Validation ledger
 
-Full warning-denied release build/test/check, prescribed formatter, and the locked
-full desktop harness results will be appended after all four items. H62-H65 are
+Warning-denied `cargo build --release -j 2`, `cargo test --release -j 2` and
+`cargo check --release --all-targets -j 2` pass after item 4: **1324 library +
+15 CLI tests**, one ignored doctest. Required formatter and the four additive
+PowerShell parser checks pass. Locked full desktop results will be appended after
+all four items. H62-H65 are
 Lane V gates; no existing assertion is weakened. Until that run, desktop checks
 are planned, not claimed passed. No load/stress/soak test or display/system-wide
 settings mutation is part of this lane.

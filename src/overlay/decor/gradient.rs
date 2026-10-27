@@ -17,7 +17,7 @@ pub struct Gradient {
     pub to: Rgba,
     /// Degrees: 0 points up, 90 right, 180 down.
     pub angle: f32,
-    /// Measured against the workspace view instead of the shape that is painted.
+    /// Measured against the workspace view instead of the local reference rectangle.
     pub relative_to_view: bool,
     pub space: GradientSpace,
     pub hue: GradientHue,
