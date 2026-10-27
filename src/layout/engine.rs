@@ -2899,7 +2899,6 @@ impl TilingEngine {
                 None
             };
             let eff_cfg = overview_cfg.as_ref().unwrap_or(&eff_cfg);
-            let border_w = eff_cfg.border_inset();
 
             // Resolve the focused colour for this tile, including the live
             // Windows accent (cached for 30 s) and its configured fallback.

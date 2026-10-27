@@ -85,8 +85,14 @@ impl TilingEngine {
     /// The ordered output preferences of one `workspace` declaration: its repeated
     /// `open-on-output` lines, then the legacy `monitor` as the last fallback (the same
     /// list that decides where the workspace is first created).
-    pub(super) fn output_preferences(workspace: &crate::config::types::WorkspaceConfig) -> Vec<&str> {
-        let mut outputs: Vec<&str> = workspace.open_on_outputs.iter().map(String::as_str).collect();
+    pub(super) fn output_preferences(
+        workspace: &crate::config::types::WorkspaceConfig,
+    ) -> Vec<&str> {
+        let mut outputs: Vec<&str> = workspace
+            .open_on_outputs
+            .iter()
+            .map(String::as_str)
+            .collect();
         if !workspace.monitor.is_empty() && !outputs.contains(&workspace.monitor.as_str()) {
             outputs.push(workspace.monitor.as_str());
         }

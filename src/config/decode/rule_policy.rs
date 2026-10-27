@@ -185,6 +185,9 @@ mod tests {
             base_dir: None,
             stack: Vec::new(),
             depth: 0,
+            source: String::new(),
+            include_trace: Vec::new(),
+            bind_groups: Vec::new(),
         }
     }
 

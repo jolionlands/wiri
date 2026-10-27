@@ -137,7 +137,10 @@ fn assert_contents_on(
     windows: [WindowId; 3],
 ) -> i32 {
     let (actual_output, workspace) = named_workspace(engine, name).unwrap();
-    assert_eq!(actual_output, output, "workspace {name:?} is on another output");
+    assert_eq!(
+        actual_output, output,
+        "workspace {name:?} is on another output"
+    );
     assert_contents_at(engine, output, workspace, windows);
     workspace
 }
@@ -216,7 +219,10 @@ fn minimized_only_named_workspace_preserves_empty_strip_metadata_on_migration() 
     let mut engine = engine_with_config(config);
     let first = connect(&mut engine, "physical-one", "DISPLAY1");
     let (home, key) = named_workspace(&engine, "Code").unwrap();
-    assert_eq!(home, first, "DISPLAY2 is absent, so the second preference hosts it");
+    assert_eq!(
+        home, first,
+        "DISPLAY2 is absent, so the second preference hosts it"
+    );
     let [tiled, floating, minimized] = seed_contents(&mut engine, first, key);
     engine.float_homes.remove(&floating);
     engine.floating_windows.remove(&floating);
@@ -509,7 +515,10 @@ fn window_config_uses_actual_inactive_tiled_floating_and_minimized_homes() {
     assert_eq!(engine.active_workspace_config(actual).column_width, 101);
     // An unknown window falls back to the supplied output's active (unnamed) workspace.
     let unknown = engine.config_for_window(WindowId::new(999), hint);
-    assert_eq!(unknown.column_width, engine.effective_config(hint).column_width);
+    assert_eq!(
+        unknown.column_width,
+        engine.effective_config(hint).column_width
+    );
     assert_ne!(unknown.column_width, 101);
     assert_eq!(unknown.column_gap, 11);
 }
