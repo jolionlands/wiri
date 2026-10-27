@@ -10,6 +10,7 @@ pub use animation::{Animation, AnimationManager, AnimationTarget, Easing};
 pub use engine::AddWindowTarget;
 pub use engine::ColumnWidthMode;
 pub use engine::ColumnWidthPreset;
+pub use engine::FocusLayer;
 pub use engine::LayoutConfig;
 pub use engine::SizeAxis;
 pub use engine::TilingEngine;
