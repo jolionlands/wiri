@@ -86,3 +86,30 @@ the shell's gestures. No physical three-finger/swipe or real device descriptor
 was exercised by automation; H61 verifies configured-only registration, HWND
 creation and removal, not hardware recognition. Devices that do not expose
 raw PTP reports cannot use this path. Two-finger pinch/hold remain untouched.
+
+## 4. Drag-and-drop (Windows approximation)
+
+Presence of `gestures { }` enables the capture adapter. niri
+`dnd-edge-view-scroll { trigger-width 30; delay-ms 100; max-speed 1500; }`
+and `dnd-edge-workspace-switch { trigger-height 50; delay-ms 100; max-speed 1500; }`
+are parsed/validated; zero trigger/speed disables an axis. The existing LL hook
+observes a held left button, >=8 px drag and capture on the original source
+GUI thread in a foreign process. Wiri move/resize/spatial grabs are excluded.
+This is a capture heuristic, not a claim that every captured application
+selection is OLE, or that every OLE implementation captures on that thread.
+No COM injection/global OLE hook is installed.
+
+View speed increases linearly with edge penetration after the configured
+delay; it is DPI-scaled and bounded at both strip ends. Overview-only vertical
+edge accumulation switches ordered workspaces at one-screen thresholds
+(1500 units/s = one workspace/s), not niri's continuous two-scene composition.
+Outside edge zones, 500 ms stable hover activates a managed window (raises
+floats) or selects a workspace in the overview. One-shot hover/delay timers
+are killed before processing; 16 ms frames exist only while an edge actually
+scrolls, revalidating held capture, and stop on release/cancel/bounds/reload.
+No idle timer/thread. A message-only HWND exists only with the gestures block.
+
+Pure tests cover capture/held/grab/distance discrimination, speed/scale, delay
+and direction reset, and config/range validation. **No real OLE drag was
+performed** by this automated lane: unit-only evidence is explicit in H60.
+All DnD rows remain partial, not mislabelled as live-verified OLE parity.

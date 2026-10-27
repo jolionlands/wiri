@@ -1,6 +1,7 @@
 pub mod decode;
 pub mod effects;
 pub mod error;
+pub mod gestures_config;
 pub mod kdl;
 pub mod loader;
 pub mod parse;

@@ -797,6 +797,7 @@ unsafe extern "system" fn mouse_hook_callback(
             state.backend.clone(),
         )
     };
+    crate::input::dnd::observe(msg, cursor, !matches!(grab, GrabState::None));
     if !matches!(grab, GrabState::None) {
         if let GrabState::Move(g) = &grab {
             if msg == 0x204 {

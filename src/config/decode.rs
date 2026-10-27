@@ -23,6 +23,7 @@ use super::types::*;
 #[path = "decode/animations_decode.rs"]
 mod animations_decode;
 mod effects_decode;
+mod gestures_decode;
 #[path = "decode/recent_windows_decode.rs"]
 mod recent_windows_decode;
 mod rule_effects_decode;
@@ -285,6 +286,7 @@ const TOP_LEVEL: &[&str] = &[
     "binds",
     "recent-windows",
     "animations",
+    "gestures",
     "spawn-at-startup",
     "spawn-sh-at-startup",
     "include",
@@ -299,7 +301,7 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "config-notification" => Some("wiri always shows a balloon for a config error"),
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
-        "gestures" => Some("not implemented yet"),
+
         "overview" => Some("not implemented yet"),
         "environment" => Some("not implemented yet"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
@@ -852,6 +854,7 @@ impl Decoder {
                 "binds" => self.decode_binds(node, cfg),
                 "recent-windows" => self.decode_recent_windows(node, &mut cfg.recent_windows),
                 "animations" => self.decode_animations(node, cfg),
+                "gestures" => self.decode_gestures(node, &mut cfg.gestures),
                 "spawn-at-startup" => self.decode_spawn_at_startup(node, cfg),
                 "spawn-sh-at-startup" => {
                     if let Some(cmd) = self.arg_text(node) {
