@@ -30,22 +30,22 @@ and the final product/harness fixes have not been rerun live.
 | --- | --- | --- | --- | --- | --- |
 | 1. Config system (loading, KDL syntax, include, live reload, errors, validate) | 28 | 24 | 3 | 0 | 1 |
 | 2. Keyboard input | 10 | 1 | 4 | 0 | 5 |
-| 3. Pointing devices (touchpad, mouse, trackpoint, trackball, tablet, touch) | 18 | 0 | 5 | 9 | 4 |
+| 3. Pointing devices (touchpad, mouse, trackpoint, trackball, tablet, touch) | 18 | 0 | 12 | 0 | 6 |
 | 4. General input settings (focus-follows-mouse, warp, workspace back-and-forth, mod key) | 7 | 4 | 2 | 0 | 1 |
 | 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 15 | 4 | 1 | 1 |
-| 6. Hotkey overlay ("Important Hotkeys") | 7 | 2 | 3 | 2 | 0 |
+| 6. Hotkey overlay ("Important Hotkeys") | 7 | 4 | 3 | 0 | 0 |
 | 7. Screenshots | 11 | 10 | 1 | 0 | 0 |
 | 8. IPC transport, protocol and CLI | 11 | 10 | 1 | 0 | 0 |
 | 9. IPC `Request` variants (one row each) | 16 | 10 | 4 | 0 | 2 |
-| 10. IPC `Event` variants (one row each) | 20 | 16 | 0 | 1 | 3 |
-| 11. Outputs (config and runtime behaviour) | 17 | 3 | 8 | 3 | 3 |
-| 12. Actions in scope (non-layout), one row each | 29 | 4 | 15 | 1 | 9 |
-| 13. Misc top-level config (startup, environment, cursor, clipboard, session) | 11 | 1 | 1 | 4 | 5 |
-| 14. Switch events, named workspaces config, recent windows (Alt-Tab) | 13 | 7 | 1 | 4 | 1 |
+| 10. IPC `Event` variants (one row each) | 20 | 17 | 0 | 0 | 3 |
+| 11. Outputs (config and runtime behaviour) | 17 | 3 | 11 | 0 | 3 |
+| 12. Actions in scope (non-layout), one row each | 29 | 4 | 16 | 0 | 9 |
+| 13. Misc top-level config (startup, environment, cursor, clipboard, session) | 11 | 3 | 1 | 2 | 5 |
+| 14. Switch events, named workspaces config, recent windows (Alt-Tab) | 13 | 10 | 1 | 1 | 1 |
 | 15. Layer rules | 5 | 0 | 0 | 0 | 5 |
 | 16. Debug options | 22 | 0 | 0 | 0 | 22 |
 | 17. Accessibility, security model, screencasting, Xwayland | 13 | 1 | 0 | 4 | 8 |
-| **total** | **259** | **98** | **57** | **34** | **70** |
+| **total** | **259** | **116** | **63** | **8** | **72** |
 
 Release and priority tags are historical and are not reassigned by this status recount.
 Release tagging of the rows: main-only 9, release 238, release? 12. Priorities of the
