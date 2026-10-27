@@ -221,14 +221,13 @@ mod tests {
         );
         assert_eq!(d.error_count(), 1, "{:?}", d.issues);
         let issue = &d.issues[0];
-        assert!(issue.message.contains("duplicate node 'binds'"), "{issue:?}");
+        assert!(
+            issue.message.contains("duplicate node 'binds'"),
+            "{issue:?}"
+        );
         assert_eq!(issue.line, 2);
         assert_eq!(issue.context.related[0].line, 1);
-        let one = decode::decode_text(
-            "binds { Ctrl+Alt+F9 { screenshot; } }\n",
-            "test.kdl",
-            None,
-        );
+        let one = decode::decode_text("binds { Ctrl+Alt+F9 { screenshot; } }\n", "test.kdl", None);
         assert_eq!(one.error_count(), 0, "{:?}", one.issues);
     }
     #[test]
