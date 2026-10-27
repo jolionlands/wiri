@@ -62,3 +62,27 @@ Remaining approximation: tiled drops join an existing column; arbitrary new
 column insertion, cross-output drops and niri's insertion compositor are not
 implemented here. The move row stays partial. H59 covers actual edge actions
 and resize persistence; final live evidence is recorded below.
+
+## 3. Precision Touchpad
+
+Opt in with niri syntax `input { touchpad { } }`; absence or
+`input { touchpad { off; } }` leaves no Raw Input registration/window. Unlike
+niri's libinput default, this Windows opt-in is deliberate. The HID Digitizers
+page 0x0D / Touch Pad usage 0x05 registers RIDEV_INPUTSINK (plus DEVNOTIFY) on
+`WiriTouchpadRawInput`, a message-only HWND on the existing hotkey thread.
+No process-global input settings are written. Descriptor-derived contact IDs,
+X/Y ranges, tip/confidence bits and Contact Count/Scan Time support parallel
+and serial/hybrid reports. Buffers, descriptor caches and contact counts are
+bounded; removal cancels the active device. Three stable IDs produce centroid
+deltas; replacement rebases, a fourth finger cancels until all lift. Deltas
+feed the shared axis lock, 150ms velocity/projection, snapping and active-only
+spring. Pure recorded-frame tests cover these cases, serial assembly, release
+pause and opt-in/off decoding.
+
+**Operator prerequisite (not performed by this lane):** Windows Settings →
+Bluetooth & devices → Touchpad → Three-finger gestures → Swipes: **Nothing**.
+Windows may otherwise also act on the same swipe. Raw Input does not suppress
+the shell's gestures. No physical three-finger/swipe or real device descriptor
+was exercised by automation; H61 verifies configured-only registration, HWND
+creation and removal, not hardware recognition. Devices that do not expose
+raw PTP reports cannot use this path. Two-finger pinch/hold remain untouched.

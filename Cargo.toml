@@ -36,6 +36,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Controls",
     "Win32_Graphics_Gdi",
     "Win32_Devices_Display",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_UI_Input",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

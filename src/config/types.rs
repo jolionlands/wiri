@@ -95,6 +95,8 @@ pub struct InputConfig {
     /// Enable touch input handling. Default false — wiri only reads touch when
     /// this is true.
     pub touch_enabled: bool,
+    /// Opt-in raw Precision Touchpad contacts: presence of input.touchpad without off.
+    pub touchpad_enabled: bool,
     /// Convert a tap into a left-click event (mirrors trackpad behaviour).
     pub touch_tap_to_click: bool,
     /// Touch scroll speed multiplier (1.0 = native).
@@ -121,6 +123,7 @@ impl InputConfig {
             warp_mode: WarpMode::default(),
             numlock: false,
             touch_enabled: false,
+            touchpad_enabled: false,
             touch_tap_to_click: true,
             touch_scroll_speed: 1.0,
         }

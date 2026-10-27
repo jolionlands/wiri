@@ -679,6 +679,11 @@ impl MessageLoop {
         crate::input::dispatch::initialize(thread_id);
         crate::input::focus::initialize(engine.clone(), backend_handle.clone(), hwnd);
         crate::input::gestures::configure(engine.clone(), backend_handle.clone());
+        let touchpad_enabled = engine
+            .read()
+            .full_config()
+            .is_some_and(|c| c.input.touchpad_enabled);
+        crate::input::touchpad::configure(touchpad_enabled, engine.clone(), backend_handle.clone());
         let mut hook_active = false;
         match crate::input::start_keyboard_hook() {
             Ok(()) => hook_active = true,
@@ -728,7 +733,17 @@ impl MessageLoop {
                 }
                 if msg.message == WM_RELOAD_HOTKEYS {
                     crate::input::focus::reload();
+                    crate::input::touchpad::shutdown();
                     crate::input::gestures::configure(engine.clone(), backend_handle.clone());
+                    let touchpad_enabled = engine
+                        .read()
+                        .full_config()
+                        .is_some_and(|c| c.input.touchpad_enabled);
+                    crate::input::touchpad::configure(
+                        touchpad_enabled,
+                        engine.clone(),
+                        backend_handle.clone(),
+                    );
                     // Hot-reload: unregister old, re-read config, register new
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
@@ -807,6 +822,7 @@ impl MessageLoop {
         crate::overlay::compositor::detach_message_thread();
         crate::overlay::decor::layer::detach_message_thread();
         crate::input::focus::shutdown();
+        crate::input::touchpad::shutdown();
         crate::input::gestures::shutdown();
         crate::input::dispatch::shutdown();
         unsafe {

@@ -1063,7 +1063,20 @@ impl Decoder {
                     self.input_key(InputScope::Touch, c, cfg);
                 }
             }
-            "touchpad" | "trackpoint" | "trackball" | "tablet" if in_input => {
+            "touchpad" if in_input => {
+                self.section(child);
+                cfg.input.touchpad_enabled = true;
+                for c in child.kids() {
+                    if norm(&c.name) == "off" {
+                        if let Some(off) = self.flag(c) {
+                            cfg.input.touchpad_enabled = !off;
+                        }
+                    } else {
+                        self.unsupported(c, "device settings remain owned by Windows; only raw three-finger gestures are read");
+                    }
+                }
+            }
+            "trackpoint" | "trackball" | "tablet" if in_input => {
                 self.unsupported(child, "Windows has one pointer setup for all devices")
             }
             // keyboard
@@ -2789,8 +2802,10 @@ mod tests {
     fn niri_input_options_wiri_lacks_are_warnings() {
         let d = load("input {\n    touchpad {\n        tap\n        dwt\n    }\n    keyboard { xkb { layout \"us\" } }\n    mod-key-nested \"Alt\"\n}\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(warnings(&d).len(), 3, "{:?}", warnings(&d));
-        assert!(warnings(&d)[0].contains("'touchpad' is not supported"));
+        assert_eq!(warnings(&d).len(), 4, "{:?}", warnings(&d));
+        assert!(d.config.input.touchpad_enabled);
+        assert!(warnings(&d)[0].contains("'tap' is not supported"));
+        assert!(warnings(&d)[1].contains("'dwt' is not supported"));
     }
 
     #[test]

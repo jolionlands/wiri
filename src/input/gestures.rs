@@ -302,7 +302,7 @@ fn end(
             };
             e.gesture_workspace_end(c.output, c.workspaces[index], offset, velocity, backend);
         }
-        None => {}
+        None => e.gesture_end_idle(),
     }
     crate::ipc::notify_state_changed();
 }

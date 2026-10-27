@@ -117,6 +117,11 @@ impl TilingEngine {
         Some(c)
     }
 
+    pub(crate) fn gesture_end_idle(&mut self) {
+        self.gesture_output = None;
+        self.gesture_workspace_offset = None;
+    }
+
     fn gesture_apply(&mut self, output: OutputId, backend: &BackendHandle) {
         // Input events, not a timer, pace direct manipulation. Do not ease each HWND
         // behind the finger or let a preceding 16 ms configure swallow the final point.
