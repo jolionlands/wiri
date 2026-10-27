@@ -2,7 +2,7 @@
 //! It never reconfigures applications to thumbnail-sized rectangles.
 use super::{AppliedState, BackendHandle, OverviewState, TilingEngine};
 use crate::overlay::thumbnail_overview::{OverviewCommand, OverviewContext, OverviewWorkspace};
-use crate::utils::{OutputId, Rect, WindowId};
+use crate::utils::{OutputId, Point, Rect, WindowId};
 
 use crate::layout::animation::Animation;
 
@@ -18,6 +18,43 @@ impl OverviewCamera {
     pub fn animating(&self) -> bool {
         self.timeline.as_ref().is_some_and(|a| !a.is_finished())
     }
+}
+
+/// The monitor's workspaces as one vertical stack in visible order, centred on the active
+/// one. Pure: the host paints it, the pointer hit-tests it, drag-and-drop targets it and
+/// the engine lays tiles out inside it, so the four never disagree about where a workspace
+/// is. Rows carry the stable key, the IPC identity and the name (else "Workspace N").
+pub(super) fn overview_workspace_stack(
+    monitor: &crate::layout::Monitor,
+    view: Rect,
+    zoom: f64,
+) -> Vec<OverviewWorkspace> {
+    let ids = monitor.workspace_ids();
+    let active = ids
+        .iter()
+        .position(|id| *id == monitor.active_workspace)
+        .unwrap_or(0) as i32;
+    let height = (view.size.h as f64 * zoom).round() as i32;
+    let stride = height + (WORKSPACE_GAP as f64 * zoom).round() as i32;
+    let center_y = view.loc.y + (view.size.h as i32 - height) / 2;
+    ids.into_iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            let ws = monitor.workspaces.get(&id)?;
+            let y = center_y + (index as i32 - active) * stride;
+            Some(OverviewWorkspace {
+                id,
+                ipc_id: ws.ipc_id,
+                label: ws
+                    .name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("Workspace {}", index + 1)),
+                active: id == monitor.active_workspace,
+                rect: zoom_rect(view, view, y, zoom),
+            })
+        })
+        .collect()
 }
 
 fn zoom_rect(rect: Rect, view: Rect, section_y: i32, zoom: f64) -> Rect {
@@ -172,29 +209,18 @@ impl TilingEngine {
             return Vec::new();
         };
         // The camera spans the full work area; each workspace resolves its own
-        // insets inside it, rather than inheriting the active workspace's view.
+        // insets inside it (C2), rather than inheriting the active workspace's view.
         let view = monitor.work_area;
-        let ids = monitor.workspace_ids();
-        let active = ids
-            .iter()
-            .position(|id| *id == monitor.active_workspace)
-            .unwrap_or(0) as i32;
         let zoom = self.overview_zoom();
-        let height = (view.size.h as f64 * zoom).round() as i32;
-        let stride = height + (WORKSPACE_GAP as f64 * zoom).round() as i32;
-        let center_y = view.loc.y + (view.size.h as i32 - height) / 2;
-        let mut workspaces = Vec::new();
+        let workspaces = overview_workspace_stack(monitor, view, zoom);
         let mut positions = Vec::new();
-        for (index, id) in ids.into_iter().enumerate() {
+        for entry in &workspaces {
+            let (id, y) = (entry.id, entry.rect.loc.y);
             let Some(ws) = monitor.workspaces.get(&id) else {
                 continue;
             };
-            let y = center_y + (index as i32 - active) * stride;
-            workspaces.push(OverviewWorkspace {
-                id,
-                active: id == monitor.active_workspace,
-                rect: zoom_rect(view, view, y, zoom),
-            });
+            // Each workspace lays out inside its own configured insets (C2), then the
+            // camera transform places that inside the shared stack entry.
             let cfg = self.effective_config_for_workspace(output, id);
             let workspace_view = Self::tiling_work_rect(monitor, cfg);
             let normal = self.calculate_positions_at_zoom(
@@ -217,7 +243,10 @@ impl TilingEngine {
                     .map(|rect| (*wid, zoom_rect(rect, view, y, zoom)))
             }));
         }
-        if let Some(sink) = &self.thumbnail_overview {
+        // One session host exists, on the output the camera opened over: another
+        // output's layout pass must not republish its own geometry to that host.
+        let hosted = self.overview_camera.output.map_or(true, |o| o == output);
+        if let (true, Some(sink)) = (hosted, &self.thumbnail_overview) {
             sink.set_appearance(self.overview_options(), zoom);
             sink.set_context(OverviewContext {
                 bounds: monitor.bounds,
@@ -226,6 +255,20 @@ impl TilingEngine {
             });
         }
         positions
+    }
+
+    /// The workspace the overview currently draws under `point` (screen pixels), found in
+    /// the same stack the host paints, so a drag lands on what the user sees at any zoom.
+    pub(crate) fn overview_workspace_at(&self, point: Point) -> Option<(OutputId, i32)> {
+        let (&output, monitor) = self
+            .monitors
+            .iter()
+            .find(|(_, m)| m.bounds.contains_point(point))?;
+        // The same camera view `workspace_overview_scene` stacks the workspaces in.
+        overview_workspace_stack(monitor, monitor.work_area, self.overview_zoom())
+            .into_iter()
+            .find(|ws| point.y >= ws.rect.loc.y && point.y < ws.rect.bottom())
+            .map(|ws| (output, ws.id))
     }
 
     /// Called by the session-local host, never while holding a host mutex.
@@ -404,6 +447,146 @@ mod tests {
         assert!(!e.has_active_animations());
         assert!(!e.is_overview());
         assert_eq!(sink.exit_calls(), 1);
+    }
+
+    fn two_workspace_engine(zoom: f64) -> (TilingEngine, OutputId) {
+        use crate::layout::{Monitor, Workspace};
+        let output = OutputId::from_name("stack");
+        let mut e = TilingEngine::new(Default::default());
+        let mut m = Monitor::new(
+            output,
+            Rect::new(0, 0, 1366, 768),
+            Rect::new(0, 0, 1366, 728),
+        );
+        m.insert_workspace(1, Workspace::new());
+        e.monitors.insert(output, m);
+        e.monitors.set_focused(output);
+        let mut config = crate::config::Config::default();
+        config.overview.zoom = zoom;
+        e.set_full_config(config);
+        (e, output)
+    }
+
+    #[test]
+    fn workspace_stack_follows_visible_order_names_and_ipc_identity() {
+        use crate::layout::{Monitor, Workspace};
+        let output = OutputId::from_name("order");
+        let mut m = Monitor::new(
+            output,
+            Rect::new(-1366, 0, 1366, 768),
+            Rect::new(-1366, 0, 1366, 728),
+        );
+        m.insert_workspace(5, Workspace::new());
+        m.insert_workspace(2, Workspace::new());
+        m.move_workspace_to_position(5, 0);
+        m.workspaces.get_mut(&0).unwrap().name = Some("web".into());
+        m.workspaces.get_mut(&2).unwrap().name = Some(String::new());
+        let view = Rect::new(-1366, 0, 1366, 728);
+        let stack = overview_workspace_stack(&m, view, 0.5);
+        // Visible order [5, 0, 2]; the active one (key 0) is centred on the view.
+        assert_eq!(
+            stack.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![5, 0, 2]
+        );
+        assert_eq!(
+            stack.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(),
+            vec!["Workspace 1", "web", "Workspace 3"]
+        );
+        for w in &stack {
+            assert_eq!(w.ipc_id, m.workspaces[&w.id].ipc_id);
+            assert_eq!(w.active, w.id == m.active_workspace);
+        }
+        assert_eq!(stack[1].rect, Rect::new(-1024, 182, 683, 364));
+        // 50 px niri gap scaled with the workspaces: 364 + 25.
+        assert_eq!(stack[0].rect.loc.y, 182 - 389);
+        assert_eq!(stack[2].rect.loc.y, 182 + 389);
+    }
+
+    #[test]
+    fn drag_targets_use_the_configured_zoom_not_a_fixed_half_scale() {
+        let (mut e, output) = two_workspace_engine(0.35);
+        let sink = crate::overlay::MockThumbnailOverview::new();
+        e.thumbnail_overview = Some(sink.clone());
+        e.set_animation_notifier(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let backend = BackendHandle::default_for_test();
+        e.enter_overview(&backend);
+        e.tick_animations_with_backend(60_000, &backend);
+        assert_eq!(e.overview_zoom(), 0.35);
+
+        // The camera spans the monitor's whole work area (C2): a workspace's own insets
+        // move its tiles inside its stack entry, never the entry itself.
+        let view = e.monitors.get(&output).unwrap().work_area;
+        let stack = overview_workspace_stack(e.monitors.get(&output).unwrap(), view, 0.35);
+        assert_eq!(stack.len(), 2);
+        // The host was handed exactly this stack, so paint, pointer and DnD agree.
+        assert_eq!(sink.last_context().unwrap().workspaces, stack);
+        e.monitors
+            .get_mut(&output)
+            .unwrap()
+            .workspaces
+            .get_mut(&1)
+            .unwrap()
+            .name = Some("inset".to_string());
+        let inset = crate::layout::LayoutConfig {
+            outer_gaps: (20, 30, 40, 50),
+            reserve_left: 80,
+            ..e.config.clone()
+        };
+        e.config_per_workspace.insert(
+            "inset".to_string(),
+            std::collections::HashMap::from([(output, inset)]),
+        );
+        e.apply_layout_for_monitor(output, &backend);
+        let renamed: Vec<_> = sink.last_context().unwrap().workspaces;
+        assert_eq!(
+            renamed.iter().map(|w| w.rect).collect::<Vec<_>>(),
+            stack.iter().map(|w| w.rect).collect::<Vec<_>>(),
+            "insets do not move the stack"
+        );
+        assert_eq!(renamed[1].label, "inset");
+        let (first, second) = (&stack[0], &stack[1]);
+        assert!(first.rect.size.h < 300, "0.35 is not the half-scale 364");
+        let mid = |r: Rect| Point::new(r.loc.x + 10, r.loc.y + r.size.h as i32 / 2);
+        assert_eq!(e.overview_workspace_at(mid(first.rect)), Some((output, 0)));
+        assert_eq!(
+            e.overview_workspace_at(mid(second.rect)),
+            Some((output, 1))
+        );
+        // The gap between two workspaces, and the area outside every monitor, hit nothing.
+        let gap = Point::new(10, first.rect.bottom() + 1);
+        assert!(gap.y < second.rect.loc.y);
+        assert_eq!(e.overview_workspace_at(gap), None);
+        assert_eq!(e.overview_workspace_at(Point::new(-5000, 10)), None);
+        // The same lookup backs the native drag-and-drop adapter.
+        assert!(matches!(
+            e.dnd_target(mid(second.rect)),
+            Some(crate::input::dnd::Target::Workspace(o, 1)) if o == output
+        ));
+    }
+
+    #[test]
+    fn only_the_hosted_output_publishes_overview_geometry() {
+        let (mut e, output) = two_workspace_engine(0.5);
+        let other = OutputId::from_name("other");
+        e.monitors.insert(
+            other,
+            crate::layout::Monitor::new(
+                other,
+                Rect::new(1366, 0, 800, 600),
+                Rect::new(1366, 0, 800, 560),
+            ),
+        );
+        let sink = crate::overlay::MockThumbnailOverview::new();
+        e.thumbnail_overview = Some(sink.clone());
+        e.set_animation_notifier(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let backend = BackendHandle::default_for_test();
+        e.enter_overview(&backend);
+        let hosted = sink.last_context().unwrap().bounds;
+        // A layout pass for the other output must not replace the host's geometry.
+        e.apply_layout_for_monitor(other, &backend);
+        e.apply_layout_for_monitor(output, &backend);
+        assert_eq!(sink.last_context().unwrap().bounds, hosted);
+        assert_eq!(hosted, Rect::new(0, 0, 1366, 768));
     }
 
     #[test]

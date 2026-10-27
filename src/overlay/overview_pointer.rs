@@ -26,6 +26,22 @@ pub fn drop_target(context: &OverviewContext, x: i32, y: i32) -> Option<DropTarg
     Some(DropTarget::InsertBefore(None))
 }
 
+/// How long a touch must rest on a window before it picks the window up (niri: long press).
+pub const TOUCH_LONG_PRESS_MS: u32 = 500;
+/// Vertical finger travel, in pixels, that steps one workspace.
+const TOUCH_WORKSPACE_STEP: i32 = 150;
+
+/// A touch contact that Windows promoted to mouse input (the primary finger only). One
+/// finger pans the overview like niri's touch overview; resting without moving picks the
+/// pressed window up so the same drag-and-drop path moves it.
+#[derive(Default)]
+struct Touch {
+    last: (i32, i32),
+    panning: bool,
+    long: bool,
+    vertical: i32,
+}
+
 #[derive(Default)]
 pub struct Pointer {
     pressed: Option<(OverviewCommand, i32, i32)>,
@@ -34,6 +50,7 @@ pub struct Pointer {
     right: Option<i32>,
     wheel_remainder: i32,
     anchor: Option<Rect>,
+    touch: Option<Touch>,
 }
 impl Pointer {
     pub fn press(&mut self, command: OverviewCommand, x: i32, y: i32) {
@@ -41,6 +58,34 @@ impl Pointer {
         self.current = (x, y);
         self.dragging = false;
         self.anchor = None;
+        self.touch = None;
+    }
+    /// A press from a promoted touch contact. The caller arms a one-shot
+    /// [`TOUCH_LONG_PRESS_MS`] timer for it and calls [`Self::long_press`] when it fires.
+    pub fn press_touch(&mut self, command: OverviewCommand, x: i32, y: i32) {
+        self.press(command, x, y);
+        self.touch = Some(Touch {
+            last: (x, y),
+            ..Touch::default()
+        });
+    }
+    /// The long-press timer fired. True when the touched window was picked up (the caller
+    /// repaints the drag image); false when the touch already moved, ended or hit no window.
+    pub fn long_press(&mut self) -> bool {
+        let on_window = matches!(self.pressed, Some((OverviewCommand::SelectWindow(_), _, _)));
+        match &mut self.touch {
+            Some(touch) if on_window && !touch.panning && !touch.long => {
+                touch.long = true;
+                self.dragging = true;
+                true
+            }
+            _ => false,
+        }
+    }
+    /// True while the current press is a touch that is still a tap or a long press
+    /// candidate, i.e. the long-press timer is worth keeping armed.
+    pub fn touch_pending(&self) -> bool {
+        self.touch.as_ref().is_some_and(|t| !t.panning && !t.long)
     }
     pub fn set_anchor(&mut self, rect: Option<Rect>) {
         self.anchor = rect;
@@ -55,6 +100,37 @@ impl Pointer {
             *last = x;
             return Some(OverviewCommand::ScrollView(delta));
         }
+        if let (Some(touch), Some((_, ox, oy))) = (&mut self.touch, self.pressed) {
+            if touch.long {
+                return None;
+            }
+            if !touch.panning && i64::from(x - ox).pow(2) + i64::from(y - oy).pow(2) >= 64 {
+                touch.panning = true;
+                touch.last = (x, y);
+                return None;
+            }
+            if touch.panning {
+                let (dx, dy) = (touch.last.0 - x, y - touch.last.1);
+                touch.last = (x, y);
+                touch.vertical = touch.vertical.saturating_add(dy);
+                if dx != 0 && dx.abs() >= dy.abs() {
+                    return Some(OverviewCommand::ScrollView(dx));
+                }
+                if touch.vertical.abs() >= TOUCH_WORKSPACE_STEP {
+                    // Dragging the content down reveals the workspace above.
+                    let down = touch.vertical > 0;
+                    touch.vertical -= TOUCH_WORKSPACE_STEP * touch.vertical.signum();
+                    return Some(if down {
+                        OverviewCommand::PreviousWorkspace
+                    } else {
+                        OverviewCommand::NextWorkspace
+                    });
+                }
+                if dx != 0 {
+                    return Some(OverviewCommand::ScrollView(dx));
+                }
+            }
+        }
         None
     }
     pub fn motion(&mut self, x: i32, y: i32) -> Option<OverviewCommand> {
@@ -67,8 +143,10 @@ impl Pointer {
         self.right = None;
     }
     pub fn dragging_window(&self) -> Option<(WindowId, i32, i32)> {
+        // A touch pans the overview; only a long press picks a window up.
+        let may_drag = self.touch.as_ref().map_or(true, |touch| touch.long);
         match self.pressed {
-            Some((OverviewCommand::SelectWindow(id), x, y)) if self.dragging => {
+            Some((OverviewCommand::SelectWindow(id), x, y)) if self.dragging && may_drag => {
                 Some((id, self.current.0 - x, self.current.1 - y))
             }
             _ => None,
@@ -83,11 +161,16 @@ impl Pointer {
         self.motion(x, y);
         let dragged = self.dragging_window();
         let pressed = self.pressed.take();
+        let panned = self.touch.take().is_some_and(|touch| touch.panning);
         self.dragging = false;
         if let Some((window, _, _)) = dragged {
             return context
                 .and_then(|c| drop_target(c, x, y))
                 .map(|target| OverviewCommand::DropWindow { window, target });
+        }
+        if panned {
+            // A pan is never a tap: lifting the finger must not select what it started on.
+            return None;
         }
         pressed.map(|(command, _, _)| command)
     }
@@ -95,6 +178,7 @@ impl Pointer {
         self.pressed = None;
         self.right = None;
         self.dragging = false;
+        self.touch = None;
     }
     pub fn wheel(&mut self, delta: i32) -> Vec<OverviewCommand> {
         self.wheel_remainder = self.wheel_remainder.saturating_add(delta);
@@ -131,16 +215,8 @@ mod tests {
             bounds: Rect::new(-100, 0, 800, 800),
             focused: None,
             workspaces: vec![
-                OverviewWorkspace {
-                    id: 0,
-                    rect: Rect::new(100, 100, 400, 250),
-                    active: true,
-                },
-                OverviewWorkspace {
-                    id: 1,
-                    rect: Rect::new(100, 400, 400, 250),
-                    active: false,
-                },
+                OverviewWorkspace::new(0, Rect::new(100, 100, 400, 250), true),
+                OverviewWorkspace::new(1, Rect::new(100, 400, 400, 250), false),
             ],
         }
     }
@@ -195,6 +271,69 @@ mod tests {
             Rect::new(80, -100, 200, 200)
         );
     }
+    #[test]
+    fn touch_tap_selects_but_a_pan_scrolls_and_never_selects_on_release() {
+        let id = WindowId::new(5);
+        let mut p = Pointer::default();
+        p.press_touch(OverviewCommand::SelectWindow(id), 300, 200);
+        assert!(p.touch_pending());
+        // Inside the slop it is still a tap.
+        assert_eq!(p.motion(303, 202), None);
+        assert_eq!(
+            p.release(Some(&context()), 303, 202),
+            Some(OverviewCommand::SelectWindow(id))
+        );
+        // Past the slop the finger pans (dragging left scrolls the view right) and the
+        // window is not picked up, so lifting the finger over it selects nothing.
+        p.press_touch(OverviewCommand::SelectWindow(id), 300, 200);
+        assert_eq!(p.motion(280, 200), None, "crossing the slop only arms the pan");
+        assert!(!p.touch_pending());
+        assert_eq!(p.motion(250, 200), Some(OverviewCommand::ScrollView(30)));
+        assert!(p.dragging_window().is_none());
+        assert!(!p.long_press(), "a moving finger cannot become a long press");
+        assert_eq!(p.release(Some(&context()), 250, 500), None);
+    }
+
+    #[test]
+    fn touch_vertical_pan_steps_workspaces_per_150_pixels() {
+        let mut p = Pointer::default();
+        p.press_touch(OverviewCommand::SelectWorkspace(0), 300, 100);
+        assert_eq!(p.motion(300, 110), None);
+        assert_eq!(p.motion(300, 200), None);
+        assert_eq!(p.motion(300, 270), Some(OverviewCommand::PreviousWorkspace));
+        // The remainder carries over; moving back up steps the other way.
+        assert_eq!(p.motion(300, 100), Some(OverviewCommand::NextWorkspace));
+        assert_eq!(p.release(Some(&context()), 300, 100), None);
+    }
+
+    #[test]
+    fn touch_long_press_picks_a_window_up_and_the_drop_uses_the_mouse_path() {
+        let id = WindowId::new(7);
+        let mut p = Pointer::default();
+        p.press_touch(OverviewCommand::SelectWindow(id), 300, 200);
+        assert!(p.long_press());
+        assert!(!p.long_press(), "the timer fires once");
+        assert!(!p.touch_pending());
+        assert_eq!(p.dragging_window(), Some((id, 0, 0)));
+        // While held it does not pan.
+        assert_eq!(p.motion(300, 500), None);
+        assert_eq!(
+            p.release(Some(&context()), 300, 500),
+            Some(OverviewCommand::DropWindow {
+                window: id,
+                target: DropTarget::Workspace(1)
+            })
+        );
+        // Neither an empty workspace nor an ended touch can be picked up.
+        p.press_touch(OverviewCommand::SelectWorkspace(1), 300, 500);
+        assert!(!p.long_press());
+        p.cancel();
+        assert!(!p.long_press());
+        p.press(OverviewCommand::SelectWindow(id), 300, 200);
+        assert!(!p.long_press(), "a mouse press has no long-press pickup");
+        assert!(!p.touch_pending());
+    }
+
     #[test]
     fn wheel_accumulates_and_right_drag_alone_scrolls_view() {
         let mut p = Pointer::default();

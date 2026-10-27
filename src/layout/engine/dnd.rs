@@ -1,4 +1,4 @@
-//! Native DnD adapters; overview workspace hits use the existing half-scale scene.
+//! Native DnD adapters; overview workspace hits use the overview's own configured stack.
 use super::*;
 use crate::input::dnd::Target;
 impl TilingEngine {
@@ -37,23 +37,10 @@ impl TilingEngine {
     }
     pub(crate) fn dnd_target(&self, point: Point) -> Option<Target> {
         if self.is_overview() {
-            let (&output, m) = self
-                .monitors
-                .iter()
-                .find(|(_, m)| m.bounds.contains_point(point))?;
-            let cfg = self.effective_config(output);
-            let view = Self::tiling_work_rect(m, cfg);
-            let height = (view.size.h as f64 * 0.5).round() as i32;
-            let center = view.loc.y + (view.size.h as i32 - height) / 2;
-            let ids = m.workspace_ids();
-            let active = ids.iter().position(|id| *id == m.active_workspace)? as i32;
-            for (index, id) in ids.iter().enumerate() {
-                let y = center + (index as i32 - active) * (height + 25);
-                if point.y >= y && point.y < y + height {
-                    return Some(Target::Workspace(output, *id));
-                }
-            }
-            return None;
+            // The configured/animated overview stack, not a fixed half-scale copy of it.
+            return self
+                .overview_workspace_at(point)
+                .map(|(output, id)| Target::Workspace(output, id));
         }
         let child = unsafe {
             windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(
