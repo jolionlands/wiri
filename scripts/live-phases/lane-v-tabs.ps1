@@ -80,7 +80,7 @@
         $inside=if ($within) { 'true' } else { 'false' }
         $single=if ($hide) { 'true' } else { 'false' }
         $paints=if ($paint -eq 'gradient') {
-            'active-gradient from="#e03040" to="#f09030" angle=90; inactive-gradient from="#20b050" to="#20a0c0" angle=90; urgent-gradient from="#3050f0" to="#a030f0" angle=90;'
+            'active-gradient from="#e03040" to="#f09030" angle=180; inactive-gradient from="#20b050" to="#20a0c0" angle=180; urgent-gradient from="#3050f0" to="#a030f0" angle=180;'
         } else { 'active-color "#e03040"; inactive-color "#20b050"; urgent-color "#3050f0";' }
         return @"
 input { mod-key "ctrl-alt"; }
@@ -164,7 +164,9 @@ layout {
         if ($first -lt 8 -or $second -lt 8) { throw 'Indicator too short for unambiguous owned probes' }
         $cross=if ($horizontal) { $r.T+8 } else { $r.L+8 }
         $start=if ($horizontal) { $r.L+2 } else { $r.T+2 }
-        $values=@($start+[int]($first/2),$start+$first+14+[int]($second/2),$start+$first+7)
+        # Parenthesised: the comma operator binds tighter than +, so the unparenthesised list
+        # was `$start + (a, $start) + ...` and threw "op_Addition" on the first click gate.
+        $values=@(($start+[int]($first/2)),($start+$first+14+[int]($second/2)),($start+$first+7))
         $points=@(foreach ($v in $values) {
             if ($horizontal) { [pscustomobject]@{X=$v;Y=$cross} }
             else { [pscustomobject]@{X=$cross;Y=$v} }
@@ -172,6 +174,7 @@ layout {
         $margin=if ($horizontal) { [pscustomobject]@{X=$points[0].X;Y=$r.T} }
             else { [pscustomobject]@{X=$r.L;Y=$points[0].Y} }
         return [pscustomobject]@{Tabs=@($points[0],$points[1]); Gap=$points[2]; Margin=$margin;
+            Lengths=@($first,$second);
             Corner=[pscustomobject]@{X=($r.L+2);Y=($r.T+2)}}
     }
     function VTSelected([IntPtr]$expected) {
@@ -264,6 +267,40 @@ layout {
         VTAction $action
         $restored=VTSnapshot ($action+'-normal-again')
         VTGate $gate (-not ($checks -contains $false) -and $restored.host -ne 0) $checks
+    }
+    function VTRecover([string]$why) {
+        # Best effort after a faulted group: default indicator config, no fullscreen/edge
+        # maximize left over, the surviving probes in one tabbed column, one visible and
+        # focused. It never throws; the next group does its own reload and checks.
+        try {
+            VTAlive
+            $vtDetails['recover-'+$why]='attempted'
+            VTReload (VTConfig) ('recover-'+$why)
+            $live=@($vtForms | Where-Object { [LT]::IsWindow($_) })
+            if ($live.Count -eq 0) { return }
+            $list=@((VTCtl ('recover-list-'+$why) @('--json','window-list') | ConvertFrom-Json).result)
+            foreach ($f in $live) {
+                $e=WinOf $list $f
+                if ($null -ne $e -and ($e.fullscreen -or $e.maximized)) {
+                    FocusForm $f
+                    if ($e.fullscreen) { $null=VTCtl ('recover-fullscreen-'+$why) @('action','fullscreen-window') }
+                    if ($e.maximized) { $null=VTCtl ('recover-edges-'+$why) @('action','maximize-window-to-edges') }
+                    Start-Sleep -Milliseconds 500
+                    break
+                }
+            }
+            $null=VTCtl ('recover-tabbed-'+$why) @('set-column-display','tabbed')
+            FocusForm $live[$live.Count-1]
+            Start-Sleep -Milliseconds 500
+        } catch { $vtDetails['recover-error-'+$why]=($_ | Out-String) }
+    }
+    function VTGroup([string]$name,[scriptblock]$body) {
+        # Gates are false until set, so a fault here fails only this group's own gates.
+        try { & $body }
+        catch {
+            $vtDetails['error-'+$name]=($_ | Out-String)
+            VTRecover $name
+        }
     }
     function VTStop {
         if ($null -eq $vt.Proc) { return }
@@ -382,129 +419,168 @@ public static class LaneVTabsNative {
         $paired=VTSnapshot 'paired'
         VTGate 'h65_owned_two_tab_column' ($same -and $paired.active -eq [int64]$vtForms[1] -and $paired.host -ne 0) $list
         if (-not $summary['h65_owned_two_tab_column']) { throw 'Failed to establish the owned two-tab column' }
-        $sideResults=@(); $clickResults=@(); $ignoredResults=@(); $cornerResults=@(); $activationResults=@()
-        foreach ($side in @('left','right','top','bottom')) {
-            VTReload (VTConfig $side $false) ($side+'-outside')
-            $outside=VTSnapshot ($side+'-outside')
-            VTReload (VTConfig $side $true) ($side+'-inside')
-            $inside=VTSnapshot ($side+'-inside')
-            $reservation=VTReserved $outside.window $inside.window $side 20
-            $horizontal=$side -in @('top','bottom')
-            $band=if ($horizontal) { $inside.indicator.H } else { $inside.indicator.W }
-            $along=if ($horizontal) { $inside.indicator.W } else { $inside.indicator.H }
-            $areaLength=if ($horizontal) { $inside.window.W } else { $inside.window.H }
-            $expectedLength=[Math]::Round(($areaLength*0.64),[MidpointRounding]::AwayFromZero)+4
-            $position=switch ($side) {
-                left { [Math]::Abs(($inside.indicator.R-2)-($inside.window.L-8)) -le 3 }
-                right { [Math]::Abs(($inside.indicator.L+2)-($inside.window.R+8)) -le 3 }
-                top { [Math]::Abs(($inside.indicator.B-2)-($inside.window.T-8)) -le 3 }
-                bottom { [Math]::Abs(($inside.indicator.T+2)-($inside.window.B+8)) -le 3 }
-            }
-            $centered=if ($horizontal) {
-                [Math]::Abs(($inside.indicator.L+$inside.indicator.R)-($inside.window.L+$inside.window.R)) -le 4
-            } else { [Math]::Abs(($inside.indicator.T+$inside.indicator.B)-($inside.window.T+$inside.window.B)) -le 4 }
-            VTGate ('h65_'+$side+'_indicator_geometry') ($inside.host -ne 0 -and $band -eq 16 -and
-                [Math]::Abs($along-$expectedLength) -le 2 -and $position -and $centered) $inside
-            $sideResults += $reservation
-            $points=VTPoints $inside.indicator $side
-            $current=VTActive
-            # Only inter-tab gaps and the 2px AA margin reject clicks.
-            foreach ($region in @('Gap','Margin')) {
-                $ignored=VTClick $points.$region $current $false ($side+'-'+$region)
-                $ignoredResults += ($ignored.selected -and $ignored.inputRegionCorrect)
-                $activationResults += ($ignored.noActivateStyle -and $ignored.mouseActivate -eq 3)
-            }
-            # Pinned niri hit-tests rectangular tabs, including rounded cutouts.
-            # Native alpha flooring keeps this first-tab corner hittable; it must
-            # select the previously hidden first tab, not behave like the AA margin.
-            $corner=VTClick $points.Corner $vtForms[0] $true ($side+'-corner-selects-tab')
-            $cornerResults += ($corner.before -ne $corner.expected -and $corner.selected -and $corner.inputRegionCorrect)
-            $activationResults += ($corner.noActivateStyle -and $corner.mouseActivate -eq 3)
-            $current=VTActive
-            $target=if ($current -eq $vtForms[0]) { 1 } else { 0 }
-            $clicked=VTClick $points.Tabs[$target] $vtForms[$target] $true ($side+'-hidden-tab')
-            $clickResults += ($clicked.before -ne $clicked.expected -and $clicked.selected -and $clicked.inputRegionCorrect)
-            $activationResults += ($clicked.noActivateStyle -and $clicked.mouseActivate -eq 3)
-        }
-        VTGate 'h65_place_within_column_reserves_each_side' (-not ($sideResults -contains $false)) $sideResults
-        VTGate 'h65_click_hidden_tab_and_focus' (-not ($clickResults -contains $false)) $clickResults
-        VTGate 'h65_gap_and_margin_ignore_clicks' (-not ($ignoredResults -contains $false)) $ignoredResults
-        VTGate 'h65_rounded_corners_select_tab' (-not ($cornerResults -contains $false)) $cornerResults
-        VTGate 'h65_decor_never_activates' (-not $vt.DecorActivated -and -not ($activationResults -contains $false)) $activationResults
-        $reloadPassed=$summary['h65_place_within_column_reserves_each_side']
-        foreach ($side in @('left','right','top','bottom')) { $reloadPassed=$reloadPassed -and $summary['h65_'+$side+'_indicator_geometry'] }
-        VTGate 'h65_reload_updates_indicator_and_reservation' $reloadPassed $sideResults
-        VTReload (VTConfig) 'off-baseline'
-        $on=VTSnapshot 'before-off'
-        VTReload (VTConfig 'left' $true $true) 'off'
-        $off=VTSnapshot 'off'
-        VTReload (VTConfig) 'on-again'
-        $again=VTSnapshot 'on-again'
-        VTGate 'h65_off_removes_indicator_and_reservation' ($off.host -eq 0 -and $on.host -ne 0 -and
-            $again.host -ne 0 -and $off.active -eq $on.active -and
-            (VTReserved $off.window $on.window 'left' 20) -and (VTEqual $on.window $again.window)) @($on,$off,$again)
-        $negativeChecks=@()
-        foreach ($gap in @(-4,-20)) {
-            VTReload (VTConfig 'left' $true $true $false $gap) ('negative-off-'+$gap)
-            $base=VTSnapshot ('negative-off-'+$gap)
-            VTReload (VTConfig 'left' $true $false $false $gap) ('negative-on-'+$gap)
-            $inset=VTSnapshot ('negative-on-'+$gap)
-            $negativeChecks += ($inset.host -ne 0 -and (VTReserved $base.window $inset.window 'left' ([Math]::Max(12+$gap,0))))
-        }
-        VTGate 'h65_negative_gap_reservation' (-not ($negativeChecks -contains $false)) $negativeChecks
-        VTReload (VTConfig) 'solid-paints'
-        $solid=VTSnapshot 'solid-paints'; $points=VTPoints $solid.indicator 'left'
-        $solidChecks=@(); $solidSamples=@()
-        foreach ($i in 0..1) {
-            $rgb=@(VTRgb $points.Tabs[$i]); $solidSamples += ,$rgb
-            $expected=if ([int64]$vtForms[$i] -eq $solid.active) { @(224,48,64) } else { @(32,176,80) }
-            $solidChecks += (VTColorNear $rgb $expected)
-        }
-        VTGate 'h65_active_inactive_colors' (-not ($solidChecks -contains $false)) $solidSamples
-        VTReload (VTConfig 'left' $true $false $false 8 'gradient') 'gradient-paints'
-        $gradient=VTSnapshot 'gradient-paints'; $gp=VTPoints $gradient.indicator 'left'
-        $gradientSamples=@(); $gradientChecks=@()
-        foreach ($i in 0..1) {
-            $c=$gp.Tabs[$i]
-            $samples=@(foreach ($dx in @(-3,3)) { foreach ($dy in @(-5,5)) {
-                ,@(VTRgb ([pscustomobject]@{X=($c.X+$dx);Y=($c.Y+$dy)}))
-            } })
-            $gradientSamples += ,$samples
-            $varies=$false; $changed=$false
-            foreach ($rgb in $samples) {
-                for ($channel=0; $channel -lt 3; $channel++) {
-                    if ([Math]::Abs($rgb[$channel]-$samples[0][$channel]) -gt 10) { $varies=$true }
-                    if ([Math]::Abs($rgb[$channel]-$solidSamples[$i][$channel]) -gt 10) { $changed=$true }
+        # Every group below is independent: a fault inside one records error-<group>, restores
+        # a known state and leaves only that group's own gates false (they start false), so a
+        # single bad step can no longer hide the remaining H65 gates.
+        VTGroup 'sides' {
+            $sideResults=@(); $clickResults=@(); $ignoredResults=@(); $cornerResults=@(); $activationResults=@()
+            foreach ($side in @('left','right','top','bottom')) {
+                # A part that did not run counts as failed, never as passed.
+                $sr=@{ reserve=$false; click=$false; corner=$false
+                    ignored=@($false,$false); activation=@($false,$false,$false) }
+                try {
+                    VTReload (VTConfig $side $false) ($side+'-outside')
+                    $outside=VTSnapshot ($side+'-outside')
+                    VTReload (VTConfig $side $true) ($side+'-inside')
+                    $inside=VTSnapshot ($side+'-inside')
+                    $sr.reserve=[bool](VTReserved $outside.window $inside.window $side 20)
+                    $horizontal=$side -in @('top','bottom')
+                    $band=if ($horizontal) { $inside.indicator.H } else { $inside.indicator.W }
+                    $along=if ($horizontal) { $inside.indicator.W } else { $inside.indicator.H }
+                    $areaLength=if ($horizontal) { $inside.window.W } else { $inside.window.H }
+                    $expectedLength=[Math]::Round(($areaLength*0.64),[MidpointRounding]::AwayFromZero)+4
+                    $position=switch ($side) {
+                        left { [Math]::Abs(($inside.indicator.R-2)-($inside.window.L-8)) -le 3 }
+                        right { [Math]::Abs(($inside.indicator.L+2)-($inside.window.R+8)) -le 3 }
+                        top { [Math]::Abs(($inside.indicator.B-2)-($inside.window.T-8)) -le 3 }
+                        bottom { [Math]::Abs(($inside.indicator.T+2)-($inside.window.B+8)) -le 3 }
+                    }
+                    $centered=if ($horizontal) {
+                        [Math]::Abs(($inside.indicator.L+$inside.indicator.R)-($inside.window.L+$inside.window.R)) -le 4
+                    } else { [Math]::Abs(($inside.indicator.T+$inside.indicator.B)-($inside.window.T+$inside.window.B)) -le 4 }
+                    VTGate ('h65_'+$side+'_indicator_geometry') ($inside.host -ne 0 -and $band -eq 16 -and
+                        [Math]::Abs($along-$expectedLength) -le 2 -and $position -and $centered) $inside
+                    $points=VTPoints $inside.indicator $side
+                    $current=VTActive
+                    # Only inter-tab gaps and the 2px AA margin reject clicks.
+                    $k=0
+                    foreach ($region in @('Gap','Margin')) {
+                        $ignored=VTClick $points.$region $current $false ($side+'-'+$region)
+                        $sr.ignored[$k]=[bool]($ignored.selected -and $ignored.inputRegionCorrect)
+                        $sr.activation[$k]=[bool]($ignored.noActivateStyle -and $ignored.mouseActivate -eq 3)
+                        $k++
+                    }
+                    # Pinned niri hit-tests rectangular tabs, including rounded cutouts.
+                    # Native alpha flooring keeps this first-tab corner hittable; it must
+                    # select the previously hidden first tab, not behave like the AA margin.
+                    $corner=VTClick $points.Corner $vtForms[0] $true ($side+'-corner-selects-tab')
+                    $sr.corner=[bool]($corner.before -ne $corner.expected -and $corner.selected -and $corner.inputRegionCorrect)
+                    $sr.activation[2]=[bool]($corner.noActivateStyle -and $corner.mouseActivate -eq 3)
+                    $current=VTActive
+                    $target=if ($current -eq $vtForms[0]) { 1 } else { 0 }
+                    $clicked=VTClick $points.Tabs[$target] $vtForms[$target] $true ($side+'-hidden-tab')
+                    $sr.click=[bool]($clicked.before -ne $clicked.expected -and $clicked.selected -and $clicked.inputRegionCorrect)
+                    $sr.activation += [bool]($clicked.noActivateStyle -and $clicked.mouseActivate -eq 3)
+                } catch {
+                    $vtDetails['error-sides-'+$side]=($_ | Out-String)
+                    VTRecover ('sides-'+$side)
                 }
+                $sideResults += $sr.reserve; $clickResults += $sr.click; $cornerResults += $sr.corner
+                $ignoredResults += $sr.ignored; $activationResults += $sr.activation
+                $vtDetails.observations.Add([pscustomobject]@{tag=($side+'-results'); reserve=$sr.reserve;
+                    click=$sr.click; corner=$sr.corner; ignored=$sr.ignored; activation=$sr.activation})
             }
-            $gradientChecks += ($varies -and $changed)
+            # Not-run parts are $false entries above, so a missing side can never pass.
+            VTGate 'h65_place_within_column_reserves_each_side' (-not ($sideResults -contains $false)) $sideResults
+            VTGate 'h65_click_hidden_tab_and_focus' (-not ($clickResults -contains $false)) $clickResults
+            VTGate 'h65_gap_and_margin_ignore_clicks' (-not ($ignoredResults -contains $false)) $ignoredResults
+            VTGate 'h65_rounded_corners_select_tab' (-not ($cornerResults -contains $false)) $cornerResults
+            VTGate 'h65_decor_never_activates' (-not $vt.DecorActivated -and -not ($activationResults -contains $false) -and
+                $activationResults.Count -eq 16) $activationResults
+            $reloadPassed=$summary['h65_place_within_column_reserves_each_side']
+            foreach ($side in @('left','right','top','bottom')) { $reloadPassed=$reloadPassed -and $summary['h65_'+$side+'_indicator_geometry'] }
+            VTGate 'h65_reload_updates_indicator_and_reservation' $reloadPassed $sideResults
         }
-        VTGate 'h65_gradients_reload' (-not ($gradientChecks -contains $false) -and
-            $gradient.active -eq $solid.active -and (VTEqual $gradient.window $solid.window)) $gradientSamples
-        VTMode 'fullscreen-window' $true 'h65_fullscreen_suppresses_across_tab_switches'
-        VTMode 'maximize-window-to-edges' $true 'h65_maximize_edges_suppresses_across_tab_switches'
-        VTMode 'maximize-column' $false 'h65_maximize_column_keeps_indicator_and_reservation'
-        VTReload (VTConfig 'left' $true $false $true) 'hide-single-before-close'
-        $victim=$vtForms[1]; VTOwnForm $victim
-        FocusForm $victim
-        if (-not (WaitForeground $victim 100 3000)) { throw 'Owned second probe is not foreground for close' }
-        if (-not (CloseFocused $victim 'lane-v-tabs-close')) { throw 'Owned second probe close chord refused' }
-        for ($i=0; $i -lt 60 -and [LT]::IsWindow($victim); $i++) { Start-Sleep -Milliseconds 50 }
-        if ([LT]::IsWindow($victim)) { throw 'Owned second probe did not close' }
-        FocusForm $vtForms[0]
-        if (-not (WaitForeground $vtForms[0] 100 3000)) { throw 'Surviving owned probe is not foreground' }
-        Start-Sleep -Milliseconds 650
-        $hidden=VTSnapshot 'single-hidden'
-        VTReload (VTConfig 'left' $true $true $true) 'single-off-reference'
-        $singleOff=VTSnapshot 'single-off-reference'
-        VTGate 'h65_hide_single_removes_indicator_and_reservation' ($hidden.host -eq 0 -and
-            $singleOff.host -eq 0 -and (VTEqual $hidden.window $singleOff.window)) @($hidden,$singleOff)
-        VTReload (VTConfig) 'show-single'
-        $shown=VTSnapshot 'single-shown'
-        VTGate 'h65_single_tab_can_be_shown' ($shown.host -ne 0 -and $shown.active -eq [int64]$vtForms[0] -and
-            (VTReserved $hidden.window $shown.window 'left' 20)) $shown
-        $vt.Proc.Refresh()
-        $summary['p_h65_daemon_peak_working_set_bytes']=[int64]$vt.Proc.PeakWorkingSet64
+        VTGroup 'off' {
+            VTReload (VTConfig) 'off-baseline'
+            $on=VTSnapshot 'before-off'
+            VTReload (VTConfig 'left' $true $true) 'off'
+            $off=VTSnapshot 'off'
+            VTReload (VTConfig) 'on-again'
+            $again=VTSnapshot 'on-again'
+            VTGate 'h65_off_removes_indicator_and_reservation' ($off.host -eq 0 -and $on.host -ne 0 -and
+                $again.host -ne 0 -and $off.active -eq $on.active -and
+                (VTReserved $off.window $on.window 'left' 20) -and (VTEqual $on.window $again.window)) @($on,$off,$again)
+        }
+        VTGroup 'negative-gap' {
+            $negativeChecks=@()
+            foreach ($gap in @(-4,-20)) {
+                VTReload (VTConfig 'left' $true $true $false $gap) ('negative-off-'+$gap)
+                $base=VTSnapshot ('negative-off-'+$gap)
+                VTReload (VTConfig 'left' $true $false $false $gap) ('negative-on-'+$gap)
+                $inset=VTSnapshot ('negative-on-'+$gap)
+                $negativeChecks += ($inset.host -ne 0 -and (VTReserved $base.window $inset.window 'left' ([Math]::Max(12+$gap,0))))
+            }
+            VTGate 'h65_negative_gap_reservation' (-not ($negativeChecks -contains $false)) $negativeChecks
+        }
+        VTGroup 'colors' {
+            VTReload (VTConfig) 'solid-paints'
+            $solid=VTSnapshot 'solid-paints'; $points=VTPoints $solid.indicator 'left'
+            $solidChecks=@(); $solidSamples=@()
+            foreach ($i in 0..1) {
+                $rgb=@(VTRgb $points.Tabs[$i]); $solidSamples += ,$rgb
+                $expected=if ([int64]$vtForms[$i] -eq $solid.active) { @(224,48,64) } else { @(32,176,80) }
+                $solidChecks += (VTColorNear $rgb $expected)
+            }
+            VTGate 'h65_active_inactive_colors' (-not ($solidChecks -contains $false)) $solidSamples
+        }
+        VTGroup 'gradients' {
+            # The gradient is measured over the WINDOW rectangle (Gradient::color_at via
+            # fill_relative), not over each 12px tab, and the indicator sits outside that
+            # rectangle. Angle 90 would therefore clamp every indicator pixel to the first
+            # colour; angle 180 runs down the window, so the two ends of a 216px tab differ.
+            # Own solid reference, so this group does not depend on the colours group.
+            VTReload (VTConfig) 'gradient-solid-reference'
+            $solid=VTSnapshot 'gradient-solid-reference'; $sp=VTPoints $solid.indicator 'left'
+            $solidSamples=@(foreach ($i in 0..1) { ,@(VTRgb $sp.Tabs[$i]) })
+            VTReload (VTConfig 'left' $true $false $false 8 'gradient') 'gradient-paints'
+            $gradient=VTSnapshot 'gradient-paints'; $gp=VTPoints $gradient.indicator 'left'
+            $gradientSamples=@(); $gradientChecks=@()
+            foreach ($i in 0..1) {
+                $c=$gp.Tabs[$i]
+                $reach=[int][Math]::Floor($gp.Lengths[$i]/2.0)-10
+                $samples=@(foreach ($dy in @(-$reach,0,$reach)) {
+                    ,@(VTRgb ([pscustomobject]@{X=$c.X;Y=($c.Y+$dy)}))
+                })
+                $gradientSamples += ,$samples
+                $varies=$false; $changed=$false
+                for ($channel=0; $channel -lt 3; $channel++) {
+                    if ([Math]::Abs($samples[0][$channel]-$samples[2][$channel]) -gt 10) { $varies=$true }
+                    if ([Math]::Abs($samples[1][$channel]-$solidSamples[$i][$channel]) -gt 10) { $changed=$true }
+                }
+                $gradientChecks += ($varies -and $changed)
+            }
+            VTGate 'h65_gradients_reload' (-not ($gradientChecks -contains $false) -and
+                $gradient.active -eq $solid.active -and (VTEqual $gradient.window $solid.window)) $gradientSamples
+        }
+        VTGroup 'fullscreen' { VTMode 'fullscreen-window' $true 'h65_fullscreen_suppresses_across_tab_switches' }
+        VTGroup 'maximize-edges' { VTMode 'maximize-window-to-edges' $true 'h65_maximize_edges_suppresses_across_tab_switches' }
+        VTGroup 'maximize-column' { VTMode 'maximize-column' $false 'h65_maximize_column_keeps_indicator_and_reservation' }
+        VTGroup 'single-tab' {
+            VTReload (VTConfig 'left' $true $false $true) 'hide-single-before-close'
+            $victim=$vtForms[1]; VTOwnForm $victim
+            FocusForm $victim
+            if (-not (WaitForeground $victim 100 3000)) { throw 'Owned second probe is not foreground for close' }
+            if (-not (CloseFocused $victim 'lane-v-tabs-close')) { throw 'Owned second probe close chord refused' }
+            for ($i=0; $i -lt 60 -and [LT]::IsWindow($victim); $i++) { Start-Sleep -Milliseconds 50 }
+            if ([LT]::IsWindow($victim)) { throw 'Owned second probe did not close' }
+            FocusForm $vtForms[0]
+            if (-not (WaitForeground $vtForms[0] 100 3000)) { throw 'Surviving owned probe is not foreground' }
+            Start-Sleep -Milliseconds 650
+            $hidden=VTSnapshot 'single-hidden'
+            VTReload (VTConfig 'left' $true $true $true) 'single-off-reference'
+            $singleOff=VTSnapshot 'single-off-reference'
+            VTGate 'h65_hide_single_removes_indicator_and_reservation' ($hidden.host -eq 0 -and
+                $singleOff.host -eq 0 -and (VTEqual $hidden.window $singleOff.window)) @($hidden,$singleOff)
+            VTReload (VTConfig) 'show-single'
+            $shown=VTSnapshot 'single-shown'
+            VTGate 'h65_single_tab_can_be_shown' ($shown.host -ne 0 -and $shown.active -eq [int64]$vtForms[0] -and
+                (VTReserved $hidden.window $shown.window 'left' 20)) $shown
+        }
+        try {
+            $vt.Proc.Refresh()
+            $summary['p_h65_daemon_peak_working_set_bytes']=[int64]$vt.Proc.PeakWorkingSet64
+        } catch { $vtDetails['error-peak-working-set']=($_ | Out-String) }
     } catch {
         $vtDetails['error']=$_ | Out-String
     } finally {
