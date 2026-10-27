@@ -34,6 +34,39 @@ fn fixture() -> (TilingEngine, BackendHandle, OutputId) {
 }
 
 #[test]
+fn h17_workspace_setup_stays_put_until_explicit_focus() {
+    use crate::input::{parse_action_name, Action};
+
+    for structured in [false, true] {
+        let (mut engine, backend, output) = fixture();
+        let window = WindowId::new(101);
+        engine.focus_action_window(window, &backend);
+        let (name, args) = if structured {
+            ("move-window-to-workspace", vec!["2", "--focus", "false"])
+        } else {
+            ("move-to-workspace", vec!["2"])
+        };
+        let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        match parse_action_name(name, &args).unwrap() {
+            Action::MoveToWorkspace(number) => {
+                let workspace = engine.workspace_id_for_number(number);
+                engine.move_window_to_workspace(workspace, &backend);
+            }
+            Action::WorkspaceAction(action) => engine.workspace_layout_action(&action, &backend),
+            action => panic!("unexpected workspace setup action: {action:?}"),
+        }
+        assert_eq!(engine.monitors.get(&output).unwrap().active_workspace, 0);
+        assert_eq!(engine.locate_window(window).unwrap().1, 1);
+        engine.focus_workspace_number(2, &backend);
+        assert_eq!(engine.monitors.get(&output).unwrap().active_workspace, 1);
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().focus_window,
+            Some(window)
+        );
+    }
+}
+
+#[test]
 fn floating_only_workspace_restores_its_last_focused_float() {
     let (mut engine, backend, output) = fixture();
     for id in 100..102 {

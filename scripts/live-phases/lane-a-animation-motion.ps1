@@ -42,16 +42,28 @@ try {
     $h17Evidence.move = @($before, $middle, $after)
     $summary.h17_column_move_has_intermediate_frame = ($middle.L -lt ($before.L - 2)) -and ($middle.L -gt ($after.L + 2))
     $summary.h17_column_move_reaches_destination = ($after.L -lt ($before.L - 100))
-    $null = Ctl 'h17-move-ws2' @('action', 'move-to-workspace', '2')
+    # Explicitly stay on workspace 1: niri's move-window-to-workspace follows focus
+    # by default. The separately sampled focus below must start the vertical slide.
+    $null = Ctl 'h17-move-ws2' @('action', 'move-window-to-workspace', '2', '--focus', 'false')
     Start-Sleep -Milliseconds 1800
     $null = Ctl 'h17-focus-ws2' @('action', 'focus-workspace', '2')
     Start-Sleep -Milliseconds 90; $middle = Rc $h
     $h17Layers = @([LT]::TopLevel() | Where-Object { [LT]::Class($_) -eq 'WiriAnimationLayer' -and [LT]::IsWindowVisible($_) })
     $h17SlideY = if ($h17Layers.Count -eq 1) { [H17AnimationProbe]::GetProp($h17Layers[0], 'WiriAnimationIncomingY').ToInt64() } else { 0 }
     $h17SlideCloaked = [LT]::Cloaked($h)
+    # Zero IncomingY is ambiguous: it can also be a single host with no admitted
+    # incoming tile. Keep the exact-one-layer gate, but retain enough evidence to
+    # distinguish admission failure from absent/foreign/duplicate hosts.
+    $h17LayerEvidence = @($h17Layers | ForEach-Object {
+        @{ hwnd=$_.ToInt64(); pid=[LT]::Pid($_)
+           kind=[H17AnimationProbe]::GetProp($_, 'WiriAnimationKind').ToInt64()
+           incoming_y=[H17AnimationProbe]::GetProp($_, 'WiriAnimationIncomingY').ToInt64()
+           outgoing_y=[H17AnimationProbe]::GetProp($_, 'WiriAnimationOutgoingY').ToInt64()
+           thumbnails=[H17AnimationProbe]::GetProp($_, 'WiriAnimationThumbnailCount').ToInt64() }
+    })
     Shot 'h17-workspace-slide'
     Start-Sleep -Milliseconds 1800; $after = Rc $h
-    $h17Evidence.workspace = @($middle, $after, @{thumbnail_y=$h17SlideY; cloaked=$h17SlideCloaked})
+    $h17Evidence.workspace = @($middle, $after, @{thumbnail_y=$h17SlideY; cloaked=$h17SlideCloaked; layer_count=$h17Layers.Count; layers=$h17LayerEvidence})
     $summary.h17_workspace_moves_vertically = ($h17SlideCloaked -gt 0) -and ($h17SlideY -gt ($after.T + 2)) -and (Near $middle.L $after.L 3)
     $summary.h17_workspace_reaches_rest = [LT]::IsWindowVisible($h) -and ($after.T -ge 0) -and ($after.B -le 768)
     Start-Sleep -Milliseconds 600; $still = Rc $h
