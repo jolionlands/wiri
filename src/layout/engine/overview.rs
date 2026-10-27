@@ -444,10 +444,7 @@ mod tests {
         assert!(first.rect.size.h < 300, "0.35 is not the half-scale 364");
         let mid = |r: Rect| Point::new(r.loc.x + 10, r.loc.y + r.size.h as i32 / 2);
         assert_eq!(e.overview_workspace_at(mid(first.rect)), Some((output, 0)));
-        assert_eq!(
-            e.overview_workspace_at(mid(second.rect)),
-            Some((output, 1))
-        );
+        assert_eq!(e.overview_workspace_at(mid(second.rect)), Some((output, 1)));
         // The gap between two workspaces, and the area outside every monitor, hit nothing.
         let gap = Point::new(10, first.rect.bottom() + 1);
         assert!(gap.y < second.rect.loc.y);

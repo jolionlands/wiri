@@ -51,7 +51,11 @@ impl FourFinger {
             return None;
         }
         let points: BTreeMap<_, _> = contacts.iter().map(|c| (c.id, (c.x, c.y))).collect();
-        if points.len() != 4 || points.values().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        if points.len() != 4
+            || points
+                .values()
+                .any(|(x, y)| !x.is_finite() || !y.is_finite())
+        {
             // Any other count ends the swipe; `fired` stays until all fingers lift so one
             // touch is one action even if a finger leaves and returns.
             self.last.clear();
@@ -569,9 +573,13 @@ mod tests {
     #[test]
     fn four_finger_vertical_swipe_fires_once_and_rearms_after_all_fingers_lift() {
         let mut r = Recognizer::default();
-        assert!(!r.frame(&four_at(200.0, 50.0)).contains(&Swipe::Overview(true)));
+        assert!(!r
+            .frame(&four_at(200.0, 50.0))
+            .contains(&Swipe::Overview(true)));
         // Fingers travel up the pad (y shrinks): below the distance nothing happens.
-        assert!(!r.frame(&four_at(180.0, 50.0)).contains(&Swipe::Overview(true)));
+        assert!(!r
+            .frame(&four_at(180.0, 50.0))
+            .contains(&Swipe::Overview(true)));
         // Crossing the distance opens exactly once; continuing to swipe does not repeat.
         let fired = r.frame(&four_at(150.0, 50.0));
         assert!(fired.contains(&Swipe::Overview(true)), "{fired:?}");
@@ -648,10 +656,14 @@ mod tests {
         overview_swipe(&engine, &backend, true);
         overview_swipe(&engine, &backend, true);
         assert_eq!(sink.enter_calls(), 1);
-        engine.write().tick_animations_with_backend(60_000, &backend);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
         assert!(engine.read().is_overview());
         overview_swipe(&engine, &backend, false);
-        engine.write().tick_animations_with_backend(60_000, &backend);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
         assert!(!engine.read().is_overview());
         assert_eq!(sink.exit_calls(), 1);
     }
