@@ -90,9 +90,8 @@ mod tests {
         assert!(only.config.gestures.hot_corners.top_right);
         // An empty block, or any drag block next to hot-corners, keeps T2's opt-in.
         assert!(decode("gestures {}").config.gestures.enabled);
-        let both = decode(
-            "gestures { hot-corners { off; }; dnd-edge-view-scroll { delay-ms 50; }; }",
-        );
+        let both =
+            decode("gestures { hot-corners { off; }; dnd-edge-view-scroll { delay-ms 50; }; }");
         assert!(both.issues.is_empty(), "{:?}", both.issues);
         assert!(both.config.gestures.enabled);
         assert!(both.config.gestures.hot_corners.off);

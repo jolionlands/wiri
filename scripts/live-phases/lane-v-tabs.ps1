@@ -74,6 +74,7 @@
         $null=VTCtl $name @('action',$name)
         Start-Sleep -Milliseconds 500
     }
+    $prefix='wiri-h65-'+[Guid]::NewGuid().ToString('N')
     function VTConfig([string]$side='left',[bool]$within=$true,[bool]$off=$false,
             [bool]$hide=$false,[int]$gap=8,[string]$paint='solid') {
         $flag=if ($off) { 'off;' } else { '' }

@@ -45,9 +45,13 @@
     function VClose { VAction 'close-overview'; $null=VWait $false }
     function VWindows([string]$tag) {
         $text=Ctl ('lane-v-'+$tag) @('--json','windows')
-        return @(($text | ConvertFrom-Json).result)
+        return @(($text | ConvertFrom-Json).result.windows)
     }
-    function VWindow($list,$h) { return @($list | Where-Object { [int64]$_.id -eq [int64]$h })[0] }
+    function VWindow($list,$h) {
+        $matches=@($list | Where-Object { [int64]$_.id -eq [int64]$h })
+        if ($matches.Count -ne 1) { throw 'Expected exactly one owned probe in the windows snapshot' }
+        return $matches[0]
+    }
     function VFocus($h) {
         $null=Ctl 'lane-v-focus' @('focus-window',[string][int64]$h)
         Start-Sleep -Milliseconds 450
