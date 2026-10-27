@@ -422,7 +422,42 @@ impl TilingEngine {
                 Some(&self.rule_state),
             ));
         }
+        // niri `fullscreen-backdrop-color`: while a fullscreen window of this monitor is up,
+        // the layer fills the tiling view with the configured colour behind it (before the
+        // frames, so it is drawn below them).  A fullscreen window can leave a rim — gaps,
+        // the taskbar area, DPI rounding — and that rim is the backdrop, not the desktop.
+        if let Some(backdrop) = self.fullscreen_backdrop_spec(output_id, view) {
+            specs.insert(0, backdrop);
+        }
         sink.set_output(key, specs);
+    }
+
+    /// The backdrop of a monitor with a fullscreen window, when
+    /// `layout { fullscreen-backdrop-color }` names one.  `None` when no window of the
+    /// monitor is fullscreen or the colour is unset (no spec, so nothing is drawn).
+    fn fullscreen_backdrop_spec(
+        &self,
+        output_id: OutputId,
+        view: Rect,
+    ) -> Option<crate::overlay::decor::DecorSpec> {
+        let cfg = self.effective_config(output_id);
+        let color = cfg
+            .fullscreen_backdrop_color
+            .as_deref()
+            .and_then(crate::config::parse_color)
+            .map(crate::overlay::decor::paint::Rgba::from_array)?;        let fullscreen = self.fullscreen_windows.iter().any(|window| {
+            self.locate_window(*window)
+                .map(|(output, _, _)| output)
+                .or_else(|| self.float_location(*window).map(|(output, _)| output))
+                == Some(output_id)
+        });
+        if !fullscreen {
+            return None;
+        }
+        Some(crate::overlay::decor::DecorSpec::backdrop(
+            output_id.as_u64(),
+            crate::overlay::decor::BackdropSpec::new(view, color),
+        ))
     }
 
     /// Show the drop destination while a column is being dragged. The same column hit-test
@@ -522,8 +557,7 @@ mod tests {
 
     fn frame_of(spec: &DecorSpec) -> &FrameSpec {
         match &spec.content {
-            DecorContent::Frame(f) => f,
-            other => panic!("expected a frame, got {:?}", other),
+            DecorContent::Frame(f) => f,            other => panic!("expected a frame, got {:?}", other),
         }
     }
 
@@ -604,8 +638,95 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_and_maximized_windows_have_no_frame() {
-        let cfg = cfg_with(Effects::default());
+    fn a_fullscreen_window_gets_the_configured_backdrop_and_nothing_else_does() {
+        use crate::backend::{BackendHandle, WindowInfo, WindowState};
+        use crate::overlay::decor::paint::{Paint, Rgba};
+        use crate::overlay::decor::RecordingSink;
+
+        let sink = RecordingSink::new();
+        let be = BackendHandle::default_for_test();
+        let mut engine = TilingEngine::new(LayoutConfig {
+            fullscreen_backdrop_color: Some("#101010".into()),
+            ..LayoutConfig::default()
+        });
+        engine.install_decor_sink(sink.clone());
+        let output = OutputId::from_name("backdrop");
+        engine.register_monitor(
+            output,
+            Rect::new(0, 0, 1200, 800),
+            Rect::new(0, 0, 1200, 760),
+        );
+        engine.add_window(
+            WindowInfo {
+                hwnd: 1,
+                title: "player".into(),
+                class_name: "backdrop".into(),
+                process_id: 1,
+                bounds: Rect::new(0, 0, 400, 400),
+                state: WindowState::Normal,
+                is_visible: true,
+            },
+            &be,
+        );
+        let view = Rect::new(8, 8, 1184, 744);
+        let empty: HashMap<WindowId, Rect> = HashMap::new();
+        let modes: HashMap<WindowId, DrawMode> = HashMap::new();
+        engine.refresh_decorations(output, &empty, &modes, view, false);
+        assert!(
+            !sink
+                .of_output(output.as_u64())
+                .iter()
+                .any(|spec| matches!(spec.content, DecorContent::Backdrop(_))),
+            "no fullscreen window, no backdrop"
+        );
+        engine.fullscreen_windows.insert(WindowId::new(1));
+        engine.refresh_decorations(output, &empty, &modes, view, false);
+        let specs = sink.of_output(output.as_u64());
+        let backdrop = specs
+            .iter()
+            .find(|spec| matches!(spec.content, DecorContent::Backdrop(_)))
+            .expect("a fullscreen window gets the backdrop");
+        match &backdrop.content {
+            DecorContent::Backdrop(spec) => {
+                assert_eq!(spec.rect, view, "the tiling view of the monitor");
+                assert_eq!(spec.paint, Paint::Solid(Rgba::new(0x10, 0x10, 0x10, 255)));
+            }
+            other => panic!("expected a backdrop, got {other:?}"),
+        }
+        assert_eq!(
+            specs.first().map(|spec| spec.id.kind),
+            Some(crate::overlay::decor::DecorKind::Backdrop),
+            "the backdrop is drawn below the frames"
+        );
+    }
+
+    #[test]
+    fn a_monitor_without_the_colour_draws_no_backdrop() {
+        use crate::backend::BackendHandle;
+        use crate::overlay::decor::RecordingSink;
+        let sink = RecordingSink::new();
+        let be = BackendHandle::default_for_test();
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        engine.install_decor_sink(sink.clone());
+        let output = OutputId::from_name("no-backdrop");
+        engine.register_monitor(
+            output,
+            Rect::new(0, 0, 1200, 800),
+            Rect::new(0, 0, 1200, 760),
+        );
+        let _ = be;
+        engine.fullscreen_windows.insert(WindowId::new(1));
+        let empty: HashMap<WindowId, Rect> = HashMap::new();
+        let modes: HashMap<WindowId, DrawMode> = HashMap::new();
+        engine.refresh_decorations(output, &empty, &modes, Rect::new(8, 8, 1184, 744), false);
+        assert!(sink
+            .of_output(output.as_u64())
+            .iter()
+            .all(|spec| !matches!(spec.content, DecorContent::Backdrop(_))));
+    }
+
+    #[test]
+    fn fullscreen_and_maximized_windows_have_no_frame() {        let cfg = cfg_with(Effects::default());
         let urgent = HashSet::new();
         let tiles = [
             (wid(1), Rect::new(0, 0, 1366, 768), DrawMode::Exact),

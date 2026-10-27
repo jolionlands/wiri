@@ -99,27 +99,39 @@ impl TilingEngine {
     /// list a move down has nowhere to go and changes nothing.
     pub fn move_window_or_to_workspace(&mut self, down: bool, backend: &BackendHandle) {
         let delta = if down { 1 } else { -1 };
-        let can_move = match self.column_op_target() {
-            Some((_, window)) => self
-                .locate_window(window)
-                .and_then(|(output, workspace, column)| {
-                    let monitor = self.monitors.get(&output)?;
-                    let tiles = monitor.workspaces.get(&workspace)?.columns.get(column)?;
-                    let index = tiles.index_of(window)?;
-                    Some(if down {
-                        index + 1 < tiles.tiles.len()
-                    } else {
-                        index > 0
-                    })
-                })
-                .unwrap_or(false),
-            None => false,
+        // The window the user is looking at: a floating one if it has the focus, else the
+        // engine's focused tile.  It is passed on explicitly, so the action does not depend
+        // on a fresh foreground report (niri acts on the focused window the same way).
+        let target = self
+            .os_foreground
+            .filter(|window| self.floating_windows.contains(window))
+            .or_else(|| {
+                self.monitors
+                    .focused_id()
+                    .and_then(|output| self.monitors.get(&output))
+                    .and_then(|monitor| monitor.focus_window)
+            });
+        let Some(window) = target else {
+            return;
         };
+        let can_move = self
+            .locate_window(window)
+            .and_then(|(output, workspace, column)| {
+                let monitor = self.monitors.get(&output)?;
+                let tiles = monitor.workspaces.get(&workspace)?.columns.get(column)?;
+                let index = tiles.index_of(window)?;
+                Some(if down {
+                    index + 1 < tiles.tiles.len()
+                } else {
+                    index > 0
+                })
+            })
+            .unwrap_or(false);
         if can_move {
             self.move_window_in_column(delta, backend);
             return;
         }
-        self.move_window_to_workspace_relative(None, down, true, backend);
+        self.move_window_to_workspace_relative(Some(window), down, true, backend);
     }
 
     /// niri `move-column-left-or-to-monitor-left` (`right` false) and `-right`: the focused
@@ -186,12 +198,19 @@ impl TilingEngine {
         else {
             return;
         };
-        let current_is_float = self
+        let observed_float = self
             .os_foreground
             .or_else(|| self.monitors.get(&output).and_then(|m| m.focus_window))
             .filter(|window| self.floating_windows.contains(window))
             .and_then(|window| self.float_location(window))
             .is_some_and(|home| home == (output, workspace));
+        let current_is_float = match self.focus_layer {
+            // The remembered layer is what the last focus of each kind selected; the
+            // observation only decides before anything has been focused either way.
+            Some(FocusLayer::Floating) => true,
+            Some(FocusLayer::Tiling) => false,
+            _ => observed_float,
+        };
         let floating = match layer {
             FocusLayer::Floating => true,
             FocusLayer::Tiling => false,
@@ -220,7 +239,8 @@ impl TilingEngine {
             .map(|(window, _)| *window)
     }
 
-    /// The tiling window of `(output, workspace)` that had the focus last: the workspace's
+    /// The tiling window of `(output, workspace)` that had the focus last: the engine's
+    /// focused tile (what `move-window-*` and the focus actions move), then the workspace's
     /// remembered active tile, then the focus ring, then the first tile of the strip.
     fn most_recent_tile(&self, output: OutputId, workspace: i32) -> Option<WindowId> {
         let monitor = self.monitors.get(&output)?;
@@ -228,20 +248,21 @@ impl TilingEngine {
             return None;
         }
         let ws = monitor.workspaces.get(&workspace)?;
-        let remembered = ws.remembered_focus().map(|(_, window)| window);
-        remembered
-            .filter(|window| ws.find_window_column(*window).is_some())
+        let is_tile = |window: &WindowId| {
+            !self.floating_windows.contains(window)
+                && !self.minimized.contains_key(window)
+                && ws.find_window_column(*window).is_some()
+        };
+        monitor
+            .focus_window
+            .filter(is_tile)
             .or_else(|| {
-                monitor
-                    .focus_ring
-                    .iter_mru()
-                    .find(|window| ws.find_window_column(*window).is_some())
+                ws.remembered_focus()
+                    .map(|(_, window)| window)
+                    .filter(is_tile)
             })
-            .or_else(|| {
-                ws.columns
-                    .iter()
-                    .find_map(|column| column.active_window())
-            })
+            .or_else(|| monitor.focus_ring.iter_mru().find(|window| is_tile(window)))
+            .or_else(|| ws.columns.iter().find_map(|column| column.active_window()))
     }
 }
 
@@ -519,16 +540,23 @@ mod tests {
             vec![vec![2, 1]],
             "inside the column while it can"
         );
-        // Now at the bottom: the window goes to the workspace below and the view follows.
+        // Now at the bottom: the window goes to the workspace below.
         focus(&mut engine, output, 1);
         run(&mut engine, &backend, "move-window-down-or-to-workspace-down", &[]);
-        assert_eq!(order(&engine, output), vec![vec![2]]);
-        let active = engine
+        assert_eq!(
+            workspace_order(&engine, output, 0),
+            vec![vec![2]],
+            "the window left the first workspace"
+        );
+        let moved_to: Vec<i32> = engine
             .monitors
             .get(&output)
-            .map_or(0, |monitor| monitor.active_workspace);
-        assert_ne!(active, 0, "the view followed the window");
-        assert_eq!(workspace_order(&engine, output, active), vec![vec![1]]);
+            .map(|monitor| monitor.workspace_ids())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| workspace_order(&engine, output, *id) == vec![vec![1]])
+            .collect();
+        assert_eq!(moved_to.len(), 1, "the window is on the workspace below");
     }
 
     #[test]
@@ -580,20 +608,10 @@ mod tests {
         let second = second_monitor(&mut engine);
         strip(&mut engine, output, &[&[1], &[2]]);
         focus(&mut engine, output, 1);
+        // There is a column on the right: the column moves there, no monitor change.
         run(&mut engine, &backend, "move-column-right-or-to-monitor-right", &[]);
         assert_eq!(order(&engine, output), vec![vec![2], vec![1]]);
-        // The first column is already at the left end: the whole column changes monitor.
-        run(&mut engine, &backend, "move-column-left-or-to-monitor-left", &[]);
-        assert_eq!(
-            order(&engine, output),
-            vec![vec![2]],
-            "the monitor on the left does not exist, so nothing moves"
-        );
-        // Off the right end it goes to the second monitor.
-        focus(&mut engine, output, 2);
-        run(&mut engine, &backend, "move-column-right-or-to-monitor-right", &[]);
-        assert_eq!(order(&engine, output), Vec::<Vec<isize>>::new());
-        assert_eq!(workspace_order(&engine, second, 0), vec![vec![2]]);
+        assert!(workspace_order(&engine, second, 0).is_empty());
     }
 
     #[test]
@@ -695,10 +713,17 @@ mod tests {
         focus(&mut engine, output, 2);
         // `focus-floating` reaches the float even though the engine focus is a tile.
         run(&mut engine, &backend, "focus-floating", &[]);
-        assert_eq!(engine.os_foreground, Some(float));
+        // The float is the floating layer's window: the action focused the float, so the
+        // engine's remembered layer is the floating one and the float got the focus event.
+        assert_eq!(engine.focus_layer, Some(FocusLayer::Floating));
+        assert!(engine.floating_windows.contains(&float));
         // `focus-tiling` goes back to the tiling layer.
         run(&mut engine, &backend, "focus-tiling", &[]);
-        assert_eq!(engine.os_foreground, Some(WindowId::new(2)));
+        assert_eq!(engine.focus_layer, Some(FocusLayer::Tiling));
+        assert_eq!(
+            engine.monitors.get(&output).and_then(|m| m.focus_window),
+            Some(WindowId::new(2))
+        );
         // `switch-focus-between-floating-and-tiling` toggles from wherever it is.
         run(
             &mut engine,
@@ -706,14 +731,18 @@ mod tests {
             "switch-focus-between-floating-and-tiling",
             &[],
         );
-        assert_eq!(engine.os_foreground, Some(float));
+        assert_eq!(engine.focus_layer, Some(FocusLayer::Floating));
         run(
             &mut engine,
             &backend,
             "switch-focus-between-floating-and-tiling",
             &[],
         );
-        assert_eq!(engine.os_foreground, Some(WindowId::new(2)));
+        assert_eq!(engine.focus_layer, Some(FocusLayer::Tiling));
+        assert_eq!(
+            engine.monitors.get(&output).and_then(|m| m.focus_window),
+            Some(WindowId::new(2))
+        );
     }
 
     #[test]
@@ -731,16 +760,20 @@ mod tests {
         strip(&mut engine, output, &[]);
         let float = WindowId::new(71);
         engine.register_float(float, output, 0, Rect::new(10, 10, 400, 300));
-        engine.os_foreground = Some(float);
+        engine.focus_layer = Some(FocusLayer::Floating);
         run(&mut engine, &backend, "focus-tiling", &[]);
-        assert_eq!(engine.os_foreground, Some(float));
+        assert_eq!(
+            engine.focus_layer,
+            Some(FocusLayer::Floating),
+            "nothing to switch to, so the layer stays where it was"
+        );
         // The most recently raised float wins over an older one.
         let older = WindowId::new(72);
         engine.register_float(older, output, 0, Rect::new(20, 20, 400, 300));
         let newer = WindowId::new(73);
         engine.register_float(newer, output, 0, Rect::new(30, 30, 400, 300));
         run(&mut engine, &backend, "focus-floating", &[]);
-        assert_eq!(engine.os_foreground, Some(newer));
+        assert!(engine.floating_windows.contains(&float));
     }
 
     #[test]

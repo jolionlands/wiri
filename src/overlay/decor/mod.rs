@@ -25,8 +25,8 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 pub use spec::{
-    paint_of, DecorContent, DecorId, DecorKind, DecorSpec, FrameSpec, HintSpec, ShadowSpec,
-    TabsSpec, TRANSIENT_OUTPUT,
+    paint_of, BackdropSpec, DecorContent, DecorId, DecorKind, DecorSpec, FrameSpec, HintSpec,
+    ShadowSpec, TabsSpec, TRANSIENT_OUTPUT,
 };
 
 /// Where the engine (and the hooks) send decorations.

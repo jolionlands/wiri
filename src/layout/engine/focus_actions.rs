@@ -259,8 +259,10 @@ impl TilingEngine {
         backend: &BackendHandle,
     ) -> bool {
         if self.floating_windows.contains(&window) {
+            self.focus_layer = Some(FocusLayer::Floating);
             return self.focus_float(window, backend);
         }
+        self.focus_layer = Some(FocusLayer::Tiling);
         if self.minimized.contains_key(&window) {
             self.restore_window(window, backend);
         }

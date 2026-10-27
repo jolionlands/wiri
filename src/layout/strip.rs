@@ -142,10 +142,11 @@ mod tests {
         assert_eq!(ws.scroll_offset.x, -90);
         // Centring again moves nothing.
         assert!(!ws.center_visible_columns(400, 20, 1000));
-        // Scrolled so that only the middle and the last column are fully visible.
+        // Scrolled so that the middle and the last column are fully visible: their span
+        // (420..1240) is centred in the 1000 px view.
         ws.scroll_offset.x = 240;
         assert!(ws.center_visible_columns(400, 20, 1000));
-        assert_eq!(ws.scroll_offset.x, 180, "span 180..1000 centred in 1000");
+        assert_eq!(ws.scroll_offset.x, 330, "span 420..1240 centred in 1000");
     }
 
     #[test]

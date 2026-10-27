@@ -674,6 +674,10 @@ pub struct TilingEngine {
     /// window shows at the engine's own alpha (dimming only) until it is toggled back.  A
     /// reload of the rules does not forget it (niri's toggle is a per-window override).
     opacity_overridden: HashSet<WindowId>,
+    /// Which focus layer the focus is in (`focus-floating` / `focus-tiling`): the
+    /// `switch-focus-between-floating-and-tiling` action toggles this.  `None` until the
+    /// first layer action or a floating window is focused.
+    focus_layer: Option<crate::layout::FocusLayer>,
     /// Windows that opened with `open-focused false`, for the first focus report they get.
     unfocused_opens: HashMap<WindowId, rules::UnfocusedOpen>,
     /// The device name of each monitor (`\\.\DISPLAY1`), as told by `set_output_name`.
@@ -840,6 +844,7 @@ impl TilingEngine {
             rule_limits: HashMap::new(),
             rule_heights: HashMap::new(),
             opacity_overridden: HashSet::new(),
+            focus_layer: None,
             unfocused_opens: HashMap::new(),
             output_names: HashMap::new(),
             output_identities: Vec::new(),
@@ -3433,6 +3438,8 @@ impl TilingEngine {
         // looking at now.
         self.record_ipc_foreground(window_id);
         if self.floating_windows.contains(&window_id) {
+            // niri's focus layers: a float the user selected is the floating layer.
+            self.focus_layer = Some(FocusLayer::Floating);
             // The user is looking at a floating window: it goes to the top of the float stack.
             // Not a float of an inactive workspace that wiri itself hid: Windows reports it as
             // the foreground window when it picks a replacement for a window hidden a moment
@@ -3454,6 +3461,8 @@ impl TilingEngine {
             return None;
         }
         let (output_id, workspace_id, column_idx) = self.locate_window(window_id)?;
+        // A tiled window that the OS reports as the foreground one is the tiling layer.
+        self.focus_layer = Some(FocusLayer::Tiling);
 
         // A window on an inactive workspace that wiri itself hid is not the user asking
         // to go there: Windows reports it as the foreground window when it picks a

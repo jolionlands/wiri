@@ -15,6 +15,13 @@ pub enum Easing {
 }
 
 impl Easing {
+    /// The eased position (0 to 1) of `t` (0 to 1) on this curve.  The layout timeline uses
+    /// it for its own animations; the overlay's recent-windows fade reuses it so that the
+    /// configured curve means the same thing everywhere.
+    pub fn apply(self, t: f64) -> f64 {
+        apply_easing(t, self)
+    }
+
     pub fn parse(text: &str) -> Option<Self> {
         Some(match text.to_ascii_lowercase().replace('_', "-").as_str() {
             "none" | "off" => Self::None,

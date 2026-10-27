@@ -28,6 +28,131 @@ pub struct FocusDeadline {
     pub delay_ms: u32,
 }
 
+// ---------------------------------------------------------------------------------------------
+// niri `recent-windows-close`: the fade-out of the overlay
+// ---------------------------------------------------------------------------------------------
+
+/// The fade of the recent-windows overlay when it closes, as pure data: the configured
+/// duration and the curve of the animation timeline (`animations { recent-windows-close }`).
+///
+/// The host window only runs a timer while a fade lasts (it starts one when the overlay is
+/// hidden and kills it when the alpha reaches zero), so nothing ticks at rest.  A spring has
+/// no duration of its own; it is boxed to the time it takes to settle to `epsilon` — about
+/// 190 ms for niri's default spring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CloseFade {
+    duration_ms: u32,
+    curve: crate::layout::animation::Easing,
+}
+
+impl CloseFade {
+    /// The fade of `kind`, or `None` when nothing is to be animated.
+    pub fn of(kind: crate::layout::animation::AnimationKind) -> Option<Self> {
+        use crate::layout::animation::{AnimationKind, Easing};
+        match kind {
+            AnimationKind::Off => None,
+            AnimationKind::Easing { duration_ms, curve } => {
+                if duration_ms == 0 || matches!(curve, Easing::None) {
+                    None
+                } else {
+                    Some(Self { duration_ms, curve })
+                }
+            }
+            AnimationKind::Spring(spring) => Some(Self {
+                duration_ms: Self::spring_settle_ms(spring),
+                // A spring moves fast at first, like an ease-out; the exact spring shape is
+                // the layout lane's business (no frame clock in the overlay).
+                curve: Easing::QuadOut,
+            }),
+        }
+    }
+
+    /// How long a spring takes to settle to its `epsilon`, in milliseconds (bounded).
+    fn spring_settle_ms(spring: crate::layout::animation::Spring) -> u32 {
+        let w = spring.stiffness.max(0.000_001).sqrt();
+        let z = spring.damping_ratio.max(0.01);
+        // A critically damped spring decays like exp(-w t); the overshoot factor gives the
+        // rest a little more time.  Clamped to something a person can see.
+        let seconds = (6.0 / (z * w)).max(0.05);
+        (seconds * 1000.0).round().clamp(40.0, 1000.0) as u32
+    }
+
+    pub fn duration_ms(&self) -> u32 {
+        self.duration_ms
+    }
+
+    /// The alpha of the overlay (0 to 255) `elapsed_ms` into the fade.
+    pub fn alpha(&self, elapsed_ms: u32) -> u8 {
+        let t = (elapsed_ms as f64 / self.duration_ms.max(1) as f64).clamp(0.0, 1.0);
+        let eased = self.curve.apply(t);
+        ((1.0 - eased).clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    /// True once the fade is over and the overlay can be destroyed.
+    pub fn finished(&self, elapsed_ms: u32) -> bool {
+        elapsed_ms >= self.duration_ms
+    }
+}
+
+/// The fade the daemon installed from the config (`0` = no fade).  The overlay host thread
+/// has no engine, so the setting lives here; a reload replaces it.
+static CLOSE_FADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A stable code for a curve, so the setting can cross the thread boundary as one number
+/// without depending on the enum's declaration order.
+fn curve_code(curve: crate::layout::animation::Easing) -> u64 {
+    use crate::layout::animation::Easing;
+    match curve {
+        Easing::None => 0,
+        Easing::Linear => 1,
+        Easing::EaseIn => 2,
+        Easing::EaseOut => 3,
+        Easing::EaseInOut => 4,
+        Easing::CubicOut => 5,
+        Easing::QuadOut => 6,
+        Easing::ExpoOut => 7,
+    }
+}
+
+fn curve_from_code(code: u64) -> crate::layout::animation::Easing {
+    use crate::layout::animation::Easing;
+    match code {
+        0 => Easing::None,
+        1 => Easing::Linear,
+        2 => Easing::EaseIn,
+        3 => Easing::EaseOut,
+        4 => Easing::EaseInOut,
+        5 => Easing::CubicOut,
+        7 => Easing::ExpoOut,
+        _ => Easing::QuadOut,
+    }
+}
+
+/// Install `animations { recent-windows-close }` for the overlay host.
+pub fn set_close_fade(kind: crate::layout::animation::AnimationKind) {
+    use std::sync::atomic::Ordering;
+    let encoded = CloseFade::of(kind).map_or(0, |fade| {
+        // Lower 32 bits: milliseconds.  Upper byte: curve, so a reload can change the shape
+        // without the host holding a lock.
+        fade.duration_ms as u64 | (curve_code(fade.curve) << 32)
+    });
+    CLOSE_FADE.store(encoded, Ordering::Release);
+}
+
+/// The fade the overlay host should run when it closes, if any.
+pub fn close_fade() -> Option<CloseFade> {
+    use std::sync::atomic::Ordering;
+    let encoded = CLOSE_FADE.load(Ordering::Acquire);
+    if encoded == 0 {
+        return None;
+    }
+    let duration_ms = (encoded & 0xFFFF_FFFF) as u32;
+    (duration_ms > 0).then_some(CloseFade {
+        duration_ms,
+        curve: curve_from_code(encoded >> 32),
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct RecentHistory {
     order: Vec<WindowId>,
@@ -486,8 +611,68 @@ pub type DwmRecentWindows = MockRecentWindows;
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn windows() -> Vec<RecentWindow> {
-        (1..=4)
+    use crate::layout::animation::{AnimationKind, Easing, Spring};
+
+    #[test]
+    fn the_close_fade_follows_the_configured_curve() {
+        let fade = CloseFade::of(AnimationKind::Easing {
+            duration_ms: 200,
+            curve: Easing::Linear,
+        })
+        .expect("a fade");
+        assert_eq!(fade.duration_ms(), 200);
+        assert_eq!(fade.alpha(0), 255);
+        assert_eq!(fade.alpha(100), 128);
+        assert_eq!(fade.alpha(200), 0);
+        assert!(!fade.finished(199));
+        assert!(fade.finished(200));
+        assert!(fade.finished(1000), "a late tick still ends the fade");
+    }
+
+    #[test]
+    fn an_off_animation_fades_nothing() {
+        assert!(CloseFade::of(AnimationKind::Off).is_none());
+        assert!(CloseFade::of(AnimationKind::Easing {
+            duration_ms: 0,
+            curve: Easing::Linear
+        })
+        .is_none());
+        assert!(CloseFade::of(AnimationKind::Easing {
+            duration_ms: 200,
+            curve: Easing::None
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn a_spring_is_boxed_to_a_visible_duration() {
+        let fade = CloseFade::of(AnimationKind::Spring(Spring::default())).expect("a fade");
+        assert!(
+            (40..=1000).contains(&fade.duration_ms()),
+            "{}",
+            fade.duration_ms()
+        );
+        assert_eq!(fade.alpha(0), 255);
+        assert_eq!(fade.alpha(fade.duration_ms()), 0);
+    }
+
+    #[test]
+    fn the_installed_fade_round_trips_through_the_published_setting() {
+        // Nothing installed: no fade (a daemon with animations off stays as it was).
+        set_close_fade(AnimationKind::Off);
+        assert!(close_fade().is_none());
+        set_close_fade(AnimationKind::Easing {
+            duration_ms: 150,
+            curve: Easing::ExpoOut,
+        });
+        let fade = close_fade().expect("a fade");
+        assert_eq!(fade.duration_ms(), 150);
+        assert_eq!(fade.curve, Easing::ExpoOut);
+        set_close_fade(AnimationKind::Off);
+        assert!(close_fade().is_none());
+    }
+
+    fn windows() -> Vec<RecentWindow> {        (1..=4)
             .map(|i| RecentWindow {
                 id: WindowId::new(i),
                 output: OutputId::from_name(if i == 4 { "B" } else { "A" }),

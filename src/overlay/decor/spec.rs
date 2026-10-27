@@ -22,6 +22,8 @@ pub enum DecorKind {
     Frame,
     Tabs,
     Hint,
+    /// niri `fullscreen-backdrop-color`: a filled rectangle behind a fullscreen window.
+    Backdrop,
 }
 
 /// Names a decoration across updates: the layer keeps one window per id.
@@ -388,6 +390,34 @@ pub struct HintSpec {
     pub view: Rect,
 }
 
+/// niri `fullscreen-backdrop-color`: the colour the layer fills the tiling view with while a
+/// fullscreen window is up, so that the rim a fullscreen window can leave (gaps, the taskbar
+/// area, DPI rounding) is not the desktop showing through.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackdropSpec {
+    pub rect: Rect,
+    pub paint: Paint,
+}
+
+impl BackdropSpec {
+    pub fn new(rect: Rect, color: Rgba) -> Self {
+        Self {
+            rect,
+            paint: Paint::Solid(color),
+        }
+    }
+
+    pub fn bounds(&self) -> Rect {
+        self.rect
+    }
+
+    pub fn render(&self, surf: &mut Surface, origin: (i32, i32)) {
+        let rr = RRect::of(self.rect, origin, 0.0);
+        let view = RRect::of(self.rect, origin, 0.0);
+        fill(surf, &rr, &self.paint, &view);
+    }
+}
+
 impl HintSpec {
     pub fn bounds(&self) -> Rect {
         expand(self.rect, 2)
@@ -419,6 +449,7 @@ pub enum DecorContent {
     Frame(FrameSpec),
     Tabs(TabsSpec),
     Hint(HintSpec),
+    Backdrop(BackdropSpec),
 }
 
 /// One decoration: what to draw, and the window it belongs to.
@@ -465,12 +496,26 @@ impl DecorSpec {
         }
     }
 
+    /// The fullscreen backdrop of an output: one per monitor, keyed by the output, stacked
+    /// above every ordinary window (`anchor` 0) so it sits behind the fullscreen window.
+    pub fn backdrop(output: u64, backdrop: BackdropSpec) -> Self {
+        Self {
+            id: DecorId {
+                kind: DecorKind::Backdrop,
+                key: output as isize,
+            },
+            anchor: 0,
+            content: DecorContent::Backdrop(backdrop),
+        }
+    }
+
     /// The rectangle of the layered window, in screen pixels.
     pub fn bounds(&self) -> Rect {
         match &self.content {
             DecorContent::Frame(f) => f.bounds(),
             DecorContent::Tabs(t) => t.bounds(),
             DecorContent::Hint(h) => h.bounds(),
+            DecorContent::Backdrop(b) => b.bounds(),
         }
     }
 
@@ -481,6 +526,7 @@ impl DecorSpec {
             DecorContent::Frame(f) => f.render(surf, origin),
             DecorContent::Tabs(t) => t.render(surf, origin),
             DecorContent::Hint(h) => h.render(surf, origin),
+            DecorContent::Backdrop(b) => b.render(surf, origin),
         }
     }
 
@@ -493,6 +539,8 @@ impl DecorSpec {
             DecorContent::Frame(f) => f.translate(-b.loc.x, -b.loc.y),
             DecorContent::Tabs(t) => t.translate(-b.loc.x, -b.loc.y),
             DecorContent::Hint(h) => h.translate(-b.loc.x, -b.loc.y),
+            // The backdrop is the output's rectangle, so it is compared where it is.
+            DecorContent::Backdrop(_) => {}
         }
         out
     }
@@ -504,6 +552,7 @@ impl DecorSpec {
             DecorContent::Frame(f) => f.uses_view(),
             DecorContent::Tabs(t) => t.uses_view(),
             DecorContent::Hint(h) => h.uses_view(),
+            DecorContent::Backdrop(_) => false,
         }
     }
 
