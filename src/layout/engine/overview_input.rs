@@ -210,7 +210,7 @@ mod tests {
         assert!(e.is_overview());
     }
     /// The visible 0-based place of the workspace `window` is on.
-    fn place_of(e: &TilingEngine, o: OutputId, window: u32) -> usize {
+    fn place_of(e: &TilingEngine, o: OutputId, window: isize) -> usize {
         let (_, workspace, _) = e.locate_window(WindowId::new(window)).unwrap();
         let ids = e.monitors.get(&o).unwrap().workspace_ids();
         ids.iter().position(|id| *id == workspace).unwrap()
