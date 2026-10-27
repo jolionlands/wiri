@@ -1004,7 +1004,10 @@ mod tests {
         assert_eq!(mouse_vanish_set_arguments(false), (0, 0));
         // The mapping from the stored value is the same for both directions of a restore.
         for stored in [0, 1] {
-            assert_eq!(mouse_vanish_set_arguments(stored != 0), (0, stored as usize));
+            assert_eq!(
+                mouse_vanish_set_arguments(stored != 0),
+                (0, stored as usize)
+            );
         }
     }
 

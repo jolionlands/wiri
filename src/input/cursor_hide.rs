@@ -459,20 +459,32 @@ impl CursorBackend for SystemCursors {
 
 #[cfg(target_os = "windows")]
 mod windows_cursors {
-    use windows::Win32::UI::WindowsAndMessaging::HCURSOR;
     use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HBITMAP, HGDIOBJ};
+    use windows::Win32::UI::WindowsAndMessaging::HCURSOR;
     use windows::Win32::UI::WindowsAndMessaging::{
         CopyIcon, CreateIconIndirect, DestroyCursor, SetSystemCursor, SystemParametersInfoW,
         ICONINFO, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL,
-        OCR_SIZEALL, OCR_SIZENS, OCR_SIZENESW, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT,
+        OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT,
         SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     };
 
     /// Every cursor a window can show: the arrow, the text caret, the busy/working ones, the
     /// resize arrows, the "no" sign and the hand.
     const SYSTEM_CURSORS: [SYSTEM_CURSOR_ID; 14] = [
-        OCR_NORMAL, OCR_IBEAM, OCR_WAIT, OCR_CROSS, OCR_UP, OCR_SIZENWSE, OCR_SIZENESW, OCR_SIZEWE,
-        OCR_SIZENS, OCR_SIZEALL, OCR_NO, OCR_HAND, OCR_APPSTARTING, OCR_HELP,
+        OCR_NORMAL,
+        OCR_IBEAM,
+        OCR_WAIT,
+        OCR_CROSS,
+        OCR_UP,
+        OCR_SIZENWSE,
+        OCR_SIZENESW,
+        OCR_SIZEWE,
+        OCR_SIZENS,
+        OCR_SIZEALL,
+        OCR_NO,
+        OCR_HAND,
+        OCR_APPSTARTING,
+        OCR_HELP,
     ];
 
     /// A 32x32 transparent monochrome cursor.  A monochrome cursor's `hbmMask` is twice as tall as
@@ -617,7 +629,10 @@ mod tests {
     fn a_movement_arms_one_timer_and_firing_it_hides_the_pointer() {
         let fake = Arc::new(Fake::default());
         let mut hider = hider_for(&fake);
-        assert!(hider.configure(Some(400)).is_empty(), "nothing until movement");
+        assert!(
+            hider.configure(Some(400)).is_empty(),
+            "nothing until movement"
+        );
         assert_eq!(hider.activity(), vec![Effect::Arm(400)]);
         assert_eq!(fake.calls(), Vec::<&'static str>::new(), "only arming");
         assert_eq!(hider.timer(), vec![Effect::Hide]);
@@ -690,10 +705,7 @@ mod tests {
         hider.activity();
         hider.timer();
         assert!(hider.hidden());
-        assert_eq!(
-            hider.configure(None),
-            vec![Effect::Show, Effect::Restore]
-        );
+        assert_eq!(hider.configure(None), vec![Effect::Show, Effect::Restore]);
         assert_eq!(fake.calls(), vec!["hide", "show", "restore"]);
         assert!(!hider.hidden());
         // A reload that keeps the option changes nothing.
