@@ -212,7 +212,9 @@ window-rule {
 Strings are in double quotes with KDL's escapes (`\n \t \\ \" \u{1F600}`) or raw (`r"..."`, `r#"..."#`).
 A bad escape is an error that says how to fix it.  For Windows paths, wiri keeps the old format's
 convenience: **a string that starts like a path (`C:\...` or `\\server`) keeps its backslashes as
-written** (`"C:\Program Files\x"` works); in any other string write `\\` or use a raw string.  Numbers
+written** (`"C:\Program Files\x"` works); in any other string write `\\` or use a raw string.  A
+string that starts with three or more backslashes is KDL's escaped spelling of a UNC or device name,
+so `"\\\\.\\DISPLAY1"` and `"\\.\DISPLAY1"` both mean the monitor `\\.\DISPLAY1`.  Numbers
 may use `_`, `0x`, `0o`, `0b`.  A byte-order mark, CRLF and UTF-16 files (what PowerShell's `Out-File`
 writes) are fine.  wiri also still reads its older spellings: bare words as values (`hide-method hide`),
 `key=value` as a whole line (`repeat_delay=600`), and the flat keys of `layout`.
