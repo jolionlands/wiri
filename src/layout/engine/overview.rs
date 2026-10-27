@@ -1,6 +1,6 @@
 //! The overview is a camera over a vertically stacked set of normal workspace views.
 //! It never reconfigures applications to thumbnail-sized rectangles.
-use super::{AppliedState, BackendHandle, LayoutConfig, OverviewState, TilingEngine};
+use super::{AppliedState, BackendHandle, OverviewState, TilingEngine};
 use crate::overlay::thumbnail_overview::{OverviewCommand, OverviewContext, OverviewWorkspace};
 use crate::utils::{OutputId, Rect, WindowId};
 
@@ -65,15 +65,13 @@ impl TilingEngine {
         self.apply_layout_for_monitor(output, backend);
     }
 
-    pub(super) fn workspace_overview_scene(
-        &self,
-        output: OutputId,
-        view: Rect,
-        cfg: &LayoutConfig,
-    ) -> Vec<(WindowId, Rect)> {
+    pub(super) fn workspace_overview_scene(&self, output: OutputId) -> Vec<(WindowId, Rect)> {
         let Some(monitor) = self.monitors.get(&output) else {
             return Vec::new();
         };
+        // The camera spans the full work area; each workspace resolves its own
+        // insets inside it, rather than inheriting the active workspace's view.
+        let view = monitor.work_area;
         let ids = monitor.workspace_ids();
         let active = ids
             .iter()
@@ -94,8 +92,16 @@ impl TilingEngine {
                 active: id == monitor.active_workspace,
                 rect: zoom_rect(view, view, y),
             });
-            let normal =
-                self.calculate_positions_at_zoom(ws, view, 0, view.size.h as i32, cfg, 1.0);
+            let cfg = self.effective_config_for_workspace(output, id);
+            let workspace_view = Self::tiling_work_rect(monitor, cfg);
+            let normal = self.calculate_positions_at_zoom(
+                ws,
+                workspace_view,
+                0,
+                workspace_view.size.h as i32,
+                cfg,
+                1.0,
+            );
             positions.extend(
                 normal
                     .into_iter()
@@ -163,6 +169,69 @@ impl TilingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inactive_thumbnail_uses_its_workspace_insets_before_camera_transform() {
+        use crate::layout::{LayoutConfig, Workspace};
+        let output = OutputId::from_name("overview-insets");
+        let view = Rect::new(-1000, 20, 1000, 760);
+        let mut engine = TilingEngine::new(LayoutConfig {
+            outer_gaps: (0, 0, 0, 0),
+            ..LayoutConfig::default()
+        });
+        engine.register_monitor(output, view, view);
+        let id = WindowId::new(901);
+        let mut workspace = Workspace::new();
+        workspace.name = Some("insets".to_string());
+        workspace.add_window_to_new_column_with_width(id, Some(300));
+        engine
+            .monitors
+            .get_mut(&output)
+            .unwrap()
+            .workspaces
+            .insert(1, workspace);
+        let cfg = LayoutConfig {
+            outer_gaps: (20, 30, 40, 50),
+            reserve_left: 80,
+            reserve_top: 40,
+            ..engine.config.clone()
+        };
+        engine.config_per_workspace.insert(
+            "insets".to_string(),
+            std::collections::HashMap::from([(output, cfg.clone())]),
+        );
+        let monitor = engine.monitors.get(&output).unwrap();
+        let inset = TilingEngine::tiling_work_rect(monitor, &cfg);
+        let normal = engine.calculate_positions_at_zoom(
+            &monitor.workspaces[&1],
+            inset,
+            0,
+            inset.size.h as i32,
+            &cfg,
+            1.0,
+        );
+        let height = (view.size.h as f64 * ZOOM).round() as i32;
+        let y = view.loc.y
+            + (view.size.h as i32 - height) / 2
+            + height
+            + (WORKSPACE_GAP as f64 * ZOOM).round() as i32;
+        let expected = zoom_rect(normal[0].1, view, y);
+        let scene = engine.workspace_overview_scene(output);
+        assert_eq!(
+            scene.iter().find(|(wid, _)| *wid == id).unwrap().1,
+            expected
+        );
+        // Prove the fixture distinguishes the old active-workspace rectangle.
+        let wrong = engine.calculate_positions_at_zoom(
+            &monitor.workspaces[&1],
+            view,
+            0,
+            view.size.h as i32,
+            &cfg,
+            1.0,
+        );
+        assert_ne!(zoom_rect(wrong[0].1, view, y), expected);
+    }
+
     #[test]
     fn overview_scales_half_and_preserves_normal_aspect_and_negative_origins() {
         let view = Rect::new(-1366, 0, 1366, 728);

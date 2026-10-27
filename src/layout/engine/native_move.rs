@@ -60,7 +60,9 @@ impl TilingEngine {
         {
             return;
         }
-        let cfg = self.effective_config(output).clone();
+        let cfg = self
+            .effective_config_for_workspace(output, workspace)
+            .clone();
         let Some(monitor) = self.monitors.get_mut(&output) else {
             return;
         };

@@ -65,6 +65,8 @@ $ErrorActionPreference = if ($env:WIRI_LIVE_CI -eq '1') { 'Stop' } else { 'Conti
 # of this lock: Codex Sol's commit ee41d27.
 $liveLock = New-Object System.Threading.Mutex($false, 'Global\wiri-live-test')
 $ownsLiveLock = $false
+# Native keyboard settings/layout requests are NEVER applied on the shared test laptop.
+$env:WIRI_KEYBOARD_DRY_RUN = '1'
 try { $ownsLiveLock = $liveLock.WaitOne([TimeSpan]::FromMinutes([Math]::Max(0, $LockWaitMinutes))) }
 catch [System.Threading.AbandonedMutexException] { $ownsLiveLock = $true }
 if (-not $ownsLiveLock) { throw 'Another wiri live test is running on this machine; this run refuses to start (two runs would spoil each other).' }
@@ -73,6 +75,10 @@ if (-not $ownsLiveLock) { throw 'Another wiri live test is running on this machi
 if (@(Get-Process -Name wiri -ErrorAction SilentlyContinue).Count -ne 0) {
     throw 'An existing wiri instance is running; refusing to stop an unowned process.'
 }
+# Keep inherited explicit config/pipe overrides away from the real profile.
+# Per-lane private daemons retain their own PID-verifying connection helpers.
+$env:WIRI_CONFIG = ''; $env:NIRI_CONFIG = ''
+$env:WIRI_PIPE = '\\.\pipe\wiri_live_main_' + $PID + '_' + [Guid]::NewGuid().ToString('N')
 $D = [System.IO.Path]::GetFullPath($Out)
 # Every wiri this run starts keeps its config and state in this run's evidence (Start-Wiri), so the
 # real user's config and recovery journal on a shared developer desktop are never reset.
@@ -784,7 +790,15 @@ function Stop-WiriGracefully($proc, [string]$tag) {
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
     Start-Sleep -Milliseconds 800
 }
-function Start-WiriWithConfig([string]$text, [string]$stderr) {
+function Start-WiriWithConfig([string]$text, [string]$stderr, [switch]$NoDefaultBinds) {
+    # Legacy scenarios explicitly exercise the shipped keymap. Their historical
+    # implicit inheritance is now opt-in via a separate physical config part;
+    # C2 replacement/empty-table probes use NoDefaultBinds or their own process.
+    if (-not $NoDefaultBinds) {
+        $fixtureDefaults = Join-Path $D 'legacy-default-binds.kdl'
+        [IO.File]::WriteAllText($fixtureDefaults, 'binds { extend-defaults; }', (New-Object Text.UTF8Encoding($false)))
+        $text = 'include r#"' + $fixtureDefaults + '"#' + "`n" + $text
+    }
     [IO.File]::WriteAllText($cfg, $text, (New-Object Text.UTF8Encoding($false)))
     $p = Start-Wiri $stderr ($stderr + '.out')
     Start-Sleep -Seconds 4
@@ -808,14 +822,23 @@ function SameList($a, $b) {
     return $true
 }
 
-# ---- H1: modifiers - an unknown one is rejected (it used to register a bare global key), `Mod` follows mod-key
+# ---- H1: invalid modifiers are config errors, not bare global keys; Mod follows mod-key.
+# Mod5 is now supported AltGr (covered by H67); Mod3 remains unsupported.
+$h1UnknownPath = Join-Path $D 'h1-unknown.kdl'
+$h1UnsupportedPath = Join-Path $D 'h1-unsupported.kdl'
+$h1UnknownLog = Join-Path $D 'h1-unknown.err'
+$h1UnsupportedLog = Join-Path $D 'h1-unsupported.err'
+[IO.File]::WriteAllText($h1UnknownPath, 'binds { Hyper+F9 { close-window; }; }')
+[IO.File]::WriteAllText($h1UnsupportedPath, 'binds { Mod3+F8 { close-window; }; }')
+$h1UnknownProbe = Start-Process -FilePath $wiri -ArgumentList @('validate', '-c', (Q $h1UnknownPath)) -RedirectStandardError $h1UnknownLog -RedirectStandardOutput (Join-Path $D 'h1-unknown.out') -Wait -PassThru
+$h1UnsupportedProbe = Start-Process -FilePath $wiri -ArgumentList @('validate', '-c', (Q $h1UnsupportedPath)) -RedirectStandardError $h1UnsupportedLog -RedirectStandardOutput (Join-Path $D 'h1-unsupported.out') -Wait -PassThru
+$h1UnknownRejected = ($h1UnknownProbe.ExitCode -ne 0) -and ((LogLines $h1UnknownLog 'unknown modifier').Count -gt 0)
+$h1UnsupportedRejected = ($h1UnsupportedProbe.ExitCode -ne 0) -and ((LogLines $h1UnsupportedLog 'no distinct Windows mapping').Count -gt 0)
 $h1Config = @"
 input {
     mod-key "ctrl-alt"
 }
 binds {
-    Hyper+F9 close-window
-    Mod5+F8 close-window
     Mod+F7 refresh
 }
 "@
@@ -830,8 +853,11 @@ $h1ModBind = @($h1Entries | Where-Object { $_.vk_code -eq 118 -and $_.modifiers 
 [TestForms]::ClearKeys()
 $h1Keys = [TestForms]::OpenKeys('wiri-keys-h1')
 Start-Sleep -Milliseconds 1800
-Chord 'f9'; Start-Sleep -Milliseconds 400
-Chord 'f8'; Start-Sleep -Milliseconds 400
+FocusForm $h1Keys
+if (WaitForeground $h1Keys 200 3000) {
+    Chord 'f9'; Start-Sleep -Milliseconds 400
+    Chord 'f8'; Start-Sleep -Milliseconds 400
+}
 $h1KeysSeen = [TestForms]::KeyLog()
 Set-Content (Join-Path $D 'h1-keys-seen.txt') $h1KeysSeen
 [TestForms]::CloseForm($h1Keys)
@@ -1593,12 +1619,10 @@ Start-Sleep -Milliseconds 1500
 
 # ---- H9: Phase 0 leftovers - default hotkeys that register, an exact fullscreen, a terminal's minimum width, ------
 # ----     windows put back where they were after a crash ----------------------------------------------------------
-# No config file: the only thing under test is what the shipped defaults do.
+# Explicitly request the complete built-in table: user config has no hidden defaults.
 $log9 = Join-Path $D 'wiri.stderr9.log'
 Stop-WiriGracefully $w 'h9'
-Remove-Item $cfg -Force -ErrorAction SilentlyContinue
-$w9 = Start-Wiri $log9 ($log9 + '.out')
-Start-Sleep -Seconds 4
+$w9 = Start-WiriWithConfig 'binds { extend-defaults; }' $log9
 $w = $w9
 $sb = [System.Windows.Forms.SystemInformation]::VirtualScreen
 # Every default chord registers: Ctrl+Alt+Tab is Windows' own task switcher and was refused at every start.
@@ -2782,8 +2806,10 @@ $summary = [ordered]@{
     hotkey_workspace_hidden = $hotkeyHidden
     hotkey_workspace_back_visible = $hotkeyBack
     # --- Phase 1 / H1: modifiers
-    h1_unknown_modifier_warnings = (LogLines $log3 'unknown modifier').Count
-    h1_unsupported_modifier_warnings = (LogLines $log3 'cannot be bound on Windows').Count
+    h1_unknown_modifier_warnings = (LogLines $h1UnknownLog 'unknown modifier').Count
+    h1_unsupported_modifier_warnings = (LogLines $h1UnsupportedLog 'no distinct Windows mapping').Count
+    h1_unknown_modifier_is_a_config_error = $h1UnknownRejected
+    h1_level5_modifier_is_a_config_error = $h1UnsupportedRejected
     h1_rejected_binds_registered = $h1StolenKeys
     h1_mod_bind_is_ctrl_alt = ($h1ModBind -eq 1)
     h1_f9_f8_reach_application = (($h1KeysSeen -match 'F9,') -and ($h1KeysSeen -match 'F8,'))
@@ -3075,6 +3101,10 @@ $summary = [ordered]@{
 . (Join-Path $PSScriptRoot 'live-phases\lane-f.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-t.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-c2.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-c2-binds.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-c2-keyboard.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-c2-session.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-c2-workspaces.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

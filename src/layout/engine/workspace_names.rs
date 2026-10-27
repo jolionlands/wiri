@@ -173,6 +173,8 @@ impl TilingEngine {
             }
         }
         self.maintain_empty_workspace(output);
+        // A name event: the layout view and any output preference follow the new name.
+        self.refresh_named_config();
         Ok(())
     }
 

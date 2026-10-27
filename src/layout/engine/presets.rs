@@ -3,7 +3,19 @@ use crate::config::types::SizeSpec;
 
 impl TilingEngine {
     pub(super) fn column_presets(&self, output: OutputId) -> Vec<SizeSpec> {
-        let configured = &self.effective_config(output).preset_column_widths;
+        Self::column_presets_from_config(self.active_workspace_config(output))
+    }
+
+    pub(super) fn column_presets_for_workspace(
+        &self,
+        output: OutputId,
+        workspace: i32,
+    ) -> Vec<SizeSpec> {
+        Self::column_presets_from_config(self.effective_config_for_workspace(output, workspace))
+    }
+
+    fn column_presets_from_config(cfg: &LayoutConfig) -> Vec<SizeSpec> {
+        let configured = &cfg.preset_column_widths;
         if configured.is_empty() {
             Self::PRESET_COLUMN_PROPORTIONS
                 .iter()

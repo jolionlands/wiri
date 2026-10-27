@@ -6,6 +6,11 @@ use crate::config::types::SizeSpec;
 impl TilingEngine {
     /// Compose signed struts and outer gaps without casting negative insets to u32.
     pub(super) fn tiling_work_rect(monitor: &crate::layout::Monitor, cfg: &LayoutConfig) -> Rect {
+        Self::tiling_rect_in(monitor.work_area, cfg)
+    }
+
+    /// [`Self::tiling_work_rect`] for a bare work area (no monitor borrowed).
+    pub(super) fn tiling_rect_in(work_area: Rect, cfg: &LayoutConfig) -> Rect {
         let left = cfg.reserve_left as i64 + cfg.outer_gaps.3 as i64;
         let right = cfg.reserve_right as i64 + cfg.outer_gaps.1 as i64;
         let top = cfg.reserve_top as i64 + cfg.outer_gaps.0 as i64;
@@ -13,21 +18,24 @@ impl TilingEngine {
         let coord = |value: i64| value.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let size = |value: i64| value.clamp(0, i32::MAX as i64) as u32;
         Rect::new(
-            coord(monitor.work_area.loc.x as i64 + left),
-            coord(monitor.work_area.loc.y as i64 + top),
-            size(monitor.work_area.size.w as i64 - left - right),
-            size(monitor.work_area.size.h as i64 - top - bottom),
+            coord(work_area.loc.x as i64 + left),
+            coord(work_area.loc.y as i64 + top),
+            size(work_area.size.w as i64 - left - right),
+            size(work_area.size.h as i64 - top - bottom),
         )
     }
 
     pub(super) fn refresh_strip_widths(&mut self, output: OutputId) {
-        let cfg = self.effective_config(output).clone();
+        let base = self.config_per_monitor.get(&output).unwrap_or(&self.config);
+        let per_workspace = &self.config_per_workspace;
         let Some(monitor) = self.monitors.get_mut(&output) else {
             return;
         };
-        let view = Self::view_width_for_monitor(monitor, &cfg);
+        let work_area = monitor.work_area;
         let scale = monitor.scale_factor;
         for ws in monitor.workspaces.values_mut() {
+            let cfg = Self::workspace_layout_in(per_workspace, output, ws).unwrap_or(base);
+            let view = Self::view_width_for_work_area(work_area, cfg);
             for column in &mut ws.columns {
                 // Fullscreen/maximize temporarily override the cached width.
                 if column.maximized
@@ -69,7 +77,7 @@ impl TilingEngine {
         let Some((output, ws, col)) = self.locate_window(id) else {
             return;
         };
-        let cfg = self.effective_config(output).clone();
+        let cfg = self.effective_config_for_workspace(output, ws).clone();
         let spec = rule.or(cfg.default_column_width);
         let Some(monitor) = self.monitors.get_mut(&output) else {
             return;

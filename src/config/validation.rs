@@ -71,9 +71,15 @@ fn check_level(
                 key,
                 node.args
                     .first()
-                    .map(Value::to_text)
+                    .map(|value| {
+                        let name = value.to_text();
+                        if key == "output" {
+                            name.to_ascii_lowercase()
+                        } else {
+                            name
+                        }
+                    })
                     .unwrap_or_default()
-                    .to_ascii_lowercase()
             )
         } else if parent == "animations" && key == "window-resize" {
             // Wiri's legacy boolean and niri's animation block are separate fields.

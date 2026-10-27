@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use std::os::windows::ffi::OsStrExt;
 use std::sync::{mpsc, Arc};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -354,31 +353,15 @@ impl TrayIcon {
     /// Open the wiri config folder in Explorer, creating it if missing.
     /// Used by the tray menu's "Open Config Folder…" item.
     pub fn open_config_folder() -> Result<()> {
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
         let dir = crate::config::default_config_dir()
             .ok_or_else(|| anyhow::anyhow!("APPDATA environment variable not set"))?;
-        // Best-effort: create the folder if missing.
-        let _ = std::fs::create_dir_all(&dir);
-
-        let dir_w: Vec<u16> = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let verb_w: Vec<u16> = "open\0".encode_utf16().collect();
-
-        unsafe {
-            let _ = ShellExecuteW(
-                HWND::default(),
-                PCWSTR::from_raw(verb_w.as_ptr()),
-                PCWSTR::from_raw(dir_w.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
-        }
+        // This legacy helper uses the same child-only environment as all other
+        // launchers. The tray action itself opens the active path in main.
+        std::fs::create_dir_all(&dir)?;
+        crate::hooks::spawner::spawn_argv(&[
+            "explorer.exe".into(),
+            dir.to_string_lossy().into_owned(),
+        ])?;
         Ok(())
     }
 

@@ -285,6 +285,7 @@ impl TilingEngine {
     /// and the IPC refer to it by.
     pub fn set_output_name(&mut self, output: OutputId, name: &str) {
         self.output_names.insert(output, name.to_string());
+        self.refresh_named_config();
     }
 
     /// Reuse the output registration pass's CCD/EDID snapshot for action and
@@ -294,6 +295,8 @@ impl TilingEngine {
         identities: Vec<crate::backend::outputs::OutputIdentity>,
     ) {
         self.output_identities = identities;
+        // Output names resolve through the identities, so preferences may change.
+        self.refresh_named_config();
     }
 
     /// The device name of a monitor, when the engine was told.
@@ -425,12 +428,14 @@ impl TilingEngine {
 
     // ---- where a window opens -------------------------------------------------------------
 
-    /// The height of the view of `output`: what a proportion of a window height is of.
-    fn view_height_for(&self, output: OutputId) -> i32 {
+    /// The height of the destination workspace's view: what a proportion of a window height is of.
+    /// `None` uses the active workspace of `output`.
+    fn view_height_for(&self, output: OutputId, workspace: Option<i32>) -> i32 {
         let Some(monitor) = self.monitors.get(&output) else {
             return 0;
         };
-        let cfg = self.effective_config(output);
+        let cfg = self
+            .effective_config_for_workspace(output, workspace.unwrap_or(monitor.active_workspace));
         monitor.work_area.size.h as i32
             - cfg.outer_gaps.0
             - cfg.outer_gaps.2
@@ -442,6 +447,7 @@ impl TilingEngine {
     /// `open-on-output` (a name no monitor has is ignored, as niri does), else the monitor
     /// the window is on; `open-on-workspace` (a name no workspace has is ignored) or
     /// `open-in-workspace` (the position from the top, the last workspace for one past it).
+    /// A named workspace with an output preference uses its resolved output owner instead.
     pub(super) fn rule_placement(
         &self,
         window: &WindowInfo,
@@ -482,14 +488,17 @@ impl TilingEngine {
     }
 
     /// The width in pixels of the column of a new window, when the rules ask for one.
+    /// `None` uses the active workspace of `output`.
     pub(super) fn open_column_width(
         &self,
         output: OutputId,
+        workspace: Option<i32>,
         window: &WindowInfo,
         rules: &ResolvedWindowRules,
     ) -> Option<u32> {
         let monitor = self.monitors.get(&output)?;
-        let cfg = self.effective_config(output);
+        let cfg = self
+            .effective_config_for_workspace(output, workspace.unwrap_or(monitor.active_workspace));
         let view = Self::view_width_for_monitor(monitor, cfg);
         let border = 2 * rules
             .effects
@@ -506,19 +515,29 @@ impl TilingEngine {
 
     /// The height in pixels of the tile of a new window, when the rules ask for one.  It
     /// matters in a column of several windows; a column of one always fills the view.
+    /// `None` uses the active workspace of `output`.
     fn open_tile_height(
         &self,
         output: OutputId,
+        workspace: Option<i32>,
         window: &WindowInfo,
         rules: &ResolvedWindowRules,
     ) -> Option<u32> {
-        let cfg = self.effective_config(output);
+        let cfg = workspace.map_or_else(
+            || self.active_workspace_config(output),
+            |workspace| self.effective_config_for_workspace(output, workspace),
+        );
         let border = 2 * rules
             .effects
             .border
             .inset(&cfg.effects.border, cfg.border_inset());
         let px = match rules.default_window_height {
-            Some(Some(spec)) => spec_px(spec, self.view_height_for(output), cfg.window_gap, border),
+            Some(Some(spec)) => spec_px(
+                spec,
+                self.view_height_for(output, workspace),
+                cfg.window_gap,
+                border,
+            ),
             Some(None) => window.bounds.size.h as i32 + border,
             None => return rules.default_height_px,
         };
@@ -527,10 +546,12 @@ impl TilingEngine {
 
     /// Remember what the rules ask of a window that is about to open: its size limits and
     /// the height it asks for (the tiles are given them by `sync_min_widths`).
+    /// `None` uses the active workspace of `output`.
     pub(super) fn remember_open_rules(
         &mut self,
         window_id: WindowId,
         output: OutputId,
+        workspace: Option<i32>,
         window: &WindowInfo,
         rules: &ResolvedWindowRules,
     ) {
@@ -541,7 +562,7 @@ impl TilingEngine {
         } else {
             self.rule_limits.insert(window_id, limits);
         }
-        match self.open_tile_height(output, window, rules) {
+        match self.open_tile_height(output, workspace, window, rules) {
             Some(height) => {
                 self.rule_heights.insert(window_id, height);
             }
@@ -678,11 +699,10 @@ impl TilingEngine {
         let Some((output, workspace, column)) = self.locate_window(window_id) else {
             return;
         };
-        let Some(view) = self
-            .monitors
-            .get(&output)
-            .map(|m| Self::view_width_for_monitor(m, self.effective_config(output)).max(50) as u32)
-        else {
+        let Some(view) = self.monitors.get(&output).map(|m| {
+            Self::view_width_for_monitor(m, self.effective_config_for_workspace(output, workspace))
+                .max(50) as u32
+        }) else {
             return;
         };
         if let Some(column) = self
@@ -881,12 +901,15 @@ impl TilingEngine {
         let Some(rule) = self.rule_state.get(&window_id).map(|s| s.resolved.opacity) else {
             return;
         };
-        let output = self
+        let location = self
             .locate_window(window_id)
-            .map(|(output, _, _)| output)
-            .or_else(|| self.float_location(window_id).map(|(output, _)| output));
-        let dim = output.map_or(1.0, |o| self.effective_config(o).dim_unfocused);
-        let focused = output.map_or(false, |o| {
+            .map(|(output, workspace, _)| (output, workspace))
+            .or_else(|| self.float_location(window_id));
+        let dim = location.map_or(1.0, |(output, workspace)| {
+            self.effective_config_for_workspace(output, workspace)
+                .dim_unfocused
+        });
+        let focused = location.map_or(false, |(o, _)| {
             self.monitors.focused_id() == Some(o)
                 && self.monitors.get(&o).and_then(|m| m.focus_window) == Some(window_id)
         });

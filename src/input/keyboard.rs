@@ -118,11 +118,7 @@ impl KeyboardEngine {
         // Keep down/captured: reloading with a held key must never leak an unmatched up.
     }
     pub fn modifiers(&self) -> u32 {
-        self.down
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| **d)
-            .fold(0, |m, (v, _)| m | modifier(v as u32))
+        super::keynames::modifiers_from_pressed(&self.down)
     }
     pub fn inhibited(&self) -> bool {
         self.inhibited
@@ -138,7 +134,9 @@ impl KeyboardEngine {
         })
     }
     pub fn fallback_allowed(&self, key: (u32, u32)) -> bool {
-        self.active(key) && self.bindings.get(&key).is_some_and(|b| !b.options.release)
+        super::keynames::register_hotkey_modifiers(key.0).is_some()
+            && self.active(key)
+            && self.bindings.get(&key).is_some_and(|b| !b.options.release)
     }
     /// A higher-priority modal surface owns dispatch, but physical state must
     /// still advance. Retire captured releases without firing release binds.
@@ -227,14 +225,10 @@ impl KeyboardEngine {
     }
     /// RegisterHotKey is only a down fallback when the LL hook cannot observe input.
     pub fn fallback(&mut self, key: (u32, u32), repeat: bool, now: Instant) -> Option<Action> {
-        if !self.active(key) {
+        if !self.fallback_allowed(key) {
             return None;
         }
-        let b = self.bindings.get_mut(&key)?;
-        if b.options.release {
-            return None;
-        }
-        b.fire(repeat, now)
+        self.bindings.get_mut(&key)?.fire(repeat, now)
     }
 }
 pub static ENGINE: LazyLock<Mutex<KeyboardEngine>> =
@@ -250,6 +244,93 @@ mod tests {
             &HashMap::from([((8, 0x54), options)]),
         );
         e
+    }
+    #[test]
+    fn altgr_matches_ctrl_right_alt_but_not_ctrl_left_alt_or_right_alt_alone() {
+        use super::super::{keynames::MOD_ALTGR, MOD_ALT, MOD_CTRL};
+        let t = Instant::now();
+        for (ctrl, alt, expected_mods, expected_action) in [
+            (Some(0xA2), 0xA5, MOD_ALTGR, Some(Action::Refresh)),
+            (Some(0xA3), 0xA5, MOD_ALTGR, Some(Action::Refresh)),
+            (Some(0xA2), 0xA4, MOD_CTRL | MOD_ALT, Some(Action::Quit)),
+            (None, 0xA5, MOD_ALT, None),
+        ] {
+            let mut e = KeyboardEngine::default();
+            e.configure(
+                &[
+                    (MOD_ALTGR, 0x54, Action::Refresh),
+                    (MOD_CTRL | MOD_ALT, 0x54, Action::Quit),
+                ],
+                &HashMap::new(),
+            );
+            if let Some(ctrl) = ctrl {
+                assert!(!e.event(ctrl, true, t).consume);
+            }
+            assert!(!e.event(alt, true, t).consume);
+            assert_eq!(e.modifiers(), expected_mods);
+            let d = e.event(0x54, true, t);
+            assert_eq!(d.consume, expected_action.is_some());
+            assert_eq!(d.action, expected_action);
+            assert!(!e.event(alt, false, t).consume);
+            if let Some(ctrl) = ctrl {
+                assert!(!e.event(ctrl, false, t).consume);
+            }
+            assert_eq!(e.event(0x54, false, t).consume, expected_action.is_some());
+            assert_eq!(e.modifiers(), 0);
+        }
+    }
+    #[test]
+    fn altgr_capture_survives_modifier_release_reload_and_inhibition() {
+        use super::super::keynames::MOD_ALTGR;
+        let t = Instant::now();
+        for release in [false, true] {
+            let mut e = KeyboardEngine::default();
+            e.configure(
+                &[(MOD_ALTGR, 0x54, Action::Refresh)],
+                &HashMap::from([(
+                    (MOD_ALTGR, 0x54),
+                    BindOptions {
+                        release,
+                        ..Default::default()
+                    },
+                )]),
+            );
+            e.event(0xA2, true, t);
+            e.event(0xA5, true, t);
+            let d = e.event(0x54, true, t);
+            assert!(d.consume);
+            assert_eq!(d.action, (!release).then_some(Action::Refresh));
+            e.event(0xA2, false, t);
+            e.event(0xA5, false, t);
+            e.configure(&[], &HashMap::new());
+            let d = e.event(0x54, true, t);
+            assert!(d.consume);
+            assert_eq!(d.action, (!release).then_some(Action::Refresh));
+            e.toggle_inhibit();
+            let d = e.event(0x54, true, t);
+            assert!(d.consume && d.action.is_none());
+            e.toggle_inhibit();
+            let d = e.event(0x54, false, t);
+            assert!(d.consume);
+            assert_eq!(d.action, release.then_some(Action::Refresh));
+            assert!(!e.event(0x54, false, t).consume);
+        }
+    }
+    #[test]
+    fn hook_only_and_unknown_modifiers_never_reach_hotkey_fallback() {
+        use super::super::{keynames::MOD_ALTGR, MOD_ALT, MOD_CTRL, MOD_SHIFT};
+        let t = Instant::now();
+        let mut e = KeyboardEngine::default();
+        for mods in [MOD_ALTGR, MOD_ALTGR | MOD_SHIFT, 0x100, MOD_CTRL | 0x100] {
+            e.configure(&[(mods, 0x54, Action::Refresh)], &HashMap::new());
+            assert!(e.active((mods, 0x54)));
+            assert!(!e.fallback_allowed((mods, 0x54)));
+            assert!(e.fallback((mods, 0x54), false, t).is_none());
+        }
+        let mods = MOD_CTRL | MOD_ALT;
+        e.configure(&[(mods, 0x54, Action::Refresh)], &HashMap::new());
+        assert!(e.fallback_allowed((mods, 0x54)));
+        assert_eq!(e.fallback((mods, 0x54), false, t), Some(Action::Refresh));
     }
     #[test]
     fn modal_input_tracks_modifiers_without_firing_release_bindings() {

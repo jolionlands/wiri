@@ -159,7 +159,8 @@ public static class LaneSNative {
         $env:WIRI_PIPE = '\\.\pipe\wiri_live_s_' + $PID + '_' + [Guid]::NewGuid().ToString('N')
         $env:WIRI_SYSTEM_ACTIONS_DRY_RUN = Join-Path $sDir ('power-dry-run-' + [Guid]::NewGuid().ToString('N') + '.ndjson')
         $sCfg = Join-Path $sDir 'config.kdl'
-        $sConfig = "animations { off }`ninput { focus-follows-mouse false }`nscreenshot-path null`nbinds { Ctrl+Alt+F8 { screenshot; } }`n"
+        $sCommonConfig = "animations { off }`ninput { focus-follows-mouse false }`nscreenshot-path null`n"
+        $sConfig = $sCommonConfig + "binds { Ctrl+Alt+F8 { screenshot; } }`n"
         [IO.File]::WriteAllText($sCfg,$sConfig,(New-Object Text.UTF8Encoding($false)))
         # A tiny owned program records literal argv and exits. Fake USERPROFILE
         # is child-local: no files or settings in the real profile are touched.
@@ -271,7 +272,7 @@ public static class LaneSSpawnProbe {
         SGate 'h47_typed_window_flags_and_path' ($typed.Ok -eq 'Handled' -and $windowPng[2] -eq 1 -and [LT]::CountColor($sExplicit,44,88,200) -gt 1000) @{reply=$typed; png=$windowPng}
         # Reload a real niri bind with per-action properties; no global path.
         $sBindPath = (Join-Path $sDir 'bind-must-not-write.png').Replace('\','/')
-        $sBindConfig = $sConfig + "`nbinds { Ctrl+Alt+F9 { screenshot-screen `"$sBindPath`" write-to-disk=false show-pointer=false; } }`n"
+        $sBindConfig = $sCommonConfig + "binds { Ctrl+Alt+F9 { screenshot-screen `"$sBindPath`" write-to-disk=false show-pointer=false; } }`n"
         [IO.File]::WriteAllText($sCfg,$sBindConfig,(New-Object Text.UTF8Encoding($false)))
         $null = SRequest @{type='reload_config'}
         Start-Sleep -Milliseconds 700
@@ -322,7 +323,7 @@ public static class LaneSSpawnProbe {
         SGate 'h48_keyboard_layout_next_prev_index' ($layoutCount -gt 0 -and $nextLayout.Ok -eq 'Handled' -and $prevLayout.Ok -eq 'Handled' -and $indexLayout.Ok -eq 'Handled' -and $layoutsNext.Ok.KeyboardLayouts.current_idx -eq (($initialIdx+1)%$layoutCount) -and $layoutsPrev.Ok.KeyboardLayouts.current_idx -eq $initialIdx -and $layoutsIndex.Ok.KeyboardLayouts.current_idx -eq $initialIdx) @($layouts0,$layoutsNext,$layoutsPrev,$layoutsIndex)
 
         $sAltCfg = Join-Path $sDir 'alternate.kdl'
-        $sAltConfig = $sConfig + "`nbinds { Ctrl+Alt+F10 { screenshot-screen write-to-disk=false show-pointer=false; } }`n"
+        $sAltConfig = $sCommonConfig + "binds { Ctrl+Alt+F10 { screenshot-screen write-to-disk=false show-pointer=false; } }`n"
         [IO.File]::WriteAllText($sAltCfg,$sAltConfig,(New-Object Text.UTF8Encoding($false)))
         $loaded = SRequest @{Action=@{LoadConfigFile=@{path=$sAltCfg}}}; Start-Sleep -Milliseconds 700
         $reloaded = SRequest @{Action=@{LoadConfigFile=@{path=$null}}}; Start-Sleep -Milliseconds 700

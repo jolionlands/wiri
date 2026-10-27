@@ -696,7 +696,7 @@ pub fn current_grab() -> GrabState {
 /// Read modifiers from the OS as well when the keyboard hook is unavailable.
 fn pointer_modifiers() -> u32 {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    [(0x12, 1), (0x11, 2), (0x10, 4), (0x5B, 8), (0x5C, 8)]
+    let flags = [(0x12, 1), (0x11, 2), (0x10, 4), (0x5B, 8), (0x5C, 8)]
         .iter()
         .fold(0, |mods, (vk, flag)| {
             if unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0 {
@@ -704,7 +704,11 @@ fn pointer_modifiers() -> u32 {
             } else {
                 mods
             }
-        })
+        });
+    super::keynames::normalize_observed_modifiers(
+        flags,
+        unsafe { GetAsyncKeyState(0xA5) } as u16 & 0x8000 != 0,
+    )
 }
 
 /// Some(false): observe motion without stopping the system cursor; Some(true):

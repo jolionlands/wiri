@@ -14,9 +14,10 @@ impl TilingEngine {
         let Some((output, workspace, index)) = self.locate_window(window) else {
             return;
         };
-        let tabbed = self
-            .window_policy(window)
-            .column_is_tabbed(self.effective_config(output).default_tabbed);
+        let tabbed = self.window_policy(window).column_is_tabbed(
+            self.effective_config_for_workspace(output, workspace)
+                .default_tabbed,
+        );
         if let Some(column) = self
             .monitors
             .get_mut(&output)

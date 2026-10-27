@@ -65,7 +65,10 @@ pub(crate) fn switch_layout(target: LayoutSwitchTarget) -> Result<(), String> {
 
 // Shared Lane-H poster: never activates a layout on the calling thread.
 // Success means queued, not accepted by the foreground application.
-fn post_layout_request(hwnd: windows::Win32::Foundation::HWND, selected: HKL) -> Result<(), String> {
+fn post_layout_request(
+    hwnd: windows::Win32::Foundation::HWND,
+    selected: HKL,
+) -> Result<(), String> {
     unsafe {
         PostMessageW(
             hwnd,
@@ -93,7 +96,8 @@ pub(crate) fn request_configured_layout(
         return Ok(false);
     }
     let current = unsafe { GetKeyboardLayout(thread_id) }.0 as isize;
-    let Some(target) = configured_request_target(plan, hwnd.0 as isize, thread_id, current, restore)
+    let Some(target) =
+        configured_request_target(plan, hwnd.0 as isize, thread_id, current, restore)
     else {
         return Ok(false);
     };
@@ -573,17 +577,37 @@ mod tests {
         let original = test_hkl(0xf002_0409).0 as isize;
         let selected = test_hkl(0xe001_0411).0 as isize;
         let plan = ConfiguredLayoutPlan {
-            window: 10, thread_id: 20, original, selected, name: "Synthetic".into(),
+            window: 10,
+            thread_id: 20,
+            original,
+            selected,
+            name: "Synthetic".into(),
         };
-        assert_eq!(configured_request_target(&plan, 10, 20, original, false), Some(selected));
-        assert_eq!(configured_request_target(&plan, 10, 20, selected, true), Some(original));
-        assert_eq!(configured_request_target(&plan, 10, 20, original, true), Some(original));
+        assert_eq!(
+            configured_request_target(&plan, 10, 20, original, false),
+            Some(selected)
+        );
+        assert_eq!(
+            configured_request_target(&plan, 10, 20, selected, true),
+            Some(original)
+        );
+        assert_eq!(
+            configured_request_target(&plan, 10, 20, original, true),
+            Some(original)
+        );
         for (window, thread, current, restore) in [
-            (0, 20, original, false), (11, 20, original, false),
-            (10, 0, original, false), (10, 21, selected, true),
-            (10, 20, 0, true), (10, 20, 30, true), (10, 20, selected, false),
+            (0, 20, original, false),
+            (11, 20, original, false),
+            (10, 0, original, false),
+            (10, 21, selected, true),
+            (10, 20, 0, true),
+            (10, 20, 30, true),
+            (10, 20, selected, false),
         ] {
-            assert_eq!(configured_request_target(&plan, window, thread, current, restore), None);
+            assert_eq!(
+                configured_request_target(&plan, window, thread, current, restore),
+                None
+            );
         }
     }
 

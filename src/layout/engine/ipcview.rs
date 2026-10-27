@@ -55,11 +55,11 @@ impl TilingEngine {
     fn ipc_layouts(&self) -> HashMap<WindowId, WindowLayoutIpc> {
         let mut layouts = HashMap::new();
         for (output, monitor) in self.monitors.iter() {
-            let cfg = self.effective_config(*output);
-            // The rectangle the tiles are laid out in (signed struts and outer gaps).
-            let work = Self::tiling_work_rect(monitor, cfg);
             let scale = monitor.scale_factor.max(0.01);
-            for workspace in monitor.workspaces.values() {
+            for (workspace_id, workspace) in &monitor.workspaces {
+                let cfg = self.effective_config_for_workspace(*output, *workspace_id);
+                // Inactive workspaces may have a different layout from the active one.
+                let work = Self::tiling_work_rect(monitor, cfg);
                 use crate::layout::workspace::WorkspaceLayout;
                 let positions = match workspace.layout_mode {
                     WorkspaceLayout::Scrolling => self.calculate_positions(workspace, work, cfg),

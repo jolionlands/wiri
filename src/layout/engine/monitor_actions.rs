@@ -173,13 +173,32 @@ impl TilingEngine {
         let Some(destination) = self.monitor_target(source, target) else {
             return;
         };
+        self.relocate_workspace(source, workspace, destination, Some(backend));
+    }
+
+    /// Move one whole workspace object (identity, name, columns, floating and minimized
+    /// homes) to the end of `destination`'s stack and return its new local key.
+    ///
+    /// `backend` is `None` for event-driven output-preference changes: floating windows
+    /// then keep their (shifted) bookkeeping rectangle and the next layout pass places
+    /// them, and no layout pass is requested here.
+    pub(super) fn relocate_workspace(
+        &mut self,
+        source: OutputId,
+        workspace: i32,
+        destination: OutputId,
+        backend: Option<&BackendHandle>,
+    ) -> Option<i32> {
+        if source == destination {
+            return None;
+        }
         let Some((source_work, destination_work)) = self
             .monitors
             .get(&source)
             .zip(self.monitors.get(&destination))
             .map(|(from, to)| (from.work_area, to.work_area))
         else {
-            return;
+            return None;
         };
         let follow = self.monitors.focused_id() == Some(source)
             && self
@@ -191,7 +210,7 @@ impl TilingEngine {
             let ids = monitor.workspace_ids();
             let position = ids.iter().position(|id| *id == workspace).unwrap_or(0);
             let Some(moved) = monitor.remove_workspace(workspace) else {
-                return;
+                return None;
             };
             let active = monitor.active_workspace == workspace;
             if active {
@@ -258,16 +277,20 @@ impl TilingEngine {
                 windows.push(*window);
             }
         }
-        for (window, rect) in moved_float_rects {
-            if !self.fullscreen_windows.contains(&window) && !self.minimized.contains_key(&window) {
-                // Floats do not pass through the strip layout; without this the
-                // bookkeeping moves to the other output but the HWND stays put.
-                let _ = backend.set_window_position(
-                    window.as_isize(),
-                    rect,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
+        if let Some(backend) = backend {
+            for (window, rect) in moved_float_rects {
+                if !self.fullscreen_windows.contains(&window)
+                    && !self.minimized.contains_key(&window)
+                {
+                    // Floats do not pass through the strip layout; without this the
+                    // bookkeeping moves to the other output but the HWND stays put.
+                    let _ = backend.set_window_position(
+                        window.as_isize(),
+                        rect,
+                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                    );
+                }
             }
         }
         for minimized in self.minimized.values_mut() {
@@ -311,16 +334,33 @@ impl TilingEngine {
         }
         if follow {
             self.set_focused_output(destination);
-            self.switch_workspace(destination_key, backend);
-            if let Some(window) = selected {
-                self.focus_action_window(window, backend);
+            match backend {
+                Some(backend) => {
+                    self.switch_workspace(destination_key, backend);
+                    if let Some(window) = selected {
+                        self.focus_action_window(window, backend);
+                    }
+                }
+                // State only: the keyboard focus follows the workspace without a
+                // layout pass, and the OS focus is reconciled by the next event.
+                None => {
+                    if let Some(monitor) = self.monitors.get_mut(&destination) {
+                        monitor.switch_workspace(destination_key);
+                        if let Some(window) = selected {
+                            monitor.set_focus(window);
+                        }
+                    }
+                }
             }
         }
         for window in windows {
             self.applied_state.remove(&window);
             self.animating_rects.remove(&window);
         }
-        self.apply_layout_for_monitor(source, backend);
-        self.apply_layout_for_monitor(destination, backend);
+        if let Some(backend) = backend {
+            self.apply_layout_for_monitor(source, backend);
+            self.apply_layout_for_monitor(destination, backend);
+        }
+        Some(destination_key)
     }
 }
