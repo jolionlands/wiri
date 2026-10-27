@@ -1357,9 +1357,9 @@ pub(crate) fn perform_action_on(
             engine.write().focus_monitor_toward(direction, backend);
         }
         Action::OverviewOpen => {
-            if !engine.read().is_overview() {
-                engine.write().toggle_overview(backend);
-            }
+            // A closing camera still has a host: explicit open must reverse it,
+            // not mistake the pending retirement for an already-open overview.
+            engine.write().enter_overview(backend);
         }
         Action::ResizeColumnLeft => {
             match float_of(target) {
@@ -1731,6 +1731,52 @@ fn terminal_action_from_config(cfg: Option<&crate::config::Config>) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_overview_open_reverses_close_and_is_idempotent() {
+        use crate::layout::Monitor;
+        use crate::overlay::MockThumbnailOverview;
+        use crate::utils::{OutputId, Rect};
+
+        let output = OutputId::from_name("explicit-overview-test");
+        let mut e = TilingEngine::new(Default::default());
+        e.monitors_mut().insert(
+            output,
+            Monitor::new(
+                output,
+                Rect::new(0, 0, 1366, 768),
+                Rect::new(0, 0, 1366, 728),
+            ),
+        );
+        e.monitors_mut().set_focused(output);
+        let sink = MockThumbnailOverview::new();
+        e.install_thumbnail_overview(sink.clone());
+        e.set_animation_notifier(Arc::new(tokio::sync::Notify::new()));
+        let engine = Arc::new(parking_lot::RwLock::new(e));
+        let backend = BackendHandle::default_for_test();
+        let quit_tx = Arc::new(Mutex::new(None));
+
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        assert_eq!(sink.enter_calls(), 1);
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(70, &backend);
+        let zoom = engine.read().overview_zoom();
+        assert!(zoom > 0.5 && zoom < 1.0);
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        assert_eq!(engine.read().overview_zoom(), zoom);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        assert!(engine.read().is_overview());
+        assert_eq!(engine.read().overview_zoom(), 0.5);
+        assert_eq!(sink.enter_calls(), 1);
+        assert_eq!(sink.exit_calls(), 0);
+        assert!(!engine.read().has_active_animations());
+    }
 
     #[test]
     fn explicit_column_display_is_idempotent_and_preserves_focus_and_tab_selection() {
