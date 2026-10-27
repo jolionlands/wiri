@@ -187,10 +187,22 @@
         $fRuntime.serial++
         $null = FCheckedCtl ('lane-f-{0:D3}-focus-owned' -f $fRuntime.serial) @('focus-window',[string][int64]$handle)
         $settled = FWaitFocus ([int64]$handle) $timeout
+        $retried = $false
+        if (-not $settled -and $timeout -ge 400) {
+            # The e7ced50 and 8c6c9b0 live cycles each lost a whole group (H31, then H30) to ONE fixture
+            # focus that did not settle, with every recorded product check passing. focus-window is
+            # idempotent, so ask once more and wait again; the retry is recorded, and a window that
+            # never settles still fails the fixture. Short-visit callers (< 400 ms) must not retry.
+            $retried = $true
+            $fRuntime.serial++
+            $null = FCheckedCtl ('lane-f-{0:D3}-focus-owned-retry' -f $fRuntime.serial) @('focus-window',[string][int64]$handle)
+            $settled = FWaitFocus ([int64]$handle) $timeout
+            $fNotes['fixture-focus-retries'] = 1 + [int]$fNotes['fixture-focus-retries']
+        }
         $null = WaitForeground $handle 0 $timeout
         Start-Sleep -Milliseconds 20
         $actual = [int64][LT]::GetForegroundWindow()
-        [void]$fChecks.Add([pscustomobject]@{ gate='fixture-focus'; pass=($settled -and $actual -eq [int64]$handle); expected_hwnd=[int64]$handle; actual_hwnd=$actual; managed_focus_settled=$settled })
+        [void]$fChecks.Add([pscustomobject]@{ gate='fixture-focus'; pass=($settled -and $actual -eq [int64]$handle); expected_hwnd=[int64]$handle; actual_hwnd=$actual; managed_focus_settled=$settled; retried=$retried })
         if (-not $settled -or $actual -ne [int64]$handle) { throw "Fixture focus expected managed/native $handle, got native $actual (managed settled: $settled)" }
     }
     function FHoldFocus([IntPtr]$handle, [int]$minimum = 1150) {
