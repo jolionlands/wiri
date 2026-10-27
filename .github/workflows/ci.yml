@@ -101,7 +101,9 @@ jobs:
     needs: build
     runs-on: ${{ matrix.os }}
     continue-on-error: true
-    timeout-minutes: 30
+    # The full harness takes about 50 minutes on the tridaris desktop since lanes W/K/F2; hosted runners
+    # are slower. At 30 minutes every live job was cancelled before writing a summary.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
