@@ -31,6 +31,8 @@ const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_MOUSEWHEEL: u32 = 0x020A;
+/// A thread timer (`SetTimer` with a NULL window) is delivered as this message.
+const WM_TIMER: u32 = 0x0113;
 
 // WM_ keyboard messages used by the primary bind hook
 const WM_KEYDOWN: u32 = 0x0100;
@@ -213,6 +215,17 @@ fn run_hook_message_loop(name: &str) {
         let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         if ret.0 == 0 || ret.0 == -1 || msg.message == WM_STOP_HOOK_LOOP {
             break;
+        }
+        // niri `cursor { hide-after-inactive-ms }`: the one one-shot timer this thread owns.
+        // `WM_TIMER` for a thread timer arrives with a NULL window; only wiri's own id counts.
+        if msg.message == WM_TIMER && crate::input::cursor_hide::timer_fired(msg.wParam.0) {
+            crate::input::cursor_hide::on_timer();
+            continue;
+        }
+        // Another thread dropped the option while the timer was armed on this one.
+        if msg.message == crate::input::cursor_hide::CANCEL_MESSAGE {
+            crate::input::cursor_hide::cancel_timer_message(msg.wParam.0);
+            continue;
         }
         let _ = unsafe { TranslateMessage(&msg) };
         unsafe {
@@ -734,6 +747,10 @@ unsafe extern "system" fn mouse_hook_callback(
     let msg = w_param.0 as u32;
     let event = &*(l_param.0 as *const MSLLHOOKSTRUCT);
     crate::overlay::compositor::input_activity();
+    // niri `cursor { hide-after-inactive-ms }`: any pointer event shows the pointer again and
+    // re-arms the one timer.  `pointer_activity` is a single atomic load when the option is
+    // not configured.
+    crate::input::cursor_hide::pointer_activity();
     // Our replacement wheel must bypass binds as well as scaling. Other injected
     // input (automation/accessibility) keeps its normal path.
     if event.dwExtraInfo == super::rule_scroll::REINJECTED {
@@ -875,9 +892,14 @@ unsafe extern "system" fn mouse_hook_callback(
         _ => None,
     };
     let (consume, actions) = if let Some((b, down)) = button {
-        crate::input::pointer::ENGINE
-            .lock()
-            .button(mods, b, down, Instant::now())
+        let stylus = crate::input::touchpen::stylus_button(msg, event.dwExtraInfo);
+        crate::input::pointer::ENGINE.lock().button_with_stylus(
+            mods,
+            b,
+            stylus,
+            down,
+            Instant::now(),
+        )
     } else if msg == WM_MOUSEWHEEL || msg == 0x20E {
         crate::input::pointer::ENGINE.lock().wheel(
             mods,

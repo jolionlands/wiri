@@ -15,6 +15,8 @@ pub struct Config {
     pub gestures: super::gestures_config::GesturesConfig,
     /// niri `hotkey-overlay { skip-at-startup; hide-not-bound }`.
     pub hotkey_overlay: HotkeyOverlayConfig,
+    /// niri `cursor { hide-when-typing; hide-after-inactive-ms <ms> }`.
+    pub cursor: CursorConfig,
     pub overview: super::overview_config::OverviewConfig,
     /// niri screenshot-path: Pictures default, a strftime template, or null (clipboard only).
     pub screenshot_path: crate::screenshot::path::ScreenshotPath,
@@ -64,6 +66,7 @@ impl Default for Config {
             animations: AnimationsConfig::default_config(),
             gestures: super::gestures_config::GesturesConfig::default(),
             hotkey_overlay: HotkeyOverlayConfig::default(),
+            cursor: CursorConfig::default(),
             overview: super::overview_config::OverviewConfig::default(),
             screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
@@ -125,6 +128,21 @@ pub struct HotkeyOverlayConfig {
     /// `hide-not-bound`: leave out the essential actions that have no key bound to them
     /// (niri lists them as "(not bound)" otherwise).
     pub hide_not_bound: bool,
+}
+
+/// niri `cursor { ... }`: the cursor options Windows has a lever for.
+///
+/// `xcursor-theme` and `xcursor-size` belong to the Windows pointer scheme
+/// (Settings > Accessibility > Mouse pointer), so they are not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CursorConfig {
+    /// `hide-when-typing`: the per-user "hide pointer while typing" flag
+    /// (`SPI_GETMOUSEVANISH` / `SPI_SETMOUSEVANISH`).  `None` leaves the Windows setting alone;
+    /// a reload that drops the key puts the original value back.
+    pub hide_when_typing: Option<bool>,
+    /// `hide-after-inactive-ms <ms>`: hide the pointer after this many milliseconds without
+    /// pointer movement (`0` hides as soon as the pointer stops).  `None` never hides.
+    pub hide_after_inactive_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]

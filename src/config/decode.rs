@@ -301,6 +301,7 @@ const TOP_LEVEL: &[&str] = &[
     "environment",
     "switch-events",
     "hotkey-overlay",
+    "cursor",
     "overview",
     "spawn-at-startup",
     "spawn-sh-at-startup",
@@ -311,7 +312,6 @@ const TOP_LEVEL: &[&str] = &[
 /// niri sections that have no meaning for wiri (yet), with why.
 fn top_level_unsupported(name: &str) -> Option<&'static str> {
     match name {
-        "cursor" => Some("the cursor theme belongs to Windows"),
         "clipboard" => Some("Windows has no primary selection"),
         "config-notification" => Some("wiri always shows a balloon for a config error"),
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
@@ -1034,6 +1034,7 @@ impl Decoder {
                 "binds" => self.decode_binds(node, cfg),
                 "recent-windows" => self.decode_recent_windows(node, &mut cfg.recent_windows),
                 "hotkey-overlay" => self.decode_hotkey_overlay(node, cfg),
+                "cursor" => self.decode_cursor(node, cfg),
                 "animations" => self.decode_animations(node, cfg),
                 "gestures" => self.decode_gestures(node, &mut cfg.gestures),
                 "environment" => self.decode_environment(node, cfg),
@@ -1066,7 +1067,6 @@ impl Decoder {
                     None => {
                         let mut known: Vec<&str> = TOP_LEVEL.to_vec();
                         known.extend_from_slice(&[
-                            "cursor",
                             "clipboard",
                             "hotkey-overlay",
                             "screenshot-path",
@@ -1113,6 +1113,41 @@ impl Decoder {
                     child,
                     "'hotkey-overlay'",
                     &["skip-at-startup", "hide-not-bound"],
+                ),
+            }
+        }
+    }
+
+    /// niri `cursor { hide-when-typing; hide-after-inactive-ms <ms>; xcursor-theme; xcursor-size }`.
+    ///
+    /// The two hide options have a Windows lever (`SPI_SETMOUSEVANISH` and a cursor swap after
+    /// inactivity); the Xcursor theme and size belong to the Windows pointer scheme.
+    fn decode_cursor(&mut self, node: &Node, cfg: &mut Config) {
+        self.section(node);
+        for child in node.kids() {
+            match norm(&child.name).as_str() {
+                "hide-when-typing" => {
+                    if let Some(value) = self.flag(child) {
+                        cfg.cursor.hide_when_typing = Some(value);
+                    }
+                }
+                "hide-after-inactive-ms" => {
+                    if let Some(ms) = self.arg_u32(child, u32::MAX) {
+                        cfg.cursor.hide_after_inactive_ms = Some(ms);
+                    }
+                }
+                "xcursor-theme" | "xcursor-size" => {
+                    self.unsupported(child, "the cursor theme belongs to Windows");
+                }
+                _ => self.unknown(
+                    child,
+                    "'cursor'",
+                    &[
+                        "hide-when-typing",
+                        "hide-after-inactive-ms",
+                        "xcursor-theme",
+                        "xcursor-size",
+                    ],
                 ),
             }
         }
@@ -3276,15 +3311,25 @@ impl Decoder {
         // key
         if bind.vk_code().is_none() && crate::input::pointer::parse_trigger(&bind.key).is_none() {
             let lower = bind.key.to_ascii_lowercase();
+            if lower.starts_with("tabletstylusbutton") {
+                // niri's stylus buttons are 1-3; anything else is a typo, not a wiri gap.
+                self.error(
+                    node.pos,
+                    format!(
+                        "bind {}: '{}' is not a stylus button (wiri decodes TabletStylusButton1, TabletStylusButton2 and TabletStylusButton3); the bind is ignored",
+                        chord, bind.key
+                    ),
+                );
+                return None;
+            }
             let niri_only = lower.starts_with("mouse")
                 || lower.starts_with("wheelscroll")
-                || lower.starts_with("touchpadscroll")
-                || lower.starts_with("tabletstylusbutton");
+                || lower.starts_with("touchpadscroll");
             if niri_only {
                 self.warn(
                     node.pos,
                     format!(
-                        "bind {}: mouse, wheel and stylus triggers are not supported by wiri yet; the bind is ignored",
+                        "bind {}: mouse and wheel triggers are not supported by wiri yet; the bind is ignored",
                         chord
                     ),
                 );
@@ -4010,6 +4055,78 @@ overview { backdrop-color \"#000000\" }",
             assert!(warnings(&decoded).is_empty(), "{action}");
             assert!(decoded.config.binds.hotkeys.is_empty(), "{action}");
         }
+    }
+
+    #[test]
+    fn the_cursor_section_decodes_the_two_options_windows_has_and_warns_about_xcursor() {
+        let d = load("cursor {\n    hide-when-typing\n    hide-after-inactive-ms 400\n    xcursor-theme \"Adwaita\"\n    xcursor-size 24\n}\n");
+        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+        // The Xcursor theme and size are the Windows pointer scheme, not a wiri setting.
+        assert_eq!(warnings(&d).len(), 2, "{:?}", warnings(&d));
+        assert_eq!(d.config.cursor.hide_when_typing, Some(true));
+        assert_eq!(d.config.cursor.hide_after_inactive_ms, Some(400));
+        // Not writing the section leaves both unset: wiri touches no cursor setting at all.
+        let untouched = clean("");
+        assert_eq!(untouched.cursor.hide_when_typing, None);
+        assert_eq!(untouched.cursor.hide_after_inactive_ms, None);
+        // `false` is an explicit "off", which is not the same as "not configured".
+        assert_eq!(
+            clean("cursor { hide-when-typing false; }").cursor.hide_when_typing,
+            Some(false)
+        );
+        assert_eq!(
+            clean("cursor { hide-after-inactive-ms 0; }")
+                .cursor
+                .hide_after_inactive_ms,
+            Some(0)
+        );
+        // A value that is not a whole number of milliseconds is an error, not a silent 0.
+        let bad = load("cursor {\n    hide-after-inactive-ms 12.5\n}\n");
+        assert_eq!(errors(&bad).len(), 1, "{:?}", errors(&bad));
+        let unknown = load("cursor {\n    hide-after-inactive 400\n}\n");
+        assert_eq!(errors(&unknown).len(), 1, "{:?}", errors(&unknown));
+        assert!(
+            errors(&unknown)[0].contains("hide-after-inactive"),
+            "{:?}",
+            errors(&unknown)
+        );
+    }
+
+    #[test]
+    fn tablet_stylus_button_binds_decode_like_mouse_binds() {
+        let cfg = clean(
+            "binds {\n    Mod+TabletStylusButton1 { close-window; }\n    Mod+TabletStylusButton2 { refresh; }\n    Mod+TabletStylusButton3 cooldown-ms=80 { close-window; }\n}\n",
+        );
+        let keys: Vec<&str> = cfg
+            .binds
+            .hotkeys
+            .iter()
+            .map(|b| b.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["TabletStylusButton1", "TabletStylusButton2", "TabletStylusButton3"]
+        );
+        assert_eq!(
+            cfg.binds.hotkeys[2].cooldown_ms,
+            Some(80),
+            "a stylus bind takes the same properties as any other"
+        );
+        for bind in &cfg.binds.hotkeys {
+            assert!(
+                bind.vk_code().is_none(),
+                "{} is a pointer trigger, not a key",
+                bind.key
+            );
+            assert!(
+                crate::input::pointer::parse_trigger(&bind.key).is_some(),
+                "{} must be a pointer trigger",
+                bind.key
+            );
+        }
+        // A stylus name that does not exist is still reported, with the place.
+        let bad = load("binds {\n    Mod+TabletStylusButton4 { close-window; }\n}\n");
+        assert_eq!(errors(&bad).len(), 1, "{:?}", errors(&bad));
     }
 
     #[test]

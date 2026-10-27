@@ -9,11 +9,15 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trigger {
     Button(u8),
     Wheel(bool, bool),
+    /// niri `TabletStylusButton1-3`: the pen's buttons, as far as Windows promotes them to
+    /// mouse input (see [`super::touchpen::stylus_button`]).
+    Stylus(u8),
 } // horizontal, positive
 pub fn parse_trigger(name: &str) -> Option<Trigger> {
     Some(match name.to_ascii_lowercase().as_str() {
@@ -26,6 +30,9 @@ pub fn parse_trigger(name: &str) -> Option<Trigger> {
         "wheelscrolldown" | "touchpadscrolldown" => Trigger::Wheel(false, false),
         "wheelscrollleft" | "touchpadscrollleft" => Trigger::Wheel(true, false),
         "wheelscrollright" | "touchpadscrollright" => Trigger::Wheel(true, true),
+        "tabletstylusbutton1" => Trigger::Stylus(1),
+        "tabletstylusbutton2" => Trigger::Stylus(2),
+        "tabletstylusbutton3" => Trigger::Stylus(3),
         _ => return None,
     })
 }
@@ -63,6 +70,7 @@ impl PointerEngine {
         self.binds.clear();
         self.residual = [0; 2];
         self.residual_mods = None;
+        let mut stylus = 0;
         for b in &config.binds.hotkeys {
             let (Some(trigger), Ok(mods), Some(action)) = (
                 parse_trigger(&b.key),
@@ -71,6 +79,9 @@ impl PointerEngine {
             ) else {
                 continue;
             };
+            if matches!(trigger, Trigger::Stylus(_)) {
+                stylus += 1;
+            }
             self.binds.insert(
                 (mods, trigger),
                 Bind {
@@ -86,6 +97,14 @@ impl PointerEngine {
                 },
             );
         }
+        if stylus > 0 {
+            // What the live harness looks for: the binds were decoded and registered.  Windows
+            // only delivers promoted pen mouse events, so this is not a hardware claim.
+            info!(
+                "Tablet stylus binds: {} registered (promoted pen mouse events only; no raw WM_POINTER without UIAccess)",
+                stylus
+            );
+        }
     }
     pub fn capture_gesture(&mut self, button: u8) {
         self.gesture[button as usize] = true;
@@ -95,6 +114,20 @@ impl PointerEngine {
         &mut self,
         mods: u32,
         button: u8,
+        pressed: bool,
+        now: Instant,
+    ) -> (bool, Vec<Action>) {
+        self.button_with_stylus(mods, button, None, pressed, now)
+    }
+
+    /// The same, with the stylus button a promoted pen event stands for (if any).  Pairing is
+    /// still keyed by the promoted mouse button, so a consumed stylus press also consumes its
+    /// release even after the modifier is let go or the config is reloaded.
+    pub fn button_with_stylus(
+        &mut self,
+        mods: u32,
+        button: u8,
+        stylus: Option<u8>,
         pressed: bool,
         now: Instant,
     ) -> (bool, Vec<Action>) {
@@ -117,7 +150,12 @@ impl PointerEngine {
         } else if self.captured.contains_key(&button) {
             return (true, vec![]);
         } else if !repeated {
-            let key = (mods, Trigger::Button(button));
+            // A stylus bind wins over the plain mouse button the pen event was promoted to;
+            // an unbound pen button keeps behaving like the mouse button it looks like.
+            let stylus_key = stylus
+                .map(|stylus| (mods, Trigger::Stylus(stylus)))
+                .filter(|key| self.binds.contains_key(key));
+            let key = stylus_key.unwrap_or((mods, Trigger::Button(button)));
             if let Some(b) = self.binds.get_mut(&key) {
                 let a = if b.options.release { None } else { b.fire(now) };
                 self.captured.insert(button, (key, b.clone()));
@@ -219,6 +257,59 @@ mod tests {
             assert!(parse_trigger(name).is_some(), "{name}");
         }
         assert_eq!(parse_trigger("F9"), None);
+    }
+
+    #[test]
+    fn stylus_trigger_names_are_decoded_case_insensitively_and_only_for_one_to_three() {
+        for (name, expected) in [
+            ("TabletStylusButton1", Trigger::Stylus(1)),
+            ("tabletstylusbutton2", Trigger::Stylus(2)),
+            ("TABLETSTYLUSBUTTON3", Trigger::Stylus(3)),
+        ] {
+            assert_eq!(parse_trigger(name), Some(expected), "{name}");
+        }
+        assert_eq!(parse_trigger("TabletStylusButton0"), None);
+        assert_eq!(parse_trigger("TabletStylusButton4"), None);
+    }
+
+    #[test]
+    fn a_pen_barrel_button_runs_its_stylus_bind_and_pairs_the_release() {
+        let mut e = engine(
+            "binds {\n    extend-defaults false;\n    Mod+TabletStylusButton2 { refresh; }\n    Mod+MouseRight { close-window; }\n}\n",
+        );
+        let t = Instant::now();
+        // Windows promotes the pen's barrel button to the right mouse button; the stylus bind
+        // wins over the mouse bind and the press is consumed.
+        assert_eq!(
+            e.button_with_stylus(3, 1, Some(2), true, t),
+            (true, vec![Action::Refresh])
+        );
+        // The release is still paired, even with the modifier already let go.
+        assert_eq!(e.button_with_stylus(0, 1, Some(2), false, t), (true, vec![]));
+        // An ordinary right click is the mouse bind again.
+        assert_eq!(
+            e.button_with_stylus(3, 1, None, true, t),
+            (true, vec![Action::CloseWindow])
+        );
+        assert_eq!(e.button_with_stylus(3, 1, None, false, t), (true, vec![]));
+    }
+
+    #[test]
+    fn an_unbound_pen_button_behaves_like_the_mouse_button_it_was_promoted_to() {
+        let mut e = engine("binds {\n    extend-defaults false;\n    Mod+MouseRight { close-window; }\n}\n");
+        let t = Instant::now();
+        assert_eq!(
+            e.button_with_stylus(3, 1, Some(2), true, t),
+            (true, vec![Action::CloseWindow])
+        );
+        // A stylus bind that is configured but for another button leaves the mouse bind alone.
+        let mut e = engine(
+            "binds {\n    extend-defaults false;\n    Mod+TabletStylusButton3 { refresh; }\n    Mod+MouseLeft { close-window; }\n}\n",
+        );
+        assert_eq!(
+            e.button_with_stylus(3, 0, Some(1), true, t),
+            (true, vec![Action::CloseWindow])
+        );
     }
     #[test]
     fn buttons_override_gestures_and_pair_release_after_modifier_up() {

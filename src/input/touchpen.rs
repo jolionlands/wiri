@@ -28,6 +28,29 @@ pub fn source(extra: usize) -> Option<Source> {
         Source::Pen((bits & 0x7f) as u8)
     })
 }
+
+/// Which niri `TabletStylusButtonN` a promoted pen mouse event carries, if it is a pen event at
+/// all.
+///
+/// Windows has no global pen-button stream without UIAccess, so wiri only sees what the system
+/// promotes to mouse input: the pen tip arrives as the left button, the barrel button as the
+/// right button, and a second barrel button or the eraser as the first X button.  Which
+/// physical button lands on which promoted button is the driver's choice, so this is an
+/// approximation of niri's own evdev stylus buttons, not a device-accurate mapping.
+pub fn stylus_button(message: u32, extra: usize) -> Option<u8> {
+    if !matches!(source(extra)?, Source::Pen(_)) {
+        return None;
+    }
+    match message {
+        // WM_LBUTTONDOWN / WM_LBUTTONUP: the pen tip.
+        0x201 | 0x202 => Some(1),
+        // WM_RBUTTONDOWN / WM_RBUTTONUP: the barrel button.
+        0x204 | 0x205 => Some(2),
+        // WM_XBUTTONDOWN / WM_XBUTTONUP: a second barrel button or the eraser.
+        0x20B | 0x20C => Some(3),
+        _ => None,
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     Begin,
@@ -334,6 +357,23 @@ mod tests {
         assert_eq!(source(0xff515705), Some(Source::Pen(5)));
         assert_eq!(source(0), None);
         assert_eq!(source(0x57495249), None);
+    }
+    #[test]
+    fn stylus_buttons_follow_only_promoted_pen_button_events() {
+        let pen = 0xff515705usize;
+        let touch = 0xff515785usize;
+        // The pen tip, the barrel button and a second barrel button (or the eraser).
+        assert_eq!(stylus_button(0x201, pen), Some(1));
+        assert_eq!(stylus_button(0x202, pen), Some(1));
+        assert_eq!(stylus_button(0x204, pen), Some(2));
+        assert_eq!(stylus_button(0x205, pen), Some(2));
+        assert_eq!(stylus_button(0x20B, pen), Some(3));
+        assert_eq!(stylus_button(0x20C, pen), Some(3));
+        // Motion and wheel are not buttons; a finger is not a pen; a mouse is not a pen.
+        assert_eq!(stylus_button(0x200, pen), None);
+        assert_eq!(stylus_button(0x20A, pen), None);
+        assert_eq!(stylus_button(0x201, touch), None);
+        assert_eq!(stylus_button(0x201, 0), None);
     }
     #[test]
     fn mod_claim_secondary_taps_and_paired_releases_even_after_primary_ends() {

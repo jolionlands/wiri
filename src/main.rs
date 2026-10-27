@@ -267,9 +267,15 @@ async fn main() -> Result<()> {
         std::panic::set_hook(Box::new(move |info| {
             // Whatever is going wrong, do not strand hidden windows.
             wiri::backend::hidden::restore_all_hidden();
+            // Nor leave the pointer invisible: `cursor { hide-after-inactive-ms }` swaps the
+            // system cursors, and only this puts the user's own back after a crash.
+            wiri::input::cursor_hide::panic_restore();
             default_hook(info);
         }));
     }
+    // A previous run may have died while the pointer was hidden: reload the user's cursors
+    // before anything else can hide them again.
+    wiri::input::cursor_hide::restore_at_startup();
 
     // Explicit CLI/env paths are never created, including missing ones.
     let selected_config = wiri::config::search::resolve(args.config.clone());
@@ -370,10 +376,14 @@ async fn main() -> Result<()> {
     apply_mouse_config(&config.input);
 
     // Lane P: niri's pointing-device options that Windows can be told about ("Enhance pointer
-    // precision", button swap, two precision-touchpad values).  Only the options the config names
-    // are written, the previous values are remembered, and they are restored on a graceful quit
-    // or when a reload stops naming them.
-    wiri::input::pointer_settings::apply_config(&config.input);
+    // precision", button swap, two precision-touchpad values, "hide pointer while typing").
+    // Only the options the config names are written, the previous values are remembered, and
+    // they are restored on a graceful quit or when a reload stops naming them.
+    wiri::input::pointer_settings::apply_config(&config.input, &config.cursor);
+
+    // Lane LAST: `cursor { hide-after-inactive-ms }` rides the mouse hook's own message loop
+    // with one one-shot timer; nothing exists at rest and the cursors are always restored.
+    wiri::input::cursor_hide::configure(&config.cursor);
 
     // Convert config to layout config
     let layout_config = LayoutConfig::from_config(&config);
@@ -1028,6 +1038,10 @@ async fn main() -> Result<()> {
     // Lane P: give the user their own pointer settings back before anything else goes away.
     wiri::input::pointer_settings::restore();
 
+    // Lane LAST: the pointer must never be left invisible, and the one-shot timer goes with the
+    // mouse hook thread below.
+    wiri::input::cursor_hide::shutdown();
+
     // Cancel and drain interactive previews before final restoration; a late
     // move cleanup must not re-tile or re-clip a window after restore_all.
     stop_mouse_hook();
@@ -1197,7 +1211,10 @@ fn apply_loaded_config(
     apply_mouse_config(&new_config.input);
     // Lane P: pointing-device options follow a reload; the ones the new config no longer names
     // go back to what the OS had before wiri changed them.
-    wiri::input::pointer_settings::apply_config(&new_config.input);
+    wiri::input::pointer_settings::apply_config(&new_config.input, &new_config.cursor);
+    // Lane LAST: a reload that drops `hide-after-inactive-ms` shows the pointer again (and the
+    // one timer goes away); one that adds it waits for the next pointer movement.
+    wiri::input::cursor_hide::configure(&new_config.cursor);
     mouse_tracker.write().set_config(mouse_config);
     let hide_method = hide_method_of(&new_config);
     wiri::backend::cloak::set_hide_method(hide_method);

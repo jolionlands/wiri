@@ -1,3 +1,4 @@
+pub mod cursor_hide;
 pub mod dispatch;
 pub mod dnd;
 mod double_alt;

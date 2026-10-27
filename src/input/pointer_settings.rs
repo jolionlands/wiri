@@ -58,6 +58,9 @@ pub enum Setting {
     TouchpadTypingSensitivity,
     /// Precision touchpad `HKCU\...\PrecisionTouchPad\LeaveOnWithMouse`.
     TouchpadLeaveOnWithMouse,
+    /// `SPI_GETMOUSEVANISH`/`SPI_SETMOUSEVANISH`: the per-user "hide pointer while typing"
+    /// flag (niri `cursor { hide-when-typing }`).
+    HidePointerWhileTyping,
 }
 
 impl Setting {
@@ -68,6 +71,7 @@ impl Setting {
             Self::ButtonSwap => "mouse-button-swap",
             Self::TouchpadTypingSensitivity => "touchpad-typing-sensitivity",
             Self::TouchpadLeaveOnWithMouse => "touchpad-leave-on-with-mouse",
+            Self::HidePointerWhileTyping => "hide-pointer-while-typing",
         }
     }
 
@@ -96,6 +100,13 @@ impl Setting {
                     "touchpad stays on with a mouse".to_string()
                 } else {
                     "touchpad off while a mouse is connected".to_string()
+                }
+            }
+            (Self::HidePointerWhileTyping, Value::Int(vanish)) => {
+                if vanish != 0 {
+                    "the pointer hides while typing".to_string()
+                } else {
+                    "the pointer never hides while typing".to_string()
                 }
             }
             (_, other) => format!("{other:?}"),
@@ -359,6 +370,22 @@ pub fn wanted(input: &InputConfig) -> Vec<Wanted> {
     wanted
 }
 
+/// niri `cursor { hide-when-typing }` is Windows' own per-user "hide pointer while typing"
+/// (`SPI_GETMOUSEVANISH`/`SPI_SETMOUSEVANISH`).  Everything else under `cursor` is not a
+/// setting wiri owns (`xcursor-theme`/`xcursor-size` are the Windows pointer scheme, and
+/// `hide-after-inactive-ms` is handled by `crate::input::cursor_hide`).
+pub fn wanted_cursor(cursor: &crate::config::CursorConfig) -> Vec<Wanted> {
+    let mut wanted = Vec::new();
+    if let Some(hide) = cursor.hide_when_typing {
+        wanted.push(Wanted {
+            setting: Setting::HidePointerWhileTyping,
+            value: Value::Int(i32::from(hide)),
+            option: "cursor hide-when-typing",
+        });
+    }
+    wanted
+}
+
 // ---------------------------------------------------------------------------------------
 // the runtime state: one applier, plus the `toggle-touchpad` switch
 // ---------------------------------------------------------------------------------------
@@ -386,10 +413,12 @@ fn backend_from_env() -> Arc<dyn PointerSettingsBackend> {
 
 /// Apply the pointer options of a loaded (or reloaded) config.  Options the config no longer
 /// names are put back to what the OS had before wiri changed them.
-pub fn apply_config(input: &InputConfig) {
+pub fn apply_config(input: &InputConfig, cursor: &crate::config::CursorConfig) {
     let mut guard = SETTINGS.lock();
     let settings = guard.get_or_insert_with(|| PointerSettings::new(backend_from_env()));
-    for line in settings.apply(&wanted(input)) {
+    let mut wanted = wanted(input);
+    wanted.extend(wanted_cursor(cursor));
+    for line in settings.apply(&wanted) {
         info!("{}", line);
     }
     let unapplied = unapplied(input);
@@ -568,8 +597,8 @@ mod system {
     use windows::Win32::UI::Input::KeyboardAndMouse::SwapMouseButton;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SendMessageTimeoutW, SystemParametersInfoW, HWND_BROADCAST,
-        SMTO_ABORTIFHUNG, SPI_GETMOUSE, SPI_SETMOUSE, SYSTEM_METRICS_INDEX,
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETTINGCHANGE,
+        SMTO_ABORTIFHUNG, SPI_GETMOUSE, SPI_GETMOUSEVANISH, SPI_SETMOUSE, SPI_SETMOUSEVANISH,
+        SYSTEM_METRICS_INDEX, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETTINGCHANGE,
     };
 
     /// `SM_SWAPBUTTON`: nonzero when the primary and secondary buttons are exchanged.
@@ -596,6 +625,19 @@ mod system {
             }
             Setting::TouchpadTypingSensitivity => read_touchpad("AAPThreshold").map(Value::Int),
             Setting::TouchpadLeaveOnWithMouse => read_touchpad("LeaveOnWithMouse").map(Value::Int),
+            Setting::HidePointerWhileTyping => {
+                let mut vanish = windows::Win32::Foundation::BOOL(0);
+                unsafe {
+                    SystemParametersInfoW(
+                        SPI_GETMOUSEVANISH,
+                        0,
+                        Some(&mut vanish as *mut _ as *mut _),
+                        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                    )
+                    .ok()?;
+                }
+                Some(Value::Int(i32::from(vanish.as_bool())))
+            }
         }
     }
 
@@ -627,6 +669,20 @@ mod system {
             }
             (Setting::TouchpadLeaveOnWithMouse, Value::Int(leave)) => {
                 write_touchpad("LeaveOnWithMouse", leave)
+            }
+            (Setting::HidePointerWhileTyping, Value::Int(vanish)) => {
+                // The parameter is a BOOL and there is no value pointer: this is the same
+                // switch as Settings > Accessibility > Mouse pointer > "hide pointer while
+                // typing".
+                let result = unsafe {
+                    SystemParametersInfoW(
+                        SPI_SETMOUSEVANISH,
+                        u32::from(vanish != 0),
+                        None,
+                        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                    )
+                };
+                result.map_err(|error| error.to_string())
             }
             (setting, value) => Err(format!("{} does not take {:?}", setting.name(), value)),
         }
@@ -816,6 +872,108 @@ mod tests {
             decoded.issues
         );
         decoded.config.input
+    }
+
+    fn cursor(text: &str) -> crate::config::CursorConfig {
+        let decoded = crate::config::decode::decode_text(text, "", None);
+        assert!(
+            decoded.issues.is_empty(),
+            "unexpected issues: {:?}",
+            decoded.issues
+        );
+        decoded.config.cursor
+    }
+
+    #[test]
+    fn hide_when_typing_writes_spi_mousevanish_and_restores_the_original() {
+        let fake = Arc::new(Fake::with(&[(
+            Setting::HidePointerWhileTyping,
+            Value::Int(0),
+        )]));
+        let mut settings = PointerSettings::new(fake.clone());
+        let lines = settings.apply(&wanted_cursor(&cursor(
+            "cursor {\n    hide-when-typing\n}\n",
+        )));
+        // Exactly one write: the Windows flag turned on, nothing else.
+        assert_eq!(
+            fake.writes(),
+            vec![(Setting::HidePointerWhileTyping, Value::Int(1))]
+        );
+        assert!(fake.removes().is_empty());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("cursor hide-when-typing"), "{}", lines[0]);
+        assert_eq!(settings.changed(), vec![Setting::HidePointerWhileTyping]);
+        // A graceful quit writes back the value the machine had (0), not a guessed default.
+        settings.restore();
+        assert_eq!(
+            fake.writes(),
+            vec![
+                (Setting::HidePointerWhileTyping, Value::Int(1)),
+                (Setting::HidePointerWhileTyping, Value::Int(0))
+            ]
+        );
+        assert_eq!(
+            fake.values().get(&Setting::HidePointerWhileTyping),
+            Some(&Value::Int(0))
+        );
+        assert!(settings.changed().is_empty());
+    }
+
+    #[test]
+    fn hide_when_typing_that_the_os_already_has_is_neither_written_nor_restored() {
+        let fake = Arc::new(Fake::with(&[(
+            Setting::HidePointerWhileTyping,
+            Value::Int(1),
+        )]));
+        let mut settings = PointerSettings::new(fake.clone());
+        let lines = settings.apply(&wanted_cursor(&cursor("cursor { hide-when-typing; }")));
+        assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+        assert!(lines.is_empty());
+        assert!(settings.restore().is_empty());
+        assert!(fake.writes().is_empty());
+    }
+
+    #[test]
+    fn a_reload_that_drops_hide_when_typing_puts_the_os_flag_back() {
+        let fake = Arc::new(Fake::with(&[(
+            Setting::HidePointerWhileTyping,
+            Value::Int(0),
+        )]));
+        let mut settings = PointerSettings::new(fake.clone());
+        settings.apply(&wanted_cursor(&cursor("cursor { hide-when-typing; }")));
+        assert_eq!(
+            fake.values().get(&Setting::HidePointerWhileTyping),
+            Some(&Value::Int(1))
+        );
+        // The new config says nothing about the cursor: the reload restores the old value.
+        let lines = settings.apply(&wanted_cursor(&cursor("")));
+        assert_eq!(
+            fake.values().get(&Setting::HidePointerWhileTyping),
+            Some(&Value::Int(0))
+        );
+        assert!(!lines.is_empty());
+        assert!(settings.changed().is_empty());
+    }
+
+    #[test]
+    fn hide_when_typing_false_is_an_explicit_zero() {
+        let fake = Arc::new(Fake::with(&[(
+            Setting::HidePointerWhileTyping,
+            Value::Int(1),
+        )]));
+        let mut settings = PointerSettings::new(fake.clone());
+        settings.apply(&wanted_cursor(&cursor(
+            "cursor {\n    hide-when-typing false\n}\n",
+        )));
+        assert_eq!(
+            fake.writes(),
+            vec![(Setting::HidePointerWhileTyping, Value::Int(0))]
+        );
+        settings.restore();
+        assert_eq!(
+            fake.values().get(&Setting::HidePointerWhileTyping),
+            Some(&Value::Int(1))
+        );
     }
 
     #[test]
