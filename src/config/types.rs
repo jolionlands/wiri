@@ -1,6 +1,7 @@
 #[derive(Debug, Clone)]
 pub struct Config {
     pub input: InputConfig,
+    pub gestures: super::hot_corner_config::GesturesConfig,
     pub output: Vec<OutputConfig>,
     pub layout: LayoutConfig,
     pub workspace: Vec<WorkspaceConfig>,
@@ -23,6 +24,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             input: InputConfig::default_config(),
+            gestures: super::hot_corner_config::GesturesConfig::default(),
             output: vec![OutputConfig {
                 name: String::new(),
                 position: Position::default(),
@@ -34,6 +36,7 @@ impl Default for Config {
                 primary: false,
                 position_set: false,
                 focus_at_startup: false,
+                hot_corners: None,
                 transform: String::new(),
                 enable: true,
                 layout_override: None,
@@ -238,6 +241,8 @@ pub struct OutputConfig {
     pub position_set: bool,
     /// Select this output in wiri once at startup, not as the Windows primary display.
     pub focus_at_startup: bool,
+    /// Omitted inherits global gestures.hot-corners; a block replaces it.
+    pub hot_corners: Option<super::hot_corner_config::HotCorners>,
     pub position: Position,
     pub width: u32,
     pub height: u32,
@@ -1930,6 +1935,7 @@ mod tests {
             name: "DP-1".to_string(),
             position_set: false,
             focus_at_startup: false,
+            hot_corners: None,
             position: Position::default(),
             width: 1920,
             height: 1080,

@@ -23,6 +23,8 @@ use super::types::*;
 #[path = "decode/animations_decode.rs"]
 mod animations_decode;
 mod effects_decode;
+#[path = "decode/hot_corner_decode.rs"]
+mod hot_corner_decode;
 #[path = "decode/overview_decode.rs"]
 mod overview_decode;
 #[path = "decode/recent_windows_decode.rs"]
@@ -278,6 +280,7 @@ fn suggestion(name: &str, known: &[&str]) -> Option<String> {
 const TOP_LEVEL: &[&str] = &[
     "version",
     "input",
+    "gestures",
     "output",
     "layout",
     "workspace",
@@ -299,7 +302,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "config-notification" => Some("wiri always shows a balloon for a config error"),
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
-        "gestures" => Some("not implemented yet"),
         "environment" => Some("not implemented yet"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
         "switch-events" => Some("Windows has no lid or tablet-mode switch events"),
@@ -818,6 +820,7 @@ impl Decoder {
             match key.as_str() {
                 "version" => {}
                 "input" => self.decode_input(node, cfg),
+                "gestures" => self.decode_gestures(node, &mut cfg.gestures),
                 "output" => self.decode_output(node, cfg),
                 "layout" => {
                     self.section(node);
@@ -1323,6 +1326,7 @@ impl Decoder {
             primary: false,
             position_set: false,
             focus_at_startup: false,
+            hot_corners: None,
             transform: String::new(),
             enable: true,
             layout_override: None,
@@ -1478,7 +1482,8 @@ impl Decoder {
                     self.decode_layout_into(child, &mut partial);
                     out.layout_override = Some(partial);
                 }
-                "max-bpc" | "modeline" | "background-color" | "backdrop-color" | "hot-corners" => {
+                "hot-corners" => out.hot_corners = Some(self.decode_hot_corners(child)),
+                "max-bpc" | "modeline" | "background-color" | "backdrop-color" => {
                     self.unsupported(child, "")
                 }
                 _ => self.unknown(
@@ -1500,6 +1505,7 @@ impl Decoder {
                         "mod-key",
                         "variable-refresh-rate",
                         "focus-at-startup",
+                        "hot-corners",
                     ],
                 ),
             }

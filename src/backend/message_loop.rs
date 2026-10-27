@@ -677,6 +677,7 @@ impl MessageLoop {
         // and hot-reload paths share a single source of truth.
         crate::input::dispatch::initialize(thread_id);
         crate::input::focus::initialize(engine.clone(), backend_handle.clone(), hwnd);
+        crate::input::hot_corner::initialize(engine.clone(), backend_handle.clone(), hwnd);
         let mut hook_active = false;
         match crate::input::start_keyboard_hook() {
             Ok(()) => hook_active = true,
@@ -718,11 +719,14 @@ impl MessageLoop {
                 if crate::overlay::decor::layer::handle_message(msg.message) {
                     continue;
                 }
-                if crate::input::focus::handle_message(&msg) {
+                if crate::input::focus::handle_message(&msg)
+                    || crate::input::hot_corner::handle_message(&msg)
+                {
                     continue;
                 }
                 if msg.message == WM_RELOAD_HOTKEYS {
                     crate::input::focus::reload();
+                    crate::input::hot_corner::reload();
                     // Hot-reload: unregister old, re-read config, register new
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
@@ -799,6 +803,7 @@ impl MessageLoop {
         crate::input::stop_keyboard_hook();
         crate::input::recent::reset();
         crate::overlay::decor::layer::detach_message_thread();
+        crate::input::hot_corner::shutdown();
         crate::input::focus::shutdown();
         crate::input::dispatch::shutdown();
         unsafe {
@@ -829,6 +834,7 @@ impl MessageLoop {
                 // diffs against the engine's known set, registers new monitors,
                 // and unregisters vanished ones (see `handle_backend_event`).
                 info!("WM_DISPLAYCHANGE received — monitor configuration changed");
+                crate::input::hot_corner::display_changed();
                 crate::backend::hooks::notify_display_change();
                 LRESULT(0)
             }

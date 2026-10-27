@@ -2,6 +2,7 @@ pub mod dispatch;
 mod double_alt;
 pub mod focus;
 pub mod grab;
+pub mod hot_corner;
 pub mod hotkey;
 pub mod keyboard;
 pub mod low_level_hook;

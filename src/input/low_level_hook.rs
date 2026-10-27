@@ -510,6 +510,11 @@ unsafe extern "system" fn mouse_hook_callback(
         }
     }
     let cursor = Point::new(event.pt.x, event.pt.y);
+    if msg == WM_MOUSEMOVE {
+        // Publish even during modal/grab handling; only the existing message
+        // thread checks hot-corner suppression and owns its transient dwell.
+        crate::input::hot_corner::on_mouse_move(cursor);
+    }
     if crate::ipc::pick::mouse_event(msg, cursor, event.flags & LLMHF_INJECTED != 0) {
         return LRESULT(1);
     }

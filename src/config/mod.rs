@@ -1,6 +1,7 @@
 pub mod decode;
 pub mod effects;
 pub mod error;
+pub mod hot_corner_config;
 pub mod kdl;
 pub mod loader;
 pub mod overview_config;
