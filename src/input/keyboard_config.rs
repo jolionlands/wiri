@@ -7,7 +7,8 @@
 //! Windows speed zero (which still repeats). InputConfig retains niri values.
 //!
 //! Only explicitly configured options acquire ownership. Native SPI changes
-//! are non-persistent; NumLock uses a key pair only when explicitly requested.
+//! are non-persistent. Native NumLock enforcement is refused: GetKeyState is
+//! queue-relative, so a background daemon cannot safely capture/restore its toggle.
 //! WIRI_KEYBOARD_DRY_RUN=1 selects shadow writes and log-only layout requests:
 //! no SPI setters, SendInput, or layout posts, including restoration/Drop.
 //! The mode is sampled once, so cleanup cannot accidentally change backends.
@@ -25,10 +26,6 @@ use crate::ipc::keyboard::{
     plan_configured_layout, request_configured_layout, ConfiguredLayoutPlan,
 };
 use tracing::{info, warn};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, VK_NUMLOCK,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED, SPI_SETKEYBOARDDELAY,
     SPI_SETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
@@ -50,7 +47,7 @@ impl KeyboardConfigSession {
             settings: ManagedSettings::new(if dry_run {
                 WindowsSettings::DryRun(DryRunWindows::default())
             } else {
-                WindowsSettings::Native(NativeWindows::default())
+                WindowsSettings::Native(NativeWindows)
             }),
             layout: ManagedLayout::new(WindowsLayout { dry_run }),
         }
@@ -427,7 +424,7 @@ impl SettingsBackend for WindowsSettings {
 
 fn read_windows_setting(setting: Setting) -> Result<u32, String> {
     if setting == Setting::NumLock {
-        return Ok(u32::from(unsafe { GetKeyState(i32::from(VK_NUMLOCK.0)) } & 1 != 0));
+        return Err("NumLock skipped: Windows exposes only a queue-relative toggle state; a background daemon cannot safely capture and restore it".into());
     }
     let mut value = 0u32;
     let action = match setting {
@@ -447,47 +444,11 @@ fn read_windows_setting(setting: Setting) -> Result<u32, String> {
     Ok(value)
 }
 
-// Only an explicit NumLock write can create a pending key-up obligation.
 #[derive(Default)]
-struct NativeWindows {
-    numlock_release_pending: bool,
-}
-
-const NUMLOCK_TAG: usize = 0x57494e4c;
-
-fn numlock_events() -> [INPUT; 2] {
-    let event = |flags| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VK_NUMLOCK,
-                dwFlags: flags,
-                dwExtraInfo: NUMLOCK_TAG,
-                ..Default::default()
-            },
-        },
-    };
-    [event(KEYEVENTF_EXTENDEDKEY), event(KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP)]
-}
-
-impl NativeWindows {
-    fn release_numlock(&mut self) -> Result<(), String> {
-        if self.numlock_release_pending {
-            let events = numlock_events();
-            if unsafe { SendInput(&events[1..], std::mem::size_of::<INPUT>() as i32) } != 1 {
-                return Err("NumLock key-up was not accepted; release remains pending (possibly UIPI)".into());
-            }
-            self.numlock_release_pending = false;
-        }
-        Ok(())
-    }
-}
+struct NativeWindows;
 
 impl SettingsBackend for NativeWindows {
     fn read(&mut self, setting: Setting) -> Result<u32, String> {
-        if setting == Setting::NumLock {
-            self.release_numlock()?;
-        }
         read_windows_setting(setting)
     }
 
@@ -495,50 +456,18 @@ impl SettingsBackend for NativeWindows {
         if !setting.valid(value) {
             return Err(format!("invalid native keyboard value {value}"));
         }
-        if setting == Setting::NumLock {
-            self.release_numlock()?;
-            // Do not start a new synthetic pair while NumLock is held.
-            if unsafe {
-                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from(VK_NUMLOCK.0))
-            } < 0
-            {
-                return Err("NumLock is held; refusing to inject a toggle".into());
-            }
-            if read_windows_setting(setting)? == value {
-                return Ok(());
-            }
-            let events = numlock_events();
-            let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
-            if sent == 0 {
-                return Err("NumLock input was not accepted (possibly UIPI)".into());
-            }
-            if sent == 1 {
-                self.numlock_release_pending = true;
-                if let Err(error) = self.release_numlock() {
-                    // Down already toggled it: preserve restoration ownership.
-                    warn!(%error, "Partial NumLock injection; retaining restoration ownership");
-                }
-            }
-        } else {
-            let action = match setting {
-                Setting::Delay => SPI_SETKEYBOARDDELAY,
-                Setting::Speed => SPI_SETKEYBOARDSPEED,
-                Setting::NumLock => unreachable!(),
-            };
-            // Both setters take uiParam and NULL pvParam. No profile persistence.
-            unsafe { SystemParametersInfoW(action, value, None, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) }
-                .map_err(|error| format!("could not set {}: {error}", setting.name()))?;
+        let action = match setting {
+            Setting::Delay => SPI_SETKEYBOARDDELAY,
+            Setting::Speed => SPI_SETKEYBOARDSPEED,
+            Setting::NumLock => return Err("native NumLock enforcement is unavailable without a trustworthy toggle-state baseline".into()),
+        };
+        // Both setters take uiParam and NULL pvParam. No profile persistence.
+        unsafe {
+            SystemParametersInfoW(action, value, None, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))
         }
+        .map_err(|error| format!("could not set {}: {error}", setting.name()))?;
         info!(action = ?phase, option = setting.name(), native_value = value, "Keyboard option changed (non-persistent, best-effort restoration)");
         Ok(())
-    }
-}
-
-impl Drop for NativeWindows {
-    fn drop(&mut self) {
-        if let Err(error) = self.release_numlock() {
-            warn!(%error, "Final NumLock key-up cleanup failed");
-        }
     }
 }
 
@@ -551,6 +480,11 @@ impl SettingsBackend for DryRunWindows {
     fn read(&mut self, setting: Setting) -> Result<u32, String> {
         if let Some(value) = self.shadow.get(&setting) {
             return Ok(*value);
+        }
+        // NumLock has no trustworthy native baseline on this background thread.
+        // A fixed hypothetical baseline exercises planning only, never OS state.
+        if setting == Setting::NumLock {
+            return Ok(0);
         }
         read_windows_setting(setting)
     }
@@ -921,9 +855,16 @@ mod tests {
         fn new() -> Self {
             Self(Rc::new(RefCell::new(FakeLayoutState {
                 plan: ConfiguredLayoutPlan {
-                    window: 1, thread_id: 2, original: 10, selected: 20, name: "Synthetic".into(),
+                    window: 1,
+                    thread_id: 2,
+                    original: 10,
+                    selected: 20,
+                    name: "Synthetic".into(),
                 },
-                plans: 0, requests: Vec::new(), fail: false, owned: true,
+                plans: 0,
+                requests: Vec::new(),
+                fail: false,
+                owned: true,
             })))
         }
     }
@@ -937,7 +878,11 @@ mod tests {
         fn request(&mut self, plan: &ConfiguredLayoutPlan, restore: bool) -> Result<bool, String> {
             let mut state = self.0.borrow_mut();
             state.requests.push((plan.clone(), restore));
-            if state.fail { Err("synthetic post failure".into()) } else { Ok(state.owned) }
+            if state.fail {
+                Err("synthetic post failure".into())
+            } else {
+                Ok(state.owned)
+            }
         }
     }
 
@@ -992,15 +937,24 @@ mod tests {
     }
 
     #[test]
-    fn numlock_plan_is_one_tagged_extended_down_up_pair_without_injection() {
-        let events = numlock_events();
-        for (index, event) in events.iter().enumerate() {
-            assert_eq!(event.r#type, INPUT_KEYBOARD);
-            let key = unsafe { event.Anonymous.ki };
-            assert_eq!(key.wVk, VK_NUMLOCK);
-            assert_eq!(key.dwExtraInfo, NUMLOCK_TAG);
-            assert_eq!(key.dwFlags, if index == 0 { KEYEVENTF_EXTENDEDKEY } else { KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP });
-        }
+    fn native_numlock_is_refused_without_query_or_injection() {
+        let mut backend = NativeWindows;
+        assert!(backend
+            .read(Setting::NumLock)
+            .unwrap_err()
+            .contains("queue-relative"));
+        assert!(backend.write(Setting::NumLock, 1, Phase::Apply).is_err());
+        assert!(backend.write(Setting::NumLock, 0, Phase::Restore).is_err());
+    }
+
+    #[test]
+    fn dry_run_numlock_uses_only_a_hypothetical_baseline_and_shadow() {
+        let mut backend = DryRunWindows::default();
+        assert_eq!(backend.read(Setting::NumLock), Ok(0));
+        assert_eq!(backend.write(Setting::NumLock, 1, Phase::Apply), Ok(()));
+        assert_eq!(backend.read(Setting::NumLock), Ok(1));
+        assert_eq!(backend.write(Setting::NumLock, 0, Phase::Restore), Ok(()));
+        assert_eq!(backend.read(Setting::NumLock), Ok(0));
     }
 
     #[test]

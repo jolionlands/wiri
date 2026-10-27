@@ -33,7 +33,8 @@ use wiri::overlay::{
 };
 use wiri::utils::WindowId;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use wiri::input::keyboard_config::KeyboardConfigSession;
 
 /// Build version string. `build.rs` sets `WIRI_GIT_HASH` to the short commit
 /// hash when available; otherwise we just render the crate version.
@@ -320,6 +321,10 @@ async fn main() -> Result<()> {
             e
         );
     }
+
+    // One explicit-only native-settings lifetime, including reload and early-return cleanup.
+    let keyboard_session = Mutex::new(KeyboardConfigSession::from_env());
+    configure_session(&config, &keyboard_session);
 
     // Spawn programs listed in spawn-at-startup config entries (niri parity).
     // --no-autostart suppresses this loop (useful when testing config changes).
@@ -733,6 +738,7 @@ async fn main() -> Result<()> {
         message_loop: &message_loop,
         mouse_tracker: &mouse_tracker,
         ipc_server: &ipc_server,
+        keyboard_session: &keyboard_session,
     };
 
     // Main loop: process tray actions + wait for shutdown signal
@@ -900,9 +906,12 @@ async fn main() -> Result<()> {
                     // Open the folder containing the active config in Explorer.
                     if let Some(dir) = reload.config_path.parent() {
                         info!("Tray: opening config dir {}", dir.display());
-                        let _ = std::process::Command::new("explorer.exe")
-                            .arg(dir.as_os_str())
-                            .spawn();
+                        if let Err(error) = wiri::hooks::spawner::spawn_argv(&[
+                            "explorer.exe".into(),
+                            dir.to_string_lossy().into_owned(),
+                        ]) {
+                            warn!(%error, "Could not open active config directory");
+                        }
                     }
                 }
                 TrayAction::About => {
@@ -955,6 +964,7 @@ async fn main() -> Result<()> {
     // be picked up before the process (and our hooks) go away.
     std::thread::sleep(Duration::from_millis(100));
 
+    keyboard_session.lock().restore();
     stop_mouse_hook();
     wiri::hooks::clear_backend();
     info!("Goodbye!");
@@ -970,6 +980,7 @@ struct ReloadCtx<'a> {
     message_loop: &'a MessageLoop,
     mouse_tracker: &'a Arc<RwLock<MouseTracker>>,
     ipc_server: &'a Arc<IpcServer>,
+    keyboard_session: &'a Mutex<KeyboardConfigSession>,
 }
 
 impl<'a> ReloadCtx<'a> {
@@ -1008,6 +1019,7 @@ impl<'a> ReloadCtx<'a> {
             self.handle,
             self.message_loop,
             self.mouse_tracker,
+            self.keyboard_session,
         );
         self.ipc_server.broadcast_event(IpcEvent::ConfigLoaded {
             config_path: self.config_path.display().to_string(),
@@ -1062,13 +1074,28 @@ fn balloon_text(text: &str) -> String {
     }
 }
 
+/// Publish only good configs. Spawns use child-only environment snapshots;
+/// switch subscriptions live on the existing hidden-window pump.
+fn configure_session(config: &Config, keyboard_session: &Mutex<KeyboardConfigSession>) {
+    if let Err(error) = wiri::hooks::environment::configure(&config.environment) {
+        warn!(%error, "Child environment unchanged");
+    }
+    if let Err(error) = wiri::hooks::switch_events::configure(config.switch_events.subscriptions())
+    {
+        warn!(%error, "Switch-event subscriptions could not be updated");
+    }
+    keyboard_session.lock().apply(&config.input);
+}
+
 fn apply_loaded_config(
     new_config: Config,
     engine: &Arc<RwLock<TilingEngine>>,
     handle: &BackendHandle,
     message_loop: &MessageLoop,
     mouse_tracker: &Arc<RwLock<MouseTracker>>,
+    keyboard_session: &Mutex<KeyboardConfigSession>,
 ) {
+    configure_session(&new_config, keyboard_session);
     wiri::screenshot::configure(&new_config);
     // Lane D: reload physical differences outside the engine lock, then refresh geometry/DPI.
     wiri::backend::outputs::apply(&new_config);
@@ -1246,6 +1273,20 @@ fn handle_backend_event(
         _ => Some(wiri::ipc::StateChangeGuard),
     };
     match event {
+        BackendEvent::SwitchEvent(edge) => {
+            // Switch binds deliberately bypass keyboard inhibition/lock filtering.
+            let command = engine
+                .read()
+                .full_config()
+                .and_then(|config| config.switch_events.command(edge))
+                .map(<[String]>::to_vec);
+            if let Some(command) = command {
+                match wiri::hooks::spawner::spawn_argv(&command) {
+                    Ok(pid) => info!(?edge, pid, "switch-events: spawned command"),
+                    Err(error) => warn!(?edge, %error, "switch-events: spawn failed"),
+                }
+            }
+        }
         BackendEvent::WindowCreated { hwnd } => {
             // Most windows fail `should_tile_window` at CREATE time because the
             // title/visibility aren't set yet — that's expected; SHOW/NAMECHANGE

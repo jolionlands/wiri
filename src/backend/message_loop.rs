@@ -205,8 +205,7 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32
 /// When `extend_defaults` is false:
 ///   - Returns `parsed_config` verbatim (override count is the input length
 ///     so the caller can log it; the defaults are discarded).
-///   - If `parsed_config` is empty, returns `defaults` so the daemon never
-///     ships zero hotkeys after a bad reload.
+///   - An empty replacement remains empty, as in niri.
 fn merge_hotkeys(
     defaults: Vec<(u32, u32, Action)>,
     parsed_config: Vec<(u32, u32, Action)>,
@@ -214,9 +213,6 @@ fn merge_hotkeys(
 ) -> (Vec<(u32, u32, Action)>, usize) {
     use std::collections::{HashMap, HashSet};
     if !extend_defaults {
-        if parsed_config.is_empty() {
-            return (defaults, 0);
-        }
         let n = parsed_config.len();
         return (parsed_config, n);
     }
@@ -255,16 +251,14 @@ fn merge_hotkeys(
 /// configs.  The second value holds the options of the binds that have any.
 ///
 /// Resolution order:
-///   1. Read `binds.extend_defaults` (default `true`).
+///   1. Read `binds.extend_defaults` (default `false` for decoded config).
 ///   2. When `true`: build the default table, then walk config binds.
 ///      Each successfully-parsed config bind WINS on a `(mods, vk)`
 ///      collision with the defaults; otherwise the config bind is
 ///      appended.  Bindings the user could not parse (unknown key /
 ///      unknown action name) are logged and skipped.
-///   3. When `false`: behaviour matches the pre-2026-05-18 path —
-///      config binds replace defaults entirely (with the same skip-and-log
-///      semantics), and an empty surviving table falls back to defaults
-///      so the daemon never ships zero hotkeys after a bad reload.
+///   3. When `false`: config binds replace defaults entirely, including an
+///      empty table. Invalid reloads are rejected before this point.
 fn build_hotkey_list(
     engine: &Arc<parking_lot::RwLock<TilingEngine>>,
 ) -> (Vec<(u32, u32, Action)>, HashMap<(u32, u32), BindOptions>) {
@@ -281,13 +275,15 @@ fn build_hotkey_list(
         .map(|c| resolve_mod_prefix(&c.input.mod_key))
         .unwrap_or((MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT));
 
-    // Always materialise the defaults first so we can both A) return them
-    // verbatim when the user's binds block is missing, and B) merge with
-    // user binds when extend_defaults=true.
-    let defaults = default_hotkeys(prefix, shift_prefix, terminal.clone());
+    // Defaults are opt-in, including the separate emergency Config fallback.
+    let defaults = if extend_defaults {
+        default_hotkeys(prefix, shift_prefix, terminal)
+    } else {
+        Vec::new()
+    };
     let default_count = defaults.len();
 
-    if config_binds.is_empty() {
+    if config_binds.is_empty() && extend_defaults {
         info!(
             "Hotkeys: {} from defaults, 0 from config (0 overridden)",
             default_count
@@ -342,13 +338,6 @@ fn build_hotkey_list(
         info!(
             "Hotkeys: 0 from defaults (extend-defaults=false), {} from config",
             config_count,
-        );
-    }
-    if merged.is_empty() {
-        warn!("Hotkey table empty after merge; defaults reinstated");
-        return (
-            default_hotkeys(prefix, shift_prefix, terminal),
-            HashMap::new(),
         );
     }
     (merged, options)
@@ -1763,15 +1752,37 @@ mod tests {
         assert_eq!(merged[0].2, spawn_of("config-alt-p"));
     }
 
-    /// Empty config + extend=true returns defaults untouched (a fresh user
-    /// install or a config with only `binds { }` should still get every
-    /// shipped default).
+    /// Empty config + explicit extend=true returns defaults untouched.
     #[test]
     fn merge_empty_config_returns_defaults() {
         let defaults = vec![d(0x0002, 0x25, "default-left")];
         let (merged, overridden) = merge_hotkeys(defaults.clone(), vec![], true);
         assert_eq!(overridden, 0);
         assert_eq!(merged, defaults);
+    }
+
+    #[test]
+    fn runtime_builder_keeps_omitted_empty_and_pointer_only_tables_empty() {
+        for source in [
+            "",
+            "binds {}",
+            "binds { WheelScrollDown { close-window; }; }",
+        ] {
+            let config = crate::config::parse_kdl_config(source).unwrap();
+            let mut engine = TilingEngine::new(crate::layout::LayoutConfig::from_config(&config));
+            engine.set_full_config(config);
+            let (hotkeys, options) = build_hotkey_list(&Arc::new(parking_lot::RwLock::new(engine)));
+            assert!(hotkeys.is_empty(), "{source}");
+            assert!(options.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn empty_replacement_never_restores_defaults() {
+        let defaults = vec![d(MOD_CTRL | MOD_ALT, 0x51, "close")];
+        let (merged, overridden) = merge_hotkeys(defaults, vec![], false);
+        assert!(merged.is_empty());
+        assert_eq!(overridden, 0);
     }
 
     /// System-critical chords (Win+L, Win+Shift+S, Win+D) must be flagged by

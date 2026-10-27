@@ -21,13 +21,16 @@ impl TilingEngine {
     }
 
     pub(super) fn refresh_strip_widths(&mut self, output: OutputId) {
-        let cfg = self.effective_config(output).clone();
+        let base = self.config_per_monitor.get(&output).unwrap_or(&self.config);
+        let per_workspace = &self.config_per_workspace;
         let Some(monitor) = self.monitors.get_mut(&output) else {
             return;
         };
-        let view = Self::view_width_for_monitor(monitor, &cfg);
+        let work_area = monitor.work_area;
         let scale = monitor.scale_factor;
-        for ws in monitor.workspaces.values_mut() {
+        for (workspace, ws) in &mut monitor.workspaces {
+            let cfg = per_workspace.get(&(output, *workspace)).unwrap_or(base);
+            let view = Self::view_width_for_work_area(work_area, cfg);
             for column in &mut ws.columns {
                 // Fullscreen/maximize temporarily override the cached width.
                 if column.maximized
@@ -69,7 +72,7 @@ impl TilingEngine {
         let Some((output, ws, col)) = self.locate_window(id) else {
             return;
         };
-        let cfg = self.effective_config(output).clone();
+        let cfg = self.effective_config_for_workspace(output, ws).clone();
         let spec = rule.or(cfg.default_column_width);
         let Some(monitor) = self.monitors.get_mut(&output) else {
             return;

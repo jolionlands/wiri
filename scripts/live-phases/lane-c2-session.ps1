@@ -37,7 +37,10 @@
         [IO.File]::WriteAllText((Join-Path $c2Root 'evidence.json'), ($c2Details | ConvertTo-Json -Depth 18), $c2Utf8)
     }
     function C2KdlString([string]$text) {
-        return '"' + $text.Replace('\','\\').Replace('"','\"').Replace("`r",'\r').Replace("`n",'\n').Replace("`t",'\t') + '"'
+        # Raw KDL avoids double-escaping literal Windows path separators.
+        $hashes = '#'
+        while ($text.Contains('"' + $hashes)) { $hashes += '#' }
+        return 'r' + $hashes + '"' + $text + '"' + $hashes
     }
     function C2PsString([string]$text) { return "'" + $text.Replace("'","''") + "'" }
     function C2Wire($request, $reply) {

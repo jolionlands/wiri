@@ -14,7 +14,7 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
 | Layout and behaviour (226 rows) | 80 | 58 | 73 | 15 |
-| Config, input and IPC (260 rows) | 95 | 61 | 34 | 70 |
+| Config, input and IPC (259 rows) | 110 | 55 | 24 | 70 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
 retained Phase 2C Lane B/D and Lane G/H/S updates; they are not a full live sign-off.

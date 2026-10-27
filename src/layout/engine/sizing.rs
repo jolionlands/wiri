@@ -201,11 +201,12 @@ impl TilingEngine {
         }
     }
 
-    /// The width of the view of `output`, which a column is made while its window is
-    /// fullscreen or maximized (the width `maximize-column` gives).
-    fn slot_view_width(&self, output: OutputId) -> Option<u32> {
+    /// The width of the view of `workspace` on `output`, which a column is made while its
+    /// window is fullscreen or maximized (the width `maximize-column` gives).
+    fn slot_view_width(&self, output: OutputId, workspace: i32) -> Option<u32> {
         let monitor = self.monitors.get(&output)?;
-        Some(Self::view_width_for_monitor(monitor, self.effective_config(output)).max(50) as u32)
+        let cfg = self.effective_config_for_workspace(output, workspace);
+        Some(Self::view_width_for_monitor(monitor, cfg).max(50) as u32)
     }
 
     /// The window takes the whole view while it is fullscreen or maximized: its column is made
@@ -215,7 +216,7 @@ impl TilingEngine {
         let Some((output, workspace, column)) = self.locate_window(window_id) else {
             return;
         };
-        let Some(view) = self.slot_view_width(output) else {
+        let Some(view) = self.slot_view_width(output, workspace) else {
             return;
         };
         let Some(column) = self
@@ -246,7 +247,7 @@ impl TilingEngine {
         let Some((output, workspace, column)) = self.locate_window(window_id) else {
             return;
         };
-        let Some(view) = self.slot_view_width(output) else {
+        let Some(view) = self.slot_view_width(output, workspace) else {
             return;
         };
         if let Some(column) = self

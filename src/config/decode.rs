@@ -6,9 +6,9 @@
 //! * a syntax error, an unknown section or key, a value of the wrong type or outside its
 //!   range, an unknown bind action, a bad regular expression and a missing include are
 //!   **errors**: the file does not load (on a reload the last good config stays);
-//! * a niri option that wiri does not implement, a bind that cannot work on Windows
-//!   (an AltGr modifier, a mouse trigger, an action wiri lacks) and a duplicate bind are
-//!   **warnings**: the file loads and that part is ignored;
+//! * a known niri option or trigger without a Windows equivalent is a warning;
+//!   unknown modifiers and duplicate chords within one config part are errors;
+//! * included config parts override earlier chords using the final Mod mapping;
 //! * the old wiri spellings (flat keys under `layout`, `Ctrl+Alt+Left focus-column-left`
 //!   binds, `window-rule { class-name "x" }`, ...) keep working next to niri's.
 
@@ -163,6 +163,7 @@ fn run(text: &str, file: &str, base_dir: Option<&Path>, root: Option<PathBuf>) -
         depth: 0,
         source: String::new(),
         include_trace: Vec::new(),
+        bind_groups: Vec::new(),
     };
     if let Some(root) = root {
         decoder.stack.push(root);
@@ -171,6 +172,7 @@ fn run(text: &str, file: &str, base_dir: Option<&Path>, root: Option<PathBuf>) -
     // Outputs come only from the text; the single default entry returns when it has none.
     config.output.clear();
     decoder.decode_source(text, &mut config);
+    decoder.finish_binds(&mut config);
     if config.output.is_empty() {
         config.output = Config::default().output;
     }
@@ -287,6 +289,8 @@ const TOP_LEVEL: &[&str] = &[
     "binds",
     "recent-windows",
     "animations",
+    "environment",
+    "switch-events",
     "spawn-at-startup",
     "spawn-sh-at-startup",
     "include",
@@ -303,9 +307,7 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "blur" => Some("no compositor blur on Windows"),
         "gestures" => Some("not implemented yet"),
         "overview" => Some("not implemented yet"),
-        "environment" => Some("not implemented yet"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
-        "switch-events" => Some("Windows has no lid or tablet-mode switch events"),
         "debug" => Some("these are compositor debug options"),
         "layer-rule" => Some("Windows has no layer shell"),
         _ => None,
@@ -520,6 +522,12 @@ fn expand_user_path(raw: &str) -> String {
 // the decoder
 // ---------------------------------------------------------------------------------------
 
+struct LocatedBind {
+    bind: HotkeyBinding,
+    label: super::diagnostics::SourceLabel,
+    includes: Vec<super::diagnostics::SourceLabel>,
+}
+
 struct Decoder {
     issues: Vec<ValidationIssue>,
     includes: Vec<PathBuf>,
@@ -532,6 +540,7 @@ struct Decoder {
     depth: u8,
     source: String,
     include_trace: Vec<super::diagnostics::SourceLabel>,
+    bind_groups: Vec<Vec<LocatedBind>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -875,6 +884,8 @@ impl Decoder {
                 "binds" => self.decode_binds(node, cfg),
                 "recent-windows" => self.decode_recent_windows(node, &mut cfg.recent_windows),
                 "animations" => self.decode_animations(node, cfg),
+                "environment" => self.decode_environment(node, cfg),
+                "switch-events" => self.decode_switch_events(node, cfg),
                 "spawn-at-startup" => self.decode_spawn_at_startup(node, cfg),
                 "spawn-sh-at-startup" => {
                     if let Some(cmd) = self.arg_text(node) {
@@ -1040,6 +1051,99 @@ impl Decoder {
         }
     }
 
+    fn decode_environment(&mut self, node: &Node, cfg: &mut Config) {
+        use crate::hooks::environment::{names_equal, validate_entry};
+        self.section(node);
+        let mut seen: Vec<(&str, Pos)> = Vec::new();
+        for child in node.kids() {
+            let Some(arg) = self.one_arg(child) else {
+                continue;
+            };
+            let value = match &arg.scalar {
+                Scalar::Null => None,
+                Scalar::Str { text, .. } => Some(text.clone()),
+                _ => {
+                    self.error(arg.pos, "an environment value must be a string or null");
+                    continue;
+                }
+            };
+            if let Err(error) = validate_entry(&child.name, value.as_deref()) {
+                self.error(child.pos, error.to_string());
+                continue;
+            }
+            if let Some((_, first)) = seen.iter().find(|(name, _)| names_equal(name, &child.name)) {
+                self.error(
+                    child.pos,
+                    format!(
+                        "duplicate Windows environment variable '{}' (case-insensitive)",
+                        child.name
+                    ),
+                );
+                let label = super::diagnostics::SourceLabel::at(
+                    &self.file,
+                    &self.source,
+                    *first,
+                    "first definition is here",
+                );
+                self.issues.last_mut().unwrap().context.related.push(label);
+                continue;
+            }
+            seen.push((&child.name, child.pos));
+            // Includes are separate parts: the later declaration wins, even
+            // when the spelling of the Windows variable name changes case.
+            cfg.environment
+                .retain(|name, _| !names_equal(name, &child.name));
+            cfg.environment.insert(child.name.clone(), value);
+        }
+    }
+
+    fn decode_switch_events(&mut self, node: &Node, cfg: &mut Config) {
+        self.section(node);
+        for child in node.kids() {
+            let slot = match norm(&child.name).as_str() {
+                "lid-close" => &mut cfg.switch_events.lid_close,
+                "lid-open" => &mut cfg.switch_events.lid_open,
+                "tablet-mode-on" => &mut cfg.switch_events.tablet_mode_on,
+                "tablet-mode-off" => &mut cfg.switch_events.tablet_mode_off,
+                _ => {
+                    self.unknown(
+                        child,
+                        "'switch-events'",
+                        &["lid-close", "lid-open", "tablet-mode-on", "tablet-mode-off"],
+                    );
+                    continue;
+                }
+            };
+            self.section(child);
+            if child.kids().len() != 1 {
+                self.error(
+                    child.pos,
+                    "a switch event requires exactly one spawn action",
+                );
+                continue;
+            }
+            let action = &child.kids()[0];
+            if norm(&action.name) != "spawn" {
+                self.error(action.pos, "switch events support only the spawn action");
+                continue;
+            }
+            self.no_props(action);
+            self.no_children(action);
+            let mut argv = Vec::new();
+            for arg in &action.args {
+                match &arg.scalar {
+                    Scalar::Str { text, .. } if !text.contains('\0') => argv.push(text.clone()),
+                    _ => self.error(arg.pos, "spawn arguments must be strings without NUL"),
+                }
+            }
+            if argv.first().is_none_or(|program| program.is_empty()) {
+                self.error(action.pos, "spawn needs a nonempty program");
+            } else {
+                *slot = Some(argv);
+            }
+        }
+    }
+
     fn decode_spawn_at_startup(&mut self, node: &Node, cfg: &mut Config) {
         self.no_props(node);
         self.no_children(node);
@@ -1102,28 +1206,44 @@ impl Decoder {
             {
                 if let Some(v) = self.arg_text(child) {
                     cfg.input.keyboard_layout = v;
+                    cfg.input.keyboard_layout_configured = true;
                 }
             }
             "repeat-delay" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
                 if let Some(v) = self.arg_u32(child, 65535) {
                     cfg.input.repeat_delay = v;
+                    cfg.input.repeat_delay_configured = true;
                 }
             }
             "repeat-rate" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
                 if let Some(v) = self.arg_u32(child, 255) {
                     cfg.input.repeat_rate = v;
+                    cfg.input.repeat_rate_configured = true;
                 }
             }
             "numlock" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
                 if let Some(v) = self.flag(child) {
                     cfg.input.numlock = v;
+                    cfg.input.numlock_configured = true;
                 }
             }
-            "xkb" | "track-layout" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
-                self.unsupported(
-                    child,
-                    "Windows has no XKB; the keyboard layout is the system's",
-                )
+            "xkb" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
+                self.section(child);
+                for option in child.kids() {
+                    match norm(&option.name).as_str() {
+                        "layout" => {
+                            if let Some(name) = self.arg_text(option) {
+                                cfg.input.keyboard_layout = name;
+                                cfg.input.keyboard_layout_configured = true;
+                            }
+                        }
+                        "variant" | "options" | "model" | "rules" | "file" => self.unsupported(option, "Windows has no XKB; only one already-loaded Windows layout can be selected"),
+                        _ => self.unknown(option, "'xkb'", &["layout", "variant", "options", "model", "rules", "file"]),
+                    }
+                }
+            }
+            "track-layout" if matches!(scope, InputScope::Input | InputScope::Keyboard) => {
+                self.unsupported(child, "Windows controls per-application layout tracking")
             }
             // focus
             "focus-follows-mouse" | "follows-mouse" => {
@@ -1985,17 +2105,30 @@ impl Decoder {
                 return;
             }
         };
+        if name.is_empty() {
+            self.error(node.pos, "workspace name must not be empty");
+            return;
+        }
         let mut ws = WorkspaceConfig {
             name,
-            layout: "tile".to_string(),
-            monitor: String::new(),
-            follow_on_focus: true,
+            ..WorkspaceConfig::default_config()
         };
         for child in node.kids() {
             match norm(&child.name).as_str() {
                 "layout" => {
                     if child.args.is_empty() && child.children.is_some() {
-                        self.unsupported(child, "per-workspace layout overrides");
+                        self.section(child);
+                        let mut partial = LayoutConfigPartial::default();
+                        self.decode_layout_into(child, &mut partial);
+                        for option in child.kids() {
+                            if matches!(
+                                norm(&option.name).as_str(),
+                                "empty-workspace-above-first" | "insert-hint"
+                            ) {
+                                self.error(option.pos, format!("'{}' is an output-level option and is not allowed in workspace layout", option.name));
+                            }
+                        }
+                        ws.layout_override = Some(partial);
                     } else if let Some(v) = self.arg_text(child) {
                         ws.layout = v;
                     }
@@ -2007,8 +2140,10 @@ impl Decoder {
                 }
                 "open-on-output" => {
                     if let Some(v) = self.arg_text(child) {
-                        if ws.monitor.is_empty() {
-                            ws.monitor = v;
+                        if v.is_empty() {
+                            self.error(child.pos, "open-on-output must not be empty");
+                        } else {
+                            ws.open_on_outputs.push(v);
                         }
                     }
                 }
@@ -2383,8 +2518,7 @@ impl Decoder {
 
     fn decode_binds(&mut self, node: &Node, cfg: &mut Config) {
         self.section(node);
-        let mut parsed: Vec<HotkeyBinding> = Vec::new();
-        let mut seen: Vec<(String, Pos)> = Vec::new();
+        let mut parsed = Vec::new();
         for child in node.kids() {
             if norm(&child.name) == "extend-defaults" {
                 if let Some(v) = self.flag(child) {
@@ -2393,28 +2527,55 @@ impl Decoder {
                 continue;
             }
             if let Some(bind) = self.decode_bind(child) {
-                let id = chord_key(&bind);
-                if let Some((_, first)) = seen.iter().find(|(k, _)| *k == id) {
-                    let first_line = first.line;
-                    self.warn(
+                parsed.push(LocatedBind {
+                    bind,
+                    label: super::diagnostics::SourceLabel::at(
+                        &self.file,
+                        &self.source,
                         child.pos,
-                        format!(
-                            "bind {} is defined twice (first at line {}); the first one is used",
-                            bind.chord_text(),
-                            first_line
-                        ),
-                    );
-                    continue;
-                }
-                seen.push((id, child.pos));
-                parsed.push(bind);
+                        "first definition is here",
+                    ),
+                    includes: self.include_trace.clone(),
+                });
             }
         }
-        // A later `binds` block (an included file) replaces earlier binds on the same chord.
-        cfg.binds
-            .hotkeys
-            .retain(|old| !parsed.iter().any(|new| chord_key(new) == chord_key(old)));
-        cfg.binds.hotkeys.extend(parsed);
+        self.bind_groups.push(parsed);
+    }
+
+    fn finish_binds(&mut self, cfg: &mut Config) {
+        use crate::input::keynames::ChordIdentity;
+        let prefix = crate::input::mod_key_flags(&cfg.input.mod_key)
+            .unwrap_or(crate::input::DEFAULT_MOD_KEY);
+        let mut merged: Vec<(ChordIdentity, HotkeyBinding)> = Vec::new();
+        for group in std::mem::take(&mut self.bind_groups) {
+            let mut seen: std::collections::HashMap<
+                ChordIdentity,
+                super::diagnostics::SourceLabel,
+            > = std::collections::HashMap::new();
+            for located in group {
+                let Ok(id) = ChordIdentity::new(&located.bind.modifiers, &located.bind.key, prefix)
+                else {
+                    continue;
+                };
+                if let Some(first) = seen.get(&id) {
+                    let label = located.label;
+                    self.issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Error, file: label.file, line: label.line, column: label.column,
+                        message: format!("duplicate chord {}", located.bind.chord_text()),
+                        context: super::diagnostics::DiagnosticContext {
+                            source_line: label.source_line, related: vec![first.clone()], includes: located.includes,
+                            help: "remove one binding; included configuration parts may override a chord".into(),
+                        },
+                    });
+                    continue;
+                }
+                seen.insert(id, located.label);
+                // Includes override only matching chords, not the entire table.
+                merged.retain(|(old, _)| *old != id);
+                merged.push((id, located.bind));
+            }
+        }
+        cfg.binds.hotkeys = merged.into_iter().map(|(_, bind)| bind).collect();
     }
 
     fn decode_bind_release(&mut self, node: &Node, value: &Value, bind: &mut HotkeyBinding) {
@@ -2528,7 +2689,11 @@ impl Decoder {
                 }
                 "cooldown-ms" => {
                     if let Some(v) = self.value_number(node, &p.value, 0.0, 3_600_000.0) {
-                        bind.cooldown_ms = Some(v.round() as u32);
+                        if v.fract() == 0.0 {
+                            bind.cooldown_ms = Some(v as u32);
+                        } else {
+                            self.error(p.value.pos, "cooldown-ms expects an integer");
+                        }
                     }
                 }
                 "allow-when-locked" => {
@@ -2571,7 +2736,7 @@ impl Decoder {
 
         // modifiers
         if let Err(e) = bind.resolve_modifiers(crate::input::DEFAULT_MOD_KEY) {
-            self.warn(
+            self.error(
                 node.pos,
                 format!("bind {}: {}; the bind is ignored", chord, e),
             );
@@ -2650,17 +2815,6 @@ impl Decoder {
         }
         Some(bind)
     }
-}
-
-/// A chord as a comparable string: modifiers (sorted, lower case) and key.
-fn chord_key(bind: &HotkeyBinding) -> String {
-    let mut mods: Vec<String> = bind
-        .modifiers
-        .iter()
-        .map(|m| m.to_ascii_lowercase())
-        .collect();
-    mods.sort();
-    format!("{}+{}", mods.join("+"), bind.key.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -2799,7 +2953,8 @@ mod tests {
     fn niri_input_options_wiri_lacks_are_warnings() {
         let d = load("input {\n    touchpad {\n        tap\n        dwt\n    }\n    keyboard { xkb { layout \"us\" } }\n    mod-key-nested \"Alt\"\n}\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(warnings(&d).len(), 3, "{:?}", warnings(&d));
+        assert_eq!(warnings(&d).len(), 2, "{:?}", warnings(&d));
+        assert!(d.config.input.keyboard_layout_configured);
         assert!(warnings(&d)[0].contains("'touchpad' is not supported"));
     }
 
@@ -3021,7 +3176,7 @@ mod tests {
             "in the order they are declared"
         );
         assert_eq!(cfg.workspace[3].monitor, "DP-1");
-        assert_eq!(cfg.workspace[4].monitor, "HDMI-1");
+        assert_eq!(cfg.workspace[4].open_on_outputs, vec!["HDMI-1"]);
         let d = load("workspace { }\n");
         assert!(errors(&d)[0].contains("needs a name"));
     }
@@ -3137,18 +3292,15 @@ mod tests {
 
     #[test]
     fn bind_problems_that_cost_one_bind() {
-        // Unknown/AltGr modifiers and an unsupported media key lose their binds;
-        // pointer triggers and the rest of the config load.
+        // Unknown modifiers reject the config rather than weakening the chord.
+        // AltGr, pointer triggers and media keys have real Windows equivalents.
         let d = load("binds {\n    Hyper+F9 { close-window; }\n    Mod5+F8 { close-window; }\n    Mod+MouseLeft { close-window; }\n    XF86AudioMute { spawn \"x\"; }\n    Mod+F7 { refresh; }\n}\n");
-        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        let w = warnings(&d);
-        assert_eq!(w.len(), 3, "{:?}", w);
-        assert!(w[0].contains("unknown modifier 'Hyper'"), "{}", w[0]);
-        assert!(w[1].contains("cannot be bound on Windows"), "{}", w[1]);
-        assert!(w[2].contains("no Windows virtual key"), "{}", w[2]);
-        assert_eq!(d.config.binds.hotkeys.len(), 2);
-        assert_eq!(d.config.binds.hotkeys[0].key, "MouseLeft");
-        assert_eq!(d.config.binds.hotkeys[1].key, "F7");
+        assert_eq!(errors(&d).len(), 1, "{:?}", errors(&d));
+        assert!(errors(&d)[0].contains("unknown modifier 'Hyper'"));
+        assert!(warnings(&d).is_empty(), "{:?}", warnings(&d));
+        assert_eq!(d.config.binds.hotkeys.len(), 4);
+        assert_eq!(d.config.binds.hotkeys[0].key, "F8");
+        assert_eq!(d.config.binds.hotkeys[1].key, "MouseLeft");
         // An action wiri lacks but niri has: a warning, not an error.
         let d = load("binds { Mod+X { swap-window-left; } }\n");
         assert!(errors(&d).is_empty());
@@ -3184,13 +3336,22 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_bind_keeps_the_first_with_a_warning() {
-        let d = load("binds {\n    Mod+T { close-window; }\n    mod+t { quit; }\n}\n");
-        assert!(errors(&d).is_empty());
-        assert_eq!(warnings(&d).len(), 1, "{:?}", warnings(&d));
-        assert!(warnings(&d)[0].contains("defined twice (first at line 2)"));
+    fn duplicate_bind_aliases_are_errors_with_both_locations() {
+        let d =
+            load("binds {\n    Control+Return { close-window; }\n    ctrl+enter { quit; }\n}\n");
+        assert_eq!(errors(&d).len(), 1, "{:?}", errors(&d));
+        assert!(warnings(&d).is_empty());
+        assert!(errors(&d)[0].contains("duplicate chord"));
+        assert_eq!(d.issues[0].context.related[0].line, 2);
         assert_eq!(d.config.binds.hotkeys.len(), 1);
         assert_eq!(d.config.binds.hotkeys[0].command, "close-window");
+    }
+
+    #[test]
+    fn duplicate_chords_use_final_mod_even_after_binds() {
+        let d = load("binds { Mod+Return { close-window; }\nSuper+Enter { quit; } }\ninput { mod-key \"super\"; }");
+        assert_eq!(d.error_count(), 1, "{:?}", d.issues);
+        assert!(d.issues[0].message.contains("duplicate chord"));
     }
 
     #[test]
@@ -3344,6 +3505,110 @@ mod tests {
         let d = load("window-rule { match is-window-cast-target=true\n focus-ring { off }\n geometry-corner-radius 8 }\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
         assert_eq!(warnings(&d).len(), 3);
+    }
+
+    #[test]
+    fn keyboard_options_only_acquire_when_explicit() {
+        let d = load("input { keyboard {} }");
+        assert!(!d.config.input.keyboard_layout_configured);
+        assert!(!d.config.input.repeat_delay_configured);
+        assert!(!d.config.input.repeat_rate_configured);
+        assert!(!d.config.input.numlock_configured);
+        let d = load("input { keyboard { xkb { layout \"us\"; }; repeat-delay 500; repeat-rate 0; numlock false; } }");
+        assert!(!d.has_errors(), "{:?}", d.issues);
+        assert!(d.config.input.keyboard_layout_configured);
+        assert!(d.config.input.repeat_delay_configured);
+        assert!(d.config.input.repeat_rate_configured);
+        assert!(d.config.input.numlock_configured);
+        assert_eq!(d.config.input.keyboard_layout, "us");
+        assert_eq!(d.config.input.repeat_rate, 0);
+        assert!(!d.config.input.numlock);
+    }
+
+    #[test]
+    fn environment_strings_empty_and_null_are_distinct() {
+        let before = std::env::var_os("PATH");
+        let d = load("environment { Path null; EMPTY \"\"; UNICODE \"hello 🦀\"; }");
+        assert!(!d.has_errors(), "{:?}", d.issues);
+        assert_eq!(d.config.environment["Path"], None);
+        assert_eq!(d.config.environment["EMPTY"].as_deref(), Some(""));
+        assert_eq!(d.config.environment["UNICODE"].as_deref(), Some("hello 🦀"));
+        assert_eq!(std::env::var_os("PATH"), before);
+        let d = load("environment { Path \"first\"; PATH null; }");
+        assert_eq!(d.error_count(), 1, "{:?}", d.issues);
+        assert_eq!(d.first_error().unwrap().context.related.len(), 1);
+        for invalid in [
+            "environment { A 42; }",
+            "environment { \"A=B\" \"x\"; }",
+            "environment { \"\" null; }",
+        ] {
+            assert!(load(invalid).has_errors(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn environment_included_parts_merge_case_insensitively() {
+        let dir = Path::new(".scratch").join(format!("c2-env-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("env.kdl"),
+            "environment { PATH \"second\"; REMOVE null; }",
+        )
+        .unwrap();
+        let d = decode_text(
+            "environment { Path \"first\"; KEEP \"yes\"; }\ninclude \"env.kdl\"",
+            "root.kdl",
+            Some(&dir),
+        );
+        assert!(!d.has_errors(), "{:?}", d.issues);
+        assert_eq!(d.config.environment.len(), 3);
+        assert_eq!(d.config.environment["PATH"].as_deref(), Some("second"));
+        assert_eq!(d.config.environment["REMOVE"], None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switches_support_only_one_spawn_and_preserve_all_arguments() {
+        use crate::hooks::switch_events::SwitchEvent;
+        let d = load(
+            r##"switch-events { lid-close { spawn r#"C:\a b\p.exe"# "a b" ""; }; lid-open { spawn "cmd.exe"; }; tablet-mode-on { spawn "tablet.exe"; }; tablet-mode-off { spawn "laptop.exe"; } }"##,
+        );
+        assert!(!d.has_errors(), "{:?}", d.issues);
+        let switches = &d.config.switch_events;
+        assert_eq!(
+            switches.command(SwitchEvent::LidClose).unwrap(),
+            ["C:\\a b\\p.exe", "a b", ""]
+        );
+        assert_eq!(switches.command(SwitchEvent::LidOpen).unwrap(), ["cmd.exe"]);
+        assert!(switches.subscriptions().lid && switches.subscriptions().tablet_mode);
+        for invalid in [
+            "switch-events { lid-close { quit; } }",
+            "switch-events { lid-close {} }",
+            "switch-events { lid-close { spawn \"x\"; spawn \"y\"; } }",
+            "switch-events { lid-close { spawn; } }",
+            "switch-events { tablet-mood-on { spawn \"x\"; } }",
+        ] {
+            assert!(load(invalid).has_errors(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn workspace_layout_partial_and_output_priority_decode() {
+        let d = load("layout { gaps 8; always-center-single-column; }\nworkspace \"chat\" { open-on-output \"first\"; open-on-output \"second\"; layout { gaps 16; always-center-single-column false; } }");
+        assert!(!d.has_errors(), "{:?}", d.issues);
+        let ws = &d.config.workspace[0];
+        assert_eq!(ws.open_on_outputs, ["first", "second"]);
+        let layout = ws
+            .layout_override
+            .as_ref()
+            .unwrap()
+            .apply_to(&d.config.layout);
+        assert_eq!(layout.inner_gaps, 16);
+        assert!(!layout.always_center_single_column);
+        for option in ["empty-workspace-above-first", "insert-hint {}"] {
+            let d = load(&format!("workspace \"a\" {{ layout {{ {option}; }} }}"));
+            assert!(d.has_errors(), "{option}");
+        }
     }
 
     #[test]

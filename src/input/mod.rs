@@ -4,6 +4,8 @@ pub mod focus;
 pub mod grab;
 pub mod hotkey;
 pub mod keyboard;
+pub mod keyboard_config;
+pub mod keynames;
 pub mod low_level_hook;
 pub mod mouse;
 pub mod pointer;
@@ -631,116 +633,7 @@ pub fn parse_column_width_arg(arg: &str) -> Option<Action> {
 /// (`page-up`, `arrow-left`) and the underscored ones the generated default
 /// config used (`Bracket_Left`, `Backslash`, `Comma`, `Period`).
 pub fn parse_key_name(name: &str) -> Option<u32> {
-    let k = name.trim().to_lowercase();
-    // Letters: a-z → 0x41-0x5A
-    // Use chars().count() (not .len()) so the guard is correct for multi-byte UTF-8.
-    if k.chars().count() == 1 {
-        // Safety: count() == 1 guarantees exactly one char exists.
-        let ch = k.chars().next().unwrap_or('\0');
-        if ch.is_ascii_alphabetic() {
-            return Some(0x41 + (ch as u32) - ('a' as u32));
-        }
-        if ch.is_ascii_digit() {
-            return Some(0x30 + (ch as u32) - ('0' as u32));
-        }
-        // Punctuation typed as the character itself (OEM keys of a US layout).
-        let oem = match ch {
-            ';' => Some(0xBA),
-            '=' => Some(0xBB),
-            ',' => Some(0xBC),
-            '-' => Some(0xBD),
-            '.' => Some(0xBE),
-            '/' => Some(0xBF),
-            '`' => Some(0xC0),
-            '[' => Some(0xDB),
-            '\\' => Some(0xDC),
-            ']' => Some(0xDD),
-            '\'' => Some(0xDE),
-            _ => None,
-        };
-        if oem.is_some() {
-            return oem;
-        }
-    }
-    let canon: String = k
-        .chars()
-        .filter(|c| !matches!(c, '_' | '-' | ' '))
-        .collect();
-    match canon.as_str() {
-        "left" | "arrowleft" => Some(0x25),
-        "right" | "arrowright" => Some(0x27),
-        "up" | "arrowup" => Some(0x26),
-        "down" | "arrowdown" => Some(0x28),
-        "enter" | "return" | "kpenter" | "numpadenter" => Some(0x0D),
-        "space" => Some(0x20),
-        "tab" => Some(0x09),
-        "escape" | "esc" => Some(0x1B),
-        "backspace" => Some(0x08),
-        "delete" | "del" => Some(0x2E),
-        "home" => Some(0x24),
-        "end" => Some(0x23),
-        "pageup" | "prior" => Some(0x21),
-        "pagedown" | "next" => Some(0x22),
-        "insert" | "ins" => Some(0x2D),
-        "capslock" => Some(0x14),
-        "numlock" => Some(0x90),
-        "f1" => Some(0x70),
-        "f2" => Some(0x71),
-        "f3" => Some(0x72),
-        "f4" => Some(0x73),
-        "f5" => Some(0x74),
-        "f6" => Some(0x75),
-        "f7" => Some(0x76),
-        "f8" => Some(0x77),
-        "f9" => Some(0x78),
-        "f10" => Some(0x79),
-        "f11" => Some(0x7A),
-        "f12" => Some(0x7B),
-        "f13" => Some(0x7C),
-        "f14" => Some(0x7D),
-        "f15" => Some(0x7E),
-        "f16" => Some(0x7F),
-        "f17" => Some(0x80),
-        "f18" => Some(0x81),
-        "f19" => Some(0x82),
-        "f20" => Some(0x83),
-        "f21" => Some(0x84),
-        "f22" => Some(0x85),
-        "f23" => Some(0x86),
-        "f24" => Some(0x87),
-        "print" | "printscreen" | "sysrq" => Some(0x2C),
-        "scrolllock" => Some(0x91),
-        "pause" | "break" => Some(0x13),
-        // Punctuation keys (US layout), xkb names.
-        "semicolon" => Some(0xBA),
-        "equal" | "plus" => Some(0xBB),
-        "comma" => Some(0xBC),
-        "minus" => Some(0xBD),
-        "period" | "dot" => Some(0xBE),
-        "slash" => Some(0xBF),
-        "grave" | "backtick" | "quoteleft" => Some(0xC0),
-        "bracketleft" => Some(0xDB),
-        "backslash" => Some(0xDC),
-        "bracketright" => Some(0xDD),
-        "apostrophe" | "quote" => Some(0xDE),
-        // Numeric keypad: `KP_1` / `kp1` / `numpad1`, and its operators.
-        "kp0" | "numpad0" => Some(0x60),
-        "kp1" | "numpad1" => Some(0x61),
-        "kp2" | "numpad2" => Some(0x62),
-        "kp3" | "numpad3" => Some(0x63),
-        "kp4" | "numpad4" => Some(0x64),
-        "kp5" | "numpad5" => Some(0x65),
-        "kp6" | "numpad6" => Some(0x66),
-        "kp7" | "numpad7" => Some(0x67),
-        "kp8" | "numpad8" => Some(0x68),
-        "kp9" | "numpad9" => Some(0x69),
-        "kpmultiply" | "numpadmultiply" => Some(0x6A),
-        "kpadd" | "numpadadd" => Some(0x6B),
-        "kpsubtract" | "numpadsubtract" => Some(0x6D),
-        "kpdecimal" | "numpaddecimal" => Some(0x6E),
-        "kpdivide" | "numpaddivide" => Some(0x6F),
-        _ => None,
-    }
+    keynames::parse_key_name(name)
 }
 
 /// Parse modifier name strings into Windows MOD_* flags.
@@ -801,7 +694,7 @@ pub fn mod_key_flags(name: &str) -> Option<u32> {
 pub enum ModifierError {
     /// Not a modifier name at all (a typo, or a name from another WM).
     Unknown(String),
-    /// A valid niri modifier that Windows cannot bind (AltGr / level-5 shift).
+    /// A valid niri modifier with no distinct Windows mapping (level-5 shift).
     Unsupported(String),
 }
 
@@ -810,12 +703,12 @@ impl std::fmt::Display for ModifierError {
         match self {
             ModifierError::Unknown(name) => write!(
                 f,
-                "unknown modifier '{}' (use Mod, Ctrl, Shift, Alt or Super)",
+                "unknown modifier '{}' (use Mod, Ctrl, Shift, Alt, Super or AltGr/Mod5)",
                 name
             ),
             ModifierError::Unsupported(name) => write!(
                 f,
-                "modifier '{}' (AltGr / level shift) cannot be bound on Windows",
+                "modifier '{}' (level-5 shift) has no distinct Windows mapping; use AltGr/Mod5 for Ctrl+RAlt",
                 name
             ),
         }
@@ -823,27 +716,13 @@ impl std::fmt::Display for ModifierError {
 }
 
 /// Resolve the modifier names of one key bind (`Mod+Ctrl+T` has `Mod`, `Ctrl`)
-/// into `RegisterHotKey` flags.  `mod_key` is what `Mod` stands for (see
-/// [`mod_key_flags`] and [`DEFAULT_MOD_KEY`]).  Unlike [`parse_modifiers`] a name
+/// into hook modifier flags. AltGr is hook-only; Win32 registration must use
+/// [`keynames::register_hotkey_modifiers`]. `mod_key` is what `Mod` stands for
+/// (see [`mod_key_flags`] and [`DEFAULT_MOD_KEY`]). Unlike [`parse_modifiers`] a name
 /// that is not understood is an error: silently dropping it registers a bare
 /// global hotkey that steals the key from every application.
 pub fn resolve_bind_modifiers(names: &[String], mod_key: u32) -> Result<u32, ModifierError> {
-    let mut flags = 0u32;
-    for raw in names {
-        let name = raw.trim();
-        match name.to_lowercase().as_str() {
-            "mod" => flags |= mod_key,
-            "ctrl" | "control" => flags |= MOD_CTRL,
-            "alt" => flags |= MOD_ALT,
-            "shift" => flags |= MOD_SHIFT,
-            "super" | "win" | "meta" => flags |= MOD_WIN,
-            "iso_level3_shift" | "mod5" | "iso_level5_shift" | "mod3" => {
-                return Err(ModifierError::Unsupported(name.to_string()))
-            }
-            _ => return Err(ModifierError::Unknown(name.to_string())),
-        }
-    }
-    Ok(flags)
+    keynames::resolve_modifiers(names, mod_key)
 }
 
 /// Modifier keys used in hotkey bindings
@@ -1196,8 +1075,14 @@ mod tests {
             resolve_bind_modifiers(&names(&["Ctrl", "Typo"]), DEFAULT_MOD_KEY),
             Err(ModifierError::Unknown("Typo".to_string()))
         );
-        // Valid niri names that Windows cannot bind are refused with their own reason.
-        for name in ["Mod5", "ISO_Level3_Shift", "Mod3", "iso_level5_shift"] {
+        // Level-3 shift is hook-only AltGr; level-5 has no Windows mapping.
+        for name in ["AltGr", "Mod5", "ISO_Level3_Shift"] {
+            assert_eq!(
+                resolve_bind_modifiers(&names(&[name]), DEFAULT_MOD_KEY),
+                Ok(keynames::MOD_ALTGR)
+            );
+        }
+        for name in ["Mod3", "iso_level5_shift"] {
             assert!(
                 matches!(
                     resolve_bind_modifiers(&names(&[name]), DEFAULT_MOD_KEY),
@@ -1235,8 +1120,8 @@ mod tests {
     fn test_modifier_error_messages_name_the_modifier() {
         let unknown = ModifierError::Unknown("Hyper".to_string()).to_string();
         assert!(unknown.contains("Hyper") && unknown.contains("unknown modifier"));
-        let unsupported = ModifierError::Unsupported("Mod5".to_string()).to_string();
-        assert!(unsupported.contains("Mod5") && unsupported.contains("Windows"));
+        let unsupported = ModifierError::Unsupported("Mod3".to_string()).to_string();
+        assert!(unsupported.contains("Mod3") && unsupported.contains("Windows"));
     }
 
     #[test]
@@ -1295,7 +1180,7 @@ mod tests {
     fn test_parse_key_invalid() {
         assert_eq!(parse_key_name("invalid"), None);
         assert_eq!(parse_key_name(""), None);
-        assert_eq!(parse_key_name("_"), None);
+        assert_eq!(parse_key_name("_"), Some(0xBD)); // US shifted punctuation alias.
     }
 
     #[test]

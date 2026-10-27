@@ -25,6 +25,7 @@ mod ipcview;
 mod decor;
 mod float_stack;
 mod motion;
+mod named_config;
 mod native_move;
 mod overview;
 mod presets;
@@ -583,6 +584,10 @@ pub struct TilingEngine {
     /// reference to the per-monitor `LayoutConfig`; otherwise it falls
     /// through to the global `self.config`.
     config_per_monitor: HashMap<OutputId, LayoutConfig>,
+    /// Resolved global -> output -> named-workspace layouts, including inactive ones.
+    config_per_workspace: HashMap<(OutputId, i32), LayoutConfig>,
+    /// Last connected host for workspaces with output preferences.
+    named_workspace_outputs: HashMap<i32, OutputId>,
     tiled_windows: HashMap<WindowId, WindowInfo>,
     fullscreen_windows: HashSet<WindowId>,
     floating_windows: HashSet<WindowId>,
@@ -765,6 +770,8 @@ impl TilingEngine {
             monitors: MonitorSet::new(),
             config,
             config_per_monitor: HashMap::new(),
+            config_per_workspace: HashMap::new(),
+            named_workspace_outputs: HashMap::new(),
             tiled_windows: HashMap::new(),
             fullscreen_windows: HashSet::new(),
             floating_windows: HashSet::new(),
@@ -1075,6 +1082,7 @@ impl TilingEngine {
             }
         }
 
+        self.refresh_named_config();
         info!("Workspace {} renamed to {:?}", workspace_id, new_name);
         Ok(())
     }
@@ -1167,6 +1175,7 @@ impl TilingEngine {
         self.adopt_homeless_workspaces(output_id);
         // The workspaces the config names exist on every monitor.
         self.ensure_named_workspaces();
+        self.refresh_named_config();
     }
 
     pub fn sync_monitor_with_scale(
@@ -1227,6 +1236,7 @@ impl TilingEngine {
             ),
         }
         self.unplugged.insert(*output_id, kept);
+        self.refresh_named_config();
     }
 
     /// Move what an unplugged monitor held to `host`: every workspace with a window, a
@@ -1521,9 +1531,22 @@ impl TilingEngine {
         // Where it opens: `open-on-output`, `open-on-workspace` / `open-in-workspace`.  A caller
         // that names the target has chosen; the rules only place a window that comes in the
         // normal way.
-        let (mut rule_output, mut rule_workspace) = match target {
+        let (mut rule_output, mut rule_workspace) = match &target {
             AddWindowTarget::Auto => self.rule_placement(&window, &rules),
-            _ => (self.get_target_output(&window), None),
+            AddWindowTarget::Output(output) => (*output, None),
+            AddWindowTarget::Workspace {
+                output,
+                workspace_id,
+            }
+            | AddWindowTarget::Column {
+                output,
+                workspace_id,
+                ..
+            } => (*output, Some(*workspace_id)),
+            AddWindowTarget::NextTo(other) => self
+                .locate_window(*other)
+                .map(|(output, workspace, _)| (output, Some(workspace)))
+                .unwrap_or_else(|| (self.get_target_output(&window), None)),
         };
         let dialog_owner = auto_float
             .then(|| WindowId::new(root_owner_of(hwnd)))
@@ -1542,7 +1565,7 @@ impl TilingEngine {
             }
         }
         let focus_before = self.focus_before(rule_output);
-        self.remember_open_rules(window_id, rule_output, &window, &rules);
+        self.remember_open_rules(window_id, rule_output, rule_workspace, &window, &rules);
 
         if rules.float {
             // A floating window belongs to a workspace like any other: the active one
@@ -1582,13 +1605,17 @@ impl TilingEngine {
             AddWindowTarget::Auto => {
                 let output_id = rule_output;
 
-                // The width of the column: what the rules ask for, else the configured fixed
-                // width.
+                // The width of the column: what the rules ask for, else the destination
+                // workspace's configured fixed width.
+                let cfg = rule_workspace.map_or_else(
+                    || self.active_workspace_config(output_id),
+                    |workspace| self.effective_config_for_workspace(output_id, workspace),
+                );
                 let width_hint = self
-                    .open_column_width(output_id, &window, &rules)
+                    .open_column_width(output_id, rule_workspace, &window, &rules)
                     .or_else(|| {
-                        if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                            Some(self.config.column_width)
+                        if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                            Some(cfg.column_width)
                         } else {
                             None
                         }
@@ -1606,22 +1633,22 @@ impl TilingEngine {
             }
 
             AddWindowTarget::Output(oid) => {
-                // Route to the active workspace of the given monitor.
-                let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                    Some(self.config.column_width)
+                // Route to the active workspace of the given monitor, falling back to
+                // Auto if the monitor is unavailable. Resolve widths on the actual output.
+                let output_id = if self.monitors.get(&oid).is_some() {
+                    oid
+                } else {
+                    self.get_target_output(&window)
+                };
+                let cfg = self.active_workspace_config(output_id);
+                let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                    Some(cfg.column_width)
                 } else {
                     None
                 };
-                if let Some(monitor) = self.monitors.get_mut(&oid) {
+                if let Some(monitor) = self.monitors.get_mut(&output_id) {
                     monitor.add_window_with_width(window_id, width_hint);
                     self.tiled_windows.insert(window_id, window);
-                } else {
-                    // Monitor not found — fall back to Auto.
-                    let output_id = self.get_target_output(&window);
-                    if let Some(monitor) = self.monitors.get_mut(&output_id) {
-                        monitor.add_window_with_width(window_id, width_hint);
-                        self.tiled_windows.insert(window_id, window);
-                    }
                 }
                 self.strip_frame_for_tiling(hwnd);
                 self.apply_shadow_for_window(hwnd);
@@ -1639,6 +1666,13 @@ impl TilingEngine {
                 output: oid,
                 workspace_id,
             } => {
+                // Resolve the destination config before mutably borrowing its monitor.
+                let cfg = self.effective_config_for_workspace(oid, workspace_id);
+                let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                    Some(cfg.column_width)
+                } else {
+                    None
+                };
                 // Ensure workspace exists; switch active workspace to it.
                 if let Some(monitor) = self.monitors.get_mut(&oid) {
                     if !monitor.workspaces.contains_key(&workspace_id) {
@@ -1649,11 +1683,6 @@ impl TilingEngine {
                     // Temporarily switch to the target workspace to add the window.
                     let previous_ws = monitor.active_workspace;
                     monitor.active_workspace = workspace_id;
-                    let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                        Some(self.config.column_width)
-                    } else {
-                        None
-                    };
                     monitor.add_window_with_width(window_id, width_hint);
                     // Restore previous active workspace (the window is parked in target ws).
                     monitor.active_workspace = previous_ws;
@@ -1730,6 +1759,12 @@ impl TilingEngine {
                     });
 
                 if let Some((oid, ws_id, col_idx)) = location {
+                    let cfg = self.effective_config_for_workspace(oid, ws_id);
+                    let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                        Some(cfg.column_width)
+                    } else {
+                        None
+                    };
                     let insert_col = col_idx + 1;
                     if let Some(monitor) = self.monitors.get_mut(&oid) {
                         let previous_ws = monitor.active_workspace;
@@ -1738,9 +1773,7 @@ impl TilingEngine {
                             // Insert a new column to the right of the found column.
                             let tile = crate::layout::Tile::new(window_id);
                             let mut col = crate::layout::Column::new();
-                            if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                                col.width = Some(self.config.column_width);
-                            }
+                            col.width = width_hint;
                             col.add_tile(tile);
                             workspace.columns.insert(insert_col, col);
                         }
@@ -1753,8 +1786,9 @@ impl TilingEngine {
                 } else {
                     // `other_wid` not found — fall back to Auto on first available monitor.
                     let output_id = self.get_target_output(&window);
-                    let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                        Some(self.config.column_width)
+                    let cfg = self.active_workspace_config(output_id);
+                    let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                        Some(cfg.column_width)
                     } else {
                         None
                     };
@@ -1806,7 +1840,9 @@ impl TilingEngine {
         // A new column inherits the configured display; existing multi-window columns keep
         // theirs. Selecting the new window also makes consume/add into tabbed columns visible.
         if let Some((oid, wsid, colidx)) = self.locate_window(window_id) {
-            let default_tabbed = self.effective_config(oid).default_tabbed;
+            let default_tabbed = self
+                .effective_config_for_workspace(oid, wsid)
+                .default_tabbed;
             if let Some(column) = self
                 .monitors
                 .get_mut(&oid)
@@ -1950,13 +1986,16 @@ impl TilingEngine {
         let known = &self.window_min_widths;
         let limits = &self.rule_limits;
         let heights = &self.rule_heights;
-        let global_border = 2 * self.config.border_inset() as u32;
+        let global = &self.config;
         let per_monitor = &self.config_per_monitor;
+        let per_workspace = &self.config_per_workspace;
         for (output, monitor) in self.monitors.iter_mut() {
-            let border = per_monitor
-                .get(output)
-                .map_or(global_border, |c| 2 * c.border_inset() as u32);
-            for workspace in monitor.workspaces.values_mut() {
+            for (workspace_id, workspace) in monitor.workspaces.iter_mut() {
+                let cfg = per_workspace
+                    .get(&(*output, *workspace_id))
+                    .or_else(|| per_monitor.get(output))
+                    .unwrap_or(global);
+                let border = 2 * cfg.border_inset() as u32;
                 for column in workspace.columns.iter_mut() {
                     for tile in column.tiles.iter_mut() {
                         let window_min = known.get(&tile.window_id).copied().unwrap_or(0);
@@ -2190,7 +2229,11 @@ impl TilingEngine {
     }
 
     fn view_width_for_monitor(monitor: &Monitor, config: &LayoutConfig) -> i32 {
-        monitor.work_area.size.w as i32
+        Self::view_width_for_work_area(monitor.work_area, config)
+    }
+
+    fn view_width_for_work_area(work_area: Rect, config: &LayoutConfig) -> i32 {
+        work_area.size.w as i32
             - config.outer_gaps.1
             - config.outer_gaps.3
             - config.reserve_left as i32
@@ -2243,7 +2286,7 @@ impl TilingEngine {
             .map(|w| w.scroll_offset.x)
             .unwrap_or(0);
         self.refresh_strip_widths(focused_output);
-        let cfg = self.effective_config(focused_output).clone();
+        let cfg = self.active_workspace_config(focused_output).clone();
         let focus_col = self
             .monitors
             .get(&focused_output)
@@ -2509,21 +2552,18 @@ impl TilingEngine {
         // this function then renders with the new zoom.
         if let Some(threshold) = self.auto_tile_threshold {
             if self.overview.is_none() {
+                let cfg = self.active_workspace_config(output_id);
                 let (col_count, vw) = match self.monitors.get(&output_id).and_then(|m| {
-                    m.workspace().map(|w| {
-                        (
-                            w.columns.len(),
-                            Self::view_width_for_monitor(m, &self.config),
-                        )
-                    })
+                    m.workspace()
+                        .map(|w| (w.columns.len(), Self::view_width_for_monitor(m, cfg)))
                 }) {
                     Some(v) => v,
                     None => return,
                 };
                 if col_count > threshold {
-                    let cw = Self::effective_column_width(col_count, vw, &self.config);
-                    let total = col_count as i32 * cw
-                        + (col_count as i32 - 1).max(0) * self.config.column_gap;
+                    let cw = Self::effective_column_width(col_count, vw, cfg);
+                    let total =
+                        col_count as i32 * cw + (col_count as i32 - 1).max(0) * cfg.column_gap;
                     let zoom = if total > vw {
                         (vw as f64 / total as f64).min(1.0)
                     } else {
@@ -2573,7 +2613,7 @@ impl TilingEngine {
         // Win32 calls without fighting the borrow checker.  `LayoutConfig`
         // is a small struct (~20 fields, no large allocations) so the clone
         // cost is negligible vs the Win32 calls it gates.
-        let eff_cfg: LayoutConfig = self.effective_config(output_id).clone();
+        let eff_cfg: LayoutConfig = self.active_workspace_config(output_id).clone();
 
         // Subtract reserved screen-edge pixels (for external bars / panels)
         // before applying outer_gaps so the two insets compose correctly.
@@ -2642,7 +2682,7 @@ impl TilingEngine {
         let positions: Vec<(WindowId, Rect)> = if overview_active
             && self.thumbnail_overview.is_some()
         {
-            self.workspace_overview_scene(output_id, work_rect, &eff_cfg)
+            self.workspace_overview_scene(output_id)
         } else if overview_active {
             let monitor = self.monitors.get(&output_id).unwrap();
             let mut out: Vec<(WindowId, Rect)> = Vec::new();
@@ -2650,7 +2690,8 @@ impl TilingEngine {
             // numerical "Workspace 1, Workspace 2, …" labels.
             let mut ws_ids: Vec<i32> = monitor.workspaces.keys().copied().collect();
             ws_ids.sort();
-            // Per-workspace section height + gap come from `OverviewState`.
+            // Keep full work-area sections aligned with the overview height
+            // budget, but resolve each workspace's reserved edges and gaps.
             let zoom = self.overview_zoom();
             const INTER_WORKSPACE_GAP: i32 = 50;
             let nominal_section_height = monitor.work_area.size.h as i32;
@@ -2665,12 +2706,18 @@ impl TilingEngine {
                 if ws.columns.is_empty() {
                     continue; // skip empty workspaces, no Y consumption
                 }
+                let cfg = self.effective_config_for_workspace(output_id, ws_id);
+                let mut ws_work_rect = Self::tiling_work_rect(monitor, cfg);
+                // The helper scales the section height, not its origin. Scale
+                // the top inset too so it stays inside this workspace's section.
+                ws_work_rect.loc.y = monitor.work_area.loc.y
+                    + ((ws_work_rect.loc.y as f64 - monitor.work_area.loc.y as f64) * zoom) as i32;
                 let mut ws_positions = self.calculate_positions_in_section(
                     ws,
-                    work_rect,
+                    ws_work_rect,
                     section_y,
-                    nominal_section_height,
-                    &eff_cfg,
+                    ws_work_rect.size.h as i32,
+                    cfg,
                 );
                 out.append(&mut ws_positions);
                 section_y += scaled_section_h + scaled_gap;
@@ -2751,29 +2798,6 @@ impl TilingEngine {
         } else {
             None
         };
-        let border_w = eff_cfg.border_inset();
-
-        // Resolve the focused border colour for this pass.  When the user
-        // opted into `border-color-focused "accent"` we read the live
-        // Windows accent (cached for 30 s) and convert it to a `#rrggbb`
-        // literal so the rest of the pipeline (cache compare, DWM call)
-        // keeps treating it as a normal colour.  If the registry lookup
-        // fails we fall through to the configured literal.
-        let resolved_focused_color: String = match eff_cfg.border_color_focused_mode {
-            BorderColorMode::Fixed => eff_cfg.border_color_focused.clone(),
-            BorderColorMode::WindowsAccent => {
-                match crate::backend::accent::current_windows_accent_rgba() {
-                    Some([r, g, b, _a]) => format!("#{:02x}{:02x}{:02x}", r, g, b),
-                    None => eff_cfg.border_color_focused.clone(),
-                }
-            }
-        };
-
-        // Pre-compute target colors (as packed u32) for this pass.
-        let border_color_focused_u32 = parse_color_to_u32(&resolved_focused_color);
-        let border_color_normal_u32 = parse_color_to_u32(&eff_cfg.border_color);
-        let border_color_urgent_u32 = parse_color_to_u32(&eff_cfg.border_color_urgent);
-
         // niri-parity smart borders: when the active workspace has exactly
         // one column with exactly one tile, suppress the per-tile DWM border
         // colour (gives more usable space when there's nothing to delimit).
@@ -2835,6 +2859,34 @@ impl TilingEngine {
             if self.floating_windows.contains(&window_id) {
                 continue;
             }
+            // Overview includes inactive workspaces: resolve each tile's styling
+            // from its owning workspace, not from the active workspace's config.
+            // Clone before updating applied_state so no config borrow spans writes.
+            let overview_cfg = if overview_active {
+                self.locate_window(window_id).map(|(output, ws_id, _)| {
+                    self.effective_config_for_workspace(output, ws_id).clone()
+                })
+            } else {
+                None
+            };
+            let eff_cfg = overview_cfg.as_ref().unwrap_or(&eff_cfg);
+            let border_w = eff_cfg.border_inset();
+
+            // Resolve the focused colour for this tile, including the live
+            // Windows accent (cached for 30 s) and its configured fallback.
+            let resolved_focused_color: String = match eff_cfg.border_color_focused_mode {
+                BorderColorMode::Fixed => eff_cfg.border_color_focused.clone(),
+                BorderColorMode::WindowsAccent => {
+                    match crate::backend::accent::current_windows_accent_rgba() {
+                        Some([r, g, b, _a]) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+                        None => eff_cfg.border_color_focused.clone(),
+                    }
+                }
+            };
+            let border_color_focused_u32 = parse_color_to_u32(&resolved_focused_color);
+            let border_color_normal_u32 = parse_color_to_u32(&eff_cfg.border_color);
+            let border_color_urgent_u32 = parse_color_to_u32(&eff_cfg.border_color_urgent);
+
             let draw_mode = draw_modes
                 .get(&window_id)
                 .copied()
@@ -3770,6 +3822,7 @@ impl TilingEngine {
             None => return,
         };
 
+        let cfg = self.active_workspace_config(focused_output).clone();
         // Do scroll work, then apply layout
         {
             let monitor = match self.monitors.get_mut(&focused_output) {
@@ -3781,7 +3834,7 @@ impl TilingEngine {
                 None => return,
             };
 
-            let amount = self.config.scroll_step;
+            let amount = cfg.scroll_step;
             match direction {
                 ScrollDirection::Left => {
                     workspace.scroll_offset.x = workspace.scroll_offset.x.saturating_sub(amount)
@@ -3798,13 +3851,13 @@ impl TilingEngine {
         // Clamp scroll after releasing mutable borrow
         {
             let monitor = self.monitors.get_mut(&focused_output).unwrap();
-            let view_width = Self::view_width_for_monitor(monitor, &self.config);
+            let view_width = Self::view_width_for_monitor(monitor, &cfg);
             let col_w = monitor
                 .workspace()
-                .map(|w| Self::workspace_default_width(w, view_width, &self.config))
-                .unwrap_or_else(|| Self::effective_column_width(0, view_width, &self.config));
+                .map(|w| Self::workspace_default_width(w, view_width, &cfg))
+                .unwrap_or_else(|| Self::effective_column_width(0, view_width, &cfg));
             if let Some(workspace) = monitor.workspace_mut() {
-                workspace.clamp_scroll(col_w, self.config.column_gap, view_width);
+                workspace.clamp_scroll(col_w, cfg.column_gap, view_width);
             }
         }
 
@@ -4401,8 +4454,18 @@ impl TilingEngine {
         // Whatever the layout cache knows about the window is stale: it was moved around as a
         // float.  The next layout pass places it from scratch.
         self.applied_state.remove(&window_id);
-        let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-            Some(self.config.column_width)
+        let destination_workspace = self.monitors.get(&output).map(|monitor| {
+            if monitor.workspaces.contains_key(&workspace) {
+                workspace
+            } else {
+                monitor.active_workspace
+            }
+        });
+        let cfg = destination_workspace
+            .map(|id| self.effective_config_for_workspace(output, id))
+            .unwrap_or(&self.config);
+        let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+            Some(cfg.column_width)
         } else {
             None
         };
@@ -4620,7 +4683,7 @@ impl TilingEngine {
         forwards: bool,
         backend: &BackendHandle,
     ) {
-        let Some((output, _)) = self.float_location(window_id) else {
+        let Some((output, workspace)) = self.float_location(window_id) else {
             return;
         };
         let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
@@ -4631,7 +4694,7 @@ impl TilingEngine {
         };
         let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
         let widths: Vec<i32> = self
-            .column_presets(output)
+            .column_presets_for_workspace(output, workspace)
             .iter()
             .map(|spec| match spec {
                 crate::config::types::SizeSpec::Proportion(p) => {
@@ -4778,7 +4841,15 @@ impl TilingEngine {
             return;
         }
 
-        let margins = if self.config.shadow_enable {
+        let config = self
+            .locate_window(window_id)
+            .map(|(output, _, _)| output)
+            .or_else(|| self.float_homes.get(&window_id).map(|home| home.output))
+            .or_else(|| self.minimized.get(&window_id).map(|window| window.output))
+            .map(|output| self.config_for_window(window_id, output))
+            .unwrap_or(&self.config)
+            .clone();
+        let margins = if config.shadow_enable {
             // 1 px top extension — the smallest value that re-enables DWM's
             // drop shadow without producing a visible gap inside the window.
             MARGINS {
@@ -4859,7 +4930,15 @@ impl TilingEngine {
     ///
     /// TODO(audit): app will overdraw; future fix is sibling overlay window per tile.
     fn paint_title_for_tile(&self, hwnd: isize, rect: Rect, title: &str, is_focused: bool) {
-        if !self.config.strip_frame {
+        let window_id = WindowId::new(hwnd);
+        let config = self
+            .locate_window(window_id)
+            .map(|(output, _, _)| output)
+            .or_else(|| self.float_homes.get(&window_id).map(|home| home.output))
+            .or_else(|| self.minimized.get(&window_id).map(|window| window.output))
+            .map(|output| self.config_for_window(window_id, output))
+            .unwrap_or(&self.config);
+        if !config.strip_frame {
             return;
         }
         use windows::Win32::Foundation::{COLORREF, HWND, RECT};
@@ -4918,7 +4997,16 @@ impl TilingEngine {
         // Frame stripping is opt-in via config — many apps (Windows Terminal,
         // Edge, some Electron) render their content area black after style
         // changes until they receive a fresh paint. Default off for compatibility.
-        if !self.config.strip_frame {
+        let window_id = WindowId::new(hwnd);
+        let config = self
+            .locate_window(window_id)
+            .map(|(output, _, _)| output)
+            .or_else(|| self.float_homes.get(&window_id).map(|home| home.output))
+            .or_else(|| self.minimized.get(&window_id).map(|window| window.output))
+            .map(|output| self.config_for_window(window_id, output))
+            .unwrap_or(&self.config)
+            .clone();
+        if !config.strip_frame {
             return;
         }
 
@@ -4928,7 +5016,6 @@ impl TilingEngine {
             WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
         };
 
-        let window_id = WindowId::new(hwnd);
         // Only strip if we haven't already saved styles for this window
         if self.saved_styles.contains_key(&window_id) {
             return;
@@ -4963,7 +5050,7 @@ impl TilingEngine {
             // so DWM keeps painting the drop-shadow.  With -1 margins the DWM
             // shadow is stripped along with the invisible 7-px border.
             // When shadow_enable is false, use -1 to remove the invisible border.
-            let margins = if self.config.shadow_enable {
+            let margins = if config.shadow_enable {
                 windows::Win32::UI::Controls::MARGINS {
                     cxLeftWidth: 0,
                     cxRightWidth: 0,
@@ -5194,6 +5281,8 @@ impl TilingEngine {
     /// Update the layout configuration (e.g., on config reload)
     pub fn update_config(&mut self, config: LayoutConfig) {
         self.config = config;
+        // Runtime ReserveArea changes reach cached output/workspace views too.
+        self.refresh_named_config();
     }
 
     /// Update animation settings from config
@@ -5339,8 +5428,13 @@ impl TilingEngine {
         }
         // Read the current position from the workspace's calculated layout
         // (not the stale cached info.bounds which is only updated at registration time).
-        let default_w = self.config.column_width as i32;
-        let gap = self.config.column_gap;
+        let cfg = self
+            .monitors
+            .focused_id()
+            .map(|output| self.active_workspace_config(output))
+            .unwrap_or(&self.config);
+        let default_w = cfg.column_width as i32;
+        let gap = cfg.column_gap;
         let current_pos = self
             .monitors
             .focused_id()
@@ -5427,7 +5521,8 @@ impl TilingEngine {
                 })
                 .collect();
             entries.sort_by_key(|(id, _)| *id);
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
+            let vw =
+                Self::view_width_for_monitor(monitor, self.active_workspace_config(focused_output));
             let vh = monitor.work_area.size.h as i32;
             (entries, vw, vh)
         };
@@ -5440,9 +5535,15 @@ impl TilingEngine {
         // The widest workspace's stripe sets the horizontal content width.
         let widest_total: i32 = sorted_ws
             .iter()
-            .map(|(_id, n_cols)| {
-                let col_width = Self::effective_column_width(*n_cols, view_width, &self.config);
-                *n_cols as i32 * col_width + (*n_cols as i32 - 1).max(0) * self.config.column_gap
+            .map(|(id, n_cols)| {
+                let cfg = self.effective_config_for_workspace(focused_output, *id);
+                let workspace_view_width = self
+                    .monitors
+                    .get(&focused_output)
+                    .map(|monitor| Self::view_width_for_monitor(monitor, cfg))
+                    .unwrap_or(view_width);
+                let col_width = Self::effective_column_width(*n_cols, workspace_view_width, cfg);
+                *n_cols as i32 * col_width + (*n_cols as i32 - 1).max(0) * cfg.column_gap
             })
             .max()
             .unwrap_or(0);
@@ -5747,29 +5848,9 @@ impl TilingEngine {
         self.configure_motion(&config.animations);
         self.set_window_rules(config.window_rules.clone());
 
-        // Rebuild per-monitor overrides from `config.output[*].layout_override`.
-        self.config_per_monitor.clear();
-        for out in &config.output {
-            let Some(partial) = out.layout_override.as_ref() else {
-                continue;
-            };
-            if out.name.is_empty() {
-                continue;
-            }
-            // Fold the partial onto a clone of the global layout, then
-            // produce the engine's runtime `LayoutConfig` from the merged
-            // view so colour parsing / column-width-mode mapping match the
-            // default code path verbatim.
-            let merged_config_layout = partial.apply_to(&config.layout);
-            let mut shim = config.clone();
-            shim.layout = merged_config_layout;
-            let engine_cfg = LayoutConfig::from_config(&shim);
-            let oid = OutputId::from_name(&out.name);
-            self.config_per_monitor.insert(oid, engine_cfg);
-        }
-
         self.full_config = Some(config);
         self.ensure_named_workspaces();
+        self.refresh_named_config();
     }
 
     /// Take a snapshot of the current monitor / workspace / column / tile
@@ -6023,7 +6104,7 @@ impl TilingEngine {
             return false;
         }
 
-        let eff_cfg = self.effective_config(oid);
+        let eff_cfg = self.active_workspace_config(oid);
         let gap = eff_cfg.column_gap;
         // Half-gap slop so the cursor doesn't have to land pixel-perfectly.
         let half_gap = (gap / 2).max(1);
@@ -6586,7 +6667,7 @@ impl TilingEngine {
         };
 
         self.refresh_strip_widths(focused_output);
-        let cfg = self.effective_config(focused_output).clone();
+        let cfg = self.active_workspace_config(focused_output).clone();
         let (focus_col, view_width, col_w) = {
             let monitor = match self.monitors.get(&focused_output) {
                 Some(m) => m,
@@ -6639,7 +6720,7 @@ impl TilingEngine {
     /// the borders take around a window.
     fn focused_column_metrics(&self, output: OutputId) -> Option<(usize, i32, i32, i32, i32)> {
         let monitor = self.monitors.get(&output)?;
-        let cfg = self.effective_config(output);
+        let cfg = self.active_workspace_config(output);
         let col_idx = monitor.focus_column?;
         let view = Self::view_width_for_monitor(monitor, cfg);
         let workspace = monitor.workspace()?;
@@ -6739,7 +6820,7 @@ impl TilingEngine {
         let Some((col_idx, current, view, gap, _)) = self.focused_column_metrics(output) else {
             return;
         };
-        let cfg = self.effective_config(output).clone();
+        let cfg = self.active_workspace_config(output).clone();
         let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
         let presets = self.column_presets(output);
         let resolved: Vec<i32> = presets
@@ -6818,7 +6899,7 @@ impl TilingEngine {
             let Some(monitor) = self.monitors.get(&output) else {
                 return;
             };
-            let cfg = self.effective_config(output);
+            let cfg = self.active_workspace_config(output);
             let view_h = monitor.work_area.size.h as i32
                 - cfg.outer_gaps.0
                 - cfg.outer_gaps.2
@@ -7018,11 +7099,12 @@ impl TilingEngine {
                 Some(m) => m,
                 None => return,
             };
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
+            let cfg = self.active_workspace_config(focused_output);
+            let vw = Self::view_width_for_monitor(monitor, cfg);
             let dw = monitor
                 .workspace()
-                .map(|w| Self::workspace_default_width(w, vw, &self.config))
-                .unwrap_or_else(|| Self::effective_column_width(1, vw, &self.config));
+                .map(|w| Self::workspace_default_width(w, vw, cfg))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, cfg));
             (vw, dw)
         };
 
@@ -7241,7 +7323,7 @@ impl TilingEngine {
             let Some(monitor) = self.monitors.get(&output) else {
                 return;
             };
-            let cfg = self.effective_config(output);
+            let cfg = self.active_workspace_config(output);
             let (Some(active), Some(workspace)) = (monitor.focus_column, monitor.workspace())
             else {
                 return;
@@ -7328,8 +7410,8 @@ impl TilingEngine {
         };
         let view_width = match self.monitors.get(&focused_output) {
             Some(monitor) => {
-                Self::view_width_for_monitor(monitor, self.effective_config(focused_output)).max(50)
-                    as u32
+                Self::view_width_for_monitor(monitor, self.active_workspace_config(focused_output))
+                    .max(50) as u32
             }
             None => return,
         };
@@ -7350,7 +7432,7 @@ impl TilingEngine {
     /// monitor, other gaps or reserved edges): follow it.
     fn refresh_maximized_widths(&mut self, output_id: OutputId) {
         let Some(view_width) = self.monitors.get(&output_id).map(|m| {
-            Self::view_width_for_monitor(m, self.effective_config(output_id)).max(50) as u32
+            Self::view_width_for_monitor(m, self.active_workspace_config(output_id)).max(50) as u32
         }) else {
             return;
         };
@@ -7382,11 +7464,12 @@ impl TilingEngine {
             let Some(monitor) = self.monitors.get(&focused_output) else {
                 return;
             };
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
+            let cfg = self.active_workspace_config(focused_output);
+            let vw = Self::view_width_for_monitor(monitor, cfg);
             let dw = monitor
                 .workspace()
-                .map(|w| Self::workspace_default_width(w, vw, &self.config))
-                .unwrap_or_else(|| Self::effective_column_width(1, vw, &self.config));
+                .map(|w| Self::workspace_default_width(w, vw, cfg))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, cfg));
             (vw, dw)
         };
         // 10% .. 95% of view_width, but never smaller than 50 px.
@@ -7741,6 +7824,7 @@ impl TilingEngine {
             self.workspace_names.insert(a, name_b);
             self.workspace_names.insert(b, name_a);
         }
+        self.refresh_named_config();
     }
 
     // -------------------------------------------------------------------------
@@ -8179,7 +8263,15 @@ impl TilingEngine {
         use tracing::warn;
         match self.workspace_id_by_name(name) {
             Some(id) => {
-                let id = self.auto_back_and_forth(id);
+                let other_output = self
+                    .named_workspace_output(id)
+                    .filter(|output| Some(*output) != self.monitors.focused_id());
+                let id = if let Some(output) = other_output {
+                    self.monitors.set_focused(output);
+                    id
+                } else {
+                    self.auto_back_and_forth(id)
+                };
                 self.switch_workspace(id, backend)
             }
             None => warn!("workspace name not found: {}", name),
@@ -12078,6 +12170,8 @@ mod tests {
                 layout: "tile".to_string(),
                 monitor: String::new(),
                 follow_on_focus: false,
+                layout_override: None,
+                open_on_outputs: Vec::new(),
             })
             .collect();
         config
@@ -12512,12 +12606,14 @@ mod tests {
                 layout: "tile".to_string(),
                 monitor: String::new(),
                 follow_on_focus: false,
+                ..crate::config::types::WorkspaceConfig::default_config()
             },
             crate::config::types::WorkspaceConfig {
                 name: "code".to_string(),
                 layout: "tile".to_string(),
                 monitor: String::new(),
                 follow_on_focus: false,
+                ..crate::config::types::WorkspaceConfig::default_config()
             },
         ];
         engine.set_full_config(config);
@@ -12558,6 +12654,7 @@ mod tests {
             layout: "tile".to_string(),
             monitor: String::new(),
             follow_on_focus: false,
+            ..crate::config::types::WorkspaceConfig::default_config()
         }];
         engine.set_full_config(config);
         assert_eq!(engine.workspace_id_by_name("web"), Some(0));

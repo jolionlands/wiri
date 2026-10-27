@@ -1,5 +1,7 @@
+pub mod environment;
 pub mod spawner;
 pub mod startup;
+pub mod switch_events;
 pub mod tray;
 
 use anyhow::Result;
@@ -44,7 +46,7 @@ impl SystemIntegration {
     /// Poll for tray actions and return them.
     /// Call this from the main event loop.
     ///
-    /// Self-contained tray actions (OpenConfigDir, About) are handled inline
+    /// Self-contained tray actions (About) are handled inline
     /// here and never returned to the caller — that keeps main.rs's match
     /// arms unchanged when new menu items are added.  Caller-relevant
     /// actions (ShowHide, ReloadConfig, FocusPrevious, Quit) are forwarded
@@ -53,12 +55,6 @@ impl SystemIntegration {
         loop {
             let action = self.tray.try_recv_action()?;
             match action {
-                TrayAction::OpenConfigDir => {
-                    if let Err(e) = TrayIcon::open_config_folder() {
-                        tracing::warn!("OpenConfigDir failed: {}", e);
-                    }
-                    continue; // do not surface to main; consume + loop.
-                }
                 TrayAction::About => {
                     let _ = self.tray.show_balloon(
                         "wiri",

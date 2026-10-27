@@ -16,6 +16,9 @@ pub struct Config {
     /// Shell command lines to run at startup (`spawn-sh-at-startup "cmd"`), each through
     /// `cmd.exe /d /s /c` like the `spawn-sh` bind.
     pub spawn_sh_at_startup: Vec<String>,
+    /// Child-only set/unset overrides; never modify the compositor environment.
+    pub environment: crate::hooks::environment::Environment,
+    pub switch_events: SwitchEventsConfig,
     /// Suppress failed-load balloons, not diagnostics or ConfigLoaded events.
     pub disable_failed_config_notification: bool,
 }
@@ -49,20 +52,60 @@ impl Default for Config {
             screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
             spawn_sh_at_startup: Vec::new(),
+            environment: Default::default(),
+            switch_events: Default::default(),
             disable_failed_config_notification: false,
         }
     }
 }
 
 impl Config {
+    /// Emergency fallback when no valid file can be loaded. A successfully
+    /// decoded empty file instead uses Default and never invents keybindings.
     pub fn default_config() -> Self {
-        Self::default()
+        let mut config = Self::default();
+        config.binds.extend_defaults = true;
+        config
+    }
+}
+
+/// Switch bindings intentionally support only `spawn`, as in pinned niri.
+#[derive(Debug, Clone, Default)]
+pub struct SwitchEventsConfig {
+    pub lid_close: Option<Vec<String>>,
+    pub lid_open: Option<Vec<String>>,
+    pub tablet_mode_on: Option<Vec<String>>,
+    pub tablet_mode_off: Option<Vec<String>>,
+}
+
+impl SwitchEventsConfig {
+    pub fn subscriptions(&self) -> crate::hooks::switch_events::SwitchEventSubscriptions {
+        crate::hooks::switch_events::SwitchEventSubscriptions {
+            lid: self.lid_close.is_some() || self.lid_open.is_some(),
+            tablet_mode: self.tablet_mode_on.is_some() || self.tablet_mode_off.is_some(),
+        }
+    }
+
+    pub fn command(&self, event: crate::hooks::switch_events::SwitchEvent) -> Option<&[String]> {
+        use crate::hooks::switch_events::SwitchEvent;
+        match event {
+            SwitchEvent::LidClose => &self.lid_close,
+            SwitchEvent::LidOpen => &self.lid_open,
+            SwitchEvent::TabletModeOn => &self.tablet_mode_on,
+            SwitchEvent::TabletModeOff => &self.tablet_mode_off,
+        }
+        .as_deref()
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct InputConfig {
     pub keyboard_layout: String,
+    /// Native keyboard settings are acquired only when explicitly configured.
+    pub keyboard_layout_configured: bool,
+    pub repeat_delay_configured: bool,
+    pub repeat_rate_configured: bool,
+    pub numlock_configured: bool,
     pub repeat_delay: u32,
     pub repeat_rate: u32,
     pub mouse_speed: f64,
@@ -108,6 +151,10 @@ impl InputConfig {
     pub fn default_config() -> Self {
         Self {
             keyboard_layout: "us".to_string(),
+            keyboard_layout_configured: false,
+            repeat_delay_configured: false,
+            repeat_rate_configured: false,
+            numlock_configured: false,
             repeat_delay: 250,
             repeat_rate: 25,
             mouse_speed: 1.0,
@@ -752,6 +799,8 @@ impl WorkspaceConfig {
             layout: "tile".to_string(),
             monitor: String::new(),
             follow_on_focus: true,
+            layout_override: None,
+            open_on_outputs: Vec::new(),
         }
     }
 }

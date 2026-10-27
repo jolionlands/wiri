@@ -10,6 +10,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reject duplicate singleton nodes with both source locations and invalid ranges/fractional integers. Render source labels, help and include chains in validation/logs. User binds replace defaults unless the wiri `extend-defaults` extension is explicit.
 - Add offline `wiri validate [-c path]`, generated shell completions, pure policy/validation tests and H66 offline checks; desktop evidence is tracked in `docs/parity/lane-c2-report.md`.
 
+### Lane C2 item 2 — binding identities and replacement
+- Keep omitted and empty bind tables empty at runtime; built-in defaults require explicit `extend-defaults=true` (emergency invalid-startup fallback remains separate).
+- Share canonical XKB/Win32/legacy key names and final-Mod chord identities across validation and input. Unknown modifiers and same-part duplicate aliases are errors with both source locations; included parts override earlier matching chords.
+- Distinguish Ctrl+right-Alt (AltGr/Mod5/ISO_Level3_Shift) from Ctrl+left-Alt in the existing hooks, never register the hook-only bit with RegisterHotKey, and reject indistinguishable level-5 modifiers. Add pure normalization/input regressions and H67 checks.
+
+### Lane C2 item 3 — explicit keyboard configuration
+- Apply only explicitly configured repeat delay/rate and an already-loaded foreground keyboard layout. Track original values through reload/removal/exit and relinquish ownership after external changes; Windows repeat granularity and asynchronous layout acceptance remain approximations. Native NumLock requests warn without changes because queue-relative toggle state cannot provide a trustworthy background-thread restoration baseline; dry-run models it only.
+- Add synthetic backend/lifecycle tests and a lifetime-stable `WIRI_KEYBOARD_DRY_RUN=1` adapter. The shared live harness always selects dry-run; no real native keyboard setting or layout mutation is part of validation.
+
+### Lane C2 item 4 — child environment and switch events
+- Apply string/null environment entries to every non-elevated argv/shell/startup/IPC launch through one Unicode Windows snapshot, including executable lookup. Keep the parent environment unchanged, label case-insensitive duplicates, and refuse UAC broker launches that cannot honor overrides.
+- Run shell startup commands through the same path, suppress both startup forms with `--no-autostart`, and never rerun them on reload. Observe configured lid/slate edges on the existing hidden-window pump, with no initial spurious edge, polling or extra thread; physical switches are synthetic-tested only.
+- Add H69 child snapshots and reload/startup checks using private profiles and PID-verified IPC.
+
+### Lane C2 item 5 — named workspace configuration
+- Resolve workspace-local layout after global and output settings throughout placement, targeted rules, sizing, presets, decorations and overview. Rebuild views on reload/removal without losing inherited values; reject output-only options in workspace layouts.
+- Preserve repeated `open-on-output` priority and reevaluate on config/output/name events, migrating columns, floats and minimized homes while keeping layout/focus state. Add nine synthetic integration regressions and overview geometry coverage, plus H70 single-display width/reload checks; multiple displays are not live-tested.
+
 ### Lane Z — floating layer survives delayed native raises
 - Repair actual workspace z-order inversions on native REORDER events, not only on focus/layout. Correct the SHOW/HIDE WinEvent IDs so REORDER is no longer misclassified as HIDE. Keep float MRU and tile keyboard focus with asynchronous relative-HWND placement, without TOPMOST, global float promotion, idle timers or new threads.
 - Add deterministic H45 delayed-raise coverage and opt-in repeated H3/H5/H45 evidence. The delayed-layer check fails 3/3 before and passes 4/4 after; the complete release desktop run passes 500 gates. Release validation passes 1210 library + 14 CLI tests. Record repeat pass rates, one unrelated Terminal focus interruption, measured resting cost and limits in `docs/parity/lane-z-report.md`.

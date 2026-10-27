@@ -48,6 +48,11 @@ fn compare_names(left: &OsStr, right: &OsStr) -> Ordering {
     result.cmp(&2)
 }
 
+/// Use the same Windows identity for config merging and executable lookup.
+pub fn names_equal(left: &str, right: &str) -> bool {
+    compare_names(OsStr::new(left), OsStr::new(right)) == Ordering::Equal
+}
+
 pub fn validate_entry(name: &str, value: Option<&str>) -> Result<()> {
     if name.is_empty() || name.contains(['=', '\0']) {
         bail!("environment variable name must be nonempty and contain neither '=' nor NUL");

@@ -296,7 +296,7 @@ impl TilingEngine {
             sink.set_output(key, Vec::new());
             return;
         }
-        let cfg = self.effective_config(output_id);
+        let cfg = self.active_workspace_config(output_id);
         let lone_tile = monitor.workspace().map_or(false, |ws| {
             ws.columns.len() == 1 && ws.columns[0].tiles.len() == 1
         });
@@ -354,7 +354,7 @@ impl TilingEngine {
             let monitor = self.monitors.get(&output)?;
             let col = self.column_at_x(x)?;
             let column = monitor.workspace()?.columns.get(col)?;
-            let cfg = self.effective_config(output);
+            let cfg = self.active_workspace_config(output);
             if cfg.effects.insert_hint.off {
                 return None;
             }

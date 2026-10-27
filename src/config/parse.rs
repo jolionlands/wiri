@@ -100,11 +100,11 @@ mod tests {
             .iter()
             .filter(|i| i.severity == ValidationSeverity::Warning)
             .collect();
-        assert_eq!(errors.len(), 1, "{:?}", issues);
+        assert_eq!(errors.len(), 2, "{:?}", issues);
         assert_eq!(errors[0].line, 1);
-        assert_eq!(warnings.len(), 1, "{:?}", issues);
-        assert_eq!(warnings[0].line, 4);
-        assert!(warnings[0].message.contains("Hyper"), "{:?}", warnings[0]);
+        assert_eq!(errors[1].line, 4);
+        assert!(errors[1].message.contains("Hyper"), "{:?}", errors[1]);
+        assert!(warnings.is_empty(), "{:?}", issues);
         assert!(validate_kdl_config("").is_empty());
     }
 
@@ -265,13 +265,19 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_with_unknown_modifier_is_dropped_at_parse_time() {
-        // `Hyper+F9` used to register a bare global F9.
+    fn test_unknown_modifiers_are_fatal_but_mod5_is_a_supported_altgr_alias() {
+        // An unknown modifier must never become a bare global F9 or a partial load.
         let input =
             "binds {\n  Hyper+F9 close-window\n  Ctrl+Alt+Q close-window\n  Mod5+T quit\n}\n";
-        let config = parse_kdl_config(input).unwrap();
-        assert_eq!(config.binds.hotkeys.len(), 1, "{:?}", config.binds.hotkeys);
-        assert_eq!(config.binds.hotkeys[0].key, "Q");
+        let error = parse_kdl_config(input).unwrap_err();
+        assert!(error.to_string().contains("unknown modifier 'Hyper'"));
+        let config = parse_kdl_config("binds { Mod5+T quit; }").unwrap();
+        assert_eq!(config.binds.hotkeys.len(), 1);
+        assert_eq!(config.binds.hotkeys[0].key, "T");
+        assert_eq!(
+            config.binds.hotkeys[0].resolve_modifiers(crate::input::DEFAULT_MOD_KEY),
+            Ok(crate::input::keynames::MOD_ALTGR)
+        );
     }
 
     #[test]

@@ -116,6 +116,95 @@ fn assert_contents_on(
 }
 
 #[test]
+fn inactive_workspace_width_intent_and_refresh_use_its_own_layout() {
+    use crate::config::types::SizeSpec;
+    let mut config = Config::default();
+    config.layout.default_column_width = Some(Some(SizeSpec::Fixed(600)));
+    config.workspace = vec![
+        workspace_config("Active", &[], None),
+        workspace_config(
+            "Inactive",
+            &[],
+            Some(LayoutConfigPartial {
+                default_column_width: Some(Some(SizeSpec::Fixed(200))),
+                outer_gaps: Some(30),
+                inner_gaps: Some(40),
+                reserve_left: Some(100),
+                reserve_right: Some(20),
+                border_width: Some(9),
+                ..Default::default()
+            }),
+        ),
+    ];
+    let mut engine = engine_with_config(config);
+    let output = connect(&mut engine, "physical-one", "DISPLAY1");
+    let fixed = WindowId::new(901);
+    let proportional = WindowId::new(902);
+    let ws = engine
+        .monitors
+        .get_mut(&output)
+        .unwrap()
+        .workspaces
+        .get_mut(&1)
+        .unwrap();
+    ws.add_window_to_new_column(fixed);
+    ws.add_window_to_new_column(proportional);
+    engine.remember_column_width_spec(fixed, None, None);
+    let cfg = engine.effective_config_for_workspace(output, 1).clone();
+    let border = 2 * cfg.border_width.max(1);
+    let view = TilingEngine::view_width_for_monitor(engine.monitors.get(&output).unwrap(), &cfg);
+    let ws = engine
+        .monitors
+        .get_mut(&output)
+        .unwrap()
+        .workspaces
+        .get_mut(&1)
+        .unwrap();
+    assert_eq!(ws.columns[0].width_fixed_logical, Some(200.0));
+    assert_eq!(ws.columns[0].width, Some((200 + border) as u32));
+    ws.columns[1].set_proportion(0.5, 100, 0);
+    engine.monitors.get_mut(&output).unwrap().scale_factor = 1.5;
+    engine.refresh_strip_widths(output);
+    let monitor = engine.monitors.get(&output).unwrap();
+    assert_eq!(monitor.active_workspace, 0);
+    assert_eq!(
+        monitor.workspaces[&1].columns[0].width,
+        Some((300 + border) as u32)
+    );
+    assert_eq!(
+        monitor.workspaces[&1].columns[1].width,
+        Some(proportion_px(view, cfg.column_gap, 0.5) as u32)
+    );
+}
+
+#[test]
+fn minimized_only_named_workspace_preserves_empty_strip_metadata_on_migration() {
+    let mut config = Config::default();
+    config.workspace = vec![workspace_config("Code", &["DISPLAY2", "DISPLAY1"], None)];
+    let mut engine = engine_with_config(config);
+    let first = connect(&mut engine, "physical-one", "DISPLAY1");
+    let [tiled, floating, minimized] = seed_contents(&mut engine, first, 0);
+    engine.float_homes.remove(&floating);
+    engine.floating_windows.remove(&floating);
+    let strip = engine
+        .monitors
+        .get_mut(&first)
+        .unwrap()
+        .workspaces
+        .get_mut(&0)
+        .unwrap();
+    strip.remove_window(tiled);
+    strip.layout_mode = crate::layout::WorkspaceLayout::Spiral;
+    strip.scroll_offset.x = 83;
+    let second = connect(&mut engine, "physical-two", "DISPLAY2");
+    let strip = &engine.monitors.get(&second).unwrap().workspaces[&0];
+    assert!(strip.columns.is_empty());
+    assert_eq!(strip.layout_mode, crate::layout::WorkspaceLayout::Spiral);
+    assert_eq!(strip.scroll_offset.x, 83);
+    assert_eq!(engine.minimized[&minimized].output, second);
+}
+
+#[test]
 fn workspace_layout_folds_global_then_output_then_workspace() {
     let mut config = Config::default();
     config.layout.column_width = 240;
@@ -163,7 +252,10 @@ fn workspace_layout_folds_global_then_output_then_workspace() {
     let per_output = engine.effective_config(output);
     assert_eq!(per_output.column_width, 480);
     assert_eq!(per_output.column_gap, 22);
-    assert!(!per_output.strip_frame, "Some(false) must override global true");
+    assert!(
+        !per_output.strip_frame,
+        "Some(false) must override global true"
+    );
     assert!(per_output.always_center_single_column);
     assert_eq!(per_output.effects.focus_ring, output_ring);
 
@@ -212,14 +304,20 @@ fn repeated_output_preferences_choose_first_connected_then_stable_fallback() {
 fn hotplug_rename_and_reload_migrate_all_named_workspace_contents() {
     let mut config = Config::default();
     config.output = vec![
-        output_config("DISPLAY1", LayoutConfigPartial {
-            inner_gaps: Some(11),
-            ..Default::default()
-        }),
-        output_config("DISPLAY2", LayoutConfigPartial {
-            inner_gaps: Some(22),
-            ..Default::default()
-        }),
+        output_config(
+            "DISPLAY1",
+            LayoutConfigPartial {
+                inner_gaps: Some(11),
+                ..Default::default()
+            },
+        ),
+        output_config(
+            "DISPLAY2",
+            LayoutConfigPartial {
+                inner_gaps: Some(22),
+                ..Default::default()
+            },
+        ),
     ];
     config.workspace = vec![workspace_config(
         "Code",
@@ -252,11 +350,18 @@ fn hotplug_rename_and_reload_migrate_all_named_workspace_contents() {
     assert_contents_on(&engine, first, 0, windows);
 
     config.workspace[0].open_on_outputs = vec!["RENAMED2".into(), "DISPLAY1".into()];
-    config.workspace[0].layout_override.as_mut().unwrap().column_width = Some(888);
+    config.workspace[0]
+        .layout_override
+        .as_mut()
+        .unwrap()
+        .column_width = Some(888);
     engine.set_full_config(config);
     assert_eq!(engine.named_workspace_output(0), Some(second));
     assert_contents_on(&engine, second, 0, windows);
-    assert_eq!(engine.config_for_window(windows[0], second).column_width, 888);
+    assert_eq!(
+        engine.config_for_window(windows[0], second).column_width,
+        888
+    );
 }
 
 #[test]
@@ -301,22 +406,34 @@ fn no_preferences_is_unpinned_and_monitor_is_only_a_legacy_fallback() {
 fn window_config_uses_actual_inactive_tiled_floating_and_minimized_homes() {
     let mut config = Config::default();
     config.output = vec![
-        output_config("DISPLAY1", LayoutConfigPartial {
-            inner_gaps: Some(11),
-            ..Default::default()
-        }),
-        output_config("DISPLAY2", LayoutConfigPartial {
-            inner_gaps: Some(22),
-            ..Default::default()
-        }),
+        output_config(
+            "DISPLAY1",
+            LayoutConfigPartial {
+                inner_gaps: Some(11),
+                ..Default::default()
+            },
+        ),
+        output_config(
+            "DISPLAY2",
+            LayoutConfigPartial {
+                inner_gaps: Some(22),
+                ..Default::default()
+            },
+        ),
     ];
     config.workspace = ["Active", "Tiled", "Floating", "Minimized"]
         .iter()
         .zip([101, 202, 303, 404])
-        .map(|(name, width)| workspace_config(name, &[], Some(LayoutConfigPartial {
-            column_width: Some(width),
-            ..Default::default()
-        })))
+        .map(|(name, width)| {
+            workspace_config(
+                name,
+                &[],
+                Some(LayoutConfigPartial {
+                    column_width: Some(width),
+                    ..Default::default()
+                }),
+            )
+        })
         .collect();
     let mut engine = engine_with_config(config);
     let hint = connect(&mut engine, "physical-one", "DISPLAY1");
@@ -344,21 +461,39 @@ fn window_config_uses_actual_inactive_tiled_floating_and_minimized_homes() {
 fn single_output_workspace_name_swap_moves_layout_overrides_by_name() {
     let mut config = Config::default();
     config.workspace = vec![
-        workspace_config("Code", &[], Some(LayoutConfigPartial {
-            column_width: Some(640),
-            strip_frame: Some(false),
-            ..Default::default()
-        })),
-        workspace_config("Web", &[], Some(LayoutConfigPartial {
-            column_width: Some(960),
-            strip_frame: Some(true),
-            ..Default::default()
-        })),
+        workspace_config(
+            "Code",
+            &[],
+            Some(LayoutConfigPartial {
+                column_width: Some(640),
+                strip_frame: Some(false),
+                ..Default::default()
+            }),
+        ),
+        workspace_config(
+            "Web",
+            &[],
+            Some(LayoutConfigPartial {
+                column_width: Some(960),
+                strip_frame: Some(true),
+                ..Default::default()
+            }),
+        ),
     ];
     let mut engine = engine_with_config(config);
     let output = connect(&mut engine, "physical-one", "DISPLAY1");
-    assert_eq!(engine.effective_config_for_workspace(output, 0).column_width, 640);
-    assert_eq!(engine.effective_config_for_workspace(output, 1).column_width, 960);
+    assert_eq!(
+        engine
+            .effective_config_for_workspace(output, 0)
+            .column_width,
+        640
+    );
+    assert_eq!(
+        engine
+            .effective_config_for_workspace(output, 1)
+            .column_width,
+        960
+    );
 
     // This is the pure name/home bookkeeping used by workspace reordering.
     engine.swap_workspace_ties(output, 0, 1);
@@ -381,40 +516,65 @@ fn update_config_refreshes_cached_reservations_but_keeps_explicit_overrides() {
     config.layout.reserve_top = 11;
     config.layout.column_width = 240;
     config.output = vec![
-        output_config("DISPLAY1", LayoutConfigPartial {
-            column_width: Some(480),
-            ..Default::default()
-        }),
-        output_config("DISPLAY2", LayoutConfigPartial {
-            column_width: Some(600),
-            reserve_top: Some(31),
-            ..Default::default()
-        }),
+        output_config(
+            "DISPLAY1",
+            LayoutConfigPartial {
+                column_width: Some(480),
+                ..Default::default()
+            },
+        ),
+        output_config(
+            "DISPLAY2",
+            LayoutConfigPartial {
+                column_width: Some(600),
+                reserve_top: Some(31),
+                ..Default::default()
+            },
+        ),
     ];
     config.workspace = vec![
-        workspace_config("Inherited", &[], Some(LayoutConfigPartial {
-            inner_gaps: Some(13),
-            ..Default::default()
-        })),
-        workspace_config("Explicit", &[], Some(LayoutConfigPartial {
-            column_width: Some(720),
-            reserve_top: Some(51),
-            ..Default::default()
-        })),
+        workspace_config(
+            "Inherited",
+            &[],
+            Some(LayoutConfigPartial {
+                inner_gaps: Some(13),
+                ..Default::default()
+            }),
+        ),
+        workspace_config(
+            "Explicit",
+            &[],
+            Some(LayoutConfigPartial {
+                column_width: Some(720),
+                reserve_top: Some(51),
+                ..Default::default()
+            }),
+        ),
     ];
     let mut engine = engine_with_config(config);
     let first = connect(&mut engine, "physical-one", "DISPLAY1");
     let second = connect(&mut engine, "physical-two", "DISPLAY2");
     assert_eq!(engine.effective_config(first).reserve_top, 11);
-    assert_eq!(engine.effective_config_for_workspace(first, 0).reserve_top, 11);
+    assert_eq!(
+        engine.effective_config_for_workspace(first, 0).reserve_top,
+        11
+    );
     assert_eq!(engine.effective_config(second).reserve_top, 31);
-    assert_eq!(engine.effective_config_for_workspace(first, 1).reserve_top, 51);
+    assert_eq!(
+        engine.effective_config_for_workspace(first, 1).reserve_top,
+        51
+    );
 
     let mut updated = engine.config.clone();
     updated.reserve_top = 99;
     engine.update_config(updated);
 
-    assert_eq!(engine.effective_config(OutputId::from_name("unconfigured")).reserve_top, 99);
+    assert_eq!(
+        engine
+            .effective_config(OutputId::from_name("unconfigured"))
+            .reserve_top,
+        99
+    );
     assert_eq!(engine.effective_config(first).reserve_top, 99);
     assert_eq!(engine.effective_config(first).column_width, 480);
     let inherited = engine.effective_config_for_workspace(first, 0);
