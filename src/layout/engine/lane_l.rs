@@ -833,7 +833,11 @@ mod tests {
             2,
             "the moved window is on the workspace that was the empty one"
         );
-        assert_eq!(number_of(&engine, 1), 3, "a window that stayed moved down a number");
+        assert_eq!(
+            number_of(&engine, 1),
+            3,
+            "a window that stayed moved down a number"
+        );
         assert_eq!(number_of(&engine, 3), 3, "so did the other one");
         assert_ne!(
             number_of(&engine, 2),
