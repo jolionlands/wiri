@@ -131,10 +131,17 @@
             # switch is only for the child, never for later code of this run.
             $env:WIRI_POINTER_SETTINGS_DRY_RUN = $savedDry
         }
+        # Owned from the moment it exists: whatever happens below (the record, the pipe wait),
+        # the lane's `finally` stops it.  A daemon that was only registered after PStartDaemon
+        # had returned leaked when this function threw, and the next lane then refused to run
+        # next to an unowned wiri process.
+        $pDaemons.Add($daemon)
         $pDaemonRecords.Add([ordered]@{
-                name = $name; pipe = $daemon.Pipe; config = $configPath; audit = $audit
+                name = $name; pid = $daemon.Process.Id; pipe = $daemon.Pipe; config = $configPath; audit = $audit
             })
-        $pDetails['daemons'] = @($pDaemonRecords)
+        # NOT `@($pDaemonRecords)`: on Windows PowerShell 5.1 the array operator on a
+        # List[object] throws "Argument types do not match" (see EvList in live-test.ps1).
+        $pDetails['daemons'] = $pDaemonRecords.ToArray()
         PWaitPipe $daemon
         return $daemon
     }
@@ -147,9 +154,14 @@
                 try {
                     $null = PRequest $rpc @{ type = 'run_action'; data = @{ name = 'quit'; args = @('--skip-confirmation'); quoted = @() } }
                 } finally { $rpc.Dispose() }
-                $null = [LanePNative]::Exited($daemon.Process.Handle, 8000)
             } catch { $pDetails[($daemon.Name + '-quit-error')] = [string]$_ }
-            if (-not $daemon.Process.HasExited) { Stop-Process -Id $daemon.Process.Id -Force }
+            # The reply can be lost with the pipe when the daemon shuts down at once, so the
+            # exit is what is waited for; only a daemon that is still up after that is killed.
+            $null = [LanePNative]::Exited($daemon.Process.Handle, 8000)
+            if (-not $daemon.Process.HasExited) {
+                $pDetails[($daemon.Name + '-forced-stop')] = $true
+                Stop-Process -Id $daemon.Process.Id -Force
+            }
         }
         $null = $daemon.Process.WaitForExit(4000)
     }
@@ -246,7 +258,6 @@ binds {
 }
 "@
         $pShown = PStartDaemon 'overlay-shown' $pShownConfig
-        $pDaemons.Add($pShown)
         $pOverlay = [IntPtr]::Zero
         $pOverlayClock = [Diagnostics.Stopwatch]::StartNew()
         do {
@@ -290,7 +301,6 @@ input {
 }
 "@
         $pSkip = PStartDaemon 'overlay-skip' $pSkipConfig
-        $pDaemons.Add($pSkip)
         $pSkipLog = PWaitLog $pSkip 'Hotkey overlay: skipped at startup' 8000
         # Nothing should appear at startup: give a stray sheet the same grace the shown run had.
         Start-Sleep -Milliseconds 1500
@@ -394,6 +404,15 @@ input {
         PCheckpoint 'closing-owned-daemons'
         if ($pRpc) { $pRpc.Dispose(); $pRpc = $null }
         foreach ($daemon in $pDaemons) { PStopDaemon $daemon }
+        # Nothing this lane started may outlive it: the next lane refuses to run next to a
+        # wiri process it does not own.  Only the PIDs recorded above are ever touched.
+        foreach ($record in $pDaemonRecords.ToArray()) {
+            $left = Get-Process -Id $record.pid -ErrorAction SilentlyContinue
+            if ($null -ne $left -and $left.ProcessName -eq 'wiri') {
+                $pDetails[($record.name + '-left-running')] = $true
+                Stop-Process -Id $record.pid -Force -ErrorAction SilentlyContinue
+            }
+        }
         $env:WIRI_PIPE = $pSavedPipe
         PCheckpoint 'snapshotting-real-pointer-settings-again'
         $pAfter = PRealSettings

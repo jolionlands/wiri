@@ -62,6 +62,13 @@
     function A11yError($err) {
         $aDetails.cleanup.errors.Add(($err | Out-String))
     }
+    # A note on something that went wrong while observing (polling, reading a log, the optional
+    # UIA listener).  Unlike A11yError it is not a cleanup failure: it must not turn every gate
+    # of the lane red, because a gate passes or fails on what it read, not on how often a poll
+    # was refused on the way.
+    function A11yObserve([string]$what) {
+        if ($aDetails.observations.Count -lt 20) { $aDetails.observations.Add([ordered]@{ note = $what }) }
+    }
 
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
     if (-not ('LaneA11yNative' -as [type])) {
@@ -150,6 +157,10 @@ public static class LaneA11yNative {
         $stdout = Join-Path $aRoot ($label + '.stdout.log')
         $stderr = Join-Path $aRoot ($label + '.stderr.log')
         $started = Start-Wiri $stderr $stdout
+        # Keep the process handle (as every other lane that owns a daemon does): without it
+        # Start-Process's object can lose the exit code, and the cleanup gate would read an
+        # empty ExitCode as a failed exit and fail every gate of the lane.
+        $null = $started.Handle
         $aState.proc = $started
         $aState.label = $label
         $aState.started = $true
@@ -196,11 +207,14 @@ public static class LaneA11yNative {
             $aState.started = $false
         }
     }
-    function A11yWindows([int]$pid, [string]$class) {
-        return @([LaneA11yNative]::Windows([uint32]$pid) | Where-Object { $_[1] -eq $class })
+    # NOT a parameter called `$pid`: that is PowerShell's read-only automatic $PID, and a function
+    # that declares it fails on every call ("Cannot overwrite variable pid because it is
+    # read-only or constant"), which took the whole lane down at its first gate.
+    function A11yWindows([int]$ownerPid, [string]$class) {
+        return @([LaneA11yNative]::Windows([uint32]$ownerPid) | Where-Object { $_[1] -eq $class })
     }
-    function A11yProviderHandle([int]$pid) {
-        $found = @(A11yWindows $pid 'WiriAnnounce')
+    function A11yProviderHandle([int]$ownerPid) {
+        $found = @(A11yWindows $ownerPid 'WiriAnnounce')
         if ($found.Count -eq 0) { return [IntPtr]::Zero }
         return [IntPtr][int64]$found[0][0]
     }
@@ -210,33 +224,44 @@ public static class LaneA11yNative {
             $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
             if ($null -eq $element) { return $null }
             return [string]$element.Current.Name
-        } catch { A11yError $_; return $null }
+        } catch {
+            # A client can be refused while the provider window is being created or its text is
+            # being replaced.  That is an observation of this poll, not a cleanup failure: the
+            # gates only pass on the name actually read, and the loop that polls tries again.
+            A11yObserve ('uia read failed: ' + [string]$_.Exception.Message)
+            return $null
+        }
     }
     function A11yWaitName([IntPtr]$hwnd, [string]$expected, [int]$timeoutMs) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $last = $null
         while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
             $last = A11yUiaName $hwnd
-            if ($last -eq $expected) { return [pscustomobject]@{ pass = $true; name = $last } }
+            if ($last -eq $expected) { return [pscustomobject]@{ pass = $true; name = $last; window_text = [LaneA11yNative]::Title($hwnd) } }
             Start-Sleep -Milliseconds 100
         }
-        return [pscustomobject]@{ pass = $false; name = $last }
+        $text = $(if ($hwnd -eq [IntPtr]::Zero) { $null } else { [LaneA11yNative]::Title($hwnd) })
+        return [pscustomobject]@{ pass = $false; name = $last; window_text = $text }
     }
-    function A11yWaitProvider([int]$pid, [bool]$present, [int]$timeoutMs) {
+    function A11yWaitProvider([int]$ownerPid, [bool]$present, [int]$timeoutMs) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
-            $handle = A11yProviderHandle $pid
+            $handle = A11yProviderHandle $ownerPid
             if ($present -and $handle -ne [IntPtr]::Zero) { return $handle }
             if (-not $present -and $handle -eq [IntPtr]::Zero) { return $handle }
             Start-Sleep -Milliseconds 100
         }
-        return (A11yProviderHandle $pid)
+        return (A11yProviderHandle $ownerPid)
     }
-    # The owned daemon's log, read while it is still writing (shared access, no lock).
+    # The owned daemon's own stderr log, read while it is still writing (shared access, no
+    # lock).  Not the run-wide wiri.log: that file also holds every earlier lane's daemons, whose
+    # "screen reader: Workspace 2" and "Overview opened" lines would satisfy the gate without
+    # this lane's daemon having raised anything.
     function A11yLog {
         $text = ''
-        foreach ($name in @('wiri.log.1', 'wiri.log')) {
-            $path = Join-Path $testLocal ('wiri\' + $name)
+        $record = $(if ($null -ne $aState.label) { $aDetails['daemon_' + $aState.label] } else { $null })
+        if ($null -eq $record) { return $text }
+        foreach ($path in @($record.stderr)) {
             if (-not [IO.File]::Exists($path)) { continue }
             $stream = $null; $reader = $null
             try {
@@ -245,7 +270,7 @@ public static class LaneA11yNative {
                 $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true)
                 $text += $reader.ReadToEnd()
             } catch {
-                A11yError $_
+                A11yObserve ('log read failed: ' + [string]$_.Exception.Message)
             } finally {
                 if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
             }
@@ -279,7 +304,7 @@ public static class LaneA11yNative {
                 [System.Windows.Automation.TreeScope]::Subtree,
                 $script:a11yNotificationHandler)
             return $true
-        } catch { A11yError $_; return $false }
+        } catch { A11yObserve ('uia notification listener unavailable: ' + [string]$_.Exception.Message); return $false }
     }
     function A11yUnsubscribeNotifications {
         if ($null -eq $script:a11yNotificationHandler -or $null -eq $script:a11yNotificationEvent) { return }
@@ -288,7 +313,7 @@ public static class LaneA11yNative {
                 $script:a11yNotificationEvent,
                 [System.Windows.Automation.AutomationElement]::RootElement,
                 $script:a11yNotificationHandler)
-        } catch { A11yError $_ }
+        } catch { A11yObserve ('uia listener removal failed: ' + [string]$_.Exception.Message) }
         $script:a11yNotificationHandler = $null
     }
 
@@ -337,19 +362,19 @@ binds {
         $provider = A11yWaitProvider $aPid $true 8000
         $workspace = A11yWaitName $provider 'Workspace 2' 8000
         A11yGate 'h77_uia_element_reports_workspace_switch' $workspace.pass ([ordered]@{
-                provider = [int64]$provider; uia_name = $workspace.name; expected = 'Workspace 2'
+                provider = [int64]$provider; uia_name = $workspace.name; window_text = $workspace.window_text; expected = 'Workspace 2'
             })
 
         # The overview opening and closing.
         $null = A11yCtl 'overview-open' @('action', 'toggle-overview')
         $open = A11yWaitName $provider 'Overview opened' 8000
         A11yGate 'h77_uia_element_reports_overview_open' $open.pass ([ordered]@{
-                uia_name = $open.name; expected = 'Overview opened'
+                uia_name = $open.name; window_text = $open.window_text; expected = 'Overview opened'
             })
         $null = A11yCtl 'overview-close' @('action', 'toggle-overview')
         $close = A11yWaitName $provider 'Overview closed' 10000
         A11yGate 'h77_uia_element_reports_overview_close' $close.pass ([ordered]@{
-                uia_name = $close.name; expected = 'Overview closed'
+                uia_name = $close.name; window_text = $close.window_text; expected = 'Overview closed'
             })
 
         if ($subscribed) {

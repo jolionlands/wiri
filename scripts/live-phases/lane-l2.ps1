@@ -98,8 +98,44 @@ window-rule {
         if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) }
         Start-Sleep -Milliseconds 900
     }
-    function L2Rect([IntPtr]$h) { return [LT]::Visible($h) }
+    # The visible bounds of a window with its width and height (Rc, live-test.ps1).  The bare
+    # [LT]::Visible rectangle only has L/T/R/B: reading `.W` or `.H` from it gave $null, so every
+    # width or height gate of this lane compared nothing with nothing.
+    function L2Rect([IntPtr]$h) { return (Rc $h) }
     function L2Near([int]$a, [int]$b, [int]$tol = 8) { return [Math]::Abs($a - $b) -le $tol }
+    # The workspace number window-list reports for one window of an already fetched list.
+    function L2WorkspaceOf($list, [IntPtr]$h) {
+        $found = @($list | Where-Object { [int64]$_.hwnd -eq [int64]$h })
+        if ($found.Count -ne 1) { throw "expected exactly one window-list entry for $h, got $($found.Count)" }
+        return $found[0].workspace
+    }
+    # The tiles that are fully in view on the workspace of `$reference`: window-list says which
+    # windows are tiles of that workspace, their real rectangles say what the user sees.  This
+    # lane's daemon tiles every window of the session, so the strip is not just the three
+    # windows the lane opened; a span is measured over every tile that is fully in view.
+    function L2VisibleSpan([string]$tag, [IntPtr]$reference) {
+        $list = L2List $tag
+        $workspace = L2WorkspaceOf $list $reference
+        $inView = New-Object System.Collections.ArrayList
+        foreach ($entry in $list) {
+            if ($entry.workspace -ne $workspace -or $entry.floating -or $entry.minimized -or $entry.fullscreen) { continue }
+            $h = [IntPtr][int64]$entry.hwnd
+            if (-not [LT]::IsWindow($h)) { continue }
+            $r = Rc $h
+            if ($r.L -ge ($swa.Left - 3) -and $r.R -le ($swa.Right + 3) -and $r.T -ge ($swa.Top - 3) -and $r.B -le ($swa.Bottom + 3)) {
+                [void]$inView.Add([pscustomobject]@{ hwnd = [int64]$h; title = [string]$entry.title; L = $r.L; R = $r.R; T = $r.T; B = $r.B; own = $l2Forms.Contains($h) })
+            }
+        }
+        if ($inView.Count -eq 0) {
+            return [pscustomobject]@{ count = 0; owned = 0; left = $null; right = $null; centre = $null; windows = @() }
+        }
+        $left = ($inView | Measure-Object -Property L -Minimum).Minimum
+        $right = ($inView | Measure-Object -Property R -Maximum).Maximum
+        return [pscustomobject]@{
+            count = $inView.Count; owned = @($inView | Where-Object { $_.own }).Count
+            left = $left; right = $right; centre = (($left + $right) / 2); windows = $inView.ToArray()
+        }
+    }
     function L2Stop([string]$tag) {
         if ($null -eq $l2Process -or $l2Process.HasExited) { return }
         Ctl ('h76-'+$tag) @('quit') | Out-Null
@@ -149,29 +185,48 @@ public static class LaneL2Native {
 
         # move-column-to-index 0: the focused (last) column goes to the front.
         L2Focus $l2C
+        # The strip is not just A, B and C (the daemon tiles every window of the session), so
+        # "back" is the column the window really had, not a number.
+        $columnBefore = (L2Entry 'move-column-to-index-before' $l2C).column
+        $restoreIndex = $(if ($null -ne $columnBefore) { [string]$columnBefore } else { '2' })
         $null = L2Action 'move-column-to-index-forward' @('move-column-to-index', '0')
         $movedRect = L2Rect $l2C
         $entry = L2Entry 'move-column-to-index-check' $l2C
-        L2Gate 'h76_move_column_to_index' ($movedRect.L -lt $rectB.L) @{ before = $rectC.L; after = $movedRect.L; column = $entry.column }
-        # Put it back where it was: index 2 is the last of three columns.
-        $null = L2Action 'move-column-to-index-back' @('move-column-to-index', '2')
+        L2Gate 'h76_move_column_to_index' ($movedRect.L -lt $rectB.L) @{ before = $rectC.L; after = $movedRect.L; column = $entry.column; column_before = $columnBefore }
+        # Put it back where it was.
+        $null = L2Action 'move-column-to-index-back' @('move-column-to-index', $restoreIndex)
         Start-Sleep -Milliseconds 300
 
-        # center-visible-columns: the span that is in view is centred in the view.
+        # center-visible-columns: the tiles that are fully in view form a span, and the span
+        # is centred in the view.  A tile hanging off an edge is not part of it, so this reads
+        # every fully visible tile of the workspace, not the first window the lane opened.
+        $spanBefore = L2VisibleSpan 'center-visible-columns-before' $l2C
         $null = L2Action 'center-visible-columns' @('center-visible-columns')
-        $centred = L2Rect $l2A
-        $viewLeft = $swa.Left; $viewWidth = $swa.Width
-        $centre = ($centred.L + $centred.W / 2)
-        L2Gate 'h76_center_visible_columns' (L2Near ([int]$centre) ([int]($viewLeft + $viewWidth / 2)) 60) @{ centre = $centre; view_centre = ($viewLeft + $viewWidth / 2) }
+        $spanAfter = L2VisibleSpan 'center-visible-columns-after' $l2C
+        $viewCentre = ($swa.Left + $swa.Right) / 2
+        L2Gate 'h76_center_visible_columns' ($spanAfter.count -ge 1 -and $spanAfter.owned -ge 1 -and (L2Near ([int]$spanAfter.centre) ([int]$viewCentre) 10)) @{
+            view_centre = $viewCentre; centre_before = $spanBefore.centre; centre_after = $spanAfter.centre
+            tiles_after = $spanAfter.count; own_tiles_after = $spanAfter.owned; span_after = @($spanAfter.left, $spanAfter.right)
+            windows_after = $spanAfter.windows
+        }
 
         # ---- width presets ------------------------------------------------------------
+        # Presets are [fixed 260, proportion 0.45, fixed 700] and the default width (30 %) is
+        # none of them.  Forward from it lands on the first preset that is wider, forward again
+        # on the next one; `-back` steps to the PREVIOUS preset (niri's cycle), so it must
+        # return to the width the first forward step gave, not to the width the window started
+        # with.
         L2Focus $l2B
-        $wide = L2Rect $l2B
+        $widthStart = (L2Rect $l2B).W
         $null = L2Action 'preset-window-width' @('switch-preset-window-width')
-        $wider = L2Rect $l2B
+        $widthNext = (L2Rect $l2B).W
+        $null = L2Action 'preset-window-width-second' @('switch-preset-window-width')
+        $widthSecond = (L2Rect $l2B).W
         $null = L2Action 'preset-window-width-back' @('switch-preset-window-width-back')
-        $narrow = L2Rect $l2B
-        L2Gate 'h76_preset_window_width_and_back' ($wider.W -ne $wide.W -and (L2Near $narrow.W $wide.W)) @{ start = $wide.W; next = $wider.W; back = $narrow.W }
+        $widthBack = (L2Rect $l2B).W
+        L2Gate 'h76_preset_window_width_and_back' ($widthNext -gt $widthStart -and (L2Near $widthSecond 700) -and (L2Near $widthBack $widthNext)) @{
+            start = $widthStart; next = $widthNext; second = $widthSecond; back = $widthBack; presets = 'fixed 260, proportion 0.45, fixed 700'
+        }
 
         # ---- stacked column: window-height presets, move-window-or-to-workspace ---------
         # consume-window-into-column puts the right neighbour's window under the focused one.
@@ -184,13 +239,21 @@ public static class LaneL2Native {
         $top = L2Rect $l2B
         $bottom = L2Rect $below
         $l2Details['stacked'] = @{ top = $top; bottom = $bottom }
+        # Presets are [proportion 0.25, fixed 300, proportion 0.6]; the half-and-half height the
+        # stacked tile starts with is none of them.  Forward twice walks the cycle (0.6, then
+        # round to 0.25) and `-back` steps to the previous preset, which must be the height the
+        # first forward step gave.
         L2Focus $below
-        $heightBefore = (L2Rect $below).H
+        $heightStart = (L2Rect $below).H
         $null = L2Action 'preset-window-height' @('switch-preset-window-height')
-        $heightAfter = (L2Rect $below).H
+        $heightNext = (L2Rect $below).H
+        $null = L2Action 'preset-window-height-second' @('switch-preset-window-height')
+        $heightSecond = (L2Rect $below).H
         $null = L2Action 'preset-window-height-back' @('switch-preset-window-height-back')
         $heightBack = (L2Rect $below).H
-        L2Gate 'h76_preset_window_height_and_back' ($heightAfter -ne $heightBefore -and (L2Near $heightBack $heightBefore)) @{ start = $heightBefore; next = $heightAfter; back = $heightBack }
+        L2Gate 'h76_preset_window_height_and_back' ($heightNext -ne $heightStart -and $heightSecond -ne $heightNext -and (L2Near $heightBack $heightNext)) @{
+            start = $heightStart; next = $heightNext; second = $heightSecond; back = $heightBack; presets = 'proportion 0.25, fixed 300, proportion 0.6'
+        }
 
         # move-window-up-or-to-workspace-up on the bottom window of the column: it swaps
         # with the tile above it first.
@@ -201,11 +264,24 @@ public static class LaneL2Native {
         # At the top of its column the same action moves it to the workspace above; the
         # window leaves this workspace and the empty workspace above first was there.
         # move-window-up-or-to-workspace-up at the top of its column moves the window to
-        # the workspace above: window-list reports a different workspace number for it.
-        $wsBefore = (L2Entry 'move-window-ws-before' $below).workspace
+        # the workspace above.  With `empty-workspace-above-first` the empty workspace the
+        # window lands on becomes workspace 2 once a new empty one is inserted above it, and
+        # every window that stayed moves from 2 to 3, so the moved window's own number does
+        # not change (2 -> 2).  What changes is where it is relative to the windows that did
+        # not move: it shared a workspace with them and must not any more.
+        $wsListBefore = L2List 'move-window-ws-before'
+        $wsMovedBefore = L2WorkspaceOf $wsListBefore $below
+        $wsStayBefore = L2WorkspaceOf $wsListBefore $l2B
         $null = L2Action 'move-window-up-to-workspace' @('move-window-up-or-to-workspace-up')
-        $wsAfter = (L2Entry 'move-window-ws-after' $below).workspace
-        L2Gate 'h76_move_window_down_or_to_workspace' ($null -ne $wsBefore -and $null -ne $wsAfter -and $wsAfter -ne $wsBefore) @{ before = $wsBefore; after = $wsAfter }
+        $wsListAfter = L2List 'move-window-ws-after'
+        $wsMovedAfter = L2WorkspaceOf $wsListAfter $below
+        $wsStayAfter = L2WorkspaceOf $wsListAfter $l2B
+        $wsOtherAfter = L2WorkspaceOf $wsListAfter $l2A
+        L2Gate 'h76_move_window_down_or_to_workspace' ($null -ne $wsMovedBefore -and $null -ne $wsMovedAfter -and
+            $wsMovedBefore -eq $wsStayBefore -and $wsMovedAfter -ne $wsStayAfter -and $wsOtherAfter -eq $wsStayAfter) @{
+            moved_before = $wsMovedBefore; moved_after = $wsMovedAfter
+            staying_before = $wsStayBefore; staying_after = $wsStayAfter; other_staying_after = $wsOtherAfter
+        }
         # The workspace above the first one is the empty one `empty-workspace-above-first`
         # keeps: going up lands on it, going up again at the top does not wrap and does not
         # move any window of the strip.
