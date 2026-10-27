@@ -98,7 +98,7 @@ $dndBlock
         return $pt
     }
     function TDrag([IntPtr]$h, [string]$button, [int]$x, [int]$y, [int]$dx, [int]$dy) {
-        TFocus $h; [LaneTNative]::Move($x,$y)
+        TFocus $h; [LaneTNative]::Move($x,$y); Start-Sleep -Milliseconds 80
         try {
             [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button($button,$false)
             Start-Sleep -Milliseconds 100
@@ -114,7 +114,7 @@ $dndBlock
         $r = Rc $h
         $x = if ($side) { $r.L+1 } else { $r.L+[int]($r.W/2) }
         $y = if ($side) { $r.T+[int]($r.H/2) } else { $r.T+1 }
-        [LaneTNative]::Move($x,$y)
+        [LaneTNative]::Move($x,$y); Start-Sleep -Milliseconds 80
         try {
             [LaneTNative]::Key(0xA4,$false)
             [LaneTNative]::Button('R',$false); Start-Sleep -Milliseconds 40
@@ -238,10 +238,12 @@ public static class LaneTNative {
                 [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('M',$false)
                 [LaneTNative]::Move(($tPt.X-3),$tPt.Y); Start-Sleep -Milliseconds 150
                 $tThreshold = Rc $tB
-                TGate 'h58_middle_waits_for_axis_threshold' (Near $tThreshold.L $tInitial.L 3) @($tInitial,$tThreshold)
                 foreach ($i in 1..6) { [LaneTNative]::Move(($tPt.X-30*$i),$tPt.Y); Start-Sleep -Milliseconds 30 }
                 Start-Sleep -Milliseconds 80
                 $tHeld = Rc $tB
+                # Below 8 px nothing may move, but an inert grab would pass that alone: the same
+                # grab must then follow the pointer, or the threshold was never armed.
+                TGate 'h58_middle_waits_for_axis_threshold' ((Near $tThreshold.L $tInitial.L 3) -and ($tHeld.L -lt $tInitial.L-100)) @($tInitial,$tThreshold,$tHeld)
                 TGate 'h58_horizontal_follows_pointer_while_held' ((Near $tHeld.L ($tInitial.L-180) 10) -and (Near $tHeld.T $tInitial.T 3)) @($tInitial,$tHeld)
                 Shot 'h58-middle-held'
                 [LaneTNative]::Key(0xA4,$true) # paired up must still be captured
@@ -276,7 +278,7 @@ public static class LaneTNative {
             $tWidthBefore = Rc $tA; TDouble $tA $true; $tWide = Rc $tA; TDouble $tA $true; $tNormal = Rc $tA
             TGate 'h59_side_edge_double_toggles_full_width' (($tWide.W -gt $tWidthBefore.W+200) -and (Near $tNormal.W $tWidthBefore.W 5)) @($tWidthBefore,$tWide,$tNormal)
             TFocus $tA; $tR = Rc $tA; $tX = $tR.R-2; $tY = $tR.T+[int]($tR.H/2)
-            [LaneTNative]::Move($tX,$tY)
+            [LaneTNative]::Move($tX,$tY); Start-Sleep -Milliseconds 80
             try {
                 [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('R',$false)
                 Start-Sleep -Milliseconds 100
