@@ -140,6 +140,16 @@ animations {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// The "Important Hotkeys" sheet — niri's hotkey overlay.
+//
+// wiri shows it when it starts (any key press or click closes it) and the
+// `show-hotkey-overlay` action opens it again.  Uncomment to change that:
+//
+// hotkey-overlay {
+//     skip-at-startup     // do not open the sheet when wiri starts
+//     hide-not-bound      // list only the hotkeys that are actually bound
+// }
+// ───────────────────────────────────────────────────────────────────────────
 // Keybindings.  `Mod` is Ctrl+Alt unless `input { mod-key }` says otherwise.
 //
 // These binds are added to wiri's built-in defaults (a bind here wins when it uses

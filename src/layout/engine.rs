@@ -420,6 +420,10 @@ pub struct LayoutConfig {
     /// What the overlay layer draws around the windows (niri's `focus-ring`, `border`,
     /// `shadow`, `insert-hint` and `tab-indicator`).
     pub effects: crate::config::Effects,
+    /// The colour painted behind the overview's workspaces (GDI `COLORREF`): niri
+    /// `overview { backdrop-color }`, else `layout { background-color }`, else wiri's dark
+    /// backdrop.  Windows owns the desktop behind the tiled windows themselves.
+    pub overview_backdrop: u32,
 }
 
 impl Default for LayoutConfig {
@@ -454,6 +458,7 @@ impl Default for LayoutConfig {
             reserve_left: 0,
             reserve_right: 0,
             effects: crate::config::Effects::default(),
+            overview_backdrop: crate::overlay::thumbnail_overview::DEFAULT_BACKDROP,
         }
     }
 }
@@ -542,6 +547,12 @@ impl LayoutConfig {
         lc.reserve_bottom = config.layout.reserve_bottom;
         lc.reserve_left = config.layout.reserve_left;
         lc.reserve_right = config.layout.reserve_right;
+        // niri `overview { backdrop-color }` / `layout { background-color }`: what wiri paints
+        // behind the overview's workspaces.
+        lc.overview_backdrop = crate::overlay::thumbnail_overview::backdrop_color(
+            config.overview.backdrop_color.as_deref(),
+            config.layout.background_color.as_deref(),
+        );
         lc
     }
 }

@@ -23,6 +23,27 @@ pub struct OverviewWorkspace {
     pub active: bool,
 }
 
+/// wiri's built-in overview backdrop, in GDI `COLORREF` order (`0x00BBGGRR`): what the overview
+/// paints when neither `overview { backdrop-color }` nor `layout { background-color }` is set.
+pub const DEFAULT_BACKDROP: u32 = 0x0018_1210;
+
+/// The colour the overview paints behind its workspaces, from niri's two colour options:
+/// `overview { backdrop-color }` wins, then `layout { background-color }` (where niri's
+/// deprecated per-output `background-color` maps), then [`DEFAULT_BACKDROP`].
+///
+/// `COLORREF` is `0x00BBGGRR`; the colours arrive as `#rrggbb[aa]` and the alpha is ignored
+/// (GDI `FillRect` does not blend).
+pub fn backdrop_color(overview: Option<&str>, background: Option<&str>) -> u32 {
+    let Some(rgba) = overview
+        .or(background)
+        .and_then(crate::config::types::parse_color)
+    else {
+        return DEFAULT_BACKDROP;
+    };
+    let [r, g, b, _a] = rgba;
+    u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
+}
+
 /// Publish this after computing an overview layout, including after keyboard
 /// navigation. Bounds are the focused monitor, not the primary screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +51,9 @@ pub struct OverviewContext {
     pub bounds: Rect,
     pub workspaces: Vec<OverviewWorkspace>,
     pub focused: Option<WindowId>,
+    /// What to paint behind the workspaces: [`backdrop_color`] of the loaded config, in GDI
+    /// `COLORREF` order.
+    pub backdrop: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,10 +505,16 @@ mod win {
         unsafe fn paint(&self, hwnd: HWND) {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut ps);
+            let backdrop = self
+                .scene
+                .context
+                .as_ref()
+                .map(|context| context.backdrop)
+                .unwrap_or(super::DEFAULT_BACKDROP);
             fill(
                 dc,
                 Rect::new(0, 0, self.bounds.size.w, self.bounds.size.h),
-                BACKDROP,
+                backdrop,
             );
             if let Some(context) = &self.scene.context {
                 for ws in &context.workspaces {
@@ -745,7 +775,31 @@ mod tests {
                 rect: Rect::new(-1800, 100, 900, 400),
                 active: true,
             }],
+            backdrop: DEFAULT_BACKDROP,
         }
+    }
+
+    #[test]
+    fn the_backdrop_comes_from_the_overview_then_the_layout_then_the_built_in_colour() {
+        // `#rrggbb` becomes GDI's 0x00BBGGRR order.
+        assert_eq!(backdrop_color(Some("#102030"), None), 0x0030_2010);
+        assert_eq!(backdrop_color(None, Some("#102030")), 0x0030_2010);
+        // `overview { backdrop-color }` wins over `layout { background-color }`.
+        assert_eq!(
+            backdrop_color(Some("#ffffff"), Some("#000000")),
+            0x00ff_ffff
+        );
+        // Neither set: wiri's own dark backdrop.
+        assert_eq!(backdrop_color(None, None), DEFAULT_BACKDROP);
+        // An alpha (or a colour the decoder could not know about) does not change the paint.
+        assert_eq!(backdrop_color(Some("#10203080"), None), 0x0030_2010);
+        // A value that is not a literal colour paints the built-in backdrop (the decoder rejects
+        // such a config, so this is only the defensive path).
+        assert_eq!(
+            backdrop_color(Some("not-a-colour"), Some("#010203")),
+            DEFAULT_BACKDROP
+        );
+        assert_eq!(backdrop_color(None, Some("")), DEFAULT_BACKDROP);
     }
     #[test]
     fn mock_registration_is_idempotent_and_exit_clears_everything() {

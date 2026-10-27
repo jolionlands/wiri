@@ -74,9 +74,15 @@ struct Args {
     /// Remove wiri from the Windows Run key
     #[arg(long)]
     unregister_autostart: bool,
-    /// Skip spawning programs listed in spawn-at-startup config entries (useful for testing)
+    /// Skip spawning programs listed in spawn-at-startup config entries (useful for testing).
+    /// Also keeps the Important Hotkeys sheet closed at startup, like `--no-startup-overlay`.
     #[arg(long)]
     no_autostart: bool,
+    /// Do not open the Important Hotkeys sheet at startup, as `hotkey-overlay { skip-at-startup }`
+    /// does from the config. The scripted live harness starts every daemon with this so a sheet
+    /// never takes the first key press of a scripted scenario.
+    #[arg(long)]
+    no_startup_overlay: bool,
 }
 
 #[tokio::main]
@@ -603,9 +609,18 @@ async fn main() -> Result<()> {
     info!("Key-bindings cheatsheet overlay installed");
     // niri shows the sheet at startup unless `hotkey-overlay { skip-at-startup }` asks for quiet.
     // `show_hotkey_overlay` lists the bindings Windows actually registered and honours
-    // `hotkey-overlay { hide-not-bound }`.
-    if config.hotkey_overlay.skip_at_startup {
-        info!("Hotkey overlay: skipped at startup (hotkey-overlay {{ skip-at-startup }})");
+    // `hotkey-overlay { hide-not-bound }`.  `--no-startup-overlay` (and `--no-autostart`, which
+    // means "no startup extras") keeps it closed for a scripted start.
+    let quiet_start = args.no_startup_overlay || args.no_autostart;
+    if config.hotkey_overlay.skip_at_startup || quiet_start {
+        info!(
+            "Hotkey overlay: skipped at startup ({})",
+            if config.hotkey_overlay.skip_at_startup {
+                "hotkey-overlay { skip-at-startup }"
+            } else {
+                "command line"
+            }
+        );
     } else {
         let rows = wiri::backend::message_loop::show_hotkey_overlay(&engine);
         if rows == 0 {

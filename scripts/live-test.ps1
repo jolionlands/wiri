@@ -530,7 +530,7 @@ function Start-Wiri([string]$stderrLog, [string]$stdoutLog) {
     $savedRoaming = $env:APPDATA; $savedLocal = $env:LOCALAPPDATA
     try {
         $env:APPDATA = $testRoaming; $env:LOCALAPPDATA = $testLocal
-        $p = Start-Process -FilePath $wiri -ArgumentList '-v' -RedirectStandardError $stderrLog -RedirectStandardOutput $stdoutLog -PassThru
+        $p = Start-Process -FilePath $wiri -ArgumentList '-v', '--no-startup-overlay' -RedirectStandardError $stderrLog -RedirectStandardOutput $stdoutLog -PassThru
     } finally {
         $env:APPDATA = $savedRoaming; $env:LOCALAPPDATA = $savedLocal
     }
@@ -3074,6 +3074,10 @@ $summary = [ordered]@{
 . (Join-Path $PSScriptRoot 'live-phases\lane-k.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-f.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-t.ps1')
+# Lane P: pointer-device settings, the hotkey overlay's startup options and the
+# dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
+# so nothing here changes this machine's real pointer or touchpad settings.
+. (Join-Path $PSScriptRoot 'live-phases\lane-p.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

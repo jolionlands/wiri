@@ -657,8 +657,9 @@ mod tests {
             parse("toggle-touchpad", &[]),
             Some(Some(SystemAction::ToggleTouchpad))
         );
-        // Arguments are refused rather than ignored: not a system action, and not a bind either.
-        assert!(parse("toggle-touchpad", &["on".into()]).is_none());
+        // Arguments are refused rather than ignored: a known action with bad arguments, and
+        // no bind either.
+        assert_eq!(parse("toggle-touchpad", &["on".into()]), Some(None));
         assert!(
             crate::input::parse_action_flagged("toggle-touchpad", &["on".into()], &[false]).is_none()
         );

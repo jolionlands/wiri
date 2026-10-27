@@ -107,6 +107,7 @@ impl TilingEngine {
                 bounds: monitor.bounds,
                 workspaces,
                 focused: monitor.focus_window,
+                backdrop: cfg.overview_backdrop,
             });
         }
         positions
