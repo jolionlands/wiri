@@ -3133,6 +3133,7 @@ if ($env:WIRI_LIVE_CI -eq '1') {
     })
 }
 . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') # p_* numeric information only; never pass/fail
+. (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1')
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }
