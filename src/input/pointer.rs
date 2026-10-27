@@ -285,7 +285,10 @@ mod tests {
             (true, vec![Action::Refresh])
         );
         // The release is still paired, even with the modifier already let go.
-        assert_eq!(e.button_with_stylus(0, 1, Some(2), false, t), (true, vec![]));
+        assert_eq!(
+            e.button_with_stylus(0, 1, Some(2), false, t),
+            (true, vec![])
+        );
         // An ordinary right click is the mouse bind again.
         assert_eq!(
             e.button_with_stylus(3, 1, None, true, t),
@@ -296,7 +299,9 @@ mod tests {
 
     #[test]
     fn an_unbound_pen_button_behaves_like_the_mouse_button_it_was_promoted_to() {
-        let mut e = engine("binds {\n    extend-defaults false;\n    Mod+MouseRight { close-window; }\n}\n");
+        let mut e = engine(
+            "binds {\n    extend-defaults false;\n    Mod+MouseRight { close-window; }\n}\n",
+        );
         let t = Instant::now();
         assert_eq!(
             e.button_with_stylus(3, 1, Some(2), true, t),

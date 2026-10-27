@@ -4071,7 +4071,9 @@ overview { backdrop-color \"#000000\" }",
         assert_eq!(untouched.cursor.hide_after_inactive_ms, None);
         // `false` is an explicit "off", which is not the same as "not configured".
         assert_eq!(
-            clean("cursor { hide-when-typing false; }").cursor.hide_when_typing,
+            clean("cursor { hide-when-typing false; }")
+                .cursor
+                .hide_when_typing,
             Some(false)
         );
         assert_eq!(
@@ -4097,15 +4099,14 @@ overview { backdrop-color \"#000000\" }",
         let cfg = clean(
             "binds {\n    Mod+TabletStylusButton1 { close-window; }\n    Mod+TabletStylusButton2 { refresh; }\n    Mod+TabletStylusButton3 cooldown-ms=80 { close-window; }\n}\n",
         );
-        let keys: Vec<&str> = cfg
-            .binds
-            .hotkeys
-            .iter()
-            .map(|b| b.key.as_str())
-            .collect();
+        let keys: Vec<&str> = cfg.binds.hotkeys.iter().map(|b| b.key.as_str()).collect();
         assert_eq!(
             keys,
-            vec!["TabletStylusButton1", "TabletStylusButton2", "TabletStylusButton3"]
+            vec![
+                "TabletStylusButton1",
+                "TabletStylusButton2",
+                "TabletStylusButton3"
+            ]
         );
         assert_eq!(
             cfg.binds.hotkeys[2].cooldown_ms,
