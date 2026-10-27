@@ -44,3 +44,21 @@ No dependency, idle timer, polling loop, always-on thread or resting HWND is
 added for mouse gestures. Work runs through `crate::input::dispatch` on the
 existing hotkey thread. The existing baseline mouse-hook thread is retained,
 not misreported as removed. No display/input system settings are changed.
+
+## 2. Edge actions and interactive grabs
+
+Top/bottom edge doubles (native left or configured Mod+right) reset height;
+left/right doubles toggle full width. System double-click time and rectangle
+are read, never changed. Explicit pointer binds still win. Pure tests cover
+edge/window/button/time/distance discrimination. Native-loop exclusion prevents
+an unrelated refresh from fighting the held preview. Resize release uses Lane
+G's final-rect adapter (logical column width, stacked preferred height, float
+memory); move release invalidates the old HWND target and selects the actual
+variable-width, scrolled destination column rather than dividing by the source
+width. Right-click while moving toggles floating/tiling. Cancellation restores
+the original geometry and removes exclusion.
+
+Remaining approximation: tiled drops join an existing column; arbitrary new
+column insertion, cross-output drops and niri's insertion compositor are not
+implemented here. The move row stays partial. H59 covers actual edge actions
+and resize persistence; final live evidence is recorded below.

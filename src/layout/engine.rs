@@ -39,6 +39,7 @@ mod workspace_names;
 mod decor;
 mod float_stack;
 mod gestures;
+mod interactive;
 mod motion;
 mod native_clip;
 mod native_move;

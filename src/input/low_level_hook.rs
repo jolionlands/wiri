@@ -532,6 +532,11 @@ pub fn begin_resize_grab(grab: ResizeGrab) {
     let mut state = HOOK_STATE.lock();
     if state.try_begin_grab(GrabState::Resize(grab.clone())) {
         info!("Starting resize grab for window {:?}", grab.window_id);
+        if let Some(engine) = state.engine.clone() {
+            crate::input::dispatch::send_work(Box::new(move || {
+                engine.write().native_move_resize_start(grab.window_id);
+            }));
+        }
     }
 }
 
@@ -601,6 +606,18 @@ fn cancelled_grab_cleanup(
                 {
                     if let Some(backend) = backend {
                         eng.cancel_window_insert(g.window_id, &backend);
+                        if eng.is_floating(g.window_id) {
+                            eng.place_float_from_pointer(
+                                g.window_id,
+                                Rect::new(
+                                    g.initial_window_pos.x,
+                                    g.initial_window_pos.y,
+                                    g.initial_size.w,
+                                    g.initial_size.h,
+                                ),
+                                &backend,
+                            );
+                        }
                     } else {
                         eng.clear_window_insert(g.window_id);
                     }
@@ -611,6 +628,16 @@ fn cancelled_grab_cleanup(
                 clear_move_guides();
             }
             HOOK_STATE.lock().finish_move(&g);
+        }
+        GrabState::Resize(g) => {
+            if let Some(engine) = engine {
+                let mut eng = engine.write();
+                if invalidate_source {
+                    eng.clear_window_insert(g.window_id);
+                } else if let Some(backend) = backend {
+                    eng.pointer_resize_end(g.window_id, g.initial_rect, &backend);
+                }
+            }
         }
         _ => {
             if let Some(engine) = engine {
@@ -771,6 +798,22 @@ unsafe extern "system" fn mouse_hook_callback(
         )
     };
     if !matches!(grab, GrabState::None) {
+        if let GrabState::Move(g) = &grab {
+            if msg == 0x204 {
+                let s = HOOK_STATE.lock();
+                if let (Some(engine), Some(backend)) = (s.engine.clone(), s.backend.clone()) {
+                    let grab = g.clone();
+                    crate::input::dispatch::send_work(Box::new(move || {
+                        let mut eng = engine.write();
+                        if validate_move(&grab, &mut eng) {
+                            eng.toggle_floating_for(grab.window_id, &backend);
+                        }
+                    }));
+                    crate::input::pointer::ENGINE.lock().capture_gesture(1);
+                    return LRESULT(1);
+                }
+            }
+        }
         if let Some(consume) = disposition {
             if msg != WM_MOUSEMOVE {
                 crate::input::pointer::ENGINE.lock().button(
@@ -829,6 +872,36 @@ unsafe extern "system" fn mouse_hook_callback(
             mask_shell_menu();
         }
         return LRESULT(1);
+    }
+    // Native left-edge clicks and Mod+right edge clicks share double-click semantics.
+    if button == Some((0, true)) && mods == 0
+        || button == Some((1, true)) && mods == crate::input::pointer::ENGINE.lock().mod_key
+    {
+        let child = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT {
+            x: cursor.x,
+            y: cursor.y,
+        });
+        let root = windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+            child,
+            windows::Win32::UI::WindowsAndMessaging::GA_ROOT,
+        );
+        let s = HOOK_STATE.lock();
+        if let (Some(engine), Some(backend)) = (&s.engine, &s.backend) {
+            let b = button.unwrap().0;
+            if crate::input::interactive::edge_click(
+                engine,
+                backend,
+                WindowId::new(root.0 as isize),
+                cursor,
+                b,
+            ) {
+                crate::input::pointer::ENGINE.lock().capture_gesture(b);
+                if mods & (1 | 8) != 0 {
+                    mask_shell_menu();
+                }
+                return LRESULT(1);
+            }
+        }
     }
     // Explicit button/wheel binds always win; middle gestures use the same Mod.
     if button == Some((2, true))
@@ -906,6 +979,7 @@ unsafe extern "system" fn mouse_hook_callback(
                         };
                         drop(eng);
                         let hint = matches!(&next, GrabState::ColumnReorder(_));
+                        let resize_start = matches!(&next, GrabState::Resize(_));
                         let move_hint = match &next {
                             GrabState::Move(g) => Some(g.clone()),
                             _ => None,
@@ -917,6 +991,12 @@ unsafe extern "system" fn mouse_hook_callback(
                             }
                             if let Some(g) = move_hint {
                                 queue_move_start(g, engine.clone());
+                            }
+                            if resize_start {
+                                let engine = engine.clone();
+                                crate::input::dispatch::send_work(Box::new(move || {
+                                    engine.write().native_move_resize_start(wid);
+                                }));
                             }
                             if hint {
                                 let engine = engine.clone();
@@ -1084,32 +1164,7 @@ fn process_grab(
                 preview_rect(g.window_id, rect, backend);
             } else {
                 let mut eng = engine.write();
-                if eng.is_floating(g.window_id) {
-                    eng.place_float_from_pointer(g.window_id, rect, backend);
-                } else {
-                    let target = eng.monitors().iter().find_map(|(o, m)| {
-                        m.workspace()
-                            .and_then(|w| w.find_window_column(g.window_id))
-                            .map(|c| (*o, c))
-                    });
-                    if let Some((o, c)) = target {
-                        eng.set_focused_output(o);
-                        if let Some(m) = eng.monitors_mut().get_mut(&o) {
-                            m.focus_column = Some(c);
-                            m.focus_window = Some(g.window_id);
-                        }
-                        // Use the engine's existing setters: the width/height becomes layout
-                        // state (and observes its limits), not a transient SetWindowPos.
-                        eng.set_column_width_by(
-                            crate::input::SizeChange::SetFixed(rect.size.w as i32),
-                            backend,
-                        );
-                        eng.set_window_height_by(
-                            crate::input::SizeChange::SetFixed(rect.size.h as i32),
-                            backend,
-                        );
-                    }
-                }
+                eng.pointer_resize_end(g.window_id, rect, backend);
                 crate::ipc::notify_state_changed();
             }
         }

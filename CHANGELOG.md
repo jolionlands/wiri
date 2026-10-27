@@ -57,6 +57,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Lane F2 — structured layout action transport
 - Port lane F's shared focus/workspace/monitor grammar onto the integrated branch. Preserve quoted workspace names and carry explicit window-transfer targets through Lane H's typed action path without focus-first activation. Engine execution follows in the next integration part.
 
+- Lane T: system-time/rectangle edge double-clicks reset tiled height or toggle full width; Mod move/resize excludes layout writes while held and persists its drop, with right-click floating/tiling toggle.
+
 ### Lane T — spatial pointer gestures
 - Configured Mod+middle drag follows the pointer horizontally or vertically after niri's axis lock. Release projects the 150 ms velocity history to column/workspace snaps, handing velocity to Phase 2B's spring; bounded end rubber-banding and pause-before-release are unit-tested. Explicit pointer/wheel binds retain precedence and niri syntax. No idle timer or extra frame thread. Native workspace previews still show only the active HWND scene, not niri's two-workspace compositor crop; see the Lane T report.
 

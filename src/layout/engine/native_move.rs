@@ -29,7 +29,7 @@ impl TilingEngine {
         self.apply_all(backend);
     }
 
-    fn finish_native_move(&mut self, id: WindowId, final_rect: Option<Rect>) {
+    pub(super) fn finish_native_move(&mut self, id: WindowId, final_rect: Option<Rect>) {
         let Some(before) = self.native_moves.remove(&id) else {
             return;
         };

@@ -571,6 +571,28 @@ mod tests {
     }
 
     #[test]
+    fn lane_t_drop_uses_actual_variable_width_scrolled_destinations() {
+        // Adapt T's nearest-column regression to W's shared hint/drop selector.
+        let columns: Vec<_> = [
+            Rect::new(-100, 0, 250, 700),
+            Rect::new(170, 0, 650, 700),
+            Rect::new(840, 0, 300, 700),
+        ]
+        .into_iter()
+        .map(|bounds| ColumnGeometry { bounds, slots: vec![(0, 0), (1, 700)] })
+        .collect();
+        let view = Rect::new(-100, 0, 1240, 700);
+        let target = |point| insertion_destination(&columns, view, point, 20, 300).unwrap().position;
+        assert_eq!(target(Point::new(500, 0)), InsertPosition::InColumn(1, 0));
+        assert_eq!(target(Point::new(835, 300)), InsertPosition::NewColumn(2));
+        assert_eq!(target(Point::new(-900, 300)), InsertPosition::NewColumn(0));
+        assert_eq!(
+            insertion_destination(&[], view, Point::new(10, 10), 20, 300).unwrap().position,
+            InsertPosition::NewColumn(0)
+        );
+    }
+
+    #[test]
     fn edges_make_columns_and_vertical_gaps_offer_every_slot() {
         let mut ws = Workspace::new();
         ws.columns = vec![column(20, &[1, 2]), column(440, &[3])];

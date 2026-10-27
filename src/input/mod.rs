@@ -4,6 +4,7 @@ pub mod focus;
 pub mod gestures;
 pub mod grab;
 pub mod hotkey;
+pub mod interactive;
 pub mod keyboard;
 pub mod layout_actions;
 pub mod low_level_hook;
