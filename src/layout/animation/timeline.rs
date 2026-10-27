@@ -183,6 +183,31 @@ impl Animation {
         }
     }
 
+    /// Gesture hand-off starts with the measured physical velocity, even when
+    /// the nearest snap equals the current position. Off/easing policies retain
+    /// their usual semantics; a spring owns deceleration and termination.
+    pub fn with_velocity(
+        start: f64,
+        end: f64,
+        velocity: f64,
+        kind: AnimationKind,
+        slowdown: f64,
+    ) -> Self {
+        let mut animation = Self::with_kind(start, end, kind, slowdown);
+        if matches!(kind, AnimationKind::Spring(s) if s.valid())
+            && slowdown.is_finite()
+            && slowdown > 0.0
+            && velocity.is_finite()
+            && (start != end || velocity != 0.0)
+        {
+            animation.finished = false;
+            animation.initial_velocity = velocity;
+            animation.velocity = velocity;
+            animation.value = animation.start;
+        }
+        animation
+    }
+
     /// Retarget from the displayed value, retaining spring momentum. Easing keeps
     /// positional continuity (its prescribed curve restarts with its own derivative).
     pub fn retarget(&mut self, end: f64, kind: AnimationKind, slowdown: f64) {
@@ -356,6 +381,20 @@ impl RectAnimation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gesture_seed_moves_with_measured_velocity_even_at_its_snap() {
+        let kind = AnimationKind::Spring(Spring::default());
+        let mut moving = Animation::with_velocity(300.0, 300.0, 900.0, kind, 1.0);
+        assert_eq!(moving.velocity(), 900.0);
+        assert!(!moving.is_finished());
+        assert!(moving.tick(1) > 300.0);
+        assert_eq!(moving.tick(60_000), 300.0);
+        assert!(moving.is_finished());
+        let off = Animation::with_velocity(0.0, 100.0, 900.0, AnimationKind::Off, 1.0);
+        assert_eq!(off.current(), 100.0);
+        assert!(off.is_finished());
+    }
 
     #[test]
     fn analytic_springs_are_frame_rate_independent_and_settle() {

@@ -1,6 +1,7 @@
 pub mod dispatch;
 mod double_alt;
 pub mod focus;
+pub mod gestures;
 pub mod grab;
 pub mod hotkey;
 pub mod keyboard;

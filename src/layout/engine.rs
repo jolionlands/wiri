@@ -38,6 +38,7 @@ mod workspace_names;
 // What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
 mod decor;
 mod float_stack;
+mod gestures;
 mod motion;
 mod native_clip;
 mod native_move;
@@ -772,6 +773,8 @@ pub struct TilingEngine {
     animation_wake: Option<Arc<tokio::sync::Notify>>,
     frame_in_progress: bool,
     transitions: transitions::Transitions,
+    gesture_output: Option<OutputId>,
+    gesture_workspace_offset: Option<(OutputId, f64)>,
     // ---- Item 3: sticky windows (visible on all workspaces) ----
     /// Windows marked sticky by the user; they float above all workspaces and
     /// are never hidden during workspace switches.
@@ -847,6 +850,8 @@ impl TilingEngine {
             animation_wake: None,
             frame_in_progress: false,
             transitions: Default::default(),
+            gesture_output: None,
+            gesture_workspace_offset: None,
             sticky_windows: HashSet::new(),
             focus_history: focus_actions::FocusHistory::default(),
             foreground_observations: foreground::ForegroundReducer::default(),
@@ -2259,6 +2264,9 @@ impl TilingEngine {
     /// visible is left where it is (no scroll), and the offset stays inside the
     /// valid range.
     fn reveal_focused_column(&mut self, focused_output: OutputId) {
+        if self.gesture_output == Some(focused_output) {
+            return;
+        }
         let from = self
             .monitors
             .get(&focused_output)
@@ -2731,7 +2739,12 @@ impl TilingEngine {
         // in overview mode (overview already lays out workspaces vertically)
         // and when no slide is active (returns 0.0).
         let slide_offset_y = if !overview_active {
-            self.animation.workspace_slide_offset(output_id) as i32
+            self.gesture_workspace_offset
+                .filter(|(output, _)| *output == output_id)
+                .map_or_else(
+                    || self.animation.workspace_slide_offset(output_id),
+                    |(_, value)| value,
+                ) as i32
         } else {
             0
         };

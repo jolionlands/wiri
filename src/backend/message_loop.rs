@@ -678,6 +678,7 @@ impl MessageLoop {
         // and hot-reload paths share a single source of truth.
         crate::input::dispatch::initialize(thread_id);
         crate::input::focus::initialize(engine.clone(), backend_handle.clone(), hwnd);
+        crate::input::gestures::configure(engine.clone(), backend_handle.clone());
         let mut hook_active = false;
         match crate::input::start_keyboard_hook() {
             Ok(()) => hook_active = true,
@@ -727,6 +728,7 @@ impl MessageLoop {
                 }
                 if msg.message == WM_RELOAD_HOTKEYS {
                     crate::input::focus::reload();
+                    crate::input::gestures::configure(engine.clone(), backend_handle.clone());
                     // Hot-reload: unregister old, re-read config, register new
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
@@ -805,6 +807,7 @@ impl MessageLoop {
         crate::overlay::compositor::detach_message_thread();
         crate::overlay::decor::layer::detach_message_thread();
         crate::input::focus::shutdown();
+        crate::input::gestures::shutdown();
         crate::input::dispatch::shutdown();
         unsafe {
             let _ = DestroyWindow(hwnd);

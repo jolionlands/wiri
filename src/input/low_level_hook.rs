@@ -656,7 +656,7 @@ fn cancel_move_on_key(vk: u32, pressed: bool) {
 /// Check if a grab is currently active
 pub fn is_grab_active() -> bool {
     let state = HOOK_STATE.lock();
-    matches!(state.grab, GrabState::None) == false
+    !matches!(state.grab, GrabState::None) || crate::input::gestures::is_active()
 }
 
 /// Get a copy of the current grab state
@@ -736,6 +736,13 @@ unsafe extern "system" fn mouse_hook_callback(
     // Windows deliver them to its host, never the ordinary bind/grab dispatcher.
     if crate::overlay::screenshot_ui::is_active() {
         return CallNextHookEx(None, n_code, w_param, l_param);
+    }
+    if let Some(consume) = crate::input::gestures::captured_event(msg, cursor) {
+        return if consume {
+            LRESULT(1)
+        } else {
+            CallNextHookEx(None, n_code, w_param, l_param)
+        };
     }
     if msg == WM_MOUSEMOVE {
         crate::input::focus::on_mouse_move(cursor);
@@ -818,6 +825,17 @@ unsafe extern "system" fn mouse_hook_callback(
         for a in actions {
             crate::input::dispatch::send(a);
         }
+        if mods & (1 | 8) != 0 {
+            mask_shell_menu();
+        }
+        return LRESULT(1);
+    }
+    // Explicit button/wheel binds always win; middle gestures use the same Mod.
+    if button == Some((2, true))
+        && mods == crate::input::pointer::ENGINE.lock().mod_key
+        && crate::input::gestures::begin_middle(cursor)
+    {
+        crate::input::pointer::ENGINE.lock().capture_gesture(2);
         if mods & (1 | 8) != 0 {
             mask_shell_menu();
         }

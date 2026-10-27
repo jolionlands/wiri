@@ -96,6 +96,30 @@ impl AnimationManager {
         }
     }
 
+    /// Replace a camera timeline with a gesture's displayed position and measured
+    /// velocity, rather than retaining a pre-grab animation's stale momentum.
+    pub fn animate_with_velocity(
+        &mut self,
+        target: AnimationTarget,
+        start: f64,
+        end: f64,
+        velocity: f64,
+        kind: AnimationKind,
+    ) {
+        let kind = if self.enabled {
+            kind
+        } else {
+            AnimationKind::Off
+        };
+        self.animations.insert(
+            target,
+            Animation::with_velocity(start, end, velocity, kind, self.slowdown),
+        );
+        if let Some(wake) = &self.wake {
+            wake.notify_one();
+        }
+    }
+
     /// Start a new animation with custom duration (legacy easing API).
     pub fn animate_with_duration(
         &mut self,

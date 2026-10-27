@@ -15,6 +15,8 @@ impl TilingEngine {
     pub(super) fn configure_motion(&mut self, options: &AnimationsConfig) {
         self.reset_composited_transitions();
         self.animation.cancel_all();
+        self.gesture_output = None;
+        self.gesture_workspace_offset = None;
         self.animating_rects.clear();
         self.animation.set_enabled(options.enabled);
         self.animation.set_kind(options.workspace_kind());
