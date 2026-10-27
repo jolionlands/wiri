@@ -779,6 +779,81 @@ mod tests {
         assert_eq!(workspace_order(&engine, output, ids[1]), vec![vec![7]]);
     }
 
+    /// The `workspace` number `window-list` reports is the workspace's place from the top.  With
+    /// `empty-workspace-above-first` a window sent up lands on the empty workspace above, a
+    /// fresh empty one is inserted over it, and so the moved window keeps number 2 while every
+    /// window that stayed goes from number 2 to 3.  The live `h76_move_window_down_or_to_workspace`
+    /// compares the moved window with the windows that stayed for exactly this reason (its first
+    /// version compared the moved window's own number, 2 against 2, and failed on a correct move).
+    #[test]
+    fn a_window_sent_up_keeps_its_workspace_number_while_the_windows_that_stayed_move_down_one() {
+        let backend = BackendHandle::default_for_test();
+        let mut engine = TilingEngine::new(LayoutConfig {
+            empty_workspace_above_first: true,
+            ..LayoutConfig::default()
+        });
+        let output = OutputId::from_name("lane-l-numbers");
+        engine.register_monitor(
+            output,
+            Rect::new(0, 0, 1200, 800),
+            Rect::new(0, 0, 1200, 760),
+        );
+        engine.set_output_name(output, "lane-l-numbers");
+        strip(&mut engine, output, &[&[1, 2], &[3]]);
+        engine.maintain_empty_workspace(output);
+        fn number_of(engine: &TilingEngine, window: isize) -> i32 {
+            let (output, workspace, _) = engine
+                .locate_window(WindowId::new(window))
+                .expect("the window is in a strip");
+            engine.workspace_number_on(output, workspace)
+        }
+        // All three share the first occupied workspace, which is number 2 (the empty one above
+        // is number 1).
+        for window in [1, 2, 3] {
+            assert_eq!(number_of(&engine, window), 2, "window {window} before");
+        }
+        // Window 2 is the bottom tile of its column: up swaps it with window 1 first ...
+        focus(&mut engine, output, 2);
+        run(
+            &mut engine,
+            &backend,
+            "move-window-up-or-to-workspace-up",
+            &[],
+        );
+        assert_eq!(order(&engine, output), vec![vec![2, 1], vec![3]]);
+        // ... and now that it is the top tile the same action sends it to the workspace above.
+        run(
+            &mut engine,
+            &backend,
+            "move-window-up-or-to-workspace-up",
+            &[],
+        );
+        assert_eq!(
+            number_of(&engine, 2),
+            2,
+            "the moved window is on the workspace that was the empty one"
+        );
+        assert_eq!(number_of(&engine, 1), 3, "a window that stayed moved down a number");
+        assert_eq!(number_of(&engine, 3), 3, "so did the other one");
+        assert_ne!(
+            number_of(&engine, 2),
+            number_of(&engine, 1),
+            "relative to the windows that stayed, the moved one is on another workspace"
+        );
+        let numbers: Vec<i32> = engine
+            .monitors
+            .get(&output)
+            .map(|monitor| {
+                monitor
+                    .workspace_ids()
+                    .iter()
+                    .map(|id| engine.workspace_number_on(output, *id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(numbers.first(), Some(&1), "a new empty workspace is on top");
+    }
+
     #[test]
     fn focus_floating_and_tiling_switch_between_the_two_layers() {
         let (mut engine, backend, output) = fixture();
