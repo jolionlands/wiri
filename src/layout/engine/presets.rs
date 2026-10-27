@@ -268,10 +268,23 @@ mod tests {
             ]
         );
         engine.switch_preset_window_height(true, &be);
-        // A column with two windows, a 744 px view and 12 px gaps: a third of (732 + 12).
+        // A column of two windows, a 744 px view and 12 px gaps gives each 366 px, which
+        // sits between the half (360 px) and the two-thirds preset (484 px): niri takes the
+        // next preset *wider* than the window, so the first switch lands on two thirds.
         let tile = focused_tile(&engine, output);
-        assert_eq!(tile.height_proportion, Some(1.0 / 3.0));
+        assert_eq!(tile.height_proportion, Some(2.0 / 3.0));
+        assert_eq!(tile.height_preset_idx, Some(2));
+        // The thirds of `preset-window-heights` resolve against the same room.
         assert_eq!(proportion_px(732, 12, 1.0 / 3.0), 236);
+        assert_eq!(proportion_px(732, 12, 2.0 / 3.0), 484);
+        // Backwards from there goes to the half, then to the third.
+        engine.switch_preset_window_height(false, &be);
+        assert_eq!(focused_tile(&engine, output).height_proportion, Some(0.5));
+        engine.switch_preset_window_height(false, &be);
+        assert_eq!(
+            focused_tile(&engine, output).height_proportion,
+            Some(1.0 / 3.0)
+        );
     }
 
     #[test]

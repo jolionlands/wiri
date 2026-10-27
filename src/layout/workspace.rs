@@ -2016,6 +2016,7 @@ mod tests {
     #[test]
     fn test_swap_window_exchanges_the_windows_of_two_columns() {
         let mut ws = ws_with(&[&[1, 2], &[3, 4], &[5]]);
+        ws.columns[0].active_window = Some(WindowId::new(1));
         ws.columns[1].active_window = Some(WindowId::new(4));
         // The focused window goes into the neighbour, the neighbour's active window comes
         // into this column at the same index.

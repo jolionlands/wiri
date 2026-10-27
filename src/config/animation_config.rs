@@ -23,6 +23,8 @@ pub struct AnimationsConfig {
     pub resize: Option<AnimationKind>,
     pub window_open: Option<AnimationKind>,
     pub window_close: Option<AnimationKind>,
+    /// niri `recent-windows-close`: the fade-out of the recent-windows overlay.
+    pub recent_windows_close: Option<AnimationKind>,
 }
 
 impl Default for AnimationsConfig {
@@ -52,6 +54,7 @@ impl AnimationsConfig {
             resize: None,
             window_open: None,
             window_close: None,
+            recent_windows_close: None,
         }
     }
 
@@ -110,6 +113,13 @@ impl AnimationsConfig {
     }
     pub fn close_kind(&self) -> AnimationKind {
         self.content_kind(self.window_close, Easing::QuadOut)
+    }
+
+    /// niri `recent-windows-close`: how the recent-windows overlay fades out.  Nothing is
+    /// faded when animations are off or the option says `off`; a spring is boxed to a
+    /// duration by the overlay (`overlay::recent_windows::CloseFade`).
+    pub fn recent_windows_close_kind(&self) -> AnimationKind {
+        self.content_kind(self.recent_windows_close, Easing::QuadOut)
     }
 
     pub fn workspace_kind(&self) -> AnimationKind {

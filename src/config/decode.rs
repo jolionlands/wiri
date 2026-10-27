@@ -3262,7 +3262,7 @@ mod tests {
         assert_eq!(d.config.binds.hotkeys[0].key, "MouseLeft");
         assert_eq!(d.config.binds.hotkeys[1].key, "F7");
         // An action wiri lacks but niri has: a warning, not an error.
-        let d = load("binds { Mod+X { swap-window-left; } }\n");
+        let d = load("binds { Mod+X { toggle-debug-tint; } }\n");
         assert!(errors(&d).is_empty());
         assert!(
             warnings(&d)[0].contains("not implemented by wiri yet"),
