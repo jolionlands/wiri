@@ -37,8 +37,8 @@ mod workspace_actions_tests;
 mod workspace_names;
 // What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
 mod decor;
-mod float_stack;
 mod dnd;
+mod float_stack;
 mod gestures;
 mod interactive;
 mod motion;

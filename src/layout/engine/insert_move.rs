@@ -579,15 +579,24 @@ mod tests {
             Rect::new(840, 0, 300, 700),
         ]
         .into_iter()
-        .map(|bounds| ColumnGeometry { bounds, slots: vec![(0, 0), (1, 700)] })
+        .map(|bounds| ColumnGeometry {
+            bounds,
+            slots: vec![(0, 0), (1, 700)],
+        })
         .collect();
         let view = Rect::new(-100, 0, 1240, 700);
-        let target = |point| insertion_destination(&columns, view, point, 20, 300).unwrap().position;
+        let target = |point| {
+            insertion_destination(&columns, view, point, 20, 300)
+                .unwrap()
+                .position
+        };
         assert_eq!(target(Point::new(500, 0)), InsertPosition::InColumn(1, 0));
         assert_eq!(target(Point::new(835, 300)), InsertPosition::NewColumn(2));
         assert_eq!(target(Point::new(-900, 300)), InsertPosition::NewColumn(0));
         assert_eq!(
-            insertion_destination(&[], view, Point::new(10, 10), 20, 300).unwrap().position,
+            insertion_destination(&[], view, Point::new(10, 10), 20, 300)
+                .unwrap()
+                .position,
             InsertPosition::NewColumn(0)
         );
     }
