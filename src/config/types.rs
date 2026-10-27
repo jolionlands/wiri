@@ -35,6 +35,7 @@ impl Default for Config {
                 primary: false,
                 position_set: false,
                 focus_at_startup: false,
+                hot_corners: None,
                 transform: String::new(),
                 enable: true,
                 layout_override: None,
@@ -246,6 +247,8 @@ pub struct OutputConfig {
     pub position_set: bool,
     /// Select this output in wiri once at startup, not as the Windows primary display.
     pub focus_at_startup: bool,
+    /// Omitted inherits global gestures.hot-corners; a block replaces it.
+    pub hot_corners: Option<super::hot_corner_config::HotCorners>,
     pub position: Position,
     pub width: u32,
     pub height: u32,
@@ -1952,6 +1955,7 @@ mod tests {
             name: "DP-1".to_string(),
             position_set: false,
             focus_at_startup: false,
+            hot_corners: None,
             position: Position::default(),
             width: 1920,
             height: 1080,

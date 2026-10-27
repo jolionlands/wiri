@@ -5,6 +5,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane V item 3 - event-driven overview hot corners
+- Enable niri's default top-left physical-pixel corner, named corners and global/per-output `hot-corners` policies. A 120 ms one-shot dwell toggles once per entry; parking or an IPC close cannot rearm it.
+- Reuse the existing low-level mouse hook and message thread; no idle timer, poller or worker. Add pure policy/dwell/negative-origin tests and H64 locked-desktop checks (results in the Lane V report).
+
 ### Lane V item 2 — overview pointer and normal actions
 - Add captured click/drag handling, workspace/new-workspace drops above/between/below, drag dwell, high-resolution wheel workspace navigation and right-drag scrolling. Keep normal actions live and refresh DWM sources after model changes; floating previews participate too.
 - Cover pure hit/drag/scroll/insertion/source lifecycle logic and add H62/H63 desktop checks; live results remain explicitly pending in the Lane V report.

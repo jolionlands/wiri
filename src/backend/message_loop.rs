@@ -686,6 +686,7 @@ impl MessageLoop {
             .full_config()
             .is_some_and(|c| c.input.touchpad_enabled);
         crate::input::touchpad::configure(touchpad_enabled, engine.clone(), backend_handle.clone());
+        crate::input::hot_corner::initialize(engine.clone(), backend_handle.clone(), hwnd);
         let mut hook_active = false;
         match crate::input::start_keyboard_hook() {
             Ok(()) => hook_active = true,
@@ -730,7 +731,9 @@ impl MessageLoop {
                 if crate::overlay::decor::layer::handle_message(msg.message) {
                     continue;
                 }
-                if crate::input::focus::handle_message(&msg) {
+                if crate::input::focus::handle_message(&msg)
+                    || crate::input::hot_corner::handle_message(&msg)
+                {
                     continue;
                 }
                 if msg.message == WM_RELOAD_HOTKEYS {
@@ -749,6 +752,7 @@ impl MessageLoop {
                         backend_handle.clone(),
                     );
                     crate::input::touchpen::configure(engine.clone(), backend_handle.clone());
+                    crate::input::hot_corner::reload();
                     // Hot-reload: unregister old, re-read config, register new
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
@@ -826,6 +830,7 @@ impl MessageLoop {
         crate::input::recent::reset();
         crate::overlay::compositor::detach_message_thread();
         crate::overlay::decor::layer::detach_message_thread();
+        crate::input::hot_corner::shutdown();
         crate::input::focus::shutdown();
         crate::input::dnd::shutdown();
         crate::input::touchpen::shutdown();
@@ -860,6 +865,7 @@ impl MessageLoop {
                 // diffs against the engine's known set, registers new monitors,
                 // and unregisters vanished ones (see `handle_backend_event`).
                 info!("WM_DISPLAYCHANGE received — monitor configuration changed");
+                crate::input::hot_corner::display_changed();
                 crate::backend::hooks::notify_display_change();
                 LRESULT(0)
             }

@@ -24,6 +24,8 @@ use super::types::*;
 mod animations_decode;
 mod effects_decode;
 mod gestures_decode;
+#[path = "decode/hot_corner_decode.rs"]
+mod hot_corner_decode;
 #[path = "decode/overview_decode.rs"]
 mod overview_decode;
 #[path = "decode/recent_windows_decode.rs"]
@@ -1376,6 +1378,7 @@ impl Decoder {
             primary: false,
             position_set: false,
             focus_at_startup: false,
+            hot_corners: None,
             transform: String::new(),
             enable: true,
             layout_override: None,
@@ -1531,7 +1534,8 @@ impl Decoder {
                     self.decode_layout_into(child, &mut partial);
                     out.layout_override = Some(partial);
                 }
-                "max-bpc" | "modeline" | "background-color" | "backdrop-color" | "hot-corners" => {
+                "hot-corners" => out.hot_corners = Some(self.decode_hot_corners(child)),
+                "max-bpc" | "modeline" | "background-color" | "backdrop-color" => {
                     self.unsupported(child, "")
                 }
                 _ => self.unknown(
@@ -1553,6 +1557,7 @@ impl Decoder {
                         "mod-key",
                         "variable-refresh-rate",
                         "focus-at-startup",
+                        "hot-corners",
                     ],
                 ),
             }
