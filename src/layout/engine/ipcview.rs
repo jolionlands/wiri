@@ -313,8 +313,8 @@ impl TilingEngine {
                 focus_timestamp: self.focus_timestamps.get(window).copied(),
                 class_name: info.class_name.clone(),
                 output: place.and_then(|p| names.get(&p.output).map(|name| (*name).clone())),
-                is_fullscreen: self.fullscreen_windows.contains(window),
-                is_maximized: self.maximized_edges.contains(window),
+                is_fullscreen: self.is_fullscreen(*window),
+                is_maximized: self.is_maximized_to_edges(*window),
                 is_minimized: self.minimized.contains_key(window),
             });
         }

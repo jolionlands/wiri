@@ -389,22 +389,22 @@ impl Decoder {
                     }
                 }
                 "gap" => {
-                    if let Some(v) = self.arg_number(c, -4096.0, 4096.0) {
+                    if let Some(v) = self.arg_number(c, -65535.0, 65535.0) {
                         style.gap = v;
                     }
                 }
                 "width" => {
-                    if let Some(v) = self.arg_number(c, 0.0, 4096.0) {
+                    if let Some(v) = self.arg_number(c, 0.0, 65535.0) {
                         style.width = v;
                     }
                 }
                 "gaps-between-tabs" => {
-                    if let Some(v) = self.arg_number(c, 0.0, 4096.0) {
+                    if let Some(v) = self.arg_number(c, 0.0, 65535.0) {
                         style.gaps_between_tabs = v;
                     }
                 }
                 "corner-radius" => {
-                    if let Some(v) = self.arg_number(c, 0.0, 4096.0) {
+                    if let Some(v) = self.arg_number(c, 0.0, 65535.0) {
                         style.corner_radius = v;
                     }
                 }
@@ -413,7 +413,9 @@ impl Decoder {
                     self.no_children(c);
                     for prop in &c.props {
                         if prop.key == "total-proportion" {
-                            if let Some(v) = self.value_number(c, &prop.value, 0.0, 2.0) {
+                            // The pinned niri schema accepts an optional f64 here; the
+                            // indicator clamps it to 0..2 when producing geometry.
+                            if let Some(v) = self.value_number(c, &prop.value, f64::MIN, f64::MAX) {
                                 style.length = v;
                             }
                         } else {
@@ -471,9 +473,155 @@ impl Decoder {
                         "active-color",
                         "inactive-color",
                         "urgent-color",
+                        "active-gradient",
+                        "inactive-gradient",
+                        "urgent-gradient",
                     ],
                 ),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+    use crate::config::decode::decode_text;
+
+    fn style(body: &str) -> TabIndicatorStyle {
+        let decoded = decode_text(
+            &format!("layout {{ tab-indicator {{ {body} }} }}"),
+            "",
+            None,
+        );
+        assert!(!decoded.has_errors(), "{body}: {:?}", decoded.issues);
+        decoded.config.layout.effects.tab_indicator
+    }
+
+    #[test]
+    fn pinned_niri_tab_indicator_defaults_and_all_options() {
+        let defaults = style("");
+        assert_eq!(defaults, TabIndicatorStyle::default());
+        assert!(!defaults.off && !defaults.hide_when_single_tab && !defaults.place_within_column);
+        assert_eq!(
+            (defaults.width, defaults.gap, defaults.length),
+            (4.0, 5.0, 0.5)
+        );
+        assert_eq!(
+            (defaults.gaps_between_tabs, defaults.corner_radius),
+            (0.0, 0.0)
+        );
+        assert_eq!(defaults.position, TabPosition::Left);
+        assert!(
+            defaults.active.is_none() && defaults.inactive.is_none() && defaults.urgent.is_none()
+        );
+
+        let parsed = style(
+            r##"
+            off; on; hide-when-single-tab; place-within-column;
+            width 12.5; gap -6.25; gaps-between-tabs 3.5; corner-radius 8.75;
+            length total-proportion=0.75; position "bottom";
+            active-color "#ff0000";
+            inactive-color "#00ff00";
+            urgent-color "#0000ff";
+        "##,
+        );
+        assert!(!parsed.off && parsed.hide_when_single_tab && parsed.place_within_column);
+        assert_eq!(
+            (parsed.width, parsed.gap, parsed.length),
+            (12.5, -6.25, 0.75)
+        );
+        assert_eq!(
+            (parsed.gaps_between_tabs, parsed.corner_radius),
+            (3.5, 8.75)
+        );
+        assert_eq!(parsed.position, TabPosition::Bottom);
+        for paint in [parsed.active, parsed.inactive, parsed.urgent] {
+            assert!(matches!(paint, Some(PaintStyle::Color(_))));
+        }
+        assert!(style("off;").off);
+    }
+
+    #[test]
+    fn every_indicator_side_and_gradient_spelling_is_decoded() {
+        for (text, expected) in [
+            ("left", TabPosition::Left),
+            ("right", TabPosition::Right),
+            ("top", TabPosition::Top),
+            ("bottom", TabPosition::Bottom),
+        ] {
+            assert_eq!(style(&format!("position \"{text}\";")).position, expected);
+        }
+        for key in ["active-gradient", "inactive-gradient", "urgent-gradient"] {
+            let parsed = style(&format!(
+                "{key} from=\"red\" to=\"blue\" angle=45 relative-to=\"workspace-view\" in=\"srgb\";"
+            ));
+            let paint = match key {
+                "active-gradient" => parsed.active,
+                "inactive-gradient" => parsed.inactive,
+                _ => parsed.urgent,
+            };
+            assert!(matches!(paint, Some(PaintStyle::Gradient(_))));
+        }
+    }
+
+    #[test]
+    fn indicator_dimensions_accept_full_pinned_ranges_and_decimals() {
+        for (key, min) in [
+            ("gap", -65535.0),
+            ("width", 0.0),
+            ("gaps-between-tabs", 0.0),
+            ("corner-radius", 0.0),
+        ] {
+            for value in [min, 4096.5, 65535.0] {
+                let parsed = style(&format!("{key} {value};"));
+                let actual = match key {
+                    "gap" => parsed.gap,
+                    "width" => parsed.width,
+                    "gaps-between-tabs" => parsed.gaps_between_tabs,
+                    _ => parsed.corner_radius,
+                };
+                assert_eq!(actual, value);
+            }
+        }
+        // Schema permits all finite proportions; rendering applies the 0..2 clamp.
+        assert_eq!(style("length total-proportion=-0.5;").length, -0.5);
+        assert_eq!(style("length total-proportion=3.5;").length, 3.5);
+    }
+
+    #[test]
+    fn malformed_indicator_options_report_errors_instead_of_silently_defaulting() {
+        for body in [
+            "gap -65535.01;",
+            "gap 65535.01;",
+            "width -0.01;",
+            "width 65535.01;",
+            "gaps-between-tabs -1;",
+            "gaps-between-tabs 65536;",
+            "corner-radius -1;",
+            "corner-radius 65536;",
+            "position \"middle\";",
+            "position 2;",
+            "length 0.5;",
+            "length proportion=0.5;",
+            "length total-proportion=\"half\";",
+            "width 1 2;",
+            "gap size=2;",
+            "unknown-option;",
+            "active-color \"not-a-color\";",
+            "active-gradient from=\"red\";",
+            "inactive-gradient from=\"red\" to=\"blue\" foo=1;",
+            "urgent-gradient from=\"red\" to=\"blue\" relative-to=\"column\";",
+        ] {
+            let decoded = decode_text(
+                &format!("layout {{ tab-indicator {{ {body} }} }}"),
+                "",
+                None,
+            );
+            assert!(
+                decoded.has_errors(),
+                "accepted malformed tab-indicator: {body}"
+            );
         }
     }
 }

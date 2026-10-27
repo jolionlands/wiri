@@ -333,6 +333,12 @@ enum Commands {
         preset: String,
     },
 
+    /// Set the focused column display without toggling it
+    SetColumnDisplay {
+        #[arg(value_parser = ["normal", "tabbed"])]
+        display: String,
+    },
+
     /// Resize the focused column by ±N pixels
     ResizeColumn { delta_px: i32 },
 
@@ -658,6 +664,11 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
         }
         Commands::CenterColumn => IpcMessage::CenterColumn,
         Commands::SetColumnWidth { preset } => IpcMessage::SetColumnWidth { preset },
+        Commands::SetColumnDisplay { display } => IpcMessage::RunAction {
+            name: "set-column-display".to_string(),
+            args: vec![display],
+            quoted: Vec::new(),
+        },
         Commands::ResizeColumn { delta_px } => IpcMessage::ResizeColumn { delta_px },
         Commands::FocusWorkspaceNext => IpcMessage::FocusWorkspaceNext,
         Commands::FocusWorkspacePrevious => IpcMessage::FocusWorkspacePrevious,
@@ -1990,6 +2001,33 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["wiri-ctl", "workspaces"]).expect("parses");
         assert!(!cli.json, "the readable output is the default");
+    }
+
+    #[test]
+    fn set_column_display_subcommand_uses_the_shared_action() {
+        for display in ["normal", "tabbed"] {
+            let expected = serde_json::json!({
+                "type": "run_action",
+                "data": {"name": "set-column-display", "args": [display]}
+            });
+            for args in [
+                vec!["wiri-ctl", "set-column-display", display],
+                vec!["wiri-ctl", "msg", "set-column-display", display],
+                vec!["wiri-ctl", "action", "set-column-display", display],
+                vec!["wiri-ctl", "msg", "action", "set-column-display", display],
+            ] {
+                let request = request_of(&args);
+                assert_eq!(serde_json::to_value(request).unwrap(), expected);
+            }
+        }
+        for args in [
+            vec!["wiri-ctl", "set-column-display"],
+            vec!["wiri-ctl", "set-column-display", "stacked"],
+            vec!["wiri-ctl", "set-column-display", "Normal"],
+            vec!["wiri-ctl", "set-column-display", "tabbed", "normal"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

@@ -5,6 +5,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane V item 4 - explicit tab display and clickable indicators
+- Add niri `set-column-display "normal"|"tabbed"` binds, ctl commands and typed IPC with idempotent selection/focus preservation.
+- Make tab indicators select/focus hidden tabs without activating the overlay. Apply pinned-niri geometry, signed gap/rounding, colours/gradients and reload semantics; ignore inter-tab gaps and margins.
+- Share fullscreen/maximize-to-edges across tabbed columns, suppressing both indicator and reservation until exit. Keep maximize-column distinct. Add pure regressions and H65 desktop checks; evidence and limits are in the Lane V report.
+
 ### Lane V item 3 - event-driven overview hot corners
 - Enable niri's default top-left physical-pixel corner, named corners and global/per-output `hot-corners` policies. A 120 ms one-shot dwell toggles once per entry; parking or an IPC close cannot rearm it.
 - Reuse the existing low-level mouse hook and message thread; no idle timer, poller or worker. Add pure policy/dwell/negative-origin tests and H64 locked-desktop checks (results in the Lane V report).

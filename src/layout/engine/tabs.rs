@@ -1,24 +1,28 @@
 //! Tab selection is focus, not just a different rectangle. Inactive tabs use the same
 //! crash-safe hiding path as inactive workspaces and never enter the positioning batch.
-use super::{BackendHandle, TilingEngine};
+use super::{BackendHandle, DrawMode, TilingEngine};
 use crate::layout::workspace::ColumnDisplay;
-use crate::utils::OutputId;
+use crate::utils::{OutputId, WindowId};
 
 pub(super) fn reserve_indicator(
     mut rect: crate::utils::Rect,
     column: &crate::layout::Column,
     style: &crate::config::TabIndicatorStyle,
     zoom: f64,
+    sizing: DrawMode,
 ) -> crate::utils::Rect {
     use crate::config::TabPosition;
     if !matches!(column.display, ColumnDisplay::Tabbed { .. })
+        || sizing != DrawMode::Inset
         || style.off
         || !style.place_within_column
         || (style.hide_when_single_tab && column.tiles.len() < 2)
     {
         return rect;
     }
-    let space = ((style.width + style.gap).max(0.0) * zoom).round() as u32;
+    // niri rounds each logical dimension to physical pixels before adding them. In
+    // particular a negative gap can cancel all of the reserved space, but never add it.
+    let space = ((style.width * zoom).round() + (style.gap * zoom).round()).max(0.0) as u32;
     match style.position {
         TabPosition::Left => {
             let n = space.min(rect.size.w.saturating_sub(1));
@@ -96,6 +100,47 @@ impl TilingEngine {
         self.apply_layout_for_monitor(output, backend);
     }
 
+    /// A decor click is delivered on the existing session UI thread, after its input
+    /// handler has released the native overlay's state. Revalidate here: layout, reload,
+    /// workspace changes and window destruction can all overtake a queued click.
+    pub fn select_tab_window(&mut self, target: WindowId, backend: &BackendHandle) -> bool {
+        if self.is_overview() || self.effective_zoom() < 1.0 {
+            return false;
+        }
+        let Some((output, workspace, column)) = self.locate_window(target) else {
+            return false;
+        };
+        let Some(monitor) = self.monitors.get(&output) else {
+            return false;
+        };
+        if monitor.active_workspace != workspace {
+            return false;
+        }
+        let Some(col) = monitor.workspace().and_then(|ws| ws.columns.get(column)) else {
+            return false;
+        };
+        let style = &self.effective_config(output).effects.tab_indicator;
+        if !matches!(col.display, ColumnDisplay::Tabbed { .. })
+            || style.off
+            || (style.hide_when_single_tab && col.tiles.len() < 2)
+            || self.column_sizing_mode(col) != DrawMode::Inset
+        {
+            return false;
+        }
+        self.monitors.set_focused(output);
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            monitor.set_focus(target);
+        }
+        self.reveal_focused_column(output);
+        // The layout must unhide the selected HWND before activation: Windows refuses
+        // activation of a hidden tab. It also updates the old/new indicators atomically.
+        self.apply_layout_for_monitor(output, backend);
+        // This is an explicit user click, even when the model selection has not
+        // changed: an unmanaged foreground HWND does not invalidate last_activated.
+        self.activate_now(target, backend);
+        true
+    }
+
     fn cycle_tab(&mut self, forward: bool, backend: &BackendHandle) {
         let Some(output) = self.monitors.focused_id() else {
             return;
@@ -157,6 +202,102 @@ mod tests {
         m.workspace_mut().unwrap().columns.push(column());
         m.set_focus(wid(2));
         m
+    }
+
+    #[test]
+    fn indicator_reservation_follows_each_side_without_moving_the_column_slot() {
+        use crate::config::{TabIndicatorStyle, TabPosition};
+        let col = column();
+        let area = Rect::new(100, 200, 400, 600);
+        let mut style = TabIndicatorStyle {
+            width: 7.0,
+            gap: 3.0,
+            place_within_column: true,
+            ..TabIndicatorStyle::default()
+        };
+        for (position, expected) in [
+            (TabPosition::Left, Rect::new(110, 200, 390, 600)),
+            (TabPosition::Right, Rect::new(100, 200, 390, 600)),
+            (TabPosition::Top, Rect::new(100, 210, 400, 590)),
+            (TabPosition::Bottom, Rect::new(100, 200, 400, 590)),
+        ] {
+            style.position = position;
+            assert_eq!(
+                reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fullscreen_and_edges_remove_indicator_reservation_but_maximize_column_does_not() {
+        let mut col = column();
+        let mut style = crate::config::TabIndicatorStyle {
+            place_within_column: true,
+            ..crate::config::TabIndicatorStyle::default()
+        };
+        let area = Rect::new(100, 200, 400, 600);
+        for mode in [DrawMode::Exact, DrawMode::Edges] {
+            assert_eq!(reserve_indicator(area, &col, &style, 1.0, mode), area);
+        }
+        // maximize-column changes the slot width, not its DrawMode.
+        col.maximized = true;
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            Rect::new(109, 200, 391, 600)
+        );
+        style.off = true;
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            area
+        );
+        style.off = false;
+        style.place_within_column = false;
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            area
+        );
+    }
+
+    #[test]
+    fn indicator_space_rounds_dimensions_separately_and_never_expands_a_tile() {
+        let mut col = column();
+        let mut style = crate::config::TabIndicatorStyle {
+            place_within_column: true,
+            width: 4.6,
+            gap: -0.6,
+            ..crate::config::TabIndicatorStyle::default()
+        };
+        let area = Rect::new(0, 0, 400, 600);
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            Rect::new(4, 0, 396, 600)
+        );
+        style.gap = -65535.0;
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            area
+        );
+        style.gap = 5.0;
+        style.width = 0.0;
+        style.length = 0.0;
+        // Rendering has a one-physical-pixel minimum; reservation intentionally uses raw width.
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            Rect::new(5, 0, 395, 600)
+        );
+        style.hide_when_single_tab = true;
+        col.tiles.truncate(1);
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            area
+        );
+        style.hide_when_single_tab = false;
+        col.display = ColumnDisplay::Stacked;
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            area
+        );
     }
 
     #[test]

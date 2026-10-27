@@ -1,7 +1,9 @@
 //! The Win32 side of the overlay layer.
 //!
-//! One layered, click-through, never-activated tool window per decoration, stacked directly
-//! below the window it belongs to. Windows are created on first use on the existing hotkey
+//! One layered, never-activated tool window per decoration. Frames and hints are click-through
+//! and sit below their anchor; tabs accept clicks only on their tab rectangles and sit above
+//! their anchor (including when a negative gap puts them over the application).
+//! Windows are created on first use on the existing hotkey
 //! message thread: decorations add no thread or timer. WinEvent location changes keep them
 //! aligned with their targets, including applications that enforce their own minimum sizes.
 //!
@@ -13,6 +15,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tracing::{debug, warn};
@@ -22,24 +25,28 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
-    HBITMAP, HDC, HGDIOBJ,
+    ClientToScreen, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, PostThreadMessageW, RegisterClassExW,
-    SetWindowPos, UpdateLayeredWindow, HTTRANSPARENT, HWND_TOP, MA_NOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, ULW_ALPHA, WM_APP, WM_ERASEBKGND,
-    WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindow, GetWindowLongPtrW, IsWindow,
+    PostThreadMessageW, RegisterClassExW, SetWindowPos, UpdateLayeredWindow, GWL_EXSTYLE,
+    GW_HWNDPREV, HTCLIENT, HTTRANSPARENT, HWND_TOP, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, ULW_ALPHA, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use super::paint::Surface;
-use super::spec::{DecorContent, DecorId, DecorSpec};
+use super::spec::{DecorContent, DecorId, DecorSpec, TabHitRegion};
 use super::DecorSink;
-use crate::utils::Rect;
+use crate::utils::{Point, Rect, WindowId};
+
+/// Invoked only on the existing session UI thread, outside native window-state borrows.
+pub type TabHandler = Arc<dyn Fn(WindowId) + Send + Sync>;
 
 /// The window class of every decoration.
 pub const CLASS_NAME: &str = "WiriDecor";
@@ -62,13 +69,54 @@ enum Cmd {
     Set(Vec<DecorSpec>),
     Moved(isize),
     Restack(isize),
+    TabHandler(Option<TabHandler>),
+    Click {
+        overlay: isize,
+        point: Point,
+        target: WindowId,
+    },
     Quit,
 }
 
 static MESSAGE_THREAD: AtomicU32 = AtomicU32::new(0);
 static COMMANDS: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
 thread_local! {
-    static WINDOWS: RefCell<WorkerState> = RefCell::new(WorkerState::new());
+    // Take the worker out while running native calls or callbacks. Reentrant work messages
+    // leave their commands queued for the outer drain; no RefCell borrow crosses Win32.
+    static WINDOWS: RefCell<Option<WorkerState>> = RefCell::new(Some(WorkerState::new()));
+    // WndProc uses this immutable geometry snapshot, never the worker being reconciled.
+    static TAB_INPUT: RefCell<HashMap<isize, Vec<TabHitRegion>>> = RefCell::new(HashMap::new());
+}
+
+fn input_target(overlay: isize, point: Point) -> Option<WindowId> {
+    TAB_INPUT.with(|input| {
+        input
+            .borrow()
+            .get(&overlay)?
+            .iter()
+            .find_map(|r| r.hit_test(point))
+    })
+}
+
+fn remove_input(overlay: isize) {
+    TAB_INPUT.with(|input| {
+        input.borrow_mut().remove(&overlay);
+    });
+}
+
+fn publish_input(overlay: isize, spec: &DecorSpec) {
+    let regions = match &spec.content {
+        DecorContent::Tabs(tabs) => tabs.hit_regions(),
+        _ => Vec::new(),
+    };
+    TAB_INPUT.with(|input| {
+        let mut input = input.borrow_mut();
+        if regions.is_empty() {
+            input.remove(&overlay);
+        } else {
+            input.insert(overlay, regions);
+        }
+    });
 }
 
 fn send(cmd: Cmd) {
@@ -96,15 +144,34 @@ pub fn handle_message(message: u32) -> bool {
     if message != WM_WORK {
         return false;
     }
-    let commands = std::mem::take(&mut *COMMANDS.lock());
-    WINDOWS.with(|state| unsafe { state.borrow_mut().drain(commands) });
+    let Some(mut worker) = WINDOWS.with(|state| state.borrow_mut().take()) else {
+        return true;
+    };
+    loop {
+        let commands = std::mem::take(&mut *COMMANDS.lock());
+        if commands.is_empty() {
+            break;
+        }
+        let clicks = unsafe { worker.drain(commands) };
+        // Native focus/activation can reenter the message pump. The worker is not borrowed,
+        // and reentrant WM_WORK waits in COMMANDS until this callback has released the engine.
+        for (handler, target) in clicks {
+            handler(target);
+        }
+    }
+    WINDOWS.with(|state| *state.borrow_mut() = Some(worker));
     true
 }
 
 pub fn detach_message_thread() {
     MESSAGE_THREAD.store(0, Ordering::Release);
-    COMMANDS.lock().clear();
-    WINDOWS.with(|state| unsafe { state.borrow_mut().drain(vec![Cmd::Quit]) });
+    TAB_INPUT.with(|input| input.borrow_mut().clear());
+    {
+        let mut queue = COMMANDS.lock();
+        queue.clear();
+        queue.push(Cmd::Quit);
+    }
+    handle_message(WM_WORK);
 }
 
 #[derive(Default)]
@@ -127,6 +194,11 @@ impl DecorLayer {
         Self {
             state: Mutex::new(LayerState::default()),
         }
+    }
+
+    /// Install the tab-selection callback without creating a window, thread or timer.
+    pub fn set_tab_handler(&self, handler: TabHandler) {
+        send(Cmd::TabHandler(Some(handler)));
     }
 }
 
@@ -177,6 +249,7 @@ impl DecorSink for DecorLayer {
         st.sent.clear();
         st.anchors.clear();
         send(Cmd::Set(Vec::new()));
+        send(Cmd::TabHandler(None));
     }
 }
 
@@ -188,17 +261,57 @@ fn hwnd_of(raw: isize) -> HWND {
     HWND(raw as *mut std::ffi::c_void)
 }
 
+fn message_point(lparam: LPARAM) -> Point {
+    // GET_X/Y_LPARAM, not LOWORD/HIWORD: monitors can have negative screen coordinates.
+    Point::new(
+        lparam.0 as u16 as i16 as i32,
+        (lparam.0 >> 16) as u16 as i16 as i32,
+    )
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let overlay = hwnd.0 as isize;
     match msg {
-        // Mouse input goes to whatever is below.
-        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
-        // Never take the focus.
+        WM_NCHITTEST => {
+            let hit = input_target(overlay, message_point(lparam)).is_some();
+            LRESULT(if hit {
+                HTCLIENT as isize
+            } else {
+                HTTRANSPARENT as isize
+            })
+        }
+        // Focus the tab on pointer press, like niri. Only queue here: the engine callback
+        // must not run inside a native WndProc or a worker's paint/stack operation.
+        WM_LBUTTONDOWN => {
+            let client = message_point(lparam);
+            let mut point = POINT {
+                x: client.x,
+                y: client.y,
+            };
+            if ClientToScreen(hwnd, &mut point).as_bool() {
+                let point = Point::new(point.x, point.y);
+                if let Some(target) = input_target(overlay, point) {
+                    send(Cmd::Click {
+                        overlay,
+                        point,
+                        target,
+                    });
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => LRESULT(0),
+        // Never give the tool window keyboard focus, even when accepting a tab click.
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_NCDESTROY => {
+            remove_input(overlay);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         // The content comes from `UpdateLayeredWindow`.
         WM_ERASEBKGND => LRESULT(1),
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -303,6 +416,38 @@ impl Drop for Dib {
     }
 }
 
+/// Layered windows normally let alpha-zero pixels pass through before WM_NCHITTEST. Give
+/// otherwise transparent pixels inside each rectangular tab a one-byte alpha floor, so the
+/// native input shape also includes rounded cutouts and transparent configured paints. This
+/// stays out of the pure rasterizer and never expands into gaps or the two-pixel AA margin.
+fn make_tab_rectangles_hittable(surf: &mut Surface<'_>, spec: &DecorSpec, bounds: Rect) {
+    let DecorContent::Tabs(tabs) = &spec.content else {
+        return;
+    };
+    if tabs.tabs.len() != tabs.windows.len() {
+        return;
+    }
+    for (rect, target) in tabs.tab_rects().into_iter().zip(tabs.windows.iter()) {
+        if target.as_isize() == 0 {
+            continue;
+        }
+        let left = (i64::from(rect.loc.x) - i64::from(bounds.loc.x)).clamp(0, i64::from(surf.w));
+        let top = (i64::from(rect.loc.y) - i64::from(bounds.loc.y)).clamp(0, i64::from(surf.h));
+        let right = (i64::from(rect.right()) - i64::from(bounds.loc.x)).clamp(0, i64::from(surf.w));
+        let bottom =
+            (i64::from(rect.bottom()) - i64::from(bounds.loc.y)).clamp(0, i64::from(surf.h));
+        for y in top..bottom {
+            let row = (y * i64::from(surf.w)) as usize;
+            for x in left..right {
+                let pixel = &mut surf.px[row + x as usize];
+                if *pixel >> 24 == 0 {
+                    *pixel = 0x0100_0000;
+                }
+            }
+        }
+    }
+}
+
 /// One layered window.
 struct Overlay {
     hwnd: HWND,
@@ -317,8 +462,12 @@ impl Overlay {
         let class_name = wide(CLASS_NAME);
         let hinstance = GetModuleHandleW(None).ok()?;
         let b = spec.bounds();
+        let mut ex_style = WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+        if !matches!(spec.content, DecorContent::Tabs(_)) {
+            ex_style |= WS_EX_TRANSPARENT;
+        }
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            ex_style,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide(&format!("WiriDecor {:?} {}", spec.id.kind, spec.id.key)).as_ptr()),
             WS_POPUP,
@@ -356,6 +505,7 @@ impl Overlay {
             let mut surf = dib.surface();
             surf.clear();
             spec.render(&mut surf, (b.loc.x, b.loc.y));
+            make_tab_rectangles_hittable(&mut surf, spec, b);
         }
         let pos = POINT {
             x: b.loc.x,
@@ -388,24 +538,42 @@ impl Overlay {
         true
     }
 
-    /// Stack the window directly below its anchor (above every ordinary window when it has
-    /// none) and make sure it is shown, without activating anything.
+    /// Frames go below their anchor; tabs go directly above it so negative gaps still draw
+    /// and receive input over the application. Never activate or promote to the topmost band.
     unsafe fn stack(&self, spec: &DecorSpec, show: bool) {
         let mut flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         if show {
             flags |= SWP_SHOWWINDOW;
         }
-        let anchor = spec.anchor;
-        if anchor != 0 && IsWindow(hwnd_of(anchor)).as_bool() {
-            if SetWindowPos(self.hwnd, hwnd_of(anchor), 0, 0, 0, 0, flags).is_ok() {
+        let anchor = hwnd_of(spec.anchor);
+        if spec.anchor != 0 && IsWindow(anchor).as_bool() {
+            let after = if matches!(spec.content, DecorContent::Tabs(_)) {
+                match GetWindow(anchor, GW_HWNDPREV) {
+                    Ok(prev) if prev == self.hwnd => {
+                        let _ = SetWindowPos(self.hwnd, None, 0, 0, 0, 0, flags | SWP_NOZORDER);
+                        return;
+                    }
+                    Ok(prev)
+                        if !prev.0.is_null()
+                            && GetWindowLongPtrW(prev, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as isize
+                                == 0 =>
+                    {
+                        prev
+                    }
+                    _ => HWND_TOP,
+                }
+            } else {
+                anchor
+            };
+            if SetWindowPos(self.hwnd, after, 0, 0, 0, 0, flags).is_ok() {
                 return;
             }
         }
         let _ = SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0, flags);
     }
 
-    unsafe fn move_to(&mut self, x: i32, y: i32) {
-        let _ = SetWindowPos(
+    unsafe fn move_to(&mut self, x: i32, y: i32) -> bool {
+        if SetWindowPos(
             self.hwnd,
             None,
             x,
@@ -413,15 +581,22 @@ impl Overlay {
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        )
+        .is_err()
+        {
+            return false;
+        }
         self.bounds.loc.x = x;
         self.bounds.loc.y = y;
         MOVES.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
 impl Drop for Overlay {
     fn drop(&mut self) {
+        // Destruction reenters WndProc. Revoke the snapshot before calling USER32.
+        remove_input(self.hwnd.0 as isize);
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
@@ -430,21 +605,25 @@ impl Drop for Overlay {
 
 struct WorkerState {
     windows: HashMap<DecorId, Overlay>,
+    tab_handler: Option<TabHandler>,
 }
 
 impl WorkerState {
     fn new() -> Self {
         Self {
             windows: HashMap::new(),
+            tab_handler: None,
         }
     }
 
-    /// Take every command that is waiting and act on the last set and on the notices after it.
-    unsafe fn drain(&mut self, commands: Vec<Cmd>) {
+    /// Apply the latest snapshot before validating queued input. Return callbacks rather
+    /// than invoking them here, so engine reentry cannot alias the native worker state.
+    unsafe fn drain(&mut self, commands: Vec<Cmd>) -> Vec<(TabHandler, WindowId)> {
         let mut quit = false;
         let mut latest: Option<Vec<DecorSpec>> = None;
         let mut moved: Vec<isize> = Vec::new();
         let mut restack: Vec<isize> = Vec::new();
+        let mut clicks = Vec::new();
         for cmd in commands {
             match cmd {
                 Cmd::Set(v) => {
@@ -461,8 +640,20 @@ impl WorkerState {
                         restack.push(h);
                     }
                 }
+                Cmd::TabHandler(handler) => self.tab_handler = handler,
+                Cmd::Click {
+                    overlay,
+                    point,
+                    target,
+                } => clicks.push((overlay, point, target)),
                 Cmd::Quit => quit = true,
             }
+        }
+        if quit {
+            self.tab_handler = None;
+            self.windows.clear();
+            TAB_INPUT.with(|input| input.borrow_mut().clear());
+            return Vec::new();
         }
         if let Some(set) = latest {
             self.reconcile(set);
@@ -473,9 +664,14 @@ impl WorkerState {
         for h in restack {
             self.restack(h);
         }
-        if quit {
-            self.windows.clear();
-        }
+        let Some(handler) = &self.tab_handler else {
+            return Vec::new();
+        };
+        clicks
+            .into_iter()
+            .filter(|(overlay, point, target)| input_target(*overlay, *point) == Some(*target))
+            .map(|(_, _, target)| (handler.clone(), target))
+            .collect()
     }
 
     unsafe fn reconcile(&mut self, set: Vec<DecorSpec>) {
@@ -505,24 +701,31 @@ impl WorkerState {
             self.windows.remove(&id);
             return;
         }
-        if let Some(o) = self.windows.get_mut(&id) {
-            if o.spec == spec {
-                return;
-            }
-            let same_size = o.bounds.size == b.size;
-            if same_size && o.spec.looks_like(&spec) {
-                if o.bounds.loc != b.loc {
-                    o.move_to(b.loc.x, b.loc.y);
+        if let Some(mut o) = self.windows.remove(&id) {
+            if IsWindow(o.hwnd).as_bool() {
+                if o.spec == spec {
+                    self.windows.insert(id, o);
+                    return;
                 }
-            } else if !o.paint(&spec) {
-                debug!("overlay layer: could not repaint {:?}", id);
+                remove_input(o.hwnd.0 as isize);
+                let same_size = o.bounds.size == b.size;
+                if same_size && o.spec.looks_like(&spec) {
+                    if o.bounds.loc != b.loc && !o.move_to(b.loc.x, b.loc.y) {
+                        return;
+                    }
+                } else if !o.paint(&spec) {
+                    // Failed/extreme styles must not leave a stale clickable decoration.
+                    debug!("overlay layer: could not repaint {:?}", id);
+                    return;
+                }
+                publish_input(o.hwnd.0 as isize, &spec);
+                if o.spec.anchor != spec.anchor {
+                    o.stack(&spec, false);
+                }
+                o.spec = spec;
+                self.windows.insert(id, o);
                 return;
             }
-            if o.spec.anchor != spec.anchor {
-                o.stack(&spec, false);
-            }
-            o.spec = spec;
-            return;
         }
         let Some(mut o) = Overlay::create(&spec) else {
             warn!("overlay layer: could not create the window of {:?}", id);
@@ -532,6 +735,7 @@ impl WorkerState {
             debug!("overlay layer: could not paint {:?}", id);
             return;
         }
+        publish_input(o.hwnd.0 as isize, &spec);
         o.stack(&spec, true);
         self.windows.insert(id, o);
     }

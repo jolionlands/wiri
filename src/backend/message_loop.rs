@@ -1233,6 +1233,10 @@ pub(crate) fn perform_action_on(
             engine.write().toggle_tabbed_for_focused_column(backend);
             engine.write().apply_all(backend);
         }
+        Action::SetColumnDisplay { tabbed } => {
+            let mut engine = engine.write();
+            set_column_display(&mut engine, *tabbed, backend);
+        }
         Action::TabNext => {
             engine.write().focused_column_next_tab(backend);
             engine.write().apply_all(backend);
@@ -1635,6 +1639,21 @@ fn take_window_screenshot() {
     }
 }
 
+/// An explicit display request must not flip a column already in that mode or reset its tab.
+fn set_column_display(engine: &mut TilingEngine, tabbed: bool, backend: &BackendHandle) {
+    let current = engine.monitors().focused().and_then(|monitor| {
+        let column = monitor.workspace()?.columns.get(monitor.focus_column?)?;
+        Some(matches!(
+            column.display,
+            crate::layout::ColumnDisplay::Tabbed { .. }
+        ))
+    });
+    if current.is_some_and(|current| current != tabbed) {
+        engine.toggle_tabbed_for_focused_column(backend);
+        engine.apply_all(backend);
+    }
+}
+
 /// Item 3: capture the full virtual desktop to a BMP file via the shared
 /// helper in `crate::hooks::capture_screenshot_to_pictures` so the hotkey
 /// path and the tray-menu path obey identical destination-resolution rules.
@@ -1710,6 +1729,109 @@ fn terminal_action_from_config(cfg: Option<&crate::config::Config>) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_column_display_is_idempotent_and_preserves_focus_and_tab_selection() {
+        use crate::layout::{Column, ColumnDisplay, Monitor, Tile};
+        use crate::utils::{OutputId, Rect, WindowId};
+
+        let output = OutputId::from_name("column-display-test");
+        let mut engine = TilingEngine::new(Default::default());
+        let backend = BackendHandle::default_for_test();
+        let mut monitor = Monitor::new(
+            output,
+            Rect::new(0, 0, 1366, 768),
+            Rect::new(0, 0, 1366, 728),
+        );
+        let mut column = Column::new();
+        for id in 1..=3 {
+            column.add_tile(Tile::new(WindowId::new(id)));
+        }
+        let mut other = Column::new();
+        other.add_tile(Tile::new(WindowId::new(4)));
+        other.switch_to_tabbed();
+        monitor.workspace_mut().unwrap().columns = vec![column, other];
+        monitor.set_focus(WindowId::new(2));
+        engine.monitors_mut().insert(output, monitor);
+        engine.monitors_mut().set_focused(output);
+
+        let snapshot = |engine: &TilingEngine| {
+            let monitor = engine.monitors().focused().unwrap();
+            let columns = &monitor.workspace().unwrap().columns;
+            (
+                columns[0].display.clone(),
+                columns[0].active_window(),
+                monitor.focus_window,
+                monitor.focus_column,
+                columns[1].display.clone(),
+            )
+        };
+        let initial = snapshot(&engine);
+        set_column_display(&mut engine, false, &backend);
+        set_column_display(&mut engine, false, &backend);
+        assert_eq!(snapshot(&engine), initial);
+
+        set_column_display(&mut engine, true, &backend);
+        assert_eq!(
+            snapshot(&engine),
+            (
+                ColumnDisplay::Tabbed { active_tab: 1 },
+                Some(WindowId::new(2)),
+                Some(WindowId::new(2)),
+                Some(0),
+                ColumnDisplay::Tabbed { active_tab: 0 },
+            )
+        );
+        engine.focused_column_next_tab(&backend);
+        let selected = snapshot(&engine);
+        assert_eq!(selected.0, ColumnDisplay::Tabbed { active_tab: 2 });
+        assert_eq!(selected.2, Some(WindowId::new(3)));
+        set_column_display(&mut engine, true, &backend);
+        set_column_display(&mut engine, true, &backend);
+        assert_eq!(snapshot(&engine), selected);
+
+        set_column_display(&mut engine, false, &backend);
+        let normal = snapshot(&engine);
+        assert_eq!(normal.0, ColumnDisplay::Stacked);
+        assert_eq!(normal.1, selected.1);
+        assert_eq!(normal.2, selected.2);
+        assert_eq!(normal.3, selected.3);
+        assert_eq!(normal.4, selected.4);
+        set_column_display(&mut engine, false, &backend);
+        assert_eq!(snapshot(&engine), normal);
+    }
+
+    #[test]
+    fn explicit_column_display_without_a_focused_column_is_a_noop() {
+        use crate::layout::Monitor;
+        use crate::utils::{OutputId, Rect};
+
+        let mut engine = TilingEngine::new(Default::default());
+        let backend = BackendHandle::default_for_test();
+        for tabbed in [true, false] {
+            set_column_display(&mut engine, tabbed, &backend);
+        }
+        assert!(engine.monitors().focused().is_none());
+
+        let output = OutputId::from_name("empty-column-display-test");
+        let monitor = Monitor::new(
+            output,
+            Rect::new(0, 0, 1366, 768),
+            Rect::new(0, 0, 1366, 728),
+        );
+        engine.monitors_mut().insert(output, monitor);
+        engine.monitors_mut().set_focused(output);
+        for focus_column in [None, Some(0), Some(9)] {
+            engine.monitors_mut().get_mut(&output).unwrap().focus_column = focus_column;
+            for tabbed in [true, false] {
+                set_column_display(&mut engine, tabbed, &backend);
+            }
+            let monitor = engine.monitors().focused().unwrap();
+            assert!(monitor.workspace().unwrap().columns.is_empty());
+            assert_eq!(monitor.focus_column, focus_column);
+            assert_eq!(monitor.focus_window, None);
+        }
+    }
 
     fn d(mods: u32, vk: u32, label: &str) -> (u32, u32, Action) {
         (mods, vk, Action::Spawn(vec![label.to_string()]))

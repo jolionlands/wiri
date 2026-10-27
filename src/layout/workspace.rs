@@ -113,6 +113,8 @@ pub struct Column {
     /// Separate from `SizingMode::Fullscreen`, which applies to a single window
     /// across the whole monitor including reserved bars.
     pub maximized: bool,
+    /// Internal provenance: fullscreen/edge sizing, not manual maximize-column.
+    pub(crate) sizing_forced: bool,
     /// The width the column had when it was maximized (`Some(None)`: the
     /// layout default), to restore when it is toggled back.
     pub pre_max_width: Option<Option<u32>>,
@@ -132,6 +134,7 @@ impl Column {
             width: None,
             display: ColumnDisplay::Stacked,
             maximized: false,
+            sizing_forced: false,
             pre_max_width: None,
             preset_idx: None,
         }
@@ -141,6 +144,7 @@ impl Column {
     /// that has a width of its own is not "as wide as the view" any more.
     pub fn set_width(&mut self, width: Option<u32>) {
         self.maximized = false;
+        self.sizing_forced = false;
         self.pre_max_width = None;
         self.preset_idx = None;
         self.width_proportion = None;
@@ -172,6 +176,7 @@ impl Column {
     /// wide, remembering the width it had; toggling again gives that width back.
     /// Works for a column of any number of tiles.
     pub fn toggle_maximized(&mut self, view_width: u32) {
+        self.sizing_forced = false;
         if self.maximized {
             self.maximized = false;
             self.width = self.pre_max_width.take().unwrap_or(None);
@@ -399,6 +404,7 @@ pub struct WindowSlot {
     pub column_maximized: bool,
     /// The width the column had before it was maximized (see [`Column::pre_max_width`]).
     pub column_pre_max_width: Option<Option<u32>>,
+    pub(crate) column_sizing_forced: bool,
     /// Windows above it in its column, nearest first.
     pub above: Vec<WindowId>,
     /// Windows below it in its column, nearest first.
@@ -594,6 +600,7 @@ impl Workspace {
             column_display: col.display.clone(),
             column_maximized: col.maximized,
             column_pre_max_width: col.pre_max_width,
+            column_sizing_forced: col.sizing_forced,
             above: col.tiles[..index]
                 .iter()
                 .rev()
@@ -664,6 +671,7 @@ impl Workspace {
         col.width_fixed_logical = slot.column_width_fixed_logical;
         col.maximized = column_maximized;
         col.pre_max_width = column_pre_max_width;
+        col.sizing_forced = slot.column_sizing_forced;
         col.display = match column_display {
             // One tile left: its tab is the first.
             ColumnDisplay::Tabbed { .. } => ColumnDisplay::Tabbed { active_tab: 0 },
@@ -699,6 +707,7 @@ impl Workspace {
         new_col.width_fixed_logical = source.width_fixed_logical;
         new_col.preset_idx = source.preset_idx;
         new_col.maximized = source.maximized;
+        new_col.sizing_forced = source.sizing_forced;
         new_col.pre_max_width = source.pre_max_width;
         new_col.add_tile(tile);
         Some(new_col)

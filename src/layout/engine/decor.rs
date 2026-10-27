@@ -157,8 +157,8 @@ pub(super) fn window_radius(requested: Option<u32>, rounded_corners: bool) -> f3
     }
 }
 
-/// The indicator uses the active tab's area and belongs to that column, not to a screen-wide
-/// HUD. Non-selected tabs are fainter; urgency overrides both active and inactive colours.
+/// The indicator belongs to one column. The selected tab chooses the active paint; all
+/// tabs in a column without keyboard focus are dimmed. Urgency overrides the tab selection.
 fn tab_specs(
     cfg: &LayoutConfig,
     workspace: &crate::layout::Workspace,
@@ -166,6 +166,7 @@ fn tab_specs(
     modes: &HashMap<WindowId, DrawMode>,
     urgent: &HashSet<WindowId>,
     focused_output: bool,
+    focused_window: Option<WindowId>,
     view: Rect,
     accent: Option<[u8; 4]>,
 ) -> Vec<DecorSpec> {
@@ -186,36 +187,48 @@ fn tab_specs(
                 return None;
             }
             let active = col.tiles.get(active_tab)?.window_id;
-            if modes.get(&active).map_or(false, |m| *m != DrawMode::Inset) {
+            if col.tiles.iter().any(|tile| {
+                modes
+                    .get(&tile.window_id)
+                    .map_or(false, |mode| *mode != DrawMode::Inset)
+            }) {
                 return None;
             }
             let area = *positions.get(&active)?;
             if !area.intersects(view) {
                 return None;
             }
-            let fallback = if !cfg.effects.border.off {
-                &cfg.effects.border
-            } else {
+            // niri falls back to the enabled focus ring, otherwise to the border,
+            // even when both frame effects are disabled.
+            let fallback = if !cfg.effects.focus_ring.off {
                 &cfg.effects.focus_ring
+            } else {
+                &cfg.effects.border
             };
+            let column_is_active = focused_output
+                && col
+                    .tiles
+                    .iter()
+                    .any(|tile| Some(tile.window_id) == focused_window);
             let paints = col
                 .tiles
                 .iter()
                 .enumerate()
                 .map(|(i, tile)| {
                     let is_urgent = urgent.contains(&tile.window_id);
+                    let is_selected = i == active_tab;
                     let paint = if is_urgent {
                         style.urgent.as_ref()
-                    } else if focused_output {
+                    } else if is_selected {
                         style.active.as_ref()
                     } else {
                         style.inactive.as_ref()
                     };
                     let paint = paint
                         .and_then(|s| paint_of(s, accent))
-                        .or_else(|| paint_for(fallback, is_urgent, focused_output, accent))
+                        .or_else(|| paint_for(fallback, is_urgent, is_selected, accent))
                         .unwrap_or(Paint::Solid(Rgba::new(128, 200, 255, 255)));
-                    if i == active_tab {
+                    if column_is_active {
                         paint
                     } else {
                         paint.faded(0.5)
@@ -229,11 +242,12 @@ fn tab_specs(
                     area,
                     position: style.position,
                     width: style.width.round() as i32,
-                    gap: style.gap.round() as i32,
-                    gaps_between: style.gaps_between_tabs.round() as i32,
-                    length: style.length as f32,
+                    gap: style.gap,
+                    gaps_between: style.gaps_between_tabs,
+                    length: style.length,
                     corner_radius: style.corner_radius as f32,
                     tabs: paints,
+                    windows: col.tiles.iter().map(|tile| tile.window_id).collect(),
                     view,
                 },
             ))
@@ -336,6 +350,7 @@ impl TilingEngine {
                 draw_modes,
                 &self.urgent_windows,
                 inputs.focus_monitor,
+                monitor.focus_window,
                 view,
                 inputs.accent,
             ));
@@ -643,6 +658,184 @@ mod tests {
             Some(Rect::new(420, 8, 350, 712))
         );
         assert_eq!(column_drop_bounds(&Column::new()), None);
+    }
+
+    fn tab_workspace() -> crate::layout::Workspace {
+        use crate::layout::{Column, Tile, Workspace};
+        let mut column = Column::new();
+        for n in 1..=3 {
+            column.add_tile(Tile::new(wid(n)));
+        }
+        column.switch_to_tabbed();
+        column.select_window(wid(2));
+        let mut workspace = Workspace::new();
+        workspace.columns.push(column);
+        workspace
+    }
+
+    fn tabs_for_test(
+        cfg: &LayoutConfig,
+        workspace: &crate::layout::Workspace,
+        modes: &HashMap<WindowId, DrawMode>,
+        urgent: &HashSet<WindowId>,
+        focused_output: bool,
+        focused_window: Option<WindowId>,
+    ) -> Vec<crate::overlay::decor::TabsSpec> {
+        let area = Rect::new(30, 40, 400, 600);
+        let positions = (1..=3).map(|n| (wid(n), area)).collect();
+        tab_specs(
+            cfg,
+            workspace,
+            &positions,
+            modes,
+            urgent,
+            focused_output,
+            focused_window,
+            Rect::new(0, 0, 1366, 768),
+            None,
+        )
+        .into_iter()
+        .map(|spec| match spec.content {
+            DecorContent::Tabs(tabs) => tabs,
+            other => panic!("expected tabs, got {:?}", other),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn tabs_fall_back_to_enabled_focus_ring_otherwise_border_even_when_both_are_off() {
+        let mut cfg = cfg_with(Effects::default());
+        cfg.effects.focus_ring.active = PaintStyle::color("#102030");
+        cfg.effects.focus_ring.inactive = PaintStyle::color("#405060");
+        cfg.effects.focus_ring.urgent = PaintStyle::color("#708090");
+        cfg.effects.border.active = PaintStyle::color("#a02030");
+        cfg.effects.border.inactive = PaintStyle::color("#b05060");
+        cfg.effects.border.urgent = PaintStyle::color("#c08090");
+        let workspace = tab_workspace();
+        let urgent = HashSet::from([wid(3)]);
+        for (ring_off, border_off) in [(false, false), (true, false), (true, true)] {
+            cfg.effects.focus_ring.off = ring_off;
+            cfg.effects.border.off = border_off;
+            let tabs = tabs_for_test(
+                &cfg,
+                &workspace,
+                &HashMap::new(),
+                &urgent,
+                true,
+                Some(wid(2)),
+            );
+            let fallback = if ring_off {
+                &cfg.effects.border
+            } else {
+                &cfg.effects.focus_ring
+            };
+            assert_eq!(
+                tabs[0].tabs,
+                vec![
+                    paint_of(&fallback.inactive, None).unwrap(),
+                    paint_of(&fallback.active, None).unwrap(),
+                    paint_of(&fallback.urgent, None).unwrap(),
+                ]
+            );
+            assert_eq!(tabs[0].windows, vec![wid(1), wid(2), wid(3)]);
+        }
+    }
+
+    #[test]
+    fn explicit_tab_paints_use_selected_tab_urgency_and_whole_column_focus() {
+        let mut cfg = cfg_with(Effects::default());
+        let style = &mut cfg.effects.tab_indicator;
+        style.active = Some(PaintStyle::color("#102030"));
+        style.inactive = Some(PaintStyle::color("#405060"));
+        style.urgent = Some(PaintStyle::color("#708090"));
+        let workspace = tab_workspace();
+        let modes = HashMap::new();
+        let urgent = HashSet::from([wid(2), wid(3)]);
+        let active = paint_of(cfg.effects.tab_indicator.active.as_ref().unwrap(), None).unwrap();
+        let inactive =
+            paint_of(cfg.effects.tab_indicator.inactive.as_ref().unwrap(), None).unwrap();
+        let urgent_paint =
+            paint_of(cfg.effects.tab_indicator.urgent.as_ref().unwrap(), None).unwrap();
+        let focused = tabs_for_test(&cfg, &workspace, &modes, &urgent, true, Some(wid(2)));
+        assert_eq!(
+            focused[0].tabs,
+            vec![inactive.clone(), urgent_paint.clone(), urgent_paint.clone()]
+        );
+        let normal = tabs_for_test(
+            &cfg,
+            &workspace,
+            &modes,
+            &HashSet::new(),
+            true,
+            Some(wid(2)),
+        );
+        assert_eq!(normal[0].tabs[1], active);
+        for (output, focus) in [(false, Some(wid(2))), (true, Some(wid(99))), (true, None)] {
+            let unfocused = tabs_for_test(&cfg, &workspace, &modes, &urgent, output, focus);
+            assert_eq!(
+                unfocused[0].tabs,
+                focused[0]
+                    .tabs
+                    .iter()
+                    .map(|p| p.faded(0.5))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn fullscreen_and_edges_on_any_tab_suppress_rendering_after_every_selection() {
+        let cfg = cfg_with(Effects::default());
+        let mut workspace = tab_workspace();
+        for mode in [DrawMode::Exact, DrawMode::Edges] {
+            let modes = HashMap::from([(wid(1), mode)]);
+            for n in 1..=3 {
+                workspace.columns[0].select_window(wid(n));
+                assert!(tabs_for_test(
+                    &cfg,
+                    &workspace,
+                    &modes,
+                    &HashSet::new(),
+                    true,
+                    Some(wid(n))
+                )
+                .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn maximize_column_keeps_tabs_and_reservation_and_preserves_raw_geometry_values() {
+        let mut cfg = cfg_with(Effects::default());
+        cfg.effects.tab_indicator.place_within_column = true;
+        cfg.effects.tab_indicator.gap = -0.25;
+        cfg.effects.tab_indicator.gaps_between_tabs = 0.25;
+        cfg.effects.tab_indicator.length = f64::MAX;
+        let mut workspace = tab_workspace();
+        workspace.columns[0].maximized = true;
+        let tabs = tabs_for_test(
+            &cfg,
+            &workspace,
+            &HashMap::new(),
+            &HashSet::new(),
+            true,
+            Some(wid(2)),
+        );
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].gap, -0.25);
+        assert_eq!(tabs[0].gaps_between, 0.25);
+        assert_eq!(tabs[0].length, f64::MAX);
+        let area = Rect::new(0, 0, 600, 400);
+        assert_ne!(
+            super::super::tabs::reserve_indicator(
+                area,
+                &workspace.columns[0],
+                &cfg.effects.tab_indicator,
+                1.0,
+                DrawMode::Inset,
+            ),
+            area
+        );
     }
 
     #[test]

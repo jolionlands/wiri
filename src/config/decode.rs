@@ -3028,6 +3028,45 @@ mod tests {
     }
 
     #[test]
+    fn set_column_display_binds_parse_both_modes() {
+        let cfg = clean(
+            "binds {\n    Mod+N { set-column-display \"normal\"; }\n    Mod+T { set-column-display \"tabbed\"; }\n    Mod+U { set-column-display normal; }\n    Mod+V { set-column-display tabbed; }\n}\n",
+        );
+        let binds = &cfg.binds.hotkeys;
+        assert_eq!(binds.len(), 4);
+        assert_eq!(
+            binds[0].parse_action(),
+            Some(crate::input::Action::SetColumnDisplay { tabbed: false })
+        );
+        assert_eq!(
+            binds[1].parse_action(),
+            Some(crate::input::Action::SetColumnDisplay { tabbed: true })
+        );
+        assert_eq!(
+            binds[2].parse_action(),
+            Some(crate::input::Action::SetColumnDisplay { tabbed: false })
+        );
+        assert_eq!(
+            binds[3].parse_action(),
+            Some(crate::input::Action::SetColumnDisplay { tabbed: true })
+        );
+    }
+
+    #[test]
+    fn set_column_display_bind_errors_are_invalid_arguments_not_unsupported_actions() {
+        for action in [
+            "set-column-display",
+            "set-column-display \"stacked\"",
+            "set-column-display \"normal\" \"tabbed\"",
+        ] {
+            let decoded = load(&format!("binds {{\n    Mod+T {{ {action}; }}\n}}\n"));
+            assert_eq!(errors(&decoded).len(), 1, "{action}");
+            assert!(warnings(&decoded).is_empty(), "{action}");
+            assert!(decoded.config.binds.hotkeys.is_empty(), "{action}");
+        }
+    }
+
+    #[test]
     fn niri_only_sections_are_warnings() {
         let d = load("prefer-no-csd\nhotkey-overlay { skip-at-startup }\nscreenshot-path \"~/Pictures/x.png\"\ncursor { xcursor-size 24 }\nlayer-rule { match namespace=\"x\" }\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));

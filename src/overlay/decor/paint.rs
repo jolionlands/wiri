@@ -63,7 +63,7 @@ pub struct Gradient {
     pub to: Rgba,
     /// Degrees: 0 points up, 90 right, 180 down.
     pub angle: f32,
-    /// Measured against the workspace view instead of the shape that is painted.
+    /// Measured against the workspace view instead of the local reference rectangle.
     pub relative_to_view: bool,
 }
 
@@ -203,6 +203,25 @@ impl RRect {
         let cy = self.y + self.h / 2.0;
         let qx = px - cx;
         let qy = py - cy;
+        if self.max_radius() > self.w.min(self.h) / 2.0 {
+            // CSS-fitted asymmetric caps may cross the centre line. Select their arcs
+            // by the corner centres, not the rectangle's quadrants. Uniform radii and
+            // the frame/shadow paths keep the existing distance calculation below.
+            let ax = qx.abs() - self.w / 2.0;
+            let ay = qy.abs() - self.h / 2.0;
+            let mut distance = ax.max(0.0).hypot(ay.max(0.0)) + ax.max(ay).min(0.0);
+            for (dx, dy, r) in [
+                (px - self.x, py - self.y, self.r[0]),
+                (self.right() - px, py - self.y, self.r[1]),
+                (self.right() - px, self.bottom() - py, self.r[2]),
+                (px - self.x, self.bottom() - py, self.r[3]),
+            ] {
+                if dx < r && dy < r {
+                    distance = distance.max((dx - r).hypot(dy - r) - r);
+                }
+            }
+            return distance;
+        }
         let r = match (qx < 0.0, qy < 0.0) {
             (true, true) => self.r[0],
             (false, true) => self.r[1],
@@ -441,8 +460,20 @@ pub fn draw_shadow(
     }
 }
 
-/// Fill a rounded shape with a paint.
+/// Fill a rounded shape with a paint, measuring local gradients against that shape.
 pub fn fill(surf: &mut Surface, shape: &RRect, paint: &Paint, view: &RRect) {
+    fill_relative(surf, shape, paint, shape, view);
+}
+
+/// Fill `shape`, measuring local gradients against `relative` rather than the painted shape.
+/// View-relative gradients still use `view`; all rectangles are in surface coordinates.
+pub fn fill_relative(
+    surf: &mut Surface,
+    shape: &RRect,
+    paint: &Paint,
+    relative: &RRect,
+    view: &RRect,
+) {
     if paint.is_invisible() {
         return;
     }
@@ -451,7 +482,7 @@ pub fn fill(surf: &mut Surface, shape: &RRect, paint: &Paint, view: &RRect) {
         let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
         let cov = shape.coverage(px, py);
         if cov > 0.0 {
-            let c = paint.sample(px, py, shape, view);
+            let c = paint.sample(px, py, relative, view);
             cells.push((x, y, [c[0] * cov, c[1] * cov, c[2] * cov, c[3] * cov]));
         }
     });

@@ -639,8 +639,11 @@ pub struct TilingEngine {
     /// The windows of `fullscreen_windows` that went fullscreen on their own (a video player,
     /// F11): their frame is not touched, and wiri follows them out of fullscreen.
     app_fullscreen: HashSet<WindowId>,
-    /// Windows whose column was made as wide as the view when they went fullscreen or were
-    /// maximized (their column is given its old width back afterwards).
+    /// Native fullscreen style state for tabs: hidden siblings defer changes until
+    /// selected. False means inherited fullscreen has not stripped this HWND yet.
+    tab_sizing_styles: HashMap<WindowId, bool>,
+    /// Windows whose column was made as wide as the view by sizing. Every tab keeps
+    /// ownership, so splitting it into a new column preserves width restoration.
     slot_forced: HashSet<WindowId>,
     /// A window that maximized itself was asked to give up the native state; the value is
     /// whether it is to be maximized to the edges once it has.
@@ -787,6 +790,7 @@ impl TilingEngine {
             output_names: HashMap::new(),
             maximized_edges: HashSet::new(),
             app_fullscreen: HashSet::new(),
+            tab_sizing_styles: HashMap::new(),
             slot_forced: HashSet::new(),
             unzoom_pending: HashMap::new(),
             fullscreen_since: HashMap::new(),
@@ -1834,6 +1838,10 @@ impl TilingEngine {
     }
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        // Preserve a tabbed column's sizing before deleting its former owner.
+        if let Some((output, _, _)) = self.locate_window(window_id) {
+            self.sync_tabbed_sizing(output);
+        }
         self.native_moves.remove(&window_id);
         self.animating_rects.remove(&window_id);
         self.forget_rule_state(window_id);
@@ -2027,7 +2035,7 @@ impl TilingEngine {
         if !self.tiled_windows.contains_key(&window_id) || self.minimized.contains_key(&window_id) {
             return;
         }
-        let was_fullscreen = self.fullscreen_windows.contains(&window_id);
+        let was_fullscreen = self.is_fullscreen(window_id);
         // A minimized window is not fullscreen (the taskbar must come back), does not hold its
         // column as wide as the view and comes back with the frame the application gave it;
         // it is fullscreen (or maximized to the edges) again when it is restored.
@@ -2505,6 +2513,9 @@ impl TilingEngine {
         if self.shut_down {
             return;
         }
+        // Tabbed sizing is a column property. Record inheritance before hiding/showing
+        // a selection or computing indicator reservations, including newly inserted tabs.
+        self.sync_tabbed_sizing(output_id);
         // -- Item 3: auto-tile threshold check (must run before borrowing monitor).
         // When threshold is set and the active workspace exceeds it, auto-engage
         // overview zoom so the user can see everything at a glance. We compute
@@ -2559,6 +2570,7 @@ impl TilingEngine {
         if !overview_active {
             self.hide_inactive_tabs_for_monitor(output_id, backend);
             self.hide_inactive_workspace_windows_for_monitor(output_id, backend);
+            self.sync_tab_sizing_styles(output_id);
             self.reconcile_floats(output_id, backend);
         }
         self.refresh_maximized_widths(output_id);
@@ -3760,8 +3772,13 @@ impl TilingEngine {
                     let base_y =
                         work_rect.loc.y + section_y_offset + y_centre_offset + accumulated_y;
                     let rect = Rect::new(screen_x, base_y, scaled_w, window_height as u32);
-                    let rect =
-                        tabs::reserve_indicator(rect, column, &cfg.effects.tab_indicator, zoom);
+                    let rect = tabs::reserve_indicator(
+                        rect,
+                        column,
+                        &cfg.effects.tab_indicator,
+                        zoom,
+                        self.column_sizing_mode(column),
+                    );
                     positions.push((tile.window_id, rect));
                     accumulated_y += window_height + effective_gap;
                 }
@@ -5112,9 +5129,9 @@ impl TilingEngine {
         self.monitors.focused_id()
     }
 
-    /// Check if a window is fullscreen
+    /// Fullscreen is column-wide while the window belongs to a tabbed column.
     pub fn is_fullscreen(&self, window_id: WindowId) -> bool {
-        self.fullscreen_windows.contains(&window_id)
+        self.effective_fullscreen(window_id)
     }
 
     /// Check if a window is floating
@@ -5185,12 +5202,18 @@ impl TilingEngine {
         updated
     }
 
-    /// Get the sizing mode for a window
+    /// Effective sizing follows the selected tab without changing the column's state.
     pub fn window_sizing_mode(&self, window_id: WindowId) -> SizingMode {
-        self.window_sizing
-            .get(&window_id)
-            .copied()
-            .unwrap_or(SizingMode::Normal)
+        if self.effective_fullscreen(window_id) {
+            SizingMode::Fullscreen
+        } else if self.is_maximized_to_edges(window_id) {
+            SizingMode::Maximized
+        } else {
+            self.window_sizing
+                .get(&window_id)
+                .copied()
+                .unwrap_or(SizingMode::Normal)
+        }
     }
 
     /// Set the focused output (e.g., when clicking on a monitor).
