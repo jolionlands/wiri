@@ -5,6 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Live-gate fixes (34694e4-live)
+- Config strings: a quoted string that starts with three or more backslashes is KDL's escaped spelling of a UNC/device name (`"\\\\.\\DISPLAY1"` is `\\.\DISPLAY1`), not a literal path. The path-compat rule kept all four leading backslashes, so `output "\\\\.\\DISPLAY1" { hot-corners ... }` (the spelling in `docs/modules/CONFIG.md`) named no monitor and was silently ignored. The literal `"\\.\DISPLAY1"` is unchanged.
+
 ### Lane C2 item 1 — config policy and diagnostics
 - Match explicit CLI → nonempty WIRI_CONFIG → compatibility NIRI_CONFIG → APPDATA selection; never create explicit paths. Notify after creating the implicit default and support `config-notification { disable-failed }` without hiding logs/events.
 - Reject duplicate singleton nodes with both source locations and invalid ranges/fractional integers. Render source labels, help and include chains in validation/logs. User binds replace defaults unless the wiri `extend-defaults` extension is explicit.

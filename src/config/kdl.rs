@@ -936,7 +936,7 @@ impl Parser {
     fn path_like_ahead(&self) -> bool {
         match (self.peek(), self.peek_at(1), self.peek_at(2)) {
             (Some(d), Some(':'), Some('\\')) if d.is_ascii_alphabetic() => true,
-            (Some('\\'), Some('\\'), _) => true,
+            (Some('\\'), Some('\\'), third) => third != Some('\\'),
             _ => false,
         }
     }
