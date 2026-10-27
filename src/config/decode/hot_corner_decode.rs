@@ -91,15 +91,30 @@ mod tests {
     }
 
     #[test]
-    fn default_top_left_and_repeat_blocks_replace_only_when_present() {
-        let decoded = decode_text(
-            "gestures { hot-corners { off; }; }\ngestures {}\ngestures { hot-corners {}; }",
+    fn default_top_left_unless_a_block_replaces_it_and_a_repeated_section_is_an_error() {
+        // No block, or a gestures section without `hot-corners`, keeps niri's top-left.
+        for text in ["", "gestures {}", "gestures { hot-corners {}; }"] {
+            let decoded = decode_text(text, "", None);
+            assert!(decoded.issues.is_empty(), "{text}: {:?}", decoded.issues);
+            assert_eq!(decoded.config.gestures.hot_corners, HotCorners::default());
+            assert!(decoded.config.gestures.hot_corners.top_left_enabled());
+        }
+        // Lane C2: one `gestures` section per file. A second one is a located error rather
+        // than a silent replacement, so a stale block can never override the intended one.
+        let repeated = decode_text(
+            "gestures { hot-corners { off; }; }\ngestures { hot-corners {}; }",
             "",
             None,
         );
-        assert!(decoded.issues.is_empty(), "{:?}", decoded.issues);
-        assert_eq!(decoded.config.gestures.hot_corners, HotCorners::default());
-        assert!(decoded.config.gestures.hot_corners.top_left_enabled());
+        assert!(repeated.has_errors());
+        assert!(
+            repeated
+                .issues
+                .iter()
+                .any(|i| i.message.contains("duplicate")),
+            "{:?}",
+            repeated.issues
+        );
     }
 
     #[test]
