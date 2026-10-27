@@ -3,7 +3,9 @@
 //! Workspaces keep their stable local keys and identities (Lane F); this module never
 //! creates or renumbers them. A workspace layout partial is found by the workspace's
 //! *name*, so it follows the workspace across renames, reordering and moves between
-//! outputs. Output preferences are reevaluated only on config, output and name events.
+//! outputs. Output preferences are reevaluated only on output and name events; a config
+//! reload rebuilds the layout views but, as Lane F requires of realized declarations,
+//! never re-places a live workspace.
 use super::*;
 use crate::input::WorkspaceRef;
 
@@ -14,13 +16,16 @@ mod tests;
 pub(super) type WorkspaceLayouts = HashMap<String, HashMap<OutputId, LayoutConfig>>;
 
 impl TilingEngine {
-    /// Rebuild the cached layout views and reevaluate the output preferences.
+    /// An output or name event: rebuild the cached layout views and reevaluate the
+    /// output preferences.
     pub(super) fn refresh_named_config(&mut self) {
-        self.rebuild_layout_views();
+        self.refresh_layout_views();
         self.reconcile_named_workspace_homes();
     }
 
-    fn rebuild_layout_views(&mut self) {
+    /// Rebuild the cached global -> output -> workspace layout views only. A config
+    /// reload (or a runtime reservation change) uses this: it never moves a workspace.
+    pub(super) fn refresh_layout_views(&mut self) {
         self.config_per_monitor.clear();
         self.config_per_workspace.clear();
         let Some(mut config) = self.full_config.clone() else {

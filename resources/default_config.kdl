@@ -142,15 +142,19 @@ animations {
 // ───────────────────────────────────────────────────────────────────────────
 // Keybindings.  `Mod` is Ctrl+Alt unless `input { mod-key }` says otherwise.
 //
-// These binds are added to wiri's built-in defaults (a bind here wins when it uses
-// the same keys as a built-in one).  `extend-defaults false` inside `binds {}` drops
-// the built-ins so that only this block counts.
+// These binds are added to wiri's built-in defaults by the `extend-defaults` line in
+// `binds {}` below (a bind here wins when it uses the same keys as a built-in one).
+// `extend-defaults` is a wiri extension: like niri, a `binds {}` block without it counts
+// alone, with no built-ins filled in.  Delete the line (or write `extend-defaults false`)
+// and only the binds written in this block are active.
 //
 // A bind is a key combination and one action in braces; niri's properties are
 // accepted: repeat=false (holding the key fires once), cooldown-ms=300,
 // hotkey-overlay-title="...".  Comment a bind out with // or `/-` to unbind it.
 // ───────────────────────────────────────────────────────────────────────────
 binds {
+    extend-defaults
+
     // Focus navigation
     Mod+Left   { focus-column-left; }
     Mod+Right  { focus-column-right; }

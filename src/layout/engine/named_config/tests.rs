@@ -405,11 +405,22 @@ fn hotplug_rename_and_reload_migrate_all_named_workspace_contents() {
         .unwrap()
         .column_width = Some(888);
     engine.set_full_config(config);
+    // Lane F's contract: a reload never re-places a realized declaration. It does
+    // rebuild the layout view, so the new block already applies where the workspace is.
+    assert_contents_on(&engine, first, "Code", windows);
+    assert_eq!(
+        engine.config_for_window(windows[0], first).column_width,
+        888
+    );
+    assert_eq!(engine.config_for_window(windows[0], first).column_gap, 11);
+    // The next output event reevaluates the reloaded preference list.
+    engine.set_output_name(second, "RENAMED2");
     assert_contents_on(&engine, second, "Code", windows);
     assert_eq!(
         engine.config_for_window(windows[0], second).column_width,
         888
     );
+    assert_eq!(engine.config_for_window(windows[0], second).column_gap, 22);
 }
 
 #[test]
@@ -447,10 +458,13 @@ fn no_preferences_is_unpinned_and_monitor_is_the_last_fallback_preference() {
     );
 
     // Without preferences a workspace is unpinned and stays where it is; with the
-    // `open-on-output` list gone, `monitor` alone moves Modern.
+    // `open-on-output` list gone, `monitor` alone is Modern's list. A reload alone
+    // re-places nothing (Lane F); the next output event reevaluates the new lists.
     config.workspace[1].monitor.clear();
     config.workspace[2].open_on_outputs.clear();
     engine.set_full_config(config);
+    assert_eq!(named_output(&engine, "Modern"), Some(first));
+    engine.set_output_name(second, "DISPLAY2");
     assert_contents_on(&engine, first, "Unpinned", windows);
     assert_eq!(named_output(&engine, "Legacy"), Some(second));
     assert_eq!(named_output(&engine, "Modern"), Some(second));

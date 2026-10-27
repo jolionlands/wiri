@@ -307,9 +307,11 @@ delivers hotkeys to a locked session, and wiri has no shortcut inhibition).  Act
 niri (`focus=false`, `show-pointer=false`, `skip-confirmation=true`) are accepted.
 
 The older line form still works: `Ctrl+Alt+Left focus-column-left`, `Ctrl+Alt+1 switch-workspace 1`,
-`Mod+Shift+T spawn "wt.exe"`.  A `binds {}` section is merged with the built-in defaults: a bind in the
-config wins when it uses the same keys as a default, the other defaults stay; `extend-defaults false`
-inside `binds {}` drops the defaults.  The same keys twice in one block keep the first (warning).
+`Mod+Shift+T spawn "wt.exe"`.  Like niri, a `binds {}` section replaces the built-in defaults: an omitted or empty block binds nothing.
+The wiri extension `extend-defaults` inside `binds {}` (the generated config has it) adds the built-in
+defaults: a bind in the config wins when it uses the same keys as a default, the other defaults stay.
+The same chord twice in one block is an error naming both lines; a bind in an included file overrides
+the same chord of the including file.
 
 ### `window-rule {}`
 

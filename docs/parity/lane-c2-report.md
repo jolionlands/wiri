@@ -117,3 +117,44 @@ completion allocations occur only on load or command invocation. Balloon display
 is not visually asserted. Windows search deliberately has no machine-wide config
 fallback. Keyboard/system settings are tested synthetically and dry-run only on
 the shared laptop; output-priority behavior on multiple displays is synthetic.
+
+## Integration on the merged head (lanes W, K, F2, T2, S, FK)
+
+Ported onto `wiri/shine-20261024` (e7ced50). Workspace identity stays Lane F's: stable
+local keys, ordered stacks, names stored on the workspace, `open-on-output` creating a
+declared workspace once on the first available preferred output. C2 adds to that without
+replacing it:
+
+- A `workspace` layout block is looked up by the workspace's **name** (and the output it is
+  on), so it follows renames, reordering and moves between outputs; there is no per-key or
+  per-position table to go stale. Overrides of a name nobody carries are inert.
+- Output preferences (repeated `open-on-output`, then the legacy `monitor` as the last
+  entry, the same list that decides first placement) are reevaluated on output
+  registration/removal, output rename/identity and workspace-name events, not on a config
+  reload: Lane F requires that a reload never re-places a realized declaration (its
+  `configured_output_preferences_and_reload_top_insertion...` test), so a reload only
+  rebuilds the layout views and the next output event applies the new list. A live named
+  workspace moves as one object to the first connected output of its list, through the
+  same path as `move-workspace-to-monitor` (identity, columns, floats, minimized homes,
+  scroll and focus state kept; pending hotplug returns are cancelled). With no connected
+  preference it stays where it is; a declaration whose preferred outputs are all absent is
+  still created lazily by Lane F, not on a fallback output.
+- `binds {}` replacement is C2's: the generated first-run config and `examples/minimal.kdl`
+  now carry the explicit `extend-defaults` line, so a first run keeps the whole built-in
+  keymap (53 written chords plus the 17 only the built-in table has: previous-window,
+  resize mode, width preset cycle, sticky, cheatsheet, workspace previous/next, ...).
+
+Classification of the 26 gates that failed in the first locked run (evidence:
+`.scratch/c2-first-summary.json`, the unit-variant request fix script `.scratch/c2-live-fixes.py`,
+the generated-config start in the rerun's `wiri.stderr.log`):
+
+| Gates | Cause | Class |
+| --- | --- | --- |
+| settle_positioning_per_s | 0.4 repositions/s with 40 managed windows (38 strays); the clean-desktop rerun settles at 0 and the idle sample was 0 | environment |
+| h1_f9_f8_reach_application | the chords were typed without making the owned form foreground; the corrected fixture called `FocusForm` before the script defines it (now uses the early helpers) | harness |
+| h9_default_hotkeys_registered | the shipped config registered 52 of its 53 chords and no built-ins once binds stopped inheriting defaults | product (fixed: shipped config opts in; H9 again starts with no config) |
+| h47_bind_properties_act, h49_load_config_file_and_reload_current, h49_bad_config_keeps_last_good | Lane S fixtures appended a second `binds {}` section; duplicate singleton sections are now errors, so the reload failed and F9/F10 never bound | harness (corrected earlier; unit regressions pin the duplicate error) |
+| all seven h67_* | request `{type,data:{}}` for unit variants was rejected before the first probe | harness |
+| h68_explicit_keyboard_reload_dry_run, h68_keyboard_removal_dry_run, h68_explicit_keyboard_startup_dry_run | the log snapshot prefix carried a synthetic newline, so the later snapshot never started with the earlier one | harness |
+| all seven failing h69_* | unit-variant requests and escaped KDL paths in the fixture | harness |
+| the three h70_* | unit-variant requests | harness |

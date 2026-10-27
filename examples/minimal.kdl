@@ -11,6 +11,13 @@ input {
     // focus-follows-mouse
 }
 
+// wiri extension: keep wiri's built-in keymap.  Like niri, a `binds {}` block without
+// `extend-defaults` binds only what is written in it.  Add your own binds in this block;
+// one on the same keys as a built-in wins.
+binds {
+    extend-defaults
+}
+
 layout {
     // niri's one-number gaps: between windows and around the screen.
     gaps 12

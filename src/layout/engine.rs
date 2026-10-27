@@ -5366,7 +5366,7 @@ impl TilingEngine {
     pub fn update_config(&mut self, config: LayoutConfig) {
         self.config = config;
         // Runtime ReserveArea changes reach cached output/workspace views too.
-        self.refresh_named_config();
+        self.refresh_layout_views();
     }
 
     /// Update animation settings from config
@@ -5934,7 +5934,8 @@ impl TilingEngine {
 
         self.full_config = Some(config);
         self.ensure_named_workspaces();
-        self.refresh_named_config();
+        // A reload rebuilds the layout views; it never re-places a realized workspace.
+        self.refresh_layout_views();
     }
 
     /// Take a snapshot of the current monitor / workspace / column / tile

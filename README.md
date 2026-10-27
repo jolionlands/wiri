@@ -46,7 +46,7 @@ To stop: `wiri-ctl quit`, the tray menu, or `Ctrl+Alt+Shift+Q`.
 
 ## Default key bindings
 
-All defaults use the `Ctrl+Alt` prefix (`Mod` in a config). A bind in the `binds {}` section of `config.kdl` wins over a default on the same keys; the other defaults stay (`extend-defaults false` drops them).
+All defaults use the `Ctrl+Alt` prefix (`Mod` in a config). The config file wiri writes on first run lists them and starts `binds {}` with `extend-defaults`, a wiri extension that adds these built-in binds to the ones written there (a bind on the same keys wins). Like niri, a `binds {}` block without `extend-defaults` counts alone: an omitted or empty block binds nothing.
 
 | Key | Action |
 | --- | --- |

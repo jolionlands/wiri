@@ -853,8 +853,12 @@ $h1ModBind = @($h1Entries | Where-Object { $_.vk_code -eq 118 -and $_.modifiers 
 [TestForms]::ClearKeys()
 $h1Keys = [TestForms]::OpenKeys('wiri-keys-h1')
 Start-Sleep -Milliseconds 1800
-FocusForm $h1Keys
-if (WaitForeground $h1Keys 200 3000) {
+# The keys must go to the form. FocusForm is defined further down this script, so ask wiri to focus
+# the form directly (as the Escape check above does) and press the chords only while it holds the foreground.
+if ([LT]::GetForegroundWindow() -ne $h1Keys) {
+    $null = Ctl 'h1-keys-focus' @('focus-window', [string][int64]$h1Keys)
+}
+if (WaitForeground $h1Keys 300 3000) {
     Chord 'f9'; Start-Sleep -Milliseconds 400
     Chord 'f8'; Start-Sleep -Milliseconds 400
 }
@@ -1619,10 +1623,14 @@ Start-Sleep -Milliseconds 1500
 
 # ---- H9: Phase 0 leftovers - default hotkeys that register, an exact fullscreen, a terminal's minimum width, ------
 # ----     windows put back where they were after a crash ----------------------------------------------------------
-# Explicitly request the complete built-in table: user config has no hidden defaults.
+# No config file: the only thing under test is what the shipped defaults do. The generated config
+# opts in to the built-in keymap with `extend-defaults` (a decoded `binds {}` counts alone otherwise),
+# so a first run must still register every default chord.
 $log9 = Join-Path $D 'wiri.stderr9.log'
 Stop-WiriGracefully $w 'h9'
-$w9 = Start-WiriWithConfig 'binds { extend-defaults; }' $log9
+Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+$w9 = Start-Wiri $log9 ($log9 + '.out')
+Start-Sleep -Seconds 4
 $w = $w9
 $sb = [System.Windows.Forms.SystemInformation]::VirtualScreen
 # Every default chord registers: Ctrl+Alt+Tab is Windows' own task switcher and was refused at every start.

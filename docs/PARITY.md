@@ -102,7 +102,7 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 | Per-monitor `output { … }` config | ✅ | name + index match |
 | `output { scale }` validation (0.5–4.0) | ✅ | warns + clamps |
 | Default-config drop on first run | ✅ | `%APPDATA%\wiri\config.kdl` |
-| Merge-with-defaults for `binds {}` | ✅ | Default `extend-defaults true`; config wins on collision, additions are appended |
+| Merge-with-defaults for `binds {}` | ✅ | Opt-in `extend-defaults` (the generated config has it; niri has no built-in binds); config wins on collision, additions are appended |
 
 ## IPC
 

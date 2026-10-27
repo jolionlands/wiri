@@ -198,6 +198,28 @@ mod tests {
         assert!(!cfg.layout.shadow_enable);
     }
 
+    /// A decoded `binds {}` block counts alone (no hidden built-ins), so the configs wiri
+    /// ships must opt in to the built-in keymap explicitly; otherwise a first run would
+    /// register only the written binds (53 of the 70 chords) and the minimal example none.
+    #[test]
+    fn the_shipped_configs_opt_in_to_the_builtin_keymap() {
+        for (name, text) in [
+            (
+                "default_config",
+                include_str!("../../resources/default_config.kdl"),
+            ),
+            ("minimal", include_str!("../../examples/minimal.kdl")),
+        ] {
+            let cfg = parse_kdl_config(text).unwrap();
+            assert!(cfg.binds.extend_defaults, "{name} must say extend-defaults");
+        }
+        let cfg = parse_kdl_config("binds { Mod+Q { close-window; } }").unwrap();
+        assert!(
+            !cfg.binds.extend_defaults,
+            "without the extension the block counts alone"
+        );
+    }
+
     #[test]
     fn the_default_config_binds_what_the_old_one_did() {
         let cfg = parse_kdl_config(include_str!("../../resources/default_config.kdl")).unwrap();
