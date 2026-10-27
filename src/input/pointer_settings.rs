@@ -386,6 +386,22 @@ pub fn wanted_cursor(cursor: &crate::config::CursorConfig) -> Vec<Wanted> {
     wanted
 }
 
+/// The `(uiParam, pvParam)` pair `SystemParametersInfoW(SPI_SETMOUSEVANISH, ..)` takes for
+/// "hide pointer while typing" on or off.
+///
+/// Unlike the older BOOL setters (`SPI_SETBEEP`), this one carries the new state in `pvParam`
+/// (`TRUE` / `FALSE` cast to a pointer) and requires `uiParam` to be 0: Windows answers
+/// `ERROR_INVALID_PARAMETER` (87) to `uiParam = 1`, which is what the first version of the
+/// real backend sent for "on" (and `pvParam = NULL` is `FALSE`, so "on" could never take effect
+/// and a restore of the user's original "on" failed as well).  Measured on a Windows 11 machine
+/// from a non-interactive session: `uiParam = 1` -> 87 whatever `pvParam` is, while `uiParam = 0`
+/// passes the parameter check and only then stops at `ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION`
+/// (1459).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) const fn mouse_vanish_set_arguments(on: bool) -> (u32, usize) {
+    (0, on as usize)
+}
+
 // ---------------------------------------------------------------------------------------
 // the runtime state: one applier, plus the `toggle-touchpad` switch
 // ---------------------------------------------------------------------------------------
@@ -671,14 +687,15 @@ mod system {
                 write_touchpad("LeaveOnWithMouse", leave)
             }
             (Setting::HidePointerWhileTyping, Value::Int(vanish)) => {
-                // The parameter is a BOOL and there is no value pointer: this is the same
-                // switch as Settings > Accessibility > Mouse pointer > "hide pointer while
-                // typing".
+                // The same switch as Settings > Accessibility > Mouse pointer > "hide pointer
+                // while typing".  The new state travels in `pvParam`, not `uiParam` (see
+                // `mouse_vanish_set_arguments`).
+                let (ui_param, pv_param) = super::mouse_vanish_set_arguments(vanish != 0);
                 let result = unsafe {
                     SystemParametersInfoW(
                         SPI_SETMOUSEVANISH,
-                        u32::from(vanish != 0),
-                        None,
+                        ui_param,
+                        Some(pv_param as *mut core::ffi::c_void),
                         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
                     )
                 };
@@ -974,6 +991,21 @@ mod tests {
             fake.values().get(&Setting::HidePointerWhileTyping),
             Some(&Value::Int(1))
         );
+    }
+
+    #[test]
+    fn the_real_mouse_vanish_write_sends_the_state_in_pv_param_and_zero_in_ui_param() {
+        // Windows rejects `uiParam = 1` for SPI_SETMOUSEVANISH with ERROR_INVALID_PARAMETER, and
+        // `pvParam = NULL` is FALSE: the first real backend sent `(1, NULL)` for "on", so "hide
+        // pointer while typing" could never be switched on and the user's own "on" was not put
+        // back on quit.  The audited backend never reaches this call, so a dry run cannot catch
+        // it; the arguments are therefore pinned here.
+        assert_eq!(mouse_vanish_set_arguments(true), (0, 1));
+        assert_eq!(mouse_vanish_set_arguments(false), (0, 0));
+        // The mapping from the stored value is the same for both directions of a restore.
+        for stored in [0, 1] {
+            assert_eq!(mouse_vanish_set_arguments(stored != 0), (0, stored as usize));
+        }
     }
 
     #[test]
