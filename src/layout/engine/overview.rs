@@ -309,10 +309,20 @@ mod tests {
         assert!(e.has_active_animations());
         e.tick_animations_with_backend(50, &backend);
         assert!(e.overview_zoom() > 0.5 && e.overview_zoom() < 1.0);
-        e.exit_overview(&backend);
         let zoom = e.overview_zoom();
-        // Reversing preserves displayed position and the timeline's momentum.
+        e.exit_overview(&backend);
+        // Reversing preserves the displayed position and reuses the host/session.
         assert_eq!(e.overview_zoom(), zoom);
+        e.tick_animations_with_backend(30, &backend);
+        let reversing = e.overview_zoom();
+        e.toggle_overview(&backend);
+        assert_eq!(e.overview_zoom(), reversing);
+        assert!(!e.overview_camera.closing);
+        assert_eq!(sink.enter_calls(), 1);
+        e.tick_animations_with_backend(60_000, &backend);
+        assert!(e.is_overview());
+        assert!(!e.has_active_animations());
+        e.exit_overview(&backend);
         e.tick_animations_with_backend(60_000, &backend);
         assert!(!e.has_active_animations());
         assert!(!e.is_overview());

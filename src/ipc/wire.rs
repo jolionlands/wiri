@@ -182,6 +182,14 @@ fn action(value: Value) -> Result<Value, String> {
             false,
         );
     }
+    if variant == "SetColumnDisplay" {
+        let display = match fields.get("display").and_then(Value::as_str) {
+            Some("Normal") => "normal",
+            Some("Tabbed") => "tabbed",
+            _ => return Err("display must be \"Normal\" or \"Tabbed\"".into()),
+        };
+        push(display.into(), false);
+    }
     for key in ["output", "name", "index", "layout"] {
         if let Some(value) = fields.get(key).filter(|v| !v.is_null()) {
             let text = value
@@ -446,6 +454,61 @@ mod tests {
         assert!(frames[2].is_err());
         assert_eq!(frames[3].as_ref().unwrap(), "Version");
         assert!(f.legacy().is_none());
+    }
+
+    #[test]
+    fn typed_column_display_decodes_both_modes_and_keeps_window_targets() {
+        for (display, argument, tabbed) in [("Normal", "normal", false), ("Tabbed", "tabbed", true)]
+        {
+            let decoded = decode(json!({"Action":{"SetColumnDisplay":{
+                "display":display, "future_field":true
+            }}}))
+            .unwrap();
+            let IpcMessage::RunAction { name, args, quoted } = decoded.message else {
+                panic!("expected the shared action request");
+            };
+            assert_eq!(name, "set-column-display");
+            assert_eq!(args, vec![argument.to_string()]);
+            assert_eq!(quoted, vec![false]);
+            assert_eq!(
+                crate::input::parse_action_flagged(&name, &args, &quoted),
+                Some(crate::input::Action::SetColumnDisplay { tabbed })
+            );
+
+            let targeted = decode(json!({"Action":{"SetColumnDisplay":{
+                "display":display, "id":44
+            }}}))
+            .unwrap();
+            let value = serde_json::to_value(targeted.message).unwrap();
+            assert_eq!(value["data"]["args"], json!(["--id", "44", argument]));
+        }
+    }
+
+    #[test]
+    fn typed_column_display_rejects_missing_invalid_modes_and_unsupported_flags() {
+        for fields in [
+            json!({}),
+            Value::Null,
+            json!({"display":null}),
+            json!({"display":true}),
+            json!({"display":0}),
+            json!({"display":"normal"}),
+            json!({"display":"Stacked"}),
+            json!({"display":{"Tabbed":null}}),
+        ] {
+            assert!(decode(json!({"Action":{"SetColumnDisplay":fields}})).is_err());
+        }
+        for (key, flag) in [
+            ("focus", json!(false)),
+            ("skip_empty", json!(false)),
+            ("skip_empty_workspaces", json!(true)),
+            ("write_to_disk", json!(false)),
+            ("show_pointer", json!(false)),
+        ] {
+            let mut fields = json!({"display":"Tabbed"});
+            fields[key] = flag;
+            assert!(decode(json!({"Action":{"SetColumnDisplay":fields}})).is_err());
+        }
     }
 
     #[test]

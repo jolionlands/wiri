@@ -20,7 +20,35 @@
 //! states, and when the application leaves them wiri tiles the window again.
 
 use super::*;
+use crate::layout::workspace::ColumnDisplay;
+use crate::layout::Column;
+use std::cell::Cell;
 use std::time::{Duration, Instant};
+
+thread_local! {
+    // Style changes can synchronously report sizes back to the engine. Never interpret
+    // those reports as a new application request halfway through a column transition.
+    static SIZING_TRANSITION_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct SizingTransition;
+
+impl SizingTransition {
+    fn begin() -> Self {
+        SIZING_TRANSITION_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+
+    fn in_progress() -> bool {
+        SIZING_TRANSITION_DEPTH.with(|depth| depth.get() != 0)
+    }
+}
+
+impl Drop for SizingTransition {
+    fn drop(&mut self) {
+        SIZING_TRANSITION_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
 
 /// How long after a window went fullscreen a report that it no longer covers its monitor is
 /// taken for something the application did to the window (leaving fullscreen), not for the
@@ -133,9 +161,231 @@ pub(super) fn size_reaction(
 }
 
 impl TilingEngine {
-    /// The window is maximized to the edges of the work area (niri `maximize-window-to-edges`).
+    /// Only current members share sizing. Stacked tiles, floats and minimized windows
+    /// retain their per-window state, even if they used to belong to a tabbed column.
+    fn sizing_tabbed_column(&self, window_id: WindowId) -> Option<&Column> {
+        if self.floating_windows.contains(&window_id) || self.minimized.contains_key(&window_id) {
+            return None;
+        }
+        let (output, workspace, column) = self.locate_window(window_id)?;
+        let column = self
+            .monitors
+            .get(&output)?
+            .workspaces
+            .get(&workspace)?
+            .columns
+            .get(column)?;
+        matches!(column.display, ColumnDisplay::Tabbed { .. }).then_some(column)
+    }
+
+    fn sizing_members(&self, window_id: WindowId) -> Vec<WindowId> {
+        self.sizing_tabbed_column(window_id)
+            .map(|column| column.tiles.iter().map(|tile| tile.window_id).collect())
+            .unwrap_or_else(|| vec![window_id])
+    }
+
+    pub(super) fn effective_fullscreen(&self, window_id: WindowId) -> bool {
+        self.sizing_tabbed_column(window_id).map_or_else(
+            || self.fullscreen_windows.contains(&window_id),
+            |column| {
+                column
+                    .tiles
+                    .iter()
+                    .any(|tile| self.fullscreen_windows.contains(&tile.window_id))
+            },
+        )
+    }
+
+    /// The window (or its current tabbed column) fills the work area.
     pub fn is_maximized_to_edges(&self, window_id: WindowId) -> bool {
-        self.maximized_edges.contains(&window_id)
+        self.sizing_tabbed_column(window_id).map_or_else(
+            || self.maximized_edges.contains(&window_id),
+            |column| {
+                column
+                    .tiles
+                    .iter()
+                    .any(|tile| self.maximized_edges.contains(&tile.window_id))
+            },
+        )
+    }
+
+    /// Column-level reservations/decorations only follow sizing in tabbed mode. A
+    /// fullscreen stacked tile must not suppress decorations for the other rows.
+    pub(super) fn column_sizing_mode(&self, column: &Column) -> DrawMode {
+        if !matches!(column.display, ColumnDisplay::Tabbed { .. }) {
+            DrawMode::Inset
+        } else if column
+            .tiles
+            .iter()
+            .any(|tile| self.fullscreen_windows.contains(&tile.window_id))
+        {
+            DrawMode::Exact
+        } else if column
+            .tiles
+            .iter()
+            .any(|tile| self.maximized_edges.contains(&tile.window_id))
+        {
+            DrawMode::Edges
+        } else {
+            DrawMode::Inset
+        }
+    }
+
+    /// Invalidate geometry, not visibility: forgetting a hidden tab's visibility can
+    /// make a reentrant layout show it. Its next selection must still reapply geometry.
+    fn invalidate_sizing_geometry(&mut self, window_id: WindowId) {
+        if let Some(applied) = self.applied_state.get_mut(&window_id) {
+            applied.rect = Rect::default();
+        }
+        self.animating_rects.remove(&window_id);
+        self.window_sizing.insert(
+            window_id,
+            if self.fullscreen_windows.contains(&window_id) {
+                SizingMode::Fullscreen
+            } else if self.maximized_edges.contains(&window_id) {
+                SizingMode::Maximized
+            } else {
+                SizingMode::Normal
+            },
+        );
+    }
+
+    /// Record inheritance without native effects. The caller must finish recording its
+    /// entire transition before styling the returned newly fullscreen members.
+    fn record_sizing_group(&mut self, members: &[WindowId]) -> Vec<WindowId> {
+        let fullscreen = members
+            .iter()
+            .any(|wid| self.fullscreen_windows.contains(wid));
+        let edges = members.iter().any(|wid| self.maximized_edges.contains(wid));
+        let mut newly_fullscreen = Vec::new();
+        if fullscreen || edges {
+            let now = Instant::now();
+            for &member in members {
+                let mut changed = false;
+                if fullscreen {
+                    let newly = self.fullscreen_windows.insert(member);
+                    // An existing non-tab fullscreen already has its native style.
+                    self.tab_sizing_styles
+                        .entry(member)
+                        .or_insert(!newly && !self.app_fullscreen.contains(&member));
+                    if newly {
+                        self.fullscreen_since.insert(member, now);
+                        newly_fullscreen.push(member);
+                        changed = true;
+                    }
+                }
+                if edges && self.maximized_edges.insert(member) {
+                    changed = true;
+                }
+                if changed {
+                    self.invalidate_sizing_geometry(member);
+                }
+            }
+            if let Some(&member) = members.first() {
+                self.hold_slot(member);
+            }
+        }
+        newly_fullscreen
+    }
+
+    /// This also handles newly inserted tabs and stacked -> tabbed transitions.
+    fn record_tabbed_sizing(&mut self, output: OutputId) -> Vec<WindowId> {
+        let groups: Vec<Vec<_>> = self
+            .monitors
+            .get(&output)
+            .into_iter()
+            .flat_map(|monitor| monitor.workspaces.values())
+            .flat_map(|workspace| &workspace.columns)
+            .filter(|column| matches!(column.display, ColumnDisplay::Tabbed { .. }))
+            .map(|column| column.tiles.iter().map(|tile| tile.window_id).collect())
+            .collect();
+        let mut newly_fullscreen = Vec::new();
+        for members in groups {
+            newly_fullscreen.extend(self.record_sizing_group(&members));
+        }
+        newly_fullscreen
+    }
+
+    fn apply_inherited_fullscreen(&mut self, members: Vec<WindowId>) {
+        for member in members {
+            if let Some(hwnd) = self.tiled_windows.get(&member).map(|window| window.hwnd) {
+                crate::backend::taskbar::mark_fullscreen(hwnd, true);
+            }
+        }
+    }
+
+    /// Only tabs layout is about to show may require a native style change. In
+    /// particular, entering/exiting fullscreen must not synchronously message every
+    /// hidden sibling (which may be hung). No style work runs for overview sources.
+    fn tab_style_changes(&self, output: OutputId) -> Vec<(WindowId, bool)> {
+        let Some(workspace) = self.monitors.get(&output).and_then(|m| m.workspace()) else {
+            return Vec::new();
+        };
+        workspace
+            .columns
+            .iter()
+            .flat_map(|column| {
+                column
+                    .visible_tile_indices()
+                    .into_iter()
+                    .filter_map(move |index| {
+                        let member = column.tiles[index].window_id;
+                        let styled = self.tab_sizing_styles.get(&member)?;
+                        let wanted = self.fullscreen_windows.contains(&member)
+                            && !self.app_fullscreen.contains(&member);
+                        (*styled != wanted).then_some((member, wanted))
+                    })
+            })
+            .collect()
+    }
+
+    pub(super) fn sync_tab_sizing_styles(&mut self, output: OutputId) {
+        let _transition = SizingTransition::begin();
+        for (member, wanted) in self.tab_style_changes(output) {
+            let Some(hwnd) = self.tiled_windows.get(&member).map(|w| w.hwnd) else {
+                continue;
+            };
+            if wanted {
+                self.tab_sizing_styles.insert(member, true);
+                // A long-hidden tab's queued frame reports need their own settle
+                // interval; the group's original entry may have been minutes ago.
+                self.fullscreen_since.insert(member, Instant::now());
+                self.style_tab_fullscreen(hwnd);
+            } else {
+                self.tab_sizing_styles.remove(&member);
+                self.restore_tab_sizing_style(hwnd);
+            }
+            self.invalidate_sizing_geometry(member);
+        }
+    }
+
+    /// Called before computing layout/decorations. No recursive layout, no showing,
+    /// raising, styling or moving of HWNDs (including newly selected hidden tabs).
+    pub(super) fn sync_tabbed_sizing(&mut self, output: OutputId) {
+        let _transition = SizingTransition::begin();
+        let inherited = self.record_tabbed_sizing(output);
+        // Moves and minimize restoration may leave a cloned forced-width column
+        // without any sizing member. Provenance belongs to the column, not an HWND.
+        let view = self.slot_view_width(output).unwrap_or(50);
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            for column in monitor.workspaces.values_mut().flat_map(|w| &mut w.columns) {
+                if column.sizing_forced
+                    && !column.tiles.iter().any(|tile| {
+                        self.fullscreen_windows.contains(&tile.window_id)
+                            || self.maximized_edges.contains(&tile.window_id)
+                    })
+                {
+                    if column.maximized {
+                        column.toggle_maximized(view);
+                    }
+                    column.sizing_forced = false;
+                    for tile in &column.tiles {
+                        self.slot_forced.remove(&tile.window_id);
+                    }
+                }
+            }
+        }
+        self.apply_inherited_fullscreen(inherited);
     }
 
     /// How each window of `windows` is drawn, when it is not the ordinary way.
@@ -148,9 +398,9 @@ impl TilingEngine {
             if self.floating_windows.contains(window_id) {
                 continue;
             }
-            if self.fullscreen_windows.contains(window_id) {
+            if self.effective_fullscreen(*window_id) {
                 modes.insert(*window_id, DrawMode::Exact);
-            } else if self.maximized_edges.contains(window_id) {
+            } else if self.is_maximized_to_edges(*window_id) {
                 modes.insert(*window_id, DrawMode::Edges);
             }
         }
@@ -179,6 +429,91 @@ impl TilingEngine {
                 )
             })
             .collect()
+    }
+
+    /// Tab fullscreen changes styles only. Layout owns placement/visibility, so even a
+    /// selected tab that has not been shown yet is never moved or raised here.
+    fn style_tab_fullscreen(&mut self, hwnd: isize) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+            SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER, WS_CAPTION, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+            WS_THICKFRAME,
+        };
+        let window_id = WindowId::new(hwnd);
+        let native = HWND(hwnd as *mut std::ffi::c_void);
+        unsafe {
+            let style = GetWindowLongW(native, GWL_STYLE) as u32;
+            let ex_style = GetWindowLongW(native, GWL_EXSTYLE) as u32;
+            // strip-frame may already have saved the actual originals.
+            self.saved_styles.entry(window_id).or_insert(style);
+            self.saved_ex_styles.entry(window_id).or_insert(ex_style);
+            let stripped = style
+                & !(WS_CAPTION.0
+                    | WS_THICKFRAME.0
+                    | WS_SYSMENU.0
+                    | WS_MINIMIZEBOX.0
+                    | WS_MAXIMIZEBOX.0);
+            SetWindowLongW(native, GWL_STYLE, stripped as i32);
+            SetWindowLongW(native, GWL_EXSTYLE, (ex_style & !WS_EX_APPWINDOW.0) as i32);
+            let _ = SetWindowPos(
+                native,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_FRAMECHANGED
+                    | SWP_ASYNCWINDOWPOS,
+            );
+        }
+        crate::backend::forget_shadow_margins(hwnd);
+    }
+
+    /// Saved styles can contain WS_VISIBLE from before a tab was hidden. Restoring
+    /// them verbatim would show that tab behind layout's back, including reentrantly.
+    fn restore_tab_sizing_style(&self, hwnd: isize) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+            SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER, WS_VISIBLE,
+        };
+        let window_id = WindowId::new(hwnd);
+        let native = HWND(hwnd as *mut std::ffi::c_void);
+        unsafe {
+            if let Some(&saved) = self.saved_styles.get(&window_id) {
+                let visible = GetWindowLongW(native, GWL_STYLE) as u32 & WS_VISIBLE.0;
+                SetWindowLongW(
+                    native,
+                    GWL_STYLE,
+                    ((saved & !WS_VISIBLE.0) | visible) as i32,
+                );
+            }
+            if let Some(&saved) = self.saved_ex_styles.get(&window_id) {
+                SetWindowLongW(native, GWL_EXSTYLE, saved as i32);
+            }
+            let _ = SetWindowPos(
+                native,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_FRAMECHANGED
+                    | SWP_ASYNCWINDOWPOS,
+            );
+        }
+        crate::backend::forget_shadow_margins(hwnd);
     }
 
     /// Put `hwnd` on top of the windows on its monitor, without activating it and without
@@ -228,32 +563,80 @@ impl TilingEngine {
         };
         if !column.maximized {
             column.toggle_maximized(view);
-            self.slot_forced.insert(window_id);
+            column.sizing_forced = true;
+        }
+        if column.sizing_forced {
+            // Each tab may later split into a column that clones pre_max_width.
+            // Keep an ownership token with it, not only with the original initiator.
+            if matches!(column.display, ColumnDisplay::Tabbed { .. }) {
+                self.slot_forced
+                    .extend(column.tiles.iter().map(|t| t.window_id));
+            } else {
+                self.slot_forced.insert(window_id);
+            }
+        } else {
+            // Incoming windows do not transfer forced-width provenance into a
+            // destination that was already maximized manually.
+            for tile in &column.tiles {
+                self.slot_forced.remove(&tile.window_id);
+            }
         }
     }
 
-    /// The window is not fullscreen nor maximized any more: its column gets its old width
-    /// back, when it was this window that made it as wide as the view and nothing else wants
-    /// that now.
+    /// Release a sizing-forced width only after the last current member no longer
+    /// needs it. When its owner leaves, move ownership to a surviving sizing member.
     fn release_slot(&mut self, window_id: WindowId) {
-        if self.fullscreen_windows.contains(&window_id) || self.maximized_edges.contains(&window_id)
+        self.release_slot_for(window_id, false);
+    }
+
+    fn release_slot_for(&mut self, window_id: WindowId, departing: bool) {
+        if !departing
+            && (self.fullscreen_windows.contains(&window_id)
+                || self.maximized_edges.contains(&window_id))
         {
             return;
         }
-        if !self.slot_forced.remove(&window_id) {
-            return;
-        }
-        let Some((output, workspace, column)) = self.locate_window(window_id) else {
+        self.slot_forced.remove(&window_id);
+        let Some((output, workspace, column_index)) = self.locate_window(window_id) else {
             return;
         };
+        let forced = self
+            .monitors
+            .get(&output)
+            .and_then(|m| m.workspaces.get(&workspace))
+            .and_then(|w| w.columns.get(column_index))
+            .is_some_and(|c| c.sizing_forced);
+        if !forced {
+            return;
+        }
+        let successor = self
+            .monitors
+            .get(&output)
+            .and_then(|monitor| monitor.workspaces.get(&workspace))
+            .and_then(|workspace| workspace.columns.get(column_index))
+            .and_then(|column| {
+                column
+                    .tiles
+                    .iter()
+                    .map(|tile| tile.window_id)
+                    .find(|&member| {
+                        member != window_id
+                            && (self.fullscreen_windows.contains(&member)
+                                || self.maximized_edges.contains(&member))
+                    })
+            });
+        if let Some(successor) = successor {
+            self.slot_forced.insert(successor);
+            return;
+        }
         let Some(view) = self.slot_view_width(output) else {
             return;
         };
         if let Some(column) = self
             .monitors
             .get_mut(&output)
-            .and_then(|m| m.workspaces.get_mut(&workspace))
-            .and_then(|w| w.columns.get_mut(column))
+            .and_then(|monitor| monitor.workspaces.get_mut(&workspace))
+            .and_then(|workspace| workspace.columns.get_mut(column_index))
         {
             if column.maximized {
                 column.toggle_maximized(view);
@@ -261,10 +644,78 @@ impl TilingEngine {
         }
     }
 
-    /// niri `fullscreen-window` for one window: toggle.
+    /// niri `fullscreen-window` for one window (or its tabbed column): toggle.
     pub fn toggle_fullscreen_for(&mut self, window_id: WindowId, backend: &BackendHandle) {
-        let on = !self.fullscreen_windows.contains(&window_id);
+        let on = !self.effective_fullscreen(window_id);
         self.set_fullscreen(window_id, on, false, backend);
+    }
+
+    /// Update the whole current tab group before calling Win32: native style changes
+    /// can report sizes synchronously, and must never see a half-transitioned column.
+    fn set_tabbed_fullscreen(
+        &mut self,
+        window_id: WindowId,
+        on: bool,
+        by_app: bool,
+        backend: &BackendHandle,
+    ) {
+        let members = self.sizing_members(window_id);
+        if members
+            .iter()
+            .all(|member| self.fullscreen_windows.contains(member) == on)
+        {
+            return;
+        }
+        let Some((output, _, _)) = self.locate_window(window_id) else {
+            return;
+        };
+        let transition = SizingTransition::begin();
+        let edges = members
+            .iter()
+            .any(|member| self.maximized_edges.contains(member));
+        let now = Instant::now();
+        for &member in &members {
+            let was_fullscreen = self.fullscreen_windows.contains(&member);
+            let was_app = self.app_fullscreen.contains(&member);
+            if edges {
+                self.maximized_edges.insert(member);
+            }
+            if on {
+                self.tab_sizing_styles
+                    .entry(member)
+                    .or_insert(was_fullscreen && !was_app);
+                self.fullscreen_windows.insert(member);
+                if !was_fullscreen {
+                    self.fullscreen_since.insert(member, now);
+                }
+                if by_app && member == window_id {
+                    self.app_fullscreen.insert(member);
+                }
+            } else {
+                self.fullscreen_windows.remove(&member);
+                self.fullscreen_since.remove(&member);
+                self.app_fullscreen.remove(&member);
+                if self.tab_sizing_styles.get(&member) == Some(&false) {
+                    self.tab_sizing_styles.remove(&member);
+                }
+            }
+            self.invalidate_sizing_geometry(member);
+        }
+        if on {
+            self.hold_slot(window_id);
+        } else {
+            for &member in &members {
+                self.release_slot(member);
+            }
+        }
+        for member in members {
+            if let Some(hwnd) = self.tiled_windows.get(&member).map(|w| w.hwnd) {
+                crate::backend::taskbar::mark_fullscreen(hwnd, on);
+            }
+        }
+        drop(transition);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
     }
 
     /// Make a window fullscreen (`on`) or take it out of fullscreen.  `by_app` says that the
@@ -284,6 +735,10 @@ impl TilingEngine {
         let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) else {
             return;
         };
+        if self.sizing_tabbed_column(window_id).is_some() {
+            self.set_tabbed_fullscreen(window_id, on, by_app, backend);
+            return;
+        }
         if self.fullscreen_windows.contains(&window_id) == on {
             return;
         }
@@ -315,9 +770,9 @@ impl TilingEngine {
             if !is_float {
                 self.hold_slot(window_id);
             }
-            if !by_app {
-                // Strip the frame and cover the monitor.  A tile is placed again by the
-                // layout pass, which draws it where its slot is.
+            if !by_app && !self.tab_sizing_styles.contains_key(&window_id) {
+                // A former tab keeps its deferred native style until layout selects it.
+                // Ordinary independent fullscreen retains the existing native path.
                 self.make_fullscreen(hwnd, monitor_bounds, backend);
             }
             crate::backend::taskbar::mark_fullscreen(hwnd, true);
@@ -340,7 +795,11 @@ impl TilingEngine {
                 },
             );
             if !by_app_before {
-                self.restore_window_style(hwnd);
+                match self.tab_sizing_styles.remove(&window_id) {
+                    Some(true) => self.restore_tab_sizing_style(hwnd),
+                    Some(false) => {} // Hidden inherited fullscreen never changed this HWND.
+                    None => self.restore_window_style(hwnd),
+                }
             }
             if is_float {
                 if let Some(rect) = self.float_memory.get(&window_id).copied() {
@@ -372,37 +831,45 @@ impl TilingEngine {
     ) {
         if !self.tiled_windows.contains_key(&window_id)
             || self.floating_windows.contains(&window_id)
-            || self.maximized_edges.contains(&window_id) == on
+        {
+            return;
+        }
+        let members = self.sizing_members(window_id);
+        if members
+            .iter()
+            .all(|member| self.maximized_edges.contains(member) == on)
         {
             return;
         }
         let Some((output, _, _)) = self.locate_window(window_id) else {
             return;
         };
-        if on {
-            self.maximized_edges.insert(window_id);
-            if !self.fullscreen_windows.contains(&window_id) {
-                self.window_sizing.insert(window_id, SizingMode::Maximized);
+        let transition = SizingTransition::begin();
+        // A member inserted since the last layout inherits fullscreen as part of the
+        // same atomic transition. Do not touch its HWND until edges are recorded too.
+        let inherited = self.record_sizing_group(&members);
+        for &member in &members {
+            if on {
+                self.maximized_edges.insert(member);
+            } else {
+                self.maximized_edges.remove(&member);
             }
+            self.invalidate_sizing_geometry(member);
+        }
+        if on {
             self.hold_slot(window_id);
         } else {
-            self.maximized_edges.remove(&window_id);
-            self.window_sizing.insert(
-                window_id,
-                if self.fullscreen_windows.contains(&window_id) {
-                    SizingMode::Fullscreen
-                } else {
-                    SizingMode::Normal
-                },
-            );
-            self.release_slot(window_id);
+            for &member in &members {
+                self.release_slot(member);
+            }
         }
+        self.apply_inherited_fullscreen(inherited);
+        drop(transition);
         info!(
             "Window {} is {} maximized to the edges",
             window_id.as_isize(),
             if on { "now" } else { "no longer" }
         );
-        self.applied_state.remove(&window_id);
         self.reveal_focused_column(output);
         self.apply_layout_for_monitor(output, backend);
     }
@@ -413,7 +880,7 @@ impl TilingEngine {
         window_id: WindowId,
         backend: &BackendHandle,
     ) {
-        let on = !self.maximized_edges.contains(&window_id);
+        let on = !self.is_maximized_to_edges(window_id);
         self.set_maximized_to_edges(window_id, on, backend);
     }
 
@@ -422,31 +889,94 @@ impl TilingEngine {
     /// minimized window comes back maximized).  Its column gets its width back.  Nothing is
     /// laid out: the caller moves the window next.
     pub(super) fn leave_sizing_states(&mut self, window_id: WindowId, keep_maximized: bool) {
-        if self.fullscreen_windows.contains(&window_id) {
-            self.fullscreen_windows.remove(&window_id);
-            self.fullscreen_since.remove(&window_id);
-            let by_app = self.app_fullscreen.remove(&window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
+        let _transition = SizingTransition::begin();
+        // Lifecycle callers remove membership afterwards. Record inheritance first, while
+        // the departing owner can still pass its flags and width hold to its siblings.
+        let inherited = if self.sizing_tabbed_column(window_id).is_some() {
+            self.record_sizing_group(&self.sizing_members(window_id))
+        } else {
+            Vec::new()
+        };
+        self.release_slot_for(window_id, true);
+        let was_fullscreen = self.fullscreen_windows.remove(&window_id);
+        self.fullscreen_since.remove(&window_id);
+        let by_app = self.app_fullscreen.remove(&window_id);
+        if !keep_maximized {
+            self.maximized_edges.remove(&window_id);
+        }
+        self.unzoom_pending.remove(&window_id);
+        self.invalidate_sizing_geometry(window_id);
+        let tab_styled = self.tab_sizing_styles.remove(&window_id);
+        if was_fullscreen {
             if let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) {
-                if !by_app {
-                    self.restore_window_style(hwnd);
+                if !by_app && tab_styled != Some(false) {
+                    self.restore_tab_sizing_style(hwnd);
                 }
                 crate::backend::taskbar::mark_fullscreen(hwnd, false);
             }
         }
-        if !keep_maximized {
-            self.maximized_edges.remove(&window_id);
-        }
-        self.release_slot(window_id);
+        self.apply_inherited_fullscreen(
+            inherited
+                .into_iter()
+                .filter(|&member| member != window_id)
+                .collect(),
+        );
     }
 
-    /// The window is gone: forget what it was doing.
+    /// The window is gone: forget it without touching its dead HWND. Called before
+    /// membership is removed, so the surviving tabs can inherit its sizing/width hold.
     pub(super) fn forget_sizing(&mut self, window_id: WindowId) {
+        let _transition = SizingTransition::begin();
+        let inherited = if self.sizing_tabbed_column(window_id).is_some() {
+            self.record_sizing_group(&self.sizing_members(window_id))
+        } else {
+            Vec::new()
+        };
+        self.release_slot_for(window_id, true);
+        self.fullscreen_windows.remove(&window_id);
         self.maximized_edges.remove(&window_id);
         self.app_fullscreen.remove(&window_id);
-        self.slot_forced.remove(&window_id);
+        self.tab_sizing_styles.remove(&window_id);
         self.unzoom_pending.remove(&window_id);
         self.fullscreen_since.remove(&window_id);
+        self.apply_inherited_fullscreen(
+            inherited
+                .into_iter()
+                .filter(|&member| member != window_id)
+                .collect(),
+        );
+    }
+
+    /// Hidden or inactive tabs report changes caused by being parked, not user requests.
+    fn ignores_sizing_report(&self, window_id: WindowId) -> bool {
+        if SizingTransition::in_progress() {
+            return true;
+        }
+        if let Some(column) = self.sizing_tabbed_column(window_id) {
+            let Some((output, workspace, _)) = self.locate_window(window_id) else {
+                return true;
+            };
+            let Some(monitor) = self.monitors.get(&output) else {
+                return true;
+            };
+            if workspace != monitor.active_workspace {
+                return true;
+            }
+            if let ColumnDisplay::Tabbed { active_tab } = column.display {
+                // Layout first reconciles the tab index with monitor focus. Use the same
+                // selection even if this report arrived before hide_inactive_tabs ran.
+                let selected = monitor
+                    .focus_window
+                    .filter(|id| column.tiles.iter().any(|tile| tile.window_id == *id))
+                    .or_else(|| column.tiles.get(active_tab).map(|tile| tile.window_id));
+                if selected != Some(window_id) {
+                    return true;
+                }
+            }
+        }
+        self.applied_state
+            .get(&window_id)
+            .is_some_and(|state| !state.visible)
     }
 
     /// The window reports its size class: it became (or stopped being) natively maximized, or as
@@ -461,9 +991,12 @@ impl TilingEngine {
         let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) else {
             return;
         };
-        // A float keeps whatever its application does with it; a minimized window reports
-        // nothing that means anything.
-        if self.floating_windows.contains(&window_id) || self.minimized.contains_key(&window_id) {
+        // Style/layout feedback (including a hidden tab being parked) is not an app request.
+        // A float keeps whatever its application does with it; minimized reports are noise.
+        if self.floating_windows.contains(&window_id)
+            || self.minimized.contains_key(&window_id)
+            || self.ignores_sizing_report(window_id)
+        {
             return;
         }
         let Some((output, _, _)) = self.locate_window(window_id) else {
@@ -481,8 +1014,8 @@ impl TilingEngine {
                 _ => (false, false),
             };
         let state = SizingState {
-            fullscreen: self.fullscreen_windows.contains(&window_id),
-            maximized_edges: self.maximized_edges.contains(&window_id),
+            fullscreen: self.effective_fullscreen(window_id),
+            maximized_edges: self.is_maximized_to_edges(window_id),
             unzoom_pending: self.unzoom_pending.get(&window_id).copied(),
             own_rect_covers,
             own_rect_beside_monitor,
@@ -552,7 +1085,7 @@ impl TilingEngine {
         let covers = self.monitors.get(&output).map_or(false, |m| {
             crate::backend::hooks::covers_monitor(frame, m.bounds)
         });
-        if covers && !self.fullscreen_windows.contains(&window_id) {
+        if covers && !self.effective_fullscreen(window_id) {
             self.set_fullscreen(window_id, true, true, backend);
         }
     }
@@ -788,6 +1321,427 @@ mod tests {
         let oid = OutputId::from_name("M");
         let (_, workspace, column) = engine.locate_window(WindowId::new(hwnd)).unwrap();
         engine.monitors.get(&oid).unwrap().workspaces[&workspace].columns[column].clone()
+    }
+
+    fn with_two_tabs() -> TilingEngine {
+        let mut engine = with_three_windows();
+        let monitor = engine.monitors.focused_mut().unwrap();
+        let workspace = monitor.workspace_mut().unwrap();
+        let second = workspace.columns.remove(1);
+        workspace.columns[0].tiles.extend(second.tiles);
+        workspace.columns[0].set_width(Some(640));
+        workspace.columns[0].display = ColumnDisplay::Tabbed { active_tab: 0 };
+        workspace.columns[0].active_window = Some(WindowId::new(1));
+        monitor.set_focus(WindowId::new(1));
+        engine.apply_layout_for_monitor(OutputId::from_name("M"), &be());
+        engine
+    }
+
+    fn assert_tab_drawing(engine: &TilingEngine, selected: isize, mode: DrawMode) {
+        let monitor = engine.monitors.get(&OutputId::from_name("M")).unwrap();
+        let work_rect = Rect::new(8, 8, 1904, 1024);
+        let positions =
+            engine.calculate_positions(monitor.workspace().unwrap(), work_rect, &engine.config);
+        let ids = [1, 2, 3].into_iter().map(WindowId::new).collect();
+        let modes = engine.sizing_draw_modes(&ids);
+        assert_eq!(modes.get(&WindowId::new(selected)), Some(&mode));
+        assert!(!modes.contains_key(&WindowId::new(3)));
+        let drawn = TilingEngine::apply_sizing_states(
+            positions,
+            &modes,
+            work_rect,
+            monitor.work_area,
+            monitor.bounds,
+        );
+        let tabs: Vec<_> = drawn
+            .iter()
+            .filter(|(wid, _)| *wid == WindowId::new(1) || *wid == WindowId::new(2))
+            .collect();
+        assert_eq!(tabs.len(), 1, "only the selected tab is positioned");
+        assert_eq!(tabs[0].0, WindowId::new(selected));
+        assert_eq!(tabs[0].1.size.w, 1920);
+        assert_eq!(
+            tabs[0].1.size.h,
+            if mode == DrawMode::Exact { 1080 } else { 1040 }
+        );
+        assert_eq!(tabs[0].1.loc.y, 0);
+    }
+
+    #[test]
+    fn native_style_work_is_lazy_for_hidden_tabs_on_entry_and_exit() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        let output = OutputId::from_name("M");
+        engine.fullscreen_windows.extend([one, two]);
+        engine
+            .tab_sizing_styles
+            .extend([(one, false), (two, false)]);
+        assert_eq!(engine.tab_style_changes(output), vec![(one, true)]);
+        engine.tab_sizing_styles.insert(one, true);
+        assert!(engine.tab_style_changes(output).is_empty());
+        {
+            let monitor = engine.monitors.get_mut(&output).unwrap();
+            monitor.workspace_mut().unwrap().columns[0].select_window(two);
+            monitor.set_focus(two);
+        }
+        assert_eq!(engine.tab_style_changes(output), vec![(two, true)]);
+        engine.tab_sizing_styles.insert(two, true);
+        engine.fullscreen_windows.clear();
+        // Exiting does not restore the other, hidden HWND synchronously either.
+        assert_eq!(engine.tab_style_changes(output), vec![(two, false)]);
+        engine.tab_sizing_styles.remove(&two);
+        assert!(engine.tab_style_changes(output).is_empty());
+        {
+            let monitor = engine.monitors.get_mut(&output).unwrap();
+            monitor.workspace_mut().unwrap().columns[0].select_window(one);
+            monitor.set_focus(one);
+        }
+        assert_eq!(engine.tab_style_changes(output), vec![(one, false)]);
+    }
+
+    #[test]
+    fn expelling_either_sized_tab_preserves_independent_width_restoration() {
+        for fullscreen in [false, true] {
+            for initiating in [1, 2] {
+                let mut engine = with_two_tabs();
+                let one = WindowId::new(1);
+                let two = WindowId::new(2);
+                let initiating = WindowId::new(initiating);
+                if fullscreen {
+                    engine.set_fullscreen(initiating, true, false, &be());
+                } else {
+                    engine.set_maximized_to_edges(initiating, true, &be());
+                }
+                engine.expel_window_from_column(&be());
+                assert_ne!(engine.locate_window(one), engine.locate_window(two));
+                assert!(engine.slot_forced.contains(&one));
+                assert!(engine.slot_forced.contains(&two));
+                if fullscreen {
+                    engine.set_fullscreen(two, false, false, &be());
+                } else {
+                    engine.set_maximized_to_edges(two, false, &be());
+                }
+                assert_eq!(column_of(&engine, 2).width, Some(640));
+                assert!(!column_of(&engine, 2).maximized);
+                assert_eq!(column_of(&engine, 1).width, Some(1904));
+                if fullscreen {
+                    engine.set_fullscreen(one, false, false, &be());
+                } else {
+                    engine.set_maximized_to_edges(one, false, &be());
+                }
+                assert_eq!(column_of(&engine, 1).width, Some(640));
+                assert!(engine.slot_forced.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn expelling_a_manually_maximized_tab_does_not_create_sizing_ownership() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        engine
+            .monitors
+            .focused_mut()
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .columns[0]
+            .toggle_maximized(1904);
+        engine.set_maximized_to_edges(one, true, &be());
+        engine.expel_window_from_column(&be());
+        assert!(engine.slot_forced.is_empty());
+        engine.set_maximized_to_edges(two, false, &be());
+        engine.set_maximized_to_edges(one, false, &be());
+        for member in [1, 2] {
+            assert!(column_of(&engine, member).maximized);
+            assert_eq!(column_of(&engine, member).width, Some(1904));
+        }
+    }
+
+    #[test]
+    fn consuming_a_forced_tab_preserves_a_manually_maximized_destination() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        let three = WindowId::new(3);
+        engine.set_maximized_to_edges(one, true, &be());
+        engine
+            .monitors
+            .focused_mut()
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .columns[1]
+            .toggle_maximized(1904);
+        // Put the manual destination on the left and consume the forced bottom tab.
+        {
+            let monitor = engine.monitors.focused_mut().unwrap();
+            monitor.workspace_mut().unwrap().columns.swap(0, 1);
+            monitor.set_focus(two);
+        }
+        engine.consume_or_expel_window(false, &be());
+        engine.consume_or_expel_window(false, &be());
+        engine.set_maximized_to_edges(two, false, &be());
+        assert!(column_of(&engine, 3).maximized);
+        assert!(!column_of(&engine, 3).sizing_forced);
+        assert_eq!(engine.locate_window(two), engine.locate_window(three));
+    }
+
+    #[test]
+    fn orphaned_forced_width_restores_but_manual_width_does_not() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        engine.set_maximized_to_edges(one, true, &be());
+        // A restored/split slot can carry width provenance without live sizing flags.
+        engine.maximized_edges.clear();
+        engine.slot_forced.clear();
+        engine.apply_layout_for_monitor(OutputId::from_name("M"), &be());
+        assert_eq!(column_of(&engine, 1).width, Some(640));
+        assert!(!column_of(&engine, 1).sizing_forced);
+        engine
+            .monitors
+            .focused_mut()
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .columns[0]
+            .toggle_maximized(1904);
+        engine.apply_layout_for_monitor(OutputId::from_name("M"), &be());
+        assert!(column_of(&engine, 1).maximized);
+    }
+
+    #[test]
+    fn joining_a_sized_tabbed_column_inherits_both_modes_and_its_width_hold() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let three = WindowId::new(3);
+        engine.toggle_maximize_window_to_edges_for(one, &be());
+        engine.set_fullscreen(one, true, false, &be());
+        {
+            let workspace = engine
+                .monitors
+                .focused_mut()
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            let joining = workspace.columns.remove(1);
+            workspace.columns[0].tiles.extend(joining.tiles);
+        }
+        engine.apply_layout_for_monitor(OutputId::from_name("M"), &be());
+        for member in [1, 2, 3].into_iter().map(WindowId::new) {
+            assert!(engine.fullscreen_windows.contains(&member));
+            assert!(engine.maximized_edges.contains(&member));
+            assert_eq!(engine.window_sizing_mode(member), SizingMode::Fullscreen);
+        }
+        assert!(!engine.app_fullscreen.contains(&three));
+        assert_eq!(column_of(&engine, 3).width, Some(1904));
+        engine.set_fullscreen(three, false, false, &be());
+        for member in [1, 2, 3].into_iter().map(WindowId::new) {
+            assert!(!engine.is_fullscreen(member));
+            assert!(engine.is_maximized_to_edges(member));
+        }
+        engine.toggle_maximize_window_to_edges_for(three, &be());
+        assert_eq!(column_of(&engine, 3).width, Some(640));
+        assert!(engine.slot_forced.is_empty());
+    }
+
+    #[test]
+    fn closing_the_sizing_owner_preserves_the_surviving_tabs_modes_and_original_width() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        engine.toggle_maximize_window_to_edges_for(one, &be());
+        engine.set_fullscreen(one, true, false, &be());
+        engine.remove_window(one, &be());
+        assert!(!engine.fullscreen_windows.contains(&one));
+        assert!(!engine.maximized_edges.contains(&one));
+        assert!(!engine.slot_forced.contains(&one));
+        assert!(engine.slot_forced.contains(&two));
+        assert!(engine.is_fullscreen(two));
+        assert!(engine.is_maximized_to_edges(two));
+        assert_eq!(column_of(&engine, 2).width, Some(1904));
+        engine.set_fullscreen(two, false, false, &be());
+        assert!(engine.is_maximized_to_edges(two));
+        engine.toggle_maximize_window_to_edges_for(two, &be());
+        assert_eq!(column_of(&engine, 2).width, Some(640));
+        assert!(engine.slot_forced.is_empty());
+    }
+
+    #[test]
+    fn minimizing_and_restoring_either_tab_preserves_the_survivors_sizing() {
+        for departing in [1, 2] {
+            let mut engine = with_two_tabs();
+            let one = WindowId::new(1);
+            let departing = WindowId::new(departing);
+            let survivor = if departing == one {
+                WindowId::new(2)
+            } else {
+                one
+            };
+            engine.toggle_maximize_window_to_edges_for(one, &be());
+            engine.set_fullscreen(one, true, false, &be());
+            engine.minimize_window(departing, &be());
+            assert!(engine.is_minimized(departing));
+            assert!(!engine.is_fullscreen(departing));
+            assert!(engine.is_fullscreen(survivor));
+            assert!(engine.is_maximized_to_edges(survivor));
+            assert!(engine.slot_forced.contains(&survivor));
+            engine.restore_window(departing, &be());
+            assert!(!engine.is_minimized(departing));
+            assert!(engine.is_fullscreen(departing));
+            assert!(engine.is_maximized_to_edges(departing));
+            assert_eq!(
+                engine.locate_window(departing),
+                engine.locate_window(survivor)
+            );
+            engine.set_fullscreen(departing, false, false, &be());
+            assert!(engine.is_maximized_to_edges(survivor));
+            engine.toggle_maximize_window_to_edges_for(survivor, &be());
+            assert_eq!(column_of(&engine, 1).width, Some(640));
+            assert!(engine.slot_forced.is_empty());
+        }
+    }
+
+    #[test]
+    fn hidden_tabs_and_reentrant_transitions_cannot_report_sizing_changes() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        assert!(!engine.ignores_sizing_report(one));
+        assert!(engine.ignores_sizing_report(two));
+        {
+            let _transition = SizingTransition::begin();
+            assert!(engine.ignores_sizing_report(one));
+            assert!(engine.ignores_sizing_report(two));
+        }
+        assert!(!engine.ignores_sizing_report(one));
+        engine.set_fullscreen(one, true, false, &be());
+        engine.focused_column_next_tab(&be());
+        assert!(engine.ignores_sizing_report(one));
+        assert!(!engine.ignores_sizing_report(two));
+        assert!(engine.is_fullscreen(one) && engine.is_fullscreen(two));
+    }
+
+    #[test]
+    fn leaving_tabbed_sizing_does_not_release_a_manually_maximized_column() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        engine
+            .monitors
+            .focused_mut()
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .columns[0]
+            .toggle_maximized(1904);
+        engine.toggle_maximize_window_to_edges_for(one, &be());
+        engine.set_fullscreen(one, true, false, &be());
+        assert!(engine.slot_forced.is_empty());
+        engine.set_fullscreen(two, false, false, &be());
+        engine.toggle_maximize_window_to_edges_for(two, &be());
+        assert!(column_of(&engine, 1).maximized);
+        assert_eq!(column_of(&engine, 1).width, Some(1904));
+        assert!(engine.slot_forced.is_empty());
+        engine
+            .monitors
+            .focused_mut()
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .columns[0]
+            .toggle_maximized(1904);
+        assert_eq!(column_of(&engine, 1).width, Some(640));
+    }
+
+    #[test]
+    fn fullscreen_is_column_wide_across_tab_switches_and_exits_from_either_tab() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        let before = engine.locate_window(one);
+        engine.set_fullscreen(one, true, false, &be());
+        assert!(engine.is_fullscreen(one) && engine.is_fullscreen(two));
+        assert!(!engine.is_fullscreen(WindowId::new(3)));
+        assert_eq!(
+            engine.column_sizing_mode(&column_of(&engine, 1)),
+            DrawMode::Exact
+        );
+        assert_tab_drawing(&engine, 1, DrawMode::Exact);
+        for selected in [2, 1, 2] {
+            // Indicators are suppressed in this mode; switch through the keyboard path.
+            engine.focused_column_next_tab(&be());
+            assert_eq!(
+                column_of(&engine, 1).active_window(),
+                Some(WindowId::new(selected))
+            );
+            assert_tab_drawing(&engine, selected, DrawMode::Exact);
+            assert!(engine.is_fullscreen(one) && engine.is_fullscreen(two));
+            assert_eq!(column_of(&engine, 1).width, Some(1904));
+        }
+        assert_eq!(engine.locate_window(one), before);
+        assert!(!engine.applied_state[&one].visible);
+        engine.toggle_fullscreen_for(two, &be());
+        assert!(!engine.is_fullscreen(one) && !engine.is_fullscreen(two));
+        assert!(!column_of(&engine, 1).maximized);
+        assert_eq!(column_of(&engine, 1).width, Some(640));
+        assert!(engine.slot_forced.is_empty());
+        assert!(
+            !engine.applied_state[&one].visible,
+            "exiting must not show the hidden tab"
+        );
+    }
+
+    #[test]
+    fn edges_is_column_wide_across_tab_switches_and_exits_from_either_tab() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        engine.toggle_maximize_window_to_edges_for(one, &be());
+        assert!(engine.is_maximized_to_edges(one) && engine.is_maximized_to_edges(two));
+        assert_eq!(
+            engine.column_sizing_mode(&column_of(&engine, 1)),
+            DrawMode::Edges
+        );
+        assert_tab_drawing(&engine, 1, DrawMode::Edges);
+        for selected in [2, 1, 2] {
+            // Indicators are suppressed in this mode; switch through the keyboard path.
+            engine.focused_column_next_tab(&be());
+            assert_eq!(
+                column_of(&engine, 1).active_window(),
+                Some(WindowId::new(selected))
+            );
+            assert_tab_drawing(&engine, selected, DrawMode::Edges);
+        }
+        engine.toggle_maximize_window_to_edges_for(two, &be());
+        assert!(!engine.is_maximized_to_edges(one) && !engine.is_maximized_to_edges(two));
+        assert_eq!(column_of(&engine, 1).width, Some(640));
+        assert!(!column_of(&engine, 1).maximized);
+        assert!(engine.slot_forced.is_empty());
+        assert!(!engine.applied_state[&one].visible);
+    }
+
+    #[test]
+    fn fullscreen_takes_precedence_without_losing_the_columns_edges_state() {
+        let mut engine = with_two_tabs();
+        let one = WindowId::new(1);
+        let two = WindowId::new(2);
+        engine.set_maximized_to_edges(one, true, &be());
+        engine.set_fullscreen(two, true, false, &be());
+        engine.focused_column_next_tab(&be());
+        assert_eq!(column_of(&engine, 1).active_window(), Some(two));
+        assert_tab_drawing(&engine, 2, DrawMode::Exact);
+        assert_eq!(engine.window_sizing_mode(two), SizingMode::Fullscreen);
+        engine.set_fullscreen(two, false, false, &be());
+        assert!(engine.is_maximized_to_edges(one) && engine.is_maximized_to_edges(two));
+        assert_eq!(engine.window_sizing_mode(two), SizingMode::Maximized);
+        assert_tab_drawing(&engine, 2, DrawMode::Edges);
+        assert!(column_of(&engine, 1).maximized);
+        engine.set_maximized_to_edges(two, false, &be());
+        assert_eq!(column_of(&engine, 1).width, Some(640));
+        assert!(engine.slot_forced.is_empty());
     }
 
     #[test]

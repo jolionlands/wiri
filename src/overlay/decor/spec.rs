@@ -6,10 +6,11 @@
 //! call [`DecorSpec::render`].  The engine builds the specs (`layout/engine/decor.rs`).
 
 use super::paint::{
-    draw_frame, draw_shadow, fill, shadow_reach, FramePaint, Gradient, Paint, RRect, Rgba, Surface,
+    draw_frame, draw_shadow, fill, fill_relative, shadow_reach, FramePaint, Gradient, Paint, RRect,
+    Rgba, Surface,
 };
 use crate::config::{GradientStyle, PaintStyle, TabPosition};
-use crate::utils::Rect;
+use crate::utils::{Point, Rect, WindowId};
 
 /// The `output` key of the specs that hooks set (the insert hint): they do not belong to the
 /// layout pass of any monitor.
@@ -166,47 +167,82 @@ pub struct TabsSpec {
     pub position: TabPosition,
     /// Thickness of the indicator.
     pub width: i32,
-    /// Between the indicator and the area; negative puts it over the window.
-    pub gap: i32,
-    pub gaps_between: i32,
-    /// All tabs together, as a proportion of the side of the area they run along.
-    pub length: f32,
+    /// Raw gap to the area; its sign (including negative zero) survives the one-pixel minimum.
+    /// Negative gaps put the indicator over the window.
+    pub gap: f64,
+    /// Raw configured gap: even a positive value that rounds to zero keeps independent caps.
+    pub gaps_between: f64,
+    /// Requested total proportion, clamped to 0..=2 before pixel rounding. Keep the config's
+    /// f64 precision; a cast before clamping can overflow or change a half-pixel decision.
+    /// Each tab and the indicator's thickness are at least one pixel, even at zero length/width.
+    pub length: f64,
     pub corner_radius: f32,
     /// One paint per tab, already dimmed for the tabs that are not active.
     pub tabs: Vec<Paint>,
+    /// One target per paint, in exactly the same order. A mismatched list is not clickable.
+    pub windows: Vec<WindowId>,
     pub view: Rect,
 }
 
+/// A snapshot of just the input geometry, independent of the native window/worker state.
+/// Like upstream hit(), the whole tab rectangle is clickable, including rounded cutouts.
+pub(super) struct TabHitRegion {
+    window: WindowId,
+    rect: Rect,
+}
+
+impl TabHitRegion {
+    pub(super) fn hit_test(&self, point: Point) -> Option<WindowId> {
+        self.rect.contains_point(point).then_some(self.window)
+    }
+}
+
 impl TabsSpec {
-    /// Where each tab is, in screen pixels (niri's layout: centred along the side of the
-    /// area, `length` of it in all, the tabs of equal length with the rounding left over
-    /// given to the first ones).
+    /// Where each tab is, in screen pixels (niri's scale=1, progress=1 layout). Equal tab
+    /// lengths are computed with at least a one-pixel gap, then the final gaps are rounded
+    /// without that minimum. Rounding left over goes to the first tabs, and the resulting
+    /// whole indicator is centred along the side of the area.
     pub fn tab_rects(&self) -> Vec<Rect> {
-        let n = self.tabs.len() as i32;
-        if n == 0 {
+        let n = self.tabs.len();
+        if n == 0
+            || !self.length.is_finite()
+            || !self.gap.is_finite()
+            || !self.gaps_between.is_finite()
+        {
             return Vec::new();
         }
         let horizontal_side = matches!(self.position, TabPosition::Top | TabPosition::Bottom);
         let side = if horizontal_side {
-            self.area.size.w as i32
+            f64::from(self.area.size.w)
         } else {
-            self.area.size.h as i32
+            f64::from(self.area.size.h)
         };
-        let gaps = self.gaps_between.max(0);
-        let wanted = (side as f32 * self.length.clamp(0.0, 2.0)).round() as i32;
-        let shortest = n * (1 + gaps) - gaps;
+        let raw_gaps = self.gaps_between.max(0.0);
+        let reserved_gaps = raw_gaps.round().max(1.0);
+        let wanted = (side * self.length.clamp(0.0, 2.0)).round();
+        let shortest = n as f64 * (1.0 + reserved_gaps) - reserved_gaps;
         let length = wanted.max(shortest);
-        let per_tab = ((length + gaps) / n - gaps).max(1);
-        let mut ones_left = (length - (n * (per_tab + gaps) - gaps)).max(0);
-        let start = ((side - length) as f32 / 2.0).round() as i32;
+        let per_tab = (length + reserved_gaps) / n as f64 - reserved_gaps;
+
+        // Upstream computes tab lengths before animating gaps. Even at progress=1, a raw
+        // gap below 0.5 loses the reserved pixel here: the final span can be n-1 shorter.
+        let gaps = raw_gaps.round();
+        let length = n as f64 * (per_tab + gaps) - gaps;
+        let per_tab = per_tab.floor().max(1.0);
+        let floored_length = n as f64 * (per_tab + gaps) - gaps;
+        let mut ones_left = (length - floored_length).round() as usize;
+        let start = ((side - length) / 2.0).round() as i32;
+        let per_tab = per_tab as i32;
+        let gaps = gaps as i32;
         let thickness = self.width.max(1);
+        let gap = self.gap.abs().round().max(1.0).copysign(self.gap) as i32;
         let across = match self.position {
-            TabPosition::Left | TabPosition::Top => -self.gap - thickness,
-            TabPosition::Right => self.area.size.w as i32 + self.gap,
-            TabPosition::Bottom => self.area.size.h as i32 + self.gap,
+            TabPosition::Left | TabPosition::Top => -gap - thickness,
+            TabPosition::Right => self.area.size.w as i32 + gap,
+            TabPosition::Bottom => self.area.size.h as i32 + gap,
         };
         let mut along = start;
-        let mut out = Vec::with_capacity(n as usize);
+        let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             let mut len = per_tab;
             if ones_left > 0 {
@@ -238,7 +274,7 @@ impl TabsSpec {
     /// of `n`: with no gap between tabs only the ends of the whole indicator are round.
     pub fn corner_radii(&self, i: usize, n: usize) -> [f32; 4] {
         let r = self.corner_radius.max(0.0);
-        if self.gaps_between == 0 && n > 1 {
+        if self.gaps_between <= 0.0 && n > 1 {
             let vertical_side = matches!(self.position, TabPosition::Left | TabPosition::Right);
             if i == 0 {
                 return if vertical_side {
@@ -279,22 +315,52 @@ impl TabsSpec {
         Rect::new(l - 2, t - 2, (r - l + 4) as u32, (b - t + 4) as u32)
     }
 
+    /// The clicked target, in screen pixels. The whole tab rectangle is an input region,
+    /// including transparent rounded cutouts, but not gaps or the bounds' 2px AA margin.
+    /// Incomplete target lists fail closed rather than use an ambiguous paint-to-window mapping.
+    pub fn hit_test(&self, point: Point) -> Option<WindowId> {
+        self.hit_regions().iter().find_map(|r| r.hit_test(point))
+    }
+
+    pub(super) fn hit_regions(&self) -> Vec<TabHitRegion> {
+        if self.windows.len() != self.tabs.len() {
+            return Vec::new();
+        }
+        self.tab_rects()
+            .into_iter()
+            .zip(self.windows.iter().copied())
+            .filter(|(_, window)| window.as_isize() != 0)
+            .map(|(rect, window)| TabHitRegion { window, rect })
+            .collect()
+    }
+
+    /// Fit the painted corner radii, including the shared end caps of touching tabs.
+    fn tab_shape(&self, rect: Rect, origin: (i32, i32), i: usize) -> RRect {
+        let mut rr = RRect::of(rect, origin, 0.0);
+        rr.r = self.corner_radii(i, self.tabs.len());
+        let [tl, tr, br, bl] = rr.r;
+        // CSS fitting scales all corners together. A shared cap can use the entire tab
+        // length, rather than half of it, because the corners at the seam are square.
+        let scale = 1.0_f32
+            .min(rr.w / (tl + tr))
+            .min(rr.w / (bl + br))
+            .min(rr.h / (tl + bl))
+            .min(rr.h / (tr + br));
+        rr.r = rr.r.map(|r| r * scale);
+        rr
+    }
+
     pub fn render(&self, surf: &mut Surface, origin: (i32, i32)) {
         let view = RRect::of(self.view, origin, 0.0);
-        let n = self.tabs.len();
+        let window = RRect::of(self.area, origin, 0.0);
         for (i, (rect, paint)) in self
             .tab_rects()
             .into_iter()
             .zip(self.tabs.iter())
             .enumerate()
         {
-            let mut rr = RRect::of(rect, origin, 0.0);
-            rr.r = self.corner_radii(i, n);
-            let max = (rr.w.min(rr.h) / 2.0).max(0.0);
-            for r in rr.r.iter_mut() {
-                *r = r.min(max);
-            }
-            fill(surf, &rr, paint, &view);
+            let rr = self.tab_shape(rect, origin, i);
+            fill_relative(surf, &rr, paint, &window, &view);
         }
     }
 
@@ -359,8 +425,8 @@ pub enum DecorContent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecorSpec {
     pub id: DecorId,
-    /// The window the decoration is stacked directly below (it follows that window's place in
-    /// the z-order); 0: above every ordinary window.
+    /// The window whose z-order this decoration follows: frames sit below it, tabs above.
+    /// Zero means above every ordinary window.
     pub anchor: isize,
     pub content: DecorContent,
 }
@@ -484,6 +550,12 @@ mod tests {
 
     const RED: Paint = Paint::Solid(Rgba::new(255, 0, 0, 255));
     const BLUE: Paint = Paint::Solid(Rgba::new(0, 0, 255, 255));
+    const TAB_SIDES: [TabPosition; 4] = [
+        TabPosition::Left,
+        TabPosition::Right,
+        TabPosition::Top,
+        TabPosition::Bottom,
+    ];
 
     fn frame(tile: Rect) -> FrameSpec {
         FrameSpec {
@@ -655,12 +727,169 @@ mod tests {
             area: Rect::new(200, 100, 400, 600),
             position,
             width: 4,
-            gap: 5,
-            gaps_between: 0,
+            gap: 5.0,
+            gaps_between: 0.0,
             length: 0.5,
             corner_radius: 3.0,
             tabs: vec![RED; n],
+            windows: (1..=n).map(|i| WindowId::new(i as isize)).collect(),
             view: Rect::new(0, 0, 1366, 768),
+        }
+    }
+
+    #[test]
+    fn zero_width_and_length_keep_one_pixel_tabs_on_every_side() {
+        for position in TAB_SIDES {
+            for length in [0.0, -1.0] {
+                let mut t = tabs(position, 3);
+                t.width = 0;
+                t.length = length;
+                t.gaps_between = 2.0;
+                let rects = t.tab_rects();
+                assert_eq!(rects.len(), 3);
+                assert!(rects.iter().all(|r| r.size.w == 1 && r.size.h == 1));
+                let b = t.bounds();
+                let (w, h) = (b.size.w as i32, b.size.h as i32);
+                let mut px = vec![0u32; (w * h) as usize];
+                let mut surf = Surface::new(w, h, &mut px);
+                t.render(&mut surf, (b.loc.x, b.loc.y));
+                for (i, rect) in rects.iter().enumerate() {
+                    assert_eq!(t.hit_test(rect.loc), Some(t.windows[i]));
+                    assert_eq!(
+                        surf.get(rect.loc.x - b.loc.x, rect.loc.y - b.loc.y),
+                        [255, 0, 0, 255]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn length_two_extends_equally_with_zero_gap_reservations_removed() {
+        for position in TAB_SIDES {
+            let mut t = tabs(position, 3);
+            t.length = 2.0;
+            let horizontal = matches!(position, TabPosition::Top | TabPosition::Bottom);
+            let (start, side) = if horizontal {
+                (t.area.loc.x, t.area.size.w as i32)
+            } else {
+                (t.area.loc.y, t.area.size.h as i32)
+            };
+            let rects = t.tab_rects();
+            let first = rects.first().unwrap();
+            let last = rects.last().unwrap();
+            assert_eq!(
+                if horizontal { first.loc.x } else { first.loc.y },
+                start - side / 2 + 1
+            );
+            assert_eq!(
+                if horizontal {
+                    last.right()
+                } else {
+                    last.bottom()
+                },
+                start + side + side / 2 - 1
+            );
+            // Clamping occurs in f64, even for finite values that would overflow f32.
+            for length in [3.0, f64::MAX] {
+                t.length = length;
+                assert_eq!(t.tab_rects(), rects);
+            }
+        }
+    }
+
+    #[test]
+    fn length_keeps_f64_precision_until_after_clamping_and_pixel_rounding() {
+        for position in TAB_SIDES {
+            let mut t = tabs(position, 1);
+            t.area = Rect::new(200, 100, 101, 101);
+            for (length, span, start) in [
+                (-f64::MAX, 1, 50),
+                (0.5 - f64::EPSILON, 50, 26),
+                (0.5, 51, 25),
+                (0.5 + f64::EPSILON, 51, 25),
+                (f64::MAX, 202, -51),
+            ] {
+                t.length = length;
+                let rects = t.tab_rects();
+                assert_eq!(rects.len(), 1);
+                let rect = rects[0];
+                if matches!(position, TabPosition::Left | TabPosition::Right) {
+                    assert_eq!((rect.loc.y, rect.size.h), (100 + start, span));
+                } else {
+                    assert_eq!((rect.loc.x, rect.size.w), (200 + start, span));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_gaps_keep_their_sign_and_one_pixel_minimum_on_every_side() {
+        for position in TAB_SIDES {
+            for (raw, expected) in [
+                (0.0, 1),
+                (-0.0, -1),
+                (0.25, 1),
+                (-0.25, -1),
+                (0.5, 1),
+                (-0.5, -1),
+                (1.5, 2),
+                (-1.5, -2),
+            ] {
+                let mut t = tabs(position, 3);
+                t.gap = raw;
+                for rect in t.tab_rects() {
+                    let actual = match position {
+                        TabPosition::Left => t.area.loc.x - rect.right(),
+                        TabPosition::Right => rect.loc.x - t.area.right(),
+                        TabPosition::Top => t.area.loc.y - rect.bottom(),
+                        TabPosition::Bottom => rect.loc.y - t.area.bottom(),
+                    };
+                    assert_eq!(actual, expected, "{position:?}, {raw:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nonfinite_tab_geometry_never_paints_or_accepts_input() {
+        for position in TAB_SIDES {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for field in 0..3 {
+                    let mut t = tabs(position, 3);
+                    match field {
+                        0 => t.length = bad,
+                        1 => t.gap = bad,
+                        _ => t.gaps_between = bad,
+                    }
+                    assert!(t.tab_rects().is_empty());
+                    assert_eq!(t.bounds(), Rect::new(200, 100, 0, 0));
+                    assert!(t.hit_regions().is_empty());
+                    assert_eq!(t.hit_test(t.area.center()), None);
+                    let mut px = [0u32; 16];
+                    let mut surf = Surface::new(4, 4, &mut px);
+                    t.render(&mut surf, (200, 100));
+                    assert!(surf.px.iter().all(|&pixel| pixel == 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn negative_gap_overlaps_the_window_but_negative_tab_gaps_only_touch() {
+        for position in TAB_SIDES {
+            let mut t = tabs(position, 3);
+            t.gap = -3.0;
+            t.gaps_between = -5.0;
+            let rects = t.tab_rects();
+            match position {
+                TabPosition::Left => assert_eq!(rects[0].right(), t.area.loc.x + 3),
+                TabPosition::Right => assert_eq!(rects[0].loc.x, t.area.right() - 3),
+                TabPosition::Top => assert_eq!(rects[0].bottom(), t.area.loc.y + 3),
+                TabPosition::Bottom => assert_eq!(rects[0].loc.y, t.area.bottom() - 3),
+            }
+            t.gaps_between = 0.0;
+            assert_eq!(t.tab_rects(), rects);
         }
     }
 
@@ -668,16 +897,19 @@ mod tests {
     fn tabs_on_the_left_run_down_the_middle_of_the_column() {
         let rects = tabs(TabPosition::Left, 3).tab_rects();
         assert_eq!(rects.len(), 3);
-        // 600 px high column, half of it in all: 300 px, from y = 100 + 150.
-        assert_eq!(rects[0].loc.y, 250);
-        assert_eq!(rects[2].bottom(), 550);
+        // 300 requested pixels minus two reserved gaps: 298 px, centred at y = 400.
+        assert_eq!(rects[0].loc.y, 251);
+        assert_eq!(rects[2].bottom(), 549);
         // 5 px gap and 4 px width to the left of x = 200.
         assert_eq!(rects[0].loc.x, 200 - 5 - 4);
         assert_eq!(rects[0].size.w, 4);
         // They touch (no gaps between tabs) and share the length.
         assert_eq!(rects[0].bottom(), rects[1].loc.y);
         assert_eq!(rects[1].bottom(), rects[2].loc.y);
-        assert!(rects.iter().all(|r| r.size.h == 100));
+        assert_eq!(
+            rects.iter().map(|r| r.size.h).collect::<Vec<_>>(),
+            vec![100, 99, 99]
+        );
     }
 
     #[test]
@@ -691,7 +923,8 @@ mod tests {
         let top = tabs(TabPosition::Top, 2).tab_rects();
         assert_eq!(top[0].loc.y, 100 - 5 - 4);
         assert_eq!(top[0].size.h, 4);
-        assert_eq!(top[0].loc.x, 200 + (400 - 200) / 2);
+        // The final zero gap removes one reserved pixel: round((400 - 199) / 2).
+        assert_eq!(top[0].loc.x, 301);
         let bottom = tabs(TabPosition::Bottom, 2).tab_rects();
         assert_eq!(bottom[0].loc.y, 100 + 600 + 5);
     }
@@ -700,16 +933,18 @@ mod tests {
     fn the_rounding_left_over_goes_to_the_first_tabs() {
         let mut t = tabs(TabPosition::Left, 4);
         t.area = Rect::new(0, 0, 100, 202);
-        t.length = 0.5; // 101 px in all
-        let heights: Vec<u32> = t.tab_rects().iter().map(|r| r.size.h).collect();
-        assert_eq!(heights.iter().sum::<u32>(), 101);
-        assert_eq!(heights, vec![26, 25, 25, 25]);
+        t.length = 0.5; // 101 requested pixels, minus three reserved gaps = 98.
+        let rects = t.tab_rects();
+        let heights: Vec<u32> = rects.iter().map(|r| r.size.h).collect();
+        assert_eq!(heights.iter().sum::<u32>(), 98);
+        assert_eq!(heights, vec![25, 25, 24, 24]);
+        assert_eq!(rects[0].loc.y, 52);
     }
 
     #[test]
     fn gaps_between_tabs_are_kept_and_make_every_tab_round() {
         let mut t = tabs(TabPosition::Left, 3);
-        t.gaps_between = 2;
+        t.gaps_between = 2.0;
         let rects = t.tab_rects();
         assert_eq!(rects[1].loc.y - rects[0].bottom(), 2);
         assert_eq!(t.corner_radii(1, 3), [3.0; 4]);
@@ -718,6 +953,139 @@ mod tests {
         assert_eq!(t.corner_radii(0, 3), [3.0, 3.0, 0.0, 0.0]);
         assert_eq!(t.corner_radii(1, 3), [0.0; 4]);
         assert_eq!(t.corner_radii(2, 3), [0.0, 0.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn static_tabs_match_both_gap_rounding_stages_on_every_side() {
+        // (raw gap, final pixel gap, tab lengths at proportion=1, start, shortest start).
+        // The column side is 101, and there are four tabs. Positive subpixel gaps keep
+        // independent caps even when their final pixel gap is zero.
+        let cases = [
+            (0.0, 0, [25, 25, 24, 24], 2, 49),
+            (f64::MIN_POSITIVE, 0, [25, 25, 24, 24], 2, 49),
+            (0.25, 0, [25, 25, 24, 24], 2, 49),
+            (0.49999999999999994, 0, [25, 25, 24, 24], 2, 49),
+            (0.5, 1, [25, 25, 24, 24], 0, 47),
+            (0.75, 1, [25, 25, 24, 24], 0, 47),
+            (1.0, 1, [25, 25, 24, 24], 0, 47),
+            (1.4999999999999998, 1, [25, 25, 24, 24], 0, 47),
+            (1.5, 2, [24, 24, 24, 23], 0, 46),
+            (2.5, 3, [23, 23, 23, 23], 0, 44),
+            (3.5, 4, [23, 22, 22, 22], 0, 43),
+            (65534.5, 65535, [1, 1, 1, 1], -98254, -98254),
+            (65535.0, 65535, [1, 1, 1, 1], -98254, -98254),
+        ];
+        for position in TAB_SIDES {
+            for (raw_gap, gap, lengths, start, shortest_start) in cases {
+                let mut t = tabs(position, 4);
+                t.area = Rect::new(200, 100, 101, 101);
+                t.gaps_between = raw_gap;
+                assert_eq!(
+                    t.corner_radii(1, 4),
+                    if raw_gap == 0.0 { [0.0; 4] } else { [3.0; 4] }
+                );
+                for (length, lengths, start) in
+                    [(0.0, [1; 4], shortest_start), (1.0, lengths, start)]
+                {
+                    t.length = length;
+                    let mut along = start;
+                    let expected: Vec<_> = lengths
+                        .iter()
+                        .map(|&len| {
+                            let rect = match position {
+                                TabPosition::Left => Rect::new(191, 100 + along, 4, len),
+                                TabPosition::Right => Rect::new(306, 100 + along, 4, len),
+                                TabPosition::Top => Rect::new(200 + along, 91, len, 4),
+                                TabPosition::Bottom => Rect::new(200 + along, 206, len, 4),
+                            };
+                            along += len as i32 + gap;
+                            rect
+                        })
+                        .collect();
+                    assert_eq!(t.tab_rects(), expected, "{position:?}, {raw_gap}, {length}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn touching_tabs_share_fitted_caps_on_every_side() {
+        for position in TAB_SIDES {
+            let mut t = tabs(position, 3);
+            t.width = 20;
+            t.corner_radius = 100.0;
+            let vertical = matches!(position, TabPosition::Left | TabPosition::Right);
+            let expected = if vertical {
+                [[10.0, 10.0, 0.0, 0.0], [0.0; 4], [0.0, 0.0, 10.0, 10.0]]
+            } else {
+                [[10.0, 0.0, 0.0, 10.0], [0.0; 4], [0.0, 10.0, 10.0, 0.0]]
+            };
+            let rects = t.tab_rects();
+            for (i, rect) in rects.iter().enumerate() {
+                assert_eq!(t.tab_shape(*rect, (0, 0), i).r, expected[i]);
+                assert_eq!(t.hit_test(rect.loc), Some(t.windows[i]));
+            }
+            for pair in rects.windows(2) {
+                let seam = if vertical {
+                    Point::new(pair[0].loc.x, pair[0].bottom())
+                } else {
+                    Point::new(pair[0].right(), pair[0].loc.y)
+                };
+                let next = rects.iter().position(|r| r.loc == pair[1].loc).unwrap();
+                assert_eq!(t.hit_test(seam), Some(t.windows[next]));
+            }
+        }
+    }
+
+    #[test]
+    fn short_touching_tabs_fit_and_paint_caps_past_their_midpoints() {
+        for position in TAB_SIDES {
+            let mut t = tabs(position, 3);
+            t.area = Rect::new(200, 100, 20, 20);
+            t.width = 20;
+            t.length = 1.0;
+            t.corner_radius = 100.0;
+            let vertical = matches!(position, TabPosition::Left | TabPosition::Right);
+            let expected = if vertical {
+                [[6.0, 6.0, 0.0, 0.0], [0.0; 4], [0.0, 0.0, 6.0, 6.0]]
+            } else {
+                [[6.0, 0.0, 0.0, 6.0], [0.0; 4], [0.0, 6.0, 6.0, 0.0]]
+            };
+            let rects = t.tab_rects();
+            let b = t.bounds();
+            let (w, h) = (b.size.w as i32, b.size.h as i32);
+            let mut px = vec![0u32; (w * h) as usize];
+            let mut surf = Surface::new(w, h, &mut px);
+            t.render(&mut surf, (b.loc.x, b.loc.y));
+            for (i, rect) in rects.iter().enumerate() {
+                assert_eq!(t.tab_shape(*rect, (0, 0), i).r, expected[i]);
+            }
+            // At these pixels the end-cap arc crosses the tab's centre line. A radius
+            // chosen by rectangle quadrant would incorrectly make them fully opaque.
+            let alpha = ((0.5 - (5.5_f32.hypot(2.5) - 6.0)) * 255.0).round() as i32;
+            for (i, along) in [(0, 3), (2, 2)] {
+                let rect = rects[i];
+                let point = if vertical {
+                    Point::new(rect.loc.x, rect.loc.y + along)
+                } else {
+                    Point::new(rect.loc.x + along, rect.loc.y)
+                };
+                let actual = surf.get(point.x - b.loc.x, point.y - b.loc.y);
+                assert!((i32::from(actual[3]) - alpha).abs() <= 1);
+                assert_eq!(t.hit_test(point), Some(t.windows[i]));
+                let cutout = if i == 0 {
+                    rect.loc
+                } else if vertical {
+                    Point::new(rect.loc.x, rect.bottom() - 1)
+                } else {
+                    Point::new(rect.right() - 1, rect.loc.y)
+                };
+                assert_eq!(surf.get(cutout.x - b.loc.x, cutout.y - b.loc.y)[3], 0);
+                assert_eq!(t.hit_test(cutout), Some(t.windows[i]));
+            }
+            let seam = rects[1].loc;
+            assert_eq!(surf.get(seam.x - b.loc.x, seam.y - b.loc.y)[3], 255);
+        }
     }
 
     #[test]
@@ -746,6 +1114,68 @@ mod tests {
     }
 
     #[test]
+    fn hits_include_rounded_cutouts_but_exclude_gaps_edges_and_aa_margin() {
+        for position in TAB_SIDES {
+            let mut t = tabs(position, 3);
+            t.width = 20;
+            t.corner_radius = 10.0;
+            t.gaps_between = 6.0;
+            let rects = t.tab_rects();
+            for (i, rect) in rects.iter().enumerate() {
+                let shape = t.tab_shape(*rect, (0, 0), i);
+                assert_eq!(
+                    shape.coverage(rect.loc.x as f32 + 0.5, rect.loc.y as f32 + 0.5),
+                    0.0
+                );
+                for point in [
+                    rect.loc,
+                    Point::new(rect.right() - 1, rect.loc.y),
+                    Point::new(rect.loc.x, rect.bottom() - 1),
+                    Point::new(rect.right() - 1, rect.bottom() - 1),
+                    rect.center(),
+                ] {
+                    assert_eq!(t.hit_test(point), Some(t.windows[i]));
+                }
+                assert_eq!(t.hit_test(Point::new(rect.right(), rect.center().y)), None);
+                assert_eq!(t.hit_test(Point::new(rect.center().x, rect.bottom())), None);
+            }
+            let gap = if matches!(position, TabPosition::Top | TabPosition::Bottom) {
+                Point::new(rects[0].right() + 3, rects[0].center().y)
+            } else {
+                Point::new(rects[0].center().x, rects[0].bottom() + 3)
+            };
+            assert_eq!(t.hit_test(gap), None);
+            let b = t.bounds();
+            for inset in 0..2 {
+                for point in [
+                    Point::new(b.loc.x + inset, b.center().y),
+                    Point::new(b.right() - 1 - inset, b.center().y),
+                    Point::new(b.center().x, b.loc.y + inset),
+                    Point::new(b.center().x, b.bottom() - 1 - inset),
+                ] {
+                    assert_eq!(t.hit_test(point), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_extra_and_null_targets_never_select_the_wrong_window() {
+        let mut t = tabs(TabPosition::Left, 2);
+        let rects = t.tab_rects();
+        let targets = t.windows.clone();
+        t.windows.pop();
+        assert!(rects.iter().all(|r| t.hit_test(r.center()).is_none()));
+        t.windows = targets;
+        t.windows.push(WindowId::new(3));
+        assert!(rects.iter().all(|r| t.hit_test(r.center()).is_none()));
+        t.windows.pop();
+        t.windows[0] = WindowId::new(0);
+        assert_eq!(t.hit_test(rects[0].center()), None);
+        assert_eq!(t.hit_test(rects[1].center()), Some(t.windows[1]));
+    }
+
+    #[test]
     fn rendering_tabs_paints_each_tab() {
         let mut t = tabs(TabPosition::Left, 2);
         t.corner_radius = 0.0;
@@ -760,6 +1190,47 @@ mod tests {
         let c1 = rects[1].center();
         assert_eq!(surf.get(c0.x - b.loc.x, c0.y - b.loc.y), [255, 0, 0, 255]);
         assert_eq!(surf.get(c1.x - b.loc.x, c1.y - b.loc.y), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn tab_gradients_use_the_window_or_view_without_restarting_per_tab() {
+        for position in TAB_SIDES {
+            for relative_to_view in [false, true] {
+                let mut t = tabs(position, 2);
+                let horizontal = matches!(position, TabPosition::Top | TabPosition::Bottom);
+                t.corner_radius = 0.0;
+                t.tabs = vec![
+                    Paint::Gradient(Gradient {
+                        from: Rgba::new(0, 0, 0, 255),
+                        to: Rgba::new(255, 255, 255, 255),
+                        angle: if horizontal { 90.0 } else { 180.0 },
+                        relative_to_view,
+                    });
+                    2
+                ];
+                let b = t.bounds();
+                let (w, h) = (b.size.w as i32, b.size.h as i32);
+                let mut px = vec![0u32; (w * h) as usize];
+                let mut surf = Surface::new(w, h, &mut px);
+                t.render(&mut surf, (b.loc.x, b.loc.y));
+                let source = if relative_to_view { t.view } else { t.area };
+                for rect in t.tab_rects() {
+                    let point = rect.center();
+                    let (coordinate, start, length) = if horizontal {
+                        (point.x, source.loc.x, source.size.w)
+                    } else {
+                        (point.y, source.loc.y, source.size.h)
+                    };
+                    let fraction = (coordinate as f32 + 0.5 - start as f32) / length as f32;
+                    let expected = (fraction.clamp(0.0, 1.0) * 255.0).round() as i32;
+                    let actual = surf.get(point.x - b.loc.x, point.y - b.loc.y);
+                    assert!((i32::from(actual[0]) - expected).abs() <= 1);
+                    assert_eq!(actual[0], actual[1]);
+                    assert_eq!(actual[1], actual[2]);
+                    assert_eq!(actual[3], 255);
+                }
+            }
+        }
     }
 
     #[test]
