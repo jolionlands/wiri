@@ -334,7 +334,13 @@ mod tests {
                 workspace
                     .columns
                     .iter()
-                    .map(|column| column.tiles.iter().map(|t| t.window_id.as_isize()).collect())
+                    .map(|column| {
+                        column
+                            .tiles
+                            .iter()
+                            .map(|t| t.window_id.as_isize())
+                            .collect()
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -349,7 +355,13 @@ mod tests {
                 workspace
                     .columns
                     .iter()
-                    .map(|column| column.tiles.iter().map(|t| t.window_id.as_isize()).collect())
+                    .map(|column| {
+                        column
+                            .tiles
+                            .iter()
+                            .map(|t| t.window_id.as_isize())
+                            .collect()
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -408,7 +420,10 @@ mod tests {
         }
         focus(&mut engine, output, 1);
         run(&mut engine, &backend, "swap-window-right", &[]);
-        assert_eq!(order(&engine, output), vec![vec![4, 2], vec![3, 1], vec![5]]);
+        assert_eq!(
+            order(&engine, output),
+            vec![vec![4, 2], vec![3, 1], vec![5]]
+        );
         let monitor = engine.monitors.get(&output).unwrap();
         assert_eq!(monitor.focus_window, Some(WindowId::new(1)));
         assert_eq!(
@@ -417,7 +432,10 @@ mod tests {
             "the view follows the window that moved"
         );
         run(&mut engine, &backend, "swap-window-left", &[]);
-        assert_eq!(order(&engine, output), vec![vec![1, 2], vec![3, 4], vec![5]]);
+        assert_eq!(
+            order(&engine, output),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
     }
 
     #[test]
@@ -480,11 +498,17 @@ mod tests {
         let (mut engine, backend, output) = fixture();
         strip(&mut engine, output, &[&[1], &[2], &[3]]);
         for index in 0..3 {
-            engine.monitors.get_mut(&output).unwrap().workspaces.values_mut().for_each(|ws| {
-                if index < ws.columns.len() {
-                    ws.columns[index].set_width(Some(400));
-                }
-            });
+            engine
+                .monitors
+                .get_mut(&output)
+                .unwrap()
+                .workspaces
+                .values_mut()
+                .for_each(|ws| {
+                    if index < ws.columns.len() {
+                        ws.columns[index].set_width(Some(400));
+                    }
+                });
         }
         focus(&mut engine, output, 1);
         run(&mut engine, &backend, "center-visible-columns", &[]);
@@ -520,7 +544,11 @@ mod tests {
 
     #[test]
     fn the_three_actions_reject_surplus_arguments() {
-        for name in ["swap-window-left", "swap-window-right", "center-visible-columns"] {
+        for name in [
+            "swap-window-left",
+            "swap-window-right",
+            "center-visible-columns",
+        ] {
             let args = vec!["extra".to_string()];
             assert_eq!(parse_action_name(name, &args), None, "{name}");
         }
@@ -534,7 +562,12 @@ mod tests {
         strip(&mut engine, output, &[&[1, 2]]);
         engine.maintain_empty_workspace(output);
         focus(&mut engine, output, 1);
-        run(&mut engine, &backend, "move-window-down-or-to-workspace-down", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-window-down-or-to-workspace-down",
+            &[],
+        );
         assert_eq!(
             order(&engine, output),
             vec![vec![2, 1]],
@@ -542,7 +575,12 @@ mod tests {
         );
         // Now at the bottom: the window goes to the workspace below.
         focus(&mut engine, output, 1);
-        run(&mut engine, &backend, "move-window-down-or-to-workspace-down", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-window-down-or-to-workspace-down",
+            &[],
+        );
         assert_eq!(
             workspace_order(&engine, output, 0),
             vec![vec![2]],
@@ -565,11 +603,21 @@ mod tests {
         strip(&mut engine, output, &[&[1, 2]]);
         engine.maintain_empty_workspace(output);
         focus(&mut engine, output, 2);
-        run(&mut engine, &backend, "move-window-up-or-to-workspace-up", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-window-up-or-to-workspace-up",
+            &[],
+        );
         assert_eq!(order(&engine, output), vec![vec![2, 1]]);
         // Already first in its column and on the first workspace: nothing above.
         focus(&mut engine, output, 2);
-        run(&mut engine, &backend, "move-window-up-or-to-workspace-up", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-window-up-or-to-workspace-up",
+            &[],
+        );
         assert_eq!(order(&engine, output), vec![vec![2, 1]]);
         assert_eq!(
             engine.monitors.get(&output).map(|m| m.active_workspace),
@@ -590,7 +638,12 @@ mod tests {
             workspace.columns[0].display = ColumnDisplay::Tabbed { active_tab: 0 };
         }
         focus(&mut engine, output, 2);
-        run(&mut engine, &backend, "move-window-down-or-to-workspace-down", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-window-down-or-to-workspace-down",
+            &[],
+        );
         // The tabbed column keeps showing a window of its own.
         let shown = engine
             .monitors
@@ -609,7 +662,12 @@ mod tests {
         strip(&mut engine, output, &[&[1], &[2]]);
         focus(&mut engine, output, 1);
         // There is a column on the right: the column moves there, no monitor change.
-        run(&mut engine, &backend, "move-column-right-or-to-monitor-right", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-column-right-or-to-monitor-right",
+            &[],
+        );
         assert_eq!(order(&engine, output), vec![vec![2], vec![1]]);
         assert!(workspace_order(&engine, second, 0).is_empty());
     }
@@ -620,7 +678,12 @@ mod tests {
         let second = second_monitor(&mut engine);
         strip(&mut engine, output, &[&[1, 2]]);
         focus(&mut engine, output, 1);
-        run(&mut engine, &backend, "move-column-right-or-to-monitor-right", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-column-right-or-to-monitor-right",
+            &[],
+        );
         assert!(order(&engine, output).is_empty());
         assert_eq!(
             workspace_order(&engine, second, 0),
@@ -637,7 +700,12 @@ mod tests {
         let float = WindowId::new(70);
         engine.register_float(float, output, 0, Rect::new(10, 10, 400, 300));
         engine.monitors.get_mut(&output).unwrap().focus_window = Some(float);
-        run(&mut engine, &backend, "move-column-right-or-to-monitor-right", &[]);
+        run(
+            &mut engine,
+            &backend,
+            "move-column-right-or-to-monitor-right",
+            &[],
+        );
         assert_eq!(
             engine.float_location(float).map(|(output, _)| output),
             Some(second)
@@ -665,7 +733,11 @@ mod tests {
             .get(&output)
             .map(|monitor| monitor.workspace_ids())
             .unwrap_or_default();
-        assert_eq!(ids.len(), 3, "one above, the occupied one, the trailing one");
+        assert_eq!(
+            ids.len(),
+            3,
+            "one above, the occupied one, the trailing one"
+        );
         assert!(
             workspace_order(&engine, output, ids[0]).is_empty(),
             "the first workspace is the empty one above"
@@ -688,7 +760,10 @@ mod tests {
         engine.switch_workspace(ids[1], &backend);
         engine.focus_workspace_relative(WorkspaceDirection::Previous, &backend);
         assert_eq!(
-            engine.monitors.get(&output).map(|monitor| monitor.active_workspace),
+            engine
+                .monitors
+                .get(&output)
+                .map(|monitor| monitor.active_workspace),
             Some(ids[0])
         );
         // A window opening there makes the workspace the first occupied one: a fresh empty
@@ -790,7 +865,8 @@ mod tests {
     }
 
     #[test]
-    fn without_empty_workspace_above_first_the_list_starts_with_the_windows() {        let (mut engine, _, output) = fixture();
+    fn without_empty_workspace_above_first_the_list_starts_with_the_windows() {
+        let (mut engine, _, output) = fixture();
         strip(&mut engine, output, &[&[1], &[2]]);
         engine.maintain_empty_workspace(output);
         let ids = engine
@@ -799,11 +875,15 @@ mod tests {
             .map(|monitor| monitor.workspace_ids())
             .unwrap_or_default();
         assert_eq!(ids.len(), 2);
-        assert_eq!(workspace_order(&engine, output, ids[0]), vec![vec![1], vec![2]]);
+        assert_eq!(
+            workspace_order(&engine, output, ids[0]),
+            vec![vec![1], vec![2]]
+        );
     }
 
     #[test]
-    fn the_composite_actions_reject_surplus_arguments() {        for name in [
+    fn the_composite_actions_reject_surplus_arguments() {
+        for name in [
             "move-window-down-or-to-workspace-down",
             "move-window-up-or-to-workspace-up",
             "move-column-left-or-to-monitor-left",

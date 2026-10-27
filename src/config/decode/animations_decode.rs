@@ -27,7 +27,8 @@ impl Decoder {
                 "window-resize" if child.children.is_some() => Some("window-resize"),
                 "recent-windows-close" => Some("recent-windows-close"),
                 _ => None,
-            };            if let Some(key) = definition {
+            };
+            if let Some(key) = definition {
                 if !seen.insert(key.to_owned()) {
                     self.error(
                         child.pos,
@@ -409,7 +410,8 @@ mod tests {
 
     #[test]
     fn recent_windows_close_is_decoded_as_a_fade() {
-        let cfg = decode_animations("recent-windows-close { duration-ms 250; curve ease-out-expo; };");
+        let cfg =
+            decode_animations("recent-windows-close { duration-ms 250; curve ease-out-expo; };");
         assert_eq!(
             cfg.recent_windows_close,
             Some(easing(250, Easing::ExpoOut)),
@@ -430,9 +432,11 @@ mod tests {
                 .recent_windows_close_kind(),
             AnimationKind::Off
         );
-        assert!(decode_animations("recent-windows-close { duration-ms 250; };")
-            .recent_windows_close
-            .is_some());
+        assert!(
+            decode_animations("recent-windows-close { duration-ms 250; };")
+                .recent_windows_close
+                .is_some()
+        );
     }
 
     #[test]

@@ -445,7 +445,8 @@ impl TilingEngine {
             .fullscreen_backdrop_color
             .as_deref()
             .and_then(crate::config::parse_color)
-            .map(crate::overlay::decor::paint::Rgba::from_array)?;        let fullscreen = self.fullscreen_windows.iter().any(|window| {
+            .map(crate::overlay::decor::paint::Rgba::from_array)?;
+        let fullscreen = self.fullscreen_windows.iter().any(|window| {
             self.locate_window(*window)
                 .map(|(output, _, _)| output)
                 .or_else(|| self.float_location(*window).map(|(output, _)| output))
@@ -557,7 +558,8 @@ mod tests {
 
     fn frame_of(spec: &DecorSpec) -> &FrameSpec {
         match &spec.content {
-            DecorContent::Frame(f) => f,            other => panic!("expected a frame, got {:?}", other),
+            DecorContent::Frame(f) => f,
+            other => panic!("expected a frame, got {:?}", other),
         }
     }
 
@@ -726,7 +728,8 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_and_maximized_windows_have_no_frame() {        let cfg = cfg_with(Effects::default());
+    fn fullscreen_and_maximized_windows_have_no_frame() {
+        let cfg = cfg_with(Effects::default());
         let urgent = HashSet::new();
         let tiles = [
             (wid(1), Rect::new(0, 0, 1366, 768), DrawMode::Exact),

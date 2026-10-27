@@ -2075,7 +2075,8 @@ impl TilingEngine {
                         tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
                         tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
                         if reset_heights || tile.preferred_height.is_none() {
-                            if tile.height_proportion.is_none() && tile.height_preset_idx.is_none() {
+                            if tile.height_proportion.is_none() && tile.height_preset_idx.is_none()
+                            {
                                 tile.preferred_height = heights.get(&tile.window_id).copied();
                             }
                         }

@@ -1981,7 +1981,11 @@ mod tests {
         assert_eq!(engine.effective_rule_opacity(wid), Some(0.5));
         // The window ignores its rule's opacity...
         assert!(engine.toggle_window_rule_opacity(wid, &be()));
-        assert_eq!(engine.rule_opacity(wid), Some(0.5), "the rule still matches");
+        assert_eq!(
+            engine.rule_opacity(wid),
+            Some(0.5),
+            "the rule still matches"
+        );
         assert_eq!(engine.effective_rule_opacity(wid), None);
         // ... and gets it back when the action is used again.
         assert!(!engine.toggle_window_rule_opacity(wid, &be()));

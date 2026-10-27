@@ -1309,7 +1309,9 @@ pub(crate) fn perform_action_on(
                 // A floating window has no column to share: niri's presets are column shares.
                 info!("switch-preset-window-height: a floating window keeps its height");
             } else {
-                engine.write().switch_preset_window_height(forwards, backend);
+                engine
+                    .write()
+                    .switch_preset_window_height(forwards, backend);
             }
         }
         // wiri's fractions are niri proportions of the view.
@@ -1524,13 +1526,19 @@ pub(crate) fn perform_action_on(
             None => info!("toggle-window-rule-opacity: no window to act on"),
         },
         Action::FocusFloating => {
-            engine.write().focus_layer_action(FocusLayer::Floating, backend);
+            engine
+                .write()
+                .focus_layer_action(FocusLayer::Floating, backend);
         }
         Action::FocusTiling => {
-            engine.write().focus_layer_action(FocusLayer::Tiling, backend);
+            engine
+                .write()
+                .focus_layer_action(FocusLayer::Tiling, backend);
         }
         Action::SwitchFocusBetweenFloatingAndTiling => {
-            engine.write().focus_layer_action(FocusLayer::Switch, backend);
+            engine
+                .write()
+                .focus_layer_action(FocusLayer::Switch, backend);
         }
         Action::ExpandColumnToAvailable => {
             if float_of(target).is_none() {

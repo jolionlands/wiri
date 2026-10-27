@@ -242,11 +242,23 @@ mod tests {
         );
         // `hotkey-overlay { hide-not-bound }` lists only what can actually be pressed.
         let hidden = curated_rows(&bindings, 3, true);
-        assert_eq!(hidden, vec![(crate::ipc::server::format_chord(3, 0x51), "Close window".to_string())]);
+        assert_eq!(
+            hidden,
+            vec![(
+                crate::ipc::server::format_chord(3, 0x51),
+                "Close window".to_string()
+            )]
+        );
         assert!(!hidden.iter().any(|row| row.0 == NOT_BOUND));
         // An explicit title always wins, including over a placeholder.
         let titled = curated_rows(
-            &[bind(0, 3, 0x46, "DebugLayout", Some(Some("My special action")))],
+            &[bind(
+                0,
+                3,
+                0x46,
+                "DebugLayout",
+                Some(Some("My special action")),
+            )],
             3,
             true,
         );
