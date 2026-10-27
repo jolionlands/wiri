@@ -209,6 +209,28 @@ mod tests {
         assert_eq!(dup.context.related[0].line, 1);
         assert_eq!(dup.line, 2);
     }
+    /// Live fixtures used to append a second `binds {}` to a config that already had
+    /// one (Lane S, H47/H49); that is a duplicate singleton section, so the reload was
+    /// refused and the new chord never bound. One section per physical file is the rule.
+    #[test]
+    fn a_second_binds_section_in_one_file_is_a_duplicate() {
+        let d = decode::decode_text(
+            "binds { Ctrl+Alt+F8 { screenshot; } }\nbinds { Ctrl+Alt+F9 { screenshot; } }\n",
+            "test.kdl",
+            None,
+        );
+        assert_eq!(d.error_count(), 1, "{:?}", d.issues);
+        let issue = &d.issues[0];
+        assert!(issue.message.contains("duplicate node 'binds'"), "{issue:?}");
+        assert_eq!(issue.line, 2);
+        assert_eq!(issue.context.related[0].line, 1);
+        let one = decode::decode_text(
+            "binds { Ctrl+Alt+F9 { screenshot; } }\n",
+            "test.kdl",
+            None,
+        );
+        assert_eq!(one.error_count(), 0, "{:?}", one.issues);
+    }
     #[test]
     fn output_parts_and_rule_matches_repeat_but_rule_values_do_not() {
         let d = decode::decode_text("output \"DP-1\" { scale 1; }\noutput \"DP-1\" { enable true; }\nwindow-rule { match title=\"a\"; match title=\"b\"; opacity 0.3; opacity 0.8; }", "", None);
