@@ -620,15 +620,20 @@ async fn run() -> Result<()> {
     let engine_clone = engine.clone();
 
     // Backend event handler
+    //
+    // It sleeps in `recv` until the WinEvent thread sends something (it used to look every
+    // 50 ms, which also delayed every event by up to 50 ms), then drains what queued behind
+    // it.
     let handle_evt = handle.clone();
     let ipc_server_events = ipc_server.clone();
     tokio::spawn(async move {
-        loop {
+        while let Some(event) = event_rx.recv().await {
+            handle_backend_event(event, &handle_evt, &engine_clone, &ipc_server_events);
             while let Ok(event) = event_rx.try_recv() {
                 handle_backend_event(event, &handle_evt, &engine_clone, &ipc_server_events);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // Every sender is gone: no window event can arrive any more.
     });
 
     // Periodic reconciliation catches windows that missed CREATE/SHOW events
