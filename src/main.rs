@@ -683,10 +683,9 @@ async fn run() -> Result<()> {
     // Focus-follows-mouse and warp are driven by the input message thread's
     // hook notifications and one-shot delay timer, never by cursor polling.
 
-    // Workspace indicator overlay — shown whenever the active workspace changes.
+    // Workspace indicator overlay — shown whenever the active workspace changes.  Its message-pump
+    // thread and window are created by the first `show`, not here.
     let overlay = Arc::new(WorkspaceIndicator::new());
-    // Spawn the Win32 message-pump thread; drop the JoinHandle (overlay lives until exit).
-    let _ = overlay.clone().spawn();
 
     // Overview-mode banner — shown while the user is in overview ("Space or
     // Esc to exit").  Engine reaches it via the
