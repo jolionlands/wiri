@@ -366,6 +366,44 @@ The older forms work too: `class-name "x"` directly in the rule and
 `off` / `on`, `duration N`, `easing "ease-out-cubic"`; niri's per-animation blocks and `slowdown` are
 accepted with a warning.
 
+### `overview {}`
+
+```kdl
+overview {
+    zoom 0.5                      // 0 to 1; lower values make the workspaces smaller
+    backdrop-color "#262626"      // behind the workspaces
+    workspace-shadow {            // off; or softness / spread / offset / color
+        softness 40
+        spread 10
+        offset x=0 y=10
+        color "#00000050"
+    }
+}
+```
+
+The overview is a camera over the real workspaces, drawn by a session-local window of live DWM
+previews; applications keep their size. The opening and closing spring is `animations {
+overview-open-close { ... } }` (it follows `off` and `slowdown`). The host is opaque (previews of
+other applications need that), so an alpha in `backdrop-color` or the shadow colour blends with
+black, not with your wallpaper. In the overview: click a window to focus it, drag it onto a
+workspace or into the gap above, between or below workspaces, use the wheel to change workspace,
+drag with the right button to scroll the view; with a touchscreen the primary finger pans and
+resting on a window picks it up. All normal binds keep working.
+
+### `gestures {}`
+
+`hot-corners { top-left; top-right; bottom-left; bottom-right; off }` opens the overview when the
+pointer rests in a screen corner for about 120 ms (once per visit). With no name the top-left
+corner is on; naming a corner replaces that default; `off` switches them all off. An `output`
+block may carry its own `hot-corners {}`, which replaces the global one for that monitor.
+`dnd-edge-view-scroll` and `dnd-edge-workspace-switch` configure the drag-and-drop edge actions; an
+empty `gestures {}` or either of those blocks turns the drag-capture approximation on, a block
+holding only `hot-corners` does not.
+
+With `input { touchpad { } }` (a Precision Touchpad; set Windows' own three- and four-finger
+Swipes to Nothing first) three fingers move the view or switch workspace and a four-finger swipe up
+or down opens or closes the overview.
+
 ### Programs to start
 
 `spawn-at-startup "prog" "arg" ...` (every argument its own string) and `spawn-sh-at-startup "command"`.
@@ -481,9 +519,11 @@ Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Br
 | `move-column-to-monitor-left` | — | — | Move the column to the monitor on the left |
 | `move-column-to-monitor-right` | — | — | Move the column to the monitor on the right |
 | `refresh` | — | — | Re-apply layout |
+| `column-toggle-tabbed` | `toggle-column-tabbed-display` | — | Switch the focused column between normal and tabbed display |
+| `set-column-display` | — | `"normal"` or `"tabbed"` | niri: set the focused column's display; choosing the current mode does nothing (the selected tab and the focus stay). `wiri-ctl set-column-display tabbed` and the typed `{"Action":{"SetColumnDisplay":{"display":"Tabbed"}}}` do the same |
 | `overview` | `overview-toggle`, `zoom-out`, `toggle-overview` | — | Enter/exit overview |
 | `open-overview` | — | — | Enter overview (nothing happens when it is open) |
-| `overview-exit` | `exit-overview`, `close-overview` | — | Leave overview |
+| `overview-exit` | `exit-overview`, `close-overview` | — | Leave overview (nothing happens when it is closed or already closing) |
 | `overview-left` | — | — | Navigate left in overview |
 | `overview-right` | — | — | Navigate right in overview |
 | `overview-select` | `overview-accept` | — | Select window, exit overview |
