@@ -132,7 +132,11 @@ mod tests {
             let matched = OutputMatcher::default()
                 .matching_config(&on.config, &monitor)
                 .unwrap_or_else(|| panic!("{output} named no monitor: {:?}", on.config.output));
-            let policy = on.config.gestures.hot_corners.for_output(matched.hot_corners);
+            let policy = on
+                .config
+                .gestures
+                .hot_corners
+                .for_output(matched.hot_corners);
             assert_eq!(
                 policy.enabled(),
                 [true, false, false, false],
