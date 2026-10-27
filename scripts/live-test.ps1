@@ -886,6 +886,7 @@ function TerminalShells {
         ForEach-Object { [int]$_.ProcessId })
 }
 $terminalShellsStopped = 0
+$terminalWindowsLeftOpen = 0
 function CloseSpawnedTerminal($window, $shellsBefore) {
     $new = @()
     for ($i = 0; $i -lt 12 -and -not $new.Count; $i++) {
@@ -893,7 +894,15 @@ function CloseSpawnedTerminal($window, $shellsBefore) {
         if (-not $new.Count) { Start-Sleep -Milliseconds 250 }
     }
     foreach ($id in $new) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
-    if ($window -and [LT]::IsWindow($window)) { Start-Sleep -Milliseconds 300; [LT]::Close($window) }
+    # A killed shell leaves its Windows Terminal window open on an "[process exited]" tab, and a
+    # close that arrives while the tab is still tearing down is ignored: retry until it is gone.
+    if ($window) {
+        for ($i = 0; $i -lt 15 -and [LT]::IsWindow($window); $i++) {
+            Start-Sleep -Milliseconds 200
+            [LT]::Close($window)
+        }
+        if ([LT]::IsWindow($window)) { $script:terminalWindowsLeftOpen++ }
+    }
     $script:terminalShellsStopped += $new.Count
 }
 
@@ -2831,6 +2840,8 @@ $summary = [ordered]@{
     h2_ipc_args_ok = $spawnIpcArgsOk
     h2_ipc_command_line_with_spaced_program_ok = $spawnIpcLineOk
     h2_wt_exe_found_on_path = $spawnWtWindow
+    terminal_shells_stopped = $terminalShellsStopped
+    terminal_windows_left_open = $terminalWindowsLeftOpen
     # --- Phase 1 / H3: actions target the real foreground window
     h3_float_keeps_foreground = $h3FloatKeepsForeground
     h3_float_reported_floating = $h3ReportedFloating
