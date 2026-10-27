@@ -229,6 +229,7 @@ mod tests {
                 )],
             },
             IpcEvent::OverviewOpenedOrClosed { is_open: true },
+            IpcEvent::TouchpadToggled { on: false },
         ];
         for event in &events {
             let json = serde_json::to_string(event).unwrap();

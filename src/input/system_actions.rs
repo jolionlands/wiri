@@ -24,6 +24,9 @@ pub enum SystemAction {
     PowerOffMonitors,
     PowerOnMonitors,
     Suspend,
+    /// niri `toggle-touchpad`: turn wiri's touchpad handling (and the OS state where there is
+    /// one) on or off for this session, and tell the event stream.
+    ToggleTouchpad,
 }
 
 pub fn parse(name: &str, args: &[String]) -> Option<Option<SystemAction>> {
@@ -83,6 +86,8 @@ pub fn parse(name: &str, args: &[String]) -> Option<Option<SystemAction>> {
         "power-on-monitors" if args.is_empty() => Some(PowerOnMonitors),
         "suspend" if args.is_empty() => Some(Suspend),
         "power-off-monitors" | "power-on-monitors" | "suspend" => None,
+        "toggle-touchpad" if args.is_empty() => Some(ToggleTouchpad),
+        "toggle-touchpad" => None,
         _ => return None,
     };
     Some(action)
@@ -103,6 +108,7 @@ pub fn wire_args(
         "PowerOffMonitors" => ("power-off-monitors", &[]),
         "PowerOnMonitors" => ("power-on-monitors", &[]),
         "Suspend" => ("suspend", &[]),
+        "ToggleTouchpad" => ("toggle-touchpad", &[]),
         _ => return None,
     };
     Some((|| {
@@ -320,8 +326,34 @@ pub(crate) fn execute(
         SystemAction::PowerOffMonitors | SystemAction::PowerOnMonitors | SystemAction::Suspend => {
             request_power(action)
         }
+        SystemAction::ToggleTouchpad => toggle_touchpad(engine, backend),
         SystemAction::Quit { .. } => Err("quit requires the shutdown sender".into()),
     }
+}
+
+/// niri `toggle-touchpad`: the state lives in `pointer_settings` (combined with `input {
+/// touchpad { off } }` and reset on restart), the event stream is told, and wiri's own raw-input
+/// reading of the touchpad is reconfigured.
+///
+/// The Raw Input window belongs to the hotkey thread, so the reconfiguration is handed to it
+/// (`dispatch::send_work`) when the action came from IPC; a bind already runs there.
+fn toggle_touchpad(
+    engine: &Arc<parking_lot::RwLock<crate::layout::TilingEngine>>,
+    backend: &crate::backend::BackendHandle,
+) -> Result<(), String> {
+    let configured = engine
+        .read()
+        .full_config()
+        .is_some_and(|config| config.input.touchpad_enabled);
+    let on = crate::input::pointer_settings::toggle_touchpad(configured);
+    tracing::info!("toggle-touchpad: touchpad is now {}", if on { "on" } else { "off" });
+    let engine = engine.clone();
+    let backend = backend.clone();
+    let apply = move || crate::input::touchpad::configure(on, engine, backend);
+    if !crate::input::dispatch::send_work(Box::new(apply.clone())) {
+        apply();
+    }
+    Ok(())
 }
 
 /// Accept real power requests off-thread: suspend does not return until wake, and
@@ -617,6 +649,31 @@ mod tests {
                 .unwrap()
                 .is_err());
         }
+    }
+    #[test]
+    fn toggle_touchpad_parses_from_a_bind_and_from_typed_ipc() {
+        // A bind: `toggle-touchpad` with no arguments.
+        assert_eq!(
+            parse("toggle-touchpad", &[]),
+            Some(Some(SystemAction::ToggleTouchpad))
+        );
+        // Arguments are refused rather than ignored: not a system action, and not a bind either.
+        assert!(parse("toggle-touchpad", &["on".into()]).is_none());
+        assert!(
+            crate::input::parse_action_flagged("toggle-touchpad", &["on".into()], &[false]).is_none()
+        );
+        // niri's typed `Action::ToggleTouchpad` has no fields.
+        let fields = serde_json::json!({});
+        let args = wire_args("ToggleTouchpad", fields.as_object().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(args.is_empty());
+        assert_eq!(
+            parse("toggle-touchpad", &args),
+            Some(Some(SystemAction::ToggleTouchpad))
+        );
+        // It is a known niri action, so a bind naming it is not reported as unknown.
+        assert!(crate::input::parse_action_flagged("toggle-touchpad", &[], &[]).is_some());
     }
     #[test]
     fn quit_tests_never_display_a_dialog_and_skip_is_immediate() {

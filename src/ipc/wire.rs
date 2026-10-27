@@ -282,6 +282,7 @@ pub fn event(dialect: Dialect, event: &IpcEvent) -> Option<Value> {
             | "keyboard_layouts_changed"
             | "keyboard_layout_switched"
             | "overview_opened_or_closed"
+            | "touchpad_toggled"
             | "config_loaded"
             | "screenshot_captured"
     ) {
@@ -643,5 +644,14 @@ mod tests {
             Some(json!({"WindowFocusChanged":{"id":3}}))
         );
         assert!(event(Dialect::Niri, &IpcEvent::WindowFocused { window_hwnd: 3 }).is_none());
+        // niri `TouchpadToggled { on }`: the `toggle-touchpad` action's event.
+        assert_eq!(
+            event(Dialect::Niri, &IpcEvent::TouchpadToggled { on: true }),
+            Some(json!({"TouchpadToggled":{"on":true}}))
+        );
+        assert_eq!(
+            event(Dialect::Wiri, &IpcEvent::TouchpadToggled { on: false }),
+            Some(json!({"type":"touchpad_toggled","data":{"on":false}}))
+        );
     }
 }

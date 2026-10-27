@@ -61,6 +61,7 @@ impl IpcServer {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(64);
         crate::screenshot::set_event_sender(event_tx.clone());
+        crate::input::pointer_settings::set_event_sender(event_tx.clone());
         Self {
             event_tx,
             engine: None,
