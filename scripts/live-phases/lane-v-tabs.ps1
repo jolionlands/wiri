@@ -317,6 +317,12 @@ public static class LaneVTabsNative {
         $null=$vt.Proc.Handle # Retain the process identity/handle until cleanup is complete.
         VTAlive
         Start-Sleep -Seconds 2
+        # The shared desktop carries about a dozen foreign Windows Terminal windows that the
+        # daemon tiles on workspace 1; the foreign-tile guard below refused them and failed
+        # every H65 gate (34694e4-live). Lanes G and T work on the empty workspace 2 for the
+        # same reason. The guard stays: it now proves workspace 2 holds only the two probes.
+        $null=VTCtl 'workspace' @('action','focus-workspace','2')
+        Start-Sleep -Milliseconds 650
         $prefix='wiri-h65-'+[Guid]::NewGuid().ToString('N').Substring(0,8)
         foreach ($i in 0..1) {
             $h=[TestForms]::Open(($prefix+'-'+$i),(70+60*$i),100,170)

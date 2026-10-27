@@ -114,16 +114,22 @@ animations {
     # Lane V implements this camera block; keep a clean fixture as well as
     # the unchanged warnings for compositor-only effects below.
     H17Case 'overview_camera_accepted' 'animations { overview-open-close { spring damping-ratio=1 stiffness=800 epsilon=0.0001; }; }'
+    # Lane A implements the recent-windows overlay fade (animations_decode.rs
+    # `recent-windows-close` -> AnimationsConfig::recent_windows_close), so it must now
+    # validate clean, with an explicit duration/curve proving the block is decoded.
+    H17Case 'recent_windows_close_accepted' 'animations { recent-windows-close { duration-ms 250; curve "ease-out-expo"; }; }'
+    # Only the three compositor-only effects wiri still has no compositor for warn.
+    # The two implemented blocks (overview-open-close, recent-windows-close) have their
+    # own clean fixtures above, which fail on any warning.
     H17Case 'compositor_options_warn_not_implemented' @'
 animations {
     config-notification-open-close {}
     exit-confirmation-open-close {}
     screenshot-ui-open {}
-    recent-windows-close {}
 }
 '@ 0 @('config-notification-open-close',
         'exit-confirmation-open-close', 'screenshot-ui-open',
-        'recent-windows-close', 'composited open/close animations') $true
+        'composited open/close animations') $true
 )
 
 foreach ($h17Case in $h17Cases) { $summary[$h17Case.gate] = $false }

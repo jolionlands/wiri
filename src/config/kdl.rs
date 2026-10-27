@@ -29,8 +29,10 @@
 //! `\t` is a tab) surprise people.  A quoted string that *starts* like a Windows path
 //! (`C:\...` or `\\server`) therefore keeps its backslashes as written, except that `\"`
 //! is a quote and a backslash run before the closing quote counts like the Windows
-//! command-line rules say.  Everywhere else a bad escape is an error that says how to fix
-//! it.  Raw strings (`r"C:\Program Files"`) always work.
+//! command-line rules say.  The one exception is a string that *starts* with three or more
+//! backslashes (`"\\\\.\\DISPLAY1"`): no literal path begins that way, so it is KDL's
+//! escaped spelling of `\\.\DISPLAY1` and is decoded as such.  Everywhere else a bad escape
+//! is an error that says how to fix it.  Raw strings (`r"C:\Program Files"`) always work.
 
 use std::fmt;
 
@@ -926,6 +928,11 @@ impl Parser {
     }
 
     /// The text after an opening quote starts like a Windows path (`C:\` or `\\`).
+    ///
+    /// A UNC or device prefix is exactly two backslashes followed by a name (`\\server`,
+    /// `\\.\DISPLAY1`). Three or more in a row (`"\\\\.\\DISPLAY1"`) cannot be a literal
+    /// prefix; that is KDL's own spelling of one (`\\` is one backslash), which is what the
+    /// docs, niri and `wiri-ctl list-monitors` JSON all show, so it takes KDL's escapes.
     fn path_like_ahead(&self) -> bool {
         match (self.peek(), self.peek_at(1), self.peek_at(2)) {
             (Some(d), Some(':'), Some('\\')) if d.is_ascii_alphabetic() => true,
@@ -1258,6 +1265,31 @@ mod tests {
         // Outside paths the escapes are KDL's.
         let d = doc(r#"a "echo \"x\" > out.txt""#);
         assert_eq!(d.nodes[0].args[0].as_str(), Some("echo \"x\" > out.txt"));
+    }
+
+    #[test]
+    fn an_escaped_unc_or_device_name_is_decoded_with_kdl_escapes() {
+        // `\\.\DISPLAY1` as KDL spells it (docs/modules/CONFIG.md, the IPC JSON, niri). The
+        // path rule used to keep all four leading backslashes, so `output "\\\\.\\DISPLAY1"`
+        // named no monitor at all.
+        let d = doc(r#"a "\\\\.\\DISPLAY1" "\\\\server\\share\\f" "\\\\?\\C:\\x""#);
+        let a = &d.nodes[0];
+        assert_eq!(a.args[0].as_str(), Some(r"\\.\DISPLAY1"));
+        assert_eq!(a.args[1].as_str(), Some(r"\\server\share\f"));
+        assert_eq!(a.args[2].as_str(), Some(r"\\?\C:\x"));
+        // The literal spellings keep working, with and without the device dot.
+        let d = doc(r#"a "\\.\DISPLAY1" "\\server\share\f" "\\.\DISPLAY1\\""#);
+        let a = &d.nodes[0];
+        assert_eq!(a.args[0].as_str(), Some(r"\\.\DISPLAY1"));
+        assert_eq!(a.args[1].as_str(), Some(r"\\server\share\f"));
+        assert_eq!(a.args[2].as_str(), Some(r"\\.\DISPLAY1\"));
+        // Strings of only backslashes read as KDL says whichever rule picks them up.
+        let d = doc(r#"a "\\" "\\\\""#);
+        assert_eq!(d.nodes[0].args[0].as_str(), Some(r"\"));
+        assert_eq!(d.nodes[0].args[1].as_str(), Some(r"\\"));
+        // Outside the exception a bad escape is still an error: `\D` is not one.
+        let e = err(r#"a "\\\\.\DISPLAY1""#);
+        assert!(e.message.contains("not an escape"), "{}", e);
     }
 
     #[test]
