@@ -3,7 +3,7 @@
 //!
 //! Windows has no way to hide the global pointer (`ShowCursor` is per-thread), so the only
 //! technique that reaches every application is swapping the system cursors: `SetSystemCursor`
-//! replaces each of the fifteen `OCR_*` cursors with a fully transparent copy, and
+//! replaces each of the fourteen `OCR_*` cursors with a fully transparent copy, and
 //! `SystemParametersInfoW(SPI_SETCURSORS)` reloads the user's own scheme.  Both calls change
 //! the machine, so the safety rules below are part of the feature, not a nicety:
 //!
@@ -19,9 +19,9 @@
 //!   The real backend refuses to run under `cfg!(test)`.
 //!
 //! This is an approximation of niri's own cursor hiding: the Windows cursor is a system-wide
-//! scheme, not a compositor surface, so a swap is visible to every application at once and a
-//! cursor shape set by an application for a single window keeps Windows' own look until the
-//! scheme is reloaded.
+//! scheme, not a compositor surface, so a swap is visible to every application at once, and an
+//! application that installs a cursor of its own (rather than the system one) keeps drawing it
+//! while wiri believes the pointer is hidden.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -288,8 +288,8 @@ pub fn restore_at_startup() {
 // the timer: one one-shot timer on the mouse-hook thread
 // ---------------------------------------------------------------------------------------
 
-/// Posted (by `KillTimer`-ing the wrong thread's timer is not possible) to the hook thread when
-/// another thread drops the option; `wParam` carries the timer id to kill.
+/// Posted to the hook thread when another thread drops the option: a thread timer can only be
+/// killed reliably by the thread whose message queue owns it, and `wParam` carries the id.
 pub const CANCEL_MESSAGE: u32 = 0x8000 + 0x5749;
 
 fn arm_timer(ms: u32) {
@@ -329,30 +329,29 @@ pub fn cancel_timer_message(id: usize) {
 
 #[cfg(target_os = "windows")]
 mod windows_timer {
-    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use tracing::warn;
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{KillTimer, PostThreadMessageW, SetTimer};
 
-    struct Armed {
-        id: usize,
-        thread: u32,
-    }
-
-    static TIMER: Mutex<Armed> = parking_lot::const_mutex(Armed { id: 0, thread: 0 });
+    /// The one timer, and the thread whose message queue owns it.  Atomics rather than a mutex:
+    /// the state machine's lock is taken here (`on_timer`) and there (`shutdown`), so a second
+    /// lock would give the two threads an order to deadlock on.  Losing a race only means one
+    /// `KillTimer` on an id that is already gone, which Windows ignores.
+    static TIMER_ID: AtomicUsize = AtomicUsize::new(0);
+    static TIMER_THREAD: AtomicU32 = AtomicU32::new(0);
 
     /// Arm the single one-shot timer.  Only the thread that pumps messages can own a timer and
     /// the low-level mouse hook runs its callback on this thread, so this is always called from
     /// the hook thread.
     pub fn arm(ms: u32) {
         let thread = unsafe { GetCurrentThreadId() };
-        let mut armed = TIMER.lock();
-        if armed.id != 0 && armed.thread == thread {
+        let previous = TIMER_ID.swap(0, Ordering::AcqRel);
+        if previous != 0 {
             unsafe {
-                let _ = KillTimer(HWND::default(), armed.id);
+                let _ = KillTimer(HWND::default(), previous);
             }
-            armed.id = 0;
         }
         let id = unsafe { SetTimer(HWND::default(), 0, ms, None) };
         if id == 0 {
@@ -362,52 +361,54 @@ mod windows_timer {
             );
             return;
         }
-        armed.id = id;
-        armed.thread = thread;
+        TIMER_THREAD.store(thread, Ordering::Release);
+        TIMER_ID.store(id, Ordering::Release);
     }
 
     /// Kill the timer, on its own thread or (through [`super::CANCEL_MESSAGE`]) by asking the
     /// hook thread to do it.
     pub fn disarm() {
-        let thread = unsafe { GetCurrentThreadId() };
-        let mut armed = TIMER.lock();
-        if armed.id == 0 {
+        let id = TIMER_ID.swap(0, Ordering::AcqRel);
+        if id == 0 {
             return;
         }
-        let id = armed.id;
-        if armed.thread == thread {
+        let thread = TIMER_THREAD.load(Ordering::Acquire);
+        if thread == unsafe { GetCurrentThreadId() } {
             unsafe {
                 let _ = KillTimer(HWND::default(), id);
             }
         } else {
             unsafe {
-                let _ =
-                    PostThreadMessageW(armed.thread, super::CANCEL_MESSAGE, WPARAM(id), LPARAM(0));
+                let _ = PostThreadMessageW(thread, super::CANCEL_MESSAGE, WPARAM(id), LPARAM(0));
             }
         }
-        armed.id = 0;
     }
 
     /// `WM_TIMER` with this id: ours, and now consumed (one shot).
     pub fn fired(id: usize) -> bool {
-        let mut armed = TIMER.lock();
-        if id == 0 || armed.id != id {
+        if id == 0 {
+            return false;
+        }
+        if TIMER_ID
+            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return false;
         }
         unsafe {
             let _ = KillTimer(HWND::default(), id);
         }
-        armed.id = 0;
         true
     }
 
     /// The hook thread killed a timer another thread asked it to.
     pub fn cancel(id: usize) {
-        TIMER.lock().id = 0;
-        if id != 0 {
-            unsafe {
-                let _ = KillTimer(HWND::default(), id);
-            }
+        if id == 0 {
+            return;
+        }
+        let _ = TIMER_ID.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
+        unsafe {
+            let _ = KillTimer(HWND::default(), id);
         }
     }
 }
@@ -460,7 +461,7 @@ impl CursorBackend for SystemCursors {
 #[cfg(target_os = "windows")]
 mod windows_cursors {
     use windows::Win32::UI::WindowsAndMessaging::HCURSOR;
-    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ};
+    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HBITMAP, HGDIOBJ};
     use windows::Win32::UI::WindowsAndMessaging::{
         CopyIcon, CreateIconIndirect, DestroyCursor, SetSystemCursor, SystemParametersInfoW,
         ICONINFO, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL,
@@ -475,46 +476,41 @@ mod windows_cursors {
         OCR_SIZENS, OCR_SIZEALL, OCR_NO, OCR_HAND, OCR_APPSTARTING, OCR_HELP,
     ];
 
-    /// A 32x32 transparent cursor: the AND mask is all ones ("leave the screen alone") and the
-    /// XOR mask is all zeros ("draw nothing").
+    /// A 32x32 transparent monochrome cursor.  A monochrome cursor's `hbmMask` is twice as tall as
+    /// the cursor: the AND mask in the top half (all ones, "leave the screen alone") and the XOR
+    /// mask in the bottom half (all zeros, "draw nothing").  `hbmColor` stays NULL.
     const CURSOR_SIZE: i32 = 32;
     /// One bit per pixel, padded to whole bytes (`32 / 8`) per row.
     const MASK_STRIDE: usize = (CURSOR_SIZE / 8) as usize;
 
-    fn blank_icon() -> Result<HCURSOR, String> {
-        let and_bits = vec![0xFFu8; MASK_STRIDE * CURSOR_SIZE as usize];
-        let xor_bits = vec![0x00u8; MASK_STRIDE * CURSOR_SIZE as usize];
-        let (and, xor) = unsafe {
-            let and = CreateBitmap(
+    pub(super) fn blank_icon() -> Result<HCURSOR, String> {
+        let rows = CURSOR_SIZE as usize;
+        let mut mask = vec![0x00u8; MASK_STRIDE * rows * 2];
+        for byte in mask.iter_mut().take(MASK_STRIDE * rows) {
+            *byte = 0xFF;
+        }
+        let bitmap = unsafe {
+            CreateBitmap(
                 CURSOR_SIZE,
-                CURSOR_SIZE,
+                CURSOR_SIZE * 2,
                 1,
                 1,
-                Some(and_bits.as_ptr() as *const _),
-            );
-            let xor = CreateBitmap(
-                CURSOR_SIZE,
-                CURSOR_SIZE,
-                1,
-                1,
-                Some(xor_bits.as_ptr() as *const _),
-            );
-            (and, xor)
+                Some(mask.as_ptr() as *const _),
+            )
         };
-        if and.0.is_null() || xor.0.is_null() {
+        if bitmap.0.is_null() {
             return Err("CreateBitmap for the blank cursor failed".into());
         }
         let info = ICONINFO {
             fIcon: windows::Win32::Foundation::BOOL(0),
             xHotspot: 0,
             yHotspot: 0,
-            hbmMask: and,
-            hbmColor: xor,
+            hbmMask: bitmap,
+            hbmColor: HBITMAP::default(),
         };
         let icon = unsafe { CreateIconIndirect(&info) };
         unsafe {
-            let _ = DeleteObject(HGDIOBJ(and.0));
-            let _ = DeleteObject(HGDIOBJ(xor.0));
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
         }
         icon.map(|icon| HCURSOR(icon.0))
             .map_err(|error| format!("CreateIconIndirect for the blank cursor failed: {error}"))
@@ -747,5 +743,45 @@ mod tests {
         assert!(hider.configure(Some(0)).is_empty());
         assert_eq!(hider.activity(), vec![Effect::Arm(0)]);
         assert_eq!(hider.timer(), vec![Effect::Hide]);
+    }
+
+    /// The real bitmap behind a hide, but only the private handle: `blank_icon` creates and
+    /// returns a cursor this test owns, and no system cursor is swapped here.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_blank_cursor_is_a_monochrome_32x32_cursor_with_both_masks() {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP, HGDIOBJ};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DestroyCursor, GetIconInfo, HICON, ICONINFO,
+        };
+        let blank = windows_cursors::blank_icon().expect("the blank cursor must be creatable");
+        assert!(!blank.0.is_null());
+        let mut info = ICONINFO::default();
+        unsafe {
+            GetIconInfo(HICON(blank.0), &mut info).expect("a real cursor handle");
+        }
+        assert!(
+            info.hbmColor.0.is_null(),
+            "a monochrome cursor has no colour bitmap"
+        );
+        let mut bitmap = BITMAP::default();
+        let copied = unsafe {
+            GetObjectW(
+                HGDIOBJ(info.hbmMask.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bitmap as *mut _ as *mut _),
+            )
+        };
+        assert_eq!(copied, std::mem::size_of::<BITMAP>() as i32);
+        // 32x32 with the AND mask in the top half and the XOR mask below it: nothing is drawn.
+        assert_eq!((bitmap.bmWidth, bitmap.bmHeight), (32, 64));
+        assert_eq!(bitmap.bmBitsPixel, 1);
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+            if !info.hbmColor.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+            }
+            let _ = DestroyCursor(blank);
+        }
     }
 }

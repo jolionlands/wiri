@@ -1270,6 +1270,11 @@ mod tests {
             Setting::TouchpadLeaveOnWithMouse.name(),
             "touchpad-leave-on-with-mouse"
         );
+        // The live phase matches this exact name in the audit file (`h78_hide_when_typing_dry_run`).
+        assert_eq!(
+            Setting::HidePointerWhileTyping.name(),
+            "hide-pointer-while-typing"
+        );
         assert_eq!(Value::Thresholds([0, 0, 0]).numbers(), vec![0, 0, 0]);
         assert_eq!(Value::Int(3).numbers(), vec![3]);
     }

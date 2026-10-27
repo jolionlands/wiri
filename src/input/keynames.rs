@@ -664,6 +664,15 @@ mod tests {
             ChordIdentity::parse("Mod+WheelScrollUp", MOD_WIN),
             ChordIdentity::parse("Mod+WheelScrollDown", MOD_WIN)
         );
+        // The three stylus buttons are distinct triggers for the duplicate-chord check.
+        assert_ne!(
+            ChordIdentity::parse("Mod+TabletStylusButton1", MOD_WIN),
+            ChordIdentity::parse("Mod+TabletStylusButton2", MOD_WIN)
+        );
+        assert_ne!(
+            ChordIdentity::parse("Mod+TabletStylusButton2", MOD_WIN),
+            ChordIdentity::parse("Mod+MouseRight", MOD_WIN)
+        );
     }
 
     #[test]

@@ -194,9 +194,24 @@ public static class LaneLastNative {
     }
     [DllImport("user32.dll", SetLastError = true)] static extern bool GetCursorInfo(ref CURSORINFO info);
     [DllImport("user32.dll", SetLastError = true)] static extern bool SystemParametersInfoW(uint action, uint param, IntPtr data, uint flags);
-    [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+        public uint type;
+        public MOUSEINPUT mi;
+    }
     const uint CURSOR_SHOWING = 0x0001;
+    const uint INPUT_MOUSE = 0;
     const uint MOUSEEVENTF_MOVE = 0x0001;
     /// SPI_GETMOUSEVANISH: the per-user "hide pointer while typing" flag (niri hide-when-typing).
     const uint SPI_GETMOUSEVANISH = 0x1028;
@@ -218,9 +233,16 @@ public static class LaneLastNative {
             return Marshal.ReadInt32(buffer) != 0 ? 1 : 0;
         } finally { Marshal.FreeHGlobal(buffer); }
     }
-    /// A real relative mouse move: WH_MOUSE_LL sees it (SetCursorPos alone does not).
-    public static void Move(int dx, int dy) {
-        mouse_event(MOUSEEVENTF_MOVE, unchecked((uint)dx), unchecked((uint)dy), 0, UIntPtr.Zero);
+    /// A real relative mouse move through SendInput: WH_MOUSE_LL sees it (SetCursorPos alone
+    /// does not).  Returns how many events SendInput accepted (1 on success).
+    public static uint Move(int dx, int dy) {
+        var input = new INPUT();
+        input.type = INPUT_MOUSE;
+        input.mi = new MOUSEINPUT();
+        input.mi.dx = dx;
+        input.mi.dy = dy;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+        return SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT)));
     }
     /// The user's own cursors come back (what the daemon does on hide/show/quit).
     public static bool RestoreCursors() { return SystemParametersInfoW(SPI_SETCURSORS, 0, IntPtr.Zero, 0); }
@@ -259,33 +281,35 @@ cursor {
 
         # ---- h78_cursor_hides_after_inactive_ms ------------------------------------------
         # A visible pointer first: any injected move shows it and re-arms the one timer.
-        [LaneLastNative]::Move(3, 0)
+        $lastMove1 = [LaneLastNative]::Move(3, 0)
         Start-Sleep -Milliseconds 150
         $lastVisibleState = [LaneLastNative]::CursorState()
         LastCheckpoint 'waiting-for-the-inactivity-timer'
         $lastHideLog = LastWaitLog $lastDaemon 'cursor: pointer hidden' 8000
         $lastHiddenState = [LaneLastNative]::CursorState()
         $lastHideSawLog = $lastHideLog -match 'cursor: pointer hidden'
-        LastGate 'h78_cursor_hides_after_inactive_ms' ($lastHideSawLog -and
+        LastGate 'h78_cursor_hides_after_inactive_ms' ($lastHideSawLog -and $lastMove1 -ge 1 -and
             $lastHiddenState -ne 'unreadable' -and $lastVisibleState -ne 'unreadable' -and
             (LastCursorHandle $lastHiddenState) -ne 0 -and
             (LastCursorHandle $lastHiddenState) -ne (LastCursorHandle $lastVisibleState)) ([ordered]@{
                 visible = $lastVisibleState
                 hidden = $lastHiddenState
                 timeout_ms = 400
+                send_input_accepted = $lastMove1
                 log = ($lastHideLog -split "`r?`n" | Where-Object { $_ -match 'cursor:' })
             })
 
         # ---- h78_cursor_shows_on_pointer_movement ----------------------------------------
         LastCheckpoint 'moving-the-pointer-again'
-        [LaneLastNative]::Move(-4, 0)
+        $lastMove2 = [LaneLastNative]::Move(-4, 0)
         $lastShowLog = LastWaitLog $lastDaemon 'cursor: pointer shown again' 8000
         $lastShownState = [LaneLastNative]::CursorState()
         LastGate 'h78_cursor_shows_on_pointer_movement' ($lastShowLog -match 'pointer shown again' -and
-            $lastShownState -ne 'unreadable' -and
+            $lastMove2 -ge 1 -and $lastShownState -ne 'unreadable' -and
             (LastCursorHandle $lastShownState) -ne (LastCursorHandle $lastHiddenState)) ([ordered]@{
                 hidden = $lastHiddenState
                 shown = $lastShownState
+                send_input_accepted = $lastMove2
                 log = ($lastShowLog -split "`r?`n" | Where-Object { $_ -match 'cursor:' })
             })
 
