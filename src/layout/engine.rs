@@ -5791,6 +5791,10 @@ impl TilingEngine {
         if let Some(sink) = self.thumbnail_overview.clone() {
             sink.exit();
         }
+        // Moving around the overview can leave an empty workspace behind in the middle of
+        // the stack (niri drops it once you have left it). Restore the one-trailing-empty
+        // invariant on the way out, before deciding which tiles to hide.
+        self.maintain_empty_workspace(focused_output);
 
         // Hide every tile that isn't on the active workspace of the focused
         // monitor.  Other monitors' active workspaces stay visible.

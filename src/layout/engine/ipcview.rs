@@ -306,7 +306,9 @@ impl TilingEngine {
         IpcSnapshot {
             windows,
             workspaces,
-            overview_open: self.overview.is_some(),
+            // niri reports the overview closed as soon as it starts closing, while the camera
+            // is still animating; the host and layout stay up until the last frame.
+            overview_open: self.overview.is_some() && !self.overview_camera.closing,
             keyboard_layouts: None,
         }
     }
@@ -631,6 +633,27 @@ mod tests {
         engine.enter_overview(&backend);
         assert!(engine.ipc_snapshot().overview_open);
         engine.exit_overview(&backend);
+        assert!(!engine.ipc_snapshot().overview_open);
+    }
+
+    #[test]
+    fn a_closing_overview_is_told_closed_at_once_and_open_again_when_reversed() {
+        use crate::overlay::MockThumbnailOverview;
+        let (mut engine, backend) = engine_with(&[100, 101]);
+        engine.install_thumbnail_overview(MockThumbnailOverview::new());
+        engine.set_animation_notifier(std::sync::Arc::new(tokio::sync::Notify::new()));
+        engine.enter_overview(&backend);
+        assert!(engine.ipc_snapshot().overview_open);
+        engine.tick_animations_with_backend(60_000, &backend);
+        engine.exit_overview(&backend);
+        // The camera is still closing: the layout and host stay up, IPC says closed.
+        assert!(engine.is_overview());
+        assert!(!engine.ipc_snapshot().overview_open);
+        engine.enter_overview(&backend);
+        assert!(engine.ipc_snapshot().overview_open);
+        engine.exit_overview(&backend);
+        engine.tick_animations_with_backend(60_000, &backend);
+        assert!(!engine.is_overview());
         assert!(!engine.ipc_snapshot().overview_open);
     }
 

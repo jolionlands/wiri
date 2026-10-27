@@ -32,6 +32,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Port C2 onto the stable ordered workspaces: a `workspace` layout block is found by workspace *name*, so it follows renames, reordering and moves between outputs. Output preferences (repeated `open-on-output`, then the legacy `monitor`) are reevaluated on output and workspace-name events (a reload rebuilds the layout views but never re-places a realized workspace, as Lane F requires) by moving the whole live workspace through the same path as `move-workspace-to-monitor`; with no connected preference a workspace stays where it is.
 - The generated first-run config and `examples/minimal.kdl` now say `extend-defaults` in `binds {}` (the explicit extension C2 introduced), so a first run keeps the full built-in keymap instead of only the 53 written chords; README, DOCUMENTATION and PARITY describe the opt-in. Unit test `the_shipped_configs_opt_in_to_the_builtin_keymap`.
 
+### Lane V integration - overview and tabs on the stable-workspace head
+- Port Lane V onto lanes K, W, F2, T2 and FK. Overview workspaces are added by a fresh stable key (names, IPC ids, floating homes stay put), the host paints names and publishes IPC ids, and native drag-and-drop uses the configured overview stack instead of a fixed half scale.
+- `close-overview` and Escape are idempotent while the camera closes. A four-finger vertical swipe (Precision Touchpad opt-in) opens or closes the overview; a Windows-promoted touch pans it and a 500 ms rest picks a window up. `gestures { hot-corners }` alone no longer starts the drag-capture adapter.
+- Every Lane V matrix row is `partial` until the lead's locked desktop cycle passes H62-H65; see `docs/parity/lane-v-report.md`.
+
 ### Lane V item 4 - explicit tab display and clickable indicators
 - Add niri `set-column-display "normal"|"tabbed"` binds, ctl commands and typed IPC with idempotent selection/focus preservation.
 - Make tab indicators select/focus hidden tabs without activating the overlay. Apply pinned-niri geometry, signed gap/rounding, colours/gradients and reload semantics; ignore inter-tab gaps and margins.

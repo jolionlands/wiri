@@ -281,6 +281,33 @@ mod tests {
         assert_eq!(e.insert_overview_workspace(o, Some(99)), None);
     }
     #[test]
+    fn leaving_the_overview_drops_an_empty_workspace_left_behind_in_the_middle() {
+        let (mut e, o) = engine();
+        let b = BackendHandle::default_for_test();
+        {
+            let m = e.monitors.get_mut(&o).unwrap();
+            m.insert_workspace(5, Workspace::new());
+            m.move_workspace_to_position(5, 1);
+            m.switch_workspace(5);
+            assert_eq!(m.workspace_ids(), vec![0, 5, 1]);
+        }
+        e.enter_overview(&b);
+        // Walking away inside the overview keeps the (now inactive) empty workspace, so the
+        // stack does not jump under the pointer while the camera is up.
+        e.switch_workspace(0, &b);
+        assert!(e.monitors.get(&o).unwrap().workspaces.contains_key(&5));
+        e.exit_overview(&b);
+        e.tick_animations_with_backend(60_000, &b);
+        assert!(!e.is_overview());
+        let ids = e.monitors.get(&o).unwrap().workspace_ids();
+        assert!(!ids.contains(&5), "{ids:?}");
+        // Exactly one empty workspace remains, at the bottom.
+        let m = e.monitors.get(&o).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(m.workspaces[ids.last().unwrap()].columns.is_empty());
+        assert_eq!(m.active_workspace, 0);
+    }
+    #[test]
     fn right_scroll_and_normal_workspace_bind_keep_camera_open() {
         let (mut e, o) = engine();
         let b = BackendHandle::default_for_test();
