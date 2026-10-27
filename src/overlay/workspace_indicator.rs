@@ -257,6 +257,12 @@ fn run_window_loop(state: Arc<IndicatorState>) {
         )
         .expect("CreateWindowExW failed");
 
+        // `block-out-from` on wiri's own overlays (see `window::block_out`).
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::WorkspaceIndicator,
+            hwnd.0 as isize,
+        );
+
         // Ask DWM to round the corners on Windows 11+. Older builds (Win10
         // and below) silently ignore the attribute (the call returns HRESULT
         // E_INVALIDARG / ERROR_INVALID_PARAMETER and we just don't get

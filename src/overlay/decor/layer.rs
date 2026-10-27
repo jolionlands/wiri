@@ -481,6 +481,10 @@ impl Overlay {
             None,
         )
         .ok()?;
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::Decor,
+            hwnd.0 as isize,
+        );
         Some(Overlay {
             hwnd,
             spec: spec.clone(),

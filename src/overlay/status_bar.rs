@@ -208,6 +208,10 @@ fn run_window_loop(state: Arc<BarState>) {
 
         // Store HWND so update() can post InvalidateRect.
         *state.hwnd.lock() = Some(hwnd.0 as isize);
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::StatusBar,
+            hwnd.0 as isize,
+        );
 
         // Show immediately (bar is persistent, not transient like workspace_indicator).
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);

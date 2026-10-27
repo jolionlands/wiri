@@ -329,6 +329,10 @@ impl Host {
             None,
         )
         .ok()?;
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::Animation,
+            hwnd.0 as isize,
+        );
         Some(Self {
             hwnd,
             bounds,

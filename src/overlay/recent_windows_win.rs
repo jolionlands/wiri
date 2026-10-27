@@ -261,6 +261,10 @@ unsafe fn run_host(mailbox: Arc<Mailbox>, delay: u32) {
             state.hwnd = Some(hwnd.0 as isize);
         }
     }
+    crate::window::block_out::apply_to(
+        crate::window::block_out::Overlay::RecentWindows,
+        hwnd.0 as isize,
+    );
     if mailbox.closed() || !refresh(hwnd, ptr) {
         close_host(hwnd, &mailbox);
         return;

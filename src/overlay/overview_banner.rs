@@ -234,6 +234,10 @@ fn run_window_loop(state: Arc<BannerState>) {
         );
 
         *state.hwnd.lock() = Some(hwnd.0 as isize);
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::OverviewBanner,
+            hwnd.0 as isize,
+        );
 
         // Start hidden — only `show()` should bring us on screen.
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);

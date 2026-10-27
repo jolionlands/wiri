@@ -773,6 +773,10 @@ mod win {
             return;
         };
         session.hwnd.store(hwnd.0 as isize, Ordering::Release);
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::OverviewHost,
+            hwnd.0 as isize,
+        );
         // Catches enter/exit racing before window creation; no ready-channel wait.
         refresh(&mut *host, hwnd);
         if !session.closed.load(Ordering::Acquire) {
