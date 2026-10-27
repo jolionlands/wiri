@@ -17,6 +17,7 @@ pub mod snap_guide;
 pub mod system_actions;
 pub mod touch;
 pub mod touchpad;
+pub mod touchpen;
 
 pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
 pub use hotkey::{HotkeyBinding, HotkeyId};

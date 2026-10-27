@@ -683,7 +683,9 @@ fn cancel_move_on_key(vk: u32, pressed: bool) {
 /// Check if a grab is currently active
 pub fn is_grab_active() -> bool {
     let state = HOOK_STATE.lock();
-    !matches!(state.grab, GrabState::None) || crate::input::gestures::is_active()
+    !matches!(state.grab, GrabState::None)
+        || crate::input::gestures::is_active()
+        || crate::input::touchpen::is_active()
 }
 
 /// Get a copy of the current grab state
@@ -765,6 +767,18 @@ unsafe extern "system" fn mouse_hook_callback(
         return CallNextHookEx(None, n_code, w_param, l_param);
     }
     if let Some(consume) = crate::input::gestures::captured_event(msg, cursor) {
+        return if consume {
+            LRESULT(1)
+        } else {
+            CallNextHookEx(None, n_code, w_param, l_param)
+        };
+    }
+    if let Some(consume) =
+        crate::input::touchpen::handle(msg, cursor, event.dwExtraInfo, pointer_modifiers())
+    {
+        if consume && msg == WM_LBUTTONDOWN {
+            mask_shell_menu();
+        }
         return if consume {
             LRESULT(1)
         } else {
@@ -1021,7 +1035,7 @@ unsafe extern "system" fn mouse_hook_callback(
     CallNextHookEx(None, n_code, w_param, l_param)
 }
 
-fn preview_rect(wid: WindowId, rect: Rect, backend: &BackendHandle) {
+pub(crate) fn preview_rect(wid: WindowId, rect: Rect, backend: &BackendHandle) {
     if let Some(sink) = crate::overlay::decor::global() {
         sink.moved(wid.as_isize());
     }

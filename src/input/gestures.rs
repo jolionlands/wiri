@@ -326,6 +326,28 @@ pub fn external_begin(engine: &Arc<RwLock<TilingEngine>>, backend: &BackendHandl
     };
     begin(engine, backend, point, true);
 }
+/// Promoted absolute touch/pen movement uses physical pixels, not PTP units.
+pub fn external_begin_at(
+    engine: &Arc<RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    point: Point,
+) {
+    begin(engine, backend, point, true);
+}
+pub fn external_update_pixels(
+    engine: &Arc<RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    dx: f64,
+    dy: f64,
+    time: Duration,
+) {
+    SESSION.with(|slot| {
+        if let Some(s) = slot.borrow_mut().as_mut().filter(|s| s.touchpad) {
+            s.gesture.update(dx, dy, time);
+            display(s, engine, backend);
+        }
+    });
+}
 pub fn external_update(
     engine: &Arc<RwLock<TilingEngine>>,
     backend: &BackendHandle,

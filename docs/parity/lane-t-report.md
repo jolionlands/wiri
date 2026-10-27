@@ -113,3 +113,27 @@ Pure tests cover capture/held/grab/distance discrimination, speed/scale, delay
 and direction reset, and config/range validation. **No real OLE drag was
 performed** by this automated lane: unit-only evidence is explicit in H60.
 All DnD rows remain partial, not mislabelled as live-verified OLE parity.
+
+## 5. Promoted touch and tablet pen (synthetic-only)
+
+`input { touch {} }` and `input { tablet {} }` independently opt in; each accepts
+niri's `off`. The existing LL hook recognizes `MI_WP_SIGNATURE` in dwExtraInfo,
+the touch bit, and the reported seven-bit contact ID. Ordinary mouse input is
+unchanged. Configured Mod claims a managed, non-fullscreen primary down. After
+8 px, a tiled horizontal drag scrolls in pixels through the shared kinetics;
+vertical drags and floating drags use move/drop with native-loop exclusion.
+A distinct reported secondary touch down toggles floating once per tap. Motion
+passes so Windows advances the cursor; claimed button releases stay guarded
+across modifier-first release and disable/reload. Generation checks reject
+obsolete queued work. No new hook, HWND, thread, dependency or timer is added.
+
+**Limits:** Windows commonly promotes only the primary contact to mouse input.
+The adapter cannot discover a secondary finger the OS does not report, or take
+over application-owned WM_POINTER streams. No transparent capture overlay or
+input forwarding is installed. Mapping/calibration/pressure remain Windows-owned.
+Five pure tests cover signature/type discrimination, primary/secondary pairing,
+release order, pen isolation, axis/mode selection and independent opt-in/off.
+There was no physical touchscreen or tablet pen test and no claim of hardware
+support. H61 explicitly records synthetic-only touch/pen evidence. The two rows
+stay partial. Item 5 required release tests: **1222 library + 14 CLI passed**,
+zero failures, one ignored doc example; warnings-denied all-target check passed.

@@ -57,6 +57,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Lane F2 — structured layout action transport
 - Port lane F's shared focus/workspace/monitor grammar onto the integrated branch. Preserve quoted workspace names and carry explicit window-transfer targets through Lane H's typed action path without focus-first activation. Engine execution follows in the next integration part.
 
+- Lane T: opt-in `input { touch {} tablet {} }` promoted touch/pen Mod drags share move/drop and pixel scrolling; reported secondary touch IDs toggle floating. MI_WP_SIGNATURE decoding, mode selection and contact pairing are synthetic-tested only; no overlay or hardware-support claim.
+
 - Lane T: opt-in niri `gestures` DnD edge view/workspace settings, foreign-capture drag detection and 500 ms hover activation on the existing dispatcher; one-shot dwell and active-edge frames only.
 
 - Lane T: opt-in Precision Touchpad HID Raw Input assembles three-contact frames and feeds shared swipe inertia/snapping; registration and its message-only HWND are removed on disable/reload/quit. Windows gesture settings are never changed.

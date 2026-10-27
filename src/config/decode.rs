@@ -1062,6 +1062,7 @@ impl Decoder {
             }
             "touch" if in_input => {
                 self.section(child);
+                cfg.input.touch_enabled = true;
                 for c in child.kids() {
                     self.input_key(InputScope::Touch, c, cfg);
                 }
@@ -1079,7 +1080,23 @@ impl Decoder {
                     }
                 }
             }
-            "trackpoint" | "trackball" | "tablet" if in_input => {
+            "tablet" if in_input => {
+                self.section(child);
+                cfg.input.tablet_enabled = true;
+                for c in child.kids() {
+                    if norm(&c.name) == "off" {
+                        if let Some(off) = self.flag(c) {
+                            cfg.input.tablet_enabled = !off;
+                        }
+                    } else {
+                        self.unsupported(
+                            c,
+                            "tablet mapping and calibration remain owned by Windows",
+                        );
+                    }
+                }
+            }
+            "trackpoint" | "trackball" if in_input => {
                 self.unsupported(child, "Windows has one pointer setup for all devices")
             }
             // keyboard
