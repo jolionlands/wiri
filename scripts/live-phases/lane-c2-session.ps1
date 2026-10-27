@@ -177,7 +177,8 @@ $path = [IO.Path]::Combine($dir, ([Guid]::NewGuid().ToString('N') + '.json'))
         $c2State.pipe = '\\.\pipe\wiri_live_h69_' + $PID + '_' + [Guid]::NewGuid().ToString('N')
         $psi = New-Object Diagnostics.ProcessStartInfo
         $psi.FileName = $wiri
-        $words = @('-v'); if ($noAutostart) { $words += '--no-autostart' }; $words += @('-c',(Q $c2Cfg))
+        # --no-startup-overlay (lane P): a startup hotkey sheet must not take a scripted key press.
+        $words = @('-v','--no-startup-overlay'); if ($noAutostart) { $words += '--no-autostart' }; $words += @('-c',(Q $c2Cfg))
         $psi.Arguments = $words -join ' '
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true

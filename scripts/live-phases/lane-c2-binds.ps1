@@ -94,7 +94,8 @@
     # launch with child-only isolation, an explicit private config and retained handle.
     function Start-Wiri([string]$stderrLog, [string]$stdoutLog) {
         $psi = New-Object Diagnostics.ProcessStartInfo $wiri
-        $psi.Arguments = '-v -c ' + (Q $cfg)
+        # No startup hotkey sheet (lane P): it must not take the first scripted key press.
+        $psi.Arguments = '-v --no-startup-overlay -c ' + (Q $cfg)
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
         foreach ($pair in @(@('APPDATA','roaming'),@('LOCALAPPDATA','local'))) {
