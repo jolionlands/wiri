@@ -574,6 +574,10 @@ pub enum IpcEvent {
     #[serde(rename = "overview_opened_or_closed")]
     OverviewOpenedOrClosed { is_open: bool },
 
+    /// niri `TouchpadToggled`: the `toggle-touchpad` action turned the touchpad on or off.
+    #[serde(rename = "touchpad_toggled")]
+    TouchpadToggled { on: bool },
+
     /// niri ScreenshotCaptured: path is null when the image was only copied to the clipboard.
     #[serde(rename = "screenshot_captured")]
     ScreenshotCaptured { path: Option<String> },

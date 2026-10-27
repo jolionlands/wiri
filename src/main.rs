@@ -354,6 +354,12 @@ async fn main() -> Result<()> {
     // wheel hook (natural_scroll + scroll_speed).
     apply_mouse_config(&config.input);
 
+    // Lane P: niri's pointing-device options that Windows can be told about ("Enhance pointer
+    // precision", button swap, two precision-touchpad values).  Only the options the config names
+    // are written, the previous values are remembered, and they are restored on a graceful quit
+    // or when a reload stops naming them.
+    wiri::input::pointer_settings::apply_config(&config.input);
+
     // Convert config to layout config
     let layout_config = LayoutConfig::from_config(&config);
     let hide_method = hide_method_of(&config);
@@ -641,6 +647,19 @@ async fn main() -> Result<()> {
     let cheatsheet = Arc::new(BindingsCheatsheet::new());
     wiri::overlay::bindings_cheatsheet::set_global_cheatsheet(cheatsheet.clone());
     info!("Key-bindings cheatsheet overlay installed");
+    // niri shows the sheet at startup unless `hotkey-overlay { skip-at-startup }` asks for quiet.
+    // `show_hotkey_overlay` lists the bindings Windows actually registered and honours
+    // `hotkey-overlay { hide-not-bound }`.
+    if config.hotkey_overlay.skip_at_startup {
+        info!("Hotkey overlay: skipped at startup (hotkey-overlay {{ skip-at-startup }})");
+    } else {
+        let rows = wiri::backend::message_loop::show_hotkey_overlay(&engine);
+        if rows == 0 {
+            warn!("Hotkey overlay: no bindings to show at startup");
+        } else {
+            info!("Hotkey overlay: shown at startup with {} rows", rows);
+        }
+    }
 
     // Status bar overlay — opt-in via `status-bar true` in `layout { }`.
     // TODO(audit): when status_bar is enabled, reserve top 32px from each
@@ -970,6 +989,9 @@ async fn main() -> Result<()> {
     animation_worker.abort();
     let _ = animation_worker.await;
 
+    // Lane P: give the user their own pointer settings back before anything else goes away.
+    wiri::input::pointer_settings::restore();
+
     // Cancel and drain interactive previews before final restoration; a late
     // move cleanup must not re-tile or re-clip a window after restore_all.
     stop_mouse_hook();
@@ -1126,6 +1148,9 @@ fn apply_loaded_config(
     };
 
     apply_mouse_config(&new_config.input);
+    // Lane P: pointing-device options follow a reload; the ones the new config no longer names
+    // go back to what the OS had before wiri changed them.
+    wiri::input::pointer_settings::apply_config(&new_config.input);
     mouse_tracker.write().set_config(mouse_config);
     let hide_method = hide_method_of(&new_config);
     wiri::backend::cloak::set_hide_method(hide_method);

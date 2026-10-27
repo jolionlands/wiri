@@ -14,6 +14,7 @@ pub mod layout_actions;
 pub mod low_level_hook;
 pub mod mouse;
 pub mod pointer;
+pub mod pointer_settings;
 pub mod recent;
 pub(crate) mod rule_scroll;
 pub mod snap_guide;

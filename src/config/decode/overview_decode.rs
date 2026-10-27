@@ -15,6 +15,7 @@ impl Decoder {
                 "backdrop-color" => {
                     if let Some(value) = self.paint_color(child).and_then(|s| parse_css_color(&s)) {
                         cfg.backdrop_color = value;
+                        cfg.backdrop_set = true;
                     }
                 }
                 "workspace-shadow" => {

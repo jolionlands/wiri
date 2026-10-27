@@ -3,6 +3,9 @@
 pub struct OverviewConfig {
     pub zoom: f64,
     pub backdrop_color: [u8; 4],
+    /// `overview { backdrop-color }` was written. Without it the overview paints the
+    /// layout's `background-color` when there is one (see `TilingEngine::overview_options`).
+    pub backdrop_set: bool,
     pub workspace_shadow: WorkspaceShadow,
 }
 
@@ -11,6 +14,7 @@ impl Default for OverviewConfig {
         Self {
             zoom: 0.5,
             backdrop_color: [0x26, 0x26, 0x26, 255],
+            backdrop_set: false,
             workspace_shadow: WorkspaceShadow::default(),
         }
     }

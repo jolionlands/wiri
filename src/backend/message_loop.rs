@@ -675,6 +675,8 @@ impl MessageLoop {
             .read()
             .full_config()
             .is_some_and(|c| c.input.touchpad_enabled);
+        // Lane P: `toggle-touchpad` may have turned the touchpad off for this session.
+        let touchpad_enabled = crate::input::pointer_settings::touchpad_active(touchpad_enabled);
         crate::input::touchpad::configure(touchpad_enabled, engine.clone(), backend_handle.clone());
         crate::input::hot_corner::initialize(engine.clone(), backend_handle.clone(), hwnd);
         let mut hook_active = false;
@@ -736,6 +738,8 @@ impl MessageLoop {
                         .read()
                         .full_config()
                         .is_some_and(|c| c.input.touchpad_enabled);
+                    let touchpad_enabled =
+                        crate::input::pointer_settings::touchpad_active(touchpad_enabled);
                     crate::input::touchpad::configure(
                         touchpad_enabled,
                         engine.clone(),
@@ -1636,23 +1640,42 @@ pub(crate) fn perform_action_on(
             engine.write().toggle_backdrop_cycle(backend);
         }
         Action::ShowKeyBindings => {
-            // Build a binding row list from the live REGISTERED_BINDINGS snapshot
-            // (what Windows actually accepted) and toggle the cheatsheet overlay.
-            if let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet() {
-                let raw = current_bindings();
-                let prefix = engine
-                    .read()
-                    .full_config()
-                    .map(|c| resolve_mod_prefix(&c.input.mod_key).0)
-                    .unwrap_or(crate::input::DEFAULT_MOD_KEY);
-                let rows = crate::overlay::hotkey_rows::curated_rows(&raw, prefix);
-                info!("ShowKeyBindings: toggling cheatsheet ({} rows)", rows.len());
-                cs.toggle(rows);
-            } else {
-                info!("ShowKeyBindings: cheatsheet overlay not installed (main.rs wiring missing)");
-            }
+            show_hotkey_overlay(engine);
         }
     }
+}
+
+/// Toggle the "Important Hotkeys" sheet from the live registered bindings and the config's
+/// `hotkey-overlay` options.  Shared by the `show-hotkey-overlay` action and the startup path in
+/// `main` (nothing is on screen at startup, so there the toggle only opens it).  Returns how many
+/// rows the sheet has.
+pub fn show_hotkey_overlay(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> usize {
+    let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet() else {
+        info!("ShowKeyBindings: cheatsheet overlay not installed (main.rs wiring missing)");
+        return 0;
+    };
+    // Build a binding row list from the live REGISTERED_BINDINGS snapshot (what Windows actually
+    // accepted); `hide-not-bound` drops the essential actions that have no key.
+    let raw = current_bindings();
+    let (prefix, hide_not_bound) = engine
+        .read()
+        .full_config()
+        .map(|c| {
+            (
+                resolve_mod_prefix(&c.input.mod_key).0,
+                c.hotkey_overlay.hide_not_bound,
+            )
+        })
+        .unwrap_or((crate::input::DEFAULT_MOD_KEY, false));
+    let rows = crate::overlay::hotkey_rows::curated_rows(&raw, prefix, hide_not_bound);
+    info!(
+        "ShowKeyBindings: toggling cheatsheet with {} rows (hide-not-bound {})",
+        rows.len(),
+        hide_not_bound
+    );
+    let count = rows.len();
+    cs.toggle(rows);
+    count
 }
 
 /// Apply a niri size change to the window an action targets: a floating window is

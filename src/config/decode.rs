@@ -299,6 +299,8 @@ const TOP_LEVEL: &[&str] = &[
     "gestures",
     "environment",
     "switch-events",
+    "hotkey-overlay",
+    "overview",
     "spawn-at-startup",
     "spawn-sh-at-startup",
     "include",
@@ -309,7 +311,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
     match name {
         "cursor" => Some("the cursor theme belongs to Windows"),
         "clipboard" => Some("Windows has no primary selection"),
-        "hotkey-overlay" => Some("the key-bindings overlay has no options yet"),
         "config-notification" => Some("wiri always shows a balloon for a config error"),
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
@@ -498,6 +499,13 @@ fn action_props(action: &str) -> &'static [&'static str] {
 
 /// A color as written: `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `accent`, `windows-accent`
 /// or empty.  Returns the text wiri stores (`#rrggbb[aa]`), or `None` when it is not a color.
+/// `accent` / `windows-accent`, which only the border colours resolve (they read the live system
+/// accent); a backdrop needs a real colour.
+fn is_accent_alias(color: &str) -> bool {
+    let text = color.trim().to_ascii_lowercase();
+    text == "accent" || text == "windows-accent" || text == "system-accent"
+}
+
 fn normalize_color(text: &str) -> Option<String> {
     let t = text.trim();
     if t.is_empty() || t == "accent" || t == "windows-accent" {
@@ -573,8 +581,123 @@ enum InputScope {
     Input,
     Keyboard,
     Mouse,
+    /// Inside `input { touchpad { ... } }`.
+    Touchpad,
+    /// Inside `input { trackpoint { ... } }`.
+    Trackpoint,
+    /// Inside `input { trackball { ... } }`.
+    Trackball,
     Focus,
     Touch,
+}
+
+impl InputScope {
+    /// The per-device-type scopes that take niri's pointing-device options: `mouse`,
+    /// `touchpad`, `trackpoint` and `trackball`.  Windows configures all of them with one
+    /// system-wide pointer setup, so they share one set of stored fields.
+    fn is_pointer(self) -> bool {
+        matches!(
+            self,
+            Self::Mouse | Self::Touchpad | Self::Trackpoint | Self::Trackball
+        )
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Input => "'input'",
+            Self::Keyboard => "'input' > 'keyboard'",
+            Self::Mouse => "'input' > 'mouse'",
+            Self::Touchpad => "'input' > 'touchpad'",
+            Self::Trackpoint => "'input' > 'trackpoint'",
+            Self::Trackball => "'input' > 'trackball'",
+            Self::Focus => "'input' > 'focus'",
+            Self::Touch => "'input' > 'touch'",
+        }
+    }
+
+    /// Which options the section takes, for the "did you mean" hint of an unknown key.
+    fn known(self) -> &'static [&'static str] {
+        match self {
+            Self::Input => &[
+                "keyboard",
+                "mouse",
+                "touchpad",
+                "trackpoint",
+                "trackball",
+                "tablet",
+                "focus",
+                "touch",
+                "focus-follows-mouse",
+                "warp-mouse-to-focus",
+                "workspace-auto-back-and-forth",
+                "mod-key",
+                "layout",
+                "repeat-delay",
+                "repeat-rate",
+                "numlock",
+            ],
+            Self::Keyboard => &[
+                "layout",
+                "repeat-delay",
+                "repeat-rate",
+                "numlock",
+                "xkb",
+                "track-layout",
+                "mod-key",
+            ],
+            Self::Mouse => &[
+                "off",
+                "natural-scroll",
+                "scroll-speed",
+                "acceleration",
+                "sensitivity",
+                "tap-to-click",
+                "scroll-factor",
+                "accel-profile",
+                "scroll-method",
+                "scroll-button",
+                "scroll-button-lock",
+                "left-handed",
+                "middle-emulation",
+            ],
+            Self::Touchpad => &[
+                "off",
+                "tap",
+                "dwt",
+                "dwtp",
+                "drag",
+                "drag-lock",
+                "tap-button-map",
+                "click-method",
+                "disabled-on-external-mouse",
+                "natural-scroll",
+                "accel-profile",
+                "scroll-method",
+                "scroll-button",
+                "scroll-button-lock",
+                "left-handed",
+                "middle-emulation",
+            ],
+            Self::Trackpoint | Self::Trackball => &[
+                "off",
+                "natural-scroll",
+                "accel-profile",
+                "scroll-method",
+                "scroll-button",
+                "scroll-button-lock",
+                "left-handed",
+                "middle-emulation",
+            ],
+            Self::Focus => &["follows-mouse", "focus-delay-ms", "warp-on-focus"],
+            Self::Touch => &[
+                "enable",
+                "off",
+                "tap-to-click",
+                "scroll-speed",
+                "map-to-output",
+            ],
+        }
+    }
 }
 
 impl Decoder {
@@ -908,6 +1031,7 @@ impl Decoder {
                 "window-rule" => self.decode_window_rule(node, cfg),
                 "binds" => self.decode_binds(node, cfg),
                 "recent-windows" => self.decode_recent_windows(node, &mut cfg.recent_windows),
+                "hotkey-overlay" => self.decode_hotkey_overlay(node, cfg),
                 "animations" => self.decode_animations(node, cfg),
                 "gestures" => self.decode_gestures(node, &mut cfg.gestures),
                 "environment" => self.decode_environment(node, cfg),
@@ -963,6 +1087,30 @@ impl Decoder {
                         self.error(node.pos, message);
                     }
                 },
+            }
+        }
+    }
+
+    /// niri `hotkey-overlay { skip-at-startup; hide-not-bound }`.
+    fn decode_hotkey_overlay(&mut self, node: &Node, cfg: &mut Config) {
+        self.section(node);
+        for child in node.kids() {
+            match norm(&child.name).as_str() {
+                "skip-at-startup" => {
+                    if let Some(value) = self.flag(child) {
+                        cfg.hotkey_overlay.skip_at_startup = value;
+                    }
+                }
+                "hide-not-bound" => {
+                    if let Some(value) = self.flag(child) {
+                        cfg.hotkey_overlay.hide_not_bound = value;
+                    }
+                }
+                _ => self.unknown(
+                    child,
+                    "'hotkey-overlay'",
+                    &["skip-at-startup", "hide-not-bound"],
+                ),
             }
         }
     }
@@ -1229,13 +1377,7 @@ impl Decoder {
                 self.section(child);
                 cfg.input.touchpad_enabled = true;
                 for c in child.kids() {
-                    if norm(&c.name) == "off" {
-                        if let Some(off) = self.flag(c) {
-                            cfg.input.touchpad_enabled = !off;
-                        }
-                    } else {
-                        self.unsupported(c, "device settings remain owned by Windows; only raw three-finger gestures are read");
-                    }
+                    self.input_key(InputScope::Touchpad, c, cfg);
                 }
             }
             "tablet" if in_input => {
@@ -1255,7 +1397,22 @@ impl Decoder {
                 }
             }
             "trackpoint" | "trackball" if in_input => {
-                self.unsupported(child, "Windows has one pointer setup for all devices")
+                // niri's trackpoint/trackball blocks take the same pointing-device options as
+                // `mouse`.  Windows has one system-wide pointer configuration, so the shared
+                // options go through the same fields; their device-specific effect is the OS's.
+                self.section(child);
+                let trackpoint = key == "trackpoint";
+                for c in child.kids() {
+                    self.input_key(
+                        if trackpoint {
+                            InputScope::Trackpoint
+                        } else {
+                            InputScope::Trackball
+                        },
+                        c,
+                        cfg,
+                    );
+                }
             }
             // keyboard
             "layout" | "keyboard-layout"
@@ -1401,7 +1558,7 @@ impl Decoder {
                 self.unsupported(child, "")
             }
             // mouse
-            "natural-scroll" if matches!(scope, InputScope::Input | InputScope::Mouse) => {
+            "natural-scroll" if scope == InputScope::Input || scope.is_pointer() => {
                 if let Some(v) = self.flag(child) {
                     cfg.input.natural_scroll = v;
                 }
@@ -1442,11 +1599,17 @@ impl Decoder {
                     self.unsupported(child, "per-axis scroll factors");
                 }
             }
-            "off" | "accel-speed" | "accel-profile" | "scroll-method" | "scroll-button"
-            | "scroll-button-lock" | "left-handed" | "middle-emulation"
-                if scope == InputScope::Mouse =>
+            "accel-speed" if scope.is_pointer() => {
+                self.unsupported(child, "Windows has one pointer speed for all devices")
+            }
+            // pointing-device options shared by mouse, touchpad, trackpoint and trackball
+            "off" | "accel-profile" | "scroll-method" | "scroll-button" | "scroll-button-lock"
+            | "left-handed" | "middle-emulation" | "dwt" | "dwtp" | "drag" | "drag-lock"
+            | "tap-button-map" | "click-method" | "disabled-on-external-mouse" | "tap"
+            | "tap-to-click"
+                if scope.is_pointer() =>
             {
-                self.unsupported(child, "Windows has one pointer setup for all devices")
+                self.pointing_option(scope, child, cfg)
             }
             // touch
             "enable" | "enabled" if scope == InputScope::Touch => {
@@ -1472,57 +1635,141 @@ impl Decoder {
             "map-to-output" | "calibration-matrix" if scope == InputScope::Touch => {
                 self.unsupported(child, "touch calibration belongs to Windows")
             }
-            _ => {
-                let parent = match scope {
-                    InputScope::Input => "'input'",
-                    InputScope::Keyboard => "'input' > 'keyboard'",
-                    InputScope::Mouse => "'input' > 'mouse'",
-                    InputScope::Focus => "'input' > 'focus'",
-                    InputScope::Touch => "'input' > 'touch'",
+            _ => self.unknown(child, scope.label(), scope.known()),
+        }
+    }
+
+    /// One niri pointing-device option, shared by `mouse`, `touchpad`, `trackpoint` and
+    /// `trackball`.  Windows configures all pointing devices with one system-wide setup, so the
+    /// stored fields are shared too; `crate::input::pointer_settings` decides what reaches the
+    /// OS and what is only validated.
+    fn pointing_option(&mut self, scope: InputScope, child: &Node, cfg: &mut Config) {
+        let key = norm(&child.name);
+        match key.as_str() {
+            "off" => {
+                // A bare `off` means off; `off false` turns the device back on.
+                let value = match child.args.len() {
+                    0 => Some(true),
+                    _ => self.flag(child),
                 };
-                let known: &[&str] = match scope {
-                    InputScope::Input => &[
-                        "keyboard",
-                        "mouse",
-                        "focus",
-                        "touch",
-                        "touchpad",
-                        "focus-follows-mouse",
-                        "warp-mouse-to-focus",
-                        "workspace-auto-back-and-forth",
-                        "mod-key",
-                        "layout",
-                        "repeat-delay",
-                        "repeat-rate",
-                        "numlock",
-                    ],
-                    InputScope::Keyboard => &[
-                        "layout",
-                        "repeat-delay",
-                        "repeat-rate",
-                        "numlock",
-                        "xkb",
-                        "track-layout",
-                        "mod-key",
-                    ],
-                    InputScope::Mouse => &[
-                        "natural-scroll",
-                        "scroll-speed",
-                        "acceleration",
-                        "sensitivity",
-                        "tap-to-click",
-                        "scroll-factor",
-                    ],
-                    InputScope::Focus => &["follows-mouse", "focus-delay-ms", "warp-on-focus"],
-                    InputScope::Touch => &[
-                        "enable",
-                        "off",
-                        "tap-to-click",
-                        "scroll-speed",
-                        "map-to-output",
-                    ],
-                };
-                self.unknown(child, parent, known);
+                let Some(value) = value else { return };
+                match scope {
+                    InputScope::Touchpad => cfg.input.touchpad_enabled = !value,
+                    InputScope::Mouse => cfg.input.mouse_off = value,
+                    InputScope::Trackpoint => cfg.input.trackpoint_off = value,
+                    InputScope::Trackball => cfg.input.trackball_off = value,
+                    _ => {}
+                }
+            }
+            "tap" | "tap-to-click" => {
+                if let Some(v) = self.flag(child) {
+                    cfg.input.tap_to_click = v;
+                }
+            }
+            "accel-profile" => {
+                if let Some(v) = self.enum_arg(child, AccelProfile::parse, "\"flat\" or \"adaptive\"")
+                {
+                    cfg.input.accel_profile = Some(v);
+                }
+            }
+            "scroll-method" => {
+                if let Some(v) = self.enum_arg(
+                    child,
+                    ScrollMethod::parse,
+                    "\"none\", \"edge\", \"two-finger\" or \"on-button-down\"",
+                ) {
+                    cfg.input.scroll_method = Some(v);
+                }
+            }
+            "scroll-button" => {
+                if let Some(v) = self.arg_number(child, 1.0, 32.0) {
+                    cfg.input.scroll_button = Some(v.round() as u32);
+                }
+            }
+            "scroll-button-lock" => {
+                if let Some(v) = self.flag(child) {
+                    cfg.input.scroll_button_lock = Some(v);
+                }
+            }
+            "left-handed" => {
+                if let Some(v) = self.flag(child) {
+                    cfg.input.left_handed = Some(v);
+                }
+            }
+            "middle-emulation" => {
+                if let Some(v) = self.flag(child) {
+                    cfg.input.middle_emulation = Some(v);
+                }
+            }
+            "click-method" => {
+                if let Some(v) = self.enum_arg(
+                    child,
+                    ClickMethod::parse,
+                    "\"button-areas\" or \"clickfinger\"",
+                ) {
+                    cfg.input.touchpad_click_method = Some(v);
+                }
+            }
+            "disabled-on-external-mouse" => {
+                if let Some(v) = self.flag(child) {
+                    cfg.input.touchpad_disabled_on_external_mouse = Some(v);
+                }
+            }
+            "dwt" | "dwtp" | "drag" | "drag-lock" if scope == InputScope::Touchpad => {
+                let Some(v) = self.flag(child) else { return };
+                match key.as_str() {
+                    "dwt" => cfg.input.touchpad_dwt = Some(v),
+                    "dwtp" => cfg.input.touchpad_dwtp = Some(v),
+                    "drag" => cfg.input.touchpad_drag = Some(v),
+                    _ => cfg.input.touchpad_drag_lock = Some(v),
+                }
+            }
+            "tap-button-map" if scope == InputScope::Touchpad => {
+                self.no_props(child);
+                let mut map = cfg.input.touchpad_tap_button_map.unwrap_or_default();
+                for c in child.kids() {
+                    let slot = match norm(&c.name).as_str() {
+                        "left" => &mut map.left,
+                        "middle" => &mut map.middle,
+                        "right" => &mut map.right,
+                        _ => {
+                            self.unknown(
+                                c,
+                                "'input' > 'touchpad' > 'tap-button-map'",
+                                &["left", "middle", "right"],
+                            );
+                            continue;
+                        }
+                    };
+                    // niri's values are finger counts.
+                    if let Some(v) = self.arg_number(c, 1.0, 5.0) {
+                        *slot = v.round() as u8;
+                    }
+                }
+                cfg.input.touchpad_tap_button_map = Some(map);
+            }
+            // An option of another device type: niri rejects it (`dwt` on a mouse, say).
+            _ => self.unknown(child, scope.label(), scope.known()),
+        }
+    }
+
+    /// A one-argument option whose text is one of a fixed vocabulary.
+    fn enum_arg<T>(
+        &mut self,
+        node: &Node,
+        parse: impl Fn(&str) -> Option<T>,
+        what: &str,
+    ) -> Option<T> {
+        let value = self.one_arg(node)?;
+        let text = self.value_text(node, value)?;
+        match parse(&text) {
+            Some(parsed) => Some(parsed),
+            None => {
+                self.error(
+                    value.pos,
+                    format!("'{}' expects {}, found \"{}\"", node.name, what, text),
+                );
+                None
             }
         }
     }
@@ -1706,8 +1953,17 @@ impl Decoder {
                     out.layout_override = Some(partial);
                 }
                 "hot-corners" => out.hot_corners = Some(self.decode_hot_corners(child)),
-                "max-bpc" | "modeline" | "background-color" | "backdrop-color" => {
-                    self.unsupported(child, "")
+                "max-bpc" | "modeline" | "backdrop-color" => self.unsupported(child, ""),
+                // niri deprecated this per-output key in favour of `layout { background-color }`;
+                // wiri has one backdrop surface (the overview), so it maps to the same place.
+                "background-color" => {
+                    if let Some(color) = self.arg_color(child) {
+                        self.warn(
+                            child.pos,
+                            "'background-color' in an output block is deprecated (niri moved it to 'layout'); mapped to the layout-level colour",
+                        );
+                        cfg.layout.background_color = Some(color);
+                    }
                 }
                 _ => self.unknown(
                     child,
@@ -1729,6 +1985,7 @@ impl Decoder {
                         "variable-refresh-rate",
                         "focus-at-startup",
                         "hot-corners",
+                        "background-color",
                     ],
                 ),
             }
@@ -1970,7 +2227,20 @@ impl Decoder {
                     }
                 }
                 // niri layout options wiri does not implement yet
-                "background-color" => self.unsupported(child, "layout"),
+                // niri: the colour behind the workspaces.  Wiri paints it behind the overview's
+                // workspaces (Windows owns the desktop behind tiled windows).
+                "background-color" => {
+                    if let Some(color) = self.arg_color(child) {
+                        if is_accent_alias(&color) {
+                            self.error(
+                                child.pos,
+                                "'background-color' needs a colour like \"#101820\"; the accent alias is for border colours",
+                            );
+                        } else {
+                            p.background_color = Some(color);
+                        }
+                    }
+                }
                 _ => self.unknown(
                     child,
                     "'layout'",
@@ -1999,6 +2269,7 @@ impl Decoder {
                         "center-focused-column",
                         "preset-column-widths",
                         "default-column-width",
+                        "background-color",
                     ],
                 ),
             }
@@ -3055,13 +3326,120 @@ mod tests {
     fn niri_input_options_wiri_lacks_are_warnings() {
         let d = load("input {\n    touchpad {\n        tap\n        dwt\n    }\n    keyboard { xkb { layout \"us\" } }\n    mod-key-nested \"Alt\"\n}\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        // `tap`, `dwt` and `mod-key-nested`: a configured xkb layout is no longer
-        // reported as unsupported (the keyboard session requests it natively).
-        assert_eq!(warnings(&d).len(), 3, "{:?}", warnings(&d));
+        // Lane P accepts `tap` and `dwt` inside the touchpad block and C2 requests a configured
+        // xkb layout natively, so only `mod-key-nested` is still reported.
+        assert_eq!(warnings(&d).len(), 1, "{:?}", warnings(&d));
         assert!(d.config.input.touchpad_enabled);
         assert!(d.config.input.keyboard_layout_configured);
-        assert!(warnings(&d)[0].contains("'tap' is not supported"));
-        assert!(warnings(&d)[1].contains("'dwt' is not supported"));
+        assert_eq!(d.config.input.tap_to_click, true);
+        assert_eq!(d.config.input.touchpad_dwt, Some(true));
+        assert!(warnings(&d)[0].contains("'mod-key-nested' is not supported"));
+    }
+
+    #[test]
+    fn pointing_device_options_are_stored_per_niri_spelling() {
+        let cfg = clean(
+            "input {\n    mouse {\n        accel-profile \"flat\"\n        left-handed\n        middle-emulation false\n        scroll-method \"on-button-down\"\n        scroll-button 8\n        scroll-button-lock\n    }\n    touchpad {\n        dwt\n        dwtp false\n        drag true\n        drag-lock\n        click-method \"clickfinger\"\n        disabled-on-external-mouse\n        tap-button-map {\n            left 1\n            middle 3\n            right 2\n        }\n    }\n    trackpoint { off }\n    trackball { off false }\n}\n",
+        );
+        assert_eq!(cfg.input.accel_profile, Some(AccelProfile::Flat));
+        assert_eq!(cfg.input.left_handed, Some(true));
+        assert_eq!(cfg.input.middle_emulation, Some(false));
+        assert_eq!(cfg.input.scroll_method, Some(ScrollMethod::OnButtonDown));
+        assert_eq!(cfg.input.scroll_button, Some(8));
+        assert_eq!(cfg.input.scroll_button_lock, Some(true));
+        assert!(cfg.input.touchpad_enabled, "a touchpad block enables wiri's reader");
+        assert_eq!(cfg.input.touchpad_dwt, Some(true));
+        assert_eq!(cfg.input.touchpad_dwtp, Some(false));
+        assert_eq!(cfg.input.touchpad_drag, Some(true));
+        assert_eq!(cfg.input.touchpad_drag_lock, Some(true));
+        assert_eq!(cfg.input.touchpad_click_method, Some(ClickMethod::Clickfinger));
+        assert_eq!(cfg.input.touchpad_disabled_on_external_mouse, Some(true));
+        assert_eq!(
+            cfg.input.touchpad_tap_button_map,
+            Some(TapButtonMap {
+                left: 1,
+                middle: 3,
+                right: 2
+            })
+        );
+        assert!(cfg.input.trackpoint_off);
+        assert!(!cfg.input.trackball_off, "off false leaves the device on");
+        // Nothing configured: every pointing option stays untouched for the OS.
+        let untouched = clean("");
+        assert_eq!(untouched.input.accel_profile, None);
+        assert_eq!(untouched.input.left_handed, None);
+        assert_eq!(untouched.input.touchpad_dwt, None);
+        assert_eq!(untouched.input.touchpad_disabled_on_external_mouse, None);
+    }
+
+    #[test]
+    fn pointing_device_options_reject_bad_values() {
+        let cases = [
+            "input { mouse { accel-profile \"bogus\" } }",
+            "input { mouse { scroll-method \"bogus\" } }",
+            "input { mouse { scroll-button 99 } }",
+            "input { mouse { scroll-button 0 } }",
+            "input { touchpad { click-method \"bogus\" } }",
+            "input { touchpad { tap-button-map { left 0 } } }",
+            "input { touchpad { tap-button-map { thumb 1 } } }",
+            // `dwt` is a touchpad option; niri rejects it on a mouse.
+            "input { mouse { dwt } }",
+            // A device type wiri does not have.
+            "input { joystick { off } }",
+        ];
+        for case in cases {
+            let d = load(case);
+            assert!(d.has_errors(), "{case:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn touchpad_off_and_mouse_off_disable_their_device_type() {
+        let cfg = clean("input {\n    touchpad { off }\n    mouse { off }\n}");
+        assert!(!cfg.input.touchpad_enabled);
+        assert!(cfg.input.mouse_off);
+        // A bare touchpad block is wiri's opt-in for reading its raw contacts.
+        assert!(clean("input { touchpad { dwt } }").input.touchpad_enabled);
+    }
+
+    #[test]
+    fn hotkey_overlay_options_are_parsed() {
+        let cfg = clean("hotkey-overlay {\n    skip-at-startup\n    hide-not-bound true\n}");
+        assert!(cfg.hotkey_overlay.skip_at_startup);
+        assert!(cfg.hotkey_overlay.hide_not_bound);
+        let defaults = clean("");
+        assert!(!defaults.hotkey_overlay.skip_at_startup);
+        assert!(!defaults.hotkey_overlay.hide_not_bound);
+        // `false` turns the startup sheet back on.
+        assert!(!clean("hotkey-overlay { skip-at-startup false }")
+            .hotkey_overlay
+            .skip_at_startup);
+        assert!(load("hotkey-overlay { skip-at-start }").has_errors());
+    }
+
+    #[test]
+    fn the_layout_background_color_is_parsed_and_the_overview_backdrop_stays_in_its_section() {
+        let cfg = clean("layout { background-color \"#101820\" }
+overview { backdrop-color \"#000000\" }");
+        assert_eq!(cfg.layout.background_color.as_deref(), Some("#101820"));
+        assert_eq!(cfg.overview.backdrop_color, [0, 0, 0, 255]);
+        assert!(cfg.overview.backdrop_set, "an explicit overview colour is remembered as such");
+        assert!(!clean("layout { background-color \"#101820\" }").overview.backdrop_set);
+        // niri moved the deprecated per-output key to `layout`; wiri maps it the same way and
+        // says that it is deprecated.
+        let d = load("output \"DISPLAY1\" {
+    background-color \"#202020\"
+}");
+        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+        assert_eq!(d.config.layout.background_color.as_deref(), Some("#202020"));
+        assert_eq!(warnings(&d).len(), 1, "{:?}", warnings(&d));
+        assert!(warnings(&d)[0].contains("deprecated"));
+        // Short form, alpha and a real colour are all accepted.
+        let cfg = clean("layout { background-color \"#123\" }");
+        assert_eq!(cfg.layout.background_color.as_deref(), Some("#112233"));
+        assert!(load("layout { background-color \"not a colour\" }").has_errors());
+        // The accent alias reads the system accent, which only the border colours paint.
+        assert!(load("layout { background-color \"accent\" }").has_errors());
     }
 
     #[test]
@@ -3400,7 +3778,9 @@ mod tests {
     fn niri_only_sections_are_warnings() {
         let d = load("prefer-no-csd\nhotkey-overlay { skip-at-startup }\nscreenshot-path \"~/Pictures/x.png\"\ncursor { xcursor-size 24 }\nlayer-rule { match namespace=\"x\" }\n");
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(warnings(&d).len(), 4); // screenshot-path is implemented on Windows.
+        // screenshot-path and (Lane P) hotkey-overlay are implemented on Windows.
+        assert_eq!(warnings(&d).len(), 3, "{:?}", warnings(&d));
+        assert!(d.config.hotkey_overlay.skip_at_startup);
     }
 
     #[test]
