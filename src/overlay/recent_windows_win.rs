@@ -239,11 +239,7 @@ unsafe fn run_host(mailbox: Arc<Mailbox>, delay: u32) {
     // Derive once: do not reborrow the Box while GWLP_USERDATA holds this pointer.
     let ptr = &mut *host as *mut Host;
     let hwnd = match CreateWindowExW(
-        WS_EX_TOPMOST
-            | WS_EX_TOOLWINDOW
-            | WS_EX_NOACTIVATE
-            | WS_EX_TRANSPARENT
-            | WS_EX_LAYERED,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
         w!("WiriRecentWindowsHost"),
         w!("Wiri Recent Windows"),
         WS_POPUP,

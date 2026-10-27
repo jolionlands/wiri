@@ -672,7 +672,8 @@ mod tests {
         assert!(close_fade().is_none());
     }
 
-    fn windows() -> Vec<RecentWindow> {        (1..=4)
+    fn windows() -> Vec<RecentWindow> {
+        (1..=4)
             .map(|i| RecentWindow {
                 id: WindowId::new(i),
                 output: OutputId::from_name(if i == 4 { "B" } else { "A" }),

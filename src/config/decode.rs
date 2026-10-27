@@ -1603,9 +1603,21 @@ impl Decoder {
                 self.unsupported(child, "Windows has one pointer speed for all devices")
             }
             // pointing-device options shared by mouse, touchpad, trackpoint and trackball
-            "off" | "accel-profile" | "scroll-method" | "scroll-button" | "scroll-button-lock"
-            | "left-handed" | "middle-emulation" | "dwt" | "dwtp" | "drag" | "drag-lock"
-            | "tap-button-map" | "click-method" | "disabled-on-external-mouse" | "tap"
+            "off"
+            | "accel-profile"
+            | "scroll-method"
+            | "scroll-button"
+            | "scroll-button-lock"
+            | "left-handed"
+            | "middle-emulation"
+            | "dwt"
+            | "dwtp"
+            | "drag"
+            | "drag-lock"
+            | "tap-button-map"
+            | "click-method"
+            | "disabled-on-external-mouse"
+            | "tap"
             | "tap-to-click"
                 if scope.is_pointer() =>
             {
@@ -1667,7 +1679,8 @@ impl Decoder {
                 }
             }
             "accel-profile" => {
-                if let Some(v) = self.enum_arg(child, AccelProfile::parse, "\"flat\" or \"adaptive\"")
+                if let Some(v) =
+                    self.enum_arg(child, AccelProfile::parse, "\"flat\" or \"adaptive\"")
                 {
                     cfg.input.accel_profile = Some(v);
                 }
@@ -3347,12 +3360,18 @@ mod tests {
         assert_eq!(cfg.input.scroll_method, Some(ScrollMethod::OnButtonDown));
         assert_eq!(cfg.input.scroll_button, Some(8));
         assert_eq!(cfg.input.scroll_button_lock, Some(true));
-        assert!(cfg.input.touchpad_enabled, "a touchpad block enables wiri's reader");
+        assert!(
+            cfg.input.touchpad_enabled,
+            "a touchpad block enables wiri's reader"
+        );
         assert_eq!(cfg.input.touchpad_dwt, Some(true));
         assert_eq!(cfg.input.touchpad_dwtp, Some(false));
         assert_eq!(cfg.input.touchpad_drag, Some(true));
         assert_eq!(cfg.input.touchpad_drag_lock, Some(true));
-        assert_eq!(cfg.input.touchpad_click_method, Some(ClickMethod::Clickfinger));
+        assert_eq!(
+            cfg.input.touchpad_click_method,
+            Some(ClickMethod::Clickfinger)
+        );
         assert_eq!(cfg.input.touchpad_disabled_on_external_mouse, Some(true));
         assert_eq!(
             cfg.input.touchpad_tap_button_map,
@@ -3411,25 +3430,38 @@ mod tests {
         assert!(!defaults.hotkey_overlay.skip_at_startup);
         assert!(!defaults.hotkey_overlay.hide_not_bound);
         // `false` turns the startup sheet back on.
-        assert!(!clean("hotkey-overlay { skip-at-startup false }")
-            .hotkey_overlay
-            .skip_at_startup);
+        assert!(
+            !clean("hotkey-overlay { skip-at-startup false }")
+                .hotkey_overlay
+                .skip_at_startup
+        );
         assert!(load("hotkey-overlay { skip-at-start }").has_errors());
     }
 
     #[test]
     fn the_layout_background_color_is_parsed_and_the_overview_backdrop_stays_in_its_section() {
-        let cfg = clean("layout { background-color \"#101820\" }
-overview { backdrop-color \"#000000\" }");
+        let cfg = clean(
+            "layout { background-color \"#101820\" }
+overview { backdrop-color \"#000000\" }",
+        );
         assert_eq!(cfg.layout.background_color.as_deref(), Some("#101820"));
         assert_eq!(cfg.overview.backdrop_color, [0, 0, 0, 255]);
-        assert!(cfg.overview.backdrop_set, "an explicit overview colour is remembered as such");
-        assert!(!clean("layout { background-color \"#101820\" }").overview.backdrop_set);
+        assert!(
+            cfg.overview.backdrop_set,
+            "an explicit overview colour is remembered as such"
+        );
+        assert!(
+            !clean("layout { background-color \"#101820\" }")
+                .overview
+                .backdrop_set
+        );
         // niri moved the deprecated per-output key to `layout`; wiri maps it the same way and
         // says that it is deprecated.
-        let d = load("output \"DISPLAY1\" {
+        let d = load(
+            "output \"DISPLAY1\" {
     background-color \"#202020\"
-}");
+}",
+        );
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
         assert_eq!(d.config.layout.background_color.as_deref(), Some("#202020"));
         assert_eq!(warnings(&d).len(), 1, "{:?}", warnings(&d));

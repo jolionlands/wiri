@@ -567,7 +567,7 @@ mod system {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::SwapMouseButton;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SendMessageTimeoutW, SystemParametersInfoW, GetSystemMetrics, HWND_BROADCAST,
+        GetSystemMetrics, SendMessageTimeoutW, SystemParametersInfoW, HWND_BROADCAST,
         SMTO_ABORTIFHUNG, SPI_GETMOUSE, SPI_SETMOUSE, SYSTEM_METRICS_INDEX,
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETTINGCHANGE,
     };
@@ -594,12 +594,8 @@ mod system {
                 let swapped = unsafe { GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_SWAPBUTTON)) };
                 Some(Value::Int(swapped))
             }
-            Setting::TouchpadTypingSensitivity => {
-                read_touchpad("AAPThreshold").map(Value::Int)
-            }
-            Setting::TouchpadLeaveOnWithMouse => {
-                read_touchpad("LeaveOnWithMouse").map(Value::Int)
-            }
+            Setting::TouchpadTypingSensitivity => read_touchpad("AAPThreshold").map(Value::Int),
+            Setting::TouchpadLeaveOnWithMouse => read_touchpad("LeaveOnWithMouse").map(Value::Int),
         }
     }
 
@@ -617,7 +613,8 @@ mod system {
                 result.map_err(|error| error.to_string())
             }
             (Setting::ButtonSwap, Value::Int(swapped)) => {
-                let previous = unsafe { SwapMouseButton(windows::Win32::Foundation::BOOL(swapped)) };
+                let previous =
+                    unsafe { SwapMouseButton(windows::Win32::Foundation::BOOL(swapped)) };
                 tracing::debug!(
                     "pointer settings: SwapMouseButton({}) returned {:?}",
                     swapped,
@@ -631,11 +628,7 @@ mod system {
             (Setting::TouchpadLeaveOnWithMouse, Value::Int(leave)) => {
                 write_touchpad("LeaveOnWithMouse", leave)
             }
-            (setting, value) => Err(format!(
-                "{} does not take {:?}",
-                setting.name(),
-                value
-            )),
+            (setting, value) => Err(format!("{} does not take {:?}", setting.name(), value)),
         }
     }
 
@@ -653,8 +646,15 @@ mod system {
     fn touchpad_key_read() -> Option<HKEY> {
         let mut key = HKEY::default();
         let path: Vec<u16> = TOUCHPAD_KEY.encode_utf16().chain(Some(0)).collect();
-        let status =
-            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), 0, KEY_QUERY_VALUE, &mut key) };
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(path.as_ptr()),
+                0,
+                KEY_QUERY_VALUE,
+                &mut key,
+            )
+        };
         status.is_ok().then_some(key)
     }
 
@@ -700,8 +700,7 @@ mod system {
     }
 
     fn write_touchpad(name: &str, value: i32) -> Result<(), String> {
-        let key =
-            touchpad_key_write().ok_or("the precision touchpad registry key is not there")?;
+        let key = touchpad_key_write().ok_or("the precision touchpad registry key is not there")?;
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let data = value as u32;
         let status = unsafe {
@@ -727,8 +726,7 @@ mod system {
     }
 
     fn remove_touchpad(name: &str) -> Result<(), String> {
-        let key =
-            touchpad_key_write().ok_or("the precision touchpad registry key is not there")?;
+        let key = touchpad_key_write().ok_or("the precision touchpad registry key is not there")?;
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let status = unsafe { RegDeleteValueW(key, PCWSTR(wide.as_ptr())) };
         unsafe {
@@ -823,14 +821,22 @@ mod tests {
     #[test]
     fn only_configured_options_are_written() {
         let fake = Arc::new(Fake::with(&[
-            (Setting::EnhancedPrecision, Value::Thresholds(ADAPTIVE_THRESHOLDS)),
+            (
+                Setting::EnhancedPrecision,
+                Value::Thresholds(ADAPTIVE_THRESHOLDS),
+            ),
             (Setting::ButtonSwap, Value::Int(0)),
         ]));
         let mut settings = PointerSettings::new(fake.clone());
-        let lines = settings.apply(&wanted(&input("input { mouse { accel-profile \"flat\" } }")));
+        let lines = settings.apply(&wanted(&input(
+            "input { mouse { accel-profile \"flat\" } }",
+        )));
         assert_eq!(
             fake.writes(),
-            vec![(Setting::EnhancedPrecision, Value::Thresholds(FLAT_THRESHOLDS))]
+            vec![(
+                Setting::EnhancedPrecision,
+                Value::Thresholds(FLAT_THRESHOLDS)
+            )]
         );
         assert!(fake.removes().is_empty());
         assert_eq!(lines.len(), 1);
@@ -845,7 +851,9 @@ mod tests {
             Value::Thresholds(FLAT_THRESHOLDS),
         )]));
         let mut settings = PointerSettings::new(fake.clone());
-        let lines = settings.apply(&wanted(&input("input { mouse { accel-profile \"flat\" } }")));
+        let lines = settings.apply(&wanted(&input(
+            "input { mouse { accel-profile \"flat\" } }",
+        )));
         assert!(fake.writes().is_empty(), "{:?}", fake.writes());
         assert!(lines.is_empty());
         // Nothing was changed, so a quit has nothing to restore.
@@ -902,14 +910,20 @@ mod tests {
         settings.apply(&wanted(&input(
             "input {\n    mouse { accel-profile \"flat\"; left-handed }\n    touchpad { disabled-on-external-mouse }\n}",
         )));
-        assert_eq!(fake.values().get(&Setting::EnhancedPrecision), Some(&Value::Thresholds(FLAT_THRESHOLDS)));
+        assert_eq!(
+            fake.values().get(&Setting::EnhancedPrecision),
+            Some(&Value::Thresholds(FLAT_THRESHOLDS))
+        );
         settings.restore();
         // The original triple comes back, not Windows' defaults.
         assert_eq!(
             fake.values().get(&Setting::EnhancedPrecision),
             Some(&Value::Thresholds([4, 8, 1]))
         );
-        assert_eq!(fake.values().get(&Setting::ButtonSwap), Some(&Value::Int(0)));
+        assert_eq!(
+            fake.values().get(&Setting::ButtonSwap),
+            Some(&Value::Int(0))
+        );
         assert_eq!(
             fake.values().get(&Setting::TouchpadLeaveOnWithMouse),
             Some(&Value::Int(1))
@@ -936,10 +950,16 @@ mod tests {
         let fake = Arc::new(Fake::with(&[(Setting::ButtonSwap, Value::Int(0))]));
         let mut settings = PointerSettings::new(fake.clone());
         settings.apply(&wanted(&input("input { mouse { left-handed } }")));
-        assert_eq!(fake.values().get(&Setting::ButtonSwap), Some(&Value::Int(1)));
+        assert_eq!(
+            fake.values().get(&Setting::ButtonSwap),
+            Some(&Value::Int(1))
+        );
         // The new config says nothing about the mouse: the reload restores the old value.
         let lines = settings.apply(&wanted(&input("input { mouse { natural-scroll } }")));
-        assert_eq!(fake.values().get(&Setting::ButtonSwap), Some(&Value::Int(0)));
+        assert_eq!(
+            fake.values().get(&Setting::ButtonSwap),
+            Some(&Value::Int(0))
+        );
         assert!(!lines.is_empty());
         assert!(settings.changed().is_empty());
     }
@@ -947,13 +967,20 @@ mod tests {
     #[test]
     fn changing_an_option_keeps_the_first_original_for_the_restore() {
         let fake = Arc::new(Fake::with(&[
-            (Setting::EnhancedPrecision, Value::Thresholds(ADAPTIVE_THRESHOLDS)),
+            (
+                Setting::EnhancedPrecision,
+                Value::Thresholds(ADAPTIVE_THRESHOLDS),
+            ),
             (Setting::ButtonSwap, Value::Int(0)),
         ]));
         let mut settings = PointerSettings::new(fake.clone());
-        settings.apply(&wanted(&input("input { mouse { accel-profile \"flat\" } }")));
+        settings.apply(&wanted(&input(
+            "input { mouse { accel-profile \"flat\" } }",
+        )));
         // Reload: adaptive again.  That is what the OS had at the start, so nothing is owed.
-        settings.apply(&wanted(&input("input { mouse { accel-profile \"adaptive\" } }")));
+        settings.apply(&wanted(&input(
+            "input { mouse { accel-profile \"adaptive\" } }",
+        )));
         assert_eq!(
             fake.values().get(&Setting::EnhancedPrecision),
             Some(&Value::Thresholds(ADAPTIVE_THRESHOLDS))
@@ -999,7 +1026,10 @@ mod tests {
         // The real backend was only read, never written.
         assert!(fake.writes().is_empty(), "{:?}", fake.writes());
         assert!(fake.removes().is_empty());
-        assert_eq!(fake.values().get(&Setting::ButtonSwap), Some(&Value::Int(0)));
+        assert_eq!(
+            fake.values().get(&Setting::ButtonSwap),
+            Some(&Value::Int(0))
+        );
         let audit = std::fs::read_to_string(&path).expect("audit file");
         let lines: Vec<serde_json::Value> = audit
             .lines()

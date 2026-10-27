@@ -19,7 +19,9 @@ pub enum Urgency {
 pub enum SystemAction {
     SwitchLayout(LayoutSwitchTarget),
     WindowUrgent(Urgency),
-    Quit { skip_confirmation: bool },
+    Quit {
+        skip_confirmation: bool,
+    },
     LoadConfigFile(Option<PathBuf>),
     PowerOffMonitors,
     PowerOnMonitors,
@@ -346,7 +348,10 @@ fn toggle_touchpad(
         .full_config()
         .is_some_and(|config| config.input.touchpad_enabled);
     let on = crate::input::pointer_settings::toggle_touchpad(configured);
-    tracing::info!("toggle-touchpad: touchpad is now {}", if on { "on" } else { "off" });
+    tracing::info!(
+        "toggle-touchpad: touchpad is now {}",
+        if on { "on" } else { "off" }
+    );
     let engine = engine.clone();
     let backend = backend.clone();
     let apply = move || crate::input::touchpad::configure(on, engine, backend);
@@ -661,7 +666,8 @@ mod tests {
         // no bind either.
         assert_eq!(parse("toggle-touchpad", &["on".into()]), Some(None));
         assert!(
-            crate::input::parse_action_flagged("toggle-touchpad", &["on".into()], &[false]).is_none()
+            crate::input::parse_action_flagged("toggle-touchpad", &["on".into()], &[false])
+                .is_none()
         );
         // niri's typed `Action::ToggleTouchpad` has no fields.
         let fields = serde_json::json!({});

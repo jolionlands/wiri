@@ -87,11 +87,7 @@ impl TilingEngine {
                 (Some(px), _) => px as i32,
                 (None, Some(proportion)) => proportion_px(available, gap, proportion),
                 (None, None) => {
-                    let weights: f32 = column
-                        .tiles
-                        .iter()
-                        .map(|t| t.height_weight.max(0.1))
-                        .sum();
+                    let weights: f32 = column.tiles.iter().map(|t| t.height_weight.max(0.1)).sum();
                     let mine = column.tiles[index].height_weight.max(0.1);
                     (available as f32 * mine / weights.max(0.1)).round() as i32
                 }
