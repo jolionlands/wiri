@@ -258,6 +258,16 @@ depth is limited to 8, a file that includes itself is an error, and the included
 niri's `touchpad`, `trackpoint`, `trackball`, `tablet`, `xkb`, `track-layout`, `mod-key-nested` and
 `disable-power-key-handling` are accepted with a warning: Windows has one pointer setup for all devices.
 
+### `cursor {}`
+
+| Option | Meaning |
+|---|---|
+| `hide-when-typing` | set Windows' own per-user "hide pointer while typing" (`SPI_SETMOUSEVANISH`); only written when the option is there, the previous value is restored on quit or when a reload drops it |
+| `hide-after-inactive-ms N` | hide the pointer after `N` ms without pointer movement; any movement or click shows it again. One one-shot timer runs on the existing mouse hook and only while the pointer is visible. The user's cursors are restored on quit, on a reload that removes the option, from the panic hook and at startup |
+
+`xcursor-theme` and `xcursor-size` are accepted with a warning: the cursor scheme belongs to Windows
+(Settings > Accessibility > Mouse pointer).
+
 ### `layout {}`
 
 | Option | Meaning |

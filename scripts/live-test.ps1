@@ -3135,6 +3135,11 @@ $summary = [ordered]@{
 # so nothing here changes this machine's real pointer or touchpad settings.
 . (Join-Path $PSScriptRoot 'live-phases\lane-p.ps1')
 . (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1')
+# Lane LAST: niri's `cursor { hide-when-typing; hide-after-inactive-ms }` and the tablet
+# stylus binds.  hide-when-typing is checked only in lane P's dry-run mode; the inactivity
+# test starts one private daemon whose own explicit hide/restore is the only cursor change,
+# and its `finally` reloads the user's cursor scheme unconditionally.
+. (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
