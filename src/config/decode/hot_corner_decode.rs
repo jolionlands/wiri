@@ -91,6 +91,57 @@ mod tests {
     }
 
     #[test]
+    fn an_output_named_in_kdl_escapes_or_literally_matches_the_windows_connector() {
+        use crate::backend::{outputs::OutputMatcher, MonitorInfo};
+        use crate::utils::{OutputId, Rect};
+        // `\\.\DISPLAY1` is what Windows calls the connector. The live H64 gates write it with
+        // KDL's escapes (the form CONFIG.md and the IPC JSON show); a literal spelling has
+        // always worked. Both must reach the same monitor, or `output { hot-corners }` is
+        // silently ignored (it was: the escaped spelling kept four leading backslashes).
+        let monitor = MonitorInfo {
+            id: OutputId::from_name(r"\\.\DISPLAY1"),
+            name: r"\\.\DISPLAY1".to_string(),
+            bounds: Rect::new(0, 0, 1366, 768),
+            work_area: Rect::new(0, 0, 1366, 728),
+            is_primary: true,
+            scale_factor: 1.0,
+        };
+        for output in [r#""\\\\.\\DISPLAY1""#, r#""\\.\DISPLAY1""#] {
+            let off = decode_text(
+                &format!("gestures {{ hot-corners {{ top-right; }}; }}\noutput {output} {{ hot-corners {{ off; }}; }}"),
+                "",
+                None,
+            );
+            assert!(off.issues.is_empty(), "{output}: {:?}", off.issues);
+            let matched = OutputMatcher::default()
+                .matching_config(&off.config, &monitor)
+                .unwrap_or_else(|| panic!("{output} named no monitor: {:?}", off.config.output));
+            let policy = off
+                .config
+                .gestures
+                .hot_corners
+                .for_output(matched.hot_corners);
+            assert_eq!(policy.enabled(), [false; 4], "{output}: per-output off");
+
+            let on = decode_text(
+                &format!("gestures {{ hot-corners {{ off; }}; }}\noutput {output} {{ hot-corners {{}}; }}"),
+                "",
+                None,
+            );
+            assert!(on.issues.is_empty(), "{output}: {:?}", on.issues);
+            let matched = OutputMatcher::default()
+                .matching_config(&on.config, &monitor)
+                .unwrap_or_else(|| panic!("{output} named no monitor: {:?}", on.config.output));
+            let policy = on.config.gestures.hot_corners.for_output(matched.hot_corners);
+            assert_eq!(
+                policy.enabled(),
+                [true, false, false, false],
+                "{output}: per-output override re-enables the default corner"
+            );
+        }
+    }
+
+    #[test]
     fn default_top_left_unless_a_block_replaces_it_and_a_repeated_section_is_an_error() {
         // No block, or a gestures section without `hot-corners`, keeps niri's top-left.
         for text in ["", "gestures {}", "gestures { hot-corners {}; }"] {
