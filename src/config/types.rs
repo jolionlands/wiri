@@ -9,6 +9,10 @@ pub struct Config {
     pub recent_windows: super::recent_windows_config::RecentWindowsConfig,
     pub animations: AnimationsConfig,
     pub gestures: super::gestures_config::GesturesConfig,
+    /// niri `hotkey-overlay { skip-at-startup; hide-not-bound }`.
+    pub hotkey_overlay: HotkeyOverlayConfig,
+    /// niri `overview { backdrop-color }`.
+    pub overview: OverviewConfig,
     /// niri screenshot-path: Pictures default, a strftime template, or null (clipboard only).
     pub screenshot_path: crate::screenshot::path::ScreenshotPath,
     /// Programs to spawn at startup. Each entry is [program, arg1, arg2, …].
@@ -46,6 +50,8 @@ impl Default for Config {
             recent_windows: super::recent_windows_config::RecentWindowsConfig::default(),
             animations: AnimationsConfig::default_config(),
             gestures: super::gestures_config::GesturesConfig::default(),
+            hotkey_overlay: HotkeyOverlayConfig::default(),
+            overview: OverviewConfig::default(),
             screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
             spawn_sh_at_startup: Vec::new(),
@@ -57,6 +63,26 @@ impl Config {
     pub fn default_config() -> Self {
         Self::default()
     }
+}
+
+/// niri `hotkey-overlay { ... }`: what the "Important Hotkeys" sheet does when wiri starts and
+/// which entries it lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HotkeyOverlayConfig {
+    /// `skip-at-startup`: do not show the sheet when wiri starts (it can still be opened with
+    /// the `show-hotkey-overlay` action).
+    pub skip_at_startup: bool,
+    /// `hide-not-bound`: leave out the essential actions that have no key bound to them
+    /// (niri lists them as "(not bound)" otherwise).
+    pub hide_not_bound: bool,
+}
+
+/// niri `overview { ... }`: the options of the zoomed-out workspace view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverviewConfig {
+    /// `backdrop-color`: the colour painted behind the overview's workspaces.  `None` means the
+    /// layout-level `background-color` (or wiri's built-in dark backdrop) is used.
+    pub backdrop_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,6 +131,44 @@ pub struct InputConfig {
     pub touch_tap_to_click: bool,
     /// Touch scroll speed multiplier (1.0 = native).
     pub touch_scroll_speed: f64,
+
+    // ---- pointing-device options (niri `input { mouse/touchpad/trackpoint/trackball }`) ----
+    // Every `Option` is `None` when the config says nothing about it: wiri then leaves the
+    // Windows setting alone, and a reload that removes the key restores what was there before
+    // (`crate::input::pointer_settings`).
+    /// niri `accel-profile "flat"` / `"adaptive"` (Windows: "Enhance pointer precision").
+    pub accel_profile: Option<AccelProfile>,
+    /// niri `left-handed` (Windows: swap the primary and secondary mouse buttons).
+    pub left_handed: Option<bool>,
+    /// niri `middle-emulation`: parsed and validated, but Windows has no lever for it.
+    pub middle_emulation: Option<bool>,
+    /// niri `scroll-method`: parsed and validated, but Windows has no lever for it.
+    pub scroll_method: Option<ScrollMethod>,
+    /// niri `scroll-button`: the button number `on-button-down` scrolling uses.
+    pub scroll_button: Option<u32>,
+    /// niri `scroll-button-lock`: keep the scroll button scrolling without holding it.
+    pub scroll_button_lock: Option<bool>,
+    /// niri `off` inside `input { mouse }`: parsed, but a Windows mouse belongs to the OS.
+    pub mouse_off: bool,
+    /// niri `off` inside `input { trackpoint }`.
+    pub trackpoint_off: bool,
+    /// niri `off` inside `input { trackball }`.
+    pub trackball_off: bool,
+    /// niri touchpad `dwt` (Windows: the precision-touchpad typing sensitivity).
+    pub touchpad_dwt: Option<bool>,
+    /// niri touchpad `dwtp`: parsed and validated, but Windows has no lever for it.
+    pub touchpad_dwtp: Option<bool>,
+    /// niri touchpad `drag`: parsed and validated, no Windows lever (the OS owns tap-and-drag).
+    pub touchpad_drag: Option<bool>,
+    /// niri touchpad `drag-lock`: parsed and validated, no Windows lever.
+    pub touchpad_drag_lock: Option<bool>,
+    /// niri touchpad `tap-button-map { left N; middle N; right N; }`.
+    pub touchpad_tap_button_map: Option<TapButtonMap>,
+    /// niri touchpad `click-method`: parsed and validated, no Windows lever.
+    pub touchpad_click_method: Option<ClickMethod>,
+    /// niri touchpad `disabled-on-external-mouse` (Windows: "Leave touchpad on when a mouse is
+    /// connected", inverted).
+    pub touchpad_disabled_on_external_mouse: Option<bool>,
 }
 
 impl InputConfig {
@@ -131,6 +195,22 @@ impl InputConfig {
             touchpad_enabled: false,
             touch_tap_to_click: true,
             touch_scroll_speed: 1.0,
+            accel_profile: None,
+            left_handed: None,
+            middle_emulation: None,
+            scroll_method: None,
+            scroll_button: None,
+            scroll_button_lock: None,
+            mouse_off: false,
+            trackpoint_off: false,
+            trackball_off: false,
+            touchpad_dwt: None,
+            touchpad_dwtp: None,
+            touchpad_drag: None,
+            touchpad_drag_lock: None,
+            touchpad_tap_button_map: None,
+            touchpad_click_method: None,
+            touchpad_disabled_on_external_mouse: None,
         }
     }
 
@@ -176,6 +256,112 @@ impl InputConfig {
             max_scroll_percent: self.focus_max_scroll_percent,
             warp_on_focus: self.warp_on_focus,
             warp_mode: self.warp_mode,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pointing-device option types (niri `input { ... }`)
+// ---------------------------------------------------------------------------
+
+/// niri `accel-profile "flat"` / `"adaptive"`.
+///
+/// Windows has one global acceleration curve ("Enhance pointer precision"), which is what
+/// wiri maps this to: `Flat` turns it off, `Adaptive` turns it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelProfile {
+    Flat,
+    Adaptive,
+}
+
+impl AccelProfile {
+    /// `flat` / `adaptive`, as niri spells them.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "flat" => Some(Self::Flat),
+            "adaptive" => Some(Self::Adaptive),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
+
+/// niri `scroll-method "none" | "edge" | "two-finger" | "on-button-down"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMethod {
+    NoScroll,
+    Edge,
+    TwoFinger,
+    OnButtonDown,
+}
+
+impl ScrollMethod {
+    /// The four niri spellings (also the older `edge-scroll` / `button-scroll` aliases).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "none" | "no-scroll" => Some(Self::NoScroll),
+            "edge" => Some(Self::Edge),
+            "two-finger" | "twofinger" => Some(Self::TwoFinger),
+            "on-button-down" | "button" => Some(Self::OnButtonDown),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoScroll => "none",
+            Self::Edge => "edge",
+            Self::TwoFinger => "two-finger",
+            Self::OnButtonDown => "on-button-down",
+        }
+    }
+}
+
+/// niri touchpad `click-method "button-areas" | "clickfinger"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickMethod {
+    ButtonAreas,
+    Clickfinger,
+}
+
+impl ClickMethod {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "button-areas" => Some(Self::ButtonAreas),
+            "clickfinger" => Some(Self::Clickfinger),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ButtonAreas => "button-areas",
+            Self::Clickfinger => "clickfinger",
+        }
+    }
+}
+
+/// niri touchpad `tap-button-map { left N; middle N; right N; }`: which button a tap with N
+/// fingers means.  niri's defaults are 1 / 2 / 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapButtonMap {
+    pub left: u8,
+    pub middle: u8,
+    pub right: u8,
+}
+
+impl Default for TapButtonMap {
+    fn default() -> Self {
+        Self {
+            left: 1,
+            middle: 2,
+            right: 3,
         }
     }
 }
@@ -323,6 +509,9 @@ pub struct LayoutConfigPartial {
     /// The `focus-ring`, `border`, `shadow`, `insert-hint` and `tab-indicator` blocks this
     /// `layout {}` names; each replaces the block of the layout it is applied to.
     pub effects: crate::config::effects::EffectsPartial,
+    /// niri `layout { background-color }` (also where the deprecated per-output
+    /// `background-color` maps).
+    pub background_color: Option<String>,
 }
 
 impl LayoutConfigPartial {
@@ -461,6 +650,9 @@ impl LayoutConfigPartial {
         if let Some(v) = self.reserve_right {
             out.reserve_right = v;
         }
+        if let Some(ref v) = self.background_color {
+            out.background_color = Some(v.clone());
+        }
         out.effects = self.effects.apply_to(&out.effects);
         // The older flat spellings of the widths count when no block named them.
         if self.effects.border.is_none() {
@@ -586,6 +778,12 @@ pub struct LayoutConfig {
     /// The flat `border_*` / `focus_ring_*` / `shadow_*` fields above are the older spelling
     /// of some of the same keys; the decoder keeps both in step.
     pub effects: crate::config::effects::Effects,
+
+    /// niri `layout { background-color }`: the colour behind the workspaces.  niri's deprecated
+    /// per-output `background-color` maps here too.  Windows owns the desktop behind tiled
+    /// windows, so wiri paints this behind the overview's workspaces (see
+    /// `OverviewConfig::backdrop_color`, which overrides it there).
+    pub background_color: Option<String>,
 }
 
 impl LayoutConfig {
@@ -633,6 +831,7 @@ impl LayoutConfig {
             reserve_left: 0,
             reserve_right: 0,
             effects: crate::config::effects::Effects::default(),
+            background_color: None,
         }
     }
 
