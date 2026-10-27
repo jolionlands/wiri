@@ -70,10 +70,24 @@ fn zoom_rect(rect: Rect, view: Rect, section_y: i32, zoom: f64) -> Rect {
 
 impl TilingEngine {
     fn overview_options(&self) -> crate::config::overview_config::OverviewConfig {
-        self.full_config
+        let mut options = self
+            .full_config
             .as_ref()
             .map(|c| c.overview)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // niri `layout { background-color }` (where the deprecated per-output key maps) is
+        // what the overview paints behind its workspaces unless `overview { backdrop-color }`
+        // names a colour. The single overview host paints it; GDI-style alpha is ignored.
+        if !options.backdrop_set {
+            let layout = self
+                .monitors
+                .focused_id()
+                .map_or(&self.config, |output| self.active_workspace_config(output));
+            if let Some([r, g, b, _]) = layout.background_color {
+                options.backdrop_color = [r, g, b, 255];
+            }
+        }
+        options
     }
 
     fn start_overview_camera(&mut self, target: f64) {

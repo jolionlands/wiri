@@ -431,6 +431,10 @@ pub struct LayoutConfig {
     /// What the overlay layer draws around the windows (niri's `focus-ring`, `border`,
     /// `shadow`, `insert-hint` and `tab-indicator`).
     pub effects: crate::config::Effects,
+    /// niri `layout { background-color }` (also where the deprecated per-output key maps):
+    /// the overview host paints it behind the workspaces unless `overview { backdrop-color }`
+    /// is set.  Windows owns the desktop behind the tiled windows themselves.
+    pub background_color: Option<crate::config::effects::Rgba8>,
 }
 
 impl Default for LayoutConfig {
@@ -468,6 +472,7 @@ impl Default for LayoutConfig {
             reserve_left: 0,
             reserve_right: 0,
             effects: crate::config::Effects::default(),
+            background_color: None,
         }
     }
 }
@@ -559,6 +564,11 @@ impl LayoutConfig {
         lc.reserve_bottom = config.layout.reserve_bottom;
         lc.reserve_left = config.layout.reserve_left;
         lc.reserve_right = config.layout.reserve_right;
+        lc.background_color = config
+            .layout
+            .background_color
+            .as_deref()
+            .and_then(crate::config::parse_css_color);
         lc
     }
 }
