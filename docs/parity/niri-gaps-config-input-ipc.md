@@ -32,7 +32,7 @@ and the final product/harness fixes have not been rerun live.
 | 2. Keyboard input | 10 | 1 | 4 | 0 | 5 |
 | 3. Pointing devices (touchpad, mouse, trackpoint, trackball, tablet, touch) | 18 | 0 | 12 | 0 | 6 |
 | 4. General input settings (focus-follows-mouse, warp, workspace back-and-forth, mod key) | 7 | 4 | 2 | 0 | 1 |
-| 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 15 | 4 | 1 | 1 |
+| 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 15 | 5 | 0 | 1 |
 | 6. Hotkey overlay ("Important Hotkeys") | 7 | 4 | 3 | 0 | 0 |
 | 7. Screenshots | 11 | 10 | 1 | 0 | 0 |
 | 8. IPC transport, protocol and CLI | 11 | 10 | 1 | 0 | 0 |
@@ -40,12 +40,12 @@ and the final product/harness fixes have not been rerun live.
 | 10. IPC `Event` variants (one row each) | 20 | 17 | 0 | 0 | 3 |
 | 11. Outputs (config and runtime behaviour) | 17 | 3 | 11 | 0 | 3 |
 | 12. Actions in scope (non-layout), one row each | 29 | 4 | 16 | 0 | 9 |
-| 13. Misc top-level config (startup, environment, cursor, clipboard, session) | 11 | 3 | 1 | 2 | 5 |
+| 13. Misc top-level config (startup, environment, cursor, clipboard, session) | 11 | 3 | 3 | 0 | 5 |
 | 14. Switch events, named workspaces config, recent windows (Alt-Tab) | 13 | 11 | 1 | 0 | 1 |
 | 15. Layer rules | 5 | 0 | 0 | 0 | 5 |
 | 16. Debug options | 22 | 0 | 0 | 0 | 22 |
 | 17. Accessibility, security model, screencasting, Xwayland | 13 | 1 | 4 | 0 | 8 |
-| **total** | **259** | **117** | **67** | **3** | **72** |
+| **total** | **259** | **117** | **70** | **0** | **72** |
 
 Lane LAST moved three rows from `missing` to `partial` (the two `cursor {}` rows in
 section 13 and the tablet stylus row in section 5); the table above is not recounted for
