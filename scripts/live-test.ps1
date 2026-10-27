@@ -844,8 +844,30 @@ Set-Content -Path $argdump -Encoding ASCII -Value 'param([string]$OutFile)', 'Co
 Copy-Item (Join-Path $env:SystemRoot 'System32\cmd.exe') (Join-Path $pdir 'my cmd.exe') -Force
 foreach ($f in 'bind-spawn.json', 'bind-shell.txt', 'startup-spawn.json', 'ipc-spawn.json', 'ipc-line.txt') { Remove-Item (Join-Path $pdir $f) -Force -ErrorAction SilentlyContinue }
 
+# Shells hosted by Windows Terminal. Closing a terminal window can leave its PowerShell running, so each
+# spawn check stops exactly the shells that appeared after its own snapshot (by PID), then closes the window.
+function TerminalShells {
+    $hosts = @(Get-CimInstance Win32_Process -Filter "Name='WindowsTerminal.exe'" -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.ProcessId })
+    if (-not $hosts.Count) { return @() }
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { ($hosts -contains [int]$_.ParentProcessId) -and ($_.Name -in 'powershell.exe', 'pwsh.exe', 'cmd.exe') } |
+        ForEach-Object { [int]$_.ProcessId })
+}
+$terminalShellsStopped = 0
+function CloseSpawnedTerminal($window, $shellsBefore) {
+    $new = @()
+    for ($i = 0; $i -lt 12 -and -not $new.Count; $i++) {
+        $new = @(TerminalShells | Where-Object { $shellsBefore -notcontains $_ })
+        if (-not $new.Count) { Start-Sleep -Milliseconds 250 }
+    }
+    foreach ($id in $new) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+    if ($window -and [LT]::IsWindow($window)) { Start-Sleep -Milliseconds 300; [LT]::Close($window) }
+    $script:terminalShellsStopped += $new.Count
+}
+
 # The built-in Mod+Enter (no spawn bind in this config) starts Windows Terminal: press it for real.
 $topBefore = [LT]::TopLevel()
+$shellsBefore = TerminalShells
 Chord 'ctrl+alt+return'
 $defaultTerm = $null
 for ($i = 0; $i -lt 40 -and -not $defaultTerm; $i++) {
@@ -854,7 +876,7 @@ for ($i = 0; $i -lt 40 -and -not $defaultTerm; $i++) {
 }
 $spawnDefaultTerminal = [bool]$defaultTerm
 Shot '13-default-terminal'
-if ($defaultTerm) { [LT]::Close($defaultTerm) }
+CloseSpawnedTerminal $defaultTerm $shellsBefore
 Start-Sleep -Seconds 2
 
 $h2Config = @"
@@ -891,6 +913,7 @@ $spawnIpcLineOk = ($ipcLineText -eq 'ipc line')
 $spawnWtWindow = $null
 if ($env:WIRI_LIVE_CI -ne '1' -or (Get-Command wt.exe -ErrorAction SilentlyContinue)) {
     $topBefore = [LT]::TopLevel()
+    $shellsBefore = TerminalShells
     $null = Ctl 'h2-ipc-spawn-wt' @('spawn', 'wt.exe')
     $wtWin = $null
     for ($i = 0; $i -lt 40 -and -not $wtWin; $i++) {
@@ -899,7 +922,7 @@ if ($env:WIRI_LIVE_CI -ne '1' -or (Get-Command wt.exe -ErrorAction SilentlyConti
     }
     $spawnWtWindow = [bool]$wtWin
     Shot '13-spawn-wt'
-    if ($wtWin) { [LT]::Close($wtWin) }
+    CloseSpawnedTerminal $wtWin $shellsBefore
     Start-Sleep -Seconds 2
 }
 $w = $w4
