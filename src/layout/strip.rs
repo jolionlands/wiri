@@ -38,6 +38,43 @@ impl Workspace {
         }
         before != self.scroll_offset.x
     }
+
+    /// niri `center-visible-columns`: centre the span of columns that are *fully* in view
+    /// (a column hanging off either edge is not part of it) in the view.  The offset may
+    /// become negative, exactly like the centring policies: even the first or the only
+    /// column can be centred, and there is no wrap-around.  Returns true when the view moved.
+    ///
+    /// An empty workspace, a zero-width view and a strip in which no column is fully in view
+    /// (every column is wider than the view, or the view sits in a gap) change nothing.
+    pub fn center_visible_columns(&mut self, default_width: i32, gap: i32, view: i32) -> bool {
+        if self.columns.is_empty() || view <= 0 {
+            return false;
+        }
+        let left = self.scroll_offset.x;
+        let right = left.saturating_add(view);
+        let mut span: Option<(i32, i32)> = None;
+        for (index, _) in self.columns.iter().enumerate() {
+            let (start, width) = self.column_x_and_width(index, default_width, gap);
+            let end = start.saturating_add(width);
+            if start < left || end > right {
+                continue;
+            }
+            span = Some(match span {
+                Some((first, last)) => (first, end.max(last)),
+                None => (start, end),
+            });
+        }
+        let Some((start, end)) = span else {
+            return false;
+        };
+        let width = (end - start).max(0);
+        let target = start - (view - width) / 2;
+        if target == self.scroll_offset.x {
+            return false;
+        }
+        self.scroll_offset.x = target;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -92,5 +129,38 @@ mod tests {
         assert_eq!(ws.scroll_offset.x, 0);
         ws.columns.clear();
         assert!(!ws.reveal_with_policy(0, 400, 20, 1000, CenterFocusedColumn::Always, true));
+    }
+
+    // --- center-visible-columns ---
+
+    #[test]
+    fn center_visible_columns_centres_the_span_that_is_fully_in_view() {
+        let mut ws = strip();
+        // Columns at 0..400, 420..820, 840..1240 of a 1000 px view: the last one hangs off
+        // the right edge, so the span is the first two (0..820) and it gets centred.
+        assert!(ws.center_visible_columns(400, 20, 1000));
+        assert_eq!(ws.scroll_offset.x, -90);
+        // Centring again moves nothing.
+        assert!(!ws.center_visible_columns(400, 20, 1000));
+        // Scrolled so that only the middle and the last column are fully visible.
+        ws.scroll_offset.x = 240;
+        assert!(ws.center_visible_columns(400, 20, 1000));
+        assert_eq!(ws.scroll_offset.x, 180, "span 180..1000 centred in 1000");
+    }
+
+    #[test]
+    fn center_visible_columns_handles_one_column_and_empty_strips() {
+        let mut one = Workspace::new();
+        one.add_window_to_new_column_with_width(WindowId::new(1), Some(400));
+        assert!(one.center_visible_columns(400, 20, 1000));
+        assert_eq!(one.scroll_offset.x, -300);
+        let mut empty = Workspace::new();
+        assert!(!empty.center_visible_columns(400, 20, 1000));
+        assert_eq!(empty.scroll_offset.x, 0);
+        // A view narrower than every column has nothing fully visible to centre.
+        let mut wide = strip();
+        wide.columns.iter_mut().for_each(|c| c.set_width(Some(900)));
+        assert!(!wide.center_visible_columns(400, 20, 500));
+        assert_eq!(wide.scroll_offset.x, 0);
     }
 }

@@ -572,5 +572,55 @@ impl TilingEngine {
             monitor.focus_column = None;
             monitor.focus_window = None;
         }
+        // niri `empty-workspace-above-first`: an empty workspace above the first one, so that
+        // going up from the topmost workspace shows an empty one instead of stopping there.
+        if !self.effective_config(output).empty_workspace_above_first {
+            return;
+        }
+        let Some(monitor) = self.monitors.get_mut(&output) else {
+            return;
+        };
+        let has_content = |id: &i32| {
+            monitor.workspaces.get(id).map_or(false, |ws| {
+                ws.columns.iter().any(|column| !column.tiles.is_empty())
+                    || ws.name.is_some()
+                    || occupied.contains(id)
+            })
+        };
+        let ids = monitor.workspace_ids();
+        match ids.iter().position(has_content) {
+            // Every workspace is empty: the trailing rule already keeps one, and an empty
+            // one above it would be a second empty workspace for nothing.
+            None => {}
+            Some(0) => {
+                let mut id = monitor.next_workspace_id();
+                if monitor.workspaces.contains_key(&id) {
+                    id = (0..i32::MAX)
+                        .find(|id| !monitor.workspaces.contains_key(id))
+                        .unwrap_or(i32::MIN);
+                }
+                monitor.insert_workspace(id, Workspace::new());
+                monitor.move_workspace_to_position(id, 0);
+            }
+            Some(first_occupied) => {
+                // Surplus empty workspaces above the first occupied one go, except the one
+                // the user is looking at.
+                let above: Vec<i32> = ids[..first_occupied].to_vec();
+                let keep = above
+                    .iter()
+                    .copied()
+                    .find(|id| *id == monitor.active_workspace)
+                    .or_else(|| above.first().copied());
+                for id in above {
+                    if Some(id) == keep || id == monitor.active_workspace {
+                        continue;
+                    }
+                    monitor.remove_workspace(id);
+                    if monitor.previous_workspace == Some(id) {
+                        monitor.previous_workspace = None;
+                    }
+                }
+            }
+        }
     }
 }

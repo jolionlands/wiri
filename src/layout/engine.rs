@@ -26,6 +26,8 @@ mod foreground;
 mod foreground_runtime;
 mod insert_move;
 mod ipcview;
+mod lane_l;
+pub use lane_l::FocusLayer;
 #[cfg(test)]
 mod lane_f_integration_tests;
 mod monitor_actions;
@@ -356,6 +358,13 @@ pub struct LayoutConfig {
     pub center_focused_column: CenterFocusedColumn,
     pub always_center_single_column: bool,
     pub preset_column_widths: Vec<crate::config::types::SizeSpec>,
+    /// `preset-window-heights`: the per-window height presets of
+    /// `switch-preset-window-height` (empty = niri's default thirds/half/two thirds).
+    pub preset_window_heights: Vec<crate::config::types::SizeSpec>,
+    /// `empty-workspace-above-first`: keep an empty workspace above the first one.
+    pub empty_workspace_above_first: bool,
+    /// `fullscreen-backdrop-color`: the colour behind a fullscreen window, as `#rrggbb(aa)`.
+    pub fullscreen_backdrop_color: Option<String>,
     pub default_column_width: Option<Option<crate::config::types::SizeSpec>>,
     /// Proportional mode only: never split the view among more than this many
     /// columns.  With 3, one window fills the screen, two share it, three get a
@@ -433,6 +442,9 @@ impl Default for LayoutConfig {
             center_focused_column: CenterFocusedColumn::Never,
             always_center_single_column: false,
             preset_column_widths: Vec::new(),
+            preset_window_heights: Vec::new(),
+            empty_workspace_above_first: false,
+            fullscreen_backdrop_color: None,
             default_column_width: None,
             max_visible_columns: 0,
             column_gap: 16,
@@ -530,6 +542,9 @@ impl LayoutConfig {
         };
         lc.always_center_single_column = config.layout.always_center_single_column;
         lc.preset_column_widths = config.layout.preset_column_widths.clone();
+        lc.preset_window_heights = config.layout.preset_window_heights.clone();
+        lc.empty_workspace_above_first = config.layout.empty_workspace_above_first;
+        lc.fullscreen_backdrop_color = config.layout.fullscreen_backdrop_color.clone();
         lc.default_column_width = config.layout.default_column_width;
         lc.strip_frame = config.layout.strip_frame;
         lc.shadow_enable = config.layout.shadow_enable;
@@ -655,6 +670,10 @@ pub struct TilingEngine {
     rule_limits: HashMap<WindowId, rules::RuleLimits>,
     /// The height in pixels a rule asks for the tile of each window (`default-window-height`).
     rule_heights: HashMap<WindowId, u32>,
+    /// Windows whose window-rule opacity `toggle-window-rule-opacity` switched off: the
+    /// window shows at the engine's own alpha (dimming only) until it is toggled back.  A
+    /// reload of the rules does not forget it (niri's toggle is a per-window override).
+    opacity_overridden: HashSet<WindowId>,
     /// Windows that opened with `open-focused false`, for the first focus report they get.
     unfocused_opens: HashMap<WindowId, rules::UnfocusedOpen>,
     /// The device name of each monitor (`\\.\DISPLAY1`), as told by `set_output_name`.
@@ -820,6 +839,7 @@ impl TilingEngine {
             rule_state: HashMap::new(),
             rule_limits: HashMap::new(),
             rule_heights: HashMap::new(),
+            opacity_overridden: HashSet::new(),
             unfocused_opens: HashMap::new(),
             output_names: HashMap::new(),
             output_identities: Vec::new(),
@@ -2040,7 +2060,9 @@ impl TilingEngine {
                         tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
                         tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
                         if reset_heights || tile.preferred_height.is_none() {
-                            tile.preferred_height = heights.get(&tile.window_id).copied();
+                            if tile.height_proportion.is_none() && tile.height_preset_idx.is_none() {
+                                tile.preferred_height = heights.get(&tile.window_id).copied();
+                            }
                         }
                     }
                 }
@@ -2961,9 +2983,7 @@ impl TilingEngine {
             let new_opacity: u32 = rules::wanted_alpha(
                 eff_cfg.dim_unfocused,
                 is_focused,
-                self.rule_state
-                    .get(&window_id)
-                    .and_then(|s| s.resolved.opacity),
+                self.effective_rule_opacity(window_id),
                 self.applied_state
                     .get(&window_id)
                     .map_or(NO_ALPHA, |s| s.opacity),
@@ -3834,7 +3854,11 @@ impl TilingEngine {
                 .iter()
                 .map(|&i| match column.tiles.get(i) {
                     Some(t) => rules::HeightSpec {
-                        fixed: t.preferred_height.map(&scaled),
+                        fixed: t.preferred_height.map(&scaled).or_else(|| {
+                            t.height_proportion.map(|share| {
+                                proportion_px(available_height, scaled_gap, share).max(1)
+                            })
+                        }),
                         weight: t.height_weight.max(0.1),
                         min: scaled(t.min_height),
                         max: scaled(t.max_height),
@@ -6724,6 +6748,9 @@ impl TilingEngine {
     /// niri's default `preset-column-widths`: a third, a half and two thirds of the view.
     const PRESET_COLUMN_PROPORTIONS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
 
+    /// niri's default `preset-window-heights`: the same shares, of the column's height.
+    const PRESET_WINDOW_PROPORTIONS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
+
     /// The narrowest column a size change makes.
     const MIN_COLUMN_PX: i32 = 50;
     /// The widest one (niri has the same limit).
@@ -6959,8 +6986,10 @@ impl TilingEngine {
             // The share of the column the window gets, and the weight that makes it so.
             let share = (target_px as f32 / available).clamp(0.05, 0.95);
             column.tiles[idx].height_weight = (share / (1.0 - share) * others).clamp(0.1, 10.0);
-            // The height the user chose replaces the one a window rule asked for.
+            // The height the user chose replaces the one a window rule or a preset asked for.
             column.tiles[idx].preferred_height = None;
+            column.tiles[idx].height_proportion = None;
+            column.tiles[idx].height_preset_idx = None;
             Some(window)
         };
         if let Some(window) = changed {
@@ -6991,6 +7020,8 @@ impl TilingEngine {
                 tile.height_weight = 1.0;
                 // The height a window rule asked for is gone too: "default" is auto.
                 tile.preferred_height = None;
+                tile.height_proportion = None;
+                tile.height_preset_idx = None;
                 tile.window_id
             });
         if let Some(window) = reset {

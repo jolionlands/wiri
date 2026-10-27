@@ -20,7 +20,7 @@ use super::BackendHandle;
 use crate::input::keyboard::bind_may_fire;
 use crate::input::keyboard::{self, BindOptions};
 use crate::input::{Action, SizeChange};
-use crate::layout::{ScrollDirection, TilingEngine};
+use crate::layout::{FocusLayer, ScrollDirection, TilingEngine};
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
 /// Custom message sent to the hotkey thread to trigger re-registration
@@ -1290,6 +1290,24 @@ pub(crate) fn perform_action_on(
                 None => engine.write().switch_preset_column_width(forwards, backend),
             }
         }
+        Action::WindowWidthPresetCycle | Action::WindowWidthPresetCycleBack => {
+            // niri `switch-preset-window-width`: in the scrolling layout a window is as wide
+            // as its column, so this is the same width request as the column presets.
+            let forwards = matches!(action, Action::WindowWidthPresetCycle);
+            match float_of(target) {
+                Some(window) => engine.write().float_cycle_width(window, forwards, backend),
+                None => engine.write().switch_preset_window_width(forwards, backend),
+            }
+        }
+        Action::WindowHeightPresetCycle | Action::WindowHeightPresetCycleBack => {
+            let forwards = matches!(action, Action::WindowHeightPresetCycle);
+            if float_of(target).is_some() {
+                // A floating window has no column to share: niri's presets are column shares.
+                info!("switch-preset-window-height: a floating window keeps its height");
+            } else {
+                engine.write().switch_preset_window_height(forwards, backend);
+            }
+        }
         // wiri's fractions are niri proportions of the view.
         Action::ColumnWidthPresetQuarter
         | Action::ColumnWidthPresetThird
@@ -1462,6 +1480,53 @@ pub(crate) fn perform_action_on(
             if float_of(target).is_none() {
                 engine.write().move_column_to_edge(true, backend);
             }
+        }
+        Action::MoveColumnToIndex(index) => {
+            if float_of(target).is_none() {
+                engine.write().move_column_to_index(*index, backend);
+            }
+        }
+        // niri `swap-window-left` / `-right`: a floating window has no column to swap
+        // with, so nothing happens for it (as for the other column operations).
+        Action::SwapWindowLeft => {
+            if float_of(target).is_none() {
+                engine.write().swap_window_toward(false, backend);
+            }
+        }
+        Action::SwapWindowRight => {
+            if float_of(target).is_none() {
+                engine.write().swap_window_toward(true, backend);
+            }
+        }
+        Action::CenterVisibleColumns => {
+            engine.write().center_visible_columns(backend);
+        }
+        Action::MoveWindowDownOrToWorkspaceDown => {
+            engine.write().move_window_or_to_workspace(true, backend);
+        }
+        Action::MoveWindowUpOrToWorkspaceUp => {
+            engine.write().move_window_or_to_workspace(false, backend);
+        }
+        Action::MoveColumnLeftOrToMonitorLeft => {
+            engine.write().move_column_or_to_monitor(false, backend);
+        }
+        Action::MoveColumnRightOrToMonitorRight => {
+            engine.write().move_column_or_to_monitor(true, backend);
+        }
+        Action::ToggleWindowRuleOpacity => match target {
+            Some(t) => {
+                engine.write().toggle_window_rule_opacity(t.window, backend);
+            }
+            None => info!("toggle-window-rule-opacity: no window to act on"),
+        },
+        Action::FocusFloating => {
+            engine.write().focus_layer_action(FocusLayer::Floating, backend);
+        }
+        Action::FocusTiling => {
+            engine.write().focus_layer_action(FocusLayer::Tiling, backend);
+        }
+        Action::SwitchFocusBetweenFloatingAndTiling => {
+            engine.write().focus_layer_action(FocusLayer::Switch, backend);
         }
         Action::ExpandColumnToAvailable => {
             if float_of(target).is_none() {
