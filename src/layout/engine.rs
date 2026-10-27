@@ -8169,7 +8169,10 @@ mod tests {
         assert!(!workspace_changed(&mut last, Some(0)), "same workspace");
         assert!(workspace_changed(&mut last, Some(1)));
         assert!(workspace_changed(&mut last, Some(0)), "back again");
-        assert!(workspace_changed(&mut last, None), "the focused monitor went away");
+        assert!(
+            workspace_changed(&mut last, None),
+            "the focused monitor went away"
+        );
         assert_eq!(last, None);
     }
 
