@@ -121,8 +121,13 @@ fn offline_command(args: &Args) -> Option<bool> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // A bounded runtime (see `wiri::runtime`): `#[tokio::main]` would start one worker per
+    // logical CPU and an unbounded blocking pool.
+    wiri::runtime::build()?.block_on(run())
+}
+
+async fn run() -> Result<()> {
     // Declare DPI awareness so Windows doesn't virtualize coordinates
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
