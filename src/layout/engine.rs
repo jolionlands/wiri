@@ -815,6 +815,10 @@ pub struct TilingEngine {
     animating_rects: HashMap<WindowId, crate::layout::animation::RectAnimation>,
     motion: crate::config::AnimationsConfig,
     animation_wake: Option<Arc<tokio::sync::Notify>>,
+    /// The focused monitor's active workspace as the last layout pass saw it: the main loop's
+    /// workspace watch is woken (see `note_focused_workspace`) when this changes, instead of
+    /// the loop looking every 33 ms.
+    last_noted_workspace: Option<i32>,
     frame_in_progress: bool,
     transitions: transitions::Transitions,
     gesture_output: Option<OutputId>,
@@ -897,6 +901,7 @@ impl TilingEngine {
             animating_rects: HashMap::new(),
             motion: Default::default(),
             animation_wake: None,
+            last_noted_workspace: None,
             frame_in_progress: false,
             transitions: Default::default(),
             gesture_output: None,
@@ -2614,7 +2619,18 @@ impl TilingEngine {
         Self::column_widths_with_limits(&explicit, &mins, &maxs, view_width, cfg.column_gap, cfg).1
     }
 
+    /// Wake the main loop's workspace watch when the focused monitor's active workspace is not
+    /// the one it was last told about.  A compare per layout pass; the notification is a
+    /// stored permit, so a change that nobody is waiting for yet is not lost.
+    fn note_focused_workspace(&mut self) {
+        let now = self.monitors.focused().map(|m| m.active_workspace_id());
+        if workspace_changed(&mut self.last_noted_workspace, now) {
+            crate::ipc::notify_workspace_maybe_changed();
+        }
+    }
+
     pub fn apply_layout_for_monitor(&mut self, output_id: OutputId, backend: &BackendHandle) {
+        self.note_focused_workspace();
         self.refresh_strip_widths(output_id);
         // After `restore_all` nothing is laid out any more (see `shut_down`).
         if self.shut_down {
@@ -8130,10 +8146,44 @@ fn restorable_bounds(original: Rect, work_areas: &[Rect], nth: usize) -> Rect {
     Rect::new(x.max(wa.loc.x), y.max(wa.loc.y), w, h)
 }
 
+/// True when `now` is not what was `last` noted; `last` follows `now`.
+fn workspace_changed(last: &mut Option<i32>, now: Option<i32>) -> bool {
+    if *last == now {
+        false
+    } else {
+        *last = now;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::utils::Rect;
+
+    #[test]
+    fn workspace_watch_fires_only_when_the_focused_workspace_differs() {
+        let mut last = None;
+        assert!(!workspace_changed(&mut last, None), "nothing to report yet");
+        assert!(workspace_changed(&mut last, Some(0)), "the first workspace");
+        assert!(!workspace_changed(&mut last, Some(0)), "same workspace");
+        assert!(workspace_changed(&mut last, Some(1)));
+        assert!(workspace_changed(&mut last, Some(0)), "back again");
+        assert!(workspace_changed(&mut last, None), "the focused monitor went away");
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn a_layout_pass_notes_the_workspace_a_switch_ended_on() {
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.apply_all(&backend);
+        assert_eq!(engine.last_noted_workspace, Some(0));
+        engine.switch_workspace(1, &backend);
+        assert_eq!(engine.last_noted_workspace, Some(1));
+        engine.switch_workspace(0, &backend);
+        assert_eq!(engine.last_noted_workspace, Some(0));
+    }
 
     fn make_engine() -> TilingEngine {
         let mut engine = TilingEngine::new(LayoutConfig::default());

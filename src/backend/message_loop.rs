@@ -1,7 +1,8 @@
 use anyhow::Result;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -571,7 +572,7 @@ pub fn current_bindings() -> Vec<RegisteredBinding> {
 
 pub struct MessageLoop {
     running: Arc<Mutex<bool>>,
-    quit_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    quit_tx: Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
 }
 
 impl MessageLoop {
@@ -583,7 +584,7 @@ impl MessageLoop {
         })
     }
 
-    pub fn set_quit_sender(&self, tx: mpsc::Sender<()>) {
+    pub fn set_quit_sender(&self, tx: mpsc::UnboundedSender<()>) {
         *self.quit_tx.lock() = Some(tx);
     }
 
@@ -603,7 +604,7 @@ impl MessageLoop {
         running: Arc<Mutex<bool>>,
         engine: Arc<parking_lot::RwLock<TilingEngine>>,
         backend_handle: BackendHandle,
-        quit_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+        quit_tx: Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
     ) {
         let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
 
@@ -936,7 +937,7 @@ fn execute_action(
     action: &Action,
     engine: &Arc<parking_lot::RwLock<TilingEngine>>,
     backend: &BackendHandle,
-    quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    quit_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
 ) {
     perform_action(action, engine, backend, quit_tx);
 }
@@ -949,7 +950,7 @@ pub(crate) fn perform_action(
     action: &Action,
     engine: &Arc<parking_lot::RwLock<TilingEngine>>,
     backend: &BackendHandle,
-    quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    quit_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
 ) {
     perform_action_on(action, engine, backend, quit_tx, None);
 }
@@ -961,7 +962,7 @@ pub(crate) fn perform_action_on(
     action: &Action,
     engine: &Arc<parking_lot::RwLock<TilingEngine>>,
     backend: &BackendHandle,
-    quit_tx: &Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    quit_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
     window: Option<isize>,
 ) {
     // Event-stream clients are told what the action did to the windows and workspaces.

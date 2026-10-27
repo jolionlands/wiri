@@ -144,13 +144,32 @@ pub fn pipe_has_listener(path: &str) -> bool {
 /// Wakes the task that tells event-stream subscribers what changed (`IpcServer::run_state_task`).
 static STATE_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
+/// Wakes the main loop, which compares the focused monitor's active workspace with the one it
+/// last showed the workspace indicator for.  It used to look every 33 ms.
+static WORKSPACE_WATCH: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The wake-up of the workspace watch: fires whenever [`notify_state_changed`] or
+/// [`notify_workspace_maybe_changed`] is called.  A stored permit is one wake-up however many
+/// notifications came, and a wake-up without a change is harmless: the watcher compares.
+pub fn workspace_watch() -> &'static tokio::sync::Notify {
+    &WORKSPACE_WATCH
+}
+
+/// The focused monitor's active workspace may have changed (the layout engine calls this when
+/// a layout pass sees a different one).  Cheap, any thread, any lock held.
+pub fn notify_workspace_maybe_changed() {
+    WORKSPACE_WATCH.notify_one();
+}
+
 /// Something that event-stream clients are told about may have changed: a window came or
-/// went, the focus moved, a workspace was switched, a config was loaded.  Costs two atomic
-/// operations, takes no lock and may be called from any thread, with any lock held; the
-/// work (describing the engine, finding what differs, writing to the clients) is done by
-/// one task, once for a burst of changes, and only while somebody is subscribed.
+/// went, the focus moved, a workspace was switched, a config was loaded.  Costs a few atomic
+/// operations, takes no lock of its own and may be called from any thread, with any lock
+/// held; the work (describing the engine, finding what differs, writing to the clients) is
+/// done by one task, once for a burst of changes, and only while somebody is subscribed.
+/// It also wakes the main loop's workspace watch (a workspace switch is one of the changes).
 pub fn notify_state_changed() {
     STATE_CHANGED.notify_one();
+    WORKSPACE_WATCH.notify_one();
 }
 
 /// Calls [`notify_state_changed`] when it is dropped: put one at the top of a function that

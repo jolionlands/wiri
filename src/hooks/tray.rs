@@ -25,6 +25,23 @@ const ID_TRAY_FOCUS_PREV: usize = 1006;
 const ID_TRAY_SCREENSHOT: usize = 1007;
 const ID_TRAY_CAPTURE_WINDOW: usize = 1008;
 
+/// Wakes whoever polls [`TrayIcon::try_recv_action`] (the daemon's main loop): a tray click is
+/// the only thing that puts an action in the channel, so the poller sleeps until this fires
+/// instead of looking every few milliseconds.
+static TRAY_ACTION_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The wake-up for tray actions: it fires once for every action the tray menu or the icon sends.
+pub fn tray_action_wake() -> &'static tokio::sync::Notify {
+    &TRAY_ACTION_WAKE
+}
+
+/// Queue `action` for the main loop and wake it.
+fn send_action(tx: &mpsc::Sender<TrayAction>, action: TrayAction) {
+    if tx.send(action).is_ok() {
+        TRAY_ACTION_WAKE.notify_one();
+    }
+}
+
 /// Actions that the tray icon can trigger
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {
@@ -202,7 +219,7 @@ impl TrayIcon {
                     ) as *mut mpsc::Sender<TrayAction>;
                     if !tx_ptr.is_null() {
                         let tx = &*tx_ptr;
-                        let _ = tx.send(TrayAction::FocusPrevious);
+                        send_action(tx, TrayAction::FocusPrevious);
                     }
                 }
                 LRESULT(0)
@@ -218,28 +235,28 @@ impl TrayIcon {
                     let tx = &*tx_ptr;
                     match cmd_id {
                         ID_TRAY_SHOW_HIDE => {
-                            let _ = tx.send(TrayAction::ShowHide);
+                            send_action(tx, TrayAction::ShowHide);
                         }
                         ID_TRAY_RELOAD_CONFIG => {
-                            let _ = tx.send(TrayAction::ReloadConfig);
+                            send_action(tx, TrayAction::ReloadConfig);
                         }
                         ID_TRAY_OPEN_CONFIG_DIR => {
-                            let _ = tx.send(TrayAction::OpenConfigDir);
+                            send_action(tx, TrayAction::OpenConfigDir);
                         }
                         ID_TRAY_ABOUT => {
-                            let _ = tx.send(TrayAction::About);
+                            send_action(tx, TrayAction::About);
                         }
                         ID_TRAY_FOCUS_PREV => {
-                            let _ = tx.send(TrayAction::FocusPrevious);
+                            send_action(tx, TrayAction::FocusPrevious);
                         }
                         ID_TRAY_SCREENSHOT => {
-                            let _ = tx.send(TrayAction::Screenshot);
+                            send_action(tx, TrayAction::Screenshot);
                         }
                         ID_TRAY_CAPTURE_WINDOW => {
-                            let _ = tx.send(TrayAction::CaptureWindow);
+                            send_action(tx, TrayAction::CaptureWindow);
                         }
                         ID_TRAY_QUIT => {
-                            let _ = tx.send(TrayAction::Quit);
+                            send_action(tx, TrayAction::Quit);
                         }
                         _ => {}
                     }
@@ -371,7 +388,8 @@ impl TrayIcon {
         self.action_rx.as_mut()?.try_recv().ok()
     }
 
-    /// Get a clone of the action sender for dispatching tray actions
+    /// Get a clone of the action sender for dispatching tray actions.  A send through this
+    /// clone does not fire [`tray_action_wake`]; the poller finds the action on its next wake.
     pub fn action_sender(&self) -> mpsc::Sender<TrayAction> {
         self.action_tx.clone()
     }
@@ -471,5 +489,53 @@ impl Drop for TrayIcon {
             // Give the thread a moment to process WM_DESTROY, then join.
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn woken_within(ms: u64) -> bool {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(ms), TRAY_ACTION_WAKE.notified())
+                    .await
+                    .is_ok()
+            })
+    }
+
+    // One test: the wake-up is a process-wide static, so parallel tests would take each
+    // other's permits.
+    #[test]
+    fn a_tray_action_is_queued_and_wakes_the_poller_exactly_when_it_arrives() {
+        let (tx, rx) = mpsc::channel();
+        // Leave no permit from an earlier send behind.
+        woken_within(1);
+        assert!(!woken_within(30), "no wake-up without an action");
+
+        send_action(&tx, TrayAction::ReloadConfig);
+        send_action(&tx, TrayAction::Quit);
+        assert!(
+            woken_within(2000),
+            "the poller must be woken by a tray action"
+        );
+        assert!(
+            !woken_within(30),
+            "a stored permit is one wake-up, not one per send"
+        );
+        assert_eq!(rx.try_recv().unwrap(), TrayAction::ReloadConfig);
+        assert_eq!(rx.try_recv().unwrap(), TrayAction::Quit);
+        assert!(rx.try_recv().is_err());
+
+        // A send nobody can receive wakes nobody.
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        send_action(&tx, TrayAction::About);
+        assert!(!woken_within(30));
     }
 }

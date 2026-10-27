@@ -496,7 +496,7 @@ async fn run() -> Result<()> {
 
     // Start message loop with hotkey handling
     let message_loop = MessageLoop::new()?;
-    let (hotkey_quit_tx, hotkey_quit_rx) = std::sync::mpsc::channel::<()>();
+    let (hotkey_quit_tx, mut hotkey_quit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     message_loop.set_quit_sender(hotkey_quit_tx);
     message_loop.start_hotkey_loop(engine.clone(), backend.handle());
     info!("Hotkeys registered and message loop started");
@@ -803,6 +803,9 @@ async fn run() -> Result<()> {
         })
     };
     let mut ipc_shutdown_rx = ipc_shutdown_rx;
+    // A oneshot (and a closed broadcast) must not be polled again once it has answered.
+    let mut ipc_shutdown_open = true;
+    let mut config_reload_open = true;
     let mut reload = ReloadCtx {
         config_path: config_path.clone(),
         engine: &engine,
@@ -812,11 +815,20 @@ async fn run() -> Result<()> {
         ipc_server: &ipc_server,
         keyboard_session: &keyboard_session,
     };
+    // One Ctrl+C future for the whole loop (it used to be built and dropped with a 1 ms
+    // timeout on every iteration), and the wake-ups of the two polled sources.
+    let ctrl_c = signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let tray_wake = wiri::hooks::tray::tray_action_wake();
+    let workspace_watch = wiri::ipc::workspace_watch();
 
-    // Main loop: process tray actions + wait for shutdown signal
+    // Main loop: event driven.  It sleeps until a tray click, a workspace change, a config
+    // reload, a quit request or Ctrl+C needs it; with none of those pending there is no
+    // timer at all (a startup balloon waiting for the tray icon is the one bounded exception).
     'main: loop {
         // Workspace-indicator: detect workspace switches and show the overlay.
-        // Polling is cheap — active_workspace is a plain i32 field; no Win32 calls.
+        // The compare is cheap — active_workspace is a plain i32 field; no Win32 calls — and
+        // runs when `workspace_watch` fires, not on a timer.
         {
             static LAST_WS: parking_lot::Mutex<Option<i32>> = parking_lot::const_mutex(None);
             let current: Option<i32> = engine
@@ -885,9 +897,80 @@ async fn run() -> Result<()> {
             }
         }
 
-        // Retain the existing tray/reload cadence; animation timing no longer
-        // depends on this loop and sleeps entirely when no timeline is active.
-        tokio::time::sleep(Duration::from_millis(33)).await;
+        // Sleep until something needs this loop.  Each source below wakes it by itself; the
+        // only timer is the 50 ms retry of a startup balloon that waits for the tray icon.
+        tokio::select! {
+            // A tray click and a possible workspace change only wake the loop: the tray
+            // actions are drained below, the workspace compare runs at the top.
+            _ = tray_wake.notified() => {}
+            _ = workspace_watch.notified() => {}
+
+            // Handle file-watcher config reloads
+            outcome = config_reload_rx.recv(), if config_reload_open => match outcome {
+                Ok(outcome) => reload.outcome(outcome, &system),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        "Config reload channel lagged {} events — reloading from disk",
+                        n
+                    );
+                    reload.from_disk(&system);
+                }
+                // The loader that owns the sender is gone: nothing more can arrive.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => config_reload_open = false,
+            },
+
+            // Handle IPC-initiated config reloads.
+            Some(()) = ipc_reload_rx.recv() => {
+                info!("IPC: Reloading config from disk");
+                reload.from_disk(&system);
+            }
+
+            // System load-config-file: switch the active path and its watcher only after
+            // a successful load. A missing path means reload the currently active file.
+            Some(path) = system_reload_rx.recv() => {
+                let previous = reload.config_path.clone();
+                if let Some(path) = path {
+                    reload.config_path = path;
+                }
+                if reload.from_disk(&system) {
+                    if reload.config_path != previous {
+                        ipc_server.set_config_path(reload.config_path.clone());
+                        config_loader.stop_watching();
+                        config_loader = ConfigLoader::new(reload.config_path.clone());
+                        config_reload_rx = config_loader.subscribe();
+                        config_reload_open = true;
+                        if let Err(error) = config_loader.start_watching() {
+                            warn!("Could not watch the selected config: {}", error);
+                        }
+                    }
+                } else {
+                    reload.config_path = previous;
+                }
+            }
+
+            // Check for IPC-initiated graceful shutdown
+            answer = &mut ipc_shutdown_rx, if ipc_shutdown_open => {
+                ipc_shutdown_open = false;
+                if answer.is_ok() {
+                    info!("Shutting down (IPC Quit)...");
+                    break 'main;
+                }
+            }
+
+            Some(()) = hotkey_quit_rx.recv() => {
+                info!("Shutting down (hotkey)...");
+                break 'main;
+            }
+
+            _ = &mut ctrl_c => {
+                info!("Shutting down (Ctrl+C)...");
+                break 'main;
+            }
+
+            // The config error that was found at startup is retried until the tray icon is
+            // there (see below); nothing else in this loop has a deadline.
+            _ = tokio::time::sleep(Duration::from_millis(50)), if pending_balloon.is_some() => {}
+        }
 
         // The config error that was found at startup is shown as soon as the tray icon is there.
         if let Some((title, text, attempts)) = pending_balloon.take() {
@@ -898,64 +981,6 @@ async fn run() -> Result<()> {
             } else {
                 warn!("The tray icon never came up; the config error balloon was not shown");
             }
-        }
-
-        // Handle file-watcher config reloads
-        match config_reload_rx.try_recv() {
-            Ok(outcome) => reload.outcome(outcome, &system),
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                warn!(
-                    "Config reload channel lagged {} events — reloading from disk",
-                    n
-                );
-                reload.from_disk(&system);
-            }
-            Err(_) => {} // Empty or closed — normal
-        }
-
-        // Handle IPC-initiated config reloads.
-        loop {
-            match ipc_reload_rx.try_recv() {
-                Ok(()) => {
-                    info!("IPC: Reloading config from disk");
-                    reload.from_disk(&system);
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        // System load-config-file: switch the active path and its watcher only after
-        // a successful load. A missing path means reload the currently active file.
-        while let Ok(path) = system_reload_rx.try_recv() {
-            let previous = reload.config_path.clone();
-            if let Some(path) = path {
-                reload.config_path = path;
-            }
-            if reload.from_disk(&system) {
-                if reload.config_path != previous {
-                    ipc_server.set_config_path(reload.config_path.clone());
-                    config_loader.stop_watching();
-                    config_loader = ConfigLoader::new(reload.config_path.clone());
-                    config_reload_rx = config_loader.subscribe();
-                    if let Err(error) = config_loader.start_watching() {
-                        warn!("Could not watch the selected config: {}", error);
-                    }
-                }
-            } else {
-                reload.config_path = previous;
-            }
-        }
-
-        // Check for IPC-initiated graceful shutdown
-        if let Ok(()) = ipc_shutdown_rx.try_recv() {
-            info!("Shutting down (IPC Quit)...");
-            break 'main;
-        }
-
-        if hotkey_quit_rx.try_recv().is_ok() {
-            info!("Shutting down (hotkey)...");
-            break 'main;
         }
 
         // Process tray actions
@@ -1024,15 +1049,6 @@ async fn run() -> Result<()> {
                     info!("Tray: window-capture — handled inline by SystemIntegration");
                 }
             }
-        }
-
-        // Check if we should exit
-        if tokio::time::timeout(Duration::from_millis(1), signal::ctrl_c())
-            .await
-            .is_ok()
-        {
-            info!("Shutting down (Ctrl+C)...");
-            break 'main;
         }
     }
 
