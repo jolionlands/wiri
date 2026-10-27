@@ -75,4 +75,47 @@ $s = New-Summary; $s.h2_wt_exe_found_on_path = $null; Assert-Invalid $s 'h2_wt_e
 $s = New-Summary; $s.ci_skips = @([pscustomobject]@{ gate = 'h3_float_keeps_foreground'; reason = 'not a dependency skip' })
 Assert-Invalid $s 'invalid/missing ci_skips'
 $s = New-Summary; $s.PSObject.Properties.Remove('ci_skips'); Assert-Invalid $s 'invalid/missing ci_skips'
+# Live phases are dot-sourced into the parent's dynamic scope, and PowerShell variable names are
+# case-insensitive: a phase variable named $d (a form handle in lane T's first version) silently
+# redirects every Ctl/Shot/CloseFocused output path, which all read the harness directory $D.
+# Lane W overrides $D on purpose (exactly "D") so the shared helpers write into its own folder.
+function Get-WiriAssignedVariable {
+    param($Node)
+    if ($Node -is [Management.Automation.Language.AssignmentStatementAst]) {
+        $target = $Node.Left
+        while ($target -is [Management.Automation.Language.ConvertExpressionAst]) { $target = $target.Child }
+        if ($target -is [Management.Automation.Language.VariableExpressionAst]) { return $target.VariablePath.UserPath }
+    } elseif ($Node -is [Management.Automation.Language.ForEachStatementAst]) {
+        return $Node.Variable.VariablePath.UserPath
+    } elseif ($Node -is [Management.Automation.Language.ParameterAst]) {
+        return $Node.Name.VariablePath.UserPath
+    }
+    return $null
+}
+function Get-WiriHarnessDirShadows {
+    param([Parameter(Mandatory = $true)]$Ast, [switch]$AllowUpperD)
+    $found = @($Ast.FindAll({ param($node)
+        $name = Get-WiriAssignedVariable $node
+        $null -ne $name -and $name -ieq 'D'
+    }, $true))
+    @($found | Where-Object {
+        $name = Get-WiriAssignedVariable $_
+        -not ($AllowUpperD -and $_ -is [Management.Automation.Language.AssignmentStatementAst] -and $name -ceq 'D')
+    })
+}
+$synthetic = [Management.Automation.Language.Parser]::ParseInput('& { $tA = 1; $d = 2; foreach ($D in 1) { } }', [ref]$null, [ref]$null)
+if (@(Get-WiriHarnessDirShadows -Ast $synthetic).Count -ne 2) { throw 'Shadow lint missed a synthetic $d assignment or foreach variable' }
+$synthetic = [Management.Automation.Language.Parser]::ParseInput('function F($d) { }; & { $tD = 1; $D = Join-Path $D "x" }', [ref]$null, [ref]$null)
+if (@(Get-WiriHarnessDirShadows -Ast $synthetic).Count -ne 2) { throw 'Shadow lint missed a $d parameter or an uppercase override' }
+if (@(Get-WiriHarnessDirShadows -Ast $synthetic -AllowUpperD).Count -ne 1) { throw 'Shadow lint must still reject a $d parameter when uppercase overrides are allowed' }
+foreach ($phase in Get-ChildItem -Path (Join-Path $PSScriptRoot '..\live-phases') -Filter '*.ps1') {
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($phase.FullName, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw "Cannot parse $($phase.Name): $($parseErrors[0].Message)" }
+    $shadows = @(Get-WiriHarnessDirShadows -Ast $ast -AllowUpperD:($phase.Name -eq 'lane-w.ps1'))
+    if ($shadows.Count) {
+        throw "$($phase.Name) line $($shadows[0].Extent.StartLineNumber) shadows the harness directory `$D (variable names are case-insensitive); rename it with a lane prefix"
+    }
+}
+Write-Host 'Live phases do not shadow the harness directory $D.'
 Write-Host 'Live-summary fixture tests passed (no desktop automation).'
