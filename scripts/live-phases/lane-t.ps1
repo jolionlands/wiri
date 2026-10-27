@@ -118,7 +118,7 @@ $dndBlock
         try {
             [LaneTNative]::Key(0xA4,$false)
             [LaneTNative]::Button('R',$false); Start-Sleep -Milliseconds 40
-            [LaneTNative]::Button('R',$true); Start-Sleep -Milliseconds 60
+            [LaneTNative]::Button('R',$true); Start-Sleep -Milliseconds 130 # the first click's grab release is queued on the dispatcher; stay far inside GetDoubleClickTime
             [LaneTNative]::Button('R',$false); Start-Sleep -Milliseconds 40
             [LaneTNative]::Button('R',$true)
         } finally { [LaneTNative]::ReleaseAll() }
@@ -222,93 +222,116 @@ public static class LaneTNative {
         TAction 't-workspace' @('focus-workspace','2')
         TGate 'h60_dnd_host_absent_without_gestures' ([LaneTNative]::MessageWindow('WiriDragGestures',$tProcess.Id) -eq [IntPtr]::Zero) 'no gestures block'
         TGate 'h61_raw_host_absent_without_touchpad' ([LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id) -eq [IntPtr]::Zero) 'touchpad off'
-        $a = TOpen 'a'; $b = TOpen 'b'; $c = TOpen 'c'; $d = TOpen 'd'
+        # Variable names: the harness helpers (Ctl, Shot, CloseFocused) read the caller's $D by
+        # dynamic scope, and PowerShell variables are case-insensitive, so a form handle called
+        # $d would turn every later Ctl output path into "<hwnd>\<step>.txt" (the first live run
+        # died exactly there). Every handle below is therefore $tA..$tD.
+        $tA = TOpen 'a'; $tB = TOpen 'b'; $tC = TOpen 'c'; $tD = TOpen 'd'
 
         # H58: direct manipulation, axis lock, release and ordered workspace selection.
-        $pt = TPoint $b 0.65 0.5
-        $initial = Rc $b
+        # Each section has its own try/catch: a failed step leaves its own and later gates false
+        # with the reason in results.json, and still lets the H60/H61 lifecycle gates run.
         try {
-            [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('M',$false)
-            [LaneTNative]::Move(($pt.X-3),$pt.Y); Start-Sleep -Milliseconds 150
-            $threshold = Rc $b
-            TGate 'h58_middle_waits_for_axis_threshold' (Near $threshold.L $initial.L 3) @($initial,$threshold)
-            foreach ($i in 1..6) { [LaneTNative]::Move(($pt.X-30*$i),$pt.Y); Start-Sleep -Milliseconds 30 }
-            Start-Sleep -Milliseconds 80
-            $held = Rc $b
-            TGate 'h58_horizontal_follows_pointer_while_held' ((Near $held.L ($initial.L-180) 10) -and (Near $held.T $initial.T 3)) @($initial,$held)
-            Shot 'h58-middle-held'
-            [LaneTNative]::Key(0xA4,$true) # paired up must still be captured
-            [LaneTNative]::Button('M',$true)
-        } finally { [LaneTNative]::ReleaseAll() }
-        $samples = @()
-        foreach ($i in 1..12) { $samples += Rc $b; Start-Sleep -Milliseconds 120 }
-        $settled = Rc $b; Start-Sleep -Milliseconds 350; $still = Rc $b
-        TGate 'h58_release_snaps_and_settles' (([Math]::Abs($settled.L-$held.L) -gt 8) -and (Near $settled.L $still.L 2)) @($held,$samples,$settled,$still)
-        [LaneTNative]::Move(($pt.X-120),$pt.Y); Start-Sleep -Milliseconds 200
-        TGate 'h58_modifier_first_release_ends_grab' (Near (Rc $b).L $still.L 2) @($still,(Rc $b))
-        $pt = TPoint $b 0.5 0.9
-        TDrag $b 'M' $pt.X $pt.Y 0 -420
-        $away = (VisibleCount @($a,$b,$c,$d)) -eq 0
-        TAction 't-return' @('focus-workspace','2')
-        TGate 'h58_vertical_switches_workspace' ($away -and (VisibleCount @($a,$b,$c,$d)) -eq 4) @($away,(VisibleCount @($a,$b,$c,$d)))
-        Shot 'h58-returned'
+            $tPt = TPoint $tB 0.65 0.5
+            $tInitial = Rc $tB
+            try {
+                [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('M',$false)
+                [LaneTNative]::Move(($tPt.X-3),$tPt.Y); Start-Sleep -Milliseconds 150
+                $tThreshold = Rc $tB
+                TGate 'h58_middle_waits_for_axis_threshold' (Near $tThreshold.L $tInitial.L 3) @($tInitial,$tThreshold)
+                foreach ($i in 1..6) { [LaneTNative]::Move(($tPt.X-30*$i),$tPt.Y); Start-Sleep -Milliseconds 30 }
+                Start-Sleep -Milliseconds 80
+                $tHeld = Rc $tB
+                TGate 'h58_horizontal_follows_pointer_while_held' ((Near $tHeld.L ($tInitial.L-180) 10) -and (Near $tHeld.T $tInitial.T 3)) @($tInitial,$tHeld)
+                Shot 'h58-middle-held'
+                [LaneTNative]::Key(0xA4,$true) # paired up must still be captured
+                [LaneTNative]::Button('M',$true)
+            } finally { [LaneTNative]::ReleaseAll() }
+            $tSamples = @()
+            foreach ($i in 1..12) { $tSamples += Rc $tB; Start-Sleep -Milliseconds 120 }
+            $tSettled = Rc $tB; Start-Sleep -Milliseconds 350; $tStill = Rc $tB
+            TGate 'h58_release_snaps_and_settles' (([Math]::Abs($tSettled.L-$tHeld.L) -gt 8) -and (Near $tSettled.L $tStill.L 2)) @($tHeld,$tSamples,$tSettled,$tStill)
+            [LaneTNative]::Move(($tPt.X-120),$tPt.Y); Start-Sleep -Milliseconds 200
+            TGate 'h58_modifier_first_release_ends_grab' (Near (Rc $tB).L $tStill.L 2) @($tStill,(Rc $tB))
+            $tPt = TPoint $tB 0.5 0.9
+            TDrag $tB 'M' $tPt.X $tPt.Y 0 -420
+            $tAway = (VisibleCount @($tA,$tB,$tC,$tD)) -eq 0
+            TAction 't-return' @('focus-workspace','2')
+            TGate 'h58_vertical_switches_workspace' ($tAway -and (VisibleCount @($tA,$tB,$tC,$tD)) -eq 4) @($tAway,(VisibleCount @($tA,$tB,$tC,$tD)))
+            Shot 'h58-returned'
+        } catch {
+            $tDetails['error-h58'] = [string]$_
+            $tDetails['error-h58-position'] = $_.InvocationInfo.PositionMessage
+        }
 
         # H59: stack a,b and close only our unused fixtures through the harness helpers.
-        foreach ($h in @($c,$d)) { TFocus $h; $null = CloseFocused $h 't-reduce'; Start-Sleep -Milliseconds 500 }
-        TFocus $a; TAction 't-stack' @('consume-window-into-column')
-        TAction 't-height' @('set-window-height','200')
-        $heightBefore = Rc $a; TDouble $a $false; $heightAfter = Rc $a
-        TGate 'h59_top_edge_double_resets_height' (($heightAfter.H -gt $heightBefore.H+50) -and (Near $heightAfter.H (Rc $b).H 5)) @($heightBefore,$heightAfter,(Rc $b))
-        $widthBefore = Rc $a; TDouble $a $true; $wide = Rc $a; TDouble $a $true; $normal = Rc $a
-        TGate 'h59_side_edge_double_toggles_full_width' (($wide.W -gt $widthBefore.W+200) -and (Near $normal.W $widthBefore.W 5)) @($widthBefore,$wide,$normal)
-        TFocus $a; $r = Rc $a; $x=$r.R-2; $y=$r.T+[int]($r.H/2)
-        [LaneTNative]::Move($x,$y)
         try {
-            [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('R',$false)
-            Start-Sleep -Milliseconds 100
-            [LaneTNative]::Move(($x+90),$y); Start-Sleep -Milliseconds 150; $preview = Rc $a
-            TAction 't-refresh-held' @('set-workspace-layout','scrolling'); $heldRefresh = Rc $a
-            TGate 'h59_resize_preview_survives_held_refresh' (($preview.W -gt $r.W+60) -and (Near $heldRefresh.W $preview.W 4)) @($r,$preview,$heldRefresh)
-        } finally { [LaneTNative]::ReleaseAll() }
-        Start-Sleep -Milliseconds 1500
-        $drop = Rc $a; TAction 't-refresh-drop' @('set-workspace-layout','scrolling'); $refresh = Rc $a
-        TGate 'h59_resize_persists_after_drop' ((Near $drop.W $preview.W 5) -and (Near $refresh.W $drop.W 3)) @($preview,$drop,$refresh)
-        TAction 't-source-width' @('set-column-width','450')
-        $c = TOpen 'destination'; TAction 't-target-width' @('set-column-width','350')
-        $pt = TPoint $a 0.6 0.4; $target = Rc $c
-        # W compares vertical tile slots with column boundaries. Aim just inside
-        # the target's top slot, not its centre (which may request a new column).
-        TDrag $a 'L' $pt.X $pt.Y ([int]($target.L+$target.W/2)-$pt.X) ($target.T+2-$pt.Y)
-        $list = @((TCtl 't-drop-list' @('--json','window-list') | ConvertFrom-Json).result)
-        TGate 'h59_move_drops_into_actual_destination_column' (((ColOf $list $a) -eq (ColOf $list $c)) -and ((ColOf $list $a) -ne (ColOf $list $b))) $list
-        $pt = TPoint $a
-        try {
-            [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('L',$false)
-            [LaneTNative]::Move(($pt.X+12),($pt.Y+12)); Start-Sleep -Milliseconds 100
-            [LaneTNative]::Button('R',$false); [LaneTNative]::Button('R',$true)
-            Start-Sleep -Milliseconds 200
-        } finally { [LaneTNative]::ReleaseAll() }
-        Start-Sleep -Milliseconds 1500
-        $list = @((TCtl 't-toggle-list' @('--json','window-list') | ConvertFrom-Json).result)
-        TGate 'h59_right_click_during_move_toggles_float' ([bool](WinOf $list $a).floating) (WinOf $list $a)
-        Shot 'h59-final'
-        TClose
+            # H58 may have stopped on another workspace; the fixtures live on lane-t (2).
+            TAction 't-h59-workspace' @('focus-workspace','2')
+            foreach ($h in @($tC,$tD)) { TFocus $h; $null = CloseFocused $h 't-reduce'; Start-Sleep -Milliseconds 500 }
+            TFocus $tA; TAction 't-stack' @('consume-window-into-column')
+            TAction 't-height' @('set-window-height','200')
+            $tHeightBefore = Rc $tA; TDouble $tA $false; $tHeightAfter = Rc $tA
+            TGate 'h59_top_edge_double_resets_height' (($tHeightAfter.H -gt $tHeightBefore.H+50) -and (Near $tHeightAfter.H (Rc $tB).H 5)) @($tHeightBefore,$tHeightAfter,(Rc $tB))
+            $tWidthBefore = Rc $tA; TDouble $tA $true; $tWide = Rc $tA; TDouble $tA $true; $tNormal = Rc $tA
+            TGate 'h59_side_edge_double_toggles_full_width' (($tWide.W -gt $tWidthBefore.W+200) -and (Near $tNormal.W $tWidthBefore.W 5)) @($tWidthBefore,$tWide,$tNormal)
+            TFocus $tA; $tR = Rc $tA; $tX = $tR.R-2; $tY = $tR.T+[int]($tR.H/2)
+            [LaneTNative]::Move($tX,$tY)
+            try {
+                [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('R',$false)
+                Start-Sleep -Milliseconds 100
+                [LaneTNative]::Move(($tX+90),$tY); Start-Sleep -Milliseconds 150; $tPreview = Rc $tA
+                TAction 't-refresh-held' @('set-workspace-layout','scrolling'); $tHeldRefresh = Rc $tA
+                TGate 'h59_resize_preview_survives_held_refresh' (($tPreview.W -gt $tR.W+60) -and (Near $tHeldRefresh.W $tPreview.W 4)) @($tR,$tPreview,$tHeldRefresh)
+            } finally { [LaneTNative]::ReleaseAll() }
+            Start-Sleep -Milliseconds 1500
+            $tDrop = Rc $tA; TAction 't-refresh-drop' @('set-workspace-layout','scrolling'); $tRefresh = Rc $tA
+            TGate 'h59_resize_persists_after_drop' ((Near $tDrop.W $tPreview.W 5) -and (Near $tRefresh.W $tDrop.W 3)) @($tPreview,$tDrop,$tRefresh)
+            TAction 't-source-width' @('set-column-width','450')
+            $tC = TOpen 'destination'; TAction 't-target-width' @('set-column-width','350')
+            $tPt = TPoint $tA 0.6 0.4; $tTarget = Rc $tC
+            # W compares vertical tile slots with column boundaries. Aim just inside
+            # the target's top slot, not its centre (which may request a new column).
+            TDrag $tA 'L' $tPt.X $tPt.Y ([int]($tTarget.L+$tTarget.W/2)-$tPt.X) ($tTarget.T+2-$tPt.Y)
+            $tList = @((TCtl 't-drop-list' @('--json','window-list') | ConvertFrom-Json).result)
+            TGate 'h59_move_drops_into_actual_destination_column' (((ColOf $tList $tA) -eq (ColOf $tList $tC)) -and ((ColOf $tList $tA) -ne (ColOf $tList $tB))) $tList
+            $tPt = TPoint $tA
+            try {
+                [LaneTNative]::Key(0xA4,$false); [LaneTNative]::Button('L',$false)
+                [LaneTNative]::Move(($tPt.X+12),($tPt.Y+12)); Start-Sleep -Milliseconds 100
+                [LaneTNative]::Button('R',$false); [LaneTNative]::Button('R',$true)
+                Start-Sleep -Milliseconds 200
+            } finally { [LaneTNative]::ReleaseAll() }
+            Start-Sleep -Milliseconds 1500
+            $tList = @((TCtl 't-toggle-list' @('--json','window-list') | ConvertFrom-Json).result)
+            TGate 'h59_right_click_during_move_toggles_float' ([bool](WinOf $tList $tA).floating) (WinOf $tList $tA)
+            Shot 'h59-final'
+        } catch {
+            $tDetails['error-h59'] = [string]$_
+            $tDetails['error-h59-position'] = $_.InvocationInfo.PositionMessage
+        }
+        try { TClose } catch { $tDetails['error-close'] = [string]$_ }
 
         # H60-H61: lifecycle evidence only, deliberately no shell settings/HID injection/OLE claims.
-        TReload (TConfig $true $true)
-        $raw = [LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id)
-        $dragHost = [LaneTNative]::MessageWindow('WiriDragGestures',$tProcess.Id)
-        $registered = (LogLines $tLog 'Precision touchpad Raw Input registered').Count
-        TGate 'h61_raw_inputsink_registered_on_opt_in' (($raw -ne [IntPtr]::Zero) -and $registered -gt 0) @([int64]$raw,$registered)
-        TReload (TConfig $false $false)
-        $rawOff = [LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id)
-        $dragOff = [LaneTNative]::MessageWindow('WiriDragGestures',$tProcess.Id)
-        TGate 'h60_dnd_host_configured_only' (($dragHost -ne [IntPtr]::Zero) -and $dragOff -eq [IntPtr]::Zero) @([int64]$dragHost,[int64]$dragOff)
-        TGate 'h61_raw_removed_on_off_reload' (($rawOff -eq [IntPtr]::Zero) -and (-not [LT]::IsWindow($raw)) -and (LogLines $tLog 'Precision touchpad Raw Input removed').Count -gt 0) @([int64]$rawOff,(LogLines $tLog 'Precision touchpad Raw Input removed').Count)
-        TReload (TConfig $true $false)
-        $rawQuit = [LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id)
-        TStop $tProcess
-        TGate 'h61_raw_removed_on_quit' (($rawQuit -ne [IntPtr]::Zero) -and (-not [LT]::IsWindow($rawQuit)) -and $tProcess.HasExited) @([int64]$rawQuit,$tProcess.HasExited)
+        try {
+            TReload (TConfig $true $true)
+            $tRaw = [LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id)
+            $tDragHost = [LaneTNative]::MessageWindow('WiriDragGestures',$tProcess.Id)
+            $tRegistered = (LogLines $tLog 'Precision touchpad Raw Input registered').Count
+            TGate 'h61_raw_inputsink_registered_on_opt_in' (($tRaw -ne [IntPtr]::Zero) -and $tRegistered -gt 0) @([int64]$tRaw,$tRegistered)
+            TReload (TConfig $false $false)
+            $tRawOff = [LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id)
+            $tDragOff = [LaneTNative]::MessageWindow('WiriDragGestures',$tProcess.Id)
+            TGate 'h60_dnd_host_configured_only' (($tDragHost -ne [IntPtr]::Zero) -and $tDragOff -eq [IntPtr]::Zero) @([int64]$tDragHost,[int64]$tDragOff)
+            TGate 'h61_raw_removed_on_off_reload' (($tRawOff -eq [IntPtr]::Zero) -and (-not [LT]::IsWindow($tRaw)) -and (LogLines $tLog 'Precision touchpad Raw Input removed').Count -gt 0) @([int64]$tRawOff,(LogLines $tLog 'Precision touchpad Raw Input removed').Count)
+            TReload (TConfig $true $false)
+            $tRawQuit = [LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id)
+            TStop $tProcess
+            TGate 'h61_raw_removed_on_quit' (($tRawQuit -ne [IntPtr]::Zero) -and (-not [LT]::IsWindow($tRawQuit)) -and $tProcess.HasExited) @([int64]$tRawQuit,$tProcess.HasExited)
+        } catch {
+            $tDetails['error-h60-h61'] = [string]$_
+            $tDetails['error-h60-h61-position'] = $_.InvocationInfo.PositionMessage
+        }
     } catch {
         $tDetails['error'] = [string]$_
         $tDetails['error-position'] = $_.InvocationInfo.PositionMessage

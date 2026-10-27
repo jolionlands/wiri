@@ -996,6 +996,12 @@ window-rule {
         finally { FFinish 'h34_' $fComplete }
 
         # H31 runs last: it deliberately closes one of the four owned windows.
+        # Managed focus follows the native foreground event, and the e7ced50 daemon logs put that
+        # at 6-70 ms (p50 42, p90 63, p99 150) after the IPC focus reply, so a 40-50 ms wait is a
+        # coin flip: FFocus $fC 50 threw and took the whole group (17 passing checks) with it.
+        # FFocus only waits for the fixture to settle; the 750 ms visit bounds below are still
+        # asserted from their own stopwatch, so a slow settle fails the gate instead of passing it.
+        $fVisitWait=200
         $fComplete=$false
         try {
             foreach ($fTransport in @('cli','raw')) {
@@ -1009,9 +1015,9 @@ window-rule {
                 # after both managed and native focus agree, before visiting B/C.
                 $fSettledA=FHoldFocus $fA 1150
                 $fVisitClock=[Diagnostics.Stopwatch]::StartNew()
-                FFocus $fB 40
+                FFocus $fB $fVisitWait
                 $fBConfirmed=$fVisitClock.ElapsedMilliseconds
-                FFocus $fC 40
+                FFocus $fC $fVisitWait
                 $fBEnd=$fVisitClock.ElapsedMilliseconds
                 $fRecord=FRun "h31-exclude-short-$fTransport" $fTransport 'focus-window-previous' @('--debounce-ms',750) ([int64]$fA) -shortVisitClock $fVisitClock
                 FCheck 'h31_short_focus_is_excluded_at_750ms' ($fBEnd -lt 750 -and $fRecord.short_visit_until_dispatch_upper_bound_ms -lt 750 -and (FFocusIs $fRecord.before ([int64]$fC)) -and $fRecord.pass) @{record=$fRecord;short_visit_upper_bound_ms=$fBEnd;b_confirmed_ms=$fBConfirmed;c_confirmed_ms=$fBEnd;settled_a_ms=$fSettledA;debounce_ms=750}
@@ -1026,9 +1032,9 @@ window-rule {
                 FQuick 'move-window-to-workspace' @($fTarget,'--id',[int64]$fD,'--focus',$false) 'raw'
                 $fSettledA=FHoldFocus $fA 1150
                 $fVisitClock.Restart()
-                FFocus $fB 40
+                FFocus $fB $fVisitWait
                 $fCrossBConfirmed=$fVisitClock.ElapsedMilliseconds
-                FFocus $fD 40
+                FFocus $fD $fVisitWait
                 $fCrossDConfirmed=$fVisitClock.ElapsedMilliseconds
                 # Dispatch immediately; the product must handle queued native focus
                 # observations without a fixture sleep masking that ordering race.
@@ -1043,13 +1049,13 @@ window-rule {
             }
             # D is now a permanently qualified MRU endpoint. Close it by numeric
             # owned HWND while A is foreground, then query history via BOTH paths.
-            FFocus $fA 100
+            FFocus $fA
             $fRecord=FRun 'h31-close-owned-endpoint' 'raw' 'close-window' @('--id',[int64]$fD) ([int64]$fA)
             $fClosed=($fRecord.pass -and -not [LT]::IsWindow($fD) -and $null -eq (FWindow $fRecord.after $fD))
             FCheck 'h31_closed_windows_are_excluded' $fClosed $fRecord
             foreach ($fTransport in @('cli','raw')) {
                 $null=FHoldFocus $fA 1150
-                FFocus $fC 50
+                FFocus $fC $fVisitWait
                 $fRecord=FRun "h31-closed-excluded-$fTransport" $fTransport 'focus-window-previous' @('--debounce-ms',750) ([int64]$fA)
                 FCheck 'h31_closed_windows_are_excluded' ($fClosed -and $fRecord.pass -and $null -eq (FWindow $fRecord.after $fD)) $fRecord
                 $fRecord=FRun "h31-closed-toggle-$fTransport" $fTransport 'focus-window-previous' @('--debounce-ms',750) ([int64]$fC)
