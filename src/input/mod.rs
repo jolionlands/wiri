@@ -161,6 +161,35 @@ pub enum Action {
     MoveColumnToFirst,
     /// niri `move-column-to-last`.
     MoveColumnToLast,
+    /// niri `move-column-to-index N`: the focused column goes to the 0-based index `N`
+    /// of its workspace (an index past the end puts it last).
+    MoveColumnToIndex(u32),
+    /// niri `swap-window-left`: the focused window changes places with the window of
+    /// the column on its left (the moved window keeps the focus).
+    SwapWindowLeft,
+    /// niri `swap-window-right`.
+    SwapWindowRight,
+    /// niri `center-visible-columns`: centre the columns that are fully in view.
+    CenterVisibleColumns,
+    /// niri `move-window-down-or-to-workspace-down`: down inside the column, else to the
+    /// workspace below.
+    MoveWindowDownOrToWorkspaceDown,
+    /// niri `move-window-up-or-to-workspace-up`.
+    MoveWindowUpOrToWorkspaceUp,
+    /// niri `move-column-left-or-to-monitor-left`: left inside the strip, else the whole
+    /// column to the monitor on the left.
+    MoveColumnLeftOrToMonitorLeft,
+    /// niri `move-column-right-or-to-monitor-right`.
+    MoveColumnRightOrToMonitorRight,
+    /// niri `toggle-window-rule-opacity`: show the focused window opaque even though a
+    /// window rule gives it an opacity (and give the rule back when used again).
+    ToggleWindowRuleOpacity,
+    /// niri `focus-floating`: focus the most recently active floating window.
+    FocusFloating,
+    /// niri `focus-tiling`: focus the most recently active tiling window.
+    FocusTiling,
+    /// niri `switch-focus-between-floating-and-tiling`.
+    SwitchFocusBetweenFloatingAndTiling,
     /// niri `set-column-width` (also `set-window-width`): `"50%"`, `"+10%"`, `"-10%"`,
     /// `"1200"`, `"+100"`.
     SetColumnWidth(SizeChange),
@@ -170,6 +199,16 @@ pub enum Action {
     ResetWindowHeight,
     /// niri `switch-preset-column-width-back`.
     ColumnWidthPresetCycleBack,
+    /// niri `switch-preset-window-width`: the focused window's width preset (in the
+    /// scrolling layout the same request as the column's).
+    WindowWidthPresetCycle,
+    /// niri `switch-preset-window-width-back`.
+    WindowWidthPresetCycleBack,
+    /// niri `switch-preset-window-height`: the focused window's share of its column, from
+    /// `preset-window-heights`.
+    WindowHeightPresetCycle,
+    /// niri `switch-preset-window-height-back`.
+    WindowHeightPresetCycleBack,
     /// niri `focus-monitor-left`: focus the monitor on the left (nothing at the edge).
     FocusMonitorLeft,
     /// niri `focus-monitor-right`.
@@ -446,6 +485,30 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         "focus-column-last" => Some(Action::FocusColumnLast),
         "move-column-to-first" => Some(Action::MoveColumnToFirst),
         "move-column-to-last" => Some(Action::MoveColumnToLast),
+        "move-column-to-index" if args.len() == 1 => {
+            args[0].parse::<u32>().ok().map(Action::MoveColumnToIndex)
+        }
+        "swap-window-left" if args.is_empty() => Some(Action::SwapWindowLeft),
+        "swap-window-right" if args.is_empty() => Some(Action::SwapWindowRight),
+        "center-visible-columns" if args.is_empty() => Some(Action::CenterVisibleColumns),
+        "move-window-down-or-to-workspace-down" if args.is_empty() => {
+            Some(Action::MoveWindowDownOrToWorkspaceDown)
+        }
+        "move-window-up-or-to-workspace-up" if args.is_empty() => {
+            Some(Action::MoveWindowUpOrToWorkspaceUp)
+        }
+        "move-column-left-or-to-monitor-left" if args.is_empty() => {
+            Some(Action::MoveColumnLeftOrToMonitorLeft)
+        }
+        "move-column-right-or-to-monitor-right" if args.is_empty() => {
+            Some(Action::MoveColumnRightOrToMonitorRight)
+        }
+        "toggle-window-rule-opacity" if args.is_empty() => Some(Action::ToggleWindowRuleOpacity),
+        "focus-floating" if args.is_empty() => Some(Action::FocusFloating),
+        "focus-tiling" if args.is_empty() => Some(Action::FocusTiling),
+        "switch-focus-between-floating-and-tiling" if args.is_empty() => {
+            Some(Action::SwitchFocusBetweenFloatingAndTiling)
+        }
         "move-window-up" => Some(Action::MoveWindowUp),
         "move-window-down" => Some(Action::MoveWindowDown),
         "consume-or-expel-window-left" => Some(Action::ConsumeOrExpelWindowLeft),
@@ -527,6 +590,10 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
             Some(Action::ColumnWidthPresetCycle)
         }
         "switch-preset-column-width-back" => Some(Action::ColumnWidthPresetCycleBack),
+        "switch-preset-window-width" => Some(Action::WindowWidthPresetCycle),
+        "switch-preset-window-width-back" => Some(Action::WindowWidthPresetCycleBack),
+        "switch-preset-window-height" => Some(Action::WindowHeightPresetCycle),
+        "switch-preset-window-height-back" => Some(Action::WindowHeightPresetCycleBack),
         "column-width-half" | "column-width-1/2" => Some(Action::ColumnWidthPresetHalf),
         "column-width-third" | "column-width-1/3" => Some(Action::ColumnWidthPresetThird),
         "column-width-two-thirds" | "column-width-2/3" => Some(Action::ColumnWidthPresetTwoThirds),

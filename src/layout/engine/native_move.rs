@@ -87,6 +87,9 @@ impl TilingEngine {
                 // The existing height allocator gives the remaining space to the siblings.
                 tile.preferred_height =
                     Some((rect.size.h as i32 + extra).clamp(1, available) as u32);
+                // A drag sets the height; a preset or rule height does not last through it.
+                tile.height_proportion = None;
+                tile.height_preset_idx = None;
                 self.rule_heights.remove(&id);
             }
         }

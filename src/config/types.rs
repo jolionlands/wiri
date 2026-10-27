@@ -302,6 +302,12 @@ pub struct LayoutConfigPartial {
     pub always_center_single_column: Option<bool>,
     pub preset_column_widths: Option<Vec<SizeSpec>>,
     pub default_column_width: Option<Option<SizeSpec>>,
+    /// `preset-window-heights`: the `switch-preset-window-height` list.
+    pub preset_window_heights: Option<Vec<SizeSpec>>,
+    /// `empty-workspace-above-first`: keep an empty workspace above the first one.
+    pub empty_workspace_above_first: Option<bool>,
+    /// `fullscreen-backdrop-color`: the colour behind a fullscreen window.
+    pub fullscreen_backdrop_color: Option<String>,
     pub strip_frame: Option<bool>,
     pub border_color_urgent: Option<String>,
     pub border_radius: Option<u32>,
@@ -406,6 +412,15 @@ impl LayoutConfigPartial {
         }
         if let Some(ref v) = self.preset_column_widths {
             out.preset_column_widths = v.clone();
+        }
+        if let Some(ref v) = self.preset_window_heights {
+            out.preset_window_heights = v.clone();
+        }
+        if let Some(v) = self.empty_workspace_above_first {
+            out.empty_workspace_above_first = v;
+        }
+        if let Some(ref v) = self.fullscreen_backdrop_color {
+            out.fullscreen_backdrop_color = Some(v.clone());
         }
         if let Some(v) = self.default_column_width {
             out.default_column_width = Some(v);
@@ -517,6 +532,15 @@ pub struct LayoutConfig {
     pub center_focused_column: String,
     pub always_center_single_column: bool,
     pub preset_column_widths: Vec<SizeSpec>,
+    /// `preset-window-heights`: niri's per-window height presets for
+    /// `switch-preset-window-height` (empty = niri's default thirds/half/two-thirds).
+    pub preset_window_heights: Vec<SizeSpec>,
+    /// `empty-workspace-above-first`: the workspace list keeps an empty workspace above the
+    /// first one, so that `focus-workspace-up` from the first workspace has somewhere to go.
+    pub empty_workspace_above_first: bool,
+    /// `fullscreen-backdrop-color`: the colour the overlay layer fills the monitor with
+    /// behind a fullscreen window (`#rrggbb`, `#rrggbbaa`); `None` draws nothing.
+    pub fullscreen_backdrop_color: Option<String>,
     pub default_column_width: Option<Option<SizeSpec>>,
     /// Proportional mode: split the screen among at most this many columns
     /// (default 3); further windows scroll in.  0 = no limit.
@@ -613,6 +637,9 @@ impl LayoutConfig {
             center_focused_column: "never".to_string(),
             always_center_single_column: false,
             preset_column_widths: Vec::new(),
+            preset_window_heights: Vec::new(),
+            empty_workspace_above_first: false,
+            fullscreen_backdrop_color: None,
             default_column_width: None,
             default_column_display: "normal".to_string(),
             max_visible_columns: 3,

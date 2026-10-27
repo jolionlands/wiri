@@ -772,6 +772,7 @@ impl TilingEngine {
     pub(super) fn forget_rule_state(&mut self, window_id: WindowId) {
         crate::input::rule_scroll::update(window_id, None);
         self.rule_state.remove(&window_id);
+        self.opacity_overridden.remove(&window_id);
         self.rule_limits.remove(&window_id);
         self.rule_heights.remove(&window_id);
         self.unfocused_opens.remove(&window_id);
@@ -782,6 +783,42 @@ impl TilingEngine {
         self.rule_state
             .get(&window_id)
             .and_then(|s| s.resolved.opacity)
+    }
+
+    /// The opacity the engine should show for a window: its rule's, unless
+    /// `toggle-window-rule-opacity` switched that rule off for it.
+    pub(crate) fn effective_rule_opacity(&self, window_id: WindowId) -> Option<f32> {
+        if self.opacity_overridden.contains(&window_id) {
+            return None;
+        }
+        self.rule_opacity(window_id)
+    }
+
+    /// niri `toggle-window-rule-opacity`: make the window opaque even though a window rule
+    /// gives it an opacity, and give the rule its transparency back when invoked again.  A
+    /// window that no rule makes transparent has nothing to toggle and is left alone.
+    /// Returns whether the window now ignores its rule's opacity.
+    pub fn toggle_window_rule_opacity(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) -> bool {
+        if self.rule_opacity(window_id).is_none() {
+            return false;
+        }
+        let opaque = if self.opacity_overridden.contains(&window_id) {
+            self.opacity_overridden.remove(&window_id);
+            false
+        } else {
+            self.opacity_overridden.insert(window_id);
+            true
+        };
+        self.sync_window_opacity(window_id);
+        // A tile gets its alpha in the layout pass as well; floats are done by the call above.
+        if let Some((output, _, _)) = self.locate_window(window_id) {
+            self.apply_layout_for_monitor(output, backend);
+        }
+        opaque
     }
 
     /// Look at the rules again for one window.  The `open-*` and `default-*` properties are
@@ -880,6 +917,11 @@ impl TilingEngine {
     pub(super) fn sync_window_opacity(&mut self, window_id: WindowId) {
         let Some(rule) = self.rule_state.get(&window_id).map(|s| s.resolved.opacity) else {
             return;
+        };
+        let rule = if self.opacity_overridden.contains(&window_id) {
+            None
+        } else {
+            rule
         };
         let output = self
             .locate_window(window_id)
@@ -1900,6 +1942,44 @@ mod tests {
             "the title is kept anyway"
         );
         assert_eq!(engine.rule_opacity(WindowId::new(1)), Some(0.9));
+    }
+
+    #[test]
+    fn toggle_window_rule_opacity_makes_a_window_opaque_and_gives_the_rule_back() {
+        let mut engine = engine();
+        engine.set_window_rules(vec![WindowRule {
+            class: Some("TestClass".to_string()),
+            opacity: Some(0.5),
+            ..WindowRule::default()
+        }]);
+        engine.add_window(window(1, "a"), &be());
+        let wid = WindowId::new(1);
+        assert_eq!(engine.rule_opacity(wid), Some(0.5));
+        assert_eq!(engine.effective_rule_opacity(wid), Some(0.5));
+        // The window ignores its rule's opacity...
+        assert!(engine.toggle_window_rule_opacity(wid, &be()));
+        assert_eq!(engine.rule_opacity(wid), Some(0.5), "the rule still matches");
+        assert_eq!(engine.effective_rule_opacity(wid), None);
+        // ... and gets it back when the action is used again.
+        assert!(!engine.toggle_window_rule_opacity(wid, &be()));
+        assert_eq!(engine.effective_rule_opacity(wid), Some(0.5));
+    }
+
+    #[test]
+    fn toggle_window_rule_opacity_ignores_a_window_no_rule_makes_transparent() {
+        let mut engine = engine();
+        engine.set_window_rules(vec![WindowRule {
+            class: Some("OtherClass".to_string()),
+            opacity: Some(0.5),
+            ..WindowRule::default()
+        }]);
+        engine.add_window(window(1, "a"), &be());
+        let wid = WindowId::new(1);
+        assert_eq!(engine.rule_opacity(wid), None);
+        assert!(!engine.toggle_window_rule_opacity(wid, &be()));
+        assert_eq!(engine.effective_rule_opacity(wid), None);
+        // An unknown window is safe too.
+        assert!(!engine.toggle_window_rule_opacity(WindowId::new(99), &be()));
     }
 
     #[test]

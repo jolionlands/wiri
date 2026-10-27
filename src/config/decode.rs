@@ -1775,32 +1775,25 @@ impl Decoder {
                     }
                 }
                 "preset-column-widths" => {
-                    self.section(child);
-                    let mut sizes = Vec::new();
-                    for c in child.kids() {
-                        match norm(&c.name).as_str() {
-                            "proportion" => {
-                                if let Some(v) = self.arg_number(c, 0.0, 100.0) {
-                                    sizes.push(SizeSpec::Proportion(v));
-                                }
-                            }
-                            "fixed" => {
-                                if let Some(v) = self.arg_number(c, 1.0, 100_000.0) {
-                                    sizes.push(SizeSpec::Fixed(v.round() as u32));
-                                }
-                            }
-                            _ => {
-                                self.unknown(c, "'preset-column-widths'", &["proportion", "fixed"])
-                            }
-                        }
+                    if let Some(sizes) = self.decode_size_list(child, false) {
+                        p.preset_column_widths = Some(sizes);
                     }
-                    p.preset_column_widths = Some(sizes);
+                }
+                "preset-window-heights" => {
+                    if let Some(sizes) = self.decode_size_list(child, true) {
+                        p.preset_window_heights = Some(sizes);
+                    }
+                }
+                "empty-workspace-above-first" => {
+                    self.set_flag(child, &mut p.empty_workspace_above_first)
+                }
+                "fullscreen-backdrop-color" => {
+                    if let Some(color) = self.arg_color(child) {
+                        p.fullscreen_backdrop_color = Some(color);
+                    }
                 }
                 // niri layout options wiri does not implement yet
-                "empty-workspace-above-first"
-                | "preset-window-heights"
-                | "background-color"
-                | "fullscreen-backdrop-color" => self.unsupported(child, "layout"),
+                "background-color" => self.unsupported(child, "layout"),
                 _ => self.unknown(
                     child,
                     "'layout'",
@@ -2189,6 +2182,38 @@ impl Decoder {
     }
 
     /// `default-column-width { proportion 0.5; }` / `{ fixed 800; }` / `{}`.
+    /// A niri size list: `{ proportion 0.5; fixed 800; }`, as used by
+    /// `preset-column-widths` and `preset-window-heights`.  `heights` only changes what an
+    /// error message calls the list; proportions are read the same way (a share of the view
+    /// for a column width, a share of the column for a window height).
+    fn decode_size_list(&mut self, node: &Node, heights: bool) -> Option<Vec<SizeSpec>> {
+        self.section(node);
+        let mut sizes = Vec::new();
+        for child in node.kids() {
+            match norm(&child.name).as_str() {
+                "proportion" => {
+                    if let Some(v) = self.arg_number(child, 0.0, 100.0) {
+                        sizes.push(SizeSpec::Proportion(v));
+                    }
+                }
+                "fixed" => {
+                    if let Some(v) = self.arg_number(child, 1.0, 100_000.0) {
+                        sizes.push(SizeSpec::Fixed(v.round() as u32));
+                    }
+                }
+                _ => {
+                    let key = if heights {
+                        "'preset-window-heights'"
+                    } else {
+                        "'preset-column-widths'"
+                    };
+                    self.unknown(child, key, &["proportion", "fixed"]);
+                }
+            }
+        }
+        Some(sizes)
+    }
+
     fn decode_size_block(&mut self, node: &Node) -> Option<Option<SizeSpec>> {
         self.no_args(node);
         self.no_props(node);
@@ -2934,13 +2959,13 @@ mod tests {
     }
 
     #[test]
-    fn the_unsupported_layout_options_are_warnings() {
-        let d = load("layout {\n    center-focused-column \"never\"\n    preset-column-widths { proportion 0.5; }\n    tab-indicator { off }\n    empty-workspace-above-first\n}\n");
+    fn the_layout_options_that_were_missing_are_decoded() {
+        let d = load("layout {\n    center-focused-column \"never\"\n    preset-column-widths { proportion 0.5; }\n    tab-indicator { off }\n    empty-workspace-above-first\n    preset-window-heights { proportion 0.25; fixed 400; }\n    fullscreen-backdrop-color \"#101010\"\n}\n");
         assert!(errors(&d).is_empty());
-        assert_eq!(
-            warnings(&d).len(),
-            1,
-            "only empty-workspace-above-first is unsupported"
+        assert!(
+            warnings(&d).is_empty(),
+            "all four are implemented now: {:?}",
+            warnings(&d)
         );
         assert!(d.config.layout.effects.tab_indicator.off);
         assert_eq!(d.config.layout.center_focused_column, "never");
@@ -2948,6 +2973,28 @@ mod tests {
             d.config.layout.preset_column_widths,
             vec![SizeSpec::Proportion(0.5)]
         );
+        assert!(d.config.layout.empty_workspace_above_first);
+        assert_eq!(
+            d.config.layout.preset_window_heights,
+            vec![SizeSpec::Proportion(0.25), SizeSpec::Fixed(400)]
+        );
+        assert_eq!(
+            d.config.layout.fullscreen_backdrop_color.as_deref(),
+            Some("#101010")
+        );
+    }
+
+    #[test]
+    fn a_bad_fullscreen_backdrop_colour_is_an_error() {
+        let d = load("layout { fullscreen-backdrop-color \"not a colour\" }\n");
+        assert_eq!(errors(&d).len(), 1);
+        assert_eq!(d.config.layout.fullscreen_backdrop_color, None);
+    }
+
+    #[test]
+    fn a_bad_preset_window_height_is_an_error_not_a_silent_drop() {
+        let d = load("layout { preset-window-heights { fixed 0 } }\n");
+        assert_eq!(errors(&d).len(), 1);
     }
 
     #[test]

@@ -20,6 +20,14 @@ pub struct Tile {
     /// column of one window always fills the view.  The user's own `set-window-height`
     /// takes it away.
     pub preferred_height: Option<u32>,
+    /// niri `switch-preset-window-height`: the share of its column the tile asks for
+    /// (`{ proportion 0.25; }` of `preset-window-heights`), resolved against the column's
+    /// available height in every layout pass.  A fixed preset uses
+    /// [`Tile::preferred_height`] instead.  `None` = the tile shares its column by weight.
+    pub height_proportion: Option<f64>,
+    /// The index of the `preset-window-heights` entry `switch-preset-window-height` gave
+    /// the tile last, so the next switch goes on from there.  Any other height forgets it.
+    pub height_preset_idx: Option<usize>,
     /// niri-style relative tile-height weight inside a column. When
     /// every tile in a column carries the default weight of 1.0 the
     /// engine distributes height equally (current behavior). Adjusting
@@ -52,6 +60,8 @@ impl Tile {
             cached_bounds: Rect::default(),
             configure_throttle: ConfigureThrottle::default_60fps(),
             preferred_height: None,
+            height_proportion: None,
+            height_preset_idx: None,
             height_weight: 1.0,
             min_width: 0,
             max_width: 0,
@@ -811,6 +821,48 @@ impl Workspace {
             }
         }
         true
+    }
+
+    /// niri `swap-window-left` / `swap-window-right`: the window changes places with the
+    /// window its neighbouring column shows (its remembered active tile).  The window keeps
+    /// the focus, both columns keep their width and their place in the strip, and a tabbed
+    /// column keeps showing one window.  Returns the index of the column the moved window is
+    /// in now, or `None` at the edge of the strip or when the neighbour has no window.
+    pub fn swap_window_with_neighbour(&mut self, window_id: WindowId, delta: i32) -> Option<usize> {
+        let col = self.find_window_column(window_id)?;
+        let target = col as i64 + delta as i64;
+        if delta == 0 || target < 0 || target >= self.columns.len() as i64 {
+            return None;
+        }
+        let target = target as usize;
+        let from = self.columns[col].index_of(window_id)?;
+        let other = {
+            let neighbour = self.columns.get(target)?;
+            neighbour.index_of(neighbour.active_window()?)
+        }?;
+        // Different columns, so the two indexes stay valid while the tiles are exchanged.
+        let other_tile = self.columns[target].tiles.remove(other);
+        let mine = std::mem::replace(&mut self.columns[col].tiles[from], other_tile);
+        self.columns[target].tiles.insert(other, mine);
+        // The moved window keeps the focus: the column it left remembers what it shows now,
+        // the column it joined shows the window that was focused.
+        if let Some(column) = self.columns.get_mut(col) {
+            if column.active_window == Some(window_id) {
+                column.active_window = column
+                    .tiles
+                    .get(from.min(column.tiles.len().saturating_sub(1)))
+                    .map(|tile| tile.window_id);
+            }
+            column.clamp_active_tab();
+        }
+        if let Some(column) = self.columns.get_mut(target) {
+            column.active_window = Some(window_id);
+            if let ColumnDisplay::Tabbed { active_tab } = &mut column.display {
+                *active_tab = other.min(column.tiles.len().saturating_sub(1));
+            }
+            column.clamp_active_tab();
+        }
+        Some(target)
     }
 
     /// Move a window to a different column
@@ -1957,6 +2009,73 @@ mod tests {
         assert_eq!(ws.move_column_to(1, 1), None, "already there");
         assert_eq!(ws.move_column_to(5, 0), None);
         assert_eq!(ws.move_column_to(0, 5), None);
+    }
+
+    // --- swap-window-left / swap-window-right ---
+
+    #[test]
+    fn test_swap_window_exchanges_the_windows_of_two_columns() {
+        let mut ws = ws_with(&[&[1, 2], &[3, 4], &[5]]);
+        ws.columns[1].active_window = Some(WindowId::new(4));
+        // The focused window goes into the neighbour, the neighbour's active window comes
+        // into this column at the same index.
+        assert_eq!(ws.swap_window_with_neighbour(WindowId::new(1), 1), Some(1));
+        assert_eq!(ids(&ws), vec![vec![4, 2], vec![3, 1], vec![5]]);
+        assert_eq!(
+            ws.columns[0].active_window,
+            Some(WindowId::new(4)),
+            "the column remembers the window it shows now"
+        );
+        assert_eq!(ws.columns[1].active_window, Some(WindowId::new(1)));
+        assert_eq!(
+            ws.find_window_column(WindowId::new(1)),
+            Some(1),
+            "the moved window keeps the focus"
+        );
+        // And back again.
+        assert_eq!(ws.swap_window_with_neighbour(WindowId::new(1), -1), Some(0));
+        assert_eq!(ids(&ws), vec![vec![1, 2], vec![3, 4], vec![5]]);
+    }
+
+    #[test]
+    fn test_swap_window_at_the_edge_single_and_missing_windows() {
+        // First and last column: nothing in that direction.
+        let mut ws = ws_with(&[&[1], &[2]]);
+        assert_eq!(ws.swap_window_with_neighbour(WindowId::new(1), -1), None);
+        assert_eq!(ws.swap_window_with_neighbour(WindowId::new(2), 1), None);
+        assert_eq!(ids(&ws), vec![vec![1], vec![2]]);
+        // A single column has no neighbour at all.
+        let mut alone = ws_with(&[&[1, 2]]);
+        assert_eq!(alone.swap_window_with_neighbour(WindowId::new(1), 1), None);
+        assert_eq!(alone.swap_window_with_neighbour(WindowId::new(1), -1), None);
+        // An empty workspace and an unknown window.
+        let mut empty = Workspace::new();
+        assert_eq!(empty.swap_window_with_neighbour(WindowId::new(1), 1), None);
+        assert_eq!(ws.swap_window_with_neighbour(WindowId::new(9), 1), None);
+    }
+
+    #[test]
+    fn test_swap_window_keeps_tabbed_columns_showing_a_window() {
+        let mut ws = ws_with(&[&[1, 2], &[3, 4], &[5]]);
+        ws.columns[0].display = ColumnDisplay::Tabbed { active_tab: 0 };
+        ws.columns[1].display = ColumnDisplay::Tabbed { active_tab: 1 };
+        ws.columns[0].active_window = Some(WindowId::new(1));
+        ws.columns[1].active_window = Some(WindowId::new(4));
+        assert_eq!(ws.swap_window_with_neighbour(WindowId::new(1), 1), Some(1));
+        assert_eq!(ids(&ws), vec![vec![4, 2], vec![3, 1], vec![5]]);
+        // The column the window joined shows it.
+        assert_eq!(
+            ws.columns[1].display,
+            ColumnDisplay::Tabbed { active_tab: 1 },
+            "the focused window is the one shown"
+        );
+        assert_eq!(ws.columns[1].active_window, Some(WindowId::new(1)));
+        // The tab index of the column it left stays a valid one.
+        assert!(matches!(
+            ws.columns[0].display,
+            ColumnDisplay::Tabbed { active_tab: 0 }
+        ));
+        assert_eq!(ws.columns[0].active_window, Some(WindowId::new(4)));
     }
 
     // --- maximize-column ---
