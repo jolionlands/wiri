@@ -256,6 +256,7 @@ fn thumbnail_geometry(dst: Rect, bounds: Rect, source: (i32, i32)) -> Option<(Re
 #[cfg(target_os = "windows")]
 mod win {
     use super::*;
+    use crate::overlay::overview_pointer::TOUCH_LONG_PRESS_MS;
     use std::sync::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
         OnceLock,
@@ -275,7 +276,6 @@ mod win {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::*;
-    use crate::overlay::overview_pointer::TOUCH_LONG_PRESS_MS;
 
     const DRAG_DWELL: usize = 1;
     const LONG_PRESS: usize = 2;

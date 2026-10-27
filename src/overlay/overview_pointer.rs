@@ -286,11 +286,18 @@ mod tests {
         // Past the slop the finger pans (dragging left scrolls the view right) and the
         // window is not picked up, so lifting the finger over it selects nothing.
         p.press_touch(OverviewCommand::SelectWindow(id), 300, 200);
-        assert_eq!(p.motion(280, 200), None, "crossing the slop only arms the pan");
+        assert_eq!(
+            p.motion(280, 200),
+            None,
+            "crossing the slop only arms the pan"
+        );
         assert!(!p.touch_pending());
         assert_eq!(p.motion(250, 200), Some(OverviewCommand::ScrollView(30)));
         assert!(p.dragging_window().is_none());
-        assert!(!p.long_press(), "a moving finger cannot become a long press");
+        assert!(
+            !p.long_press(),
+            "a moving finger cannot become a long press"
+        );
         assert_eq!(p.release(Some(&context()), 250, 500), None);
     }
 
