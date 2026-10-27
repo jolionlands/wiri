@@ -23,6 +23,9 @@ impl TilingEngine {
         self.animation.set_slowdown(options.slowdown);
         self.motion = options.clone();
         self.reconfigure_overview_camera();
+        // niri `recent-windows-close`: the overlay host thread has no engine, so the fade it
+        // runs when it closes is published here (startup and every reload).
+        crate::overlay::recent_windows::set_close_fade(options.recent_windows_close_kind());
         // A reload can interrupt a frame. Reconcile from layout, not cached targets.
         for state in self.applied_state.values_mut() {
             state.rect = Rect::new(0, 0, 0, 0);

@@ -25,9 +25,9 @@ impl Decoder {
                 | "window-open"
                 | "window-close" => Some(name.as_str()),
                 "window-resize" if child.children.is_some() => Some("window-resize"),
+                "recent-windows-close" => Some("recent-windows-close"),
                 _ => None,
-            };
-            if let Some(key) = definition {
+            };            if let Some(key) = definition {
                 if !seen.insert(key.to_owned()) {
                     self.error(
                         child.pos,
@@ -76,6 +76,9 @@ impl Decoder {
                 | "window-close" => {
                     blocks.push(child);
                 }
+                "recent-windows-close" => {
+                    blocks.push(child);
+                }
                 "window-resize" if child.children.is_some() => {
                     blocks.push(child);
                 }
@@ -111,8 +114,7 @@ impl Decoder {
                 }
                 "config-notification-open-close"
                 | "exit-confirmation-open-close"
-                | "screenshot-ui-open"
-                | "recent-windows-close" => {
+                | "screenshot-ui-open" => {
                     self.unsupported(child, "composited open/close animations (only geometry transitions are implemented)");
                 }
                 _ => self.unknown(
@@ -161,6 +163,9 @@ impl Decoder {
                 "overview-open-close" => cfg.overview_open_close = kind,
                 "window-open" => cfg.window_open = kind,
                 "window-close" => cfg.window_close = kind,
+                // niri `recent-windows-close`: the overlay fades out; a spring is
+                // time-boxed by the overlay (see `overlay::recent_windows::CloseFade`).
+                "recent-windows-close" => cfg.recent_windows_close = kind,
                 _ => unreachable!(),
             }
         }
@@ -400,6 +405,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn recent_windows_close_is_decoded_as_a_fade() {
+        let cfg = decode_animations("recent-windows-close { duration-ms 250; curve ease-out-expo; };");
+        assert_eq!(
+            cfg.recent_windows_close,
+            Some(easing(250, Easing::ExpoOut)),
+            "the overlay's fade keeps the configured curve"
+        );
+        assert_eq!(
+            crate::overlay::recent_windows::CloseFade::of(cfg.recent_windows_close_kind())
+                .map(|fade| fade.duration_ms()),
+            Some(250)
+        );
+        // An explicit off, and the global switch, both stop the fade without an error.
+        assert_eq!(
+            decode_animations("recent-windows-close { off; };").recent_windows_close_kind(),
+            AnimationKind::Off
+        );
+        assert_eq!(
+            decode_animations("off; recent-windows-close { duration-ms 250; };")
+                .recent_windows_close_kind(),
+            AnimationKind::Off
+        );
+        assert!(decode_animations("recent-windows-close { duration-ms 250; };")
+            .recent_windows_close
+            .is_some());
     }
 
     #[test]

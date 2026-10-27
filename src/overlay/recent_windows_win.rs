@@ -21,7 +21,9 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, INFINITE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const REFRESH: u32 = WM_APP + 74;
+const FADE_BEGIN: u32 = WM_APP + 75;
 const OPEN_TIMER: usize = 1;
+const FADE_TIMER: usize = 2;
 const BACKDROP: u32 = 0x202020;
 #[derive(Default)]
 struct MailboxState {
@@ -29,6 +31,11 @@ struct MailboxState {
     hwnd: Option<isize>,
     closed: bool,
     queued: bool,
+    /// The `recent-windows-close` fade this session was started with (`0` = none).
+    fade_ms: u32,
+    /// The session is fading out: it still owns its window, but a new session needs one of
+    /// its own.
+    fading: bool,
 }
 struct Mailbox {
     state: Mutex<MailboxState>,
@@ -61,6 +68,22 @@ impl Mailbox {
     }
     fn close(&self) {
         let mut state = self.state.lock();
+        // niri `recent-windows-close`: when a fade is configured the host window fades its
+        // layered alpha out and only then ends the session (a timer runs for that long and
+        // is killed at the end).  Without one, this is the immediate close it always was.
+        if state.fade_ms > 0 && !state.closed {
+            if let Some(raw) = state.hwnd {
+                state.fading = true;
+                state.frame = None;
+                let posted = unsafe {
+                    PostMessageW(HWND(raw as *mut _), FADE_BEGIN, WPARAM(0), LPARAM(0)).is_ok()
+                };
+                if posted {
+                    return;
+                }
+                state.fading = false;
+            }
+        }
         state.closed = true;
         state.frame = None;
         drop(state);
@@ -101,7 +124,7 @@ impl RecentPreviewSink for DwmRecentWindows {
         let mut current = self.current.lock();
         if let Some(mailbox) = current.as_ref() {
             let mut state = mailbox.state.lock();
-            if !state.closed {
+            if !state.closed && !state.fading {
                 state.frame = Some(frame);
                 Mailbox::wake(&mut state);
                 return;
@@ -111,7 +134,11 @@ impl RecentPreviewSink for DwmRecentWindows {
             return;
         };
         let mailbox = Arc::new(mailbox);
-        mailbox.state.lock().frame = Some(frame);
+        {
+            let mut state = mailbox.state.lock();
+            state.frame = Some(frame);
+            state.fade_ms = super::close_fade().map_or(0, |fade| fade.duration_ms());
+        }
         *current = Some(mailbox.clone());
         if std::thread::Builder::new()
             .name("wiri-recent-preview".into())
@@ -145,6 +172,8 @@ struct Host {
     mailbox: Arc<Mailbox>,
     frame: Option<RecentPreviewFrame>,
     thumbnails: HashMap<WindowId, isize>,
+    /// The running `recent-windows-close` fade: when it started and how it looks.
+    fade: Option<(std::time::Instant, super::CloseFade)>,
 }
 impl Drop for Host {
     fn drop(&mut self) {
@@ -201,6 +230,7 @@ unsafe fn run_host(mailbox: Arc<Mailbox>, delay: u32) {
         mailbox: mailbox.clone(),
         frame: None,
         thumbnails: HashMap::new(),
+        fade: None,
     });
     if mailbox.state.lock().closed {
         return;
@@ -209,7 +239,11 @@ unsafe fn run_host(mailbox: Arc<Mailbox>, delay: u32) {
     // Derive once: do not reborrow the Box while GWLP_USERDATA holds this pointer.
     let ptr = &mut *host as *mut Host;
     let hwnd = match CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        WS_EX_TOPMOST
+            | WS_EX_TOOLWINDOW
+            | WS_EX_NOACTIVATE
+            | WS_EX_TRANSPARENT
+            | WS_EX_LAYERED,
         w!("WiriRecentWindowsHost"),
         w!("Wiri Recent Windows"),
         WS_POPUP,
@@ -262,6 +296,7 @@ unsafe fn run_host(mailbox: Arc<Mailbox>, delay: u32) {
 unsafe fn close_host(hwnd: HWND, mailbox: &Mailbox) {
     mailbox.unpublish();
     let _ = KillTimer(hwnd, OPEN_TIMER);
+    let _ = KillTimer(hwnd, FADE_TIMER);
     if IsWindow(hwnd).as_bool() {
         let _ = DestroyWindow(hwnd);
     }
@@ -467,6 +502,42 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             return LRESULT(0);
         }
+        // niri `recent-windows-close`: the overlay fades out.  The timer exists for the
+        // length of the fade only (it is the one the open delay uses, re-armed) and is
+        // killed when the alpha reaches zero, so nothing wakes up at rest.
+        FADE_BEGIN => {
+            if !ptr.is_null() {
+                let mailbox = (*ptr).mailbox.clone();
+                let Some(fade) = super::close_fade() else {
+                    let _ = SetEvent(mailbox.cancel_handle());
+                    return LRESULT(0);
+                };
+                (*ptr).fade = Some((std::time::Instant::now(), fade));
+                if SetTimer(hwnd, FADE_TIMER, 16, None) == 0 {
+                    // No timer: end the session rather than leave the overlay up.
+                    let _ = SetEvent(mailbox.cancel_handle());
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_TIMER if wp.0 == FADE_TIMER => {
+            if !ptr.is_null() {
+                if let Some((started, fade)) = (*ptr).fade {
+                    let elapsed = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    let alpha = fade.alpha(elapsed);
+                    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+                    if fade.finished(elapsed) {
+                        let _ = KillTimer(hwnd, FADE_TIMER);
+                        (*ptr).fade = None;
+                        let mailbox = (*ptr).mailbox.clone();
+                        let _ = SetEvent(mailbox.cancel_handle());
+                    }
+                } else {
+                    let _ = KillTimer(hwnd, FADE_TIMER);
+                }
+            }
+            return LRESULT(0);
+        }
         REFRESH if !ptr.is_null() => {
             if !refresh(hwnd, ptr) {
                 let mailbox = (*ptr).mailbox.clone();
@@ -486,6 +557,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, OPEN_TIMER);
+            let _ = KillTimer(hwnd, FADE_TIMER);
+            if !ptr.is_null() {
+                (*ptr).fade = None;
+            }
             PostQuitMessage(0);
             return LRESULT(0);
         }
