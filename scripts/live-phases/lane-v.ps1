@@ -143,7 +143,10 @@ workspace "v-third"
         # The next workspace is partially visible at this zoom. Dwell changes the camera;
         # release then commits the move without closing the overview.
         VFocus $vForms[0]; $beforeMove=VWindow (VWindows 'before-drag') $vForms[0]
-        $targetId=VProp 'Workspace1Id'; $tx=[int]((VProp 'Workspace1X')+(VProp 'Workspace1W')/2)
+        # `windows` reports the session-stable IPC identity, not the monitor-local key the
+        # host's *Id properties carry; the host publishes both.
+        $targetId=VProp 'Workspace1Id'; $targetIpc=VProp 'Workspace1IpcId'
+        $tx=[int]((VProp 'Workspace1X')+(VProp 'Workspace1W')/2)
         $ty=[int]((VProp 'Workspace1Y')+25)
         $r=H19Rect (VHost); $sx=[int]($r[0]+$r[2]/2); $sy=[int]($r[1]+$r[3]/2)
         VPoint 0x201 $sx $sy 1; VPoint 0x200 $tx $ty 1; Start-Sleep -Milliseconds 600
@@ -152,13 +155,17 @@ workspace "v-third"
         $ty=[int]((VProp 'Workspace1Y')+50)
         VPoint 0x200 $tx $ty 1; VPoint 0x202 $tx $ty; Start-Sleep -Milliseconds 500
         $afterMove=VWindow (VWindows 'after-drag') $vForms[0]
-        VGate 'h63_drag_to_existing_workspace' ((VHost) -ne [IntPtr]::Zero -and $afterMove.workspace_id -ne $beforeMove.workspace_id) @($beforeMove,$afterMove)
+        VGate 'h63_drag_to_existing_workspace' ((VHost) -ne [IntPtr]::Zero -and $afterMove.workspace_id -ne $beforeMove.workspace_id -and [int64]$afterMove.workspace_id -eq $targetIpc) @($beforeMove,$afterMove,$targetIpc)
         # Each source is a configured workspace, so it survives becoming empty.
         $sourceIndex=0
         foreach ($region in @('above','between','below')) {
             $source=$vForms[$sourceIndex]; $sourceIndex++
             VFocus $source
             $countBefore=VProp 'WorkspaceCount'
+            # Workspaces are stable objects: an insertion adds a fresh IPC id at the dropped
+            # place and leaves every existing workspace's id and name alone.
+            $beforeIpc=@(0..($countBefore-1) | ForEach-Object { VProp ("Workspace${_}IpcId") })
+            $expectedIndex=switch ($region) { 'above' { 0 } 'between' { 1 } default { $countBefore-1 } }
             $windowBefore=VWindow (VWindows ('before-'+$region)) $source
             $dropX=[int]((VProp 'Workspace0X')+(VProp 'Workspace0W')/2)
             if ($region -eq 'below') {
@@ -168,7 +175,6 @@ workspace "v-third"
                 VPoint 0x201 $sx $sy 1
                 VAction 'focus-workspace' @([string]$countBefore); Start-Sleep -Milliseconds 400
                 $last=$countBefore-1
-                $expectedTarget=(VProp ("Workspace${last}Id"))+1
                 $dropY=[int]((VProp ("Workspace${last}Y"))+(VProp ("Workspace${last}H"))+8)
                 VPoint 0x200 $dropX $dropY 1; VPoint 0x202 $dropX $dropY
                 Start-Sleep -Milliseconds 500
@@ -176,14 +182,18 @@ workspace "v-third"
                 $r=H19Rect (VHost); $sx=[int]($r[0]+$r[2]/2); $sy=[int]($r[1]+$r[3]/2)
                 VPoint 0x201 $sx $sy 1
                 VAction 'focus-workspace' @('1'); Start-Sleep -Milliseconds 400
-                if ($region -eq 'above') { $expectedTarget=VProp 'Workspace0Id'; $dropY=[int]((VProp 'Workspace0Y')-8) }
-                else { $expectedTarget=VProp 'Workspace1Id'; $dropY=[int]((VProp 'Workspace0Y')+(VProp 'Workspace0H')+8) }
+                if ($region -eq 'above') { $dropY=[int]((VProp 'Workspace0Y')-8) }
+                else { $dropY=[int]((VProp 'Workspace0Y')+(VProp 'Workspace0H')+8) }
                 VPoint 0x200 $dropX $dropY 1; VPoint 0x202 $dropX $dropY
                 Start-Sleep -Milliseconds 500
             }
             $windowAfter=VWindow (VWindows ('after-'+$region)) $source
             $grew=if ($region -eq 'below') { (VProp 'WorkspaceCount') -ge $countBefore } else { (VProp 'WorkspaceCount') -gt $countBefore }
-            VGate ('h63_drag_inserts_'+$region) ((VHost) -ne [IntPtr]::Zero -and $grew -and (VProp 'ActiveWorkspace') -eq $expectedTarget -and ([uint64]$windowAfter.workspace_id -band 4294967295) -eq $expectedTarget) @($countBefore,(VProp 'WorkspaceCount'),$dropY,$expectedTarget,$windowBefore,$windowAfter)
+            $ipcAfter=[int64]$windowAfter.workspace_id
+            $afterIpc=@(0..((VProp 'WorkspaceCount')-1) | ForEach-Object { VProp ("Workspace${_}IpcId") })
+            $placed=($afterIpc.Count -gt $expectedIndex -and [int64]$afterIpc[$expectedIndex] -eq $ipcAfter)
+            $fresh=-not ($beforeIpc -contains $ipcAfter)
+            VGate ('h63_drag_inserts_'+$region) ((VHost) -ne [IntPtr]::Zero -and $grew -and $placed -and $fresh -and (VProp 'ActiveWorkspaceIpcId') -eq $ipcAfter) @($countBefore,(VProp 'WorkspaceCount'),$dropY,$expectedIndex,$beforeIpc,$afterIpc,$windowBefore,$windowAfter)
         }
         VClose; FocusForm $vForms[2]; VOpen
         $beforeCount=VProp 'ThumbnailCount'

@@ -1163,8 +1163,10 @@ pub(crate) fn perform_action_on(
             engine.write().toggle_overview(backend);
         }
         Action::OverviewExit => {
+            // Explicit close is idempotent: while the camera is already closing,
+            // `toggle_overview` would reverse it and reopen the overview.
             if engine.read().is_overview() {
-                engine.write().toggle_overview(backend);
+                engine.write().exit_overview(backend);
             }
         }
         Action::OverviewLeft => {
@@ -1776,6 +1778,66 @@ mod tests {
         assert_eq!(sink.enter_calls(), 1);
         assert_eq!(sink.exit_calls(), 0);
         assert!(!engine.read().has_active_animations());
+    }
+
+    #[test]
+    fn explicit_overview_close_is_idempotent_while_the_camera_is_closing() {
+        use crate::layout::Monitor;
+        use crate::overlay::MockThumbnailOverview;
+        use crate::utils::{OutputId, Rect};
+
+        let output = OutputId::from_name("explicit-close-test");
+        let mut e = TilingEngine::new(Default::default());
+        e.monitors_mut().insert(
+            output,
+            Monitor::new(
+                output,
+                Rect::new(0, 0, 1366, 768),
+                Rect::new(0, 0, 1366, 728),
+            ),
+        );
+        e.monitors_mut().set_focused(output);
+        let sink = MockThumbnailOverview::new();
+        e.install_thumbnail_overview(sink.clone());
+        e.set_animation_notifier(Arc::new(tokio::sync::Notify::new()));
+        let engine = Arc::new(parking_lot::RwLock::new(e));
+        let backend = BackendHandle::default_for_test();
+        let quit_tx = Arc::new(Mutex::new(None));
+
+        // Closing something that is not open does nothing.
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        assert_eq!((sink.enter_calls(), sink.exit_calls()), (0, 0));
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(40, &backend);
+        let first = engine.read().overview_zoom();
+        // A second close (Escape pressed twice, `close-overview` twice) keeps closing:
+        // it must not take the toggle path, which reverses a closing camera.
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(40, &backend);
+        assert!(engine.read().overview_zoom() > first, "still closing");
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        assert!(!engine.read().is_overview());
+        assert_eq!((sink.enter_calls(), sink.exit_calls()), (1, 1));
+        // A toggle while closing, in contrast, is the documented reversal.
+        perform_action(&Action::OverviewToggle, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(40, &backend);
+        perform_action(&Action::OverviewToggle, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        assert!(engine.read().is_overview(), "toggle reversed the close");
+        assert_eq!(engine.read().overview_zoom(), 0.5);
+        assert_eq!((sink.enter_calls(), sink.exit_calls()), (2, 1));
     }
 
     #[test]

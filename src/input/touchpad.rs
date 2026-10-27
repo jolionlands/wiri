@@ -24,15 +24,75 @@ pub enum Swipe {
     Begin,
     Delta(f64, f64),
     End(bool),
+    /// A completed four-finger vertical swipe: `true` (up) opens the overview, `false`
+    /// (down) closes it. Fired once per touch; the spring then animates the camera.
+    Overview(bool),
+}
+
+/// Net centroid travel (device units, where the pad is 300 across) that makes a
+/// four-finger swipe, and how much more vertical than horizontal it must be.
+const OVERVIEW_SWIPE_DISTANCE: f64 = 45.0;
+const OVERVIEW_SWIPE_DOMINANCE: f64 = 1.5;
+
+/// niri's four-finger vertical swipe, recognized as a discrete gesture: Windows has no
+/// compositor camera to scrub with the fingers, so the completed swipe toggles and the
+/// existing active-only spring plays. Three fingers keep their own recognizer.
+#[derive(Default)]
+struct FourFinger {
+    last: BTreeMap<u32, (f64, f64)>,
+    net: (f64, f64),
+    fired: bool,
+}
+impl FourFinger {
+    fn frame(&mut self, contacts: &[Contact]) -> Option<bool> {
+        if contacts.is_empty() {
+            // Every finger lifted: the next touch may fire again.
+            *self = Self::default();
+            return None;
+        }
+        let points: BTreeMap<_, _> = contacts.iter().map(|c| (c.id, (c.x, c.y))).collect();
+        if points.len() != 4 || points.values().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+            // Any other count ends the swipe; `fired` stays until all fingers lift so one
+            // touch is one action even if a finger leaves and returns.
+            self.last.clear();
+            self.net = (0.0, 0.0);
+            return None;
+        }
+        let rebase = !self.last.keys().eq(points.keys());
+        if !rebase && !self.fired {
+            let (dx, dy) = points.iter().fold((0.0, 0.0), |(dx, dy), (id, (x, y))| {
+                let (px, py) = self.last[id];
+                (dx + x - px, dy + y - py)
+            });
+            self.net.0 += dx / 4.0;
+            self.net.1 += dy / 4.0;
+        }
+        self.last = points;
+        if self.fired
+            || self.net.1.abs() < OVERVIEW_SWIPE_DISTANCE
+            || self.net.1.abs() < self.net.0.abs() * OVERVIEW_SWIPE_DOMINANCE
+        {
+            return None;
+        }
+        self.fired = true;
+        // Pad y grows downward: fingers moving up open the overview.
+        Some(self.net.1 < 0.0)
+    }
 }
 #[derive(Default)]
 pub struct Recognizer {
     last: BTreeMap<u32, (f64, f64)>,
     active: bool,
     blocked: bool,
+    four: FourFinger,
 }
 impl Recognizer {
     pub fn frame(&mut self, contacts: &[Contact]) -> Vec<Swipe> {
+        let mut out = self.three_finger_frame(contacts);
+        out.extend(self.four.frame(contacts).map(Swipe::Overview));
+        out
+    }
+    fn three_finger_frame(&mut self, contacts: &[Contact]) -> Vec<Swipe> {
         if contacts.is_empty() {
             self.blocked = false;
         }
@@ -294,6 +354,25 @@ pub fn configure(enabled: bool, engine: Arc<RwLock<TilingEngine>>, backend: Back
         tracing::info!("Precision touchpad Raw Input registered");
     }
 }
+/// A completed four-finger swipe on the input pump: up opens (or reverses a closing)
+/// overview, down closes it. Closing while it is not open does nothing at all.
+fn overview_swipe(engine: &Arc<RwLock<TilingEngine>>, backend: &BackendHandle, open: bool) {
+    let changed = {
+        let mut engine = engine.write();
+        if open {
+            engine.enter_overview(backend);
+            true
+        } else if engine.is_overview() {
+            engine.exit_overview(backend);
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        crate::ipc::notify_state_changed();
+    }
+}
 pub fn shutdown() {
     if let Some(s) = SERVICE.with(|s| s.borrow_mut().take()) {
         super::gestures::external_end(&s.engine, &s.backend, s.clock.elapsed(), true);
@@ -406,6 +485,7 @@ unsafe fn receive(raw: HRAWINPUT) {
                             Swipe::End(cancel) => {
                                 super::gestures::external_end(&engine, &backend, time, cancel)
                             }
+                            Swipe::Overview(open) => overview_swipe(&engine, &backend, open),
                         }));
                     }
                 }
@@ -482,6 +562,98 @@ mod tests {
         assert!(r.frame(&frame(5.0, 0.0, 3)).is_empty());
         r.frame(&[]);
         assert_eq!(r.frame(&frame(5.0, 0.0, 3)), vec![Swipe::Begin]);
+    }
+    fn four_at(y: f64, x: f64) -> Vec<Contact> {
+        frame(x, y, 4)
+    }
+    #[test]
+    fn four_finger_vertical_swipe_fires_once_and_rearms_after_all_fingers_lift() {
+        let mut r = Recognizer::default();
+        assert!(!r.frame(&four_at(200.0, 50.0)).contains(&Swipe::Overview(true)));
+        // Fingers travel up the pad (y shrinks): below the distance nothing happens.
+        assert!(!r.frame(&four_at(180.0, 50.0)).contains(&Swipe::Overview(true)));
+        // Crossing the distance opens exactly once; continuing to swipe does not repeat.
+        let fired = r.frame(&four_at(150.0, 50.0));
+        assert!(fired.contains(&Swipe::Overview(true)), "{fired:?}");
+        assert!(r.frame(&four_at(60.0, 50.0)).is_empty());
+        assert!(r.frame(&four_at(220.0, 50.0)).is_empty());
+        // Three fingers while four are lifting keep it spent for this touch.
+        assert!(r.frame(&frame(50.0, 100.0, 3)).is_empty());
+        assert!(r.frame(&four_at(40.0, 50.0)).is_empty());
+        r.frame(&[]);
+        // A new touch swiping down closes.
+        r.frame(&four_at(40.0, 50.0));
+        let closed = r.frame(&four_at(100.0, 50.0));
+        assert!(closed.contains(&Swipe::Overview(false)), "{closed:?}");
+    }
+    #[test]
+    fn four_finger_swipe_must_be_mostly_vertical_and_ignores_rebased_contacts() {
+        let mut r = Recognizer::default();
+        r.frame(&four_at(100.0, 0.0));
+        // Long sideways travel with little vertical movement is not an overview swipe.
+        for x in [40.0, 80.0, 120.0, 160.0] {
+            assert!(!r
+                .frame(&four_at(100.0 - x / 10.0, x))
+                .iter()
+                .any(|e| matches!(e, Swipe::Overview(_))));
+        }
+        let mut r = Recognizer::default();
+        r.frame(&four_at(200.0, 50.0));
+        // A replaced finger rebases: its id jump must not count as travel.
+        let mut replaced = four_at(200.0, 50.0);
+        replaced[0].id = 9;
+        replaced[0].y = 20.0;
+        assert!(r.frame(&replaced).is_empty());
+        assert!(r.frame(&replaced).is_empty());
+        let mut moved = replaced.clone();
+        for contact in &mut moved {
+            contact.y -= 50.0;
+        }
+        assert!(r.frame(&moved).contains(&Swipe::Overview(true)));
+    }
+    #[test]
+    fn three_fingers_never_produce_an_overview_swipe() {
+        let mut r = Recognizer::default();
+        r.frame(&frame(50.0, 200.0, 3));
+        for y in [150.0, 100.0, 20.0] {
+            assert!(!r
+                .frame(&frame(50.0, y, 3))
+                .iter()
+                .any(|e| matches!(e, Swipe::Overview(_))));
+        }
+    }
+    #[test]
+    fn overview_swipe_opens_closes_and_ignores_close_when_not_open() {
+        use crate::layout::Monitor;
+        use crate::overlay::MockThumbnailOverview;
+        use crate::utils::{OutputId, Rect};
+        let output = OutputId::from_name("touchpad-overview");
+        let mut e = TilingEngine::new(Default::default());
+        e.monitors_mut().insert(
+            output,
+            Monitor::new(
+                output,
+                Rect::new(0, 0, 1366, 768),
+                Rect::new(0, 0, 1366, 728),
+            ),
+        );
+        e.monitors_mut().set_focused(output);
+        let sink = MockThumbnailOverview::new();
+        e.install_thumbnail_overview(sink.clone());
+        e.set_animation_notifier(Arc::new(tokio::sync::Notify::new()));
+        let engine = Arc::new(RwLock::new(e));
+        let backend = BackendHandle::default_for_test();
+        overview_swipe(&engine, &backend, false);
+        assert_eq!((sink.enter_calls(), sink.exit_calls()), (0, 0));
+        overview_swipe(&engine, &backend, true);
+        overview_swipe(&engine, &backend, true);
+        assert_eq!(sink.enter_calls(), 1);
+        engine.write().tick_animations_with_backend(60_000, &backend);
+        assert!(engine.read().is_overview());
+        overview_swipe(&engine, &backend, false);
+        engine.write().tick_animations_with_backend(60_000, &backend);
+        assert!(!engine.read().is_overview());
+        assert_eq!(sink.exit_calls(), 1);
     }
     #[test]
     fn serial_reports_assemble_before_recognition_and_abandon_incomplete_frame() {

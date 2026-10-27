@@ -21,9 +21,28 @@ use std::sync::Arc;
 /// A zoomed workspace background, in screen pixels, including empty workspaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverviewWorkspace {
+    /// The monitor-local stable workspace key (never its visible position).
     pub id: i32,
+    /// The session-stable IPC identity (`Workspace::ipc_id`), the id `windows` reports.
+    pub ipc_id: u64,
+    /// The workspace's name, else "Workspace N" by its visible position.
+    pub label: String,
     pub rect: Rect,
     pub active: bool,
+}
+
+#[cfg(test)]
+impl OverviewWorkspace {
+    /// A workspace background without a name (tests and pure geometry).
+    pub fn new(id: i32, rect: Rect, active: bool) -> Self {
+        Self {
+            id,
+            ipc_id: id.max(0) as u64,
+            label: format!("Workspace {id}"),
+            rect,
+            active,
+        }
+    }
 }
 
 /// Publish this after computing an overview layout, including after keyboard
@@ -256,8 +275,10 @@ mod win {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::*;
+    use crate::overlay::overview_pointer::TOUCH_LONG_PRESS_MS;
 
     const DRAG_DWELL: usize = 1;
+    const LONG_PRESS: usize = 2;
     const REFRESH: u32 = WM_APP + 0x219;
     const BACKDROP: u32 = 0x0018_1210;
     const WORKSPACE: u32 = 0x0036_2b24;
@@ -413,6 +434,8 @@ mod win {
         background: Vec<u32>,
         pointer: crate::overlay::overview_pointer::Pointer,
         dwell_target: Option<i32>,
+        /// The one-shot touch long-press timer is armed (only while a touch is held).
+        long_press_armed: bool,
     }
     impl Drop for Host {
         fn drop(&mut self) {
@@ -525,15 +548,20 @@ mod win {
                     ] {
                         property(hwnd, &format!("{prefix}{suffix}"), value as isize);
                     }
+                    // The id `wiri-ctl windows` reports for the workspace (stable across
+                    // reordering, unlike the monitor-local key above).
+                    property(hwnd, &format!("{prefix}IpcId"), ws.ipc_id as isize);
                 }
+                let active = context.workspaces.iter().find(|ws| ws.active);
                 property(
                     hwnd,
                     "WiriOverviewActiveWorkspace",
-                    context
-                        .workspaces
-                        .iter()
-                        .find(|ws| ws.active)
-                        .map_or(0, |ws| ws.id) as isize,
+                    active.map_or(0, |ws| ws.id) as isize,
+                );
+                property(
+                    hwnd,
+                    "WiriOverviewActiveWorkspaceIpcId",
+                    active.map_or(0, |ws| ws.ipc_id) as isize,
                 );
             }
             let rect = focused
@@ -577,7 +605,7 @@ mod win {
                     let r = local(ws.rect, self.bounds);
                     fill(dc, r, WORKSPACE);
                     ring(dc, r, if ws.active { HOVER } else { BACKDROP }, 1);
-                    let text: Vec<u16> = format!("Workspace {}", ws.id).encode_utf16().collect();
+                    let text: Vec<u16> = ws.label.encode_utf16().collect();
                     let _ = SetBkMode(dc, TRANSPARENT);
                     let _ = SetTextColor(dc, COLORREF(0x00df_d8d0));
                     let _ = TextOutW(dc, r.loc.x + 6, r.loc.y + 5, &text);
@@ -670,6 +698,19 @@ mod win {
             color,
         );
     }
+    /// Windows tags touch and pen input it promotes to mouse messages in the message's
+    /// extra info (`MI_WP_SIGNATURE`); bit 0x80 distinguishes touch from pen.
+    fn is_touch_event() -> bool {
+        // SAFETY: reads the current message's extra info on the owning thread.
+        let extra = unsafe { GetMessageExtraInfo() }.0 as u32;
+        extra & 0xFFFF_FF00 == 0xFF51_5700 && extra & 0x80 != 0
+    }
+    unsafe fn stop_long_press(host: &mut Host, hwnd: HWND) {
+        if host.long_press_armed {
+            host.long_press_armed = false;
+            let _ = KillTimer(hwnd, LONG_PRESS);
+        }
+    }
     unsafe fn property(hwnd: HWND, name: &str, value: isize) {
         let _ = SetPropW(hwnd, PCWSTR(wide(name).as_ptr()), HANDLE(value as *mut _));
     }
@@ -713,6 +754,7 @@ mod win {
             background: Vec::new(),
             pointer: Default::default(),
             dwell_target: None,
+            long_press_armed: false,
         });
         let Ok(hwnd) = CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -781,7 +823,15 @@ mod win {
                             }
                             _ => None,
                         };
-                        (*ptr).pointer.press(hit, x, y);
+                        if is_touch_event() {
+                            // Windows promotes the primary finger to mouse input. It pans;
+                            // resting on a window picks that window up after the long press.
+                            (*ptr).pointer.press_touch(hit, x, y);
+                            (*ptr).long_press_armed =
+                                SetTimer(hwnd, LONG_PRESS, TOUCH_LONG_PRESS_MS, None) != 0;
+                        } else {
+                            (*ptr).pointer.press(hit, x, y);
+                        }
                         (*ptr).pointer.set_anchor(anchor);
                         SetCapture(hwnd);
                     }
@@ -789,6 +839,7 @@ mod win {
                         command = (*ptr).pointer.release((*ptr).scene.context.as_ref(), x, y);
                         (*ptr).dwell_target = None;
                         let _ = KillTimer(hwnd, DRAG_DWELL);
+                        stop_long_press(&mut *ptr, hwnd);
                         let _ = ReleaseCapture();
                         (*ptr).update(hwnd);
                     }
@@ -802,6 +853,9 @@ mod win {
                     }
                     _ => {
                         command = (*ptr).pointer.motion(x, y);
+                        if !(*ptr).pointer.touch_pending() {
+                            stop_long_press(&mut *ptr, hwnd);
+                        }
                         let hovered = match hit {
                             OverviewCommand::SelectWindow(id) => Some(id),
                             _ => None,
@@ -841,6 +895,14 @@ mod win {
                 }
                 LRESULT(0)
             }
+            WM_TIMER if w.0 == LONG_PRESS => {
+                stop_long_press(&mut *ptr, hwnd);
+                if (*ptr).pointer.long_press() {
+                    // The window is now picked up: show the drag image under the finger.
+                    (*ptr).update(hwnd);
+                }
+                LRESULT(0)
+            }
             WM_TIMER if w.0 == DRAG_DWELL => {
                 let _ = KillTimer(hwnd, DRAG_DWELL);
                 if let Some(id) = (*ptr)
@@ -859,6 +921,7 @@ mod win {
                 (*ptr).pointer.cancel();
                 (*ptr).dwell_target = None;
                 let _ = KillTimer(hwnd, DRAG_DWELL);
+                stop_long_press(&mut *ptr, hwnd);
                 LRESULT(0)
             }
             WM_CONTEXTMENU => LRESULT(0),
@@ -911,11 +974,11 @@ mod tests {
         OverviewContext {
             bounds: Rect::new(-1920, 0, 1920, 1080),
             focused: Some(WindowId::new(1)),
-            workspaces: vec![OverviewWorkspace {
-                id: 2,
-                rect: Rect::new(-1800, 100, 900, 400),
-                active: true,
-            }],
+            workspaces: vec![OverviewWorkspace::new(
+                2,
+                Rect::new(-1800, 100, 900, 400),
+                true,
+            )],
         }
     }
     #[test]
