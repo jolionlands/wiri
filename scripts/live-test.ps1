@@ -458,6 +458,8 @@ function LogLines([string]$path, [string]$needle) {
     return @(Select-String -Path $path -Pattern $needle -SimpleMatch -ErrorAction SilentlyContinue)
 }
 function PositioningLines([string]$path) { (LogLines $path 'Positioning window').Count }
+# Diagnostics, not lines: a rich config diagnostic repeats its message under the source snippet ("  |  ^ ...").
+function DiagnosticCount([string]$path, [string]$needle) { @(LogLines $path $needle | Where-Object { $_.Line -notmatch '^\s*\|' }).Count }
 # Positioning lines per one-second bucket (timestamps are UTC, second resolution is enough).
 function Buckets([string]$path, [string]$needle) {
     $b = @{}
@@ -2814,8 +2816,8 @@ $summary = [ordered]@{
     hotkey_workspace_hidden = $hotkeyHidden
     hotkey_workspace_back_visible = $hotkeyBack
     # --- Phase 1 / H1: modifiers
-    h1_unknown_modifier_warnings = (LogLines $h1UnknownLog 'unknown modifier').Count
-    h1_unsupported_modifier_warnings = (LogLines $h1UnsupportedLog 'no distinct Windows mapping').Count
+    h1_unknown_modifier_warnings = DiagnosticCount $h1UnknownLog 'unknown modifier'
+    h1_unsupported_modifier_warnings = DiagnosticCount $h1UnsupportedLog 'no distinct Windows mapping'
     h1_unknown_modifier_is_a_config_error = $h1UnknownRejected
     h1_level5_modifier_is_a_config_error = $h1UnsupportedRejected
     h1_rejected_binds_registered = $h1StolenKeys

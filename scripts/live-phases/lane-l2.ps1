@@ -294,9 +294,10 @@ public static class LaneL2Native {
         L2Gate 'h76_recent_windows_close_fade' ($fadeWarnings -eq 0 -and $panics -eq 0 -and $stillUp) @{ warnings = $fadeWarnings; panics = $panics; alive = $stillUp }
 
         # ---- a bad argument list is refused by the same parser ------------------------
-        $bad = Ctl 'h76-bad-argument' @('action','move-column-to-index','not-a-number')
-        $badRc = [string]$steps[$steps.Count-1].rc
-        L2Gate 'h76_bad_arguments_rejected' ($badRc -ne '0') @{ rc = $badRc; output = $bad }
+        # An expected refusal goes through CtlRaw: Ctl records every call as a step that must exit 0.
+        $bad = CtlRaw @('action','move-column-to-index','not-a-number')
+        $badRc = [string]$bad.rc
+        L2Gate 'h76_bad_arguments_rejected' (($badRc -ne '0') -and -not [string]::IsNullOrWhiteSpace($bad.text)) @{ rc = $badRc; output = $bad.text }
         L2Checkpoint 'gates-done'
     } finally {
         foreach ($h in $l2Forms) { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
