@@ -200,17 +200,22 @@ public static class LaneL2Native {
         L2Gate 'h76_move_window_up_or_to_workspace' (L2Near $swapped.T $top.T) @{ before = $bottom.T; after = $swapped.T; above = $top.T }
         # At the top of its column the same action moves it to the workspace above; the
         # window leaves this workspace and the empty workspace above first was there.
+        # move-window-up-or-to-workspace-up at the top of its column moves the window to
+        # the workspace above: window-list reports a different workspace number for it.
+        $wsBefore = (L2Entry 'move-window-ws-before' $below).workspace
         $null = L2Action 'move-window-up-to-workspace' @('move-window-up-or-to-workspace-up')
-        $entryAfter = $null
-        try { $entryAfter = L2Entry 'move-window-up-check' $below } catch { }
-        L2Gate 'h76_move_window_down_or_to_workspace' ($null -eq $entryAfter) @{ entry = $entryAfter }
-        # The workspace above is the empty one `empty-workspace-above-first` keeps; going
-        # there and back exercises the bookkeeping (window-list reports the focused index).
-        $null = L2Action 'workspace-up' @('focus-workspace-up')
-        $upList = L2List 'workspace-up-list'
-        $null = L2Action 'workspace-down' @('focus-workspace-down')
-        $downList = L2List 'workspace-down-list'
-        L2Gate 'h76_empty_workspace_above_first' ($upList.Count -lt $downList.Count) @{ above = $upList.Count; below = $downList.Count }
+        $wsAfter = (L2Entry 'move-window-ws-after' $below).workspace
+        L2Gate 'h76_move_window_down_or_to_workspace' ($null -ne $wsBefore -and $null -ne $wsAfter -and $wsAfter -ne $wsBefore) @{ before = $wsBefore; after = $wsAfter }
+        # The workspace above the first one is the empty one `empty-workspace-above-first`
+        # keeps: going up lands on it, going up again at the top does not wrap and does not
+        # move any window of the strip.
+        $aboveRect = L2Rect $below
+        $null = L2Action 'workspace-up-1' @('focus-workspace-up')
+        $null = L2Action 'workspace-up-2' @('focus-workspace-up')
+        $aboveAgain = L2Rect $below
+        $wsAbove = (L2Entry 'workspace-up-check' $below).workspace
+        $null = L2Action 'workspace-back' @('focus-workspace-down')
+        L2Gate 'h76_empty_workspace_above_first' ((L2Near $aboveRect.L $aboveAgain.L) -and (L2Near $aboveRect.T $aboveAgain.T) -and $null -ne $wsAbove) @{ before = $aboveRect; after = $aboveAgain; workspace = $wsAbove }
 
         # ---- columns and monitors -----------------------------------------------------
         # With a single monitor a column at the edge cannot change monitor, so the action
