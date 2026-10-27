@@ -8,14 +8,20 @@
 #                         the SPI_SETMOUSEVANISH write it *would* make and the restore instead
 #                         of making them.  The machine's real SPI_GETMOUSEVANISH value is read
 #                         before the first daemon and after the last one and must be unchanged.
-#   hide-after-inactive-ms one private daemon with a 400 ms timeout.  The system cursor object
-#                         (GetCursorInfo) must change exactly when wiri logs that it hid the
-#                         pointer, change again when an injected move shows it, and be restored
-#                         after a graceful quit.  This is the one place in the whole run where
-#                         the lane lets a daemon swap the real cursors, and it is the daemon's
-#                         own explicit hide/restore: the `finally` below reloads the user's
-#                         cursor scheme unconditionally, so a failed assertion cannot leave the
-#                         machine without a pointer.
+#   hide-after-inactive-ms one private daemon with a 400 ms timeout.  wiri hides the pointer by
+#                         replacing the system cursors with a transparent one (SetSystemCursor),
+#                         which leaves the cursor HANDLE that GetCursorInfo reports unchanged
+#                         (the arrow stays 65539 and CURSOR_SHOWING stays set): only the IMAGE
+#                         behind the handle changes.  So the lane reads the image (GetIconInfo
+#                         + the mask bits) and asks "does this cursor draw anything?".  It must
+#                         draw something first, nothing once wiri logs that it hid the pointer,
+#                         something again after an injected move, nothing again after the next
+#                         idle period, and something once more after a graceful quit that
+#                         happened while the pointer was hidden.  This is the one place in the
+#                         whole run where the lane lets a daemon swap the real cursors, and it
+#                         is the daemon's own explicit hide/restore: the `finally` below
+#                         reloads the user's cursor scheme unconditionally, so a failed
+#                         assertion cannot leave the machine without a pointer.
 #   TabletStylusButton1-3 decode and registration only.  Windows has no global pen-button
 #                         stream without UIAccess, so nothing here claims a hardware pen event
 #                         was delivered; the evidence says so.
@@ -23,9 +29,9 @@
 # Gates (all pre-set to $false; evidence in lane-last/<run>/evidence.json and lane-last/evidence.json):
 #   h78_hide_when_typing_dry_run                      the audit shows the SPI write and the restore
 #   h78_hide_when_typing_real_value_unchanged         the real SPI_GETMOUSEVANISH value is unchanged
-#   h78_cursor_hides_after_inactive_ms                the cursor object changes when the timer hides it
-#   h78_cursor_shows_on_pointer_movement              an injected move shows it again
-#   h78_cursor_restored_on_quit                       a graceful quit reloads the user's cursors
+#   h78_cursor_hides_after_inactive_ms                the cursor image goes blank when the timer hides it
+#   h78_cursor_shows_on_pointer_movement              an injected move brings the image back
+#   h78_cursor_restored_on_quit                       a quit while hidden brings the user's cursors back
 #   h78_tablet_stylus_bind_decode_and_registration    the binds decode, validate and register
 & {
     $lastRoot = Join-Path $D 'lane-last'
@@ -67,6 +73,17 @@
         do {
             $text = LastReadText $daemon.Stderr
             if ($text -match $pattern) { return $text }
+            Start-Sleep -Milliseconds 100
+        } while ($clock.ElapsedMilliseconds -lt $ms)
+        return (LastReadText $daemon.Stderr)
+    }
+    # Wait until the pattern has matched `$count` times: the log keeps every earlier line, so a
+    # second hide must be told apart from the first.
+    function LastWaitCount($daemon, [string]$pattern, [int]$count, [int]$ms = 8000) {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $text = LastReadText $daemon.Stderr
+            if ([regex]::Matches($text, $pattern).Count -ge $count) { return $text }
             Start-Sleep -Milliseconds 100
         } while ($clock.ElapsedMilliseconds -lt $ms)
         return (LastReadText $daemon.Stderr)
@@ -163,12 +180,15 @@
         if ([string]::IsNullOrWhiteSpace($text)) { return @() }
         return @($text -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
     }
-    # "handle;flags": CURSOR_SHOWING is 1, so a non-zero handle with the flag set is a cursor
-    # the system is drawing.  The identity of the object is what changes when wiri swaps the
-    # system cursors for transparent ones and back.
-    function LastCursorHandle([string]$state) {
-        if ([string]::IsNullOrEmpty($state)) { return -1 }
-        return [int64]($state.Split(';')[0])
+    # `LaneLastNative.CursorState()` is "handle;flags;image;kind;WxH".  The handle and CURSOR_SHOWING
+    # do NOT change when wiri swaps the system cursors (SetSystemCursor replaces the contents of
+    # the cursor object, not its handle), so the state that matters is the third field:
+    # "blank" (nothing of it can be seen), "visible", or "unreadable".
+    function LastCursorImage([string]$state) {
+        if ([string]::IsNullOrEmpty($state)) { return 'unreadable' }
+        $parts = $state.Split(';')
+        if ($parts.Count -lt 3) { return 'unreadable' }
+        return $parts[2]
     }
 
     $lastDaemons = New-Object System.Collections.Generic.List[object]
@@ -192,7 +212,29 @@ public static class LaneLastNative {
         public int x;
         public int y;
     }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ICONINFO {
+        public bool fIcon;
+        public int xHotspot;
+        public int yHotspot;
+        public IntPtr hbmMask;
+        public IntPtr hbmColor;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BITMAP {
+        public int bmType;
+        public int bmWidth;
+        public int bmHeight;
+        public int bmWidthBytes;
+        public ushort bmPlanes;
+        public ushort bmBitsPixel;
+        public IntPtr bmBits;
+    }
     [DllImport("user32.dll", SetLastError = true)] static extern bool GetCursorInfo(ref CURSORINFO info);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetIconInfo(IntPtr icon, out ICONINFO info);
+    [DllImport("gdi32.dll")] static extern int GetObject(IntPtr h, int count, out BITMAP bmp);
+    [DllImport("gdi32.dll")] static extern int GetBitmapBits(IntPtr bitmap, int count, byte[] bits);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr h);
     [DllImport("user32.dll", SetLastError = true)] static extern bool SystemParametersInfoW(uint action, uint param, IntPtr data, uint flags);
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h, uint ms);
@@ -214,15 +256,68 @@ public static class LaneLastNative {
     const uint INPUT_MOUSE = 0;
     const uint MOUSEEVENTF_MOVE = 0x0001;
     /// SPI_GETMOUSEVANISH: the per-user "hide pointer while typing" flag (niri hide-when-typing).
-    const uint SPI_GETMOUSEVANISH = 0x1028;
+    /// 0x1020 (winuser.h; SPI_SETMOUSEVANISH is 0x1021).  The first version of this lane read
+    /// 0x1028, which is not that setting: the call succeeds and answers 0, so the "real value
+    /// unchanged" gate compared 0 with 0 on a machine that has the setting ON.
+    const uint SPI_GETMOUSEVANISH = 0x1020;
     /// SPI_SETCURSORS: reload the user's cursor scheme (the product's own restore path).
     const uint SPI_SETCURSORS = 0x0057;
-    /// "handle;flags", or "unreadable" when GetCursorInfo fails.
+    /// What the system would draw for this cursor handle: "blank;mono;32x64" when no pixel of it
+    /// can be seen (a monochrome cursor whose AND half is all ones and XOR half all zeros, which
+    /// is what wiri installs, or a colour cursor with neither alpha nor colour and an all-ones AND
+    /// half), "visible;colour32;32x32" for a cursor that draws something, "unreadable" when the
+    /// bitmaps cannot be read.  Read with GetIconInfo, because SetSystemCursor replaces the
+    /// contents of the system cursor object and keeps its handle.
+    public static string ImageOf(IntPtr cursor) {
+        if (cursor == IntPtr.Zero) { return "none"; }
+        ICONINFO info;
+        if (!GetIconInfo(cursor, out info)) { return "unreadable"; }
+        try {
+            BITMAP mask;
+            if (GetObject(info.hbmMask, Marshal.SizeOf(typeof(BITMAP)), out mask) == 0) { return "unreadable"; }
+            byte[] maskBits = new byte[mask.bmWidthBytes * mask.bmHeight];
+            if (GetBitmapBits(info.hbmMask, maskBits.Length, maskBits) == 0) { return "unreadable"; }
+            bool color = info.hbmColor != IntPtr.Zero;
+            int rows = color ? mask.bmHeight : mask.bmHeight / 2;
+            int andBytes = rows * mask.bmWidthBytes;
+            bool andAllOnes = true;
+            for (int i = 0; i < andBytes && i < maskBits.Length; i++) { if (maskBits[i] != 0xFF) { andAllOnes = false; break; } }
+            bool drawsNothing;
+            string kind;
+            if (!color) {
+                bool xorAllZero = true;
+                for (int i = andBytes; i < maskBits.Length; i++) { if (maskBits[i] != 0x00) { xorAllZero = false; break; } }
+                drawsNothing = andAllOnes && xorAllZero;
+                kind = "mono";
+            } else {
+                BITMAP colorInfo;
+                if (GetObject(info.hbmColor, Marshal.SizeOf(typeof(BITMAP)), out colorInfo) == 0) { return "unreadable"; }
+                byte[] colorBits = new byte[colorInfo.bmWidthBytes * colorInfo.bmHeight];
+                if (GetBitmapBits(info.hbmColor, colorBits.Length, colorBits) == 0) { return "unreadable"; }
+                bool anyAlpha = false;
+                bool anyColour = false;
+                if (colorInfo.bmBitsPixel == 32) {
+                    for (int i = 3; i < colorBits.Length; i += 4) { if (colorBits[i] != 0) { anyAlpha = true; break; } }
+                }
+                for (int i = 0; i < colorBits.Length; i++) { if (colorBits[i] != 0) { anyColour = true; break; } }
+                // A 32-bit cursor with an alpha channel is drawn from alpha; any other from its masks.
+                drawsNothing = (colorInfo.bmBitsPixel == 32 && anyAlpha) ? false : (andAllOnes && !anyColour);
+                kind = "colour" + colorInfo.bmBitsPixel;
+            }
+            return (drawsNothing ? "blank" : "visible") + ";" + kind + ";" + mask.bmWidth + "x" + mask.bmHeight;
+        } finally {
+            if (info.hbmMask != IntPtr.Zero) { DeleteObject(info.hbmMask); }
+            if (info.hbmColor != IntPtr.Zero) { DeleteObject(info.hbmColor); }
+        }
+    }
+    /// "handle;flags;image;kind;WxH" for the cursor the system is drawing now, or "unreadable"
+    /// when GetCursorInfo fails.  The handle and the CURSOR_SHOWING flag stay the same while wiri
+    /// hides the pointer; the image is what changes.
     public static string CursorState() {
         var info = new CURSORINFO();
         info.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
         if (!GetCursorInfo(ref info)) { return "unreadable"; }
-        return info.hCursor.ToInt64() + ";" + (info.flags & CURSOR_SHOWING);
+        return info.hCursor.ToInt64() + ";" + (info.flags & CURSOR_SHOWING) + ";" + ImageOf(info.hCursor);
     }
     /// 1 when the machine hides the pointer while typing, 0 when it does not, -1 on failure.
     public static int MouseVanish() {
@@ -256,6 +351,11 @@ public static class LaneLastNative {
 
         # ---- one private daemon: both cursor options and three stylus binds ---------------
         LastCheckpoint 'starting-the-private-daemon'
+        # `hide-when-typing` is configured to the OPPOSITE of what this machine has, so the daemon
+        # must write it (to the audit file only: the backend is in dry-run mode) and must write
+        # the machine's own value back on quit.  Asking for the value the machine already has
+        # would test nothing: a correct daemon then writes nothing at all.
+        $lastHideTypingLine = $(if ($lastVanishBefore -eq 0) { 'hide-when-typing' } else { 'hide-when-typing false' })
         $lastConfigText = @'
 // Lane LAST: the private daemon of this lane.
 hotkey-overlay { skip-at-startup }
@@ -266,10 +366,11 @@ binds {
     Mod+TabletStylusButton3 { close-window; }
 }
 cursor {
-    hide-when-typing
+    @@HIDE_WHEN_TYPING@@
     hide-after-inactive-ms 400
 }
 '@
+        $lastConfigText = $lastConfigText.Replace('@@HIDE_WHEN_TYPING@@', $lastHideTypingLine)
         $lastDaemon = LastStartDaemon 'cursor-stylus' $lastConfigText
         $lastRpc = New-Object LaneHConnection $lastDaemon.Pipe, $lastDaemon.Process.Id
         $lastDetails['config'] = $lastConfigText
@@ -285,33 +386,46 @@ cursor {
         Start-Sleep -Milliseconds 150
         $lastVisibleState = [LaneLastNative]::CursorState()
         LastCheckpoint 'waiting-for-the-inactivity-timer'
-        $lastHideLog = LastWaitLog $lastDaemon 'cursor: pointer hidden' 8000
+        $lastHideLog = LastWaitCount $lastDaemon 'cursor: pointer hidden' 1 8000
         $lastHiddenState = [LaneLastNative]::CursorState()
-        $lastHideSawLog = $lastHideLog -match 'cursor: pointer hidden'
+        $lastHideSawLog = [regex]::Matches($lastHideLog, 'cursor: pointer hidden').Count -ge 1
+        # The handle is the same before and after (SetSystemCursor keeps it); what changes is
+        # the image behind it: something is drawn first and nothing once wiri says it hid it.
         LastGate 'h78_cursor_hides_after_inactive_ms' ($lastHideSawLog -and $lastMove1 -ge 1 -and
-            $lastHiddenState -ne 'unreadable' -and $lastVisibleState -ne 'unreadable' -and
-            (LastCursorHandle $lastHiddenState) -ne 0 -and
-            (LastCursorHandle $lastHiddenState) -ne (LastCursorHandle $lastVisibleState)) ([ordered]@{
+            (LastCursorImage $lastVisibleState) -eq 'visible' -and
+            (LastCursorImage $lastHiddenState) -eq 'blank') ([ordered]@{
                 visible = $lastVisibleState
                 hidden = $lastHiddenState
                 timeout_ms = 400
                 send_input_accepted = $lastMove1
+                note = 'state is handle;CURSOR_SHOWING;image;kind;WxH - the handle does not change when the system cursors are swapped, the image does'
                 log = ($lastHideLog -split "`r?`n" | Where-Object { $_ -match 'cursor:' })
             })
 
         # ---- h78_cursor_shows_on_pointer_movement ----------------------------------------
         LastCheckpoint 'moving-the-pointer-again'
         $lastMove2 = [LaneLastNative]::Move(-4, 0)
-        $lastShowLog = LastWaitLog $lastDaemon 'cursor: pointer shown again' 8000
+        $lastShowLog = LastWaitCount $lastDaemon 'cursor: pointer shown again' 1 8000
         $lastShownState = [LaneLastNative]::CursorState()
-        LastGate 'h78_cursor_shows_on_pointer_movement' ($lastShowLog -match 'pointer shown again' -and
-            $lastMove2 -ge 1 -and $lastShownState -ne 'unreadable' -and
-            (LastCursorHandle $lastShownState) -ne (LastCursorHandle $lastHiddenState)) ([ordered]@{
+        LastGate 'h78_cursor_shows_on_pointer_movement' ([regex]::Matches($lastShowLog, 'cursor: pointer shown again').Count -ge 1 -and
+            $lastMove2 -ge 1 -and
+            (LastCursorImage $lastHiddenState) -eq 'blank' -and
+            (LastCursorImage $lastShownState) -eq 'visible') ([ordered]@{
                 hidden = $lastHiddenState
                 shown = $lastShownState
                 send_input_accepted = $lastMove2
                 log = ($lastShowLog -split "`r?`n" | Where-Object { $_ -match 'cursor:' })
             })
+
+        # Nothing moves now: the timer the move re-armed hides the pointer a second time, and the
+        # daemon is quit in that state - the one in which the quit has something to restore.
+        LastCheckpoint 'waiting-for-the-second-hide'
+        $lastHideAgainLog = LastWaitCount $lastDaemon 'cursor: pointer hidden' 2 8000
+        $lastHiddenAgainState = [LaneLastNative]::CursorState()
+        $lastDetails['hidden-again'] = [ordered]@{
+            state = $lastHiddenAgainState
+            hides_logged = [regex]::Matches($lastHideAgainLog, 'cursor: pointer hidden').Count
+        }
 
         # ---- h78_tablet_stylus_bind_decode_and_registration ------------------------------
         LastCheckpoint 'validating-the-stylus-binds-offline'
@@ -334,42 +448,41 @@ cursor {
                 note = 'promoted pen mouse events only; no raw WM_POINTER without UIAccess'
             })
 
-        # ---- quit: the user's cursors come back and the audit records the restore --------
+        # ---- quit while hidden: the user's cursors come back -----------------------------
         LastCheckpoint 'quitting-the-private-daemon'
         LastStopDaemon $lastDaemon
         $lastQuitLog = LastReadText $lastDaemon.Stderr
         $lastRestoredState = [LaneLastNative]::CursorState()
-        $lastRestoreLogged = $lastQuitLog -match 'cursor: Windows cursors reloaded'
-        LastGate 'h78_cursor_restored_on_quit' ($lastDaemon.Process.HasExited -and $lastRestoreLogged -and
-            $lastRestoredState -ne 'unreadable' -and
-            (LastCursorHandle $lastRestoredState) -ne (LastCursorHandle $lastHiddenState)) ([ordered]@{
+        # The startup restore logs the same "Windows cursors reloaded" line, so only what follows
+        # the shutdown message counts.
+        $lastShutdownAt = $lastQuitLog.IndexOf('Shutting down')
+        $lastAfterShutdown = $(if ($lastShutdownAt -ge 0) { $lastQuitLog.Substring($lastShutdownAt) } else { '' })
+        $lastRestoreLogged = $lastAfterShutdown -match 'cursor: Windows cursors reloaded'
+        LastGate 'h78_cursor_restored_on_quit' ($lastDaemon.Process.HasExited -and
+            (LastCursorImage $lastHiddenAgainState) -eq 'blank' -and $lastRestoreLogged -and
+            (LastCursorImage $lastRestoredState) -eq 'visible') ([ordered]@{
                 exited = $lastDaemon.Process.HasExited
-                hidden = $lastHiddenState
+                hidden_when_quit_was_sent = $lastHiddenAgainState
                 after_quit = $lastRestoredState
-                log = ($lastQuitLog -split "`r?`n" | Where-Object { $_ -match 'cursor:|pointer settings:' })
+                restore_logged_after_shutdown = $lastRestoreLogged
+                log = ($lastAfterShutdown -split "`r?`n" | Where-Object { $_ -match 'cursor:|pointer settings:|Shutting down' })
             })
 
         # ---- h78_hide_when_typing_dry_run ------------------------------------------------
         LastCheckpoint 'reading-the-pointer-audit'
         $lastAudit = @(LastAuditLines $lastDaemon.Audit)
         $lastVanishLines = @($lastAudit | Where-Object { $_.setting -eq 'hide-pointer-while-typing' })
-        if ($lastVanishBefore -eq 1) {
-            # The machine already hides the pointer while typing: nothing is written, nothing
-            # is owed back.
-            $lastVanishPass = ($lastVanishLines.Count -eq 0)
-            $lastVanishWhy = 'the machine already had the setting on, so the correct behaviour is no write at all'
-        } else {
-            # The dry-run write must say "on" and the quit must write the value it found.
-            $lastWrites = @($lastVanishLines | Where-Object { $_.action -eq 'write' })
-            $lastVanishPass = ($lastWrites.Count -eq 2 -and
-                ((@($lastWrites[0].value) -join ',') -eq '1') -and
-                ((@($lastWrites[-1].value) -join ',') -eq '0'))
-            $lastVanishWhy = 'one SPI_SETMOUSEVANISH write of 1 at startup and one of 0 on quit'
-        }
-        LastGate 'h78_hide_when_typing_dry_run' ($lastVanishBefore -ne -1 -and $lastVanishPass) ([ordered]@{
+        $lastWrites = @($lastVanishLines | Where-Object { $_.action -eq 'write' })
+        # The config asked for the opposite of the machine's value: one write of that at startup
+        # and one write of the machine's own value on quit.
+        $lastVanishPass = ($lastVanishBefore -ge 0 -and $lastWrites.Count -eq 2 -and
+            ((@($lastWrites[0].value) -join ',') -eq [string](1 - $lastVanishBefore)) -and
+            ((@($lastWrites[-1].value) -join ',') -eq [string]$lastVanishBefore))
+        LastGate 'h78_hide_when_typing_dry_run' $lastVanishPass ([ordered]@{
                 real_value_before = $lastVanishBefore
+                configured = $lastHideTypingLine
                 writes = @($lastVanishLines)
-                why = $lastVanishWhy
+                why = 'one SPI_SETMOUSEVANISH write of the opposite value at startup and one of the machine''s own value on quit (dry run: recorded, never made)'
                 audit_all = $lastAudit
                 log = ($lastVanishLog -split "`r?`n" | Where-Object { $_ -match 'pointer settings:' })
             })
