@@ -5438,6 +5438,9 @@ impl TilingEngine {
             self.enter_workspace_overview(backend);
             return;
         }
+        if self.is_overview() {
+            return;
+        }
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,

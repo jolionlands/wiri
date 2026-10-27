@@ -30,7 +30,9 @@
         $null=Ctl ('h64-'+$name) @('action',$name)
     }
     function HCMove([int]$x,[int]$y,[int]$ms=400) {
-        [Windows.Forms.Cursor]::Position=New-Object Drawing.Point $x,$y
+        # SetCursorPos can warp without a WH_MOUSE_LL input notification. Exercise
+        # the real input path with motion only (no buttons or system settings).
+        [LaneVCornerNative]::Move($x,$y)
         Start-Sleep -Milliseconds $ms
     }
     function HCReload([string]$extra) {
@@ -67,6 +69,29 @@ public static class LaneVCornerNative {
     }
     public static int[] Bounds(int x,int y) { INFO i=Read(x,y);return new[]{i.L,i.T,i.R,i.B}; }
     public static string Device(int x,int y) {return Read(x,y).Device;}
+    [StructLayout(LayoutKind.Sequential)] struct MOUSE {
+        public int X,Y; public uint Data,Flags,Time; public UIntPtr Extra;
+    }
+    [StructLayout(LayoutKind.Explicit)] struct UNION {
+        [FieldOffset(0)] public MOUSE Mouse;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct INPUT {
+        public uint Type; public UNION Value;
+    }
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll",SetLastError=true)] static extern uint SendInput(uint count,INPUT[] items,int size);
+    public static void Move(int x,int y) {
+        int left=GetSystemMetrics(76),top=GetSystemMetrics(77);
+        int width=GetSystemMetrics(78),height=GetSystemMetrics(79);
+        if(width<=0 || height<=0 || x<left || x>=left+width || y<top || y>=top+height)
+            throw new InvalidOperationException("Pointer target outside virtual desktop");
+        // Centre the normalized cell for this exact physical pixel.
+        INPUT move=new INPUT{Type=0,Value=new UNION{Mouse=new MOUSE{
+            X=(int)(((long)(x-left)*65536+32768)/width),
+            Y=(int)(((long)(y-top)*65536+32768)/height),Flags=0xc001}}};
+        if(SendInput(1,new[]{move},Marshal.SizeOf(typeof(INPUT)))!=1)
+            throw new InvalidOperationException("Owned hot-corner motion injection failed");
+    }
 }
 '@
         }
