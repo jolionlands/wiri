@@ -44,8 +44,8 @@ and the final product/harness fixes have not been rerun live.
 | 14. Switch events, named workspaces config, recent windows (Alt-Tab) | 13 | 10 | 1 | 1 | 1 |
 | 15. Layer rules | 5 | 0 | 0 | 0 | 5 |
 | 16. Debug options | 22 | 0 | 0 | 0 | 22 |
-| 17. Accessibility, security model, screencasting, Xwayland | 13 | 1 | 0 | 4 | 8 |
-| **total** | **259** | **116** | **63** | **8** | **72** |
+| 17. Accessibility, security model, screencasting, Xwayland | 13 | 1 | 4 | 0 | 8 |
+| **total** | **259** | **116** | **67** | **4** | **72** |
 
 Release and priority tags are historical and are not reassigned by this status recount.
 Release tagging of the rows: main-only 9, release 238, release? 12. Priorities of the

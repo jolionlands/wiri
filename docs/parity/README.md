@@ -14,14 +14,15 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
 | Layout and behaviour (226 rows) | 138 | 69 | 2 | 17 |
-| Config, input and IPC (259 rows) | 116 | 63 | 8 | 72 |
+| Config, input and IPC (259 rows) | 116 | 67 | 4 | 72 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
-retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P updates; they are not a full
-live sign-off. Official desktop cycles passed W+K (560/560) and F2 (601/602, H34 included);
-C2's H66-H70 gates passed in the 8c6c9b0 cycle. Rows marked partial with "live pending"
-(lanes T, V, L2 and P: gates H58-H65, H75 and H76) rest on unit tests until their first
-complete official cycle.
+retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates; they are not a
+full live sign-off. Official desktop cycles passed W+K (560/560) and F2 (601/602, H34 included);
+C2's H66-H70 gates passed in the 8c6c9b0 cycle and lane T's H58-H61 in the f4d2666 cycle.
+Rows marked partial with "live pending" (lanes V, L2, P and A11Y: gates H62-H65, H75-H77)
+rest on unit tests until their first complete official cycle; V's first run was cut short when
+Windows Defender quarantined the test build mid-cycle.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
 11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;

@@ -3123,6 +3123,7 @@ $summary = [ordered]@{
 # dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
 # so nothing here changes this machine's real pointer or touchpad settings.
 . (Join-Path $PSScriptRoot 'live-phases\lane-p.ps1')
+. (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1')
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
@@ -3133,7 +3134,6 @@ if ($env:WIRI_LIVE_CI -eq '1') {
     })
 }
 . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') # p_* numeric information only; never pass/fail
-. (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1')
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }
