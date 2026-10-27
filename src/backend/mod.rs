@@ -10,6 +10,7 @@ pub mod osversion;
 // Lane D: on-demand output identity/config and event-driven monitor refresh.
 pub mod output_runtime;
 pub mod outputs;
+pub mod reconcile;
 pub mod taskbar;
 
 use anyhow::{Context, Result};

@@ -623,30 +623,51 @@ async fn run() -> Result<()> {
     //
     // It sleeps in `recv` until the WinEvent thread sends something (it used to look every
     // 50 ms, which also delayed every event by up to 50 ms), then drains what queued behind
-    // it.
+    // it, in bursts of at most `EVENT_BURST` so that a flood cannot starve the reconcile
+    // deadline below.
+    //
+    // The same task runs the reconcile pass, which catches windows that missed CREATE/SHOW
+    // events (common with launchers) and reasserts workspace visibility if the shell
+    // re-shows a hidden inactive-workspace HWND behind wiri's back.  It used to run every
+    // 750 ms forever; now window events arm it and it rests when several passes in a row
+    // found nothing (see `wiri::backend::reconcile`), so a settled desktop has no timer.
     let handle_evt = handle.clone();
     let ipc_server_events = ipc_server.clone();
     tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            handle_backend_event(event, &handle_evt, &engine_clone, &ipc_server_events);
-            while let Ok(event) = event_rx.try_recv() {
-                handle_backend_event(event, &handle_evt, &engine_clone, &ipc_server_events);
-            }
-        }
-        // Every sender is gone: no window event can arrive any more.
-    });
-
-    // Periodic reconciliation catches windows that missed CREATE/SHOW events
-    // (common with launchers) and reasserts workspace visibility if the shell
-    // re-shows a hidden inactive-workspace HWND behind wiri's back.
-    let handle_reconcile = handle.clone();
-    let engine_reconcile = engine.clone();
-    let ipc_server_reconcile = ipc_server.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(750));
+        use wiri::backend::reconcile::{event_arms_reconcile, ReconcileSchedule};
+        const EVENT_BURST: usize = 256;
+        let mut schedule = ReconcileSchedule::starting(std::time::Instant::now());
         loop {
-            interval.tick().await;
-            reconcile_visible_windows(&handle_reconcile, &engine_reconcile, &ipc_server_reconcile);
+            let due = schedule.deadline();
+            tokio::select! {
+                event = event_rx.recv() => {
+                    let Some(event) = event else {
+                        // Every sender is gone: no window event can arrive any more.
+                        break;
+                    };
+                    let mut arms = event_arms_reconcile(&event);
+                    handle_backend_event(event, &handle_evt, &engine_clone, &ipc_server_events);
+                    for _ in 1..EVENT_BURST {
+                        let Ok(event) = event_rx.try_recv() else {
+                            break;
+                        };
+                        arms |= event_arms_reconcile(&event);
+                        handle_backend_event(event, &handle_evt, &engine_clone, &ipc_server_events);
+                    }
+                    if arms {
+                        schedule.note_activity(std::time::Instant::now());
+                    }
+                }
+                // (The expression is built even while the branch is disabled; it is not polled.)
+                _ = tokio::time::sleep_until(
+                    due.map(tokio::time::Instant::from_std)
+                        .unwrap_or_else(tokio::time::Instant::now),
+                ), if due.is_some() => {
+                    let admitted =
+                        reconcile_visible_windows(&handle_evt, &engine_clone, &ipc_server_events);
+                    schedule.pass_done(std::time::Instant::now(), admitted);
+                }
+            }
         }
     });
 
@@ -1699,11 +1720,12 @@ fn add_window_if_tileable(
     true
 }
 
+/// One reconcile pass.  True when it admitted a window the events had missed.
 fn reconcile_visible_windows(
     handle: &BackendHandle,
     engine: &Arc<RwLock<TilingEngine>>,
     ipc_server: &Arc<IpcServer>,
-) {
+) -> bool {
     let visible_windows = handle.refresh_visible_windows();
     let mut added_any = false;
 
@@ -1726,6 +1748,7 @@ fn reconcile_visible_windows(
             eng.apply_all(handle);
         }
     }
+    added_any
 }
 
 /// Determine if a window should be managed by the tiling engine
