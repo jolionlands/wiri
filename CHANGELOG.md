@@ -5,6 +5,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane L2 — missing layout-action rows
+- Close eleven rows of the layout parity matrix through the one action grammar (binds, `wiri-ctl action`, typed IPC): `swap-window-left` / `-right`, `move-column-to-index`, `center-visible-columns`, `switch-preset-window-width` / `-back`, `switch-preset-window-height` / `-back` with `preset-window-heights`, `move-window-{down,up}-or-to-workspace-{down,up}`, `move-column-{left,right}-or-to-monitor-{left,right}`, `layout { empty-workspace-above-first }`, `toggle-window-rule-opacity`, `focus-floating` / `focus-tiling` / `switch-focus-between-floating-and-tiling`.
+- Add `layout { fullscreen-backdrop-color }`: the existing click-through decor layer fills the monitor's tiling view behind a fullscreen window in the configured colour, only while one is up.
+- Decode `animations { recent-windows-close }` and fade the recent-windows overlay out on close over the existing easing curves; one timer runs only while a fade lasts, so a daemon at rest is unchanged and animations-off keeps the immediate close.
+- Every action has pure unit tests covering the edges (first/last column, a single column, tabbed columns, floating windows, an empty workspace, the end of the workspace list). Release check with `-D warnings` is clean and the suite is green at 1520 library + 14 CLI tests. The new `h76_*` live gates (`scripts/live-phases/lane-l2.ps1`) are written and parse with zero errors but have not been run; the parity rows therefore say `partial (Lane L2; unit-tested; live pending lead cycle)`.
+
 ### Lane Z — floating layer survives delayed native raises
 - Repair actual workspace z-order inversions on native REORDER events, not only on focus/layout. Correct the SHOW/HIDE WinEvent IDs so REORDER is no longer misclassified as HIDE. Keep float MRU and tile keyboard focus with asynchronous relative-HWND placement, without TOPMOST, global float promotion, idle timers or new threads.
 - Add deterministic H45 delayed-raise coverage and opt-in repeated H3/H5/H45 evidence. The delayed-layer check fails 3/3 before and passes 4/4 after; the complete release desktop run passes 500 gates. Release validation passes 1210 library + 14 CLI tests. Record repeat pass rates, one unrelated Terminal focus interruption, measured resting cost and limits in `docs/parity/lane-z-report.md`.
