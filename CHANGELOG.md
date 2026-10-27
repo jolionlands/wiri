@@ -5,6 +5,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane V integration - overview and tabs on the stable-workspace head
+- Port Lane V onto lanes K, W, F2, T2 and FK. Overview workspaces are added by a fresh stable key (names, IPC ids, floating homes stay put), the host paints names and publishes IPC ids, and native drag-and-drop uses the configured overview stack instead of a fixed half scale.
+- `close-overview` and Escape are idempotent while the camera closes. A four-finger vertical swipe (Precision Touchpad opt-in) opens or closes the overview; a Windows-promoted touch pans it and a 500 ms rest picks a window up. `gestures { hot-corners }` alone no longer starts the drag-capture adapter.
+- Every Lane V matrix row is `partial` until the lead's locked desktop cycle passes H62-H65; see `docs/parity/lane-v-report.md`.
+
 ### Lane V item 4 - explicit tab display and clickable indicators
 - Add niri `set-column-display "normal"|"tabbed"` binds, ctl commands and typed IPC with idempotent selection/focus preservation.
 - Make tab indicators select/focus hidden tabs without activating the overlay. Apply pinned-niri geometry, signed gap/rounding, colours/gradients and reload semantics; ignore inter-tab gaps and margins.

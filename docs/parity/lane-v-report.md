@@ -1,7 +1,10 @@
 # Lane V — overview and tabs
 
-Branch `meylin/sa-45892-6b96a`, base `c2bb1ec`. Compared directly with pinned
-niri `e19df12cf8` wiki Overview, Miscellaneous, Gestures and config source.
+Branch `meylin/sa-45892-6b96a`, base `c2bb1ec`; ported onto the integrated head
+`e7ced50` (lanes K, W, F2, T2 and FK) as `wip/sonnet-v` — see "Integration port" at
+the end. Compared directly with pinned niri `e19df12cf8` wiki Overview, Miscellaneous,
+Gestures and config source. **Live status: pending the lead's integration cycle.** Every
+row this lane touches is `partial` until a locked desktop run passes H62-H65.
 
 ## Item 1: overview config and camera
 
@@ -26,8 +29,9 @@ Release unit run after item 1: 1257 library + 14 CLI tests pass; one doctest ign
 ## Item 2: overview pointer and normal actions
 
 The session host captures complete pointer pairs with an 8 px drag threshold.
-Drops target an existing workspace or a new one above/between/below; insertion
-rotates the normal model with names, floating homes and minimized slots. A 350 ms
+Drops target an existing workspace or a new one above/between/below; an insertion adds
+a fresh stable workspace and moves only the visible order (names, IPC ids, floating
+homes and minimized slots stay with their workspaces). A 350 ms
 one-shot dwell switches the camera during a drag. Wheel deltas accumulate at 120;
 right-drag/horizontal wheel scroll the normal workspace view at the camera scale.
 The drag image remains anchored to the pointer when the workspace camera changes.
@@ -104,6 +108,86 @@ settings mutation is part of this lane.
 
 No new idle timer, polling loop, resident thread or resting HWND. Overview host,
 DWM registrations and raster buffers exist only for a session; frame work only
-while a camera timeline runs. The four-finger overview gesture belongs to the
-gestures lane, not this change; the engine camera is its integration hook.
-Touchscreen long-press/one-finger input remains outside this mouse/keyboard lane.
+while a camera timeline runs. The four-finger swipe and promoted-touch handling
+added by the integration port are event-driven too: the swipe is recognized inside the
+existing touchpad Raw Input callback, and the touch long press is a one-shot 500 ms
+timer that exists only while a touch is held on the host.
+
+## Integration port onto `e7ced50` (lanes K, W, F2, T2, FK)
+
+The five original commits were cherry-picked in order with their subjects, then the
+unverified WIP commit was finished. Overlap decisions, all keeping both sides:
+
+- **F2 (stable workspaces, structured actions).** Workspaces are objects with a
+  session-stable IPC id and a name; the visible order is separate from the local key.
+  Dropping a window on a gap therefore *adds* a fresh workspace and moves only the order
+  (`Monitor::{next_workspace_id, insert_workspace, move_workspace_to_position}`); the
+  rotation and tie-swapping of the original port are gone, and the stale rotation test
+  became an identity test (names, IPC ids and the active key stay with their workspace).
+  The overview paints each workspace's name or "Workspace N" by visible position and
+  publishes its IPC id (`WiriOverviewWorkspace<n>IpcId`, `…ActiveWorkspaceIpcId`).
+  H63's insertion gates compare the id `windows` reports with that property instead of
+  the old composite-id low bits.
+- **K (transient compositor).** Overview and compositor never share a frame: K's
+  effects are disabled while `is_overview()`, `enter_workspace_overview` cancels any
+  running transition, and an overview workspace switch is handled before K's composited
+  one. `has_active_animations` and the per-frame tick include both; nothing is created
+  at rest.
+- **W (rule effects, decor).** `Gradient` lives in `decor/gradient.rs` with space/hue,
+  `RRect::sdf` is W's general corner-square distance (it covers the unequal-radius case
+  Lane V had patched), tab paints still honour per-window `tab-indicator` rule effects,
+  and V's `fill_relative` is retained for tab gradients.
+- **T2 (gestures).** One `GesturesConfig` now holds the drag-and-drop settings and the
+  global `hot_corners`; a block holding only `hot-corners` configures the overview and
+  does *not* start the drag-capture adapter (an empty block or a `dnd-edge-*` block
+  still does). The LL hook publishes the cursor to `hot_corner` before any gesture
+  early return, and hot corners are suppressed by `is_grab_active` (which includes the
+  gesture and pen sessions).
+- **FK (H17).** The compositor-options fixture no longer expects a warning for
+  `overview-open-close`; a separate fixture accepts the camera block.
+
+### Finishing the work
+
+- Native drag-and-drop in the overview hit-tested a hard-coded half-scale stack. It now
+  asks the engine for the same stack the host paints (`overview_workspace_stack`), so
+  the configured zoom, the 50 px gap scaled by the zoom and the camera animation all
+  agree between paint, pointer and DnD. Only the output the camera opened over
+  publishes geometry to the single host.
+- `close-overview` and Escape no longer reverse a camera that is already closing (they
+  took the toggle path); only a toggle reverses a close and `open-overview` reverses it
+  explicitly.
+- **Four-finger swipe (new).** With the Precision Touchpad opt-in, a completed
+  four-finger vertical swipe (centroid travel of at least 45 pad units of 300 and 1.5x
+  more vertical than horizontal) opens (up) or closes (down) the overview once per
+  touch. It is a discrete trigger that plays the reversible spring; the camera does not
+  scrub with the fingers. A fourth finger still cancels the three-finger swipe. The
+  operator must set Windows four-finger Swipes to Nothing; no physical touchpad was used.
+- **Touch overview (new).** The primary finger Windows promotes to mouse input pans the
+  overview (horizontal scroll; a workspace per 150 px vertically) and a tap still
+  selects; resting 500 ms on a window picks it up for the existing drop path. Windows
+  delivers only the primary contact, so there is no multi-finger or kinetic scrolling,
+  and no touchscreen was used.
+- H64 moves the physical pointer with absolute, motion-only `SendInput` (the original
+  `Cursor.Position` call can warp without a low-level hook notification), restoring the
+  cursor and config afterwards.
+- `set-column-display` was already complete through binds, ctl, direct/msg actions and
+  typed IPC; the integration kept its tests and H65, and the matrix row is `partial`
+  only because nothing here is live-verified.
+
+### Not done / limits
+
+- Four-finger and touch gestures are unit-tested only; their rows stay `partial`.
+- Multi-display overview remains one session host on the focused output (unit-tested).
+- Workspace-shadow alpha composites over the opaque host's backdrop colour, not a
+  wallpaper layer; layer-shell zooming is N/A.
+- Nothing from lanes V's H62-H65 was run: the lead's locked desktop cycle owns them.
+
+### Integration validation ledger
+
+On `wip/sonnet-v` (tridaris, `RUSTFLAGS=-D warnings`, `-j 2`): `cargo fmt` clean,
+`cargo check --release --all-targets` clean, `cargo test --release --no-fail-fast`:
+**1565 library + 15 CLI** pass, one doctest ignored. The one library test excluded
+is `hooks::spawner::tests::test_capture_screenshot_to_file_bmp_signature`, which fails
+with `BitBlt failed` in the non-interactive SSH session on tridaris (it needs a real
+desktop; the file is untouched by this lane). All changed PowerShell files parse with
+zero errors. No live harness, wiri.exe or desktop test was run.
