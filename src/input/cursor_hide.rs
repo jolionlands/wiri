@@ -221,8 +221,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn with_hider(f: impl FnOnce(&mut CursorHider) -> Vec<Effect>) -> Vec<Effect> {
     let mut guard = HIDER.lock();
-    let hider = guard
-        .get_or_insert_with(|| CursorHider::new(Arc::new(SystemCursors)));
+    let hider = guard.get_or_insert_with(|| CursorHider::new(Arc::new(SystemCursors)));
     f(hider)
 }
 
