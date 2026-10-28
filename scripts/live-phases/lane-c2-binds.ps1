@@ -7,7 +7,8 @@
     $bNames = @('h67_omitted_binds_no_defaults','h67_empty_binds_no_defaults',
         'h67_nonempty_binds_replace_defaults','h67_include_overrides_canonical_aliases_final_mod',
         'h67_duplicate_aliases_both_locations','h67_unknown_modifier_rejects_retains_last_good',
-        'h67_altgr_aliases_validation_only')
+        'h67_altgr_aliases_validation_only',
+        'h79_action_names_all_parse','h79_action_names_all_run_over_ipc')
     $bState = @{ p=$null; rpc=$null; events=$null; form=[IntPtr]::Zero; out=$null; err=$null }
     $bPipe = '\\.\pipe\wiri-h67-' + [Guid]::NewGuid().ToString('N')
     $cfg = Join-Path $bDir 'config.kdl'
@@ -106,6 +107,10 @@
         $psi.EnvironmentVariables['WIRI_PIPE'] = $bPipe
         $psi.EnvironmentVariables['WIRI_KEYBOARD_DRY_RUN'] = '1'
         $psi.EnvironmentVariables['WIRI_SYSTEM_ACTIONS_DRY_RUN'] = Join-Path $bDir 'system-actions.jsonl'
+        # h79 records every action it sends instead of performing it: a quit
+        # confirmation, the screenshot UI or a suspend would end this lane, and
+        # the claim under test is that the names are understood, not their effect.
+        $psi.EnvironmentVariables['WIRI_ACTIONS_DRY_RUN'] = Join-Path $bDir 'actions.jsonl'
         $bState.p = [Diagnostics.Process]::Start($psi)
         $null = $bState.p.Handle
         $bState.out = $bState.p.StandardOutput.ReadToEndAsync()
@@ -160,6 +165,70 @@
         # Validation ONLY: never synthesize AltGr/Mod5/ISO_Level3_Shift.
         $altgr = C67Validate 'altgr-aliases' ($bBase + 'binds { AltGr+F7 toggle-floating; Mod5+F8 toggle-floating; ISO_Level3_Shift+F9 toggle-floating; }')
         C67Gate $bNames[6] ($altgr.rc -eq '0') @{mode='validation-only; no AltGr injection'; validation=$altgr}
+        # H79: ONE source of truth.  `wiri-ctl action-names --json` prints the
+        # vocabulary the decoder ships (config::decode::bindable_niri_actions())
+        # together with the arguments that action's own parser accepts, so a new
+        # niri action is bound and run by these two gates without anyone editing
+        # this script.  One gate per half, not one per action.
+        $catalog = [LaneHNative]::RunCli($ctl, @('action-names','--json'), $null, 10000)
+        [IO.File]::WriteAllText((Join-Path $bDir 'action-names.json'), $catalog.Out, $bUtf8)
+        $actions = @()
+        try { $actions = @($catalog.Out | ConvertFrom-Json) } catch { }
+        if ([string]$catalog.Rc -ne '0' -or $actions.Count -lt 50) {
+            throw 'H79 action-names did not list the action vocabulary'
+        }
+        $c79Keys = @('A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','F1','F2','F3','F4','F5','F6')
+        $c79Mods = @('Ctrl+Alt+','Ctrl+Alt+Shift+','Ctrl+Shift+','Alt+Shift+')
+        if ($actions.Count -gt ($c79Keys.Count * $c79Mods.Count)) {
+            throw 'H79 the fixture needs more distinct chords than the lane defines'
+        }
+        # One bind per name, every chord carrying at least two modifiers so the
+        # fixture cannot answer a stray keystroke while it is loaded.
+        $c79Binds = New-Object 'Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $actions.Count; $i++) {
+            $chord = $c79Mods[[int]($i % $c79Mods.Count)] + $c79Keys[[int][Math]::Floor($i / $c79Mods.Count)]
+            $words = @([string]$actions[$i].name) + @($actions[$i].args | ForEach-Object { [string]$_ })
+            $c79Binds.Add('    ' + $chord + ' ' + ($words -join ' ') + ';')
+        }
+        $c79Text = $bBase + "binds {`n" + ($c79Binds -join "`n") + "`n}`n"
+        $c79Path = Join-Path $bDir 'all-actions.kdl'
+        [IO.File]::WriteAllText($c79Path, $c79Text, $bUtf8)
+        # `validate-config` is the daemon's own decoder: what it reports here is
+        # what the run log would report for these binds, and it needs no daemon.
+        $c79Check = [LaneHNative]::RunCli($ctl, @('validate-config',$c79Path,'--json'), $null, 20000)
+        [IO.File]::WriteAllText((Join-Path $bDir 'all-actions.validate.stdout.txt'), $c79Check.Out, $bUtf8)
+        [IO.File]::WriteAllText((Join-Path $bDir 'all-actions.validate.stderr.txt'), $c79Check.Err, $bUtf8)
+        $c79Report = $null
+        try { $c79Report = $c79Check.Out | ConvertFrom-Json } catch { }
+        $null = C67Reload $c79Text
+        $c79Loaded = @(C67Binds)
+        $c79Text2 = $c79Check.Out + "`n" + $c79Check.Err
+        C67Gate $bNames[7] ([string]$c79Check.Rc -eq '0' -and $null -ne $c79Report -and
+            [int]$c79Report.errors -eq 0 -and [int]$c79Report.warnings -eq 0 -and
+            $c79Text2 -notmatch 'unknown action' -and $c79Text2 -notmatch 'not implemented by wiri yet' -and
+            $c79Loaded.Count -eq $actions.Count) @{count=$actions.Count; rc=[string]$c79Check.Rc;
+            errors=$c79Report.errors; warnings=$c79Report.warnings; loaded=$c79Loaded.Count; config=$c79Path}
+        # Every name over the pipe.  The daemon records the accepted action in
+        # actions.jsonl instead of performing it, so the audit lines are the
+        # evidence that each name reached the same decoder the binds use.
+        $c79AuditPath = Join-Path $bDir 'actions.jsonl'
+        $c79Failed = New-Object 'Collections.Generic.List[string]'
+        foreach ($action in $actions) {
+            $mark = $steps.Count
+            $null = Ctl ('h79-run-' + [string]$action.name) (@('action',[string]$action.name) + @($action.args | ForEach-Object { [string]$_ }))
+            if ($steps.Count -ne $mark + 1 -or [string]$steps[$mark].rc -ne '0') {
+                $c79Failed.Add([string]$action.name)
+            }
+        }
+        $c79Sent = @($actions | ForEach-Object { [string]$_.name })
+        $c79Audited = @()
+        if (Test-Path $c79AuditPath) {
+            $c79Audited = @(Get-Content $c79AuditPath | ForEach-Object { [string]($_ | ConvertFrom-Json).name })
+        }
+        $c79Missing = @($c79Sent | Where-Object { $c79Audited -notcontains $_ })
+        C67Gate $bNames[8] ($c79Failed.Count -eq 0 -and $c79Missing.Count -eq 0 -and
+            $c79Audited.Count -eq $c79Sent.Count) @{ran=$c79Sent.Count; failed=@($c79Failed.ToArray());
+            audited=$c79Audited.Count; missing=@($c79Missing)}
     } catch {
         $failure = [string]$_
         foreach ($name in $bNames) { if (-not $bEvidence.Contains($name)) { C67Gate $name $false @{error=$failure} } }

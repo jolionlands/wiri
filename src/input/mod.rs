@@ -429,10 +429,23 @@ pub fn parse_action_name(name: &str, args: &[String]) -> Option<Action> {
 /// with a few typical argument lists (none, a number, a size, words, a display mode). Used to
 /// tell "bad arguments" from "wiri does not have this action" when a config is read.
 pub fn action_name_known(name: &str) -> bool {
-    const PROBES: [&[&str]; 6] = [&[], &["1"], &["50%"], &["a"], &["a", "b"], &["normal"]];
-    PROBES.iter().any(|args| {
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        parse_action_flagged(name, &args, &[]).is_some()
+    sample_action_args(name).is_some()
+}
+
+/// The argument lists [`action_name_known`] tries, in order: none, a number, a
+/// size, a word, two words and a column display mode.
+pub const ACTION_ARG_PROBES: &[&[&str]] =
+    &[&[], &["1"], &["50%"], &["a"], &["a", "b"], &["normal"]];
+
+/// The first of [`ACTION_ARG_PROBES`] that `name` accepts, as the words a bind
+/// or `wiri-ctl action` would take: `Some(vec![])` for an action without
+/// arguments, `None` when no probe parses, i.e. when wiri does not implement
+/// the name.  The completeness gate binds and runs every name with these words,
+/// so the arguments come from the parser and cannot drift from it.
+pub fn sample_action_args(name: &str) -> Option<Vec<String>> {
+    ACTION_ARG_PROBES.iter().find_map(|probe| {
+        let args: Vec<String> = probe.iter().map(|s| s.to_string()).collect();
+        parse_action_flagged(name, &args, &[]).map(|_| args)
     })
 }
 

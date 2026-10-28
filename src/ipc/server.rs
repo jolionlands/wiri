@@ -806,6 +806,11 @@ impl IpcServer {
                             return serde_json::json!({"success":false,"error":format!("no managed window with id {id}")});
                         }
                     }
+                    // The dry run (`super::action_audit`) records an accepted
+                    // screenshot instead of taking one.
+                    if let Some(reply) = super::action_audit::reply(&name, &args) {
+                        return reply;
+                    }
                     return match capture.run() {
                         Ok(path) => serde_json::json!({"success":true,"result":{"path":path}}),
                         Err(error) => {
@@ -820,6 +825,9 @@ impl IpcServer {
                     let Some(options) = crate::overlay::screenshot_ui::Options::parse(&args) else {
                         return serde_json::json!({"success":false,"error":"invalid screenshot UI options (paths must be absolute)"});
                     };
+                    if let Some(reply) = super::action_audit::reply(&name, &args) {
+                        return reply;
+                    }
                     return match crate::overlay::screenshot_ui::open(options) {
                         Ok(()) => serde_json::json!({"success":true}),
                         Err(error) => {
@@ -839,6 +847,11 @@ impl IpcServer {
                     };
                     if target.is_some() && !matches!(system, SystemAction::WindowUrgent(_)) {
                         return serde_json::json!({"success": false, "error": "this action does not accept --id"});
+                    }
+                    // The dry run records a decoded system action (quit, power,
+                    // touchpad, reload) instead of performing it.
+                    if let Some(reply) = super::action_audit::reply(&name, &args) {
+                        return reply;
                     }
                     let _changed = crate::ipc::StateChangeGuard;
                     let result = match &system {
@@ -914,6 +927,11 @@ impl IpcServer {
                         "error": format!("unknown action or bad arguments: {} {:?}", name, args)
                     });
                 };
+                // The dry run records the action the live path just decoded and
+                // dispatches nothing: no window is focused and no effect runs.
+                if let Some(reply) = super::action_audit::reply(&name, &args) {
+                    return reply;
+                }
                 if matches!(action, crate::input::Action::Quit) {
                     return self.process_message(IpcMessage::Quit);
                 }

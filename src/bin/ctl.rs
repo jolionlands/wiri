@@ -190,6 +190,11 @@ impl Invocation {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// List every niri action name wiri accepts in a bind, one per line.  With
+    /// `--json` each entry also carries the arguments that action needs.  Local:
+    /// the vocabulary is compiled in, so it never dials the daemon.
+    ActionNames,
+
     /// Get the current window manager state
     State,
 
@@ -557,6 +562,14 @@ fn real_main() -> Result<()> {
         return validate_config_subcommand(path.as_deref(), cli.json);
     }
 
+    if let Commands::ActionNames = &command {
+        anyhow::ensure!(
+            !cli.print_request,
+            "action-names is local and has no IPC request"
+        );
+        return action_names_subcommand(cli.json);
+    }
+
     if let Commands::RawRequest { request } = &command {
         let request = raw_request_text(request.as_deref(), &mut std::io::stdin().lock())?;
         if cli.print_request {
@@ -689,6 +702,7 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
         },
         Commands::ListMonitors => IpcMessage::MonitorList,
         Commands::ValidateConfig { .. } => unreachable!("handled above"),
+        Commands::ActionNames => unreachable!("handled above"),
         Commands::ConsumeWindow => IpcMessage::ConsumeWindow,
         Commands::ExpelWindow => IpcMessage::ExpelWindow,
         Commands::ExpandColumn => IpcMessage::ExpandColumn,
@@ -845,6 +859,31 @@ fn resolve_config_path(supplied: Option<&str>) -> Option<std::path::PathBuf> {
         return Some(PathBuf::from(p));
     }
     wiri::config::default_config_path()
+}
+
+/// Implementation of `wiri-ctl action-names`: the vocabulary the config decoder
+/// and the IPC `action` request share, with the arguments each name accepts.  A
+/// live phase enumerates exactly this list, so a new niri action cannot land
+/// without a gate binding and running it.
+fn action_names_subcommand(json: bool) -> Result<()> {
+    let mut rows: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for name in wiri::config::decode::bindable_niri_actions() {
+        let args = wiri::input::sample_action_args(name)
+            .ok_or_else(|| anyhow::anyhow!("{name} is bindable but no argument probe parses"))?;
+        rows.push((name, args));
+    }
+    if json {
+        let payload: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, args)| serde_json::json!({"name": name, "args": args}))
+            .collect();
+        outln!("{}", serde_json::to_string(&payload)?);
+    } else {
+        for (name, _) in &rows {
+            outln!("{}", name);
+        }
+    }
+    Ok(())
 }
 
 /// Implementation of `wiri-ctl validate-config [path]`.

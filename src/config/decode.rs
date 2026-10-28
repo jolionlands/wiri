@@ -323,7 +323,7 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
 }
 
 /// Every action niri can bind (`niri-config/src/binds.rs`), in kebab-case.
-const NIRI_ACTIONS: &[&str] = &[
+pub const NIRI_ACTIONS: &[&str] = &[
     "quit",
     "suspend",
     "power-off-monitors",
@@ -461,6 +461,42 @@ const NIRI_ACTIONS: &[&str] = &[
     "open-overview",
     "close-overview",
 ];
+
+/// niri actions wiri deliberately does not implement, with why.  Every one of
+/// them is a compositor effect or a Wayland protocol wiri has no equivalent of,
+/// so the decoder reports the bind as `not implemented by wiri yet` instead of
+/// calling it an unknown action.  This list is the only place the gate list is
+/// narrowed: [`bindable_niri_actions`] is [`NIRI_ACTIONS`] minus these, and the
+/// unit tests below keep the two halves an exact partition, so a new niri
+/// action cannot land outside the live completeness gate.
+pub const UNIMPLEMENTED_NIRI_ACTIONS: &[&str] = &[
+    // Compositor debug switches: there is no damage tracking or debug tint to
+    // toggle on Windows.
+    "toggle-debug-tint",
+    "debug-toggle-opaque-regions",
+    "debug-toggle-damage",
+    // niri's own screen-transition effect: wiri animates with its own driver.
+    "do-screen-transition",
+    // niri's windowed-fullscreen mode: Windows fullscreen is `fullscreen-window`.
+    "toggle-windowed-fullscreen",
+    // wlr-screencopy dynamic cast targets: there is no cast protocol on Windows.
+    "set-dynamic-cast-window",
+    "set-dynamic-cast-monitor",
+    "clear-dynamic-cast-target",
+];
+
+/// Every niri action name wiri accepts in a bind, in the order [`NIRI_ACTIONS`]
+/// declares them.  This is the one list the live completeness gates enumerate
+/// (`scripts/live-phases/lane-c2-binds.ps1`, `h79_*`), so a new action added to
+/// the vocabulary is bound and run by the next cycle without anyone editing a
+/// script.
+pub fn bindable_niri_actions() -> Vec<&'static str> {
+    NIRI_ACTIONS
+        .iter()
+        .copied()
+        .filter(|name| !UNIMPLEMENTED_NIRI_ACTIONS.contains(name))
+        .collect()
+}
 
 /// Properties niri allows on an action itself, per action.
 fn action_props(action: &str) -> &'static [&'static str] {
@@ -3414,6 +3450,80 @@ mod tests {
             .filter(|i| i.severity == ValidationSeverity::Warning)
             .map(|i| i.to_string())
             .collect()
+    }
+
+    /// The vocabulary the live completeness gates enumerate is exactly the two
+    /// halves below: nothing may be silently outside them, and nothing may be in
+    /// both.  A new niri action therefore cannot land without either being bound
+    /// by the gate or being listed (with a reason) as not implemented.
+    #[test]
+    fn the_bindable_action_list_partitions_the_niri_vocabulary() {
+        let bindable = super::bindable_niri_actions();
+        for (i, name) in super::NIRI_ACTIONS.iter().enumerate() {
+            assert!(
+                !super::NIRI_ACTIONS[..i].contains(name),
+                "{name} is listed twice in NIRI_ACTIONS"
+            );
+        }
+        for name in &bindable {
+            assert!(
+                super::NIRI_ACTIONS.contains(name),
+                "{name} is bindable but not a niri action"
+            );
+            assert!(
+                !super::UNIMPLEMENTED_NIRI_ACTIONS.contains(name),
+                "{name} is both bindable and unimplemented"
+            );
+        }
+        for name in super::UNIMPLEMENTED_NIRI_ACTIONS {
+            assert!(
+                super::NIRI_ACTIONS.contains(name),
+                "{name} is listed as unimplemented but is not a niri action"
+            );
+        }
+        assert_eq!(
+            bindable.len() + super::UNIMPLEMENTED_NIRI_ACTIONS.len(),
+            super::NIRI_ACTIONS.len(),
+            "the gate list and the unimplemented list must add up to the vocabulary"
+        );
+    }
+
+    /// The same check the `h79_action_names_all_parse` live gate makes, one bind
+    /// per name with the arguments the parser itself supplies.
+    #[test]
+    fn every_bindable_niri_action_binds_without_a_diagnostic() {
+        for name in super::bindable_niri_actions() {
+            let args = crate::input::sample_action_args(name)
+                .unwrap_or_else(|| panic!("{name} is bindable but no argument probe parses"));
+            let mut line = format!("Ctrl+Alt+Shift+F7 {name}");
+            for word in &args {
+                line.push(' ');
+                line.push_str(word);
+            }
+            line.push(';');
+            let decoded = load(&format!("binds {{ {line} }}"));
+            assert_eq!(
+                decoded.config.binds.hotkeys.len(),
+                1,
+                "{name} did not bind: {line}"
+            );
+            assert!(
+                decoded.issues.is_empty(),
+                "{name} produced diagnostics: {:?}",
+                decoded.issues
+            );
+        }
+    }
+
+    /// A stale exclusion would hide a newly implemented action from the gate.
+    #[test]
+    fn every_unimplemented_niri_action_is_really_unimplemented() {
+        for name in super::UNIMPLEMENTED_NIRI_ACTIONS {
+            assert!(
+                !crate::input::action_name_known(name),
+                "{name} is implemented now; move it out of UNIMPLEMENTED_NIRI_ACTIONS"
+            );
+        }
     }
 
     fn clean(text: &str) -> Config {
