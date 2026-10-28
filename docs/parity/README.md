@@ -38,6 +38,15 @@ against the gate names that actually appear in `scripts/live-test.ps1` and
 surveyed row was left `partial`: `horizontal-view-movement`, because the only evidence the
 survey could name for it is the offline H17 config-decode fragment, which its own header says
 does not prove visible motion, and no live gate covers camera scroll.
+
+**2026-10-28 gate-hardening pass, `f4157d3`.** The 2026-10-28 cycle at `f4157d3` is the first
+fully green official run at the enlarged gate count: **769 enforced gates pass, 0 fail**, and
+the hosted x86_64 live-desktop job passed at the same commit. Reaching it took five gate-side
+fixes (h79 PowerShell 5.1 JSON unwrap, h60 idle-frame baseline and held-rect comparisons,
+h75 overlay find, h25 warp poll, h15 setup poll), each root-caused against daemon logs and
+per-gate evidence: the harness was racing the event-driven runtime's deferred effects, not
+finding product bugs. The diagnosis and the open event-chain-latency question are recorded
+in [live-gate-notes.md](../live-gate-notes.md).
 Lane V's H62-H65 rows no longer rest on unit tests alone: the 2026-10-27 cycle passed
 every enforced gate, and its record names the h78 cursor-hiding, h31 focus-history and H65
 tab sets explicitly. The rows keep `partial` only for the Windows approximations and
