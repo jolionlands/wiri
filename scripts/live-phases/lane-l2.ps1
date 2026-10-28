@@ -41,7 +41,7 @@
     $l2Config = @'
 input { mod-key "ctrl-alt"; }
 animations {
-    # Long enough for an outside observer to watch the overlay's alpha go down.
+    // Long enough for an outside observer to watch the overlay's alpha go down.
     recent-windows-close { duration-ms 400; curve linear; }
 }
 layout {
@@ -120,8 +120,8 @@ window-rule {
     function L2WaitRecentHost([int]$timeoutMs = 2500) {
         $clock = [Diagnostics.Stopwatch]::StartNew()
         do {
-            $host = L2RecentHost
-            if ($host -ne [IntPtr]::Zero) { return $host }
+            $recentHost = L2RecentHost
+            if ($recentHost -ne [IntPtr]::Zero) { return $recentHost }
             Start-Sleep -Milliseconds 25
         } while ($clock.ElapsedMilliseconds -lt $timeoutMs)
         return [IntPtr]::Zero
@@ -518,20 +518,20 @@ public static class LaneL2Native {
             # recent-windows section, so the defaults (enabled) are in force.
             [LT]::Key(0x12, $false)
             Start-Sleep -Milliseconds 40
-            [LT]::Key(0x09, $true); Start-Sleep -Milliseconds 60; [LT]::Key(0x09, $false)
+            [LT]::Key(0x09, $false); Start-Sleep -Milliseconds 60; [LT]::Key(0x09, $true)
             $fadeHost = L2WaitRecentHost 2500
             $fadeOpened = ($fadeHost -ne [IntPtr]::Zero)
             if ($fadeOpened) {
                 # Escape cancels the session: the overlay closes, and that close is the
                 # fade the gate watches.  Alt is released afterwards, so the session
                 # cannot be kept alive by the modifier.
-                [LT]::Key(0x1B, $true); Start-Sleep -Milliseconds 40; [LT]::Key(0x1B, $false)
+                [LT]::Key(0x1B, $false); Start-Sleep -Milliseconds 40; [LT]::Key(0x1B, $true)
                 [LT]::Key(0x12, $true)
                 $clock = [Diagnostics.Stopwatch]::StartNew()
                 do {
-                    $host = L2RecentHost
+                    $recentHost = L2RecentHost
                     $alpha = -1
-                    if ($host -ne [IntPtr]::Zero) { $alpha = [LaneL2Native]::Alpha($host) }
+                    if ($recentHost -ne [IntPtr]::Zero) { $alpha = [LaneL2Native]::Alpha($recentHost) }
                     $fadeSamples += [pscustomobject]@{ at_ms = $clock.ElapsedMilliseconds; alpha = $alpha }
                     Start-Sleep -Milliseconds 8
                 } while ($clock.ElapsedMilliseconds -lt 2500)
@@ -578,6 +578,7 @@ public static class LaneL2Native {
         # A failed probe ends this lane only: its remaining gates stay false and the error is kept.
         $l2Details['error'] = ($_ | Out-String).Trim()
     } finally {
+        foreach ($key in 0x1B, 0x09, 0x12) { [LT]::Key($key, $true) }
         foreach ($h in $l2Forms) { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
         L2Stop 'lane-l2-quit'
         if ($null -ne $l2Process -and -not $l2Process.HasExited) { Stop-Process -Id $l2Process.Id -Force }

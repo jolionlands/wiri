@@ -93,6 +93,18 @@
             'hotkey-overlay { skip-at-startup; }' + "`n" +
             'config-notification { disable-failed; }' + "`n" + 'binds {}' + "`n"
     }
+    function CRReadLog {
+        # Redirected stderr remains open for writing while the daemon runs.
+        $stream = $null; $reader = $null
+        try {
+            $stream = [IO.File]::Open($crLog, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true)
+            return $reader.ReadToEnd()
+        } finally {
+            if ($null -ne $reader) { $reader.Dispose() }
+            elseif ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
     # Poll IPC and native geometry: >=3 matching samples over >=400ms, within
     # 2500ms. Rejection probes must retain good geometry for the ENTIRE window.
     function CRStable([int]$gap, [switch]$Retained) {
@@ -157,13 +169,13 @@
             })
             CRGate ('h66_range_' + $case.id + '_json') ($validation.rc -ne 0 -and $json.errors -gt 0 -and $errors.Count -eq 1) $json
 
-            $logBefore = [IO.File]::ReadAllText($crLog).Length
+            $logBefore = (CRReadLog).Length
             [IO.File]::WriteAllText($cfg, $candidate, $crUtf8)
             $reload = CtlRaw @('reload-config')
             $kept = CRStable 10 -Retained
             # IPC's summary names the key; the fresh daemon diagnostic includes
             # the rejected value in its source line, not in the short summary.
-            $freshLog = [IO.File]::ReadAllText($crLog).Substring($logBefore)
+            $freshLog = (CRReadLog).Substring($logBefore)
             $diagnostic = $freshLog -match $case.source -and $freshLog -match [regex]::Escape($case.key) -and
                 $freshLog -match [regex]::Escape($case.reason)
             CRGate ('h66_range_' + $case.id + '_live_rejected_keeps_good') ($reload.rc -ne 0 -and $reload.text -match [regex]::Escape($case.key) -and $diagnostic -and $kept.pass) @{

@@ -155,10 +155,14 @@ function H20RScope([byte]$key, [long]$scope) {
 }
 
 function H20RReloadConfig([string]$text, [string]$tag) {
-    # The daemon watches its config file, so the write can trigger a reload of its own.
-    # The gate waits for the daemon's own confirmation line: the IPC reply can be sent
-    # before the new config is in use, so the reply alone proves nothing.
+    # Drain the write-triggered reload before requesting the explicit one. Otherwise the
+    # watcher's trailing-edge reload can cancel a switcher opened after the IPC reload.
+    # Both acknowledgements come from the daemon: the IPC reply alone proves nothing.
+    $watchedBefore = @(LogLines $h20rLog 'Config file changed').Count
     [IO.File]::WriteAllText($cfg, $text, (New-Object Text.UTF8Encoding($false)))
+    if (-not (H20RWait { @(LogLines $h20rLog 'Config file changed').Count -gt $watchedBefore } 2500)) {
+        return $false
+    }
     $before = @(LogLines $h20rLog 'Config reloaded successfully').Count
     $null = Ctl $tag @('reload-config')
     return (H20RWait { @(LogLines $h20rLog 'Config reloaded successfully').Count -gt $before } 2500)
@@ -476,7 +480,7 @@ recent-windows {
         # The chord of the disabled switcher: no host may appear while it is off.
         [LT]::Key(0x11, $false); [LT]::Key(0x12, $false)
         Start-Sleep -Milliseconds 40
-        [LT]::Key(0x77, $true)      # F8
+        H20RTap 0x77               # F8 down and up: the recorder observes KeyDown.
         Start-Sleep -Milliseconds 80
         [LT]::Key(0x12, $true); [LT]::Key(0x11, $true)
         $watch = H20RHostMax 2500
