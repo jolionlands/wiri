@@ -114,140 +114,190 @@ passes**: the applied-state cache can suppress calls even if an extra pass happe
 
 ### Identity, conditions and verification
 
-Completed required live invocation on **2026-10-25**, desktop steps
-10:38:56–10:51:41 PDT. Measured child PID **10696**, process creation
-**2026-10-25T17:50:48.4393252Z**, binary/source commit
-**`af3eb304b002d9f6608c969a341ce77d84db0881`** (`wiri-ctl 0.1.0 (commit af3eb30)`).
-Rust source is unchanged from `d84f04b`; intervening commits only add/fix observers.
-This document is written after the live-tested collector commit, not evidence of a
-subsequent runtime optimization.
+Completed required live invocation on **2026-10-27**, local date verified with `Get-Date`
+on TRIDARIS immediately before this record was written. (One request for this update named
+2026-10-28; TRIDARIS reported `2026-10-27T18:10:29-07:00`, so that request was wrong and is
+not carried into the record.) Binary/source commit
+**`cc3920dffd295a4d494516fc97a8e241b3da7d62`** (`style(fmt)`: rustfmt drift in a layout
+engine test assertion), one commit above **`0ebdebf`**.
 
-- **Machine:** TRIDARIS, Intel Core i5-8350U @ 1.70 GHz, 4 cores / 8 logical processors;
-  native x64 collector, rustc 1.95. One 1366×768 display, work area `(0,0)-(1366,728)`.
-- **OS as measured by CIM:** Windows 11 **Pro 10.0.22631** (build 22631).
-  Earlier parity reports call this laptop Home/build 26200; that is **not the version
-  reported by this run**. Do not silently carry their OS description into this baseline.
-- **Desktop:** 49 managed windows including the two sentinels; other tenants' terminals,
-  browser and tools were left running, not created as a benchmark workload or stopped.
-  One sentinel was parked at visible-frame `(4,836)-(435,1540)`; the other tiled at
-  `(923,12)-(1354,716)`. No expectation that both fit the current strip viewport.
-- **Sampling:** one valid fresh process start, one 30 s idle interval, one resource
-  observation per endpoint, ten confirmed alternating maximize keys, two actions each
-  for width/fullscreen/column swap. No load, stress or soak run; no cache flushing.
-- **Release validation:** build, test and all-target check passed with `RUSTFLAGS=-D warnings`
-  and `-j 2`; **872 library + 4 CLI tests passed**, one ignored documentation example.
-  Collector self-check passed, including reading a log while its writer remains open.
-- **Existing live-report verdicts:** **277 pass, 0 fail, 31 information entries**, using
-  the repository's unchanged `scripts/live-report.py` rules. No step had a nonzero
-  numeric return code. The expected-False crash-record check was False; IPC timeouts,
-  settled positioning and ordinary-form overlap were zero. All **46 `p_*` fields are
-  numeric and classify as information**; collector errors = 0.
-- **Do not hide the terminal anomaly:** `h9_overlapping_terminal_pairs = 1`, an
-  informational numeric entry in the existing report (not an enforced pass/fail rule).
-  Its saved rectangles show an **11 px visible-frame overlap** between `(-10,12)-(456,716)`
-  and `(445,12)-(911,716)`, both 466 px wide. The preceding completed run also recorded
-  one pair. H9 occurs **before** Lane E starts; neither the gate nor runtime was changed.
-  This is follow-up product/harness work, not an all-clear claim about terminal geometry.
+**The event-driven perf pass (`0ebdebf`: bounded tokio runtime, event-driven main loop,
+event-woken backend handler, event-armed reconcile, lazy indicator pump) is what this
+baseline now measures** — not the `af3eb30` runtime the previous record measured. The
+`af3eb30` numbers survive only as the delta column below; their raw per-thread and
+per-action tables are replaced by these deltas and remain in git history. This document is
+written after the live-tested commit, not evidence of a later runtime optimization.
+
+- **Machine:** TRIDARIS, Intel Core i5-8350U @ 1.70 GHz, 4 cores / 8 logical processors,
+  23.84 GiB visible memory; native x64 collector, rustc 1.95.0. One 1366×768 display,
+  work area `(0,0)-(1366,728)` at 96 DPI.
+- **OS as measured by CIM:** Windows 11 **Pro 10.0.22631** (build 22631) — the same reading
+  as the `af3eb30` record. Earlier parity reports call this laptop Home/build 26200; that
+  is **not** the version reported by this run either. Do not silently carry their OS
+  description into this baseline.
+- **Desktop and sampling:** one valid fresh process start, one 30 s idle interval, one
+  resource observation per endpoint, ten confirmed alternating maximize keys,
+  `p_collector_errors = 0`. No load, stress or soak run and no cache flushing. The run
+  record handed to this documentation lane does **not** state the managed-window count or
+  which other tenants were running (the `af3eb30` record had 49 managed windows). The
+  resource endpoints below are therefore a same-machine comparison, **not a
+  population-matched one**.
+- **Release validation:** `cargo build --release -j 2` clean with 0 warnings,
+  `cargo test --release -j 2` = **1792 passed / 0 failed / 1 ignored doctest**, and
+  `cargo check --release --all-targets` clean. The test population has grown well past the
+  `af3eb30` record's 872 library + 4 CLI tests (later lanes added suites), so test counts
+  are not like-for-like either.
+- **Live-report verdicts:** **761 of 761 enforced gates passed, 0 failed**, 88 further
+  information entries, 849 report cells, using the repository's unchanged
+  `scripts/live-report.py` rules. `hidden_json_present_after_restart = False` is
+  **expected-pass** semantics (the crash record is deleted once the windows are back), not
+  a failure. IPC timeouts, observation timeouts and placement failures were zero; collector
+  errors zero. The `af3eb30` record had 277 enforced gates and 31 information entries, so
+  **compare the pass/fail ratio, not the totals**: a large number of gates has been added
+  since.
+- **Previously failing gates now pass:** all six `h78_*` cursor-hiding gates
+  (`hide_when_typing_dry_run`, `hide_when_typing_real_value_unchanged`,
+  `cursor_hides_after_inactive_ms`, `cursor_shows_on_pointer_movement`,
+  `cursor_restored_on_quit`, `tablet_stylus_bind_decode_and_registration`), all five `h31`
+  focus-history gates including `h31_history_crosses_workspaces`, and all Lane V tab gates
+  (`h65`). These are the evidence the parity rows cite; the Windows approximations those
+  rows record are unchanged.
+- **Not recorded by this run:** binary SHA-256 identities, the managed-window population,
+  the per-thread idle attribution table, the largest key-observation gap, the
+  window-owner thread table and the `h9_overlapping_terminal_pairs` numeric entry. The
+  `af3eb30` record carried all of them. Their absence is a gap in **this** record, not
+  evidence that those measurements improved.
+
+### Deltas against the `af3eb30` baseline
+
+| Measurement | `af3eb30` | `cc3920d` | Change |
+| --- | ---: | ---: | ---: |
+| OS process creation → complete first IPC reply | 182.8974 ms | **64.11 ms** | −118.7874 ms (−64.95%) |
+| OS process creation → first observed sentinel tiling | 147.4223 ms | **64.26 ms** | −83.1623 ms (−56.41%) |
+| `Process.Start` call duration | 9.1495 ms | **4.95 ms** | −4.1995 ms (−45.90%) |
+| Idle process CPU, kernel + user | 437.500 ms | **0 ms** | −437.5 ms (below one 15.625 ms counter increment) |
+| Idle CPU as percent of one core | 1.457588% | **0%** | −1.457588 points |
+| Idle thread context switches | 321.935/s (endpoint lower bound) | **9.16/s** | −312.775/s (−97.15%) |
+| Idle endpoint new / exited threads | 2 / 3 | **2 / 3** | unchanged |
+| Idle engine `Positioning window` lines | 0 | **0** | unchanged |
+| SendInput → first changed target rectangle, median | 23.68405 ms | **20.17 ms** | −3.51405 ms (−14.84%) |
+| SendInput → first changed target rectangle, max | 24.9869 ms | **24.10 ms** | −0.8869 ms (−3.55%) |
+| Confirmed hotkey samples / timeouts | 10 / 0 | **10 / 0** | unchanged |
+| Threads, startup endpoint | 24 | **14** | −10 (−41.67%) |
+| Threads, after actions | 26 | **15** | −11 (−42.31%) |
+| Handles, startup endpoint | 235 | **220** | −15 (−6.38%) |
+| Handles, after actions | 278 | **239** | −39 (−14.03%) |
+| Private bytes, startup endpoint | 3,862,528 (3.684 MiB) | **8,511,488 (8.117 MiB)** | +4,648,960 (+120.36%) |
+| Private bytes, after actions | 4,521,984 (4.312 MiB) | **8,523,776 (8.129 MiB)** | +4,001,792 (+88.50%) |
+| Working set, startup endpoint | 14,716,928 (14.035 MiB) | **25,145,344 (23.980 MiB)** | +10,428,416 (+70.86%) |
+| Working set, after actions | 18,432,000 (17.578 MiB) | **27,037,696 (25.785 MiB)** | +8,605,696 (+46.69%) |
+| `wiri.exe` | 6,698,496 (6.388 MiB) | **8,965,120 (8.550 MiB)** | +2,266,624 (+33.84%) |
+| `wiri-ctl.exe` | 3,220,480 (3.071 MiB) | **4,022,784 (3.836 MiB)** | +802,304 (+24.91%) |
+| `maximize-column` successful `SetWindowPos [sync]` lines, median | 3 | **3** | unchanged |
+| Enforced gates passed / failed | 277 / 0 | **761 / 0** | gate population grew |
+| Information entries beside the enforced gates | 31 | **88** | — |
+
+Three of those deltas need plain words rather than a headline:
+
+1. **Idle is the measured win, and it is large.** In the same 30 s window the process used
+   less CPU than the collector's 15.625 ms counter increment can resolve, and the
+   endpoint context-switch lower bound fell from 321.935/s to 9.16/s. `0 ms` is a
+   **quantization floor, not proof of zero work**; the definitions above still apply — one
+   uncontrolled interval, an endpoint lower bound that cannot see threads born and exited
+   between snapshots, and context switches that are not timer wakeups.
+2. **Resource breadth fell too.** Threads dropped from 24/26 to 14/15 and handles from
+   235/278 to 220/239 at the same two endpoints, which is what a bounded runtime replacing
+   the default worker set looks like from outside.
+3. **Memory endpoints are higher and this record does not explain why.** Private bytes rose
+   120.36% / 88.50% and working set 70.86% / 46.69%, and both release binaries also grew
+   (+33.84% `wiri.exe`, +24.91% `wiri-ctl.exe`). Without the managed-window count and the
+   per-thread attribution the `af3eb30` record carried, this cannot be attributed to the
+   runtime change, to a different window population, or to ordinary code growth. It is
+   recorded as an unmeasured difference and a follow-up — **not a leak claim in either
+   direction**, and not a claim that the memory work of Phase 4 is done.
 
 ### Resource endpoints
 
 | Resource | Startup, after 5 s settle | After actions + 5 s settle |
 | --- | ---: | ---: |
-| Private bytes | 3,862,528 (3.684 MiB) | 4,521,984 (4.313 MiB) |
-| Working set bytes | 14,716,928 (14.035 MiB) | 18,432,000 (17.578 MiB) |
-| Threads | 24 | 26 |
-| Handles | 235 | 278 |
-| GDI objects | 3 | 3 |
-| USER objects | 38 | 42 |
+| Private bytes | 8,511,488 (8.117 MiB) | 8,523,776 (8.129 MiB) |
+| Working set bytes | 25,145,344 (23.980 MiB) | 27,037,696 (25.785 MiB) |
+| Threads | 14 | 15 |
+| Handles | 220 | 239 |
+| GDI objects | not recorded this run | not recorded this run |
+| USER objects | not recorded this run | not recorded this run |
 
-These endpoints include startup probes and normal IPC; the idle window starts after
-startup IPC and a screenshot. The after-minus-startup increases are **not evidence
-of a leak**: this single short sequence exercises lazy resources and Tokio blocking
-workers, without proving they return to a long-term plateau.
+These endpoints include startup probes and normal IPC. The after-minus-startup increases are
+**not evidence of a leak**: this single short sequence exercises lazy resources, without
+proving they return to a long-term plateau.
 
 ### Idle (no harness input or IPC)
 
 | Measurement | Result |
 | --- | ---: |
-| Elapsed | 30.015335 s |
-| Process CPU, kernel + user | 437.500 ms |
-| CPU as percent of one core | **1.457588%** |
-| Thread context switches | 9,663 counted; **321.935/s lower bound** |
+| Elapsed (`p_idle_seconds`) | 30.0 s |
+| Process CPU, kernel + user (`p_idle_cpu_ms`) | 0 ms — below the 15.625 ms counter increment |
+| CPU as percent of one core (`p_idle_one_core_percent`) | 0% |
+| Thread context switches (`p_idle_context_switches_per_s`) | 9.16/s, endpoint lower bound |
 | Endpoint-visible new / exited threads | 2 / 3 |
-| Last-input tick before / after | 70,923,579 / 70,923,579 (unchanged) |
-| Engine `Positioning window` lines | **0** |
+| Engine `Positioning window` lines (`p_idle_positioning_lines`) | **0** |
+| Per-thread attribution | not recorded this run |
 
-The unchanged input tick makes this an input-free observation, **not an isolated
-machine**. External window events, other tenants' builds, scheduling, power policy,
-thermal state, timer coalescing and debug logging are uncontrolled. One interval
-cannot establish a distribution or causally attribute the process CPU to individual
-pollers. CPU counters here are visibly quantized in 15.625 ms increments.
-
-Window-owner mapping gives one useful, limited attribution:
-
-| Dedicated owner thread | CPU in 30.015335 s | Context switches |
-| --- | ---: | ---: |
-| Hidden workspace indicator, TID 30472 | **46.875 ms** (0.156170% of one core) | **2,534** (84.424/s) |
-| Hidden overview banner, TID 18344 | 0 ms | 0 |
-| Hidden cheatsheet, TID 3288 | 0 ms | 0 |
-| Tray owner, TID 36256 | 0 ms | 0 |
-| Hotkey owner, TID 23632 | 0 ms | 0 |
-
-The indicator thread's total includes any IME/system message activity; this is not
-proof that every switch was `WM_TIMER`. It alone accounts for ~10.7% of the process
-CPU observed here. Do not divide the remaining CPU between the reconciler/main pump/
-mouse/animation tasks by their nominal frequencies; there is no such instrumentation.
+The absent per-thread table is the important gap: the `af3eb30` record could attribute
+84.424/s of its 321.935/s to the hidden workspace indicator alone. **Do not transfer that
+attribution to this run**, and do not read the 9.16/s as "the indicator is event-driven
+now" — no per-thread counter was collected here. External window events, other tenants'
+builds, scheduling, power policy, thermal state, timer coalescing and debug logging remain
+uncontrolled; one interval cannot establish a distribution.
 
 ### Startup and key-to-rectangle observation
 
 | Measurement | Samples | Result |
 | --- | ---: | ---: |
-| OS process creation → complete first IPC reply | 1 | **182.8974 ms** |
-| OS process creation → first observed sentinel tiling | 1 | **147.4223 ms** |
-| `Process.Start` call duration | 1 | 9.1495 ms |
-| IPC / layout observer began after process creation | 1 each | 5.6561 / 10.1010 ms |
-| SendInput → first changed target rectangle | **10 confirmed** | **median 23.68405 ms; max 24.9869 ms** |
-| Invalid injections / observation timeouts | 10 attempted | 0 / 0 |
-| Largest gap between rectangle observations | 10 keys | **17.2182 ms** |
+| OS process creation → complete first IPC reply (`p_cold_first_ipc_ms`) | 1 | **64.11 ms** |
+| OS process creation → first observed sentinel tiling (`p_cold_first_layout_ms`) | 1 | **64.26 ms** |
+| `Process.Start` call duration (`p_cold_start_call_ms`) | 1 | 4.95 ms |
+| SendInput → first changed target rectangle | **10 confirmed** (`p_hotkey_samples`) | **median 20.17 ms; max 24.10 ms** |
+| Invalid injections / observation timeouts (`p_hotkey_timeouts`) | 10 attempted | 0 / 0 |
+| Largest gap between rectangle observations | 10 keys | not recorded this run |
 
-Raw key latencies (ms, in order):
-`24.9869, 17.3199, 23.4133, 23.9276, 24.5764, 24.0607, 21.7286, 23.4405, 23.9343, 23.4350`.
-Every key accepted all eight input events and kept the target foreground. Width
-alternated between native-frame 445 px and 1,356 px, with >=600 ms settling per key.
-The wide observer gaps mean these **upper bounds cannot decide whether the native
-placement happened within 16 ms**. No timer-resolution change was made. Use a
-WinEvent/ETW acknowledgement observer, still external to wiri, before enforcing a
-sub-frame latency gate; neither DWM presentation nor exact call-entry timing is known.
+The 20.17 ms median is inside the previous record's 23.68405 ms but still above the
+**unenforced** one-frame budget discussed under "Proposed Phase 4 budgets" below
+(`p_hotkey_move_max_ms = 24.10` is above it as well). Nothing in this record changes that:
+a WinEvent/ETW acknowledgement observer, still external to wiri, remains the prerequisite
+before any sub-frame latency gate can be enforced.
 
 ### Logged positioning work per representative action
 
-| Action | Confirmed samples | Successful `SetWindowPos [sync]` lines, per action | Median | Engine placement-intention lines |
-| --- | ---: | --- | ---: | --- |
-| `maximize-column` (real chord, alternating) | 10 | 3 on every key (max 3) | **3** | 3 each |
-| `set-column-width 600`, then `400` (IPC, explicit target) | 2 | 3, 3 | **3** | 3, 3 |
-| `fullscreen-window` on/off (IPC, explicit target) | 2 | 4, 3 | **3.5** | 3, 3 |
-| `move-column-left`, then right (IPC, from a non-boundary column) | 2 | 2, 2 | **2** | 2, 2 |
-
-Capture intervals were 611.97–649.39 ms, including the 600 ms post-action settle.
-All recorded fallback/failure-line deltas were zero. The counts concern **all 49
-managed windows**, not just the sentinel; moving neighbour tiles can be necessary.
-They do not demonstrate redundant layout passes or three calls on the same target.
-The isolated final debug log was 51,527 bytes, so no log rotation occurred.
+Only the maximize transition was recorded per action in this run
+(`p_maximize_setwindowpos_lines_median = 3`): ten confirmed keys, **3 successful
+`SetWindowPos [sync]` lines on every key**. Width/fullscreen/column-swap counts and the
+engine `Positioning window` per-action lines were not recorded this run. The `af3eb30`
+record kept them; treat the three-per-maximize figure as the only like-for-like placement
+number here, and the definitions above as unchanged: these are successful logged placement
+calls over all managed windows, not an exhaustive native API trace and not a layout-pass
+count.
 
 ### Executables
 
 | Release executable | Bytes | MiB | SHA-256 |
 | --- | ---: | ---: | --- |
-| `wiri.exe` | **6,698,496** | 6.388 | `9AD042E896249F4EF6A7311B842416075C968EF6885C7A0AAA9EA627CF5257DE` |
-| `wiri-ctl.exe` | **3,220,480** | 3.071 | `C2BCA4BFF5083138DC48372CEF325DF2F43348772E77EA61C6F5B695348BCC18` |
+| `wiri.exe` | **8,965,120** | 8.550 | not recorded this run |
+| `wiri-ctl.exe` | **4,022,784** | 3.836 | not recorded this run |
 
-Earlier attempts: one harness invocation was killed by the command runtime ceiling
-after queue wait + H14; a completed run of `83e4901` kept summary serialization working
-but its perf phase stopped at an open-log sharing error and its same-row layout
-predicate timed out on a legitimately parked sentinel. Those incomplete perf
-measurements are **not pooled** with this baseline. `af3eb30` fixes the collector,
-not wiri's runtime. Independent repeated normal runs and an ARM64 measurement remain
-necessary before claiming stable budgets.
+Both binaries are **larger** than the `af3eb30` record (+2,266,624 B and +802,304 B). This
+baseline does not claim a binary-size win and does not explain the growth.
+
+### Earlier attempts and history
+
+Unchanged from the previous record: one harness invocation was killed by the command runtime
+ceiling after queue wait + H14; a completed run of `83e4901` kept summary serialization
+working but its perf phase stopped at an open-log sharing error and its same-row layout
+predicate timed out on a legitimately parked sentinel. Those incomplete perf measurements
+are **not pooled** with this baseline, and neither are they pooled with the `af3eb30` one.
+`af3eb30` fixed the collector, not wiri's runtime. Independent repeated normal runs and an
+ARM64 measurement remain necessary before claiming stable budgets, and the endpoints above
+still lack the population control that would make the memory comparison conclusive.
 
 ## Lane K transient compositor checkpoint (2026-10-26)
 
