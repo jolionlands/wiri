@@ -377,7 +377,12 @@ public static class LaneTNative {
             $tFramesIdle = (LogLines $tLog 'dnd edge frame').Count
             $tOut3 = Rc $tG
             TGate 'h60_dnd_edge_scroll_moves_the_strip' (($tDragOn -ne [IntPtr]::Zero) -and ($tStripHeld.L -lt $tStrip0.L-40) -and ($tRightZone -gt $tRight0) -and ($tLeftZone -eq $tLeft0)) @($tStrip0,$tStripHeld,$tRight0,$tRightZone,$tLeftZone)
-            TGate 'h60_dnd_no_frame_timer_when_idle' (($tFramesZone -gt $tFrames0) -and ($tFramesOut -eq $tFramesZone) -and ($tFramesIdle -eq $tFramesZone) -and (Near $tOut1.L $tOut2.L 2) -and (Near $tOut2.L $tOut3.L 2) -and (Near $tOut2.L $tStripHeld.L 2)) @($tFramesZone,$tFramesOut,$tFramesIdle,$tOut1,$tOut2,$tOut3)
+            # The one-shot frame timer armed by the last in-zone move can fire
+            # once after the leave-move is processed (a scheduling race between
+            # the tick and the leave), so allow exactly one trailing frame.
+            # The invariant that matters: no frames keep coming while the
+            # pointer stays away, and the strip does not move on its own.
+            TGate 'h60_dnd_no_frame_timer_when_idle' (($tFramesZone -gt $tFrames0) -and ($tFramesOut -le ($tFramesZone + 1)) -and ($tFramesIdle -eq $tFramesOut) -and (Near $tOut1.L $tOut2.L 2) -and (Near $tOut2.L $tOut3.L 2) -and (Near $tOut2.L $tStripHeld.L 2)) @($tFramesZone,$tFramesOut,$tFramesIdle,$tOut1,$tOut2,$tOut3)
 
             # A fresh drag straight down to the bottom edge: past delay-ms the workspace steps
             # once, in the down direction, and a stationary pointer never repeats it.

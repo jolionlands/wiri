@@ -170,10 +170,21 @@
         # together with the arguments that action's own parser accepts, so a new
         # niri action is bound and run by these two gates without anyone editing
         # this script.  One gate per half, not one per action.
-        $catalog = [LaneHNative]::RunCli($ctl, @('action-names','--json'), $null, 10000)
+        # 30s: the first execution of a freshly built wiri-ctl.exe can stall in
+        # real-time scanner checks while the desktop is under cycle load.
+        $catalog = [LaneHNative]::RunCli($ctl, @('action-names','--json'), $null, 30000)
         [IO.File]::WriteAllText((Join-Path $bDir 'action-names.json'), $catalog.Out, $bUtf8)
         $actions = @()
-        try { $actions = @($catalog.Out | ConvertFrom-Json) } catch { }
+        try {
+            $catalogJson = $catalog.Out
+            # Strip a UTF-8 BOM if the pipe capture kept one.
+            if ($catalogJson.Length -gt 0 -and [int][char]$catalogJson[0] -eq 65279) { $catalogJson = $catalogJson.Substring(1) }
+            # Windows PowerShell 5.1 returns a top-level JSON array as a single
+            # wrapped object; unwrap it so the count sees every action.
+            $parsed = ConvertFrom-Json -InputObject $catalogJson
+            if ($parsed -is [System.Array]) { $actions = @($parsed) } else { $actions = @($parsed) }
+            if ($actions.Count -eq 1 -and $actions[0] -is [System.Array]) { $actions = @($actions[0]) }
+        } catch { }
         if ([string]$catalog.Rc -ne '0' -or $actions.Count -lt 50) {
             throw 'H79 action-names did not list the action vocabulary'
         }
