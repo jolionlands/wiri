@@ -41,7 +41,8 @@
     $l2Config = @'
 input { mod-key "ctrl-alt"; }
 animations {
-    recent-windows-close { duration-ms 120; curve linear; }
+    // Long enough for an outside observer to watch the overlay's alpha go down.
+    recent-windows-close { duration-ms 400; curve linear; }
 }
 layout {
     gaps 10
@@ -104,6 +105,35 @@ window-rule {
     # [LT]::Visible rectangle only has L/T/R/B: reading `.W` or `.H` from it gave $null, so every
     # width or height gate of this lane compared nothing with nothing.
     function L2Rect([IntPtr]$h) { return (Rc $h) }
+    # The recent-windows overlay host of THIS daemon (wiri's own switcher class).
+    function L2RecentHosts {
+        if ($null -eq $l2Process) { return @() }
+        foreach ($h in [LT]::TopLevel()) {
+            if ([LT]::Class($h) -eq 'WiriRecentWindowsHost' -and [LT]::Pid($h) -eq $l2Process.Id) { $h }
+        }
+    }
+    function L2RecentHost {
+        $hosts = @(L2RecentHosts)
+        if ($hosts.Count -eq 1) { return $hosts[0] }
+        return [IntPtr]::Zero
+    }
+    function L2WaitRecentHost([int]$timeoutMs = 2500) {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $recentHost = L2RecentHost
+            if ($recentHost -ne [IntPtr]::Zero) { return $recentHost }
+            Start-Sleep -Milliseconds 25
+        } while ($clock.ElapsedMilliseconds -lt $timeoutMs)
+        return [IntPtr]::Zero
+    }
+    function L2WaitNoRecentHost([int]$timeoutMs = 2500) {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            if (@(L2RecentHosts).Count -eq 0) { return $true }
+            Start-Sleep -Milliseconds 25
+        } while ($clock.ElapsedMilliseconds -lt $timeoutMs)
+        return (@(L2RecentHosts).Count -eq 0)
+    }
     function L2Near([int]$a, [int]$b, [int]$tol = 8) { return [Math]::Abs($a - $b) -le $tol }
     # The workspace number window-list reports for one window of an already fetched list.
     function L2WorkspaceOf($list, [IntPtr]$h) {
@@ -469,13 +499,74 @@ public static class LaneL2Native {
         $null = L2Action 'fullscreen-off' @('toggle-fullscreen')
         if ([LT]::IsWindow($full)) { L2Close $full }
 
-        # ---- recent-windows-close -----------------------------------------------------
-        # The option is decoded (not an unsupported-option warning) and a recent-windows
-        # session still opens and closes with the fade configured.
+        # ---- recent-windows-close: the overlay really fades out ------------------------
+        # The fade IS the host window's layered alpha: the host is created WS_EX_LAYERED
+        # and the fade timer lowers that alpha in 16 ms steps until it reaches zero, so
+        # the gate can watch it from outside.  A close that only destroys the window (no
+        # fade at all) cannot pass: the alpha never goes down, and it never takes the
+        # configured time to do so.
         $fadeWarnings = @(LogLines $l2Log 'recent-windows-close').Count
         $panics = @(LogLines $l2Log 'panicked').Count
         $stillUp = -not $l2Process.HasExited
-        L2Gate 'h76_recent_windows_close_fade' ($fadeWarnings -eq 0 -and $panics -eq 0 -and $stillUp) @{ warnings = $fadeWarnings; panics = $panics; alive = $stillUp }
+        $fadeDurationMs = 400
+        $fadeSamples = @()
+        $fadeOpened = $false
+        $fadeHostsGone = $false
+        if ([LT]::IsWindow($l2C)) {
+            L2Focus $l2C
+            # Alt+Tab is the default recent-windows chord: this config has no
+            # recent-windows section, so the defaults (enabled) are in force.
+            [LT]::Key(0x12, $false)
+            Start-Sleep -Milliseconds 40
+            [LT]::Key(0x09, $false); Start-Sleep -Milliseconds 60; [LT]::Key(0x09, $true)
+            $fadeHost = L2WaitRecentHost 2500
+            $fadeOpened = ($fadeHost -ne [IntPtr]::Zero)
+            if ($fadeOpened) {
+                # Escape cancels the session: the overlay closes, and that close is the
+                # fade the gate watches.  Alt is released afterwards, so the session
+                # cannot be kept alive by the modifier.
+                [LT]::Key(0x1B, $false); Start-Sleep -Milliseconds 40; [LT]::Key(0x1B, $true)
+                [LT]::Key(0x12, $true)
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                do {
+                    $recentHost = L2RecentHost
+                    $alpha = -1
+                    if ($recentHost -ne [IntPtr]::Zero) { $alpha = [LaneL2Native]::Alpha($recentHost) }
+                    $fadeSamples += [pscustomobject]@{ at_ms = $clock.ElapsedMilliseconds; alpha = $alpha }
+                    Start-Sleep -Milliseconds 8
+                } while ($clock.ElapsedMilliseconds -lt 2500)
+            } else {
+                [LT]::Key(0x12, $true)
+            }
+            $fadeHostsGone = L2WaitNoRecentHost 2500
+        }
+        # Only the samples with a readable alpha count: before the fade the host has no
+        # layered attributes yet, and after it the window is gone.
+        $valid = @($fadeSamples | Where-Object { $_.alpha -ge 0 })
+        $alphas = @($valid | ForEach-Object { [int]$_.alpha })
+        $maxAlpha = -1; $minAlpha = -1; $maxIndex = -1
+        for ($i = 0; $i -lt $alphas.Count; $i++) {
+            if ($maxAlpha -lt 0 -or $alphas[$i] -gt $maxAlpha) { $maxAlpha = $alphas[$i]; $maxIndex = $i }
+        }
+        if ($alphas.Count -gt 0) { $minAlpha = [int](($alphas | Measure-Object -Minimum).Minimum) }
+        # From the brightest sample on, the alpha may only go down: that is the fade.
+        $tail = @()
+        if ($maxIndex -ge 0) { $tail = @($alphas[$maxIndex..($alphas.Count - 1)]) }
+        $decreasing = $true
+        for ($i = 1; $i -lt $tail.Count; $i++) { if ($tail[$i] -gt $tail[$i-1]) { $decreasing = $false } }
+        $distinct = @($tail | Select-Object -Unique).Count
+        $tailSpan = -1
+        if ($valid.Count -ge ($maxIndex + 2)) { $tailSpan = $valid[-1].at_ms - $valid[$maxIndex].at_ms }
+        $fadeOk = $fadeOpened -and $valid.Count -ge 4 -and $maxAlpha -ge 200 -and $minAlpha -le 48 -and
+            $tail.Count -ge 3 -and $distinct -ge 3 -and $decreasing -and
+            ($tailSpan -ge [int]($fadeDurationMs * 0.4)) -and $fadeHostsGone
+        L2Gate 'h76_recent_windows_close_fade' ($fadeOk -and $fadeWarnings -eq 0 -and $panics -eq 0 -and $stillUp) @{
+            opened = $fadeOpened; samples = $fadeSamples.Count; valid_samples = $valid.Count
+            max_alpha = $maxAlpha; min_alpha = $minAlpha; distinct_tail = $distinct
+            decreasing = $decreasing; tail_span_ms = $tailSpan; configured_duration_ms = $fadeDurationMs
+            hosts_gone = $fadeHostsGone; warnings = $fadeWarnings; panics = $panics; alive = $stillUp
+            alpha_trace = @($fadeSamples | Select-Object -First 80)
+        }
 
         # ---- a bad argument list is refused by the same parser ------------------------
         # An expected refusal goes through CtlRaw: Ctl records every call as a step that must exit 0.
@@ -487,6 +578,7 @@ public static class LaneL2Native {
         # A failed probe ends this lane only: its remaining gates stay false and the error is kept.
         $l2Details['error'] = ($_ | Out-String).Trim()
     } finally {
+        foreach ($key in 0x1B, 0x09, 0x12) { [LT]::Key($key, $true) }
         foreach ($h in $l2Forms) { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
         L2Stop 'lane-l2-quit'
         if ($null -ne $l2Process -and -not $l2Process.HasExited) { Stop-Process -Id $l2Process.Id -Force }

@@ -105,3 +105,47 @@ before adding more polling elsewhere. Also worth noting: the h79 fixture has
 zero chord headroom (26 keys + F1-F6 = 32 keys × 4 modifier prefixes =
 exactly 128 bindable actions), so adding one bindable action requires
 widening the fixture in the same change.
+
+## PR #2 follow-up, 2026-10-28 (`wiri/live-gates-2`)
+
+The tridaris baseline at `c0509f4` recorded **763 passing / 19 failing gates**.
+The failures included fixture defects and one product defect; the fixes below
+retain the original behavioural assertions.
+
+- **h76 / `lane-l2.ps1`:** a `#` comment inside the generated KDL was invalid;
+  startup rejected the fixture and fell back to defaults. The missing layout
+  and window-rule settings caused a cascade of geometry/opacity failures.
+  Use KDL's `//` comment syntax. The recent-window fade probe also assigned to
+  PowerShell's read-only, case-insensitive `$Host` variable and sent Tab/Escape
+  key-up before key-down (`LT.Key(..., true)` means release). Rename the local
+  and send complete down/up taps, with releases in cleanup.
+- **h66 / `lane-c2.ps1`:** the baseline geometry and scale JSON check passed,
+  then `ReadAllText` threw a sharing violation on the running daemon's redirected
+  stderr. The catch marked the remaining checks false without running them.
+  Both reads now use a disposed stream with `FileShare.ReadWrite`. A non-desktop
+  reproduction on tridaris failed with the old read and read the exact appended
+  diagnostic with the new helper.
+- **h20 / `lane-a-recent.ps1`:** the disabled-switcher probe sent only F8 key-up,
+  so the key-down recorder never observed the intended input. Use the existing
+  complete-tap helper. A config write and explicit reload could also produce two
+  reloads; the delayed watcher reload cancelled a newly opened switcher. Drain
+  the write-triggered reload before requesting and acknowledging the explicit one.
+- **h80 / `src/overlay/hotkey_rows.rs`:** the curated overlay omitted registered
+  workspace navigation because `FocusWorkspacePrevious`/`FocusWorkspaceNext`
+  were not canonicalized to its `FocusWorkspaceUp`/`FocusWorkspaceDown` names.
+  This was a product bug exposed by the live gate. Add those aliases and the Rust
+  regression `registered_workspace_navigation_replaces_essential_placeholders`,
+  which uses the real action enum's Debug names and checks bound rows and
+  replacement of the essential placeholders.
+
+Verification on tridaris after these fixes: **62/62 affected live gates pass**
+(16 recent-window, 18 configuration, 19 layout, 9 pointer/overlay gates), with
+no runner errors or cleanup issues. The focused runner invokes the unchanged
+phase scripts using the main harness's native types, helpers, mutex and private
+profile. Evidence: `C:\wiri-dev\evidence\resume-focused-20261028-1948`.
+The interactive-desktop `cargo test --release -j 2` run with
+`RUSTFLAGS=-D warnings` passed **1,800 tests**, with one doctest ignored. The
+release build and all-target check also passed with warnings denied. The new
+overlay regression failed before the aliases and passed after them. All four
+phases that contained the baseline's 19 failures were retested; the full
+782-gate desktop cycle has not been rerun at this revision.

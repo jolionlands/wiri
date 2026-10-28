@@ -14,6 +14,8 @@
 #   h75_hotkey_overlay_shown_at_startup        the sheet appears at startup
 #   h75_hotkey_overlay_skip_at_startup         `hotkey-overlay { skip-at-startup }` suppresses it
 #   h75_hotkey_overlay_hide_not_bound          `hide-not-bound` drops the unbound placeholders
+#   h80_curated_hotkeys_render                curated core titles appear on the painted sheet
+#   h80_hotkey_overlay_title_per_bind         explicit markup title appears; null stays bound but hidden
 #   h75_toggle_touchpad_event_dry_run          `toggle-touchpad` emits TouchpadToggled {on} both ways
 #   h75_pointer_settings_dry_run_audit         the audit file names exactly the writes it would make
 #   h75_pointer_settings_restore_on_quit       quitting records the restores of those settings
@@ -26,7 +28,8 @@
     $pGates = @('h75_hotkey_overlay_shown_at_startup', 'h75_hotkey_overlay_skip_at_startup',
         'h75_hotkey_overlay_hide_not_bound', 'h75_toggle_touchpad_event_dry_run',
         'h75_pointer_settings_dry_run_audit', 'h75_pointer_settings_restore_on_quit',
-        'h75_pointer_settings_real_values_unchanged')
+        'h75_pointer_settings_real_values_unchanged', 'h80_curated_hotkeys_render',
+        'h80_hotkey_overlay_title_per_bind')
     foreach ($pGate in $pGates) { $summary[$pGate] = $false }
     $pDetails['gates'] = @($pGates)
     function PGate([string]$name, [bool]$pass, $observed) {
@@ -165,6 +168,103 @@
         }
         $null = $daemon.Process.WaitForExit(4000)
     }
+    # These probes need the actual GDI-painted text, not a second implementation of
+    # curated_rows over get-bindings. Windows OCR reads a retained screen capture;
+    # unavailable OCR or unreadable text fails closed (never a skipped/pass gate).
+    function PAwaitWinRT($operation, [type]$resultType, [DateTime]$deadline) {
+        $method = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+            $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and
+            $_.GetGenericArguments().Count -eq 1 -and $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+        } | Select-Object -First 1
+        $task = $method.MakeGenericMethod($resultType).Invoke($null, @($operation))
+        $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0 -or -not $task.Wait($remaining)) { throw 'Lane P OCR operation timed out' }
+        return $task.Result
+    }
+    function POverlayText([IntPtr]$window, [string]$path, [DateTime]$deadline) {
+        $bounds = [LanePNative]::Bounds($window)
+        $bitmap = New-Object Drawing.Bitmap ($bounds[2] - $bounds[0]), ($bounds[3] - $bounds[1])
+        try {
+            $graphics = [Drawing.Graphics]::FromImage($bitmap)
+            try {
+                $graphics.CopyFromScreen($bounds[0], $bounds[1], 0, 0, $bitmap.Size)
+                $bitmap.Save($path, [Drawing.Imaging.ImageFormat]::Png)
+            } finally { $graphics.Dispose() }
+        } finally { $bitmap.Dispose() }
+        $file = PAwaitWinRT ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile]) $deadline
+        $stream = PAwaitWinRT ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream]) $deadline
+        try {
+            $decoder = PAwaitWinRT ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder]) $deadline
+            $software = PAwaitWinRT ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]) $deadline
+            try {
+                $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage((New-Object Windows.Globalization.Language 'en-US'))
+                if ($null -eq $engine) { throw 'English Windows OCR is unavailable' }
+                $result = PAwaitWinRT ($engine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult]) $deadline
+                return $result.Text
+            } finally { $software.Dispose() }
+        } finally { $stream.Dispose() }
+    }
+    function PContentProbe([string]$name, [string]$configText, $expectedTitles, [int]$expectedRows) {
+        $stderr = Join-Path $pDir ($name + '.stderr')
+        [IO.File]::WriteAllText((Join-Path $pDir ($name + '.kdl')), $configText)
+        $env:WIRI_PIPE = '\\.\pipe\wiri_live_p_' + $PID + '_' + [Guid]::NewGuid().ToString('N')
+        $savedDry = $env:WIRI_POINTER_SETTINGS_DRY_RUN
+        $audit = Join-Path $pDir ($name + '-pointer-audit.ndjson')
+        try {
+            $env:WIRI_POINTER_SETTINGS_DRY_RUN = $audit
+            $process = Start-WiriWithConfig $configText $stderr -NoDefaultBinds
+        } finally { $env:WIRI_POINTER_SETTINGS_DRY_RUN = $savedDry }
+        $daemon = [pscustomobject]@{ Name = $name; Process = $process; Pipe = $env:WIRI_PIPE; Stderr = $stderr }
+        $pDaemons.Add($daemon)
+        $pDaemonRecords.Add([ordered]@{ name = $name; pid = $process.Id; pipe = $daemon.Pipe; audit = $audit })
+        $pDetails['daemons'] = $pDaemonRecords.ToArray()
+        $connection = $null
+        try {
+            $connection = New-Object LaneHConnection $daemon.Pipe, $process.Id
+            $bindingsReply = PRequest $connection @{ type = 'get_bindings' }
+            if (-not $bindingsReply.success) { throw 'get-bindings failed' }
+            $bindings = @($bindingsReply.result)
+            # PS 5.1 can wrap the top-level JSON array in one scalar object.
+            if ($bindings.Count -eq 1 -and $bindings[0] -is [System.Array]) { $bindings = @($bindings[0]) }
+            $null = PAction $connection 'show-hotkey-overlay'
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $window = [IntPtr]::Zero
+            $rows = -1
+            $text = ''
+            $missing = @($expectedTitles)
+            $ocrError = $null
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            $capture = Join-Path $pDir ($name + '.png')
+            do {
+                $log = PReadText $stderr
+                $hits = [regex]::Matches($log, 'toggling cheatsheet with (\d+) rows \(hide-not-bound true\)')
+                if ($hits.Count -gt 0) { $rows = [int]$hits[$hits.Count - 1].Groups[1].Value }
+                # Find belongs INSIDE the poll: the log can precede HWND creation.
+                $window = [LanePNative]::Find($process.Id, 'WiriBindingsCheatsheet')
+                if ($window -ne [IntPtr]::Zero -and $rows -eq $expectedRows) {
+                    try {
+                        $text = POverlayText $window $capture $deadline
+                        $missing = @($expectedTitles | Where-Object { $text.IndexOf($_, [StringComparison]::Ordinal) -lt 0 })
+                        $ocrError = $null
+                        if ($missing.Count -eq 0) { break }
+                    } catch { $ocrError = [string]$_ }
+                }
+                Start-Sleep -Milliseconds 200
+            } while ($clock.ElapsedMilliseconds -lt 15000)
+            return [ordered]@{
+                window = $window.ToInt64(); rows = $rows; expected_rows = $expectedRows
+                expected_titles = @($expectedTitles); missing_titles = $missing; rendered_text = $text
+                bindings = $bindings; capture = $capture; ocr_error = $ocrError
+                log = @($log -split "`r?`n" | Where-Object { $_ -match 'toggling cheatsheet' })
+                pass = ($window -ne [IntPtr]::Zero -and $rows -eq $expectedRows -and
+                    $missing.Count -eq 0 -and $null -eq $ocrError)
+            }
+        } finally {
+            if ($connection) { $connection.Dispose() }
+            PStopDaemon $daemon
+        }
+    }
     # The precision touchpad values the backend can write, read the same way it reads them.
     function PRealSettings {
         $mouse = [LanePNative]::MouseThresholds()
@@ -215,6 +315,13 @@ public static class LanePNative {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    struct RECT { public int Left, Top, Right, Bottom; }
+    public static int[] Bounds(IntPtr h) {
+        RECT r;
+        if (!GetWindowRect(h, out r)) throw new InvalidOperationException("Overlay bounds unavailable");
+        return new int[] { r.Left, r.Top, r.Right, r.Bottom };
+    }
     [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll", SetLastError = true)] static extern bool SystemParametersInfoW(uint action, uint param, [In, Out] int[] data, uint flags);
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
@@ -401,6 +508,80 @@ input {
         PGate 'h75_pointer_settings_restore_on_quit' ($pExpect.Count -ge 1 -and $pRestoreWrong.Count -eq 0) ([ordered]@{
                 restored = $pRestored; wrong = $pRestoreWrong; lines = $pRestores
             })
+
+        # ---- 6. C27/C28: read the painted sheet, not merely the registered keymap ------
+        PCheckpoint 'checking-curated-overlay-content'
+        Add-Type -AssemblyName System.Drawing
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+        $null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+        $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+        $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+        $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Media.Ocr.OcrResult, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
+        # One chord for every ESSENTIAL plus the launcher. No defaults, aliases,
+        # placeholders or title overrides: these are curated_rows' core descriptions.
+        $pCore = @(
+            @('spawn "notepad.exe"', 'Launch application'),
+            @('close-window', 'Close window'),
+            @('focus-column-left', 'Focus column left'),
+            @('focus-column-right', 'Focus column right'),
+            @('focus-window-up', 'Focus window above'),
+            @('focus-window-down', 'Focus window below'),
+            @('move-column-left', 'Move column left'),
+            @('move-column-right', 'Move column right'),
+            @('consume-or-expel-window-left', 'Consume or expel window left'),
+            @('consume-or-expel-window-right', 'Consume or expel window right'),
+            @('maximize-column', 'Maximize column'),
+            @('fullscreen-window', 'Fullscreen window'),
+            @('toggle-window-floating', 'Toggle floating'),
+            @('toggle-overview', 'Overview'),
+            @('focus-workspace-up', 'Previous workspace'),
+            @('focus-workspace-down', 'Next workspace'),
+            @('show-hotkey-overlay', 'Important Hotkeys'),
+            @('quit', 'Exit wiri')
+        )
+        $pCoreConfig = "hotkey-overlay { skip-at-startup; hide-not-bound; }`nbinds {`n    extend-defaults false`n"
+        for ($i = 0; $i -lt $pCore.Count; $i++) {
+            $pCoreConfig += '    Ctrl+Alt+Shift+' + [char](65 + $i) + ' { ' + $pCore[$i][0] + "; }`n"
+        }
+        $pCoreConfig += "}`n"
+        $pCoreTitles = @($pCore | ForEach-Object { $_[1] })
+        $pCurated = PContentProbe 'curated-hotkeys' $pCoreConfig $pCoreTitles $pCore.Count
+        # Important Hotkeys also occurs in the header: demand the row copy too.
+        # Check registration as well, so placeholders cannot stand in for binds.
+        $pCurated['hotkeys_title_occurrences'] = [regex]::Matches($pCurated.rendered_text, 'Important Hotkeys').Count
+        $pCurated['registered_count'] = @($pCurated.bindings).Count
+        PGate 'h80_curated_hotkeys_render' ($pCurated.pass -and
+            $pCurated.hotkeys_title_occurrences -eq 2 -and
+            $pCurated.registered_count -eq $pCore.Count) $pCurated
+
+        PCheckpoint 'checking-per-bind-overlay-titles'
+        # The Windows GDI sheet renders markup literally, not as Pango formatting.
+        # Assert the complete supplied string, including tags; never strip markup
+        # in the test and thereby accidentally accept the default action title.
+        $pMarkupTitle = '<b>C28 Launch</b>'
+        $pTitleConfig = @'
+hotkey-overlay { skip-at-startup; hide-not-bound; }
+binds {
+    extend-defaults false
+    Ctrl+Alt+F9 hotkey-overlay-title="<b>C28 Launch</b>" { spawn "notepad.exe"; }
+    Ctrl+Alt+F10 hotkey-overlay-title=null { close-window; }
+}
+'@
+        $pTitles = PContentProbe 'per-bind-titles' $pTitleConfig @($pMarkupTitle) 1
+        # null does NOT unregister the bind: its binding-table row remains, but
+        # curated_rows omits it from the sheet altogether (not an empty title row).
+        $pTitles['null_binding'] = @($pTitles.bindings | Where-Object {
+            $_.vk_code -eq 0x79 -and $_.modifiers -eq 3 -and $_.action -eq 'CloseWindow'
+        })
+        $pTitles['titled_binding'] = @($pTitles.bindings | Where-Object {
+            $_.vk_code -eq 0x78 -and $_.modifiers -eq 3 -and $_.action -like 'Spawn*'
+        })
+        PGate 'h80_hotkey_overlay_title_per_bind' ($pTitles.pass -and
+            @($pTitles.bindings).Count -eq 2 -and $pTitles.null_binding.Count -eq 1 -and
+            $pTitles.titled_binding.Count -eq 1 -and $pTitles.rendered_text -notmatch 'Close window|Launch application') $pTitles
     } catch {
         $pDetails['error'] = ($_ | Out-String)
     } finally {
