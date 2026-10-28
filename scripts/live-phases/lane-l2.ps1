@@ -17,7 +17,9 @@
     $l2Gates = @(
         'h76_swap_window_right', 'h76_swap_window_left', 'h76_move_column_to_index',
         'h76_center_visible_columns', 'h76_preset_window_width_and_back',
-        'h76_preset_window_height_and_back', 'h76_move_window_down_or_to_workspace',
+        'h76_preset_window_height_and_back', 'h76_column_height_proportion_and_fixed',
+        'h76_column_height_survives_admission', 'h76_column_height_reset_returns_to_auto',
+        'h76_move_window_down_or_to_workspace',
         'h76_move_window_up_or_to_workspace', 'h76_move_column_or_to_monitor',
         'h76_toggle_window_rule_opacity', 'h76_focus_floating_and_tiling',
         'h76_switch_focus_between_layers', 'h76_empty_workspace_above_first',
@@ -253,6 +255,112 @@ public static class LaneL2Native {
         $heightBack = (L2Rect $below).H
         L2Gate 'h76_preset_window_height_and_back' ($heightNext -ne $heightStart -and $heightSecond -ne $heightNext -and (L2Near $heightBack $heightNext)) @{
             start = $heightStart; next = $heightNext; second = $heightSecond; back = $heightBack; presets = 'proportion 0.25, fixed 300, proportion 0.6'
+        }
+
+        # ---- column height modes: fixed, proportion, admission and reset ---------------
+        # `preset-window-heights { proportion 0.25; fixed 300; proportion 0.6; }` on top of the
+        # layout defaults (`gaps 10`, a 4 px border).  A tile is the window plus the border band
+        # on both sides, so a window that fills its tile measures `tile - 2 * border` px; the
+        # room a column has is the view height (work area less the outer gaps) less one window
+        # gap per neighbour.
+        # The tiles of the column of `$window`, top to bottom: window-list says which windows
+        # share the column, the real rectangles say how tall each one is.
+        function L2ColumnTiles([string]$tag, [IntPtr]$window) {
+            $list = L2List $tag
+            $found = @($list | Where-Object { [int64]$_.hwnd -eq [int64]$window })
+            if ($found.Count -ne 1) { throw "expected exactly one window-list entry for $window, got $($found.Count)" }
+            $mine = $found[0]
+            $tiles = New-Object System.Collections.ArrayList
+            foreach ($e in $list) {
+                if ($e.floating -or $e.minimized) { continue }
+                if ($e.workspace -ne $mine.workspace -or $e.column -ne $mine.column) { continue }
+                $h = [IntPtr][int64]$e.hwnd
+                if (-not [LT]::IsWindow($h)) { continue }
+                $r = Rc $h
+                [void]$tiles.Add([pscustomobject]@{ hwnd = [int64]$h; title = [string]$e.title; T = $r.T; B = $r.B; H = $r.H })
+            }
+            $sorted = @($tiles | Sort-Object -Property T)
+            return [pscustomobject]@{ workspace = $mine.workspace; column = $mine.column; count = $sorted.Count; tiles = $sorted }
+        }
+        # A `proportion` share of a column that has `$available` px of room, as the engine
+        # resolves it (proportion_px in src/input/mod.rs: the share of the view plus the gap,
+        # less the gap again), rounded half away from zero like Rust's f64::round.
+        function L2ProportionPx([int]$available, [int]$gap, [double]$share) {
+            return [int][Math]::Round($share * ($available + $gap) - $gap, [MidpointRounding]::AwayFromZero)
+        }
+        $l2Gap = 10
+        $l2Border = 4
+        $l2ViewH = [int]$swa.Height - 2 * $l2Gap
+        # h76_column_height_proportion_and_fixed: the fixed 300 preset is 300 px of window and
+        # the proportion 0.6 preset is its share of the column, each within 1 px.  The previous
+        # gate left the window on the 0.6 preset (index 2 of the cycle): `-back` steps to the
+        # fixed one (index 1), forward returns to 0.6.
+        try {
+            L2Focus $below
+            $column = L2ColumnTiles 'column-height-fixed-list' $below
+            $available = $l2ViewH - $l2Gap * ($column.count - 1)
+            $null = L2Action 'column-height-fixed' @('switch-preset-window-height-back')
+            $fixedH = (L2Rect $below).H
+            $null = L2Action 'column-height-proportion' @('switch-preset-window-height')
+            $propH = (L2Rect $below).H
+            $expectedProp = (L2ProportionPx $available $l2Gap 0.6) - 2 * $l2Border
+            L2Gate 'h76_column_height_proportion_and_fixed' ((L2Near $fixedH 300 1) -and (L2Near $propH $expectedProp 1)) @{
+                fixed = $fixedH; fixed_expected = 300; proportion = $propH; proportion_expected = $expectedProp
+                tiles = $column.count; available = $available; border = $l2Border; gap = $l2Gap
+                presets = 'proportion 0.25, fixed 300, proportion 0.6'
+            }
+        } catch {
+            L2Gate 'h76_column_height_proportion_and_fixed' $false @{ error = ($_ | Out-String).Trim() }
+        }
+        # h76_column_height_survives_admission: a window that joins the column keeps the height
+        # rule.  A new window opens in a column of its own right of the focused one, so
+        # consume-window-into-column appends it under the fixed tile; that tile is still 300 px
+        # afterwards and the column really grew by one.
+        try {
+            L2Focus $below
+            $null = L2Action 'column-height-admission-fixed' @('switch-preset-window-height-back')
+            $beforeAdmission = L2ColumnTiles 'column-height-admission-before' $below
+            $heightBefore = (L2Rect $below).H
+            $joiner = L2Open 'lane-l2-e'
+            L2Focus $below
+            $null = L2Action 'column-height-admission-consume' @('consume-window-into-column')
+            $afterAdmission = L2ColumnTiles 'column-height-admission-after' $below
+            $heightAfter = (L2Rect $below).H
+            $joined = @($afterAdmission.tiles | Where-Object { $_.hwnd -eq [int64]$joiner }).Count
+            L2Gate 'h76_column_height_survives_admission' ($afterAdmission.count -eq $beforeAdmission.count + 1 -and
+                $joined -eq 1 -and (L2Near $heightBefore 300 1) -and (L2Near $heightAfter 300 1)) @{
+                height_before = $heightBefore; height_after = $heightAfter; expected = 300
+                tiles_before = $beforeAdmission.count; tiles_after = $afterAdmission.count
+                joiner = $joiner.ToInt64(); heights_after = @($afterAdmission.tiles | ForEach-Object { $_.H })
+            }
+        } catch {
+            L2Gate 'h76_column_height_survives_admission' $false @{ error = ($_ | Out-String).Trim() }
+        }
+        # h76_column_height_reset_returns_to_auto: `set-window-height "30%"` gives the tile a
+        # weighted share of the view (the fixed height is gone), and `reset-window-height`
+        # returns it to auto: every tile of the column is equal again and the tiles fill the
+        # view exactly (their heights plus the border band add up to the column's room).
+        try {
+            L2Focus $below
+            $column = L2ColumnTiles 'column-height-reset-list' $below
+            $available = $l2ViewH - $l2Gap * ($column.count - 1)
+            $setTarget = (L2ProportionPx $l2ViewH $l2Gap 0.3) - 2 * $l2Border
+            $null = L2Action 'column-height-set-30' @('set-window-height', '30%')
+            $setH = (L2Rect $below).H
+            $null = L2Action 'column-height-reset' @('reset-window-height')
+            $after = L2ColumnTiles 'column-height-reset-after' $below
+            $resetH = (L2Rect $below).H
+            $autoHeights = @($after.tiles | ForEach-Object { $_.H })
+            $spread = ($autoHeights | Measure-Object -Maximum).Maximum - ($autoHeights | Measure-Object -Minimum).Minimum
+            $filled = ($autoHeights | Measure-Object -Sum).Sum + 2 * $l2Border * $after.count
+            L2Gate 'h76_column_height_reset_returns_to_auto' ((L2Near $setH $setTarget 1) -and
+                ([Math]::Abs($resetH - $setH) -ge 10) -and ($spread -le 1) -and (L2Near $filled $available 1)) @{
+                set_height = $setH; set_expected = $setTarget; reset_height = $resetH
+                heights_after_reset = $autoHeights; spread = $spread; tiles_filled = $filled
+                available = $available; border = $l2Border; gap = $l2Gap
+            }
+        } catch {
+            L2Gate 'h76_column_height_reset_returns_to_auto' $false @{ error = ($_ | Out-String).Trim() }
         }
 
         # move-window-up-or-to-workspace-up on the bottom window of the column: it swaps
