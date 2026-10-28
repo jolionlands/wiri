@@ -104,11 +104,18 @@ impl TilingEngine {
         };
         let (column_index, tile_index, current, available, gap, remembered, window) = metrics;
         let presets = self.window_height_presets(output);
+        // A fixed height in `preset-window-heights` is the height of the *window*, as niri
+        // counts it, and `HeightSpec::fixed` is in pixels of the whole tile: the border wiri
+        // paints around the window sits on top of it, exactly as `set-window-height "300"`
+        // (`SizeChange::SetFixed` adds the border) and a `default-window-height` rule
+        // (`rules::spec_px`) resolve the same number.  Without the border band a `fixed 300`
+        // preset came out 2 * border px shorter than the same height asked for any other way.
+        let border = 2 * cfg.border_inset();
         let resolved: Vec<i32> = presets
             .iter()
             .map(|spec| match spec {
                 SizeSpec::Proportion(p) => proportion_px(available, gap, *p),
-                SizeSpec::Fixed(px) => (*px as f64 * scale).round() as i32,
+                SizeSpec::Fixed(px) => (*px as f64 * scale).round() as i32 + border,
             })
             .collect();
         let preset = Self::next_preset_index(remembered, current, &resolved, forwards);
@@ -126,7 +133,8 @@ impl TilingEngine {
                     }
                     SizeSpec::Fixed(px) => {
                         tile.height_proportion = None;
-                        tile.preferred_height = Some((px as f64 * scale).round().max(1.0) as u32);
+                        tile.preferred_height =
+                            Some((((px as f64 * scale).round() as i32 + border).max(1)) as u32);
                     }
                 }
                 tile.height_preset_idx = Some(preset);
@@ -251,7 +259,8 @@ mod tests {
         engine.switch_preset_window_height(true, &be);
         let tile = focused_tile(&engine, output);
         assert_eq!(tile.height_proportion, None);
-        assert_eq!(tile.preferred_height, Some(200));
+        // A fixed preset is a *window* height; the default 4 px border comes on top of it.
+        assert_eq!(tile.preferred_height, Some(200 + 8));
         assert_eq!(tile.height_preset_idx, Some(1));
         // The end of the list wraps to the first preset.
         engine.switch_preset_window_height(true, &be);
@@ -259,8 +268,28 @@ mod tests {
         // ... and backwards from the first one to the last.
         engine.switch_preset_window_height(false, &be);
         let tile = focused_tile(&engine, output);
-        assert_eq!(tile.preferred_height, Some(200));
+        assert_eq!(tile.preferred_height, Some(200 + 8));
         assert_eq!(tile.height_preset_idx, Some(1));
+    }
+
+    #[test]
+    fn a_fixed_height_preset_is_the_height_of_the_window_with_the_border_on_top() {
+        let (mut engine, be, output) = height_fixture(vec![SizeSpec::Fixed(300)]);
+        engine.switch_preset_window_height(true, &be);
+        let tile = focused_tile(&engine, output);
+        // The layout draws the window inside its tile, inset by the border band on both
+        // sides, so a 300 px window is a 308 px tile at the default 4 px border.  This is
+        // the number `set-window-height "300"` (SizeChange::SetFixed) and a
+        // `default-window-height` rule already store; a preset used to store 300 and leave
+        // a 292 px window.
+        assert_eq!(engine.config.border_width, 4);
+        assert_eq!(tile.preferred_height, Some(308));
+        assert_eq!(tile.height_proportion, None);
+        assert_eq!(tile.height_preset_idx, Some(0));
+        // With the border off there is no band to add: the tile *is* the window.
+        engine.config.border_width = 0;
+        engine.switch_preset_window_height(false, &be);
+        assert_eq!(focused_tile(&engine, output).preferred_height, Some(300));
     }
 
     #[test]
