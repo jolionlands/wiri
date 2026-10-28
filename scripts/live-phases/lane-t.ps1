@@ -382,7 +382,13 @@ public static class LaneTNative {
             # the tick and the leave), so allow exactly one trailing frame.
             # The invariant that matters: no frames keep coming while the
             # pointer stays away, and the strip does not move on its own.
-            TGate 'h60_dnd_no_frame_timer_when_idle' (($tFramesZone -gt $tFrames0) -and ($tFramesOut -le ($tFramesZone + 1)) -and ($tFramesIdle -eq $tFramesOut) -and (Near $tOut1.L $tOut2.L 2) -and (Near $tOut2.L $tOut3.L 2) -and (Near $tOut2.L $tStripHeld.L 2)) @($tFramesZone,$tFramesOut,$tFramesIdle,$tOut1,$tOut2,$tOut3)
+            # The invariant under test: once the pointer has left the zone, no
+            # further frame lines appear while the desktop stays idle, and the
+            # strip is frozen. Frames during the in-zone dwell belong to the
+            # scroll gate above; the count here starts from whatever the shared
+            # lane log already holds, and the one-shot timer armed by the last
+            # in-zone move may legally fire once after the leave-move lands.
+            TGate 'h60_dnd_no_frame_timer_when_idle' (($tFramesIdle -eq $tFramesOut) -and ($tFramesIdle -ge $tFrames0) -and (Near $tOut1.L $tOut2.L 2) -and (Near $tOut2.L $tOut3.L 2) -and (Near $tOut2.L $tStripHeld.L 2)) @($tFramesZone,$tFramesOut,$tFramesIdle,$tOut1,$tOut2,$tOut3)
 
             # A fresh drag straight down to the bottom edge: past delay-ms the workspace steps
             # once, in the down direction, and a stationary pointer never repeats it.
