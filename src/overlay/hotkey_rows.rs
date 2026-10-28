@@ -6,6 +6,8 @@ fn canonical(action: &str) -> &str {
     match action {
         "FocusLeft" => "FocusColumnLeft",
         "FocusRight" => "FocusColumnRight",
+        "FocusWorkspacePrevious" => "FocusWorkspaceUp",
+        "FocusWorkspaceNext" => "FocusWorkspaceDown",
         "ToggleOverview" | "OverviewToggle" => "Overview",
         "ShowKeyBindings" => "Hotkeys",
         _ => action,
@@ -216,6 +218,37 @@ mod tests {
         );
         assert_eq!(rows[0].1, "Launch application");
         assert_eq!(rows[1].1, "Workspace 2");
+    }
+
+    #[test]
+    fn registered_workspace_navigation_replaces_essential_placeholders() {
+        // Registered bindings use the action enum's Debug names, not KDL spellings.
+        let previous = format!("{:?}", crate::input::Action::FocusWorkspacePrevious);
+        let next = format!("{:?}", crate::input::Action::FocusWorkspaceNext);
+        let bindings = [
+            bind(0, 3, 0x21, &previous, None),
+            bind(1, 3, 0x22, &next, None),
+        ];
+        let bound = curated_rows(&bindings, 3, true);
+        assert_eq!(
+            bound,
+            vec![
+                (
+                    crate::ipc::server::format_chord(3, 0x21),
+                    "Previous workspace".to_string(),
+                ),
+                (
+                    crate::ipc::server::format_chord(3, 0x22),
+                    "Next workspace".to_string(),
+                ),
+            ]
+        );
+        let shown = curated_rows(&bindings, 3, false);
+        assert_eq!(shown.len(), ESSENTIALS.len());
+        for expected in &bound {
+            assert_eq!(shown.iter().filter(|row| row.1 == expected.1).count(), 1);
+            assert!(shown.contains(expected));
+        }
     }
 
     #[test]
