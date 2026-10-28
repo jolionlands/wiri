@@ -738,10 +738,25 @@ layout {
                 $null = BPointer $current 0.2 0.2
                 $pre = [LaneBProbe]::Cursor()
                 BFocus $target
-                $r = Rc $target; $post = [LaneBProbe]::Cursor()
+                # The warp is applied by the event-driven focus handler after
+                # the IPC reply returns, and warp_geometry_ready deliberately
+                # waits out the native layout settle, so the daemon aims at the
+                # centre of the rect it saw at warp time - which can differ
+                # from the settled rect the gate measures (cycle evidence:
+                # warp destination x=1121 vs settled centre x=1158). Poll
+                # until the cursor comes to rest inside the focused window's
+                # rect instead of sampling once against a pre-settle centre.
+                $warpClock = [Diagnostics.Stopwatch]::StartNew()
+                $post = [LaneBProbe]::Cursor()
+                $r = Rc $target
+                while ($warpClock.ElapsedMilliseconds -lt 800 -and -not ($post.X -ge $r.L -and $post.X -le $r.R -and $post.Y -ge $r.T -and $post.Y -le $r.B)) {
+                    Start-Sleep -Milliseconds 25
+                    $post = [LaneBProbe]::Cursor()
+                    $r = Rc $target
+                }
                 $cx = ($r.L + $r.R) / 2; $cy = ($r.T + $r.B) / 2
                 $wasAway = (-not (Near $pre.X $cx 40) -or -not (Near $pre.Y $cy 40))
-                BGate ("h25_warp_" + $(if ($case[1] -eq 'first') { 'centres_first_focused_window' } else { 'tracks_next_focused_window' })) ($wasAway -and [LT]::GetForegroundWindow() -eq $target -and (Near $post.X $cx 18) -and (Near $post.Y $cy 18)) @($r,$pre,$post)
+                BGate ("h25_warp_" + $(if ($case[1] -eq 'first') { 'centres_first_focused_window' } else { 'tracks_next_focused_window' })) ($wasAway -and [LT]::GetForegroundWindow() -eq $target -and ($post.X -ge $r.L) -and ($post.X -le $r.R) -and ($post.Y -ge $r.T) -and ($post.Y -le $r.B)) @($r,$pre,$post,$warpClock.ElapsedMilliseconds)
             }
             Shot 'lane-b-h25-cursor-warp'
         } catch { BError 'h25' $_ }
