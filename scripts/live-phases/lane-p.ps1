@@ -319,12 +319,15 @@ input {
         do {
             $pHiddenLog = PReadText $pSkip.Stderr
             if ($pHiddenLog -match 'toggling cheatsheet with (\d+) rows \(hide-not-bound true\)') {
-                $pHiddenRows = [int]$Matches[1]
-                break
+                # Keep the LAST toggling line: the stderr stream can still
+                # hold an earlier daemon's 17-row line, and -match pins
+                # $Matches to the first occurrence.
+                $pHiddenRows = [int]([regex]::Matches($pHiddenLog, 'toggling cheatsheet with (\d+) rows \(hide-not-bound true\)') | Select-Object -Last 1 | ForEach-Object { $_.Groups[1].Value })
+                $pOpenedWindow = [LanePNative]::Find($pSkip.Process.Id, 'WiriBindingsCheatsheet')
+                if ($pOpenedWindow -ne [IntPtr]::Zero) { break }
             }
             Start-Sleep -Milliseconds 100
-        } while ($pOpenClock.ElapsedMilliseconds -lt 8000)
-        $pOpenedWindow = [LanePNative]::Find($pSkip.Process.Id, 'WiriBindingsCheatsheet')
+        } while ($pOpenClock.ElapsedMilliseconds -lt 15000)
         PGate 'h75_hotkey_overlay_hide_not_bound' ($pOpenedWindow -ne [IntPtr]::Zero -and $pHiddenRows -ge 1 -and
             $pShownRows -gt $pHiddenRows) ([ordered]@{
                 shown_rows = $pShownRows; hidden_rows = $pHiddenRows

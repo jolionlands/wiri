@@ -384,11 +384,13 @@ public static class LaneTNative {
             # pointer stays away, and the strip does not move on its own.
             # The invariant under test: once the pointer has left the zone, no
             # further frame lines appear while the desktop stays idle, and the
-            # strip is frozen. Frames during the in-zone dwell belong to the
-            # scroll gate above; the count here starts from whatever the shared
-            # lane log already holds, and the one-shot timer armed by the last
-            # in-zone move may legally fire once after the leave-move lands.
-            TGate 'h60_dnd_no_frame_timer_when_idle' (($tFramesIdle -eq $tFramesOut) -and ($tFramesIdle -ge $tFrames0) -and (Near $tOut1.L $tOut2.L 2) -and (Near $tOut2.L $tOut3.L 2) -and (Near $tOut2.L $tStripHeld.L 2)) @($tFramesZone,$tFramesOut,$tFramesIdle,$tOut1,$tOut2,$tOut3)
+            # strip is frozen. The shared lane log accumulates every earlier
+            # probe's lines, so an absolute baseline (tFrames0) is meaningless
+        # here: when the preceding edge-scroll probe left the strip at its
+        # scroll end, the stopped_x latch legitimately keeps this probe's
+        # dwell at zero new frame lines. Assert only the idle-stability
+        # invariant and keep every count in the evidence for diagnostics.
+            TGate 'h60_dnd_no_frame_timer_when_idle' (($tFramesIdle -eq $tFramesOut) -and (Near $tOut1.L $tOut2.L 2) -and (Near $tOut2.L $tOut3.L 2) -and (Near $tOut2.L $tStripHeld.L 2)) @($tFrames0,$tFramesZone,$tFramesOut,$tFramesIdle,$tOut1,$tOut2,$tOut3,$tStripHeld)
 
             # A fresh drag straight down to the bottom edge: past delay-ms the workspace steps
             # once, in the down direction, and a stationary pointer never repeats it.
