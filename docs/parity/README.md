@@ -13,16 +13,26 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 140 | 69 | 0 | 17 |
+| Layout and behaviour (226 rows) | 141 | 68 | 0 | 17 |
 | Config, input and IPC (259 rows) | 117 | 70 | 0 | 72 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
 retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates; they are not a
 full live sign-off. Official desktop cycles passed W+K (560/560) and F2 (601/602, H34 included);
 C2's H66-H70 gates passed in the 8c6c9b0 cycle and lane T's H58-H61 in the f4d2666 cycle.
-Rows marked partial with "live pending" (lanes V, L2, P and A11Y: gates H62-H65, H75-H77)
-rest on unit tests until their first complete official cycle; V's first run was cut short when
-Windows Defender quarantined the test build mid-cycle.
+The 2026-10-27 cycle at `cc3920d` passed **761/761 enforced gates, 0 failed** (88 further
+information entries), including every `h78_*` cursor-hiding gate, all five H31
+focus-history gates (`h31_history_crosses_workspaces` included) and lane V's H62-H65 set.
+That recount moves exactly one row to `done`: `set-column-display normal or tabbed`,
+whose only stated gap was that nothing was live-verified. The two `cursor {}` rows and
+the tablet stylus row stay `partial` for their recorded Windows approximations.
+Lane V's H62-H65 rows no longer rest on unit tests alone: the 2026-10-27 cycle passed
+every enforced gate, and its record names the h78 cursor-hiding, h31 focus-history and H65
+tab sets explicitly. The rows keep `partial` only for the Windows approximations and
+unit-tested-only surfaces (four-finger swipe, promoted touch, multi-display) they document.
+Rows still marked "live pending" (lanes L2, P and A11Y: gates H75-H77) rest on unit tests
+until their own complete official cycle; V's first run was cut short when Windows Defender
+quarantined the test build mid-cycle.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
 11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;

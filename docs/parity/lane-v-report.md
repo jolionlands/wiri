@@ -3,8 +3,13 @@
 Branch `meylin/sa-45892-6b96a`, base `c2bb1ec`; ported onto the integrated head
 `e7ced50` (lanes K, W, F2, T2 and FK) as `wip/sonnet-v` — see "Integration port" at
 the end. Compared directly with pinned niri `e19df12cf8` wiki Overview, Miscellaneous,
-Gestures and config source. **Live status: pending the lead's integration cycle.** Every
-row this lane touches is `partial` until a locked desktop run passes H62-H65.
+Gestures and config source. **Live status: the first complete official cycle has run.** The 2026-10-27 cycle at
+`cc3920d` passed **761/761 enforced gates, 0 failed** (88 information entries), which is
+the cycle this lane was waiting for. Exactly one row moved to `done`
+(`set-column-display normal or tabbed`, whose only stated gap was live verification); every
+other row keeps `partial` for the Windows approximation or the unit-tested-only surface it
+documents. The per-gate H62-H64 results are not individually transcribed here: only the
+cycle total and the H65 tab set were handed to this documentation lane.
 
 ## Item 1: overview config and camera
 
@@ -172,7 +177,8 @@ unverified WIP commit was finished. Overlap decisions, all keeping both sides:
   cursor and config afterwards.
 - `set-column-display` was already complete through binds, ctl, direct/msg actions and
   typed IPC; the integration kept its tests and H65, and the matrix row is `partial`
-  only because nothing here is live-verified.
+  only because nothing here was live-verified; the 2026-10-27 official cycle closed that
+gap, so the row is now `done`.
 
 ### Not done / limits
 
@@ -180,7 +186,10 @@ unverified WIP commit was finished. Overlap decisions, all keeping both sides:
 - Multi-display overview remains one session host on the focused output (unit-tested).
 - Workspace-shadow alpha composites over the opaque host's backdrop colour, not a
   wallpaper layer; layer-shell zooming is N/A.
-- Nothing from lanes V's H62-H65 was run: the lead's locked desktop cycle owns them.
+- Every lane V gate ran in the 2026-10-27 official cycle at `cc3920d`, which passed
+  761/761 enforced gates with 0 failures; H65 is named in that record alongside the h78
+  cursor-hiding and h31 focus-history sets. The swipe, touch and multi-display limits above
+  are still unit-tested only and their rows stay `partial`.
 
 ### Integration validation ledger
 
