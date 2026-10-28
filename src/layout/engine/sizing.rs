@@ -487,12 +487,12 @@ impl TilingEngine {
                     | SWP_ASYNCWINDOWPOS,
             );
         }
-        crate::backend::forget_shadow_margins(hwnd);
+        self.invalidate_native_bounds(window_id);
     }
 
     /// Saved styles can contain WS_VISIBLE from before a tab was hidden. Restoring
     /// them verbatim would show that tab behind layout's back, including reentrantly.
-    fn restore_tab_sizing_style(&self, hwnd: isize) {
+    fn restore_tab_sizing_style(&mut self, hwnd: isize) {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
@@ -528,7 +528,7 @@ impl TilingEngine {
                     | SWP_ASYNCWINDOWPOS,
             );
         }
-        crate::backend::forget_shadow_margins(hwnd);
+        self.invalidate_native_bounds(window_id);
     }
 
     /// Put `hwnd` on top of the windows on its monitor, without activating it and without

@@ -1,7 +1,7 @@
 # wiri IPC Protocol — Integration Reference
 
 **Schema version: 1.3**  
-Last updated: 2026-10-25
+Last updated: 2026-10-28
 
 This document is the canonical reference for third-party integrations with wiri.
 Target audiences: aurora, crest, custom scripts, and any external tool that wants
@@ -500,13 +500,108 @@ the pipe, with the arguments it takes in a `binds {}` line.  The message is also
 | `name` | The niri name of the action (`focus-column-left`, `consume-or-expel-window-left`, `move-column-to-workspace`, ...), or one of wiri's older spellings.  An unknown name is `{"success":false,"error":"unknown action or bad arguments: ..."}` |
 | `args` | The words after the name in a `binds {}` line, in order.  A string is a word; a number or a boolean stands for its text (`2` is the same as `"2"`) so that a client in a typed language can send what niri's own arguments are |
 | `quoted` | `quoted[i]` is true when `args[i]` was written in double quotes: `focus-workspace 2` is the second workspace, `focus-workspace "2"` the workspace named "2".  Omitted: none |
-| `--id <hwnd>` (`--id=<hwnd>`; `--window-id` where niri spells it so) | niri's way to name the window to act on.  The window is the `id` of a window object (its HWND).  `focus-window --id <hwnd>` focuses it, `close-window --id <hwnd>` closes it and leaves the focus alone; **any other action focuses the window first** and then acts on it (niri leaves the focus where it is: an approximation).  An id that is not a managed window is an error |
+| `--id <hwnd>` (`--id=<hwnd>`; `--window-id` where niri spells it so) | Names the window to act on using its window-object `id` (HWND). `focus-window` focuses it; `close-window` closes it without first focusing it. `fullscreen-window` (including `toggle-fullscreen`/`fullscreen`) and `set-window-height` act directly on the target, preserving the current focus even when its workspace is inactive. Window transfers resolve the explicit window through their workspace-action path. Other actions using the legacy target fallback still focus the window before acting. An id that is not a managed window is an error |
 
 `wiri-ctl action <name> [args...]` sends the same request.  A word in literal double quotes is a
 `quoted` word (`wiri-ctl action focus-workspace '"2"'` in a shell that keeps the inner quotes).
 
 Success is `{"success":true}`: the action ran as if its key had been pressed.  Whatever it changed
 (the focus, the workspaces, the windows) reaches `subscribe_events` clients as events.
+
+---
+
+#### Typed size actions
+
+`SetColumnWidth`, `SetWindowWidth` and `SetWindowHeight` require a `change`
+containing exactly one typed size variant:
+
+| Variant | Value and meaning |
+|---|---|
+| `SetFixed` | Signed 32-bit integer logical pixels; sets the requested window size, excluding tile insets |
+| `AdjustFixed` | Signed 32-bit integer logical-pixel adjustment |
+| `SetProportion` | Finite number of percentage points; `50.0` means 50%, `0.1` means 0.1% |
+| `AdjustProportion` | Finite percentage-point adjustment; `-10.0` subtracts ten percentage points |
+
+All four variants accept negative and zero values. The variant determines
+whether the value sets or adjusts: `{"SetFixed":-10}` remains a set request,
+distinct from `{"AdjustFixed":-10}`. Layout constraints may clamp the resulting
+allocation. Fixed values range from `-2147483648` through `2147483647`; strings,
+fractions, overflows and float encodings such as `160.0` are invalid fixed
+values. JSON Schema's mathematical `integer` type cannot enforce the last
+encoding restriction. Proportion values are percentage points, rather than
+fractions of one; the typed path preserves set/adjust kinds directly. The current
+engine rounds proportions to 0.001 percentage points and stores those thousandths
+in a signed 32-bit integer, saturating values outside that storage range before
+layout constraints apply.
+
+Each action accepts optional `id` (alias `window_id`); omission or null selects
+the focused window. An explicit ID must identify a managed window and fit the
+positive native handle range. Explicit `SetWindowWidth` and `SetWindowHeight`
+act directly and preserve focus. Wiri's optional ID extension on `SetColumnWidth`
+retains the legacy focus-before-action behavior. `focus:false` is unsupported for
+these size actions.
+
+```json
+{"Action":{"SetColumnWidth":{"change":{"SetProportion":50.0}}}}
+{"Action":{"SetWindowWidth":{"id":328756,"change":{"AdjustFixed":-10}}}}
+{"Action":{"SetWindowHeight":{"id":328756,"change":{"SetFixed":160}}}}
+```
+
+#### Typed workspace actions
+
+The external `Action` form accepts niri's typed workspace references:
+`{"Id":42}`, `{"Index":2}`, or `{"Name":"dev"}`. `Id` selects the current
+`WorkspaceIpc.id` globally across outputs. It follows the workspace object through
+renaming, reordering and monitor relocation; it is neither its output-local `idx`
+nor an engine-local workspace key. `Index` selects a visible position on the
+relevant output (the target window's output for a window transfer); `Name` selects
+a named workspace globally. `{"Name":"2"}` remains a name.
+
+| Action | Fields |
+|---|---|
+| `FocusWorkspace` | Required `reference` |
+| `MoveWindowToWorkspace` | Required `reference`; optional `window_id` (alias `id`, omitted/null means focused window); `focus` defaults to `true` |
+| `MoveColumnToWorkspace` | Required `reference`; `focus` defaults to `true` |
+| `MoveWorkspaceToIndex` | Required integer `index`; optional `reference` |
+| `SetWorkspaceName` | Required string `name`; optional `workspace` |
+| `UnsetWorkspaceName` | Optional `reference` |
+| `MoveWorkspaceToMonitor` | Required string `output`; optional `reference` |
+
+An omitted or null optional workspace reference selects the focused workspace.
+The three required references reject null or omission. Both transfer actions
+accept the Boolean `focus:false`; this does not follow the transfer to its
+destination. Known fields
+retain their JSON types: `focus` is a Boolean, `name`/`output`/`Name` are strings,
+and `Index` is an unsigned 8-bit integer. Future unknown fields remain tolerated.
+
+```json
+{"Action":{"FocusWorkspace":{"reference":{"Id":42}}}}
+{"Action":{"MoveWindowToWorkspace":{"window_id":328756,"reference":{"Id":42},"focus":false}}}
+{"Action":{"MoveColumnToWorkspace":{"reference":{"Id":42},"focus":false}}}
+{"Action":{"MoveWorkspaceToIndex":{"index":1,"reference":{"Id":42}}}}
+{"Action":{"SetWorkspaceName":{"name":"dev","workspace":{"Id":42}}}}
+{"Action":{"UnsetWorkspaceName":{"reference":{"Id":42}}}}
+{"Action":{"MoveWorkspaceToMonitor":{"output":"DISPLAY2","reference":{"Id":42}}}}
+```
+
+`Id` accepts the complete unsigned 64-bit integer domain, from `0` through
+`18446744073709551615`, without conversion to an index, name, signed integer or
+floating-point value. Clients must preserve that integer precision when encoding
+JSON. Read actual live IDs from `Workspaces`; IDs are stable while the object
+exists, rather than a persistent identifier across daemon restarts. A valid ID
+which is absent from current state returns `{"Ok":"Handled"}` as a no-op,
+without creating a workspace, selecting a fallback, changing state or taking
+focus. Negative, fractional, string, malformed or out-of-range IDs return `Err`.
+The runtime also rejects float-encoded IDs such as `42.0`. JSON Schema defines
+`integer` mathematically and can accept that spelling, so schema validation alone
+does not establish that an ID has the integer encoding required by serde.
+
+These workspace IDs are available through typed JSON. CLI and KDL workspace
+arguments retain their existing index/name syntax; no workspace-ID spelling is
+introduced there. Legacy adjacent-envelope fields named `workspace_id` keep
+their existing semantics and are not aliases for these typed references.
+The seven typed workspace actions retain their structured targets through
+dispatch; they do not use the legacy focus-before-action fallback above.
 
 ---
 

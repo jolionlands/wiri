@@ -15,6 +15,7 @@ use crate::utils::{OutputId, Point, Rect, WindowId};
 // What the window rules do to a window: where it opens, how big, what keeps being true of it.
 mod rules;
 use rules::NO_ALPHA;
+mod startup_rules;
 // Fullscreen, maximized to the edges, and keeping the place in the strip while a window is either.
 mod sizing;
 use super::strip::CenterFocusedColumn;
@@ -45,6 +46,8 @@ mod gestures;
 mod interactive;
 mod motion;
 mod named_config;
+mod native_bounds;
+pub use native_bounds::NativeBoundsQuery;
 mod native_clip;
 mod native_move;
 mod overview;
@@ -108,6 +111,7 @@ struct FloatHome {
     workspace: i32,
     /// Where the window floats (visible rectangle, screen coordinates).
     rect: Rect,
+    position_history: super::floating_position::PositionHistory,
     /// Position in the float stack: a higher number is raised more recently.
     seq: u64,
     /// Preset order is configured, not necessarily ascending by width.
@@ -669,6 +673,8 @@ pub struct TilingEngine {
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
     window_rules: Vec<crate::config::WindowRule>,
+    /// Global matcher context until the one startup timeout; not an admission flag.
+    startup_rules: startup_rules::StartupRules,
     /// Which kinds of window state the rules depend on (the title, the focus, floating,
     /// urgency, an `app-id`): a change of one makes the engine look at the rules again.
     rule_flags: rules::RuleFlags,
@@ -756,6 +762,8 @@ pub struct TilingEngine {
     /// How many times a window was asked for its minimum width (it may not answer in time
     /// when it has just been created).
     min_width_queries: HashMap<WindowId, u8>,
+    native_bounds_cache: HashMap<WindowId, native_bounds::NativeBoundsCache>,
+    native_bounds_generation: u64,
     // ---- Item 2: always-on-top tracking ----
     /// Windows that have been pinned as HWND_TOPMOST via toggle_always_on_top_for_focused.
     always_on_top: HashSet<WindowId>,
@@ -853,6 +861,7 @@ impl TilingEngine {
             saved_styles: HashMap::new(),
             saved_ex_styles: HashMap::new(),
             window_rules: Vec::new(),
+            startup_rules: startup_rules::StartupRules::new(std::time::Instant::now()),
             rule_flags: rules::RuleFlags::default(),
             rule_state: HashMap::new(),
             rule_limits: HashMap::new(),
@@ -885,6 +894,8 @@ impl TilingEngine {
             original_bounds: HashMap::new(),
             window_min_widths: HashMap::new(),
             min_width_queries: HashMap::new(),
+            native_bounds_cache: HashMap::new(),
+            native_bounds_generation: 0,
             unplugged: HashMap::new(),
             hide_method: crate::backend::cloak::HideMethod::Hide,
             hidden_since: HashMap::new(),
@@ -1539,6 +1550,29 @@ impl TilingEngine {
         backend: &BackendHandle,
         at_startup: bool,
     ) {
+        self.add_window_with_native_seed(window, target, backend, at_startup, None);
+    }
+
+    /// The application is sampled before taking the engine lock, so native
+    /// fixed-height policy and the first allocation see the same coherent value.
+    pub fn add_window_with_native_bounds(
+        &mut self,
+        window: WindowInfo,
+        backend: &BackendHandle,
+        at_startup: bool,
+        seed: Option<crate::backend::NativeBoundsSample>,
+    ) {
+        self.add_window_with_native_seed(window, AddWindowTarget::Auto, backend, at_startup, seed);
+    }
+
+    fn add_window_with_native_seed(
+        &mut self,
+        window: WindowInfo,
+        target: AddWindowTarget,
+        backend: &BackendHandle,
+        at_startup: bool,
+        seed: Option<crate::backend::NativeBoundsSample>,
+    ) {
         let window_id = WindowId::new(window.hwnd);
         let hwnd = window.hwnd; // Capture before move
         let opened_frame = window.bounds;
@@ -1551,6 +1585,15 @@ impl TilingEngine {
             debug!("add_window: {:?} is already managed", window_id);
             return;
         }
+        self.native_bounds_generation = self.native_bounds_generation.wrapping_add(1);
+        self.native_bounds_cache.insert(
+            window_id,
+            native_bounds::NativeBoundsCache::new(
+                self.native_bounds_generation,
+                seed,
+                std::time::Instant::now(),
+            ),
+        );
 
         // Capture original bounds (first registration only) so we can restore on quit.
         // A window that an earlier wiri run moved and left behind (it was killed, or crashed)
@@ -1583,7 +1626,11 @@ impl TilingEngine {
         let auto_float = crate::window::should_auto_float(&crate::window::gather_skip_facts(
             windows::Win32::Foundation::HWND(hwnd as *mut std::ffi::c_void),
         )) && rules.open_floating != Some(false);
-        rules.float |= auto_float;
+        let effective = self
+            .native_limits(window_id)
+            .merge(rules::RuleLimits::of(&rules));
+        rules.float =
+            native_bounds::open_floating(effective, rules.open_floating, rules.float || auto_float);
         self.rule_state.insert(
             window_id,
             rules::RuleState {
@@ -1647,7 +1694,11 @@ impl TilingEngine {
                     rect.loc.x = owner.loc.x + (owner.size.w as i32 - rect.size.w as i32) / 2;
                     rect.loc.y = owner.loc.y + (owner.size.h as i32 - rect.size.h as i32) / 2;
                     if let Some(monitor) = self.monitors.get(&output_id) {
-                        rect = Self::fit_rect_into(rect, monitor.work_area);
+                        rect = native_bounds::fit_float_rect(
+                            rect,
+                            monitor.work_area,
+                            self.effective_window_limits(window_id),
+                        );
                     }
                 }
             }
@@ -1956,6 +2007,7 @@ impl TilingEngine {
         self.original_bounds.remove(&window_id);
         self.window_min_widths.remove(&window_id);
         self.min_width_queries.remove(&window_id);
+        self.native_bounds_cache.remove(&window_id);
         self.hidden_since.remove(&window_id);
         crate::backend::cloak::forget(window_id.as_isize());
         crate::backend::hidden::forget(window_id.as_isize());
@@ -2048,6 +2100,7 @@ impl TilingEngine {
     /// preferred heights. Rule/config updates retain their existing reset semantics.
     fn sync_tile_limits(&mut self, reset_heights: bool) {
         let known = &self.window_min_widths;
+        let native = &self.native_bounds_cache;
         let limits = &self.rule_limits;
         let heights = &self.rule_heights;
         let global = &self.config;
@@ -2072,13 +2125,19 @@ impl TilingEngine {
                         });
                         let window_min = known.get(&tile.window_id).copied().unwrap_or(0);
                         let rule = limits.get(&tile.window_id).copied().unwrap_or_default();
+                        let mut bounds = native
+                            .get(&tile.window_id)
+                            .map_or_else(native_bounds::NativeBounds::default, |entry| {
+                                entry.bounds
+                            });
+                        bounds.min_width = bounds.min_width.max(window_min);
+                        let effective = bounds.merge(rule);
                         // Both native and rule minima describe the visible window; a tile
                         // also contains wiri's border, which placement subtracts again.
-                        tile.min_width =
-                            rules::RuleLimits::for_tile(window_min.max(rule.min_width), border);
-                        tile.max_width = rules::RuleLimits::for_tile(rule.max_width, border);
-                        tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
-                        tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
+                        tile.min_width = rules::RuleLimits::for_tile(effective.min_width, border);
+                        tile.max_width = rules::RuleLimits::for_tile(effective.max_width, border);
+                        tile.min_height = rules::RuleLimits::for_tile(effective.min_height, border);
+                        tile.max_height = rules::RuleLimits::for_tile(effective.max_height, border);
                         if reset_heights || tile.preferred_height.is_none() {
                             if tile.height_proportion.is_none() && tile.height_preset_idx.is_none()
                             {
@@ -2088,6 +2147,101 @@ impl TilingEngine {
                     }
                 }
             }
+        }
+    }
+
+    fn native_limits(&self, window_id: WindowId) -> native_bounds::NativeBounds {
+        let mut bounds = self
+            .native_bounds_cache
+            .get(&window_id)
+            .map_or_else(native_bounds::NativeBounds::default, |entry| entry.bounds);
+        bounds.min_width = bounds
+            .min_width
+            .max(self.window_min_widths.get(&window_id).copied().unwrap_or(0));
+        bounds
+    }
+
+    /// Visible physical bounds shared by tiled and floating consumers.
+    fn effective_window_limits(&self, window_id: WindowId) -> rules::RuleLimits {
+        self.native_limits(window_id).merge(
+            self.rule_limits
+                .get(&window_id)
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn native_bounds_query(
+        &mut self,
+        window_id: WindowId,
+        context: crate::backend::NativeBoundsContext,
+        now: std::time::Instant,
+    ) -> Option<NativeBoundsQuery> {
+        if !self.tiled_windows.contains_key(&window_id) || self.minimized.contains_key(&window_id) {
+            return None;
+        }
+        let entry = self.native_bounds_cache.get_mut(&window_id)?;
+        if !entry.matches_context(context) {
+            // Placement margins belong to the previous native frame context.
+            // Discard them before a failed query in the new context could keep
+            // an obsolete compensation alive.
+            crate::backend::forget_shadow_margins(window_id.as_isize());
+        }
+        entry.begin(window_id, context, now)
+    }
+
+    /// Oldest due values first, so the bounded reconcile batch cannot starve
+    /// later HWNDs. Context validation and application queries happen outside locks.
+    pub fn native_bounds_candidates(&self) -> Vec<WindowId> {
+        let mut entries: Vec<_> = self
+            .native_bounds_cache
+            .iter()
+            .filter(|(id, _)| {
+                self.tiled_windows.contains_key(id) && !self.minimized.contains_key(id)
+            })
+            .map(|(id, entry)| (entry.next_due, *id))
+            .collect();
+        entries.sort_by_key(|(due, id)| (*due, id.as_isize()));
+        entries.into_iter().map(|(_, id)| id).collect()
+    }
+
+    pub fn invalidate_native_bounds(&mut self, window_id: WindowId) {
+        if let Some(entry) = self.native_bounds_cache.get_mut(&window_id) {
+            entry.invalidate(std::time::Instant::now());
+        }
+        crate::backend::forget_shadow_margins(window_id.as_isize());
+    }
+
+    pub fn invalidate_all_native_bounds(&mut self) {
+        let ids: Vec<_> = self.native_bounds_cache.keys().copied().collect();
+        for id in ids {
+            self.invalidate_native_bounds(id);
+        }
+    }
+
+    pub fn finish_native_bounds_query(
+        &mut self,
+        query: NativeBoundsQuery,
+        answer: Option<crate::backend::NativeBoundsSample>,
+        now: std::time::Instant,
+        backend: &BackendHandle,
+    ) {
+        let changed = self
+            .native_bounds_cache
+            .get_mut(&query.window_id)
+            .and_then(|entry| entry.finish(query, answer, now))
+            .unwrap_or(false);
+        if !changed {
+            return;
+        }
+        self.sync_tile_limits(false);
+        if self.floating_windows.contains(&query.window_id) {
+            if let Some(rect) = self.float_rect_of(query.window_id) {
+                self.place_float(query.window_id, rect, backend);
+            }
+        } else if let Some((output, _, _)) = self.locate_window(query.window_id) {
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
         }
     }
 
@@ -4383,6 +4537,10 @@ impl TilingEngine {
                 output,
                 workspace,
                 rect,
+                position_history: super::floating_position::PositionHistory::new(
+                    rect,
+                    self.tiled_windows.get(&window_id).map(|info| info.bounds),
+                ),
                 seq,
                 width_preset_idx: None,
             },
@@ -4468,6 +4626,21 @@ impl TilingEngine {
             .or_else(|| self.float_homes.get(&window_id).map(|h| h.rect))
     }
 
+    /// Native observations and requested positions are separate: reading the HWND
+    /// again can still see the previous asynchronous SetWindowPos. Only a changed
+    /// backend observation replaces the requested home used by consecutive actions.
+    fn float_action_rect(&mut self, window_id: WindowId, backend: &BackendHandle) -> Option<Rect> {
+        let observed = backend
+            .get_window(window_id.as_isize())
+            .map(|info| info.bounds);
+        let native = Self::live_window_rect(window_id);
+        let home = self.float_homes.get_mut(&window_id)?;
+        if let Some(observed) = home.position_history.reconcile(home.rect, observed, native) {
+            self.update_window_bounds(window_id, observed);
+        }
+        self.float_homes.get(&window_id).map(|home| home.rect)
+    }
+
     /// Show the floating windows of the active workspace of `output_id` and hide
     /// the ones of its other workspaces.  Part of every layout pass, next to the
     /// same job for tiles: a floating window is not left behind on screen when its
@@ -4523,9 +4696,14 @@ impl TilingEngine {
         // A fullscreen or maximized tile that floats is neither any more (niri: they cannot be
         // floating), and its column gets its width back.
         self.leave_sizing_states(window_id, false);
-        let work = self.monitors.get(&output).map(|m| m.work_area);
+        let work = self
+            .monitors
+            .get(&output)
+            .map(|m| (m.work_area, m.scale_factor));
         let rect = match (self.float_memory.get(&window_id).copied(), work) {
-            (Some(remembered), Some(work)) => Self::fit_rect_into(remembered, work),
+            (Some(remembered), Some((work, scale))) => {
+                super::floating_position::clamp_visible(remembered, work, scale)
+            }
             (Some(remembered), None) => remembered,
             _ => self.first_float_position(
                 window_id,
@@ -4599,7 +4777,7 @@ impl TilingEngine {
         let Some((output, workspace)) = self.float_location(window_id) else {
             return;
         };
-        if let Some(rect) = self.float_rect_of(window_id) {
+        if let Some(rect) = self.float_action_rect(window_id, backend) {
             self.float_memory.insert(window_id, rect);
         }
         self.float_homes.remove(&window_id);
@@ -4682,23 +4860,35 @@ impl TilingEngine {
 
     /// Set the rectangle of a floating window (kept on its monitor's work area).
     fn place_float(&mut self, window_id: WindowId, rect: Rect, backend: &BackendHandle) {
+        self.place_float_rect(window_id, rect, false, backend);
+    }
+
+    fn place_float_rect(
+        &mut self,
+        window_id: WindowId,
+        rect: Rect,
+        partial: bool,
+        backend: &BackendHandle,
+    ) {
         if self.native_move_resize_active(window_id) {
             return;
         }
         let Some((output, _)) = self.float_location(window_id) else {
             return;
         };
-        // The size limits of the window's rules hold a float too (the window's size, with no
-        // border of wiri's around it).
-        let rect = match self.rule_limits.get(&window_id) {
-            Some(limits) => {
-                let (w, h) = limits.clamp(rect.size.w, rect.size.h);
-                Rect::new(rect.loc.x, rect.loc.y, w, h)
+        // Native and rule bounds hold a float too, without a Wiri tile border.
+        let limits = self.effective_window_limits(window_id);
+        let (w, h) = limits.clamp(rect.size.w, rect.size.h);
+        let rect = Rect::new(rect.loc.x, rect.loc.y, w, h);
+        let rect = match self
+            .monitors
+            .get(&output)
+            .map(|m| (m.work_area, m.scale_factor))
+        {
+            Some((work, scale)) if partial => {
+                super::floating_position::clamp_visible(rect, work, scale)
             }
-            None => rect,
-        };
-        let rect = match self.monitors.get(&output).map(|m| m.work_area) {
-            Some(work) => Self::fit_rect_into(rect, work),
+            Some((work, _)) => native_bounds::fit_float_rect(rect, work, limits),
             None => rect,
         };
         let _ = backend.set_window_position(
@@ -4712,9 +4902,77 @@ impl TilingEngine {
                 home.width_preset_idx = None;
             }
             home.rect = rect;
+            home.position_history.submit(rect);
         }
         self.float_memory.insert(window_id, rect);
         self.sync_native_clip(window_id);
+    }
+
+    /// IPC-only niri positioning, without focusing or changing the target's layer.
+    /// `moving` is snapshotted before taking the engine lock by the native adapter.
+    pub fn move_floating_window(
+        &mut self,
+        id: Option<WindowId>,
+        x: crate::ipc::PositionChange,
+        y: crate::ipc::PositionChange,
+        moving: Option<WindowId>,
+        backend: &BackendHandle,
+    ) -> Result<(), String> {
+        if !x.is_finite() || !y.is_finite() {
+            return Err("position must be finite".into());
+        }
+        if id.is_some_and(|id| !self.tiled_windows.contains_key(&id)) {
+            return Err("no managed window with this id".into());
+        }
+        if super::floating_position::blocked_by_move(id, moving) {
+            return Ok(());
+        }
+        let Some(window) = id.or_else(|| self.state_target().map(|target| target.window)) else {
+            return Ok(());
+        };
+        if self.native_move_resize_active(window) {
+            return Ok(());
+        }
+        let _ = self.float_action_rect(window, backend);
+        let floating = self
+            .float_homes
+            .get(&window)
+            .map(|home| (home.output, home.rect));
+        let output = floating
+            .map(|home| home.0)
+            .or_else(|| self.locate_window(window).map(|(output, _, _)| output));
+        let Some(monitor) = output.and_then(|output| self.monitors.get(&output)) else {
+            return Ok(());
+        };
+        let (work, scale) = (monitor.work_area, monitor.scale_factor);
+        let output = monitor.output_id;
+        let rect = if let Some(home) = floating {
+            home.1
+        } else if let Some(remembered) = self.float_memory.get(&window).copied() {
+            remembered
+        } else {
+            let initial = self.initial_float_rect(window, output);
+            if self
+                .window_policy(window)
+                .default_floating_position
+                .is_some()
+            {
+                self.first_float_position(window, output, initial)
+            } else if x.is_absolute() && y.is_absolute() {
+                initial
+            } else {
+                // Without stored/default position, both axes must be absolute.
+                return Ok(());
+            }
+        };
+        let rect = super::floating_position::resolve(rect, work, scale, x, y)
+            .ok_or("position must be finite")?;
+        if floating.is_some() {
+            self.place_float_rect(window, rect, true, backend);
+        } else {
+            self.float_memory.insert(window, rect);
+        }
+        Ok(())
     }
 
     /// Absolute pointer-grab writeback; shares floating memory, rule limits and work-area
@@ -4754,12 +5012,17 @@ impl TilingEngine {
         dh: i32,
         backend: &BackendHandle,
     ) {
-        let Some(rect) = self.float_rect_of(window_id) else {
+        let Some(rect) = self.float_action_rect(window_id, backend) else {
             return;
         };
         let w = (rect.size.w as i32 + dw).max(120) as u32;
         let h = (rect.size.h as i32 + dh).max(80) as u32;
-        self.place_float(window_id, Rect::new(rect.loc.x, rect.loc.y, w, h), backend);
+        self.place_float_rect(
+            window_id,
+            Rect::new(rect.loc.x, rect.loc.y, w, h),
+            true,
+            backend,
+        );
     }
 
     /// Resize a floating window by a percentage of its monitor's work area.
@@ -4797,13 +5060,14 @@ impl TilingEngine {
         let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
             return;
         };
-        let Some(rect) = self.float_rect_of(window_id) else {
+        let Some(rect) = self.float_action_rect(window_id, backend) else {
             return;
         };
         let w = ((work.size.w as f64 * fraction).round() as u32).max(120);
-        self.place_float(
+        self.place_float_rect(
             window_id,
             Rect::new(rect.loc.x, rect.loc.y, w, rect.size.h),
+            true,
             backend,
         );
     }
@@ -4854,7 +5118,7 @@ impl TilingEngine {
         let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
             return;
         };
-        let Some(rect) = self.float_rect_of(window_id) else {
+        let Some(rect) = self.float_action_rect(window_id, backend) else {
             return;
         };
         let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
@@ -4873,7 +5137,7 @@ impl TilingEngine {
             .get(&window_id)
             .and_then(|home| home.width_preset_idx);
         let next = Self::next_preset_index(remembered, rect.size.w as i32, &widths, forwards);
-        self.place_float(
+        self.place_float_rect(
             window_id,
             Rect::new(
                 rect.loc.x,
@@ -4881,6 +5145,7 @@ impl TilingEngine {
                 widths[next].max(50) as u32,
                 rect.size.h,
             ),
+            true,
             backend,
         );
         if let Some(home) = self.float_homes.get_mut(&window_id) {
@@ -4943,6 +5208,10 @@ impl TilingEngine {
                         output,
                         workspace: workspace_id,
                         rect,
+                        position_history: super::floating_position::PositionHistory::new(
+                            rect,
+                            self.tiled_windows.get(&window_id).map(|info| info.bounds),
+                        ),
                         seq,
                         width_preset_idx: None,
                     },
@@ -5251,6 +5520,7 @@ impl TilingEngine {
             );
         }
         info!("Stripped frame for tiled window {}", hwnd);
+        self.invalidate_native_bounds(window_id);
     }
 
     /// Make a window fullscreen by removing its frame and covering the monitor
@@ -5290,7 +5560,7 @@ impl TilingEngine {
         // the visible window: place it exactly (the invisible border measured while it
         // still had a frame made it 7 px larger than the monitor), and measure it afresh
         // the next time it is placed with one.
-        crate::backend::forget_shadow_margins(hwnd);
+        self.invalidate_native_bounds(WindowId::new(hwnd));
         let _ = backend.set_window_position_exact(
             hwnd,
             rect,
@@ -5301,7 +5571,7 @@ impl TilingEngine {
     }
 
     /// Restore a window's original style after exiting fullscreen
-    fn restore_window_style(&self, hwnd: isize) {
+    fn restore_window_style(&mut self, hwnd: isize) {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE,
@@ -5339,7 +5609,7 @@ impl TilingEngine {
             );
         }
         // The frame is back: its invisible border has to be measured again.
-        crate::backend::forget_shadow_margins(hwnd);
+        self.invalidate_native_bounds(window_id);
     }
 
     /// Get all monitors (mutable)
@@ -5413,6 +5683,14 @@ impl TilingEngine {
         if let Some(info) = self.tiled_windows.get_mut(&window_id) {
             info.bounds = bounds;
             updated = true;
+        }
+        if let Some(home) = self.float_homes.get_mut(&window_id) {
+            if home.rect.size.w != bounds.size.w {
+                home.width_preset_idx = None;
+            }
+            home.rect = bounds;
+            home.position_history.authoritative(bounds, Some(bounds));
+            self.float_memory.insert(window_id, bounds);
         }
 
         for monitor in self.monitors.values_mut() {
@@ -6049,6 +6327,32 @@ impl TilingEngine {
         self.ensure_named_workspaces();
         // A reload rebuilds the layout views; it never re-places a realized workspace.
         self.refresh_layout_views();
+    }
+
+    /// Reconcile existing windows after the new config and output geometry
+    /// have been published by the reload path.
+    pub fn apply_reloaded_layout(&mut self, backend: &BackendHandle) {
+        self.reevaluate_all_window_rules(backend);
+        // New gaps, widths or output geometry can move a selected late column
+        // beyond its old viewport. Reconcile each output's active selection
+        // against the new layout before off-screen parking is calculated.
+        let outputs: Vec<_> = self.monitors.keys().copied().collect();
+        for output in outputs {
+            self.reveal_focused_column(output);
+        }
+        // Reload invalidated the submitted geometry. Its authoritative final
+        // layout must not be swallowed by a configure sent in the prior 16 ms;
+        // there may be no later event to retry it (the same rule as gesture end).
+        for monitor in self.monitors.values_mut() {
+            for workspace in monitor.workspaces.values_mut() {
+                for column in &mut workspace.columns {
+                    for tile in &mut column.tiles {
+                        tile.configure_throttle.last_send = None;
+                    }
+                }
+            }
+        }
+        self.apply_all(backend);
     }
 
     /// Take a snapshot of the current monitor / workspace / column / tile
@@ -6814,6 +7118,16 @@ impl TilingEngine {
         ))
     }
 
+    fn physical_size_change(change: SizeChange, scale: f64) -> SizeChange {
+        match change {
+            SizeChange::SetFixed(px) => SizeChange::SetFixed((px as f64 * scale).round() as i32),
+            SizeChange::AdjustFixed(px) => {
+                SizeChange::AdjustFixed((px as f64 * scale).round() as i32)
+            }
+            other => other,
+        }
+    }
+
     /// niri `set-column-width` / `set-window-width`: change the width of the focused
     /// column (`"50%"`, `"+10%"`, `"1200"`, `"+100"`).  A column with a width of its own
     /// is not maximized any more.
@@ -6821,22 +7135,71 @@ impl TilingEngine {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        let Some((col_idx, current, view, gap, extra)) = self.focused_column_metrics(output) else {
+        let Some((workspace, column)) = self.monitors.get(&output).and_then(|monitor| {
+            monitor
+                .focus_column
+                .map(|column| (monitor.active_workspace, column))
+        }) else {
             return;
         };
-        let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
-        let physical_change = match change {
-            SizeChange::SetFixed(px) => SizeChange::SetFixed((px as f64 * scale).round() as i32),
-            SizeChange::AdjustFixed(px) => {
-                SizeChange::AdjustFixed((px as f64 * scale).round() as i32)
-            }
-            other => other,
+        if self.change_tiled_column_width_at((output, workspace, column), None, change) {
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// Resize a named window or its tiled column without changing selection.
+    pub fn set_window_width_for(
+        &mut self,
+        window: WindowId,
+        change: SizeChange,
+        backend: &BackendHandle,
+    ) {
+        if self.floating_windows.contains(&window) {
+            self.float_apply_size_change(window, SizeAxis::Width, change, backend);
+            return;
+        }
+        let Some(location) = self.locate_window(window) else {
+            return;
         };
+        if self.change_tiled_column_width_at(location, Some(window), change) {
+            self.apply_layout_for_monitor(location.0, backend);
+        }
+    }
+
+    fn change_tiled_column_width_at(
+        &mut self,
+        (output, workspace, col_idx): (OutputId, i32, usize),
+        window: Option<WindowId>,
+        change: SizeChange,
+    ) -> bool {
+        let Some((current, view, gap, extra, window)) =
+            self.monitors.get(&output).and_then(|monitor| {
+                let cfg = self.effective_config_for_workspace(output, workspace);
+                let ws = monitor.workspaces.get(&workspace)?;
+                let column = ws.columns.get(col_idx)?;
+                let window = window.or_else(|| column.active_window());
+                let view = Self::view_width_for_monitor(monitor, cfg);
+                Some((
+                    column.resolved_width(Self::workspace_default_width(ws, view, cfg)),
+                    view,
+                    cfg.column_gap,
+                    2 * window.map_or(cfg.border_inset(), |window| {
+                        self.rule_border_inset(window, cfg)
+                    }),
+                    window,
+                ))
+            })
+        else {
+            return false;
+        };
+        let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
+        let physical_change = Self::physical_size_change(change, scale);
         let width = physical_change.resolve(current, view, gap, extra);
         if let Some(column) = self
             .monitors
             .get_mut(&output)
-            .and_then(|m| m.workspace_mut())
+            .and_then(|m| m.workspaces.get_mut(&workspace))
             .and_then(|w| w.columns.get_mut(col_idx))
         {
             // Keep the request, not a proportion reverse-engineered from a
@@ -6860,9 +7223,11 @@ impl TilingEngine {
                     extra,
                 ),
             }
+            if matches!(change, SizeChange::SetFixed(_) | SizeChange::AdjustFixed(_)) {
+                column.width_fixed_window = window;
+            }
         }
-        self.reveal_focused_column(output);
-        self.apply_layout_for_monitor(output, backend);
+        true
     }
 
     /// The index of the preset a column takes next.  `remembered` is the preset the
@@ -6971,30 +7336,67 @@ impl TilingEngine {
     /// that the new height is and the others keep their proportions.  A column of one
     /// window (or a tabbed one) always fills the view: nothing happens there.
     pub fn set_window_height_by(&mut self, change: SizeChange, backend: &BackendHandle) {
-        let Some(output) = self.monitors.focused_id() else {
+        let Some(window) = self
+            .monitors
+            .focused()
+            .and_then(|monitor| monitor.focus_window)
+        else {
             return;
         };
+        self.set_tiled_window_height_for(window, change, backend);
+    }
+
+    /// Resize an explicitly named window without selecting its output or workspace.
+    pub fn set_window_height_for(
+        &mut self,
+        window: WindowId,
+        change: SizeChange,
+        backend: &BackendHandle,
+    ) {
+        if self.floating_windows.contains(&window) {
+            self.float_apply_size_change(window, SizeAxis::Height, change, backend);
+        } else {
+            self.set_tiled_window_height_for(window, change, backend);
+        }
+    }
+
+    fn set_tiled_window_height_for(
+        &mut self,
+        window: WindowId,
+        change: SizeChange,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, workspace, col_idx)) = self.locate_window(window) else {
+            return;
+        };
+        let scale = self
+            .monitors
+            .get(&output)
+            .map_or(1.0, |monitor| monitor.scale_factor);
+        let physical_change = Self::physical_size_change(change, scale);
         let (view_h, gap, extra) = {
             let Some(monitor) = self.monitors.get(&output) else {
                 return;
             };
-            let cfg = self.active_workspace_config(output);
+            let cfg = self.effective_config_for_workspace(output, workspace);
             let view_h = monitor.work_area.size.h as i32
                 - cfg.outer_gaps.0
                 - cfg.outer_gaps.2
                 - cfg.reserve_top as i32
                 - cfg.reserve_bottom as i32;
-            (view_h, cfg.window_gap, 2 * cfg.border_inset())
+            (
+                view_h,
+                cfg.window_gap,
+                2 * self.rule_border_inset(window, cfg),
+            )
         };
         let changed = {
             let Some(monitor) = self.monitors.get_mut(&output) else {
                 return;
             };
-            let (Some(col_idx), Some(window)) = (monitor.focus_column, monitor.focus_window) else {
-                return;
-            };
             let Some(column) = monitor
-                .workspace_mut()
+                .workspaces
+                .get_mut(&workspace)
                 .and_then(|w| w.columns.get_mut(col_idx))
             else {
                 return;
@@ -7020,7 +7422,7 @@ impl TilingEngine {
             let mine = weights[idx];
             let others = total - mine;
             let current_px = (available * mine / total).round() as i32;
-            let target_px = change.resolve(current_px, view_h, gap, extra);
+            let target_px = physical_change.resolve(current_px, view_h, gap, extra);
             // The share of the column the window gets, and the weight that makes it so.
             let share = (target_px as f32 / available).clamp(0.05, 0.95);
             column.tiles[idx].height_weight = (share / (1.0 - share) * others).clamp(0.1, 10.0);
@@ -7080,24 +7482,28 @@ impl TilingEngine {
         let Some((output, _)) = self.float_location(window_id) else {
             return;
         };
-        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+        let Some((work, scale)) = self
+            .monitors
+            .get(&output)
+            .map(|m| (m.work_area, m.scale_factor))
+        else {
             return;
         };
-        let Some(rect) = self.float_rect_of(window_id) else {
+        let Some(rect) = self.float_action_rect(window_id, backend) else {
             return;
         };
         let (current, view, least) = match axis {
             SizeAxis::Width => (rect.size.w as i32, work.size.w as i32, 120),
             SizeAxis::Height => (rect.size.h as i32, work.size.h as i32, 80),
         };
-        let size = change
+        let size = Self::physical_size_change(change, scale)
             .resolve(current, view, 0, 0)
             .clamp(least, view.max(least)) as u32;
         let resized = match axis {
             SizeAxis::Width => Rect::new(rect.loc.x, rect.loc.y, size, rect.size.h),
             SizeAxis::Height => Rect::new(rect.loc.x, rect.loc.y, rect.size.w, size),
         };
-        self.place_float(window_id, resized, backend);
+        self.place_float_rect(window_id, resized, true, backend);
         if axis == SizeAxis::Width {
             if let Some(home) = self.float_homes.get_mut(&window_id) {
                 home.width_preset_idx = None;
@@ -7954,15 +8360,21 @@ impl TilingEngine {
     /// the monitor that happened to be focused.
     /// Logs a warning and returns silently when the name is not found.
     pub fn focus_workspace_named(&mut self, name: &str, backend: &BackendHandle) {
+        self.focus_workspace_ref(&crate::input::WorkspaceRef::Name(name.to_string()), backend);
+    }
+
+    /// Focus the current owner of an ID/name, or a visible index on this output.
+    pub fn focus_workspace_ref(
+        &mut self,
+        reference: &crate::input::WorkspaceRef,
+        backend: &BackendHandle,
+    ) {
         use tracing::warn;
         let Some(source) = self.monitors.focused_id() else {
             return;
         };
-        let Some((output, id)) = self.resolve_workspace_reference(
-            source,
-            &crate::input::WorkspaceRef::Name(name.to_string()),
-        ) else {
-            warn!("workspace name not found: {}", name);
+        let Some((output, id)) = self.resolve_workspace_reference(source, reference) else {
+            warn!(?reference, "workspace reference not found");
             return;
         };
         let same_output = source == output;
@@ -9652,6 +10064,366 @@ mod tests {
     // --- Floating windows: geometry, workspace, stacking ---
 
     #[test]
+    fn parity_review_float_resize_preserves_partial_position() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        engine.toggle_floating_for(window, &be);
+        engine
+            .move_floating_window(Some(window), SetFixed(-200.0), SetFixed(80.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(-200, 80, 800, 600)
+        );
+        engine.float_apply_size_change(window, SizeAxis::Height, SizeChange::AdjustFixed(0), &be);
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(-200, 80, 800, 600),
+            "a no-op resize must retain the action's bounded partial placement"
+        );
+    }
+
+    #[test]
+    fn parity_review_float_adjust_uses_observed_geometry_and_preserves_async_requests() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        engine.toggle_floating_for(window, &be);
+        // WindowMove/WindowResize and application LOCATIONCHANGE enter this observed-bounds API.
+        assert!(engine.update_window_bounds(window, Rect::new(300, 200, 640, 480)));
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(310, 200, 640, 480),
+            "the relative move must not resurrect the previous home position or size"
+        );
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(320, 200, 640, 480),
+            "back-to-back requests must use the latest requested position before native completion"
+        );
+    }
+
+    #[test]
+    fn parity_review_float_uses_changed_backend_observation_once_before_pending_actions() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let mut observed = engine.tiled_windows[&window].clone();
+        be.add_window(window.as_isize(), observed.clone());
+        engine.toggle_floating_for(window, &be);
+        // Application LOCATIONCHANGE refreshes backend bounds before the main loop
+        // broadcasts it; it does not call update_window_bounds directly.
+        observed.bounds = Rect::new(400, 300, 700, 500);
+        be.update_window(window.as_isize(), observed);
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(410, 300, 700, 500)
+        );
+        assert_eq!(engine.float_memory[&window], Rect::new(410, 300, 700, 500));
+        engine.float_apply_size_change(window, SizeAxis::Height, SizeChange::AdjustFixed(0), &be);
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(420, 300, 700, 500),
+            "unchanged observations must not replace newer asynchronous requests"
+        );
+    }
+
+    #[test]
+    fn parity_review_float_native_completion_supersedes_intermediate_backend_observation() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let mut observed = engine.tiled_windows[&window].clone();
+        be.add_window(window.as_isize(), observed.clone());
+        engine.toggle_floating_for(window, &be);
+        engine.native_move_resize_start(window);
+        // The throttled LOCATIONCHANGE cache is one frame behind the native end read.
+        observed.bounds = Rect::new(300, 200, 650, 480);
+        be.update_window(window.as_isize(), observed);
+        engine.finish_native_move(window, Some(Rect::new(400, 300, 700, 500)));
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(410, 300, 700, 500),
+            "a cached intermediate frame cannot replace the final native geometry"
+        );
+    }
+
+    #[test]
+    fn parity_review_float_late_acknowledgement_cannot_replace_newer_requested_position() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let mut observed = engine.tiled_windows[&window].clone();
+        be.add_window(window.as_isize(), observed.clone());
+        engine.toggle_floating_for(window, &be);
+        engine
+            .move_floating_window(Some(window), SetFixed(100.0), SetFixed(200.0), None, &be)
+            .unwrap();
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        // An older requested frame is acknowledged while the newer one is queued.
+        observed.bounds = Rect::new(100, 200, 800, 600);
+        be.update_window(window.as_isize(), observed);
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(120, 200, 800, 600),
+            "an acknowledgement of x=100 must not undo the queued x=110 request"
+        );
+    }
+
+    #[test]
+    fn parity_review_float_same_position_native_completion_survives_unavailable_hwnd() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let mut observed = engine.tiled_windows[&window].clone();
+        be.add_window(window.as_isize(), observed.clone());
+        engine.toggle_floating_for(window, &be);
+        engine
+            .move_floating_window(Some(window), SetFixed(100.0), SetFixed(200.0), None, &be)
+            .unwrap();
+        engine.native_move_resize_start(window);
+        observed.bounds = Rect::new(300, 250, 650, 480);
+        be.update_window(window.as_isize(), observed.clone());
+        // A drag can return to its starting frame. The next action may occur
+        // while minimized, when there is no readable live frame to acknowledge it.
+        engine.finish_native_move(window, Some(Rect::new(100, 200, 800, 600)));
+        assert!(TilingEngine::live_window_rect(window).is_none());
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(110, 200, 800, 600),
+            "native completion is authoritative even when it equals the last submitted frame and the HWND cannot be read"
+        );
+        // The completed native frame can reach the cache after x=110 was queued.
+        observed.bounds = Rect::new(100, 200, 800, 600);
+        be.update_window(window.as_isize(), observed.clone());
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(120, 200, 800, 600)
+        );
+        // Once the latest request is acknowledged, returning to the old final
+        // native frame is a legitimate application move, not a stale request.
+        observed.bounds = Rect::new(120, 200, 800, 600);
+        be.update_window(window.as_isize(), observed.clone());
+        engine
+            .move_floating_window(Some(window), AdjustFixed(0.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        observed.bounds = Rect::new(100, 200, 800, 600);
+        be.update_window(window.as_isize(), observed);
+        engine
+            .move_floating_window(Some(window), AdjustFixed(5.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(105, 200, 800, 600)
+        );
+    }
+
+    #[test]
+    fn parity_move_float_remembers_tiled_target_without_changing_layout_or_focus() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let output = engine.focused_output().unwrap();
+        let columns = column_windows(&engine, output);
+        let focus = engine.state_target();
+        // No remembered/default position: a single set axis and adjustments do nothing.
+        for (x, y) in [
+            (SetFixed(10.0), AdjustFixed(0.0)),
+            (AdjustFixed(10.0), SetFixed(20.0)),
+        ] {
+            engine
+                .move_floating_window(Some(window), x, y, None, &be)
+                .unwrap();
+            assert!(!engine.float_memory.contains_key(&window));
+        }
+        engine
+            .move_floating_window(Some(window), SetFixed(20.0), SetProportion(25.0), None, &be)
+            .unwrap();
+        assert_eq!(engine.float_memory[&window], Rect::new(20, 260, 800, 600));
+        engine
+            .move_floating_window(
+                Some(window),
+                AdjustFixed(-100.0),
+                AdjustFixed(0.0),
+                None,
+                &be,
+            )
+            .unwrap();
+        assert_eq!(engine.float_memory[&window], Rect::new(-80, 260, 800, 600));
+        assert_eq!(column_windows(&engine, output), columns);
+        assert_eq!(engine.state_target(), focus);
+        assert!(!engine.is_floating(window));
+        engine.toggle_floating_for(window, &be);
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(-80, 260, 800, 600)
+        );
+        engine.toggle_floating_for(window, &be);
+        engine.toggle_floating_for(window, &be);
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(-80, 260, 800, 600)
+        );
+    }
+
+    #[test]
+    fn parity_move_float_inactive_id_keeps_workspace_focus_stack_and_other_rects() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let other = WindowId::new(101);
+        engine.toggle_floating_for(window, &be);
+        engine.toggle_floating_for(other, &be);
+        let other_rect = engine.float_homes[&other].rect;
+        engine.float_move_to_workspace(window, 1, &be);
+        let before_focus = engine.state_target();
+        let before_seq = engine.float_homes[&window].seq;
+        let before_ws = engine.monitors.focused().unwrap().active_workspace;
+        engine
+            .move_floating_window(Some(window), SetFixed(1900.0), SetFixed(1000.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(1845, 965, 800, 600)
+        );
+        assert_eq!(engine.float_memory[&window], Rect::new(1845, 965, 800, 600));
+        assert_eq!(engine.float_homes[&other].rect, other_rect);
+        assert_eq!(engine.float_homes[&window].seq, before_seq);
+        assert_eq!(engine.float_workspace(window), Some(1));
+        assert_eq!(
+            engine.monitors.focused().unwrap().active_workspace,
+            before_ws
+        );
+        assert_eq!(engine.state_target(), before_focus);
+        assert!(!engine.applied_state[&window].visible);
+    }
+
+    #[test]
+    fn parity_move_float_grab_guard_allows_different_explicit_id_and_native_guard() {
+        use crate::ipc::PositionChange::*;
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let moving = WindowId::new(101);
+        engine.toggle_floating_for(window, &be);
+        engine.toggle_floating_for(moving, &be);
+        let original = engine.float_homes[&moving].rect;
+        engine
+            .move_floating_window(None, SetFixed(10.0), SetFixed(10.0), Some(moving), &be)
+            .unwrap();
+        engine
+            .move_floating_window(
+                Some(moving),
+                SetFixed(10.0),
+                SetFixed(10.0),
+                Some(moving),
+                &be,
+            )
+            .unwrap();
+        assert_eq!(engine.float_homes[&moving].rect, original);
+        engine
+            .move_floating_window(
+                Some(window),
+                SetFixed(10.0),
+                SetFixed(10.0),
+                Some(moving),
+                &be,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(10, 10, 800, 600)
+        );
+        engine.native_move_resize_start(window);
+        engine
+            .move_floating_window(Some(window), SetFixed(20.0), SetFixed(20.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(10, 10, 800, 600)
+        );
+        assert!(engine
+            .move_floating_window(
+                Some(WindowId::new(999)),
+                SetFixed(20.0),
+                SetFixed(20.0),
+                None,
+                &be
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn parity_move_float_uses_configured_default_before_adjusting_tiled_target() {
+        use crate::ipc::PositionChange::*;
+        use crate::window::rule_policy::{FloatingPosition, RelativeTo};
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let window = WindowId::new(100);
+        let output = engine.focused_output().unwrap();
+        engine.monitors.get_mut(&output).unwrap().work_area = Rect::new(-1600, 120, 1600, 900);
+        engine.monitors.get_mut(&output).unwrap().scale_factor = 1.5;
+        engine
+            .rule_state
+            .get_mut(&window)
+            .unwrap()
+            .resolved
+            .policy
+            .default_floating_position = Some(FloatingPosition {
+            x: 20.0,
+            y: 30.0,
+            relative_to: RelativeTo::TopLeft,
+        });
+        engine
+            .move_floating_window(Some(window), AdjustFixed(10.0), AdjustFixed(0.0), None, &be)
+            .unwrap();
+        assert_eq!(
+            engine.float_memory[&window],
+            Rect::new(-1555, 165, 800, 600)
+        );
+        engine.toggle_floating_for(window, &be);
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(-1555, 165, 800, 600)
+        );
+    }
+
+    #[test]
     fn test_a_window_floats_at_its_own_size_in_the_middle_of_the_work_area() {
         let be = BackendHandle::default_for_test();
         let mut engine = engine_with_two_tiles();
@@ -9746,7 +10518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remembered_float_geometry_is_pulled_back_onto_the_monitor() {
+    fn test_remembered_float_geometry_retains_bounded_partial_visibility() {
         let be = BackendHandle::default_for_test();
         let mut engine = engine_with_two_tiles();
         let wid = WindowId::new(100);
@@ -9756,9 +10528,7 @@ mod tests {
             .insert(wid, Rect::new(3000, 2000, 800, 600));
         engine.toggle_floating_for(wid, &be);
         let rect = engine.float_homes.get(&wid).unwrap().rect;
-        assert!(rect.loc.x >= 0 && rect.loc.y >= 0);
-        assert!(rect.loc.x + rect.size.w as i32 <= 1920);
-        assert!(rect.loc.y + rect.size.h as i32 <= 1040);
+        assert_eq!(rect.loc, Point::new(1845, 965));
         assert_eq!(rect.size, Rect::new(0, 0, 800, 600).size);
     }
 
@@ -16264,6 +17034,65 @@ mod tests {
             last.rect.loc.y >= 1080,
             "an off-screen column must be parked below the monitor, got y={}",
             last.rect.loc.y
+        );
+    }
+
+    #[test]
+    fn config_gap_reload_keeps_the_focused_late_column_visible() {
+        let backend = BackendHandle::default_for_test();
+        let decoded = crate::config::decode::decode_text(
+            "animations { off; }\nlayout { gaps 10; border { off; }; focus-ring { off; }; shadow { off; }; }",
+            "",
+            None,
+        );
+        assert!(!decoded.has_errors());
+        let mut config = decoded.config;
+        let mut engine = TilingEngine::new(LayoutConfig::from_config(&config));
+        let output = OutputId::from_name("reload-visible");
+        engine.register_monitor(
+            output,
+            Rect::new(0, 0, 1366, 768),
+            Rect::new(0, 0, 1366, 728),
+        );
+        engine.set_full_config(config.clone());
+        for hwnd in 100..125 {
+            engine.add_window(make_window(hwnd, 0, 0), &backend);
+        }
+        engine.reveal_focused();
+        engine.apply_all(&backend);
+        let focused = WindowId::new(124);
+        let before = engine.applied_state.get(&focused).unwrap().rect;
+        assert_eq!((before.loc.y, before.size.h), (10, 708));
+        assert!(before.loc.x >= 0 && before.right() <= 1366);
+
+        // A reload can follow a successful configure immediately. Make that
+        // condition deterministic instead of depending on unit-test wall time.
+        let monitor = engine.monitors.get_mut(&output).unwrap();
+        for workspace in monitor.workspaces.values_mut() {
+            for column in &mut workspace.columns {
+                for tile in &mut column.tiles {
+                    tile.configure_throttle.last_send = Some(std::time::Instant::now());
+                    tile.configure_throttle.min_interval = std::time::Duration::from_secs(60);
+                }
+            }
+        }
+
+        config.layout.inner_gaps = 34;
+        config.layout.outer_gaps = 34;
+        engine.update_config(LayoutConfig::from_config(&config));
+        engine.set_full_config(config);
+        engine.apply_reloaded_layout(&backend);
+
+        let after = engine.applied_state.get(&focused).unwrap().rect;
+        assert_eq!(
+            (after.loc.y, after.size.h),
+            (34, 660),
+            "reload must not park the focused column below the monitor"
+        );
+        assert!(after.loc.x >= 0 && after.right() <= 1366);
+        assert_eq!(
+            engine.monitors().get(&output).unwrap().focus_window,
+            Some(focused)
         );
     }
 

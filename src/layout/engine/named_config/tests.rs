@@ -72,6 +72,10 @@ fn seed_contents(engine: &mut TilingEngine, output: OutputId, workspace: i32) ->
             output,
             workspace,
             rect: Rect::new(40, 60, 320, 240),
+            position_history: crate::layout::floating_position::PositionHistory::new(
+                Rect::new(40, 60, 320, 240),
+                None,
+            ),
             seq: 7,
             width_preset_idx: Some(1),
         },

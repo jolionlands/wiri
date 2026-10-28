@@ -13,7 +13,7 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 164 | 45 | 0 | 17 |
+| Layout and behaviour (226 rows) | 163 | 46 | 0 | 17 |
 | Config, input and IPC (259 rows) | 139 | 48 | 0 | 72 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
@@ -34,7 +34,7 @@ already existed, are dot-sourced into `scripts/live-test.ps1`, and passed in tha
 `h48_*` urgency gates) and 22 in the config/input/IPC matrix. Every flip was cross-checked
 against the gate names that actually appear in `scripts/live-test.ps1` and
 `scripts/live-phases/*.ps1`. The matrices are now **164 done / 45 partial** (layout) and
-**139 done / 48 partial** (config, input and IPC); `missing` and `N/A` are unchanged. One
+**139 done / 48 partial** (config, input and IPC) after that recount; `missing` and `N/A` were unchanged. One
 surveyed row was left `partial`: `horizontal-view-movement`, because the only evidence the
 survey could name for it is the offline H17 config-decode fragment, which its own header says
 does not prove visible motion, and no live gate covers camera scroll.
@@ -51,9 +51,35 @@ Lane V's H62-H65 rows no longer rest on unit tests alone: the 2026-10-27 cycle p
 every enforced gate, and its record names the h78 cursor-hiding, h31 focus-history and H65
 tab sets explicitly. The rows keep `partial` only for the Windows approximations and
 unit-tested-only surfaces (four-finger swipe, promoted touch, multi-display) they document.
-Rows still marked "live pending" (lanes L2, P and A11Y: gates H75-H77) rest on unit tests
-until their own complete official cycle; V's first run was cut short when Windows Defender
-quarantined the test build mid-cycle.
+Blanket "live pending" labels from earlier lane reports are historical: the
+integrated cycles above and the focused run below provide named live evidence.
+Remaining partial rows retain their specific semantic or hardware limits.
+
+**2026-10-28 PR #2 verification (`f217e15`).** Tridaris passed 1,800 native tests
+and all 62 checks in the affected recent-window, config, layout and overlay
+phases. Four layout rows now cite that evidence: height modes, recent-window
+fade, recent-windows off/timestamps and the repeated fade-kind row. Current
+totals at that checkpoint were **307 done / 89 partial / 89 N/A**. Its frozen
+full desktop cycle completed with **775 passing / seven failing** enforced gates.
+
+**2026-10-28 full-parity work in progress.** The latest completed source checkpoint
+passed **1,973 tests**, including the interactive graphics test. The preceding
+native checkpoint passed all **64** new desktop checks H81-H86 on Tridaris.
+The affected keyboard/focus/reload checks passed
+**65/65**; a separate session run passed **8/8** after repairing a missing helper
+in the temporary focused runner. These are focused results, not a new full-cycle
+sign-off. Startup and transfer review follow-ups passed their integrated source
+tests and scoped reviews; the complete desktop run is now in progress against
+frozen source `E8C1274F` and copied release binaries.
+The single-output machine cannot qualify cross-output relocation or mixed DPI.
+
+The source audit also found missing DPI projection on five appearance rows that
+had been marked done. Their correction makes the current totals **302 done /
+94 partial / 89 N/A** across 485 rows: **302/396 applicable rows (76.3%)**.
+This corrects the checklist; it does not describe a runtime regression. Fractional
+spacing, appearance scaling, remaining input/config semantics and hardware evidence
+remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
+for the active work; a gate count alone is not full parity.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
 11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;

@@ -1,6 +1,7 @@
 pub mod animation;
 pub mod engine;
 pub mod floating;
+pub mod floating_position;
 pub mod snap;
 pub mod snapshot;
 pub mod strip;

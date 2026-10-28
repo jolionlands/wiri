@@ -523,12 +523,11 @@ async fn run() -> Result<()> {
         for window in windows {
             // How narrow can the window be made?  Asked before the engine lock is taken: the
             // window answers on its own thread.
-            let window_id = WindowId::new(window.hwnd);
-            let min_width = backend_handle.min_track_width(window.hwnd);
-            // Initial enumeration: at_startup=true so window rules with `at-startup` matchers fire.
+            let native_bounds = backend_handle.native_bounds(window.hwnd);
+            // Initial enumeration preserves existing geometry/focus and skips open animations.
+            // The rule matcher's startup phase is shared with subsequent CREATE/SHOW events.
             let mut eng = engine.write();
-            eng.add_window_at_startup(window, &backend_handle);
-            eng.note_min_width_answer(window_id, min_width);
+            eng.add_window_with_native_bounds(window, &backend_handle, true, native_bounds);
         }
         drop(record);
         {
@@ -846,10 +845,16 @@ async fn run() -> Result<()> {
     tokio::pin!(ctrl_c);
     let tray_wake = wiri::hooks::tray::tray_action_wake();
     let workspace_watch = wiri::ipc::workspace_watch();
+    // Fixed at engine creation: enumeration/reloads cannot extend the startup phase.
+    let startup_rules_timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(
+        engine.read().startup_rules_deadline(),
+    ));
+    tokio::pin!(startup_rules_timeout);
+    let mut startup_rules_pending = true;
 
     // Main loop: event driven.  It sleeps until a tray click, a workspace change, a config
     // reload, a quit request or Ctrl+C needs it; with none of those pending there is no
-    // timer at all (a startup balloon waiting for the tray icon is the one bounded exception).
+    // repeating timer (the startup rule expiry and a pending tray balloon are bounded).
     'main: loop {
         // Workspace-indicator: detect workspace switches and show the overlay.
         // The compare is cheap — active_workspace is a plain i32 field; no Win32 calls — and
@@ -923,12 +928,25 @@ async fn run() -> Result<()> {
         }
 
         // Sleep until something needs this loop.  Each source below wakes it by itself; the
-        // only timer is the 50 ms retry of a startup balloon that waits for the tray icon.
+        // deadlines are the one startup expiry and a pending tray balloon retry.
         tokio::select! {
             // A tray click and a possible workspace change only wake the loop: the tray
             // actions are drained below, the workspace compare runs at the top.
             _ = tray_wake.notified() => {}
             _ = workspace_watch.notified() => {}
+
+            _ = &mut startup_rules_timeout, if startup_rules_pending => {
+                startup_rules_pending = false;
+                let expired = engine.write().finish_startup_rules(
+                    std::time::Instant::now(),
+                    &handle,
+                );
+                if expired {
+                    // Own-overlay refresh queries Windows; release the engine lock first.
+                    wiri::window::block_out::finish_startup();
+                    wiri::ipc::notify_state_changed();
+                }
+            }
 
             // Handle file-watcher config reloads
             outcome = config_reload_rx.recv(), if config_reload_open => match outcome {
@@ -993,7 +1011,7 @@ async fn run() -> Result<()> {
             }
 
             // The config error that was found at startup is retried until the tray icon is
-            // there (see below); nothing else in this loop has a deadline.
+            // there (see below); this retry is independent of startup rule expiry.
             _ = tokio::time::sleep(Duration::from_millis(50)), if pending_balloon.is_some() => {}
         }
 
@@ -1272,8 +1290,7 @@ fn apply_loaded_config(
         engine.set_hide_method(hide_method);
         // The rules were replaced: the windows that are open follow them (their opacity, their
         // size limits; the `open-*` properties are for windows that open).
-        engine.reevaluate_all_window_rules(handle);
-        engine.apply_all(handle);
+        engine.apply_reloaded_layout(handle);
     }
     message_loop.reload_hotkeys();
 }
@@ -1364,6 +1381,7 @@ fn sync_monitors_from_backend(
             engine.unregister_monitor(&oid);
         }
 
+        engine.invalidate_all_native_bounds();
         engine.apply_all(handle);
     }
 
@@ -1372,6 +1390,7 @@ fn sync_monitors_from_backend(
             monitor_name: monitor.name,
         });
     }
+    refresh_native_bounds_batch(handle, engine);
 }
 
 fn print_help() {
@@ -1500,11 +1519,10 @@ fn handle_backend_event(
             };
             if current_before_retry {
                 add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
-                // Ask outside the engine lock, retaining the existing per-window retry cap.
+                // Ask outside the engine lock, using native freshness/backoff.
                 // Stale notices must not admit/activate an old foreground through this path.
-                if was_managed && engine.read().min_width_query_wanted(window_id) {
-                    let answer = handle.min_track_width(hwnd);
-                    engine.write().learn_min_width(window_id, answer, handle);
+                if was_managed {
+                    refresh_native_bounds_for_window(hwnd, handle, engine);
                 }
             }
             let owner = wiri::layout::engine::root_owner_of(hwnd);
@@ -1541,6 +1559,7 @@ fn handle_backend_event(
         // overridden by the tiling engine on next layout pass; but we
         // still forward them as IPC events for external listeners.
         BackendEvent::WindowMoved { hwnd, rect } => {
+            refresh_native_bounds_for_window(hwnd, handle, engine);
             ipc_server.broadcast_event(IpcEvent::WindowMoved {
                 window_hwnd: hwnd,
                 x: rect.loc.x,
@@ -1550,6 +1569,7 @@ fn handle_backend_event(
             });
         }
         BackendEvent::WindowResized { hwnd, rect } => {
+            refresh_native_bounds_for_window(hwnd, handle, engine);
             ipc_server.broadcast_event(IpcEvent::WindowResized {
                 window_hwnd: hwnd,
                 width: rect.size.w,
@@ -1557,13 +1577,7 @@ fn handle_backend_event(
             });
         }
         BackendEvent::WindowTitleChanged { hwnd } => {
-            // A newly created terminal may answer its minimum only once its title is ready.
-            // Reuse the same three-query lifetime cap as foreground retries, outside the lock.
-            let window_id = WindowId::new(hwnd);
-            if engine.read().min_width_query_wanted(window_id) {
-                let answer = handle.min_track_width(hwnd);
-                engine.write().learn_min_width(window_id, answer, handle);
-            }
+            refresh_native_bounds_for_window(hwnd, handle, engine);
             // The backend has read the new title already.  The engine keeps it, and the
             // window rules that look at titles are evaluated again for the window (only
             // when some rule does).
@@ -1585,7 +1599,10 @@ fn handle_backend_event(
             let id = WindowId::new(hwnd);
             if !eng.native_move_resize_active(id) {
                 eng.window_size_class_changed(id, zoomed, covers_monitor, handle);
+                eng.invalidate_native_bounds(id);
             }
+            drop(eng);
+            refresh_native_bounds_for_window(hwnd, handle, engine);
         }
 
         BackendEvent::WindowMoveResizeStart { hwnd } => {
@@ -1682,7 +1699,7 @@ fn add_window_if_tileable(
     // How narrow can the window be made?  Asked here, once, before the engine lock is
     // taken (the window answers on its own thread): a terminal that will not go below
     // 462 px has to get a column that wide, or it lies on top of its neighbour.
-    let min_width = handle.min_track_width(hwnd);
+    let native_bounds = handle.native_bounds(hwnd);
 
     // The check above ran without the write lock: the creation, show and foreground
     // events and the reconcile pass can find the same new window at the same moment.
@@ -1707,8 +1724,7 @@ fn add_window_if_tileable(
         } else {
             info!("+ {} ({}) [{}]", window.title, window.class_name, source);
         }
-        eng.add_window(window, handle);
-        eng.note_min_width_answer(window_id, min_width);
+        eng.add_window_with_native_bounds(window, handle, false, native_bounds);
         // New windows take the focus; scroll the strip so the new column is on screen.
         eng.reveal_focused();
         eng.apply_all(handle);
@@ -1717,6 +1733,43 @@ fn add_window_if_tileable(
     // (The reconcile pass comes here too, not only the events.)
     wiri::ipc::notify_state_changed();
     true
+}
+
+/// Query at most one due application outside the engine lock. Context checks
+/// also invalidate physical conversion after a DPI, frame or output change.
+fn refresh_native_bounds_for_window(
+    hwnd: isize,
+    handle: &BackendHandle,
+    engine: &Arc<RwLock<TilingEngine>>,
+) -> bool {
+    let Some(context) = handle.native_bounds_context(hwnd) else {
+        return false;
+    };
+    let query =
+        engine
+            .write()
+            .native_bounds_query(WindowId::new(hwnd), context, std::time::Instant::now());
+    let Some(query) = query else {
+        return false;
+    };
+    let answer = handle.native_bounds(hwnd);
+    engine
+        .write()
+        .finish_native_bounds_query(query, answer, std::time::Instant::now(), handle);
+    true
+}
+
+fn refresh_native_bounds_batch(handle: &BackendHandle, engine: &Arc<RwLock<TilingEngine>>) {
+    let candidates = engine.read().native_bounds_candidates();
+    let mut queried = 0;
+    for id in candidates {
+        if refresh_native_bounds_for_window(id.as_isize(), handle, engine) {
+            queried += 1;
+            if queried == 2 {
+                break;
+            }
+        }
+    }
 }
 
 /// One reconcile pass.  True when it admitted a window the events had missed.
@@ -1739,6 +1792,7 @@ fn reconcile_visible_windows(
         }
     }
 
+    refresh_native_bounds_batch(handle, engine);
     if !added_any {
         // Re-hide any inactive-workspace windows that Windows re-shown outside
         // wiri's model. try_write keeps this maintenance loop from blocking IPC

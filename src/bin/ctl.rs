@@ -353,6 +353,16 @@ enum Commands {
     /// Focus the workspace above (no wrapping)
     FocusWorkspacePrevious,
 
+    /// Move a float, or set a tile's remembered floating position (logical pixels or %).
+    MoveFloatingWindow {
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(short, long, default_value = "+0", allow_hyphen_values = true)]
+        x: wiri::ipc::PositionChange,
+        #[arg(short, long, default_value = "+0", allow_hyphen_values = true)]
+        y: wiri::ipc::PositionChange,
+    },
+
     /// Run any action by its niri name, as if its key were pressed:
     /// `wiri-ctl action focus-column-left`, `wiri-ctl action set-column-width +10%`,
     /// `wiri-ctl action focus-workspace 2`.
@@ -685,10 +695,15 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
         Commands::ResizeColumn { delta_px } => IpcMessage::ResizeColumn { delta_px },
         Commands::FocusWorkspaceNext => IpcMessage::FocusWorkspaceNext,
         Commands::FocusWorkspacePrevious => IpcMessage::FocusWorkspacePrevious,
+        Commands::MoveFloatingWindow { id, x, y } => IpcMessage::MoveFloatingWindow { id, x, y },
         Commands::Spawn { command, args } => IpcMessage::SpawnCommand { command, args },
         Commands::Action { name, args } => {
             let (args, quoted) = split_quoted_words(args);
-            IpcMessage::RunAction { name, args, quoted }
+            if name == "move-floating-window" {
+                wiri::ipc::parse_move_floating_window(&args).map_err(anyhow::Error::msg)?
+            } else {
+                IpcMessage::RunAction { name, args, quoted }
+            }
         }
         Commands::FocusPrevious => IpcMessage::FocusPrevious,
         Commands::ToggleAlwaysOnTop => IpcMessage::ToggleAlwaysOnTop,
@@ -1973,6 +1988,60 @@ mod tests {
     fn request_of(args: &[&str]) -> IpcMessage {
         let cli = Cli::try_parse_from(args).expect("the command line parses");
         request_for(cli.command.into_command()).expect("the request is valid")
+    }
+
+    #[test]
+    fn parity_move_floating_window_cli_keeps_signed_axes_and_target() {
+        let request = request_of(&[
+            "wiri-ctl",
+            "msg",
+            "action",
+            "move-floating-window",
+            "--id",
+            "42",
+            "--x",
+            "-10%",
+            "--y",
+            "120",
+        ]);
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "type":"move_floating_window",
+                "data":{"id":42,"x":{"AdjustProportion":-10.0},"y":{"SetFixed":120.0}}
+            })
+        );
+    }
+
+    #[test]
+    fn parity_move_floating_window_direct_cli_defaults_and_validates_axes() {
+        for args in [
+            vec!["wiri-ctl", "move-floating-window", "--x=50%"],
+            vec!["wiri-ctl", "msg", "move-floating-window", "-x", "50%"],
+            vec!["wiri-ctl", "action", "move-floating-window", "--x", "50%"],
+        ] {
+            assert_eq!(
+                serde_json::to_value(request_of(&args)).unwrap(),
+                serde_json::json!({
+                    "type":"move_floating_window","data":{"id":null,
+                    "x":{"SetProportion":50.0},"y":{"AdjustFixed":0.0}}
+                })
+            );
+        }
+        for args in [
+            vec!["wiri-ctl", "move-floating-window", "--x", "NaN"],
+            vec!["wiri-ctl", "move-floating-window", "--y", "10%extra"],
+            vec!["wiri-ctl", "move-floating-window", "--id", "-1"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for args in [vec!["--x"], vec!["--id", "abc"], vec!["--x", "NaN"]] {
+            let cli = Cli::try_parse_from(
+                [vec!["wiri-ctl", "action", "move-floating-window"], args].concat(),
+            )
+            .unwrap();
+            assert!(request_for(cli.command.into_command()).is_err());
+        }
     }
 
     #[test]

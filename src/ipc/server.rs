@@ -781,8 +781,130 @@ impl IpcServer {
                 }
                 serde_json::json!({"success": true})
             }
+            IpcMessage::WorkspaceAction { action } => {
+                let name = action.action_name();
+                let action = match action.into_input_action() {
+                    Ok(action) => action,
+                    Err(error) => return serde_json::json!({"success":false,"error":error}),
+                };
+                let (Some(engine), Some(backend)) = (&self.engine, &self.backend) else {
+                    return serde_json::json!({"success":false,"error":"engine or backend not initialized"});
+                };
+                if let crate::input::Action::WorkspaceAction(
+                    crate::input::WorkspaceAction::MoveWindow {
+                        window: Some(window),
+                        ..
+                    },
+                ) = &action
+                {
+                    if !engine.read().tiled_windows().contains_key(window) {
+                        return serde_json::json!({"success":false,"error":format!(
+                            "no window with id {} (the handle that `wiri-ctl windows` shows)",
+                            window.as_isize()
+                        )});
+                    }
+                }
+                // The audit accepts the decoded action without running effects.
+                // ID references remain structured; there is no invented argv syntax.
+                if let Some(reply) = super::action_audit::reply(name, &[]) {
+                    return reply;
+                }
+                let mut engine = engine.write();
+                match &action {
+                    crate::input::Action::WorkspaceAction(action) => {
+                        engine.workspace_layout_action(action, backend)
+                    }
+                    crate::input::Action::MonitorAction(action) => {
+                        engine.monitor_layout_action(action, backend)
+                    }
+                    crate::input::Action::FocusWorkspace(index) => {
+                        engine.focus_workspace_number(*index, backend)
+                    }
+                    crate::input::Action::FocusWorkspaceNamed(name) => {
+                        engine.focus_workspace_named(name, backend)
+                    }
+                    crate::input::Action::RenameWorkspace(name) => {
+                        engine.set_workspace_name(name, None, backend)
+                    }
+                    _ => unreachable!("typed workspace transport only creates workspace actions"),
+                }
+                serde_json::json!({"success":true})
+            }
+            IpcMessage::SizeAction { action } => {
+                let name = action.action_name();
+                let window = match action.window_id() {
+                    Some(id) => match isize::try_from(id).ok().filter(|id| *id > 0) {
+                        Some(id) => Some(WindowId::new(id)),
+                        None => {
+                            return serde_json::json!({
+                                "success":false,"error":"window id must be a positive native window id"
+                            })
+                        }
+                    },
+                    None => None,
+                };
+                let action = match action.into_input_action() {
+                    Ok(action) => action,
+                    Err(error) => return serde_json::json!({"success":false,"error":error}),
+                };
+                let (Some(engine), Some(backend)) = (&self.engine, &self.backend) else {
+                    return serde_json::json!({"success":false,"error":"engine or backend not initialized"});
+                };
+                if let Some(window) = window {
+                    if !engine.read().tiled_windows().contains_key(&window) {
+                        return serde_json::json!({"success":false,"error":format!(
+                            "no window with id {} (the handle that `wiri-ctl windows` shows)",
+                            window.as_isize()
+                        )});
+                    }
+                }
+                if let Some(reply) = super::action_audit::reply(name, &[]) {
+                    return reply;
+                }
+                if let (Some(window), crate::input::Action::SetWindowHeight(change)) =
+                    (window, &action)
+                {
+                    engine
+                        .write()
+                        .set_window_height_for(window, *change, backend);
+                    return serde_json::json!({"success":true});
+                }
+                if let (Some(window), crate::input::Action::SetColumnWidth(change)) =
+                    (window, &action)
+                {
+                    if name == "set-window-width" {
+                        engine
+                            .write()
+                            .set_window_width_for(window, *change, backend);
+                        return serde_json::json!({"success":true});
+                    }
+                }
+                if let Some(window) = window {
+                    // Preserve Wiri's legacy targeted SetColumnWidth extension.
+                    if !focus_window_by_hwnd(engine, backend, window.as_isize()) {
+                        return serde_json::json!({"success":false,"error":format!(
+                            "no window with id {} to focus", window.as_isize()
+                        )});
+                    }
+                }
+                let no_quit = Arc::new(parking_lot::Mutex::new(None));
+                crate::backend::message_loop::perform_action_on(
+                    &action,
+                    engine,
+                    backend,
+                    &no_quit,
+                    window.map(WindowId::as_isize),
+                );
+                serde_json::json!({"success":true})
+            }
             IpcMessage::RunAction { name, args, quoted } => {
                 info!("IPC: RunAction {} {:?}", name, args);
+                if name == "move-floating-window" {
+                    return match super::parse_move_floating_window(&args) {
+                        Ok(message) => self.process_message(message),
+                        Err(error) => serde_json::json!({"success":false,"error":error}),
+                    };
+                }
                 // Capture an explicit window without focusing it (including a
                 // parked/inactive one). Validate before the generic --id path,
                 // which otherwise changes focus for layout actions.
@@ -940,6 +1062,35 @@ impl IpcServer {
                         // Transfers carry their target without stealing focus first.
                         None
                     } else {
+                        // These niri ById actions operate directly. Even passing the
+                        // explicit HWND to perform_action_on would synchronize focus.
+                        match &action {
+                            crate::input::Action::ToggleFullscreen => {
+                                engine
+                                    .write()
+                                    .toggle_fullscreen_for(WindowId::new(hwnd), backend);
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::SetWindowHeight(change) => {
+                                engine.write().set_window_height_for(
+                                    WindowId::new(hwnd),
+                                    *change,
+                                    backend,
+                                );
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::SetColumnWidth(change)
+                                if name == "set-window-width" =>
+                            {
+                                engine.write().set_window_width_for(
+                                    WindowId::new(hwnd),
+                                    *change,
+                                    backend,
+                                );
+                                return serde_json::json!({"success": true});
+                            }
+                            _ => {}
+                        }
                         if !focus_window_by_hwnd(engine, backend, hwnd) {
                             return serde_json::json!({
                                 "success": false,
@@ -962,6 +1113,25 @@ impl IpcServer {
             IpcMessage::SubscribeEvents { event_types } => {
                 info!("IPC: Subscribe to events: {:?}", event_types);
                 serde_json::json!({"success": true, "subscription_id": 1})
+            }
+            IpcMessage::MoveFloatingWindow { id, x, y } => {
+                let (Some(engine), Some(backend)) = (&self.engine, &self.backend) else {
+                    return serde_json::json!({"success":false,"error":"engine or backend not initialized"});
+                };
+                let id = match id.map(isize::try_from).transpose() {
+                    Ok(id) => id.map(WindowId::new),
+                    Err(_) => {
+                        return serde_json::json!({"success":false,"error":"window id exceeds the native handle range"})
+                    }
+                };
+                // Snapshot hook ownership before locking the engine (the hook can enqueue work).
+                let grab = crate::input::low_level_hook::current_grab();
+                let mut engine = engine.write();
+                let moving = floating_move_target(&grab, &engine);
+                match engine.move_floating_window(id, x, y, moving, backend) {
+                    Ok(()) => serde_json::json!({"success":true}),
+                    Err(error) => serde_json::json!({"success":false,"error":error}),
+                }
             }
             IpcMessage::WindowMove { window_hwnd, x, y } => {
                 info!("IPC: Move window {} to ({}, {})", window_hwnd, x, y);
@@ -2085,8 +2255,25 @@ fn build_window_infos(eng: &crate::layout::TilingEngine) -> Vec<serde_json::Valu
     out
 }
 
-/// Requests that only read: they cannot change what event-stream clients are told, so they
-/// do not wake the task that finds out what changed.
+/// niri's IPC positioning excludes Moving, while Starting is still adjustable.
+fn floating_move_target(
+    grab: &crate::input::low_level_hook::GrabState,
+    engine: &TilingEngine,
+) -> Option<WindowId> {
+    use crate::input::low_level_hook::GrabState;
+    match grab {
+        GrabState::Move(grab)
+            if !grab.is_cancelled()
+                && (grab.has_drag_started()
+                    || engine.native_move_resize_active(grab.window_id)) =>
+        {
+            Some(grab.window_id)
+        }
+        _ => None,
+    }
+}
+
+/// Requests that only read do not wake the task that finds out what changed.
 fn is_query(message: &IpcMessage) -> bool {
     matches!(
         message,
@@ -2296,81 +2483,20 @@ fn focus_window_by_hwnd(
     hwnd: isize,
 ) -> bool {
     let wid = crate::utils::WindowId::new(hwnd);
+    let mut engine = engine.write();
 
     // Fast path: if the engine doesn't know this window, give up early.
-    if !engine.read().tiled_windows().contains_key(&wid) {
+    if !engine.tiled_windows().contains_key(&wid) {
         return false;
     }
 
-    // Find which monitor + workspace + column hosts the window.
-    let location = {
-        let eng = engine.read();
-        let mut found: Option<(crate::utils::OutputId, i32, usize)> = None;
-        for (&oid, monitor) in eng.monitors().iter() {
-            for (&ws_id, ws) in monitor.workspaces.iter() {
-                if let Some(col_idx) = ws.find_window_column(wid) {
-                    found = Some((oid, ws_id, col_idx));
-                    break;
-                }
-            }
-            if found.is_some() {
-                break;
-            }
-        }
-        found
-    };
-
-    let Some((oid, ws_id, col_idx)) = location else {
-        // Registered but not in any column: a minimized window (brought back, into its
-        // old column) or a floating one (focused here, on its own workspace).
-        if engine.read().is_minimized(wid) {
-            // Asynchronous: a hung application must not hold the IPC thread.
-            unsafe {
-                use windows::Win32::Foundation::HWND;
-                use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_RESTORE};
-                let _ = ShowWindowAsync(HWND(hwnd as *mut std::ffi::c_void), SW_RESTORE);
-            }
-            engine.write().restore_window(wid, backend);
-            engine.write().apply_all(backend);
-        } else if engine.write().focus_float(wid, backend) {
-            engine.write().apply_all(backend);
-        }
-        return true;
-    };
-
-    // Update focused output, workspace, focus_column and focus_window.
-    {
-        let mut eng = engine.write();
-        eng.set_focused_output(oid);
-        if let Some(monitor) = eng.monitors_mut().get_mut(&oid) {
-            monitor.active_workspace = ws_id;
-            monitor.focus_column = Some(col_idx);
-            monitor.focus_window = Some(wid);
-            monitor.focus_ring.push(wid);
-        }
-        // The column of the window is brought into view: it may be scrolled out of it (the
-        // OS focus report that follows finds the engine's focus already there and scrolls
-        // nothing).
-        eng.reveal_focused();
+    // Explicit focus must activate even when the layout still caches this tile
+    // while a float owns the foreground. Share the hotkey/MRU path, which also
+    // restores minimized targets and reveals their workspace before activation.
+    if !engine.focus_action_window(wid, backend) {
+        return false;
     }
-
-    // Best-effort: bring the Win32 window to the foreground (don't fail on err).
-    {
-        let eng = engine.read();
-        if let Some(window) = eng.tiled_windows().get(&wid) {
-            use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
-            let h = HWND(window.hwnd as *mut std::ffi::c_void);
-            unsafe {
-                if IsWindow(h).as_bool() {
-                    let _ = SetForegroundWindow(h);
-                }
-            }
-        }
-    }
-
-    // Re-apply layout on the target monitor.
-    engine.write().apply_all(backend);
+    engine.apply_all(backend);
     true
 }
 
@@ -2524,6 +2650,303 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    // Float 101 owns the observed foreground, while tile 100 deliberately remains
+    // the layout's cached activation target. Returning to 100 is an explicit
+    // activation request even though the layout focus has not changed.
+    fn server_with_float_over_cached_tile() -> (
+        IpcServer,
+        Arc<parking_lot::RwLock<TilingEngine>>,
+        BackendHandle,
+    ) {
+        let (mut server, engine) = server_with_windows(&[100, 101]);
+        let backend = BackendHandle::default_for_test();
+        server.set_backend(backend.clone());
+        {
+            let mut engine = engine.write();
+            engine.toggle_floating_for(WindowId::new(101), &backend);
+            assert!(engine.focus_float(WindowId::new(101), &backend));
+            engine.apply_all(&backend);
+            assert_eq!(
+                engine.monitors().focused().unwrap().focus_window,
+                Some(WindowId::new(100))
+            );
+            assert_eq!(engine.ipc_snapshot().focused_window(), Some(101));
+        }
+        (server, engine, backend)
+    }
+
+    #[test]
+    fn parity_explicit_focus_legacy_retries_refused_cached_tile_each_request() {
+        use crate::backend::activation_attempt_test_support::with_refused_activation_attempts;
+
+        with_refused_activation_attempts(|| {
+            let (server, engine, backend) = server_with_float_over_cached_tile();
+            for request in 0..2 {
+                let (reply, attempts) = with_refused_activation_attempts(|| {
+                    server.process_message(IpcMessage::FocusWindow { window_hwnd: 100 })
+                });
+                assert_eq!(reply["success"], true, "{reply}");
+                assert_eq!(
+                    attempts,
+                    vec![100],
+                    "explicit request {request} must activate the cached tile"
+                );
+                let (_, attempts) =
+                    with_refused_activation_attempts(|| engine.write().apply_all(&backend));
+                assert!(
+                    attempts.is_empty(),
+                    "layout must not retry a refused activation"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn parity_explicit_focus_run_action_reactivates_cached_tile_after_float() {
+        use crate::backend::activation_attempt_test_support::with_refused_activation_attempts;
+
+        with_refused_activation_attempts(|| {
+            let (server, _, _) = server_with_float_over_cached_tile();
+            let (reply, attempts) = with_refused_activation_attempts(|| {
+                server.process_message(action("focus-window", &["--id", "100"]))
+            });
+            assert_eq!(reply["success"], true, "{reply}");
+            assert_eq!(
+                attempts,
+                vec![100],
+                "explicit focus must use backend activation even when the layout target is cached"
+            );
+        });
+    }
+
+    #[test]
+    fn parity_explicit_focus_layout_preserves_the_float_foreground() {
+        use crate::backend::activation_attempt_test_support::with_refused_activation_attempts;
+
+        with_refused_activation_attempts(|| {
+            let (_, engine, backend) = server_with_float_over_cached_tile();
+            let (_, attempts) = with_refused_activation_attempts(|| {
+                engine.write().apply_all(&backend);
+                engine.write().apply_all(&backend);
+            });
+            assert!(
+                attempts.is_empty(),
+                "ordinary layout must leave the float focused"
+            );
+            assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+        });
+    }
+
+    #[test]
+    fn parity_explicit_focus_unknown_target_does_not_attempt_activation() {
+        use crate::backend::activation_attempt_test_support::with_refused_activation_attempts;
+
+        with_refused_activation_attempts(|| {
+            let (server, engine, _) = server_with_float_over_cached_tile();
+            let (reply, attempts) = with_refused_activation_attempts(|| {
+                server.process_message(IpcMessage::FocusWindow { window_hwnd: 999 })
+            });
+            assert_eq!(reply["success"], false, "{reply}");
+            assert!(attempts.is_empty());
+            assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+        });
+    }
+
+    #[test]
+    fn parity_explicit_focus_typed_size_target_does_not_activate_the_tile() {
+        use crate::backend::activation_attempt_test_support::with_refused_activation_attempts;
+
+        with_refused_activation_attempts(|| {
+            let (server, engine, _) = server_with_float_over_cached_tile();
+            let before = engine
+                .read()
+                .ipc_snapshot()
+                .windows
+                .into_iter()
+                .find(|w| w.id == 100)
+                .unwrap()
+                .layout
+                .tile_size
+                .0;
+            let request = super::super::wire::decode(serde_json::json!({
+                "Action":{"SetWindowWidth":{"id":100,"change":{"SetFixed":300}}}
+            }))
+            .unwrap();
+            let (reply, attempts) =
+                with_refused_activation_attempts(|| server.process_message(request.message));
+            assert_eq!(reply["success"], true, "{reply}");
+            assert!(
+                attempts.is_empty(),
+                "targeted sizing must not activate its target"
+            );
+            let snapshot = engine.read().ipc_snapshot();
+            assert_eq!(snapshot.focused_window(), Some(101));
+            let after = snapshot
+                .windows
+                .iter()
+                .find(|w| w.id == 100)
+                .unwrap()
+                .layout
+                .tile_size
+                .0;
+            assert!(after < before, "the requested size must still apply");
+        });
+    }
+
+    #[test]
+    fn parity_explicit_focus_workspace_id_transfer_does_not_activate_the_tile() {
+        use crate::backend::activation_attempt_test_support::with_refused_activation_attempts;
+
+        with_refused_activation_attempts(|| {
+            let (server, engine, _) = server_with_float_over_cached_tile();
+            let source = engine.read().monitors().focused_id();
+            let destination = OutputId::from_name("explicit-focus-destination");
+            let id = {
+                let mut engine = engine.write();
+                engine.register_monitor(
+                    destination,
+                    Rect::new(1920, 0, 1200, 800),
+                    Rect::new(1920, 0, 1200, 800),
+                );
+                engine.monitors().get(&destination).unwrap().workspaces[&0].ipc_id
+            };
+            let request = super::super::wire::decode(serde_json::json!({
+                "Action":{"MoveWindowToWorkspace":{"window_id":100,"reference":{"Id":id},"focus":false}}
+            }))
+            .unwrap();
+            let (reply, attempts) =
+                with_refused_activation_attempts(|| server.process_message(request.message));
+            assert_eq!(reply["success"], true, "{reply}");
+            assert!(
+                attempts.is_empty(),
+                "an explicit workspace transfer must not activate its target"
+            );
+            let engine = engine.read();
+            assert_eq!(engine.monitors().focused_id(), source);
+            assert_eq!(engine.ipc_snapshot().focused_window(), Some(101));
+            assert_eq!(
+                engine
+                    .locate_window(WindowId::new(100))
+                    .map(|(output, _, _)| output),
+                Some(destination)
+            );
+        });
+    }
+
+    #[test]
+    fn parity_explicit_focus_recorder_restores_outer_scope_after_unwind() {
+        use crate::backend::activation_attempt_test_support::with_refused_activation_attempts;
+
+        let backend = BackendHandle::default_for_test();
+        let (_, attempts) = with_refused_activation_attempts(|| {
+            assert!(backend.activate_window(100).is_err());
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_refused_activation_attempts(|| {
+                    assert!(backend.activate_window(101).is_err());
+                    panic!("exercise recorder restoration");
+                });
+            }));
+            assert!(unwind.is_err());
+            assert!(backend.activate_window(102).is_err());
+        });
+        assert_eq!(attempts, vec![100, 102]);
+    }
+
+    #[test]
+    fn parity_move_float_typed_and_legacy_requests_apply_the_same_geometry() {
+        let (mut server, engine) = server_with_windows(&[100, 101]);
+        server.set_backend(BackendHandle::default_for_test());
+        engine
+            .write()
+            .toggle_floating_for(WindowId::new(100), &BackendHandle::default_for_test());
+        let request =
+            super::super::wire::decode(serde_json::json!({"Action":{"MoveFloatingWindow":{
+                "id":100,"x":{"SetProportion":50.0},"y":{"SetFixed":20.0}
+            }}}))
+            .unwrap();
+        let reply = server.process_message(request.message);
+        assert_eq!(reply["success"], true, "{reply}");
+        let layout = engine
+            .read()
+            .ipc_snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.id == 100)
+            .unwrap()
+            .layout;
+        assert_eq!(layout.tile_pos_in_workspace_view, Some((960.0, 20.0)));
+        let reply = server.process_message(IpcMessage::RunAction {
+            name: "move-floating-window".into(),
+            args: words(&["--id=100", "-x", "-10%"]),
+            quoted: vec![],
+        });
+        assert_eq!(reply["success"], true, "{reply}");
+        let layout = engine
+            .read()
+            .ipc_snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.id == 100)
+            .unwrap()
+            .layout;
+        assert_eq!(layout.tile_pos_in_workspace_view, Some((768.0, 20.0)));
+        for request in [
+            IpcMessage::MoveFloatingWindow {
+                id: Some(999),
+                x: Default::default(),
+                y: Default::default(),
+            },
+            IpcMessage::MoveFloatingWindow {
+                id: Some(u64::MAX),
+                x: Default::default(),
+                y: Default::default(),
+            },
+            IpcMessage::MoveFloatingWindow {
+                id: Some(100),
+                x: super::super::PositionChange::SetFixed(f64::NAN),
+                y: Default::default(),
+            },
+            IpcMessage::RunAction {
+                name: "move-floating-window".into(),
+                args: words(&["--x", "20%%"]),
+                quoted: vec![],
+            },
+        ] {
+            assert_eq!(server.process_message(request)["success"], false);
+        }
+    }
+
+    #[test]
+    fn parity_move_float_guard_distinguishes_starting_from_moving_without_advancing_it() {
+        use crate::input::{grab::MoveGrab, low_level_hook::GrabState};
+        use crate::utils::{Point, Size};
+        let (_, engine) = server_with_windows(&[100]);
+        let window = WindowId::new(100);
+        let origin = Point::new(0, 0);
+        let grab = MoveGrab::new(window, origin, origin, Size::new(800, 600), 0);
+        let queued = GrabState::Move(grab.clone());
+        assert_eq!(floating_move_target(&queued, &engine.read()), None);
+        assert!(
+            !grab.has_drag_started(),
+            "the guard must not start a pending move"
+        );
+        assert!(!grab.tiled_drag_started(Point::new(255, 0), 1.0));
+        assert_eq!(floating_move_target(&queued, &engine.read()), None);
+        assert!(grab.tiled_drag_started(Point::new(256, 0), 1.0));
+        assert_eq!(floating_move_target(&queued, &engine.read()), Some(window));
+        grab.cancel();
+        assert_eq!(floating_move_target(&queued, &engine.read()), None);
+
+        let float_grab = MoveGrab::new(window, origin, origin, Size::new(800, 600), 0);
+        let queued = GrabState::Move(float_grab);
+        let be = BackendHandle::default_for_test();
+        engine.write().toggle_floating_for(window, &be);
+        assert_eq!(floating_move_target(&queued, &engine.read()), None);
+        // A floating move enters the native-loop exclusion on its first motion.
+        engine.write().native_move_resize_start(window);
+        assert_eq!(floating_move_target(&queued, &engine.read()), Some(window));
+    }
+
     #[test]
     fn niris_id_flag_names_the_window_and_is_taken_out_of_the_arguments() {
         let (args, quoted, target) =
@@ -2602,19 +3025,386 @@ mod tests {
 
     #[test]
     fn an_action_with_id_acts_on_that_window_not_on_the_focused_one() {
+        for inactive_workspace in [false, true] {
+            let (mut server, engine) = server_with_windows(&[100, 101]);
+            server.set_backend(BackendHandle::default_for_test());
+            engine
+                .write()
+                .sync_os_foreground(WindowId::new(101), &BackendHandle::default_for_test());
+            assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+            if inactive_workspace {
+                engine.write().move_window_to_workspace_ref(
+                    Some(WindowId::new(100)),
+                    crate::input::WorkspaceRef::Index(2),
+                    false,
+                    &BackendHandle::default_for_test(),
+                );
+            }
+            let output = engine.read().monitors().focused_id();
+            let workspace = engine.read().monitors().focused().unwrap().active_workspace;
+            // 101 is the engine's focus (the window that was added last).
+            let reply = server.process_message(action("fullscreen-window", &["--id", "100"]));
+            assert_eq!(reply["success"], true, "{}", reply);
+            assert!(engine.read().is_fullscreen(WindowId::new(100)));
+            assert!(!engine.read().is_fullscreen(WindowId::new(101)));
+            assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+            assert_eq!(engine.read().monitors().focused_id(), output);
+            assert_eq!(
+                engine.read().monitors().focused().unwrap().active_workspace,
+                workspace,
+                "an explicit fullscreen target must not activate its workspace"
+            );
+            // The same with niri's other spelling.
+            let reply = server.process_message(action("fullscreen-window", &["--id=100"]));
+            assert_eq!(reply["success"], true, "{}", reply);
+            assert!(
+                !engine.read().is_fullscreen(WindowId::new(100)),
+                "toggled back"
+            );
+            assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+            assert_eq!(engine.read().monitors().focused_id(), output);
+            assert_eq!(
+                engine.read().monitors().focused().unwrap().active_workspace,
+                workspace
+            );
+        }
+    }
+
+    #[test]
+    fn set_window_height_with_id_preserves_the_focused_tile() {
         let (mut server, engine) = server_with_windows(&[100, 101]);
-        server.set_backend(BackendHandle::default_for_test());
-        // 101 is the engine's focus (the window that was added last).
-        let reply = server.process_message(action("fullscreen-window", &["--id", "100"]));
-        assert_eq!(reply["success"], true, "{}", reply);
-        assert!(engine.read().is_fullscreen(WindowId::new(100)));
-        assert!(!engine.read().is_fullscreen(WindowId::new(101)));
-        // The same with niri's other spelling.
-        let reply = server.process_message(action("fullscreen-window", &["--id=100"]));
-        assert_eq!(reply["success"], true, "{}", reply);
+        let backend = BackendHandle::default_for_test();
+        server.set_backend(backend.clone());
+        {
+            let mut eng = engine.write();
+            eng.sync_os_foreground(WindowId::new(100), &backend);
+            eng.consume_window_into_column(&backend);
+            eng.sync_os_foreground(WindowId::new(101), &backend);
+        }
+        let output = engine.read().monitors().focused_id();
+        let workspace = engine.read().monitors().focused().unwrap().active_workspace;
+
+        let reply = server.process_message(action("set-window-height", &["--id", "100", "300"]));
+
+        assert_eq!(reply["success"], true, "{reply}");
+        let eng = engine.read();
+        let monitor = eng.monitors().focused().unwrap();
+        let tiles = &monitor.workspace().unwrap().columns[0].tiles;
+        assert_eq!(tiles.len(), 2);
+        let target = tiles
+            .iter()
+            .find(|tile| tile.window_id == WindowId::new(100))
+            .unwrap();
+        let other = tiles
+            .iter()
+            .find(|tile| tile.window_id == WindowId::new(101))
+            .unwrap();
         assert!(
-            !engine.read().is_fullscreen(WindowId::new(100)),
-            "toggled back"
+            target.height_weight < 1.0,
+            "300 px is less than half the column"
+        );
+        assert_eq!(
+            other.height_weight, 1.0,
+            "the other tile keeps its share weight"
+        );
+        assert_eq!(eng.ipc_snapshot().focused_window(), Some(101));
+        assert_eq!(eng.monitors().focused_id(), output);
+        assert_eq!(monitor.active_workspace, workspace);
+    }
+
+    #[test]
+    fn parity_explicit_window_width_typed_tiled_preserves_inactive_output_focus() {
+        assert_explicit_window_width_preserves_focus(false, true);
+    }
+
+    #[test]
+    fn parity_explicit_window_width_legacy_tiled_preserves_inactive_output_focus() {
+        assert_explicit_window_width_preserves_focus(false, false);
+    }
+
+    #[test]
+    fn parity_explicit_window_width_typed_floating_preserves_inactive_output_focus() {
+        assert_explicit_window_width_preserves_focus(true, true);
+    }
+
+    #[test]
+    fn parity_explicit_window_width_legacy_floating_preserves_inactive_output_focus() {
+        assert_explicit_window_width_preserves_focus(true, false);
+    }
+
+    fn width_target_server_fixture(
+        floating: bool,
+    ) -> (
+        IpcServer,
+        Arc<parking_lot::RwLock<TilingEngine>>,
+        OutputId,
+        OutputId,
+    ) {
+        use crate::layout::{Column, Tile, Workspace};
+
+        let mut eng = TilingEngine::new(LayoutConfig {
+            outer_gaps: (0, 0, 0, 0),
+            column_gap: 0,
+            window_gap: 0,
+            border_width: 0,
+            reserve_top: 0,
+            reserve_bottom: 0,
+            reserve_left: 0,
+            reserve_right: 0,
+            ..LayoutConfig::default()
+        });
+        let left = OutputId::from_name("width-global");
+        let right = OutputId::from_name("width-target");
+        eng.register_monitor(left, Rect::new(0, 0, 1200, 900), Rect::new(0, 0, 1200, 900));
+        eng.register_monitor_with_scale(
+            right,
+            Rect::new(1200, 0, 1200, 900),
+            Rect::new(1200, 0, 1200, 900),
+            1.5,
+        );
+        let backend = BackendHandle::default_for_test();
+        for id in [100, 200, 201, 202, 210] {
+            eng.add_window(window(id), &backend);
+        }
+        let make_workspace = |name: &str, groups: &[&[isize]]| {
+            let mut ws = Workspace::new();
+            ws.name = Some(name.to_string());
+            for group in groups {
+                let mut col = Column::new();
+                col.tiles = group
+                    .iter()
+                    .map(|id| Tile::new(WindowId::new(*id)))
+                    .collect();
+                col.set_width(Some(400));
+                col.select_window(WindowId::new(group[0]));
+                ws.columns.push(col);
+            }
+            ws
+        };
+        {
+            let monitor = eng.monitors_mut().get_mut(&left).unwrap();
+            monitor.workspaces.clear();
+            monitor.insert_workspace(40, make_workspace("global", &[&[100]]));
+            monitor.switch_workspace(40);
+            monitor.set_focus(WindowId::new(100));
+        }
+        {
+            let monitor = eng.monitors_mut().get_mut(&right).unwrap();
+            monitor.workspaces.clear();
+            monitor.insert_workspace(40, make_workspace("remote-active", &[&[210]]));
+            monitor.insert_workspace(7, make_workspace("remote-inactive", &[&[202], &[200, 201]]));
+            monitor.switch_workspace(40);
+            monitor.set_focus(WindowId::new(210));
+        }
+        eng.set_focused_output(left);
+        if floating {
+            eng.toggle_floating_for(WindowId::new(200), &backend);
+        }
+        eng.sync_os_foreground(WindowId::new(100), &backend);
+        let engine = Arc::new(parking_lot::RwLock::new(eng));
+        let mut server = IpcServer::new();
+        server.set_engine(engine.clone());
+        server.set_backend(backend);
+        (server, engine, left, right)
+    }
+
+    fn assert_explicit_window_width_preserves_focus(floating: bool, typed: bool) {
+        let (server, engine, left, right) = width_target_server_fixture(floating);
+        let cursor = |eng: &TilingEngine, output| {
+            let monitor = eng.monitors().get(&output).unwrap();
+            (
+                monitor.active_workspace,
+                monitor.focus_column,
+                monitor.focus_window,
+            )
+        };
+        let before = engine.read().ipc_snapshot();
+        assert_eq!(before.focused_window(), Some(100));
+        let cursors = (cursor(&engine.read(), left), cursor(&engine.read(), right));
+        assert_eq!(cursors.0 .0, 40);
+        assert_eq!(cursors.1 .0, 40);
+        assert_eq!(engine.read().monitors().focused_id(), Some(left));
+        let request = if typed {
+            super::super::wire::decode(serde_json::json!({
+                "Action":{"SetWindowWidth":{"id":200,"change":{"SetFixed":160}}}
+            }))
+            .unwrap()
+            .message
+        } else {
+            action("set-window-width", &["--id=200", "160"])
+        };
+
+        let reply = server.process_message(request);
+
+        assert_eq!(reply["success"], true, "{reply}");
+        let eng = engine.read();
+        let after = eng.ipc_snapshot();
+        let target = after
+            .windows
+            .iter()
+            .find(|window| window.id == 200)
+            .unwrap();
+        assert_eq!(target.is_floating, floating);
+        assert_eq!(
+            target.layout.window_size.0, 160,
+            "160 logical pixels is 240 physical at 150%"
+        );
+        if !floating {
+            let column = &eng.monitors().get(&right).unwrap().workspaces[&7].columns[1];
+            assert_eq!(column.width, Some(240));
+            assert_eq!(
+                after
+                    .windows
+                    .iter()
+                    .find(|window| window.id == 201)
+                    .unwrap()
+                    .layout
+                    .window_size
+                    .0,
+                160,
+                "a tiled window changes its whole column width"
+            );
+        }
+        for id in [100, 202, 210] {
+            assert_eq!(
+                after
+                    .windows
+                    .iter()
+                    .find(|window| window.id == id)
+                    .unwrap()
+                    .layout,
+                before
+                    .windows
+                    .iter()
+                    .find(|window| window.id == id)
+                    .unwrap()
+                    .layout,
+                "unrelated window {id} must retain its geometry"
+            );
+        }
+        assert_eq!((cursor(&eng, left), cursor(&eng, right)), cursors);
+        assert_eq!(eng.monitors().focused_id(), Some(left));
+        assert_eq!(after.focused_window(), Some(100));
+    }
+
+    #[test]
+    fn parity_explicit_window_width_rejects_unmanaged_and_out_of_range_ids() {
+        let (server, engine, _, _) = width_target_server_fixture(false);
+        let before = engine.read().ipc_snapshot();
+        for id in [999, u64::MAX] {
+            let request = super::super::wire::decode(serde_json::json!({
+                "Action":{"SetWindowWidth":{"id":id,"change":{"SetFixed":160}}}
+            }))
+            .unwrap();
+            let reply = server.process_message(request.message);
+            assert_eq!(reply["success"], false, "id={id}: {reply}");
+            assert_eq!(engine.read().ipc_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn parity_typed_size_width_actions_apply_percent_points_and_negative_sets() {
+        for variant in ["SetColumnWidth", "SetWindowWidth"] {
+            let (mut server, engine) = server_with_windows(&[100]);
+            server.set_backend(BackendHandle::default_for_test());
+            let apply = |change: serde_json::Value| {
+                let request = super::super::wire::decode(serde_json::json!({
+                    "Action":{(variant):{"change":change}}
+                }))
+                .unwrap();
+                let reply = server.process_message(request.message);
+                assert_eq!(reply["success"], true, "{variant}: {reply}");
+            };
+
+            apply(serde_json::json!({"SetProportion":50.0}));
+            let half_width = {
+                let eng = engine.read();
+                let column = &eng
+                    .monitors()
+                    .focused()
+                    .unwrap()
+                    .workspace()
+                    .unwrap()
+                    .columns[0];
+                assert_eq!(column.width_proportion, Some(0.5));
+                column.width.unwrap()
+            };
+            assert!(
+                (600..=1000).contains(&half_width),
+                "{variant}: {half_width}"
+            );
+
+            apply(serde_json::json!({"AdjustProportion":-10.0}));
+            let adjusted_width = {
+                let eng = engine.read();
+                let column = &eng
+                    .monitors()
+                    .focused()
+                    .unwrap()
+                    .workspace()
+                    .unwrap()
+                    .columns[0];
+                assert!((column.width_proportion.unwrap() - 0.4).abs() < 1e-9);
+                column.width.unwrap()
+            };
+            assert!(adjusted_width < half_width, "{variant}: width must shrink");
+
+            apply(serde_json::json!({"SetFixed":-10}));
+            let eng = engine.read();
+            let column = &eng
+                .monitors()
+                .focused()
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[0];
+            assert_eq!(column.width_fixed_logical, Some(0.0));
+            assert!(column.width.unwrap() < adjusted_width);
+        }
+    }
+
+    #[test]
+    fn parity_typed_size_targeted_height_applies_without_changing_focus() {
+        let (mut server, engine) = server_with_windows(&[100, 101]);
+        let backend = BackendHandle::default_for_test();
+        server.set_backend(backend.clone());
+        {
+            let mut eng = engine.write();
+            eng.sync_os_foreground(WindowId::new(100), &backend);
+            eng.consume_window_into_column(&backend);
+            eng.sync_os_foreground(WindowId::new(101), &backend);
+        }
+        let focus = engine.read().ipc_snapshot().focused_window();
+        let apply = |change: serde_json::Value| {
+            let request = super::super::wire::decode(serde_json::json!({
+                "Action":{"SetWindowHeight":{"id":100,"change":change}}
+            }))
+            .unwrap();
+            let reply = server.process_message(request.message);
+            assert_eq!(reply["success"], true, "{reply}");
+            let snapshot = engine.read().ipc_snapshot();
+            assert_eq!(snapshot.focused_window(), focus);
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.id == 100)
+                .unwrap()
+                .layout
+                .tile_size
+                .1
+        };
+
+        let initial = apply(serde_json::json!({"SetProportion":30.0}));
+        assert!(
+            (200.0..400.0).contains(&initial),
+            "30 percent height: {initial}"
+        );
+        let adjusted = apply(serde_json::json!({"AdjustProportion":-10.0}));
+        assert!(adjusted < initial, "negative adjustment must shrink height");
+        let clamped = apply(serde_json::json!({"SetFixed":-10}));
+        assert!(
+            clamped < adjusted,
+            "negative Set must clamp, not subtract ten"
         );
     }
 
@@ -2689,6 +3479,130 @@ mod tests {
             second,
             "a name that no workspace has does not switch anything"
         );
+    }
+
+    #[test]
+    fn typed_workspace_ipc_ids_dispatch_all_seven_actions_without_argv_coercion() {
+        fn typed(value: serde_json::Value) -> IpcMessage {
+            super::super::wire::decode(serde_json::json!({"Action":value}))
+                .unwrap()
+                .message
+        }
+        let (mut server, engine) = server_with_windows(&[100, 101]);
+        let backend = BackendHandle::default_for_test();
+        server.set_backend(backend.clone());
+        let source = OutputId::from_name("TestMonitor");
+        let destination = OutputId::from_name("typed-id-remote");
+        let id = u64::MAX - 17;
+        {
+            let mut engine = engine.write();
+            engine.register_monitor(
+                destination,
+                Rect::new(1920, 0, 1200, 800),
+                Rect::new(1920, 0, 1200, 800),
+            );
+            engine.set_output_name(source, "DISPLAY1");
+            engine.set_output_name(destination, "DISPLAY2");
+            let workspace = engine
+                .monitors_mut()
+                .get_mut(&destination)
+                .unwrap()
+                .workspaces
+                .get_mut(&0)
+                .unwrap();
+            workspace.ipc_id = id;
+            workspace.name = Some("remote-id".into());
+            engine.sync_os_foreground(WindowId::new(100), &backend);
+        }
+        for value in [
+            serde_json::json!({"SetWorkspaceName":{"name":"renamed-id","workspace":{"Id":id}}}),
+            serde_json::json!({"MoveWorkspaceToIndex":{"index":1,"reference":{"Id":id}}}),
+            serde_json::json!({"MoveWindowToWorkspace":{"window_id":101,"reference":{"Id":id},"focus":false}}),
+        ] {
+            let reply = server.process_message(typed(value.clone()));
+            assert_eq!(reply["success"], true, "{value}: {reply}");
+        }
+        {
+            let engine = engine.read();
+            assert_eq!(
+                engine.workspace_name_on(destination, 0).as_deref(),
+                Some("renamed-id")
+            );
+            assert_eq!(
+                engine
+                    .locate_window(WindowId::new(101))
+                    .map(|(output, key, _)| (output, key)),
+                Some((destination, 0))
+            );
+            assert_eq!(engine.monitors().focused_id(), Some(source));
+            assert_eq!(
+                engine.monitors().get(&source).unwrap().focus_window,
+                Some(WindowId::new(100))
+            );
+        }
+        let reply = server.process_message(typed(serde_json::json!({"MoveColumnToWorkspace":{
+            "reference":{"Id":id},"focus":false
+        }})));
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(
+            engine
+                .read()
+                .locate_window(WindowId::new(100))
+                .map(|(output, key, _)| (output, key)),
+            Some((destination, 0))
+        );
+        for value in [
+            serde_json::json!({"UnsetWorkspaceName":{"reference":{"Id":id}}}),
+            serde_json::json!({"FocusWorkspace":{"reference":{"Id":id}}}),
+            serde_json::json!({"MoveWorkspaceToMonitor":{"output":"DISPLAY1","reference":{"Id":id}}}),
+        ] {
+            let reply = server.process_message(typed(value.clone()));
+            assert_eq!(reply["success"], true, "{value}: {reply}");
+        }
+        let engine = engine.read();
+        let snapshot = engine.ipc_snapshot();
+        let target = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .unwrap();
+        assert_eq!(target.output.as_deref(), Some("DISPLAY1"));
+        assert_eq!(target.name, None);
+        assert_eq!(
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.id == 100)
+                .unwrap()
+                .workspace_id,
+            Some(id)
+        );
+        assert_eq!(
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.id == 101)
+                .unwrap()
+                .workspace_id,
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn typed_workspace_ipc_ids_reject_unmanaged_window_targets_without_mutation() {
+        let (mut server, engine) = server_with_windows(&[100]);
+        server.set_backend(BackendHandle::default_for_test());
+        let before = engine.read().ipc_snapshot();
+        let id = before.workspaces[0].id;
+        for window_id in [0, 999, u64::MAX] {
+            let request = super::super::wire::decode(serde_json::json!({"Action":{
+                "MoveWindowToWorkspace":{"window_id":window_id,"reference":{"Id":id},"focus":false}
+            }}))
+            .unwrap();
+            let reply = server.process_message(request.message);
+            assert_eq!(reply["success"], false, "{window_id}: {reply}");
+            assert_eq!(engine.read().ipc_snapshot(), before);
+        }
     }
 
     #[test]

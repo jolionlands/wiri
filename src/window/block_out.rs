@@ -40,7 +40,7 @@
 //!
 //! Layer rules are applied first and window rules after them, so a window rule wins when
 //! both match one overlay.  Nothing is polled: the affinity is set when an overlay creates
-//! its window and once more when a config is applied, and never at rest.
+//! its window, when a config is applied, and at the one startup-rule expiry.
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -167,7 +167,17 @@ pub fn resolve(
     window_rules: &[WindowRule],
     overlay: Overlay,
 ) -> Option<BlockOutFrom> {
-    let ctx = overlay.matcher_context();
+    resolve_in_phase(layer_rules, window_rules, overlay, false)
+}
+
+fn resolve_in_phase(
+    layer_rules: &[WindowRule],
+    window_rules: &[WindowRule],
+    overlay: Overlay,
+    at_startup: bool,
+) -> Option<BlockOutFrom> {
+    let mut ctx = overlay.matcher_context();
+    ctx.at_startup = at_startup;
     let mut resolved = None;
     for rule in layer_rules.iter().chain(window_rules) {
         if let (true, Some(value)) = (rule.matches(&ctx), rule.block_out_from) {
@@ -223,15 +233,39 @@ pub fn affinity_of(hwnd: isize) -> Option<u32> {
 use parking_lot::RwLock;
 use std::sync::LazyLock;
 
-#[derive(Default)]
 struct Policy {
     layer_rules: Vec<WindowRule>,
     window_rules: Vec<WindowRule>,
+    at_startup: bool,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            layer_rules: Vec::new(),
+            window_rules: Vec::new(),
+            at_startup: true,
+        }
+    }
 }
 
 impl Policy {
     fn resolve(&self, overlay: Overlay) -> Option<BlockOutFrom> {
-        resolve(&self.layer_rules, &self.window_rules, overlay)
+        resolve_in_phase(
+            &self.layer_rules,
+            &self.window_rules,
+            overlay,
+            self.at_startup,
+        )
+    }
+
+    fn install(&mut self, layer_rules: &[WindowRule], window_rules: &[WindowRule]) {
+        self.layer_rules = layer_rules.to_vec();
+        self.window_rules = window_rules.to_vec();
+    }
+
+    fn finish_startup(&mut self) -> bool {
+        std::mem::replace(&mut self.at_startup, false)
     }
 }
 
@@ -240,11 +274,7 @@ static POLICY: LazyLock<RwLock<Policy>> = LazyLock::new(|| RwLock::new(Policy::d
 /// Install the rules a config load decided (startup or reload).  Overlays that already
 /// have their window are updated here; later ones read the policy when they are created.
 pub fn install(layer_rules: &[WindowRule], window_rules: &[WindowRule]) {
-    {
-        let mut policy = POLICY.write();
-        policy.layer_rules = layer_rules.to_vec();
-        policy.window_rules = window_rules.to_vec();
-    }
+    POLICY.write().install(layer_rules, window_rules);
     if layer_rules
         .iter()
         .chain(window_rules)
@@ -258,6 +288,15 @@ pub fn install(layer_rules: &[WindowRule], window_rules: &[WindowRule]) {
         );
     }
     refresh_own_windows();
+}
+
+/// Follow the engine's one startup timeout, including overlays already created.
+/// Rule reloads preserve this phase, and later overlays resolve the expired policy.
+pub fn finish_startup() {
+    let changed = POLICY.write().finish_startup();
+    if changed {
+        refresh_own_windows();
+    }
 }
 
 /// The affinity the installed policy asks for on `overlay`.
@@ -276,7 +315,7 @@ pub fn apply_to(overlay: Overlay, hwnd: isize) -> Option<BlockOutFrom> {
 
 /// Apply the installed policy to every overlay window this process already owns.
 ///
-/// Called once per config load: no timers, no polling, and nothing happens for overlays
+/// Called per config load and at startup expiry: no polling, and nothing happens for overlays
 /// that do not exist yet — they read the policy when their window is created.
 pub fn refresh_own_windows() -> usize {
     let mut windows: Vec<(isize, Overlay)> = Vec::new();
@@ -337,6 +376,91 @@ mod tests {
 
     fn by_name(name: &str) -> Matcher {
         Matcher::TitleSearch(crate::config::types::RegexPat::new(name).unwrap())
+    }
+
+    #[test]
+    fn startup_rule_phase_applies_to_owned_overlay_policy() {
+        let policy = Policy {
+            layer_rules: vec![rule(
+                vec![Matcher::AtStartup],
+                Some(BlockOutFrom::Screencast),
+            )],
+            ..Policy::default()
+        };
+
+        assert_eq!(
+            policy.resolve(Overlay::WorkspaceIndicator),
+            Some(BlockOutFrom::Screencast)
+        );
+    }
+
+    #[test]
+    fn startup_rule_phase_overlay_expiry_resolves_existing_and_later_overlays() {
+        let mut policy = Policy::default();
+        policy.install(
+            &[rule(
+                vec![Matcher::AtStartup],
+                Some(BlockOutFrom::Screencast),
+            )],
+            &[rule(
+                vec![Matcher::Not(Box::new(Matcher::AtStartup))],
+                Some(BlockOutFrom::ScreenCapture),
+            )],
+        );
+        for overlay in Overlay::ALL {
+            assert_eq!(policy.resolve(overlay), Some(BlockOutFrom::Screencast));
+        }
+
+        assert!(policy.finish_startup());
+
+        for overlay in Overlay::ALL {
+            assert_eq!(policy.resolve(overlay), Some(BlockOutFrom::ScreenCapture));
+        }
+        assert!(!policy.finish_startup(), "the timeout is consumed once");
+    }
+
+    #[test]
+    fn startup_rule_phase_overlay_reload_preserves_the_current_phase() {
+        let mut policy = Policy::default();
+        let startup = rule(vec![Matcher::AtStartup], Some(BlockOutFrom::Screencast));
+        policy.install(&[startup.clone()], &[]);
+        assert_eq!(
+            policy.resolve(Overlay::Decor),
+            Some(BlockOutFrom::Screencast)
+        );
+        policy.install(&[], &[startup.clone()]);
+        assert_eq!(
+            policy.resolve(Overlay::Decor),
+            Some(BlockOutFrom::Screencast)
+        );
+
+        assert!(policy.finish_startup());
+        assert_eq!(policy.resolve(Overlay::Decor), None);
+        policy.install(&[startup.clone()], &[startup]);
+        assert_eq!(policy.resolve(Overlay::Decor), None);
+        assert!(!policy.finish_startup());
+    }
+
+    #[test]
+    fn startup_rule_phase_overlay_expiry_rechecks_exclusions() {
+        let mut policy = Policy::default();
+        policy.install(
+            &[WindowRule {
+                exclude_groups: vec![MatchGroup {
+                    conds: vec![Matcher::AtStartup],
+                }],
+                ..rule(Vec::new(), Some(BlockOutFrom::ScreenCapture))
+            }],
+            &[],
+        );
+        assert_eq!(policy.resolve(Overlay::ScreenshotUi), None);
+
+        assert!(policy.finish_startup());
+
+        assert_eq!(
+            policy.resolve(Overlay::ScreenshotUi),
+            Some(BlockOutFrom::ScreenCapture)
+        );
     }
 
     #[test]

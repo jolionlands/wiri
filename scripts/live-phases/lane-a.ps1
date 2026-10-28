@@ -93,6 +93,7 @@ $summary.h16_no_decor_windows_after_quit = (@([LT]::TopLevel() | Where-Object { 
 # The single Lane A entry point keeps the parent harness unchanged apart from its dot-source.
 . (Join-Path $PSScriptRoot 'lane-a-animations.ps1')
 . (Join-Path $PSScriptRoot 'lane-a-animation-motion.ps1')
+. (Join-Path $PSScriptRoot 'lane-a-camera-motion.ps1')
 . (Join-Path $PSScriptRoot 'lane-a-tabs.ps1')
 . (Join-Path $PSScriptRoot 'h19.fragment.ps1')
 . (Join-Path $PSScriptRoot 'lane-a-recent.ps1')

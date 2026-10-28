@@ -22,9 +22,15 @@ impl TilingEngine {
     }
 
     pub fn native_move_resize_end(&mut self, id: WindowId, backend: &BackendHandle) {
+        // Capture the cache before the final native read. A later application
+        // observation must remain a change relative to this completion boundary.
+        let observed = backend.get_window(id.as_isize()).map(|info| info.bounds);
         // Read the final frame unconditionally, not the throttled LOCATIONCHANGE cache.
         let rect = Self::live_window_rect(id);
         self.finish_native_move(id, rect);
+        if let Some(home) = self.float_homes.get_mut(&id) {
+            home.position_history.completion_cache(observed);
+        }
         self.sync_native_clip(id);
         self.apply_all(backend);
     }
@@ -47,6 +53,7 @@ impl TilingEngine {
                 home.width_preset_idx = None;
             }
             home.rect = rect;
+            home.position_history.native_completed(rect);
             self.float_memory.insert(id, rect);
             return;
         }

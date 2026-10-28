@@ -1635,6 +1635,9 @@ impl Decoder {
             "natural-scroll" if scope == InputScope::Input || scope.is_pointer() => {
                 if let Some(v) = self.flag(child) {
                     cfg.input.natural_scroll = v;
+                    if matches!(scope, InputScope::Mouse | InputScope::Input) {
+                        cfg.input.mouse_scroll.natural = v;
+                    }
                 }
             }
             "scroll-speed" | "mouse-speed"
@@ -1766,16 +1769,36 @@ impl Decoder {
                     "\"none\", \"edge\", \"two-finger\" or \"on-button-down\"",
                 ) {
                     cfg.input.scroll_method = Some(v);
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll.method = Some(v);
+                    } else {
+                        cfg.input.non_mouse_scroll_configured = true;
+                    }
                 }
             }
             "scroll-button" => {
-                if let Some(v) = self.arg_number(child, 1.0, 32.0) {
-                    cfg.input.scroll_button = Some(v.round() as u32);
+                if let Some(v) = self.arg_u32(child, u32::MAX) {
+                    cfg.input.scroll_button = Some(v);
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll.button = Some(v);
+                    } else {
+                        cfg.input.non_mouse_scroll_configured = true;
+                    }
+                    if (1..=5).contains(&v) {
+                        self.warn(child.pos, "legacy scroll-button 1..5 maps to left/right/middle/X1/X2; prefer evdev 272..276");
+                    } else if v != 0 && !(272..=276).contains(&v) {
+                        self.warn(child.pos, "scroll-button is valid evdev syntax but unsupported by the Windows mouse hook; left unapplied");
+                    }
                 }
             }
             "scroll-button-lock" => {
                 if let Some(v) = self.flag(child) {
                     cfg.input.scroll_button_lock = Some(v);
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll.lock = Some(v);
+                    } else {
+                        cfg.input.non_mouse_scroll_configured = true;
+                    }
                 }
             }
             "left-handed" => {
@@ -3713,13 +3736,13 @@ mod tests {
     #[test]
     fn pointing_device_options_are_stored_per_niri_spelling() {
         let cfg = clean(
-            "input {\n    mouse {\n        accel-profile \"flat\"\n        left-handed\n        middle-emulation false\n        scroll-method \"on-button-down\"\n        scroll-button 8\n        scroll-button-lock\n    }\n    touchpad {\n        dwt\n        dwtp false\n        drag true\n        drag-lock\n        click-method \"clickfinger\"\n        disabled-on-external-mouse\n        tap-button-map {\n            left 1\n            middle 3\n            right 2\n        }\n    }\n    trackpoint { off }\n    trackball { off false }\n}\n",
+            "input {\n    mouse {\n        accel-profile \"flat\"\n        left-handed\n        middle-emulation false\n        scroll-method \"on-button-down\"\n        scroll-button 274\n        scroll-button-lock\n    }\n    touchpad {\n        dwt\n        dwtp false\n        drag true\n        drag-lock\n        click-method \"clickfinger\"\n        disabled-on-external-mouse\n        tap-button-map {\n            left 1\n            middle 3\n            right 2\n        }\n    }\n    trackpoint { off }\n    trackball { off false }\n}\n",
         );
         assert_eq!(cfg.input.accel_profile, Some(AccelProfile::Flat));
         assert_eq!(cfg.input.left_handed, Some(true));
         assert_eq!(cfg.input.middle_emulation, Some(false));
         assert_eq!(cfg.input.scroll_method, Some(ScrollMethod::OnButtonDown));
-        assert_eq!(cfg.input.scroll_button, Some(8));
+        assert_eq!(cfg.input.scroll_button, Some(274));
         assert_eq!(cfg.input.scroll_button_lock, Some(true));
         assert!(
             cfg.input.touchpad_enabled,
@@ -3753,12 +3776,94 @@ mod tests {
     }
 
     #[test]
+    fn parity_button_scroll_accepts_canonical_evdev_middle() {
+        let cfg = clean(
+            "input { mouse { scroll-method \"on-button-down\"; scroll-button 274; scroll-button-lock } }",
+        );
+        assert_eq!(cfg.input.scroll_method, Some(ScrollMethod::OnButtonDown));
+        assert_eq!(cfg.input.scroll_button, Some(274));
+        assert_eq!(cfg.input.scroll_button_lock, Some(true));
+    }
+
+    #[test]
+    fn parity_button_scroll_accepts_zero_to_disable() {
+        let cfg = clean("input { mouse { scroll-method \"on-button-down\"; scroll-button 0 } }");
+        assert_eq!(cfg.input.scroll_button, Some(0));
+    }
+
+    #[test]
+    fn parity_button_scroll_mouse_scope_survives_both_device_block_orders() {
+        let mouse = "mouse { scroll-method \"on-button-down\"; scroll-button 274; scroll-button-lock; natural-scroll }";
+        let touchpad = "touchpad { scroll-method \"two-finger\"; scroll-button 276; scroll-button-lock false; natural-scroll false }";
+        for text in [
+            format!("input {{ {mouse}; {touchpad} }}"),
+            format!("input {{ {touchpad}; {mouse} }}"),
+        ] {
+            let cfg = clean(&text);
+            assert_eq!(
+                cfg.input.mouse_scroll.method,
+                Some(ScrollMethod::OnButtonDown)
+            );
+            assert_eq!(cfg.input.mouse_scroll.button, Some(274));
+            assert_eq!(cfg.input.mouse_scroll.lock, Some(true));
+            assert!(cfg.input.mouse_scroll.natural);
+            assert!(cfg.input.non_mouse_scroll_configured);
+        }
+    }
+
+    #[test]
+    fn parity_button_scroll_never_completes_partial_mouse_settings_from_touchpad() {
+        for (mouse, want_method, want_button, want_lock) in [
+            (
+                "scroll-method \"on-button-down\"",
+                Some(ScrollMethod::OnButtonDown),
+                None,
+                None,
+            ),
+            ("scroll-button 274", None, Some(274), None),
+            ("scroll-button-lock", None, None, Some(true)),
+        ] {
+            let other = "touchpad { scroll-method \"on-button-down\"; scroll-button 276; scroll-button-lock }";
+            for text in [
+                format!("input {{ mouse {{ {mouse} }}; {other} }}"),
+                format!("input {{ {other}; mouse {{ {mouse} }} }}"),
+            ] {
+                let cfg = clean(&text);
+                assert_eq!(cfg.input.mouse_scroll.method, want_method);
+                assert_eq!(cfg.input.mouse_scroll.button, want_button);
+                assert_eq!(cfg.input.mouse_scroll.lock, want_lock);
+            }
+        }
+        let cfg =
+            clean("input { touchpad { scroll-method \"on-button-down\"; scroll-button 274 } }");
+        assert_eq!(cfg.input.mouse_scroll, MouseScrollConfig::default());
+    }
+
+    #[test]
+    fn parity_button_scroll_accepts_all_u32_codes_and_reports_unsupported_or_legacy() {
+        for code in [8, 99, 277, u32::MAX] {
+            let decoded = load(&format!("input {{ mouse {{ scroll-button {code} }} }}"));
+            assert!(errors(&decoded).is_empty());
+            assert_eq!(decoded.config.input.mouse_scroll.button, Some(code));
+            assert_eq!(warnings(&decoded).len(), 1);
+            assert!(warnings(&decoded)[0].contains("unsupported"));
+        }
+        for code in 1..=5 {
+            let decoded = load(&format!("input {{ mouse {{ scroll-button {code} }} }}"));
+            assert!(errors(&decoded).is_empty());
+            assert_eq!(warnings(&decoded).len(), 1);
+            assert!(warnings(&decoded)[0].contains("legacy"));
+        }
+    }
+
+    #[test]
     fn pointing_device_options_reject_bad_values() {
         let cases = [
             "input { mouse { accel-profile \"bogus\" } }",
             "input { mouse { scroll-method \"bogus\" } }",
-            "input { mouse { scroll-button 99 } }",
-            "input { mouse { scroll-button 0 } }",
+            "input { mouse { scroll-button -1 } }",
+            "input { mouse { scroll-button 1.5 } }",
+            "input { mouse { scroll-button 4294967296 } }",
             "input { touchpad { click-method \"bogus\" } }",
             "input { touchpad { tap-button-map { left 0 } } }",
             "input { touchpad { tap-button-map { thumb 1 } } }",

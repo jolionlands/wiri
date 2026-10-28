@@ -1,6 +1,235 @@
 // Pure IPC message types — no Win32, no tokio.
 use serde::{Deserialize, Serialize};
 
+/// Niri's typed JSON workspace reference. CLI and KDL words cannot select Id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WorkspaceReferenceArg {
+    Id(u64),
+    Index(u8),
+    Name(String),
+}
+
+/// The pinned actions which carry workspace references. Keep their references
+/// typed until execution: neither an argv word nor a monitor-local key is an ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WorkspaceIpcAction {
+    FocusWorkspace {
+        reference: WorkspaceReferenceArg,
+    },
+    MoveWindowToWorkspace {
+        #[serde(default, alias = "id")]
+        window_id: Option<u64>,
+        reference: WorkspaceReferenceArg,
+        #[serde(default = "workspace_focus_default")]
+        focus: bool,
+    },
+    MoveColumnToWorkspace {
+        reference: WorkspaceReferenceArg,
+        #[serde(default = "workspace_focus_default")]
+        focus: bool,
+    },
+    MoveWorkspaceToIndex {
+        index: usize,
+        #[serde(default)]
+        reference: Option<WorkspaceReferenceArg>,
+    },
+    SetWorkspaceName {
+        name: String,
+        #[serde(default)]
+        workspace: Option<WorkspaceReferenceArg>,
+    },
+    UnsetWorkspaceName {
+        #[serde(default)]
+        reference: Option<WorkspaceReferenceArg>,
+    },
+    MoveWorkspaceToMonitor {
+        output: String,
+        #[serde(default)]
+        reference: Option<WorkspaceReferenceArg>,
+    },
+}
+
+fn workspace_focus_default() -> bool {
+    true
+}
+
+/// Pinned typed sizes use logical pixels or percentage points (50 means 50%).
+/// Keep Set distinct from Adjust: a negative Set cannot round-trip through argv.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum IpcSizeChange {
+    SetFixed(i32),
+    SetProportion(f64),
+    AdjustFixed(i32),
+    AdjustProportion(f64),
+}
+
+impl IpcSizeChange {
+    pub(crate) fn into_input_change(self) -> Result<crate::input::SizeChange, String> {
+        use crate::input::SizeChange;
+        // The engine stores proportions in thousandths of one percent.
+        let milli_percent = |percent: f64| {
+            if !percent.is_finite() {
+                return Err("size must be finite".to_string());
+            }
+            Ok((percent * 1000.0).round() as i32)
+        };
+        Ok(match self {
+            Self::SetFixed(n) => SizeChange::SetFixed(n),
+            Self::AdjustFixed(n) => SizeChange::AdjustFixed(n),
+            Self::SetProportion(n) => SizeChange::SetProportion(milli_percent(n)?),
+            Self::AdjustProportion(n) => SizeChange::AdjustProportion(milli_percent(n)?),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum SizeIpcAction {
+    SetColumnWidth {
+        // Retain Wiri's existing optional target extension on this action.
+        #[serde(default, alias = "window_id")]
+        id: Option<u64>,
+        change: IpcSizeChange,
+    },
+    SetWindowWidth {
+        #[serde(default, alias = "window_id")]
+        id: Option<u64>,
+        change: IpcSizeChange,
+    },
+    SetWindowHeight {
+        #[serde(default, alias = "window_id")]
+        id: Option<u64>,
+        change: IpcSizeChange,
+    },
+}
+
+impl SizeIpcAction {
+    pub(crate) fn action_name(self) -> &'static str {
+        match self {
+            Self::SetColumnWidth { .. } => "set-column-width",
+            Self::SetWindowWidth { .. } => "set-window-width",
+            Self::SetWindowHeight { .. } => "set-window-height",
+        }
+    }
+
+    pub(crate) fn window_id(self) -> Option<u64> {
+        match self {
+            Self::SetColumnWidth { id, .. }
+            | Self::SetWindowWidth { id, .. }
+            | Self::SetWindowHeight { id, .. } => id,
+        }
+    }
+
+    pub(crate) fn into_input_action(self) -> Result<crate::input::Action, String> {
+        Ok(match self {
+            Self::SetColumnWidth { change, .. } | Self::SetWindowWidth { change, .. } => {
+                crate::input::Action::SetColumnWidth(change.into_input_change()?)
+            }
+            Self::SetWindowHeight { change, .. } => {
+                crate::input::Action::SetWindowHeight(change.into_input_change()?)
+            }
+        })
+    }
+}
+
+/// Floating positions use logical pixels or percentage points (50 means 50%).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum PositionChange {
+    SetFixed(f64),
+    SetProportion(f64),
+    AdjustFixed(f64),
+    AdjustProportion(f64),
+}
+
+impl Default for PositionChange {
+    fn default() -> Self {
+        Self::AdjustFixed(0.0)
+    }
+}
+
+impl PositionChange {
+    pub fn is_absolute(self) -> bool {
+        matches!(self, Self::SetFixed(_) | Self::SetProportion(_))
+    }
+
+    pub fn is_finite(self) -> bool {
+        match self {
+            Self::SetFixed(n)
+            | Self::SetProportion(n)
+            | Self::AdjustFixed(n)
+            | Self::AdjustProportion(n) => n.is_finite(),
+        }
+    }
+}
+
+impl std::str::FromStr for PositionChange {
+    type Err = &'static str;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (number, percent) = match text.split_once('%') {
+            Some((number, "")) => (number, true),
+            Some(_) => return Err("trailing characters after '%' are not allowed"),
+            None => (text, false),
+        };
+        let n: f64 = number.parse().map_err(|_| "invalid position value")?;
+        if !n.is_finite() {
+            return Err("position must be finite");
+        }
+        let adjust = number.starts_with(['+', '-']);
+        Ok(match (adjust, percent) {
+            (false, false) => Self::SetFixed(n),
+            (false, true) => Self::SetProportion(n),
+            (true, false) => Self::AdjustFixed(n),
+            (true, true) => Self::AdjustProportion(n),
+        })
+    }
+}
+
+/// Parse the IPC-only action independently of the KDL bind vocabulary.
+pub fn parse_move_floating_window(args: &[String]) -> Result<IpcMessage, String> {
+    let (mut id, mut x, mut y) = (None, None, None);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        if !matches!(flag, "--id" | "--x" | "-x" | "--y" | "-y") {
+            return Err(format!("unknown move-floating-window argument: {arg}"));
+        }
+        let value = inline
+            .or_else(|| args.next().map(String::as_str))
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag {
+            "--id" => {
+                if id.is_some() {
+                    return Err("duplicate --id".into());
+                }
+                id = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "window id must be a non-negative integer")?,
+                );
+            }
+            "--x" | "-x" => {
+                if x.is_some() {
+                    return Err("duplicate x position".into());
+                }
+                x = Some(value.parse::<PositionChange>()?);
+            }
+            _ => {
+                if y.is_some() {
+                    return Err("duplicate y position".into());
+                }
+                y = Some(value.parse::<PositionChange>()?);
+            }
+        }
+    }
+    Ok(IpcMessage::MoveFloatingWindow {
+        id,
+        x: x.unwrap_or_default(),
+        y: y.unwrap_or_default(),
+    })
+}
+
 // ---- Error type ----
 
 #[derive(thiserror::Error, Debug)]
@@ -84,6 +313,16 @@ pub enum IpcMessage {
     /// Move `window_hwnd` to the absolute screen position (`x`, `y`).
     #[serde(rename = "window_move")]
     WindowMove { window_hwnd: isize, x: i32, y: i32 },
+
+    /// Move a float, or update a tile's remembered floating position.
+    #[serde(rename = "move_floating_window")]
+    MoveFloatingWindow {
+        id: Option<u64>,
+        #[serde(default)]
+        x: PositionChange,
+        #[serde(default)]
+        y: PositionChange,
+    },
 
     /// Resize `window_hwnd` to the given pixel dimensions.
     #[serde(rename = "window_resize")]
@@ -231,6 +470,14 @@ pub enum IpcMessage {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         quoted: Vec<bool>,
     },
+
+    /// Lossless internal transport for niri's seven typed workspace actions.
+    #[serde(rename = "workspace_action")]
+    WorkspaceAction { action: WorkspaceIpcAction },
+
+    /// Preserve typed size units and Set/Adjust independently of argv syntax.
+    #[serde(rename = "size_action")]
+    SizeAction { action: SizeIpcAction },
 
     // ---- Niri-parity Round-2 ----
     /// Focus the previously focused window using the MRU history (like Alt+Tab).
@@ -848,6 +1095,55 @@ pub struct VersionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parity_position_arguments_preserve_percentage_units_and_signed_changes() {
+        for (word, expected) in [
+            ("120", PositionChange::SetFixed(120.0)),
+            ("+120", PositionChange::AdjustFixed(120.0)),
+            ("-2.5", PositionChange::AdjustFixed(-2.5)),
+            ("50%", PositionChange::SetProportion(50.0)),
+            ("-10%", PositionChange::AdjustProportion(-10.0)),
+            ("+0%", PositionChange::AdjustProportion(0.0)),
+        ] {
+            assert_eq!(word.parse::<PositionChange>().unwrap(), expected);
+        }
+        for word in [
+            "", "%", "10%%", "10%extra", "NaN", "+inf", "-inf%", "1e309", " 1",
+        ] {
+            assert!(word.parse::<PositionChange>().is_err(), "{word}");
+        }
+    }
+
+    #[test]
+    fn parity_position_cli_defaults_each_axis_and_rejects_invalid_options() {
+        let words = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let request = parse_move_floating_window(&words(&["-x", "50%"])).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "type":"move_floating_window","data":{"id":null,
+                    "x":{"SetProportion":50.0},"y":{"AdjustFixed":0.0}}
+            })
+        );
+        for args in [
+            vec!["--x"],
+            vec!["--id", "-1"],
+            vec!["--id", "1", "--id", "2"],
+            vec!["--x=20", "-x", "30"],
+            vec!["--y", "20", "--y=30"],
+            vec!["--x", "NaN"],
+            vec!["--z", "20"],
+            vec!["20", "30"],
+            vec!["--window-id", "1"],
+            vec!["--id", "18446744073709551616"],
+        ] {
+            assert!(
+                parse_move_floating_window(&words(&args)).is_err(),
+                "{args:?}"
+            );
+        }
+    }
 
     #[test]
     fn capture_window_round_trip_with_path() {

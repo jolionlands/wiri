@@ -417,6 +417,7 @@ impl TilingEngine {
             };
             column.width_proportion = slot.column_width_proportion;
             column.width_fixed_logical = slot.column_width_fixed_logical;
+            column.width_fixed_window = slot.column_width_fixed_window;
         } else {
             column.width = self
                 .float_homes

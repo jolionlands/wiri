@@ -31,6 +31,13 @@ impl Default for State {
         }
     }
 }
+
+impl State {
+    fn factor(&self, window: WindowId, physical_wheel: bool) -> f64 {
+        self.factors.get(&window).copied().unwrap_or(1.0)
+            * if physical_wheel { self.device } else { 1.0 }
+    }
+}
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
 
 pub(crate) fn configure(device: f64) {
@@ -66,7 +73,7 @@ pub(super) fn wheel(point: POINT, horizontal: bool, delta: i32) -> bool {
     let window = WindowId::new(hwnd.0 as isize);
     let output = {
         let mut state = STATE.lock();
-        let factor = state.factors.get(&window).copied().unwrap_or(1.0) * state.device;
+        let factor = state.factor(window, true);
         if !factor.is_finite() || factor < 0.0 {
             state.residual.reset();
             return false;
@@ -92,7 +99,14 @@ pub(super) fn wheel(point: POINT, horizontal: bool, delta: i32) -> bool {
     }))
 }
 
-fn inject_wheel(delta: i32, horizontal: bool) -> bool {
+/// Continuous button motion bypasses the physical-wheel device multiplier.
+/// Window rules still apply to the resulting application scroll stream.
+pub(super) fn continuous_factor(point: POINT) -> f64 {
+    let hwnd = unsafe { GetAncestor(WindowFromPoint(point), GA_ROOT) };
+    STATE.lock().factor(WindowId::new(hwnd.0 as isize), false)
+}
+
+pub(super) fn inject_wheel(delta: i32, horizontal: bool) -> bool {
     let events = wheel_inputs(delta, horizontal);
     // On partial delivery do not duplicate the delivered portion by also
     // injecting a fallback. A total failure permits one original-delta attempt.
@@ -135,6 +149,18 @@ fn wheel_deltas(mut delta: i32) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parity_button_scroll_continuous_factor_keeps_window_rule_and_bypasses_wheel_device_factor() {
+        let mut state = State {
+            device: 9.0,
+            ..State::default()
+        };
+        state.factors.insert(WindowId::new(123), 0.25);
+        assert_eq!(state.factor(WindowId::new(123), false), 0.25);
+        assert_eq!(state.factor(WindowId::new(123), true), 2.25);
+        assert_eq!(state.factor(WindowId::new(456), false), 1.0);
+    }
 
     #[test]
     fn replacement_batches_preserve_axes_signs_and_bypass_tag() {

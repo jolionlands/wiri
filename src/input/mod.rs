@@ -19,6 +19,7 @@ pub mod pointer;
 pub mod pointer_settings;
 pub mod recent;
 pub(crate) mod rule_scroll;
+pub(crate) mod scroll_emulation;
 pub mod snap_guide;
 pub mod system_actions;
 pub mod touch;
@@ -389,10 +390,11 @@ impl SizeChange {
     }
 }
 
-/// niri's workspace reference: a number is the (1-based) index of a workspace on the
-/// monitor, a quoted string is the name of a workspace.
+/// A workspace identity, visible index on an output, or global name.
+/// Stable IDs are available through typed IPC; CLI/KDL words select index/name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkspaceRef {
+    Id(u64),
     Index(u32),
     Name(String),
 }
@@ -560,6 +562,7 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         // niri: a number is the index of the workspace on the monitor, a quoted string
         // is the name of a workspace.
         "focus-workspace" => match WorkspaceRef::from_word(args.first()?, is_quoted(0))? {
+            WorkspaceRef::Id(_) => None,
             WorkspaceRef::Index(index) => Some(Action::FocusWorkspace(index as i32)),
             WorkspaceRef::Name(name) => Some(Action::FocusWorkspaceNamed(name)),
         },

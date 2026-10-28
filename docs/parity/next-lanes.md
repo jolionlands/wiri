@@ -1,5 +1,16 @@
 # Next lanes: surveying the partial parity rows (2026-10-27)
 
+> **Historical survey, superseded for assignment.** This file records the
+> `0821983` snapshot. Following the integrated and PR #2 focused verification,
+> current matrices contain **302 done / 94 partial / 89 N/A** (396 applicable
+> rows), including five corrected appearance/DPI classifications, not the 138
+> partial rows below. The active
+> [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md) checks the
+> pinned source and current implementation before assigning work. In particular,
+> center-column, floating Mod grabs, gesture spring velocity/rubber-band, spawn
+> home expansion and h60/h79 coverage already exist. The proposed fullscreen
+> refusal gates below require source-semantic review, not blind implementation.
+
 Read-only survey of every row still marked `partial` in both parity matrices, written at
 `0821983` on branch `wiri/shine-20261024`. Nothing was built, run, edited or reconfigured:
 no live cycle, no wiri instance, no system setting. The classifications below rest on (a) the
@@ -13,7 +24,7 @@ gates passed, 0 failed**, 88 information entries (recorded in [PERF.md](../PERF.
 [README.md](README.md)). Gate counts below assume that population; a gate that exists and ran
 there is called "gated" even when its row text still says otherwise.
 
-The README's headline recount is per matrix: **layout 141 done / 68 partial / 17 N/A** and
+At this survey's snapshot, the README recount was **layout 141 done / 68 partial / 17 N/A** and
 **config-input-IPC 117 done / 70 partial / 72 N/A**, 0 missing in both. The "68 partial rows"
 of the task is the layout matrix; this survey covers **all 138 partial rows** (68 + 70).
 Row numbers below are this document's own ordinal over each matrix's partial rows in file

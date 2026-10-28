@@ -6,9 +6,10 @@
 //! (its opacity and its size limits), looked at again when something the rules depend on
 //! changes.
 //!
-//! Nothing here runs on a timer.  A rule is looked at again when an event says that something
+//! A rule is looked at again when an event says that something
 //! it depends on has changed: the title of the window, the foreground window, floating,
-//! urgency, a config reload.  And only the windows concerned are looked at, only when some
+//! urgency, a config reload, or the one startup timeout. Only the windows concerned
+//! are looked at for individual state changes, only when some
 //! rule depends on that kind of state at all (`RuleFlags`).
 
 use super::*;
@@ -205,8 +206,10 @@ pub(super) fn distribute_heights(available: i32, tiles: &[HeightSpec]) -> Vec<i3
     let budget = (available - takers * LEAST_AUTO_TILE_PX).max(0);
     if asked > budget && asked > 0 {
         let scale = budget as f64 / asked as f64;
-        for h in height.iter_mut().flatten() {
-            *h = (*h as f64 * scale).floor() as i32;
+        for (i, h) in height.iter_mut().enumerate() {
+            if let Some(h) = h {
+                *h = limit((*h as f64 * scale).floor() as i32, &tiles[i]);
+            }
         }
     }
     let mut rest = available - height.iter().flatten().sum::<i32>();
@@ -397,7 +400,7 @@ impl TilingEngine {
         window: &WindowInfo,
         process_name: Option<&str>,
         aumid: Option<&str>,
-        at_startup: bool,
+        _initial_scan: bool,
     ) -> ResolvedWindowRules {
         let window_id = WindowId::new(window.hwnd);
         let foreground = unsafe {
@@ -418,7 +421,7 @@ impl TilingEngine {
                 || crate::window::is_window_flashing(windows::Win32::Foundation::HWND(
                     window.hwnd as *mut std::ffi::c_void,
                 )),
-            at_startup,
+            at_startup: self.startup_rules.active(),
             aumid,
             is_focused: foreground,
             is_active_in_column: false,
@@ -648,14 +651,15 @@ impl TilingEngine {
                 }
             }
         }
-        let (width, height) = RuleLimits::of(rules).clamp(width, height);
+        let limits = self.effective_window_limits(window_id);
+        let (width, height) = limits.clamp(width, height);
         if width != rect.size.w || height != rect.size.h {
             // Keep the centre of the window where it was.
             let cx = rect.loc.x + rect.size.w as i32 / 2;
             let cy = rect.loc.y + rect.size.h as i32 / 2;
             rect = Rect::new(cx - width as i32 / 2, cy - height as i32 / 2, width, height);
         }
-        let rect = Self::fit_rect_into(rect, work);
+        let rect = native_bounds::fit_float_rect(rect, work, limits);
         if at_startup {
             rect
         } else {
@@ -849,6 +853,15 @@ impl TilingEngine {
         window_id: WindowId,
         backend: &BackendHandle,
     ) -> bool {
+        self.reevaluate_window_rules_inner(window_id, backend, false)
+    }
+
+    fn reevaluate_window_rules_inner(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+        defer_tiled_layout: bool,
+    ) -> bool {
         let mut resolved = {
             let (Some(info), Some(state)) = (
                 self.tiled_windows.get(&window_id),
@@ -867,7 +880,7 @@ impl TilingEngine {
                     || crate::window::is_window_flashing(windows::Win32::Foundation::HWND(
                         window_id.as_isize() as *mut std::ffi::c_void,
                     )),
-                at_startup: false,
+                at_startup: self.startup_rules.active(),
                 aumid: state.aumid.as_deref(),
                 is_focused: self.rule_window_is_focused(window_id),
                 is_active_in_column: self.rule_window_is_active_in_column(window_id),
@@ -884,7 +897,7 @@ impl TilingEngine {
         let effects_changed = state.resolved.effects != resolved.effects;
         state.resolved = resolved;
         if changed {
-            self.apply_dynamic_rules(window_id, backend);
+            self.apply_dynamic_rules(window_id, backend, defer_tiled_layout);
         }
         if effects_changed {
             self.refresh_rule_effects(window_id, backend);
@@ -900,8 +913,33 @@ impl TilingEngine {
         }
     }
 
+    /// Expiry defers inactive columns to its settled geometry pass. A raw limit
+    /// change masked by native bounds must not first reveal the focused column
+    /// on an otherwise unchanged strip. Active-column updates keep their normal
+    /// reconciliation, as in niri's scrolling-space window update.
+    pub(super) fn reevaluate_startup_window_rules(&mut self, backend: &BackendHandle) {
+        let windows: Vec<WindowId> = self.rule_state.keys().copied().collect();
+        for window_id in windows {
+            let defer_tiled_layout = self
+                .locate_window(window_id)
+                .and_then(|(output, workspace, column)| {
+                    self.monitors.get(&output).map(|monitor| {
+                        monitor.active_workspace != workspace
+                            || monitor.focus_column != Some(column)
+                    })
+                })
+                .unwrap_or(false);
+            self.reevaluate_window_rules_inner(window_id, backend, defer_tiled_layout);
+        }
+    }
+
     /// The opacity and the size limits of a window changed: apply them.
-    fn apply_dynamic_rules(&mut self, window_id: WindowId, backend: &BackendHandle) {
+    fn apply_dynamic_rules(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+        defer_tiled_layout: bool,
+    ) {
         let Some(resolved) = self.rule_state.get(&window_id).map(|s| s.resolved.clone()) else {
             return;
         };
@@ -923,9 +961,11 @@ impl TilingEngine {
                     // `place_float` holds the rectangle to the new limits.
                     self.place_float(window_id, rect, backend);
                 }
-            } else if let Some((output, _, _)) = self.locate_window(window_id) {
-                self.reveal_focused_column(output);
-                self.apply_layout_for_monitor(output, backend);
+            } else if !defer_tiled_layout {
+                if let Some((output, _, _)) = self.locate_window(window_id) {
+                    self.reveal_focused_column(output);
+                    self.apply_layout_for_monitor(output, backend);
+                }
             }
         }
         self.sync_window_opacity(window_id);
@@ -1218,6 +1258,15 @@ mod tests {
         assert_eq!(
             distribute_heights(1000, &[spec(None, 1.0, 400, 300), auto()]),
             vec![400, 600]
+        );
+    }
+
+    #[test]
+    fn native_bounds_review_preferred_height_cannot_shrink_below_its_minimum() {
+        assert_eq!(
+            distribute_heights(500, &[spec(Some(480), 1.0, 480, 0), spec(None, 1.0, 50, 0)]),
+            vec![480, 50],
+            "both minima win even when the column must overflow its available height"
         );
     }
 
@@ -1832,6 +1881,258 @@ mod tests {
         let home = engine.float_homes.get(&WindowId::new(1)).expect("a home");
         assert_eq!((home.rect.loc.x, home.rect.loc.y), (100, 100));
         assert_eq!((home.rect.size.w, home.rect.size.h), (700, 500));
+    }
+
+    #[test]
+    fn startup_rule_phase_applies_to_a_normally_admitted_window() {
+        let mut engine = engine();
+        engine.set_window_rules(vec![WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![Matcher::AtStartup],
+            }],
+            opacity: Some(0.4),
+            ..WindowRule::default()
+        }]);
+
+        // The compositor startup phase also covers new CREATE/SHOW admissions;
+        // it is independent of the initial-enumeration placement flag.
+        engine.add_window(window(1, "new during startup"), &be());
+
+        assert_eq!(engine.rule_opacity(WindowId::new(1)), Some(0.4));
+    }
+
+    #[test]
+    fn startup_rule_phase_survives_initial_window_reevaluation() {
+        let mut engine = engine();
+        engine.set_window_rules(vec![WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![Matcher::AtStartup],
+            }],
+            opacity: Some(0.4),
+            ..WindowRule::default()
+        }]);
+        engine.add_window_at_startup(window(1, "already open"), &be());
+        let wid = WindowId::new(1);
+        assert_eq!(engine.rule_opacity(wid), Some(0.4));
+
+        engine.reevaluate_all_window_rules(&be());
+
+        assert_eq!(engine.rule_opacity(wid), Some(0.4));
+    }
+
+    #[test]
+    fn startup_rule_phase_survives_a_title_change() {
+        let mut engine = engine();
+        engine.set_window_rules(vec![WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![
+                    Matcher::AtStartup,
+                    Matcher::TitleSearch(RegexPat::new("^startup").unwrap()),
+                ],
+            }],
+            opacity: Some(0.4),
+            ..WindowRule::default()
+        }]);
+        engine.add_window_at_startup(window(1, "startup loading"), &be());
+        let wid = WindowId::new(1);
+        assert_eq!(engine.rule_opacity(wid), Some(0.4));
+
+        engine.window_title_changed(wid, "startup ready", &be());
+
+        assert_eq!(engine.tiled_windows[&wid].title, "startup ready");
+        assert_eq!(engine.rule_opacity(wid), Some(0.4));
+    }
+
+    #[test]
+    fn startup_rule_phase_survives_rule_replacement() {
+        let mut engine = engine();
+        engine.set_window_rules(vec![WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![Matcher::AtStartup],
+            }],
+            opacity: Some(0.4),
+            ..WindowRule::default()
+        }]);
+        engine.add_window_at_startup(window(1, "already open"), &be());
+        let wid = WindowId::new(1);
+        assert_eq!(engine.rule_opacity(wid), Some(0.4));
+
+        engine.set_window_rules(vec![WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![Matcher::AtStartup],
+            }],
+            opacity: Some(0.6),
+            ..WindowRule::default()
+        }]);
+        engine.reevaluate_all_window_rules(&be());
+
+        assert_eq!(engine.rule_opacity(wid), Some(0.6));
+    }
+
+    #[test]
+    fn startup_rule_phase_expires_once_at_the_deadline_and_updates_dynamic_rules() {
+        let mut engine = engine();
+        let start = Instant::now();
+        engine.startup_rules = startup_rules::StartupRules::new(start);
+        engine.set_window_rules(vec![
+            WindowRule {
+                match_groups: vec![MatchGroup {
+                    conds: vec![Matcher::AtStartup],
+                }],
+                opacity: Some(0.4),
+                max_width: Some(300),
+                ..WindowRule::default()
+            },
+            WindowRule {
+                match_groups: vec![MatchGroup {
+                    conds: vec![Matcher::Not(Box::new(Matcher::AtStartup))],
+                }],
+                opacity: Some(0.8),
+                max_width: Some(600),
+                ..WindowRule::default()
+            },
+        ]);
+        engine.add_window_at_startup(window(1, "already open"), &be());
+        engine.add_window(window(2, "new during startup"), &be());
+        let deadline = start + Duration::from_secs(60);
+        assert_eq!(engine.startup_rules_deadline(), deadline);
+        assert!(!engine.finish_startup_rules(deadline - Duration::from_nanos(1), &be()));
+        for id in [1, 2] {
+            assert_eq!(engine.rule_opacity(WindowId::new(id)), Some(0.4));
+            assert_eq!(tile_of(&engine, id).max_width, 308);
+        }
+
+        assert!(engine.finish_startup_rules(deadline, &be()));
+        for id in [1, 2] {
+            assert_eq!(engine.rule_opacity(WindowId::new(id)), Some(0.8));
+            assert_eq!(tile_of(&engine, id).max_width, 608);
+        }
+        engine.add_window(window(3, "new after startup"), &be());
+        assert_eq!(engine.rule_opacity(WindowId::new(3)), Some(0.8));
+        assert_eq!(tile_of(&engine, 3).max_width, 608);
+        assert!(!engine.finish_startup_rules(deadline + Duration::from_secs(1), &be()));
+    }
+
+    #[test]
+    fn startup_rule_phase_full_config_reload_keeps_its_deadline_and_expiry() {
+        let mut engine = engine();
+        let start = Instant::now();
+        engine.startup_rules = startup_rules::StartupRules::new(start);
+        let config = crate::config::Config {
+            window_rules: vec![WindowRule {
+                match_groups: vec![MatchGroup {
+                    conds: vec![Matcher::AtStartup],
+                }],
+                opacity: Some(0.4),
+                ..WindowRule::default()
+            }],
+            ..crate::config::Config::default()
+        };
+        engine.set_full_config(config.clone());
+        engine.add_window(window(1, "already open"), &be());
+        let deadline = start + Duration::from_secs(60);
+
+        engine.set_full_config(config.clone());
+        engine.reevaluate_all_window_rules(&be());
+        assert_eq!(engine.startup_rules_deadline(), deadline);
+        assert_eq!(engine.rule_opacity(WindowId::new(1)), Some(0.4));
+        assert!(!engine.finish_startup_rules(deadline - Duration::from_nanos(1), &be()));
+        assert!(engine.finish_startup_rules(deadline, &be()));
+        assert_eq!(engine.rule_opacity(WindowId::new(1)), None);
+
+        engine.set_full_config(config);
+        engine.reevaluate_all_window_rules(&be());
+        assert_eq!(engine.startup_rules_deadline(), deadline);
+        assert_eq!(engine.rule_opacity(WindowId::new(1)), None);
+        engine.add_window(window(2, "after reload after expiry"), &be());
+        assert_eq!(engine.rule_opacity(WindowId::new(2)), None);
+        assert!(!engine.finish_startup_rules(deadline + Duration::from_secs(60), &be()));
+    }
+
+    #[test]
+    fn startup_rule_phase_expiry_rechecks_startup_exclusions() {
+        let mut engine = engine();
+        let start = Instant::now();
+        engine.startup_rules = startup_rules::StartupRules::new(start);
+        engine.set_window_rules(vec![WindowRule {
+            exclude_groups: vec![MatchGroup {
+                conds: vec![Matcher::AtStartup],
+            }],
+            opacity: Some(0.6),
+            ..WindowRule::default()
+        }]);
+        engine.add_window(window(1, "excluded during startup"), &be());
+        assert_eq!(engine.rule_opacity(WindowId::new(1)), None);
+
+        assert!(engine.finish_startup_rules(start + Duration::from_secs(60), &be()));
+
+        assert_eq!(engine.rule_opacity(WindowId::new(1)), Some(0.6));
+    }
+
+    #[test]
+    fn startup_rule_phase_expiry_does_not_replay_open_properties() {
+        let mut engine = engine();
+        let start = Instant::now();
+        engine.startup_rules = startup_rules::StartupRules::new(start);
+        engine.set_window_rules(vec![WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![Matcher::Not(Box::new(Matcher::AtStartup))],
+            }],
+            opacity: Some(0.6),
+            open_floating: Some(true),
+            open_fullscreen: Some(true),
+            open_in_workspace: Some(2),
+            open_focused: Some(false),
+            default_column_width: Some(Some(SizeSpec::Fixed(900))),
+            default_window_height: Some(Some(SizeSpec::Fixed(200))),
+            ..WindowRule::default()
+        }]);
+        engine.add_window(window(1, "one"), &be());
+        engine.add_window(window(2, "two"), &be());
+        let wid = WindowId::new(1);
+        let place_before = engine.locate_window(wid);
+        let height_before = tile_of(&engine, 1).preferred_height;
+        let oid = OutputId::from_name("M");
+        let focus_before = engine.monitors.get(&oid).unwrap().focus_window;
+
+        assert!(engine.finish_startup_rules(start + Duration::from_secs(60), &be()));
+
+        assert_eq!(engine.rule_opacity(wid), Some(0.6));
+        assert_eq!(engine.locate_window(wid), place_before);
+        assert_eq!(tile_of(&engine, 1).preferred_height, height_before);
+        assert_eq!(
+            engine.monitors.get(&oid).unwrap().focus_window,
+            focus_before
+        );
+        assert!(!engine.floating_windows.contains(&wid));
+        assert!(!engine.is_fullscreen(wid));
+    }
+
+    #[test]
+    fn startup_rule_phase_keeps_initial_scan_and_new_float_geometry_distinct() {
+        let mut engine = engine();
+        engine.set_window_rules(vec![WindowRule {
+            match_groups: vec![MatchGroup {
+                conds: vec![Matcher::AtStartup],
+            }],
+            open_floating: Some(true),
+            default_column_width: Some(Some(SizeSpec::Fixed(600))),
+            default_window_height: Some(Some(SizeSpec::Fixed(400))),
+            ..WindowRule::default()
+        }]);
+        engine.add_window_at_startup(window(1, "old float"), &be());
+        engine.add_window(window(2, "new float during startup"), &be());
+
+        // Explicit sizes retain the existing float's centre, while a newly opened
+        // float uses the normal centred admission placement during the same phase.
+        assert_eq!(
+            engine.float_homes[&WindowId::new(1)].rect,
+            Rect::new(150, 150, 600, 400)
+        );
+        assert_eq!(
+            engine.float_homes[&WindowId::new(2)].rect,
+            Rect::new(660, 320, 600, 400)
+        );
     }
 
     #[test]

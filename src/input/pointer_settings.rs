@@ -9,8 +9,9 @@
 //!   `disabled-on-external-mouse` ("leave the touchpad on when a mouse is connected").  Only the
 //!   options the config names are touched, the value the OS had before is remembered, and it is
 //!   put back on a graceful quit or when a reload stops naming the option.
-//! * **parsed and validated but not written** — `scroll-method`, `scroll-button`,
-//!   `scroll-button-lock`, `middle-emulation`, touchpad `dwtp`, `drag`, `drag-lock`,
+//! * **hook-only** — explicit mouse `on-button-down`/button/lock scrolling.
+//! * **parsed and validated but not written** — unsupported scroll methods,
+//!   device-scoped button scrolling, `middle-emulation`, touchpad `dwtp`, `drag`, `drag-lock`,
 //!   `tap-button-map`, `click-method` and `off` for mouse/trackpoint/trackball: Windows exposes no
 //!   public setting for them (they are reported at load time, never silently dropped).
 //! * **handled by wiri itself** — touchpad `off` and the `toggle-touchpad` action stop wiri's own
@@ -286,14 +287,18 @@ impl PointerSettings {
 /// loads and reported here once per load, so a user never wonders why nothing happened.
 pub fn unapplied(input: &InputConfig) -> Vec<&'static str> {
     let mut options = Vec::new();
-    if input.scroll_method.is_some() {
+    let button_scroll_applied = super::scroll_emulation::applied(input);
+    if input.scroll_method.is_some() && !button_scroll_applied {
         options.push("input scroll-method");
     }
-    if input.scroll_button.is_some() {
+    if input.scroll_button.is_some() && !button_scroll_applied {
         options.push("input scroll-button");
     }
-    if input.scroll_button_lock.is_some() {
+    if input.scroll_button_lock.is_some() && !button_scroll_applied {
         options.push("input scroll-button-lock");
+    }
+    if input.non_mouse_scroll_configured {
+        options.push("non-mouse device-scoped scrolling");
     }
     if input.middle_emulation.is_some() {
         options.push("input middle-emulation");
@@ -430,6 +435,7 @@ fn backend_from_env() -> Arc<dyn PointerSettingsBackend> {
 /// Apply the pointer options of a loaded (or reloaded) config.  Options the config no longer
 /// names are put back to what the OS had before wiri changed them.
 pub fn apply_config(input: &InputConfig, cursor: &crate::config::CursorConfig) {
+    super::scroll_emulation::configure(input);
     let mut guard = SETTINGS.lock();
     let settings = guard.get_or_insert_with(|| PointerSettings::new(backend_from_env()));
     let mut wanted = wanted(input);
@@ -449,6 +455,7 @@ pub fn apply_config(input: &InputConfig, cursor: &crate::config::CursorConfig) {
 
 /// Restore every setting wiri changed (graceful quit).
 pub fn restore() {
+    super::scroll_emulation::cancel();
     if let Some(settings) = SETTINGS.lock().as_mut() {
         for line in settings.restore() {
             info!("{}", line);
@@ -1247,7 +1254,7 @@ mod tests {
     #[test]
     fn options_without_a_windows_lever_are_reported() {
         let configured = input(
-            "input {\n    mouse { middle-emulation; scroll-method \"edge\"; scroll-button 8; scroll-button-lock; off }\n    touchpad { dwtp; drag; drag-lock; click-method \"clickfinger\"; tap-button-map { left 1 } }\n}",
+            "input {\n    mouse { middle-emulation; scroll-method \"edge\"; scroll-button 274; scroll-button-lock; off }\n    touchpad { dwtp; drag; drag-lock; click-method \"clickfinger\"; tap-button-map { left 1 } }\n}",
         );
         let reported = unapplied(&configured);
         assert_eq!(
@@ -1270,6 +1277,29 @@ mod tests {
             "input { mouse { accel-profile \"flat\"; left-handed } }"
         ))
         .is_empty());
+    }
+
+    #[test]
+    fn parity_button_scroll_is_hook_only_and_retains_unsupported_device_diagnostics() {
+        let configured = input("input { mouse { scroll-method \"on-button-down\"; scroll-button 274; scroll-button-lock } }");
+        assert!(
+            wanted(&configured).is_empty(),
+            "button scrolling never writes global pointer settings"
+        );
+        assert!(unapplied(&configured).is_empty());
+        let disabled =
+            input("input { mouse { scroll-method \"on-button-down\"; scroll-button 0 } }");
+        assert!(wanted(&disabled).is_empty());
+        assert!(unapplied(&disabled).is_empty());
+        let mixed = input("input { mouse { scroll-method \"on-button-down\"; scroll-button 274 }; touchpad { scroll-button 276 } }");
+        assert_eq!(unapplied(&mixed), vec!["non-mouse device-scoped scrolling"]);
+        let unsupported = crate::config::decode::decode_text(
+            "input { mouse { scroll-method \"on-button-down\"; scroll-button 99 } }",
+            "",
+            None,
+        );
+        assert!(!unsupported.has_errors());
+        assert!(unapplied(&unsupported.config.input).contains(&"input scroll-button"));
     }
 
     #[test]

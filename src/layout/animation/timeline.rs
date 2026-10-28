@@ -1,7 +1,7 @@
 //! Deterministic scalar timelines. No clocks, tasks, HWNDs or frame-rate assumptions.
 use crate::utils::Rect;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Easing {
     None,
     Linear,
@@ -12,10 +12,16 @@ pub enum Easing {
     CubicOut,
     QuadOut,
     ExpoOut,
+    CubicBezier {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
 }
 
 impl Easing {
-    /// The eased position (0 to 1) of `t` (0 to 1) on this curve.  The layout timeline uses
+    /// The eased position of `t` (0 to 1); Bezier y controls may overshoot. The layout timeline uses
     /// it for its own animations; the overlay's recent-windows fade reuses it so that the
     /// configured curve means the same thing everywhere.
     pub fn apply(self, t: f64) -> f64 {
@@ -48,7 +54,34 @@ pub(super) fn apply_easing(t: f64, easing: Easing) -> f64 {
         Easing::ExpoOut => 1.0 - 2.0_f64.powf(-10.0 * t),
         Easing::EaseInOut if t < 0.5 => 4.0 * t.powi(3),
         Easing::EaseInOut => 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0,
+        Easing::CubicBezier { x1, y1, x2, y2 } => cubic_bezier(t, x1, y1, x2, y2),
     }
+}
+
+/// Invert monotonic x, then sample y. Fixed bisection remains stable at flat
+/// derivatives, including x1=1, x2=0. The bounds and 31 iterations match niri
+/// e19df12's animation/bezier.rs; y deliberately remains unclamped.
+fn cubic_bezier(x: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    if x <= f64::EPSILON {
+        return 0.0;
+    }
+    if x >= 1.0 - f64::EPSILON {
+        return 1.0;
+    }
+    let sample = |t: f64, p1: f64, p2: f64| {
+        let omt = 1.0 - t;
+        3.0 * omt * omt * t * p1 + 3.0 * omt * t * t * p2 + t * t * t
+    };
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..=30 {
+        let t = (low + high) / 2.0;
+        if x < sample(t, x1, x2) {
+            high = t;
+        } else {
+            low = t;
+        }
+    }
+    sample((low + high) / 2.0, y1, y2)
 }
 
 /// Unit-mass damped oscillator, matching niri's named spring parameters.
@@ -276,6 +309,14 @@ impl Animation {
     pub fn current(&self) -> f64 {
         self.value
     }
+
+    /// Rebase coordinates without restarting elapsed time or changing velocity.
+    pub(super) fn translate(&mut self, delta: f64) {
+        self.start += delta;
+        self.end += delta;
+        self.value += delta;
+    }
+
     pub fn velocity(&self) -> f64 {
         self.velocity
     }
@@ -679,5 +720,101 @@ mod tests {
         assert_eq!(Easing::parse("ease-out-expo"), Some(Easing::ExpoOut));
         assert_eq!(Easing::parse("ease-out-quad"), Some(Easing::QuadOut));
         assert_eq!(Easing::parse("typo"), None);
+    }
+
+    #[test]
+    fn parity_bezier_inverts_x_instead_of_sampling_at_time() {
+        let curve = Easing::CubicBezier {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 0.0,
+            y2: 1.0,
+        };
+        // x(t)=t^3: x=.125 means parameter .5 and y=.5, not y(.125).
+        assert!((curve.apply(0.125) - 0.5).abs() < 0.000001);
+        assert_eq!(curve.apply(-1.0), 0.0);
+        assert_eq!(curve.apply(0.0), 0.0);
+        assert_eq!(curve.apply(1.0), 1.0);
+        assert_eq!(curve.apply(2.0), 1.0);
+    }
+
+    #[test]
+    fn parity_bezier_flat_slopes_remain_finite_and_accurate() {
+        for (x1, x2, x, expected) in [
+            (0.0, 0.0, 0.125, 0.5),
+            (1.0, 1.0, 0.875, 0.5),
+            (1.0, 0.0, 0.4375, 0.15625),
+            (1.0, 0.0, 0.5, 0.5),
+        ] {
+            let curve = Easing::CubicBezier {
+                x1,
+                y1: 0.0,
+                x2,
+                y2: 1.0,
+            };
+            let actual = curve.apply(x);
+            assert!((actual - expected).abs() < 0.00001, "{curve:?}: {actual}");
+        }
+    }
+
+    #[test]
+    fn parity_bezier_identity_and_overshoot_are_not_clamped() {
+        let identity = Easing::CubicBezier {
+            x1: 0.25,
+            y1: 0.25,
+            x2: 0.75,
+            y2: 0.75,
+        };
+        for t in [0.0, 0.01, 0.25, 0.5, 0.99, 1.0] {
+            assert!((identity.apply(t) - t).abs() < 0.000001);
+        }
+        for (y, expected) in [(2.0, 1.625), (-2.0, -1.375)] {
+            let curve = Easing::CubicBezier {
+                x1: 0.0,
+                y1: y,
+                x2: 1.0,
+                y2: y,
+            };
+            assert!((curve.apply(0.5) - expected).abs() < 0.000001);
+            let mut animation = Animation::new(0.0, 100.0, 1000, curve);
+            assert!((animation.tick(500) - 100.0 * expected).abs() < 0.0001);
+            assert!(!animation.is_finished());
+            assert_eq!(animation.tick(500), 100.0);
+            assert!(animation.is_finished());
+        }
+    }
+
+    #[test]
+    fn parity_bezier_and_existing_curves_honor_slowdown() {
+        for (curve, expected) in [
+            (
+                Easing::CubicBezier {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: 0.0,
+                    y2: 1.0,
+                },
+                50.0,
+            ),
+            (Easing::Linear, 12.5),
+            (Easing::CubicOut, 33.0078125),
+            (Easing::QuadOut, 23.4375),
+        ] {
+            let mut animation = Animation::with_kind(
+                0.0,
+                100.0,
+                AnimationKind::Easing {
+                    duration_ms: 1000,
+                    curve,
+                },
+                2.0,
+            );
+            assert!(
+                (animation.tick(250) - expected).abs() < 0.000001,
+                "{curve:?}"
+            );
+            assert_eq!(animation.tick(1750), 100.0);
+            assert!(animation.is_finished());
+        }
     }
 }

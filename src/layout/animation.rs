@@ -185,6 +185,13 @@ impl AnimationManager {
         self.animations.get(target).map(|a| a.current())
     }
 
+    /// Rebase one coordinate space while retaining its timeline and momentum.
+    pub(crate) fn translate(&mut self, target: &AnimationTarget, delta: f64) {
+        if let Some(animation) = self.animations.get_mut(target) {
+            animation.translate(delta);
+        }
+    }
+
     /// Cancel all animations
     pub fn cancel_all(&mut self) {
         self.animations.clear();
@@ -331,6 +338,55 @@ mod tests {
 
         // Animation should be done after 200ms total
         assert!(!mgr.has_active());
+    }
+
+    #[test]
+    fn test_animation_translation_preserves_progress_momentum_and_other_targets() {
+        let output = OutputId::from_name("translation-source");
+        let target = AnimationTarget::ScrollX(output);
+        let others = [
+            AnimationTarget::WorkspaceX(output),
+            AnimationTarget::ScrollX(OutputId::from_name("translation-other-output")),
+        ];
+        for kind in [
+            AnimationKind::Easing {
+                duration_ms: 1000,
+                curve: Easing::Linear,
+            },
+            AnimationKind::Spring(Spring::default()),
+        ] {
+            let mut manager = AnimationManager::new(true, 1000, Easing::Linear);
+            manager.animate_with_velocity(target.clone(), 1182.0, 1282.0, 75.0, kind);
+            for other in &others {
+                manager.animate(other.clone(), 20.0, 120.0);
+            }
+            manager.tick(100);
+            let mut before = manager.animations[&target].clone();
+            let mut untouched: Vec<_> = others
+                .iter()
+                .map(|other| manager.animations[other].clone())
+                .collect();
+
+            manager.translate(&target, -508.0);
+
+            let after = &manager.animations[&target];
+            assert_eq!(after.start, before.start - 508.0);
+            assert_eq!(after.end, before.end - 508.0);
+            assert_eq!(after.current(), before.current() - 508.0);
+            assert_eq!(after.elapsed_ms, before.elapsed_ms);
+            assert_eq!(after.duration_ms, before.duration_ms);
+            assert_eq!(after.velocity(), before.velocity());
+            let expected = before.tick(50) - 508.0;
+            let results = manager.tick(50);
+            let actual = results.iter().find(|(key, _)| key == &target).unwrap().1;
+            assert!((actual - expected).abs() < 1e-9, "kind={kind:?}");
+            for (other, before) in others.iter().zip(&mut untouched) {
+                assert_eq!(
+                    results.iter().find(|(key, _)| key == other).unwrap().1,
+                    before.tick(50)
+                );
+            }
+        }
     }
 
     #[test]

@@ -30,6 +30,9 @@ pub enum FocusAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkspaceAction {
+    Focus {
+        reference: WorkspaceRef,
+    },
     MoveWindow {
         window: Option<WindowId>,
         reference: WorkspaceRef,
@@ -59,6 +62,90 @@ pub enum WorkspaceAction {
     UnsetName {
         workspace: Option<WorkspaceRef>,
     },
+}
+
+impl From<crate::ipc::WorkspaceReferenceArg> for WorkspaceRef {
+    fn from(reference: crate::ipc::WorkspaceReferenceArg) -> Self {
+        match reference {
+            crate::ipc::WorkspaceReferenceArg::Id(id) => Self::Id(id),
+            crate::ipc::WorkspaceReferenceArg::Index(index) => Self::Index(u32::from(index).max(1)),
+            crate::ipc::WorkspaceReferenceArg::Name(name) => Self::Name(name),
+        }
+    }
+}
+
+impl crate::ipc::WorkspaceIpcAction {
+    pub(crate) fn action_name(&self) -> &'static str {
+        use crate::ipc::WorkspaceIpcAction as I;
+        match self {
+            I::FocusWorkspace { .. } => "focus-workspace",
+            I::MoveWindowToWorkspace { .. } => "move-window-to-workspace",
+            I::MoveColumnToWorkspace { .. } => "move-column-to-workspace",
+            I::MoveWorkspaceToIndex { .. } => "move-workspace-to-index",
+            I::SetWorkspaceName { .. } => "set-workspace-name",
+            I::UnsetWorkspaceName { .. } => "unset-workspace-name",
+            I::MoveWorkspaceToMonitor { .. } => "move-workspace-to-monitor",
+        }
+    }
+
+    /// Convert transport types without resolving an ID against transient state.
+    pub(crate) fn into_input_action(self) -> Result<Action, String> {
+        use crate::ipc::WorkspaceIpcAction as I;
+        use WorkspaceAction as W;
+        Ok(match self {
+            I::FocusWorkspace { reference } => match WorkspaceRef::from(reference) {
+                WorkspaceRef::Index(index) => Action::FocusWorkspace(index as i32),
+                WorkspaceRef::Name(name) => Action::FocusWorkspaceNamed(name),
+                reference @ WorkspaceRef::Id(_) => Action::WorkspaceAction(W::Focus { reference }),
+            },
+            I::MoveWindowToWorkspace {
+                window_id,
+                reference,
+                focus,
+            } => {
+                let window = window_id
+                    .map(|id| isize::try_from(id).map(WindowId::new))
+                    .transpose()
+                    .map_err(|_| "window id exceeds the native handle range")?;
+                Action::WorkspaceAction(W::MoveWindow {
+                    window,
+                    reference: reference.into(),
+                    focus,
+                })
+            }
+            I::MoveColumnToWorkspace { reference, focus } => {
+                Action::WorkspaceAction(W::MoveColumn {
+                    reference: reference.into(),
+                    focus,
+                })
+            }
+            I::MoveWorkspaceToIndex { index, reference } => {
+                // Larger valid usize destinations all clamp to the end of the
+                // finite workspace stack, just like the engine's u32 maximum.
+                Action::WorkspaceAction(W::MoveToIndex {
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    workspace: reference.map(Into::into),
+                })
+            }
+            I::SetWorkspaceName {
+                name,
+                workspace: None,
+            } => Action::RenameWorkspace(name),
+            I::SetWorkspaceName { name, workspace } => Action::WorkspaceAction(W::SetName {
+                name,
+                workspace: workspace.map(Into::into),
+            }),
+            I::UnsetWorkspaceName { reference } => Action::WorkspaceAction(W::UnsetName {
+                workspace: reference.map(Into::into),
+            }),
+            I::MoveWorkspaceToMonitor { output, reference } => {
+                Action::MonitorAction(MonitorAction::MoveWorkspace {
+                    workspace: reference.map(Into::into),
+                    target: MonitorTarget::Name(output),
+                })
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -391,6 +478,7 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
             })
         }
         "focus-workspace" => match w.reference()? {
+            WorkspaceRef::Id(_) => None,
             WorkspaceRef::Index(index) => Some(Action::FocusWorkspace(i32::try_from(index).ok()?)),
             WorkspaceRef::Name(name) => Some(Action::FocusWorkspaceNamed(name)),
         },

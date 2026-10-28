@@ -54,8 +54,27 @@ impl TilingEngine {
                             as u32,
                     );
                 } else if let Some(logical) = column.width_fixed_logical {
+                    // A target that left the column must not supply an unrelated
+                    // window's border. Untargeted/inherited intent uses the workspace.
+                    column.width_fixed_window = column
+                        .width_fixed_window
+                        .filter(|window| column.index_of(*window).is_some());
+                    let inset = column
+                        .width_fixed_window
+                        .map_or(cfg.border_inset(), |window| {
+                            self.rule_state
+                                .get(&window)
+                                .map_or(cfg.border_inset(), |state| {
+                                    state
+                                        .resolved
+                                        .effects
+                                        .border
+                                        .inset(&cfg.effects.border, cfg.border_inset())
+                                })
+                        });
                     column.width = Some(
-                        ((logical * scale).round() as i32 + 2 * cfg.border_width.max(1))
+                        ((logical * scale).round() as i32)
+                            .saturating_add(2 * inset)
                             .clamp(Self::MIN_COLUMN_PX, Self::MAX_COLUMN_PX)
                             as u32,
                     );

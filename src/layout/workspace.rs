@@ -114,6 +114,9 @@ pub struct Column {
     /// Requested proportion of the view; `width` is its resolved pixel cache.
     pub width_proportion: Option<f64>,
     pub width_fixed_logical: Option<f64>,
+    /// The window whose border converted a fixed window width into a tile width.
+    /// An absent target uses the workspace border when resolving the intent.
+    pub(crate) width_fixed_window: Option<WindowId>,
     /// Explicit column width in pixels (None = use layout default)
     pub width: Option<u32>,
     /// Display mode: stacked (default) or tabbed.
@@ -141,6 +144,7 @@ impl Column {
             active_window: None,
             width_proportion: None,
             width_fixed_logical: None,
+            width_fixed_window: None,
             width: None,
             display: ColumnDisplay::Stacked,
             maximized: false,
@@ -159,6 +163,7 @@ impl Column {
         self.preset_idx = None;
         self.width_proportion = None;
         self.width_fixed_logical = None;
+        self.width_fixed_window = None;
         self.width = width;
     }
 
@@ -171,7 +176,9 @@ impl Column {
 
     pub fn set_fixed_logical(&mut self, logical: f64, scale: f64, border: i32) {
         self.set_width(Some(
-            ((logical * scale).round() as i32 + border).clamp(50, 100_000) as u32,
+            ((logical * scale).round() as i32)
+                .saturating_add(border)
+                .clamp(50, 100_000) as u32,
         ));
         self.width_fixed_logical = Some(logical);
     }
@@ -410,6 +417,7 @@ pub struct WindowSlot {
     pub column_width: Option<u32>,
     pub column_width_proportion: Option<f64>,
     pub column_width_fixed_logical: Option<f64>,
+    pub(crate) column_width_fixed_window: Option<WindowId>,
     pub column_display: ColumnDisplay,
     pub column_maximized: bool,
     /// The width the column had before it was maximized (see [`Column::pre_max_width`]).
@@ -615,6 +623,7 @@ impl Workspace {
             column_width: col.width,
             column_width_proportion: col.width_proportion,
             column_width_fixed_logical: col.width_fixed_logical,
+            column_width_fixed_window: col.width_fixed_window,
             column_display: col.display.clone(),
             column_maximized: col.maximized,
             column_pre_max_width: col.pre_max_width,
@@ -687,6 +696,7 @@ impl Workspace {
         col.width = column_width;
         col.width_proportion = slot.column_width_proportion;
         col.width_fixed_logical = slot.column_width_fixed_logical;
+        col.width_fixed_window = slot.column_width_fixed_window;
         col.maximized = column_maximized;
         col.pre_max_width = column_pre_max_width;
         col.sizing_forced = slot.column_sizing_forced;
@@ -723,6 +733,7 @@ impl Workspace {
         new_col.width = source.width;
         new_col.width_proportion = source.width_proportion;
         new_col.width_fixed_logical = source.width_fixed_logical;
+        new_col.width_fixed_window = source.width_fixed_window;
         new_col.preset_idx = source.preset_idx;
         new_col.maximized = source.maximized;
         new_col.sizing_forced = source.sizing_forced;
@@ -887,6 +898,7 @@ impl Workspace {
                 self.columns[i].width,
                 self.columns[i].width_proportion,
                 self.columns[i].width_fixed_logical,
+                self.columns[i].width_fixed_window,
             )
         });
         let removed = self.remove_window(window_id);
@@ -903,10 +915,11 @@ impl Workspace {
         if target_col == self.columns.len() {
             // Append a new column for this tile
             let mut col = Column::new();
-            if let Some((pixels, proportion, logical)) = width {
+            if let Some((pixels, proportion, logical, window)) = width {
                 col.width = pixels;
                 col.width_proportion = proportion;
                 col.width_fixed_logical = logical;
+                col.width_fixed_window = window;
             }
             col.add_tile(tile);
             self.columns.push(col);

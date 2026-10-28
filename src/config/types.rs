@@ -213,6 +213,11 @@ pub struct InputConfig {
     pub scroll_button: Option<u32>,
     /// niri `scroll-button-lock`: keep the scroll button scrolling without holding it.
     pub scroll_button_lock: Option<bool>,
+    /// Preserve mouse scope: other device blocks must never enable or alter
+    /// global WH_MOUSE_LL button scrolling through the legacy merged fields.
+    pub mouse_scroll: MouseScrollConfig,
+    /// Device-scoped scrolling outside `mouse` has no WH_MOUSE_LL equivalent.
+    pub non_mouse_scroll_configured: bool,
     /// niri `off` inside `input { mouse }`: parsed, but a Windows mouse belongs to the OS.
     pub mouse_off: bool,
     /// niri `off` inside `input { trackpoint }`.
@@ -270,6 +275,8 @@ impl InputConfig {
             scroll_method: None,
             scroll_button: None,
             scroll_button_lock: None,
+            mouse_scroll: MouseScrollConfig::default(),
+            non_mouse_scroll_configured: false,
             mouse_off: false,
             trackpoint_off: false,
             trackball_off: false,
@@ -327,6 +334,14 @@ impl InputConfig {
             warp_mode: self.warp_mode,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MouseScrollConfig {
+    pub method: Option<ScrollMethod>,
+    pub button: Option<u32>,
+    pub lock: Option<bool>,
+    pub natural: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,8 +1304,9 @@ impl Matcher {
 /// populated by `layout::engine::TilingEngine::add_window_with_target` with live
 /// state pulled from `GetForegroundWindow`, the engine's `floating_windows` set,
 /// the `urgent_windows` set (driven by `backend::hooks::URGENT_WINDOWS` +
-/// `FLASHWINFO`), and the `at_startup` flag is set by
-/// `add_window_at_startup`.
+/// `FLASHWINFO`). The `at_startup` flag follows the engine's first-60-second
+/// startup rule phase for both admission and reevaluation, independently of the
+/// initial-enumeration placement flag. Owned overlay policy follows the same expiry.
 ///
 /// Other call sites (IPC, the legacy shim) construct contexts with these flags
 /// defaulting to `false`; they're considered best-effort and only used for

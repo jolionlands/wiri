@@ -91,8 +91,8 @@ fn pascal_case(name: &str) -> String {
         .collect()
 }
 
-/// Convert niri's typed action vocabulary into the same validated parser used
-/// by binds. Never silently discard a known flag whose semantics we lack.
+/// Preserve typed workspace references; other actions enter the validated bind
+/// parser. Never silently discard a known flag whose semantics we lack.
 fn action(value: Value) -> Result<Value, String> {
     let (variant, fields) = match value {
         Value::String(name) => (name, json!({})),
@@ -109,6 +109,9 @@ fn action(value: Value) -> Result<Value, String> {
     let fields = fields
         .as_object()
         .ok_or("an action's fields must be an object")?;
+    if variant == "MoveFloatingWindow" {
+        return Ok(json!({"type":"move_floating_window","data":fields}));
+    }
     if let Some(request) = super::action_options::screenshot(&variant, fields)? {
         return Ok(request);
     }
@@ -117,7 +120,67 @@ fn action(value: Value) -> Result<Value, String> {
             "name":snake_case(&variant).replace('_',"-"),"args":words?,"quoted":[]
         }}));
     }
-    if fields.get("focus") == Some(&Value::Bool(false)) {
+    // Unknown future fields are tolerated. Known unsupported behavior remains
+    // an error even when a workspace action takes the structured path below.
+    for key in [
+        "skip_empty",
+        "skip_empty_workspaces",
+        "write_to_disk",
+        "show_pointer",
+    ] {
+        if fields.get(key).is_some_and(|v| !v.is_null()) {
+            return Err(format!(
+                "action flag '{key}' is not supported on this executor"
+            ));
+        }
+    }
+    if matches!(
+        variant.as_str(),
+        "SetColumnWidth" | "SetWindowWidth" | "SetWindowHeight"
+    ) {
+        if fields.get("focus") == Some(&Value::Bool(false)) {
+            return Err("focus=false is not supported by this Windows action executor".into());
+        }
+        let action: super::SizeIpcAction =
+            serde_json::from_value(json!({(variant):fields})).map_err(|e| e.to_string())?;
+        action.into_input_action()?;
+        return Ok(json!({"type":"size_action","data":{"action":action}}));
+    }
+    if matches!(
+        variant.as_str(),
+        "FocusWorkspace"
+            | "MoveWindowToWorkspace"
+            | "MoveColumnToWorkspace"
+            | "MoveWorkspaceToIndex"
+            | "SetWorkspaceName"
+            | "UnsetWorkspaceName"
+            | "MoveWorkspaceToMonitor"
+    ) {
+        if !matches!(
+            variant.as_str(),
+            "MoveWindowToWorkspace" | "MoveColumnToWorkspace"
+        ) && fields.get("focus") == Some(&Value::Bool(false))
+        {
+            return Err("focus=false is not supported by this Windows action executor".into());
+        }
+        let action: super::WorkspaceIpcAction =
+            serde_json::from_value(json!({(variant):fields})).map_err(|e| e.to_string())?;
+        return Ok(json!({"type":"workspace_action","data":{"action":action}}));
+    }
+    let workspace_transfer = matches!(
+        variant.as_str(),
+        "MoveWindowToWorkspaceDown"
+            | "MoveWindowToWorkspaceUp"
+            | "MoveColumnToWorkspaceDown"
+            | "MoveColumnToWorkspaceUp"
+    );
+    if workspace_transfer {
+        if let Some(focus) = fields.get("focus") {
+            let focus = focus.as_bool().ok_or("focus must be a boolean")?;
+            push("--focus".into(), false);
+            push(focus.to_string(), false);
+        }
+    } else if fields.get("focus") == Some(&Value::Bool(false)) {
         return Err("focus=false is not supported by this Windows action executor".into());
     }
     for key in ["id", "window_id"] {
@@ -129,7 +192,13 @@ fn action(value: Value) -> Result<Value, String> {
             push(id.to_string(), false);
         }
     }
-    if let Some(command) = fields.get("command") {
+    if variant == "SpawnSh" {
+        let command = fields
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or("SpawnSh command must be a string")?;
+        push(command.into(), true);
+    } else if let Some(command) = fields.get("command") {
         for word in command
             .as_array()
             .ok_or("command must be an array of strings")?
@@ -141,46 +210,6 @@ fn action(value: Value) -> Result<Value, String> {
                 true,
             );
         }
-    }
-    if let Some(reference) = fields.get("reference") {
-        let (value, quote) = if let Some(name) = reference.get("Name").and_then(Value::as_str) {
-            (name.to_string(), true)
-        } else if let Some(index) = reference.get("Index").and_then(Value::as_u64) {
-            (index.to_string(), false)
-        } else if let Some(id) = reference.get("Id").and_then(Value::as_u64) {
-            return Err(format!(
-                "workspace id reference {id} is unsupported; use Index or Name"
-            ));
-        } else {
-            return Err("workspace reference must be {\"Index\":n} or {\"Name\":\"name\"}".into());
-        };
-        push(value, quote);
-    }
-    if let Some(change) = fields.get("change") {
-        let map = change
-            .as_object()
-            .filter(|map| map.len() == 1)
-            .ok_or("change needs one size variant")?;
-        let (kind, number) = map.iter().next().unwrap();
-        let number = number
-            .as_f64()
-            .filter(|n| n.is_finite())
-            .ok_or("size must be finite")?;
-        let (sign, percent) = match kind.as_str() {
-            "SetFixed" => ("", false),
-            "AdjustFixed" => (if number >= 0.0 { "+" } else { "" }, false),
-            "SetProportion" => ("", true),
-            "AdjustProportion" => (if number >= 0.0 { "+" } else { "" }, true),
-            _ => return Err(format!("unknown size change '{kind}'")),
-        };
-        push(
-            format!(
-                "{sign}{}{}",
-                if percent { number * 100.0 } else { number },
-                if percent { "%" } else { "" }
-            ),
-            false,
-        );
     }
     if variant == "SetColumnDisplay" {
         let display = match fields.get("display").and_then(Value::as_str) {
@@ -197,20 +226,6 @@ fn action(value: Value) -> Result<Value, String> {
                 .map(str::to_owned)
                 .unwrap_or_else(|| value.to_string());
             push(text, value.is_string());
-        }
-    }
-    // Unknown future fields are tolerated, as niri's compatibility contract requires.
-    // Known flags that affect behavior are never accepted as no-ops.
-    for key in [
-        "skip_empty",
-        "skip_empty_workspaces",
-        "write_to_disk",
-        "show_pointer",
-    ] {
-        if fields.get(key).is_some_and(|v| !v.is_null()) {
-            return Err(format!(
-                "action flag '{key}' is not supported on this executor"
-            ));
         }
     }
     Ok(
@@ -356,6 +371,47 @@ impl Framer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parity_move_floating_window_preserves_typed_axes_and_defaults() {
+        // The pinned action is IPC-only: routing through the bind parser loses its axes.
+        let request = decode(json!({"Action":{"MoveFloatingWindow":{
+            "id":42,"x":{"SetProportion":50.0}
+        }}}))
+        .expect("typed floating positioning is accepted");
+        assert_eq!(
+            serde_json::to_value(request.message).unwrap(),
+            json!({
+                "type":"move_floating_window",
+                "data":{"id":42,"x":{"SetProportion":50.0},"y":{"AdjustFixed":0.0}}
+            })
+        );
+    }
+
+    #[test]
+    fn parity_move_floating_window_rejects_bad_typed_axes_and_ids() {
+        for fields in [
+            json!({"x":50}),
+            json!({"x":{"Unknown":1}}),
+            json!({"x":{"SetFixed":"20"}}),
+            json!({"x":null}),
+            json!({"y":{"SetFixed":10,"AdjustFixed":20}}),
+            json!({"id":-1}),
+            json!({"id":"42"}),
+            json!({"id":1.5}),
+        ] {
+            assert!(decode(json!({"Action":{"MoveFloatingWindow":fields}})).is_err());
+            assert!(decode(json!({"type":"move_floating_window","data":fields})).is_err());
+        }
+        let request = decode(json!({"Action":{"MoveFloatingWindow":{"future":true}}})).unwrap();
+        assert_eq!(
+            serde_json::to_value(request.message).unwrap(),
+            json!({
+                "type":"move_floating_window","data":{"id":null,
+                "x":{"AdjustFixed":0.0},"y":{"AdjustFixed":0.0}}
+            })
+        );
+    }
 
     #[test]
     fn documented_schema_examples_use_the_current_wire_contract() {
@@ -624,17 +680,556 @@ mod tests {
 
     #[test]
     fn typed_niri_actions_preserve_references_sizes_and_ids() {
-        let a = decode(json!({"Action":{"FocusWorkspace":{"reference":{"Name":"2"}}}})).unwrap();
-        let json = serde_json::to_value(a.message).unwrap();
-        assert_eq!(json["data"]["args"], json!(["2"]));
-        assert_eq!(json["data"]["quoted"], json!([true]));
+        assert_eq!(
+            parsed_typed_action(json!({"FocusWorkspace":{"reference":{"Name":"2"}}})),
+            crate::input::Action::FocusWorkspaceNamed("2".into())
+        );
         let a = decode(
             json!({"Action":{"SetColumnWidth":{"change":{"AdjustProportion":0.1},"id":44}}}),
         )
         .unwrap();
-        let json = serde_json::to_value(a.message).unwrap();
-        assert_eq!(json["data"]["args"], json!(["--id", "44", "+10%"]));
+        let IpcMessage::SizeAction { action } = a.message else {
+            panic!("typed sizes need lossless transport");
+        };
+        assert_eq!(action.window_id(), Some(44));
+        assert_eq!(
+            action.into_input_action().unwrap(),
+            crate::input::Action::SetColumnWidth(crate::input::SizeChange::AdjustProportion(100))
+        );
         assert!(decode(json!({"Action":{"MoveWindowToWorkspace":{"focus":false}}})).is_err());
+    }
+
+    fn parsed_typed_action(value: Value) -> crate::input::Action {
+        let request = decode(json!({"Action":value.clone()}))
+            .unwrap_or_else(|error| panic!("{value}: {error}"));
+        match request.message {
+            IpcMessage::RunAction { name, args, quoted } => {
+                crate::input::parse_action_flagged(&name, &args, &quoted)
+                    .unwrap_or_else(|| panic!("{value}: rejected {name} {args:?} {quoted:?}"))
+            }
+            IpcMessage::WorkspaceAction { action } => action
+                .into_input_action()
+                .unwrap_or_else(|error| panic!("{value}: {error}")),
+            IpcMessage::SizeAction { action } => action
+                .into_input_action()
+                .unwrap_or_else(|error| panic!("{value}: {error}")),
+            _ => panic!("{value}: expected a shared or structured action request"),
+        }
+    }
+
+    #[test]
+    fn parity_typed_size_changes_preserve_percent_units_and_set_adjust_kinds() {
+        use crate::input::{Action, SizeChange};
+
+        let mut failures = Vec::new();
+        for (variant, expected_action) in [
+            (
+                "SetColumnWidth",
+                Action::SetColumnWidth as fn(SizeChange) -> Action,
+            ),
+            (
+                "SetWindowWidth",
+                Action::SetColumnWidth as fn(SizeChange) -> Action,
+            ),
+            (
+                "SetWindowHeight",
+                Action::SetWindowHeight as fn(SizeChange) -> Action,
+            ),
+        ] {
+            // The pin parses "10%" as SetProportion(10.), with no factor of 100.
+            // A typed Set with a negative value must retain Set despite argv's sign grammar.
+            for (change, expected) in [
+                (
+                    json!({"SetProportion":50.0}),
+                    SizeChange::SetProportion(50_000),
+                ),
+                (json!({"SetProportion":0.1}), SizeChange::SetProportion(100)),
+                (json!({"SetProportion":0.0}), SizeChange::SetProportion(0)),
+                (
+                    json!({"SetProportion":-10.0}),
+                    SizeChange::SetProportion(-10_000),
+                ),
+                (
+                    json!({"AdjustProportion":10.0}),
+                    SizeChange::AdjustProportion(10_000),
+                ),
+                (
+                    json!({"AdjustProportion":-10.0}),
+                    SizeChange::AdjustProportion(-10_000),
+                ),
+                (
+                    json!({"AdjustProportion":0.0}),
+                    SizeChange::AdjustProportion(0),
+                ),
+                (json!({"SetFixed":50}), SizeChange::SetFixed(50)),
+                (json!({"SetFixed":0}), SizeChange::SetFixed(0)),
+                (json!({"SetFixed":-10}), SizeChange::SetFixed(-10)),
+                (
+                    json!({"SetFixed":2147483647i64}),
+                    SizeChange::SetFixed(i32::MAX),
+                ),
+                (
+                    json!({"SetFixed":-2147483648i64}),
+                    SizeChange::SetFixed(i32::MIN),
+                ),
+                (json!({"AdjustFixed":10}), SizeChange::AdjustFixed(10)),
+                (json!({"AdjustFixed":-10}), SizeChange::AdjustFixed(-10)),
+                (json!({"AdjustFixed":0}), SizeChange::AdjustFixed(0)),
+                (
+                    json!({"AdjustFixed":2147483647i64}),
+                    SizeChange::AdjustFixed(i32::MAX),
+                ),
+                (
+                    json!({"AdjustFixed":-2147483648i64}),
+                    SizeChange::AdjustFixed(i32::MIN),
+                ),
+            ] {
+                let value = json!({(variant):{"change":change}});
+                let actual = parsed_typed_action(value.clone());
+                let expected = expected_action(expected);
+                if actual != expected {
+                    failures.push(format!("{value}: expected {expected:?}, got {actual:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn parity_typed_size_changes_reject_invalid_variant_payloads() {
+        let mut failures = Vec::new();
+        for variant in ["SetColumnWidth", "SetWindowWidth", "SetWindowHeight"] {
+            for change in [
+                json!({"SetFixed":1.5}),
+                json!({"AdjustFixed":1.5}),
+                json!({"SetFixed":2147483648i64}),
+                json!({"AdjustFixed":-2147483649i64}),
+                json!({"SetFixed":"50"}),
+                json!({"SetProportion":"50"}),
+                json!({"AdjustProportion":null}),
+                json!({"SetProportion":false}),
+                json!({"SetFixed":50,"AdjustFixed":10}),
+                json!({"Unknown":50}),
+                json!(null),
+            ] {
+                let value = json!({"Action":{(variant):{"change":change}}});
+                if decode(value.clone()).is_ok() {
+                    failures.push(format!("accepted {value}"));
+                }
+            }
+            let missing = json!({"Action":{(variant):{}}});
+            if decode(missing.clone()).is_ok() {
+                failures.push(format!("accepted {missing}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn parity_typed_size_transport_preserves_target_and_original_numeric_change() {
+        for variant in ["SetColumnWidth", "SetWindowWidth", "SetWindowHeight"] {
+            for id in [Value::Null, json!(42)] {
+                let change = json!({"SetProportion":-0.123456});
+                let request = decode(json!({"Action":{(variant):{
+                    "id":id,"change":change
+                }}}))
+                .unwrap();
+                let value = serde_json::to_value(request.message).unwrap();
+                assert_eq!(value["type"], "size_action");
+                assert_eq!(value["data"]["action"][variant]["id"], id);
+                assert_eq!(value["data"]["action"][variant]["change"], change);
+                let roundtrip: IpcMessage = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(serde_json::to_value(roundtrip).unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn parity_typed_workspace_ids_survive_all_seven_action_payloads() {
+        fn contains_reference(value: &Value, reference: &Value) -> bool {
+            value == reference
+                || match value {
+                    Value::Object(fields) => fields
+                        .values()
+                        .any(|value| contains_reference(value, reference)),
+                    Value::Array(values) => values
+                        .iter()
+                        .any(|value| contains_reference(value, reference)),
+                    _ => false,
+                }
+        }
+
+        let mut failures = Vec::new();
+        // IDs occupy the full u64 domain and must never become positional words,
+        // local workspace keys, names, or native window handles.
+        for id in [0, u64::MAX - 17, u64::MAX] {
+            let reference = json!({"Id":id});
+            for value in [
+                json!({"FocusWorkspace":{"reference":reference.clone()}}),
+                json!({"MoveWindowToWorkspace":{
+                    "window_id":42,"reference":reference.clone(),"focus":false
+                }}),
+                json!({"MoveColumnToWorkspace":{
+                    "reference":reference.clone(),"focus":false
+                }}),
+                json!({"MoveWorkspaceToIndex":{
+                    "index":3,"reference":reference.clone()
+                }}),
+                json!({"SetWorkspaceName":{
+                    "name":"renamed","workspace":reference.clone()
+                }}),
+                json!({"UnsetWorkspaceName":{"reference":reference.clone()}}),
+                json!({"MoveWorkspaceToMonitor":{
+                    "output":"DISPLAY2","reference":reference.clone()
+                }}),
+            ] {
+                match decode(json!({"Action":value.clone()})) {
+                    Ok(request) => {
+                        let message = serde_json::to_value(request.message).unwrap();
+                        assert!(
+                            contains_reference(&message, &reference),
+                            "{value}: lost the typed workspace ID in {message}"
+                        );
+                    }
+                    Err(error) => failures.push(format!("{value}: {error}")),
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn parity_typed_workspace_id_references_reach_input_actions() {
+        use crate::input::{
+            Action, MonitorAction, MonitorTarget, WorkspaceAction as W, WorkspaceRef,
+        };
+        let id = u64::MAX - 17;
+        let reference = json!({"Id":id});
+        for (value, expected) in [
+            (
+                json!({"FocusWorkspace":{"reference":reference.clone()}}),
+                Action::WorkspaceAction(W::Focus {
+                    reference: WorkspaceRef::Id(id),
+                }),
+            ),
+            (
+                json!({"MoveWindowToWorkspace":{
+                    "window_id":42,"reference":reference.clone(),"focus":false
+                }}),
+                Action::WorkspaceAction(W::MoveWindow {
+                    window: Some(crate::utils::WindowId::new(42)),
+                    reference: WorkspaceRef::Id(id),
+                    focus: false,
+                }),
+            ),
+            (
+                json!({"MoveColumnToWorkspace":{"reference":reference.clone()}}),
+                Action::WorkspaceAction(W::MoveColumn {
+                    reference: WorkspaceRef::Id(id),
+                    focus: true,
+                }),
+            ),
+            (
+                json!({"MoveWorkspaceToIndex":{"index":3,"reference":reference.clone()}}),
+                Action::WorkspaceAction(W::MoveToIndex {
+                    index: 3,
+                    workspace: Some(WorkspaceRef::Id(id)),
+                }),
+            ),
+            (
+                json!({"SetWorkspaceName":{"name":"renamed","workspace":reference.clone()}}),
+                Action::WorkspaceAction(W::SetName {
+                    name: "renamed".into(),
+                    workspace: Some(WorkspaceRef::Id(id)),
+                }),
+            ),
+            (
+                json!({"UnsetWorkspaceName":{"reference":reference.clone()}}),
+                Action::WorkspaceAction(W::UnsetName {
+                    workspace: Some(WorkspaceRef::Id(id)),
+                }),
+            ),
+            (
+                json!({"MoveWorkspaceToMonitor":{"output":"DISPLAY2","reference":reference}}),
+                Action::MonitorAction(MonitorAction::MoveWorkspace {
+                    workspace: Some(WorkspaceRef::Id(id)),
+                    target: MonitorTarget::Name("DISPLAY2".into()),
+                }),
+            ),
+        ] {
+            assert_eq!(parsed_typed_action(value.clone()), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn parity_typed_workspace_ids_reject_malformed_references() {
+        for reference in [
+            json!({"Id":-1}),
+            json!({"Id":1.5}),
+            json!({"Id":"42"}),
+            json!({"Id":null}),
+            json!({"Id":true}),
+            json!({"Id":[]}),
+            json!({"Id":{}}),
+            json!({"Id":42,"Index":2}),
+            serde_json::from_str::<Value>(r#"{"Id":18446744073709551616}"#).unwrap(),
+        ] {
+            for value in [
+                json!({"FocusWorkspace":{"reference":reference.clone()}}),
+                json!({"MoveWindowToWorkspace":{"reference":reference.clone()}}),
+                json!({"MoveColumnToWorkspace":{"reference":reference.clone()}}),
+                json!({"MoveWorkspaceToIndex":{"index":3,"reference":reference.clone()}}),
+                json!({"SetWorkspaceName":{"name":"renamed","workspace":reference.clone()}}),
+                json!({"UnsetWorkspaceName":{"reference":reference.clone()}}),
+                json!({"MoveWorkspaceToMonitor":{"output":"DISPLAY2","reference":reference.clone()}}),
+            ] {
+                assert!(decode(json!({"Action":value.clone()})).is_err(), "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn parity_typed_workspace_name_keeps_its_explicit_target() {
+        use crate::input::{Action, WorkspaceAction, WorkspaceRef};
+
+        // Numeric and flag-looking names must remain names through argv translation.
+        for (reference, expected) in [
+            (json!({"Index":2}), WorkspaceRef::Index(2)),
+            (json!({"Name":"2"}), WorkspaceRef::Name("2".into())),
+            (
+                json!({"Name":"--workspace"}),
+                WorkspaceRef::Name("--workspace".into()),
+            ),
+        ] {
+            assert_eq!(
+                parsed_typed_action(json!({"SetWorkspaceName":{
+                    "name":"renamed", "workspace":reference
+                }})),
+                Action::WorkspaceAction(WorkspaceAction::SetName {
+                    name: "renamed".into(),
+                    workspace: Some(expected),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn parity_typed_workspace_optional_references_reach_the_shared_parser() {
+        use crate::input::{Action, MonitorAction, MonitorTarget, WorkspaceAction, WorkspaceRef};
+
+        for (reference, expected) in [
+            (json!({"Index":2}), WorkspaceRef::Index(2)),
+            (json!({"Name":"2"}), WorkspaceRef::Name("2".into())),
+            (
+                json!({"Name":"--workspace"}),
+                WorkspaceRef::Name("--workspace".into()),
+            ),
+        ] {
+            for (value, action) in [
+                (
+                    json!({"MoveWorkspaceToIndex":{"index":3,"reference":reference.clone()}}),
+                    Action::WorkspaceAction(WorkspaceAction::MoveToIndex {
+                        index: 3,
+                        workspace: Some(expected.clone()),
+                    }),
+                ),
+                (
+                    json!({"UnsetWorkspaceName":{"reference":reference.clone()}}),
+                    Action::WorkspaceAction(WorkspaceAction::UnsetName {
+                        workspace: Some(expected.clone()),
+                    }),
+                ),
+                (
+                    json!({"MoveWorkspaceToMonitor":{
+                        "output":"DISPLAY2","reference":reference.clone()
+                    }}),
+                    Action::MonitorAction(MonitorAction::MoveWorkspace {
+                        workspace: Some(expected.clone()),
+                        target: MonitorTarget::Name("DISPLAY2".into()),
+                    }),
+                ),
+            ] {
+                assert_eq!(parsed_typed_action(value.clone()), action, "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn parity_typed_workspace_null_references_use_the_focused_workspace() {
+        use crate::input::{Action, MonitorAction, MonitorTarget, WorkspaceAction};
+
+        // serde serializes the pinned Option fields as null when no target is supplied.
+        for (value, expected) in [
+            (
+                json!({"MoveWorkspaceToIndex":{"index":3,"reference":null}}),
+                Action::WorkspaceAction(WorkspaceAction::MoveToIndex {
+                    index: 3,
+                    workspace: None,
+                }),
+            ),
+            (
+                json!({"UnsetWorkspaceName":{"reference":null}}),
+                Action::WorkspaceAction(WorkspaceAction::UnsetName { workspace: None }),
+            ),
+            (
+                json!({"MoveWorkspaceToMonitor":{"output":"DISPLAY2","reference":null}}),
+                Action::MonitorAction(MonitorAction::MoveWorkspace {
+                    workspace: None,
+                    target: MonitorTarget::Name("DISPLAY2".into()),
+                }),
+            ),
+            (
+                json!({"SetWorkspaceName":{"name":"renamed","workspace":null}}),
+                Action::RenameWorkspace("renamed".into()),
+            ),
+        ] {
+            assert_eq!(parsed_typed_action(value.clone()), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn parity_typed_workspace_transfers_preserve_false_focus() {
+        use crate::input::{Action, WorkspaceAction, WorkspaceRef};
+
+        for (value, expected) in [
+            (
+                json!({"MoveWindowToWorkspace":{
+                    "window_id":42,"reference":{"Name":"2"},"focus":false
+                }}),
+                WorkspaceAction::MoveWindow {
+                    window: Some(crate::utils::WindowId::new(42)),
+                    reference: WorkspaceRef::Name("2".into()),
+                    focus: false,
+                },
+            ),
+            (
+                json!({"MoveWindowToWorkspaceDown":{"focus":false}}),
+                WorkspaceAction::MoveWindowRelative {
+                    window: None,
+                    down: true,
+                    focus: false,
+                },
+            ),
+            (
+                json!({"MoveWindowToWorkspaceUp":{"focus":false}}),
+                WorkspaceAction::MoveWindowRelative {
+                    window: None,
+                    down: false,
+                    focus: false,
+                },
+            ),
+            (
+                json!({"MoveColumnToWorkspace":{"reference":{"Index":2},"focus":false}}),
+                WorkspaceAction::MoveColumn {
+                    reference: WorkspaceRef::Index(2),
+                    focus: false,
+                },
+            ),
+            (
+                json!({"MoveColumnToWorkspaceDown":{"focus":false}}),
+                WorkspaceAction::MoveColumnRelative {
+                    down: true,
+                    focus: false,
+                },
+            ),
+            (
+                json!({"MoveColumnToWorkspaceUp":{"focus":false}}),
+                WorkspaceAction::MoveColumnRelative {
+                    down: false,
+                    focus: false,
+                },
+            ),
+        ] {
+            assert_eq!(
+                parsed_typed_action(value.clone()),
+                Action::WorkspaceAction(expected),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_typed_spawn_sh_keeps_the_complete_command_string() {
+        let command = r#"echo "two words" & echo %PATH%"#;
+        assert_eq!(
+            parsed_typed_action(json!({"SpawnSh":{"command":command}})),
+            crate::input::Action::SpawnCmd(command.into())
+        );
+    }
+
+    #[test]
+    fn parity_typed_workspace_and_shell_fields_reject_invalid_types() {
+        for value in [
+            json!({"MoveWindowToWorkspace":{"reference":{"Index":2},"focus":"false"}}),
+            json!({"MoveWindowToWorkspaceDown":{"focus":null}}),
+            json!({"MoveWindowToWorkspaceUp":{"focus":0}}),
+            json!({"MoveColumnToWorkspace":{"reference":null}}),
+            json!({"MoveColumnToWorkspaceDown":{"focus":[]}}),
+            json!({"MoveColumnToWorkspaceUp":{"focus":{}}}),
+            json!({"SetWorkspaceName":{"name":"renamed","workspace":{"Name":2}}}),
+            json!({"MoveWorkspaceToIndex":{"index":3,"reference":{"Index":"2"}}}),
+            json!({"UnsetWorkspaceName":{"reference":{"Index":256}}}),
+            json!({"MoveWorkspaceToMonitor":{
+                "output":"DISPLAY2","reference":{"Index":2,"Name":"2"}
+            }}),
+            json!({"SpawnSh":{"command":["echo","hi"]}}),
+            json!({"SpawnSh":{"command":null}}),
+            json!({"SpawnSh":{}}),
+        ] {
+            assert!(decode(json!({"Action":value.clone()})).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn parity_typed_workspace_metadata_rejects_invalid_required_scalars() {
+        assert_eq!(
+            parsed_typed_action(json!({"MoveWorkspaceToIndex":{"index":300,"reference":null}})),
+            crate::input::Action::WorkspaceAction(crate::input::WorkspaceAction::MoveToIndex {
+                index: 300,
+                workspace: None,
+            })
+        );
+        for (variant, key, valid, invalid) in [
+            (
+                "SetWorkspaceName",
+                "name",
+                json!({"name":"renamed"}),
+                vec![json!(null), json!(false), json!(3), json!([]), json!({})],
+            ),
+            (
+                "MoveWorkspaceToMonitor",
+                "output",
+                json!({"output":"DISPLAY2"}),
+                vec![json!(null), json!(false), json!(3), json!([]), json!({})],
+            ),
+            (
+                "MoveWorkspaceToIndex",
+                "index",
+                json!({"index":3}),
+                vec![
+                    json!(null),
+                    json!(false),
+                    json!(-1),
+                    json!(1.5),
+                    json!("3"),
+                    json!("+3"),
+                    json!([]),
+                    json!({}),
+                ],
+            ),
+        ] {
+            for value in invalid.into_iter().map(Some).chain(std::iter::once(None)) {
+                let mut fields = valid.clone();
+                match value {
+                    Some(value) => fields[key] = value,
+                    None => {
+                        fields.as_object_mut().unwrap().remove(key);
+                    }
+                }
+                let request = json!({"Action":{(variant):fields}});
+                assert!(decode(request.clone()).is_err(), "{request}");
+            }
+        }
     }
 
     #[test]

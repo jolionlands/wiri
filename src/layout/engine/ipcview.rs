@@ -81,7 +81,7 @@ impl TilingEngine {
                     let inset = if modes.get(&window).copied().unwrap_or(DrawMode::Inset)
                         == DrawMode::Inset
                     {
-                        cfg.border_width.max(1)
+                        self.rule_border_inset(window, cfg)
                     } else {
                         0
                     };
@@ -718,6 +718,177 @@ mod tests {
             layout.tile_pos_in_workspace_view,
             Some((200.0 / 1.5, 100.0))
         );
+    }
+
+    fn geometry_fixture(
+        mut config: crate::config::Config,
+        inactive_layout: Option<crate::config::LayoutConfigPartial>,
+    ) -> (TilingEngine, OutputId, i32, i32) {
+        let mut active = crate::config::WorkspaceConfig::default_config();
+        active.name = "GeometryActive".to_string();
+        let mut inactive = crate::config::WorkspaceConfig::default_config();
+        inactive.name = "GeometryInactive".to_string();
+        inactive.layout_override = inactive_layout;
+        config.workspace = vec![active, inactive];
+        let mut engine = TilingEngine::new(LayoutConfig::from_config(&config));
+        engine.set_full_config(config);
+        let output = OutputId::from_name("ipc-geometry-fractional-scale");
+        engine.register_monitor_with_scale(
+            output,
+            Rect::new(-1920, 120, 1920, 1080),
+            Rect::new(-1920, 120, 1920, 1040),
+            1.5,
+        );
+        let key_of = |name: &str| {
+            engine
+                .monitors
+                .get(&output)
+                .unwrap()
+                .workspaces
+                .iter()
+                .find_map(|(key, workspace)| {
+                    (workspace.name.as_deref() == Some(name)).then_some(*key)
+                })
+                .unwrap()
+        };
+        let active = key_of("GeometryActive");
+        let inactive = key_of("GeometryInactive");
+        for (workspace, id) in [(active, 100), (inactive, 101)] {
+            let window = WindowId::new(id);
+            engine
+                .monitors
+                .get_mut(&output)
+                .unwrap()
+                .workspaces
+                .get_mut(&workspace)
+                .unwrap()
+                .add_window_to_new_column(window);
+            engine.tiled_windows.insert(window, make_window(id));
+        }
+        let monitor = engine.monitors.get_mut(&output).unwrap();
+        monitor.active_workspace = active;
+        monitor.focus_column = Some(0);
+        monitor.focus_window = Some(WindowId::new(100));
+        (engine, output, active, inactive)
+    }
+
+    fn assert_snapshot_matches_calculated_native_allocation(
+        engine: &TilingEngine,
+        output: OutputId,
+        workspace: i32,
+        expected_inset: i32,
+    ) {
+        let monitor = engine.monitors.get(&output).unwrap();
+        assert_eq!(monitor.scale_factor, 1.5);
+        let cfg = engine.effective_config_for_workspace(output, workspace);
+        let strip = &monitor.workspaces[&workspace];
+        let positions =
+            engine.calculate_positions(strip, TilingEngine::tiling_work_rect(monitor, cfg), cfg);
+        assert!(!positions.is_empty());
+        let snapshot = engine.ipc_snapshot();
+        for (window, tile) in positions {
+            // Ordinary tiles use this inset when apply_layout_for_monitor
+            // constructs the native visible allocation. Focus-ring thickness
+            // does not reserve window space; a disabled/zero-width border does
+            // not reserve an artificial pixel either.
+            let inset = engine.rule_border_inset(window, cfg);
+            assert_eq!(inset, expected_inset, "fixture's actual native inset");
+            let native = Rect::new(
+                tile.loc.x + inset,
+                tile.loc.y + inset,
+                tile.size.w.saturating_sub(2 * inset as u32),
+                tile.size.h.saturating_sub(2 * inset as u32),
+            );
+            let layout = &window_of(&snapshot, window.as_isize() as u64).layout;
+            let scale = monitor.scale_factor;
+            assert_eq!(
+                layout.tile_size,
+                (tile.size.w as f64 / scale, tile.size.h as f64 / scale),
+                "tile allocation for workspace {workspace} / {window:?}"
+            );
+            assert_eq!(
+                layout.window_size,
+                (
+                    (native.size.w as f64 / scale).round() as i32,
+                    (native.size.h as f64 / scale).round() as i32,
+                ),
+                "IPC must describe the native visible allocation, workspace {workspace} / {window:?}"
+            );
+            assert_eq!(
+                layout.window_offset_in_tile,
+                (
+                    (native.loc.x - tile.loc.x) as f64 / scale,
+                    (native.loc.y - tile.loc.y) as f64 / scale,
+                ),
+                "IPC inset must match native placement, workspace {workspace} / {window:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_ipc_layout_border_off_matches_native_allocation_at_fractional_scale() {
+        for border_width in [0, 7] {
+            for ring_width in [0, 9] {
+                for ring_off in [false, true] {
+                    let mut config = crate::config::Config::default();
+                    config.layout.effects.border.off = true;
+                    config.layout.effects.border.width = border_width;
+                    config.layout.effects.focus_ring.off = ring_off;
+                    config.layout.effects.focus_ring.width = ring_width;
+                    let (engine, output, active, inactive) = geometry_fixture(config, None);
+                    assert_eq!(engine.active_workspace_config(output).border_inset(), 0);
+                    assert_snapshot_matches_calculated_native_allocation(
+                        &engine, output, active, 0,
+                    );
+                    assert_snapshot_matches_calculated_native_allocation(
+                        &engine, output, inactive, 0,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parity_ipc_layout_enabled_border_uses_each_workspaces_own_inset() {
+        let mut config = crate::config::Config::default();
+        config.layout.effects.border.off = false;
+        config.layout.effects.border.width = 3;
+        config.layout.effects.focus_ring.width = 0;
+        let mut override_layout = crate::config::LayoutConfigPartial::default();
+        let mut border = crate::config::effects::RingStyle::border_default();
+        border.width = 6;
+        override_layout.effects.border = Some(border);
+        let mut ring = crate::config::effects::RingStyle::focus_ring_default();
+        ring.width = 11;
+        override_layout.effects.focus_ring = Some(ring);
+        override_layout.outer_gaps = Some(23);
+        let (engine, output, active, inactive) = geometry_fixture(config, Some(override_layout));
+        assert_ne!(active, inactive);
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().active_workspace,
+            active
+        );
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 3);
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, inactive, 6);
+    }
+
+    #[test]
+    fn parity_ipc_layout_inactive_border_off_does_not_inherit_active_inset() {
+        let mut config = crate::config::Config::default();
+        config.layout.effects.border.off = false;
+        config.layout.effects.border.width = 5;
+        let mut override_layout = crate::config::LayoutConfigPartial::default();
+        let mut border = crate::config::effects::RingStyle::border_default();
+        border.off = true;
+        border.width = 8;
+        override_layout.effects.border = Some(border);
+        let (engine, output, active, inactive) = geometry_fixture(config, Some(override_layout));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().active_workspace,
+            active
+        );
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 5);
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, inactive, 0);
     }
 
     #[test]

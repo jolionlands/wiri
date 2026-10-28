@@ -253,7 +253,7 @@ impl TilingEngine {
 
     /// Focus a managed window across workspaces/outputs. This is also the MRU path: never
     /// activate a hidden tile without first selecting its workspace.
-    pub(super) fn focus_action_window(
+    pub(crate) fn focus_action_window(
         &mut self,
         window: WindowId,
         backend: &BackendHandle,

@@ -5,6 +5,39 @@ All `p_*` properties in `summary.json` are numeric **information**, never pass/f
 `-1` means unavailable, not zero cost or a passing sample. Existing live gates are untouched.
 The proposed budgets below are future acceptance criteria, not enforced by this collector.
 
+## Tridaris full-baseline checkpoint, 2026-10-28 (`f217e15`)
+
+The frozen full run at `C:\wiri-dev\evidence\parity-full-f217e15-20261028`
+recorded the following with 26 managed windows and two existing sentinels:
+
+| Observation | Result |
+| --- | ---: |
+| First complete IPC reply / first observed layout | 82.30 / 65.13 ms, one cold start |
+| Idle process CPU / interval | Below the counter increment / 30.005 s |
+| Idle placement lines / context switches | 0 / 17.20 per second |
+| Hotkey to first observed rectangle change | 27.52 ms median, 33.47 ms maximum, ten keys |
+| Largest rectangle-observer gap | 33.47 ms |
+| Private bytes, startup / after actions | 8.11 / 8.24 MiB |
+| Working set, startup / after actions | 24.02 / 26.02 MiB |
+| Threads, startup / after actions | 14 / 15 |
+| Collector errors | 0 |
+
+The run's verdict records concurrent compilation. It is not a quiet performance
+qualification, and the observer gap cannot resolve a 16 ms movement target.
+Two memory endpoints establish neither a leak nor a stable long-term plateau.
+These measurements precede the current startup, native sizing and activation fixes;
+their performance effects have not been measured. Command round-trip timings from
+focused gates are a separate measurement from hotkey-to-rectangle latency.
+
+Next: repeat the normal-desktop collector on the final frozen binary after builds
+stop, improve the external acknowledgement observer before enforcing sub-frame
+limits, and separately observe focus/cursor completion and animation cadence.
+The older poller inventory below is historical: the current main loop, reconciliation
+and animation wakeups are demand-driven, and the runtime already bounds its workers.
+Remaining source-backed candidates include the synchronous 40 ms activation fallback
+under the engine lock and active animation pacing at 16 ms plus processing time.
+Measure those paths before changing them; retain final-geometry delivery guarantees.
+
 ## Reproduce
 
 From an interactive Windows x64 worktree, with `RUSTFLAGS=-D warnings`:

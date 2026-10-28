@@ -3108,6 +3108,72 @@ $summary = [ordered]@{
     h15_a_window_that_closes_is_told_by_id_and_handle = $h15CloseTold
     h15_a_late_subscriber_is_told_the_state_as_it_is = $h15LateOk
     h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
+    # Literal defaults keep the integrated parity gates in the CI schema;
+    # each phase replaces them only after observing its owned desktop fixture.
+    h81_linear_common_intermediate_motion = $false
+    h81_linear_target_visible = $false
+    h81_linear_settled = $false
+    h81_bezier_common_intermediate_motion = $false
+    h81_bezier_target_visible = $false
+    h81_bezier_settled = $false
+    h81_off_has_no_intermediate_motion = $false
+    h81_off_target_visible = $false
+    h81_cleanup = $false
+    h82_typed_fixed_position_and_origin = $false
+    h82_typed_full_area_proportions = $false
+    h82_explicit_inactive_id_preserves_foreground_and_unrelated_geometry = $false
+    h82_cli_signed_axis_preserves_omitted_axis = $false
+    h82_partial_visibility_bounds = $false
+    h82_partial_position_survives_resize = $false
+    h82_partial_position_survives_refresh = $false
+    h82_tiled_position_is_stored_until_float = $false
+    h82_stored_float_position_restores = $false
+    h83_unconfigured_middle_click_pair_passes = $false
+    h83_hold_consumes_both_button_edges = $false
+    h83_hold_motion_delivers_both_wheel_axes = $false
+    h83_hold_freezes_cursor_anchor = $false
+    h83_release_stops_scrolling = $false
+    h83_unconfigured_click_after_release_passes = $false
+    h83_short_tap_latches_scroll_lock = $false
+    h83_second_tap_unlocks_scroll_lock = $false
+    h83_reload_cancels_latched_scroll = $false
+    h83_reload_keeps_consumed_release_paired = $false
+    h83_explicit_middle_button_bind_wins = $false
+    h83_physical_wheel_bind_positive_control = $false
+    h83_emulated_wheel_bypasses_physical_bind_and_global_factor = $false
+    h83_touchpad_only_config_does_not_enable_mouse_scroll = $false
+    h83_cleanup = $false
+    h84_native_max_width_allocation = $false
+    h84_native_min_height_allocation = $false
+    h84_native_max_height_allocation = $false
+    h84_native_neighbors_do_not_overlap = $false
+    h84_fixed_height_defaults_floating = $false
+    h84_explicit_tiled_overrides_fixed_height = $false
+    h84_fixed_width_stays_tiled = $false
+    h84_zero_bounds_stay_tiled = $false
+    h84_native_bounds_refresh = $false
+    h84_successful_zero_clears_bounds = $false
+    h84_cleanup = $false
+    h85_initial_scan_startup_rules = $false
+    h85_new_admission_startup_rules = $false
+    h85_title_change_keeps_startup_rules = $false
+    h85_reload_keeps_startup_rules = $false
+    h85_real_deadline_expires_without_reload_reset = $false
+    h85_expiry_updates_existing_limits_and_opacity = $false
+    h85_expiry_does_not_replay_open_properties = $false
+    h85_expiry_remains_consumed = $false
+    h85_post_expiry_admission_uses_runtime_rules = $false
+    h85_cleanup = $false
+    h86_typed_window_id_transfer_preserves_native_focus = $false
+    h86_typed_column_id_transfer = $false
+    h86_typed_workspace_id_focus = $false
+    h86_workspace_id_survives_rename_and_reorder = $false
+    h86_workspace_id_survives_unname = $false
+    h86_unknown_id_is_handled_without_mutation_or_focus = $false
+    h86_malformed_id_is_rejected_without_mutation_or_focus = $false
+    h86_inactive_fullscreen_id_preserves_native_focus = $false
+    h86_inactive_height_id_preserves_native_focus = $false
+    h86_owned_cleanup = $false
     steps = $steps
 }
 # One lane's unexpected error must not end the run: its gates stay false and the error is recorded.
@@ -3132,6 +3198,16 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-v.ps1') } catch { LanePhaseEr
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-hot-corner.ps1') } catch { LanePhaseError 'lane_v_hot_corner' $_ }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-tabs.ps1') } catch { LanePhaseError 'lane_v_tabs' $_ }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-l2.ps1') } catch { LanePhaseError 'lane_l2' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-floating-position.ps1') } catch { LanePhaseError 'lane_floating_position' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-button-scroll.ps1') } catch { LanePhaseError 'lane_button_scroll' $_ }
+# H84: owned native bounds, allocation, classification and refresh evidence.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-native-bounds.ps1') } catch { LanePhaseError 'lane_native_bounds' $_ }
+# H85: observe the real global 60-second startup-rule deadline, including a
+# pre-expiry reload that must preserve the deadline and dynamic expiry updates.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-startup-rules.ps1') } catch { LanePhaseError 'lane_startup_rules' $_ }
+# H86: stable workspace identities and owned native focus; monitor relocation
+# remains explicit hardware qualification information on a single-output host.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-workspace-ids.ps1') } catch { LanePhaseError 'lane_workspace_ids' $_ }
 # Lane P: pointer-device settings, the hotkey overlay's startup options and the
 # dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
 # so nothing here changes this machine's real pointer or touchpad settings.
