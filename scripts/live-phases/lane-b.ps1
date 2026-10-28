@@ -746,10 +746,15 @@ layout {
                 # warp destination x=1121 vs settled centre x=1158). Poll
                 # until the cursor comes to rest inside the focused window's
                 # rect instead of sampling once against a pre-settle centre.
+                # The warp is applied by the foreground-notification chain
+                # after warp_geometry_ready waits out the layout settle, and
+                # cycle evidence shows that chain can take about 900ms under
+                # enumeration load (IPC reply 32.47s, warp 33.37s), so the
+                # window must comfortably exceed it.
                 $warpClock = [Diagnostics.Stopwatch]::StartNew()
                 $post = [LaneBProbe]::Cursor()
                 $r = Rc $target
-                while ($warpClock.ElapsedMilliseconds -lt 800 -and -not ($post.X -ge $r.L -and $post.X -le $r.R -and $post.Y -ge $r.T -and $post.Y -le $r.B)) {
+                while ($warpClock.ElapsedMilliseconds -lt 2500 -and -not ($post.X -ge $r.L -and $post.X -le $r.R -and $post.Y -ge $r.T -and $post.Y -le $r.B)) {
                     Start-Sleep -Milliseconds 25
                     $post = [LaneBProbe]::Cursor()
                     $r = Rc $target
