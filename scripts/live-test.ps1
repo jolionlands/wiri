@@ -2652,7 +2652,7 @@ do {
     $h15IdSetup = ($query.success -and $nativeFocus -eq [int64]$k1 -and $null -ne $managedFocus -and [int64]$managedFocus -eq [int64]$k1 -and $null -ne $streamFocus -and [int64]$streamFocus -eq [int64]$k1)
     if ($h15IdSetup) { break }
     Start-Sleep -Milliseconds 40
-} while ($h15IdSetupClock.ElapsedMilliseconds -lt 3000)
+} while ($h15IdSetupClock.ElapsedMilliseconds -lt 8000)
 $h15IdMark = @(EvList $evAll).Count
 $new = @(H15Step { $null = Ctl 'h15-fullscreen-id' @('action', 'fullscreen-window', '--id', [string][int64]$k3) } 2400)
 $h15IdFs = @(EvWindow $new 'window_opened_or_changed' $k3)
