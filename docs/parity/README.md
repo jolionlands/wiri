@@ -13,8 +13,8 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 141 | 68 | 0 | 17 |
-| Config, input and IPC (259 rows) | 117 | 70 | 0 | 72 |
+| Layout and behaviour (226 rows) | 164 | 45 | 0 | 17 |
+| Config, input and IPC (259 rows) | 139 | 48 | 0 | 72 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
 retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates; they are not a
@@ -23,9 +23,21 @@ C2's H66-H70 gates passed in the 8c6c9b0 cycle and lane T's H58-H61 in the f4d26
 The 2026-10-27 cycle at `cc3920d` passed **761/761 enforced gates, 0 failed** (88 further
 information entries), including every `h78_*` cursor-hiding gate, all five H31
 focus-history gates (`h31_history_crosses_workspaces` included) and lane V's H62-H65 set.
-That recount moves exactly one row to `done`: `set-column-display normal or tabbed`,
+That first recount moved exactly one row to `done`: `set-column-display normal or tabbed`,
 whose only stated gap was that nothing was live-verified. The two `cursor {}` rows and
 the tablet stylus row stay `partial` for their recorded Windows approximations.
+
+**2026-10-28 recount, following the 761/761 `cc3920d` cycle.** 45 rows moved from `partial`
+to `done` — the class-(a-1) list surveyed in [next-lanes.md](next-lanes.md), whose live gates
+already existed, are dot-sourced into `scripts/live-test.ps1`, and passed in that cycle:
+23 in the layout matrix (lanes L2, T, G, F2, V plus lane B's `h23_*` wheel and lane S's
+`h48_*` urgency gates) and 22 in the config/input/IPC matrix. Every flip was cross-checked
+against the gate names that actually appear in `scripts/live-test.ps1` and
+`scripts/live-phases/*.ps1`. The matrices are now **164 done / 45 partial** (layout) and
+**139 done / 48 partial** (config, input and IPC); `missing` and `N/A` are unchanged. One
+surveyed row was left `partial`: `horizontal-view-movement`, because the only evidence the
+survey could name for it is the offline H17 config-decode fragment, which its own header says
+does not prove visible motion, and no live gate covers camera scroll.
 Lane V's H62-H65 rows no longer rest on unit tests alone: the 2026-10-27 cycle passed
 every enforced gate, and its record names the h78 cursor-hiding, h31 focus-history and H65
 tab sets explicitly. The rows keep `partial` only for the Windows approximations and
