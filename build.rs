@@ -22,7 +22,13 @@ fn main() {
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
-        .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
+        .and_then(|o| {
+            if o.status.success() {
+                Some(o.stdout)
+            } else {
+                None
+            }
+        })
         .map(|b| String::from_utf8_lossy(&b).trim().to_string())
         .unwrap_or_default();
     println!("cargo:rustc-env=WIRI_GIT_HASH={}", hash);

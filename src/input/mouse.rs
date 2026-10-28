@@ -3,7 +3,7 @@ use std::time::Instant;
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
-use crate::utils::{OutputId, Point, WindowId, Rect};
+use crate::utils::{OutputId, Point, Rect, WindowId};
 
 /// Configuration for mouse-based focus behavior
 #[derive(Debug, Clone)]
@@ -100,7 +100,10 @@ impl MouseTracker {
     }
 
     /// Determine which monitor the cursor is currently on
-    pub fn monitor_at_cursor(&self, monitors: &HashMap<OutputId, (Rect, Rect)>) -> Option<OutputId> {
+    pub fn monitor_at_cursor(
+        &self,
+        monitors: &HashMap<OutputId, (Rect, Rect)>,
+    ) -> Option<OutputId> {
         for (output_id, (bounds, _work_area)) in monitors {
             if bounds.contains_point(self.cursor_pos) {
                 return Some(*output_id);
@@ -192,7 +195,10 @@ mod tests {
         );
         monitors.insert(
             OutputId::from_name("DISPLAY2"),
-            (Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040)),
+            (
+                Rect::new(1920, 0, 1920, 1080),
+                Rect::new(1920, 0, 1920, 1040),
+            ),
         );
 
         let mut tracker = MouseTracker::default();

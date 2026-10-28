@@ -35,7 +35,7 @@
 | **Floating Windows** | Toggle any window to/from floating mode |
 | **Configurable** | KDL configuration file with hot-reload support |
 | **Windows 11 Focus** | Uses `DWMWA_BORDER_COLOR` for colored window borders on Win11+ |
-| **IPC** | Named pipe control interface (`\\.\pipe\wiri_control`) |
+| **IPC** | Named pipe control interface (`\\.\pipe\wiri_control_<user>_<session>`) |
 | **Animation Framework** | Tick-based interpolation with 6 easing functions |
 | **Interactive Mouse** | Alt+drag for move/resize via `WH_MOUSE_LL` global hook |
 
@@ -167,11 +167,16 @@ wiri --no-tray                  # disable system tray icon
 
 ### Hot-reload
 
-Edit `config.kdl` while wiri is running and changes take effect automatically via the file watcher. Configured hotkeys also reload without restarting.
+Edit `config.kdl` while wiri is running and changes take effect automatically via the file watcher, about 200 ms after the last change to the file or to a file it includes; configured hotkeys also reload without restarting.  A mistake in the file is reported (tray balloon, log, `config_loaded` event) and the last good config stays.  See [Errors](#errors).
 
 ### Logging
 
-Logs are written to stderr. Use `RUST_LOG` env var for fine-grained control:
+`wiri.exe` is a GUI-subsystem program (it opens no console window), so its log goes to
+`%LOCALAPPDATA%\wiri\wiri.log`, rotated at 4 MB (the previous log is kept as `wiri.log.1`).
+Started from a shell with `-v` (or `--help`, `--version`) wiri attaches to that shell's console and
+shows the log there as well; `wiri -v 2> out.log` redirects it instead.  A plain `wiri` never attaches
+to a console, because a daemon attached to a console dies when the console is closed.
+Use the `RUST_LOG` env var for fine-grained control:
 ```sh
 RUST_LOG=debug wiri
 RUST_LOG=wiri::layout=trace wiri
@@ -181,198 +186,241 @@ RUST_LOG=wiri::layout=trace wiri
 
 ## 4. Configuration Guide
 
-wiri uses the **KDL** document format (`.kdl` file). The config file path defaults to `config.kdl` in the current directory and can be overridden with `-c <path>`.
+wiri's config is a **KDL** file, the syntax niri uses.  A niri `binds {}` block, `window-rule`s,
+`include` and `spawn-at-startup` lines paste in as they are.  The default location is
+`%APPDATA%\wiri\config.kdl` (wiri writes `resources/default_config.kdl` there on its first start);
+`-c <path>` and `$WIRI_CONFIG` override it.  The shipped `resources/default_config.kdl` and
+`examples/` show every option wiri reads.
 
-### Full Default Config (Conceptual)
+### The syntax
 
 ```kdl
-// ── Input ──
-input {
-    keyboard-layout "us"
-    repeat-delay 250
-    repeat-rate 25
-    mouse-speed 1.0
-    mouse-acceleration 0.0
-    natural-scroll false
-    tap-to-click false
+// a comment            /* a block comment, /* nested */ */
+/-binds { ... }         // slashdash comments out the next node, argument, property or block
+layout {                // a section: nodes in braces, one per line or separated by ;
+    gaps 16             // a node with an argument
+    focus-follows-mouse // a flag: written means on, `false` turns it off
 }
-
-// ── Layout ──
-layout {
-    column-width 500
-    column-width-mode "proportional"   // "proportional" or "fixed"
-    inner-gaps 16
-    outer-gaps 8
-    border-width 4
-    border-color "#333333"
-    border-color-focused "#0066cc"
-    focus-ring-width 3
-    focus-ring-color "#00aaff"
-    dim-unfocused 1.0
-    scroll-step 200
-    split-ratio 0.5
-    auto-balance false
+output "DP-1" {         // a section with a name
+    position x=1280 y=0 // properties are key=value
 }
-
-// ── Animations ──
-animations {
-    enabled false
-    duration 200
-    easing "cubic-bezier"
-    focus-transition true
-    workspace-transition true
-    window-move true
-    window-resize true
-}
-
-// ── Key Bindings ──
-binds {
-    Ctrl+Alt+Left focus-column-left
-    Ctrl+Alt+Right focus-column-right
-    Ctrl+Alt+Up focus-up
-    Ctrl+Alt+Down focus-down
-    Ctrl+Alt+Shift+Left move-column-left
-    Ctrl+Alt+Shift+Right move-column-right
-    Ctrl+Alt+Q close-window
-    Ctrl+Alt+Enter spawn "cmd.exe"
-    Ctrl+Alt+F toggle-fullscreen
-    Ctrl+Alt+T toggle-floating
-    Ctrl+Alt+H scroll-left
-    Ctrl+Alt+L scroll-right
-    Ctrl+Alt+Tab overview
-    Ctrl+Alt+O overview-select
-    Ctrl+Alt+Shift+Q quit
-    Ctrl+Alt+1 switch-workspace 1
-    Ctrl+Alt+2 switch-workspace 2
-    Ctrl+Alt+3 switch-workspace 3
-    Ctrl+Alt+4 switch-workspace 4
-    Ctrl+Alt+5 switch-workspace 5
-    Ctrl+Alt+6 switch-workspace 6
-    Ctrl+Alt+7 switch-workspace 7
-    Ctrl+Alt+8 switch-workspace 8
-    Ctrl+Alt+9 switch-workspace 9
-}
-
-// ── Window Rules ──
-window-rules {
-    class "CalcFrame" {
-        float true
-    }
-    class "CASCADIA_HOSTING_WINDOW_CLASS" {
-        workspace "2"
-    }
-    title "MyApp" {
-        opacity 0.85
-    }
-}
-
-// ── Outputs (Monitors) ──
-output "\\\\.\\DISPLAY1" {
-    mode "1920x1080@60"
-    scale 1.0
-    position 0 0
-    primary true
-}
-
-output "\\\\.\\DISPLAY2" {
-    mode "1920x1080@60"
-    scale 1.0
-    position 1920 0
+window-rule {
+    match app-id=r#"firefox$"#   // r#"..."# is a raw string: no escapes
 }
 ```
 
-### Config `input {}` Block
+Strings are in double quotes with KDL's escapes (`\n \t \\ \" \u{1F600}`) or raw (`r"..."`, `r#"..."#`).
+A bad escape is an error that says how to fix it.  For Windows paths, wiri keeps the old format's
+convenience: **a string that starts like a path (`C:\...` or `\\server`) keeps its backslashes as
+written** (`"C:\Program Files\x"` works); in any other string write `\\` or use a raw string.  A
+string that starts with three or more backslashes is KDL's escaped spelling of a UNC or device name,
+so `"\\\\.\\DISPLAY1"` and `"\\.\DISPLAY1"` both mean the monitor `\\.\DISPLAY1`.  Numbers
+may use `_`, `0x`, `0o`, `0b`.  A byte-order mark, CRLF and UTF-16 files (what PowerShell's `Out-File`
+writes) are fine.  wiri also still reads its older spellings: bare words as values (`hide-method hide`),
+`key=value` as a whole line (`repeat_delay=600`), and the flat keys of `layout`.
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `keyboard-layout` | string | `"us"` | Keyboard layout identifier |
-| `repeat-delay` | u32 | `250` | Key repeat initial delay (ms) |
-| `repeat-rate` | u32 | `25` | Key repeat rate (repeats/sec) |
-| `mouse-speed` | f64 | `1.0` | Mouse sensitivity multiplier |
-| `mouse-acceleration` | f64 | `0.0` | Mouse acceleration factor |
-| `natural-scroll` | bool | `false` | Reverse scroll direction |
-| `tap-to-click` | bool | `false` | Enable tap-to-click |
+### Errors
 
-### Config `layout {}` Block
+A config with a mistake does not load; niri does the same.
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `column-width` | u32 | `500` | Default column width (px) |
-| `column-width-mode` | string | `"proportional"` | `"proportional"` (fill screen) or `"fixed"` (per-column width) |
-| `inner-gaps` | u32 | `16` | Gap between columns and stacked tiles (px) |
-| `outer-gaps` | u32 | `8` | Margin around the monitor edges (px) |
-| `border-width` | u32 | `4` | Window border thickness (px) |
-| `border-color` | string | `"#333333"` | Unfocused window border color (hex) |
-| `border-color-focused` | string | `"#0066cc"` | Focused window border color (hex) |
-| `focus-ring-width` | u32 | `3` | Extra inset for focused windows (px) |
-| `focus-ring-color` | string | `"#00aaff"` | Focus ring color (hex) |
-| `dim-unfocused` | f32 | `1.0` | Opacity multiplier for unfocused windows (0.0–1.0) |
-| `scroll-step` | u32 | `200` | Pixels scrolled per scroll action |
-| `split-ratio` | f64 | `0.5` | Default split ratio for new columns |
-| `auto-balance` | bool | `false` | Auto-balance column widths |
+* **Errors** reject the file: a syntax error, an unknown section or key (with a "did you mean"), a
+  value of the wrong type or out of range, a bad color, an unknown bind action, a bad regular
+  expression, a missing `include`.  Each one names `file:line:column`.
+* **Warnings** load the file and say what is ignored: a niri option wiri does not have (`touchpad {}`,
+  `animations { workspace-switch {...} }`, `prefer-no-csd`), a bind that cannot work on Windows (an AltGr
+  modifier, a mouse or media-key trigger, a niri action wiri lacks), a duplicate bind.
+* At startup an erroneous config is not used: wiri starts with its defaults and shows a tray balloon
+  with the first error.  On a **reload** the last good config stays in use, a balloon names the file
+  and line, the log has every error, and the IPC event stream gets `config_loaded` with `failed: true`.
+* `wiri-ctl validate-config [path]` runs the same parser without starting anything (exit code 1 when
+  there are errors); `wiri-ctl reload-config` answers with the first error when the file is bad.
+* The file is re-read about 200 ms after the last change to it or to a file it includes, so an editor
+  that saves in steps never gets half a file applied.
 
-### Config `animations {}` Block
+### `include`
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | bool | `false` | Master animation toggle |
-| `duration` | u32 | `200` | Animation duration (ms) |
-| `easing` | string | `"cubic-bezier"` | Easing function: `none`, `linear`, `ease-in`, `ease-out`, `ease-in-out`, `cubic-bezier` |
-| `focus-transition` | bool | `true` | Animate focus changes |
-| `workspace-transition` | bool | `true` | Animate workspace switches |
-| `window-move` | bool | `true` | Animate window moves |
-| `window-resize` | bool | `true` | Animate window resizes |
+`include "other.kdl"` is read where it stands; the path is relative to the including file, absolute,
+`~/...` or starts with an environment variable (`%USERPROFILE%\...`).  `include optional=true "x.kdl"`
+only warns when the file is missing.  A later `binds {}` replaces earlier binds on the same keys.  The
+depth is limited to 8, a file that includes itself is an error, and the included files are watched.
 
-### Config `window-rules {}` Block
+### `input {}`
 
-Each rule has **matchers** (criteria to match a window) and **properties** (applied on match).
+| Option | Meaning |
+|---|---|
+| `mod-key "ctrl-alt"` | what `Mod` means in binds: `ctrl-alt` (default), `alt`, `ctrl`, `super`, `win-alt`, `ctrl-shift` |
+| `keyboard { repeat-delay N; repeat-rate N; numlock }` | `repeat-rate` also paces held-key binds |
+| `mouse { natural-scroll; scroll-speed N; acceleration N; sensitivity N; tap-to-click }` | wiri's own wheel binds; `scroll-factor N` is niri's name for `scroll-speed` |
+| `focus-follows-mouse` / `warp-mouse-to-focus` / `focus-delay-ms N` | flags (or `true`/`false`) |
+| `workspace-auto-back-and-forth` | asking for the workspace you are on goes back to the previous one |
+| `touch { enable; tap-to-click; scroll-speed N }` | |
 
-**Matchers:**
+niri's `touchpad`, `trackpoint`, `trackball`, `tablet`, `xkb`, `track-layout`, `mod-key-nested` and
+`disable-power-key-handling` are accepted with a warning: Windows has one pointer setup for all devices.
 
-| Property | Type | Description |
-|---|---|---|
-| `class` | string | Match window class name |
-| `title` | string | Match window title |
-| `instance` | string | Match window instance name |
-| `pid` | u32 | Match process ID |
+### `cursor {}`
 
-**Properties:**
+| Option | Meaning |
+|---|---|
+| `hide-when-typing` | set Windows' own per-user "hide pointer while typing" (`SPI_SETMOUSEVANISH`); only written when the option is there, the previous value is restored on quit or when a reload drops it |
+| `hide-after-inactive-ms N` | hide the pointer after `N` ms without pointer movement; any movement or click shows it again. One one-shot timer runs on the existing mouse hook and only while the pointer is visible. The user's cursors are restored on quit, on a reload that removes the option, from the panic hook and at startup |
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `float` | bool | `false` | Start window as floating |
-| `workspace` | string | — | Assign to specific workspace |
-| `opacity` | f64 | `1.0` | Window opacity (0.0–1.0) |
-| `blur` | bool | `false` | Enable background blur |
-| `sticky` | bool | `false` | Appear on all workspaces |
-| `scale` | f64 | — | Custom scale factor |
+`xcursor-theme` and `xcursor-size` are accepted with a warning: the cursor scheme belongs to Windows
+(Settings > Accessibility > Mouse pointer).
 
-### Config `binds {}` Block
+### `layout {}`
 
-Each line: `<Modifiers>+<Key> <Action> [args...]`
+| Option | Meaning |
+|---|---|
+| `gaps N` | niri's one number: between windows and around the screen. `gaps { inner N; outer N }` tells them apart (default 16 and 8) |
+| `struts { left N; right N; top N; bottom N }` | room kept free for a bar, in pixels (negative values count as 0) |
+| `border { width N; active-color "#rrggbb"; inactive-color; urgent-color; off; radius N }` | `width 0` or `off` turns it off; `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `accent` |
+| `focus-ring { width N; active-color; inactive-color; gap N; off }` | |
+| `shadow { on; softness N; spread N; offset x= y=; color }` | DWM draws the shadow |
+| `column-width N`, `column-width-mode "proportional"` or `"fixed"`, `max-visible-columns N`, `scroll-step N` | wiri's column sizing |
+| `dim-unfocused 0.92`, `strip-frame`, `snap-on-drag`, `snap-threshold-px N`, `smart-borders`, `status-bar` | |
+| `hide-method "hide"` or `"cloak"` | how the windows of other workspaces are hidden |
 
-**Modifiers:** `Ctrl`, `Alt`, `Shift`, `Win` (case-insensitive, any order)
+niri's `center-focused-column`, `preset-column-widths`, `default-column-width`, `tab-indicator`,
+`insert-hint`, gradients and the rest are accepted with a warning.  The older flat keys
+(`inner-gaps`, `border-width`, `border-color-focused`, `focus-ring-width`, `shadow-enable`, ...) and
+the nested `gaps { }`, `borders { }`, `shadows { }` blocks still work.
 
-**Syntax examples:**
+### `output "name" {}`
+
+`off`, `scale N`, `transform "90"`, `position x= y=` (or `x N` / `y N`), `mode "1920x1080@60"`,
+`variable-refresh-rate`, `focus-at-startup`, and a `layout { }` block that overrides the layout for
+that monitor.  The name is the Windows device name (`wiri-ctl list-monitors`).
+
+### `workspace "name" {}`
+
+Named workspaces exist from the start, in the order declared, even when empty.  `open-on-output "name"`
+and wiri's `monitor`, `layout`, `follow-on-focus` are read.
+
+### `binds {}`
+
 ```kdl
 binds {
-    Ctrl+Alt+Left focus-column-left
-    Ctrl+Alt+F toggle-fullscreen
-    Ctrl+Alt+Enter spawn "cmd.exe"
-    Ctrl+Alt+1 switch-workspace 1
+    Mod+T hotkey-overlay-title="Open a Terminal" { spawn "wt.exe"; }
+    Mod+Left { focus-column-left; }
+    Mod+1 { focus-workspace 1; }                  // an index
+    Mod+Shift+W { focus-workspace "web"; }        // a name (a quoted word)
+    Mod+R repeat=false cooldown-ms=300 { set-column-width "+10%"; }
+    /-Mod+X { quit; }                             // commented out
 }
 ```
 
-If a `binds {}` section exists, the defaults are **replaced entirely** (not merged).
+A bind is the key combination (`Mod`, `Ctrl`, `Shift`, `Alt`, `Super`/`Win`, then a key name:
+xkb names such as `Bracket_Left`, `Page_Up`, `Return`, `Grave`, or letters, digits, `F1`...`F24`) and
+exactly one action in braces.  Properties: `repeat=false` (holding the key fires the action once),
+`cooldown-ms=` (ignore the bind for that long after it fired), `hotkey-overlay-title=`
+(accepted; `null` hides it), `allow-when-locked=` and `allow-inhibiting=` (accepted: Windows never
+delivers hotkeys to a locked session, and wiri has no shortcut inhibition).  Action properties of
+niri (`focus=false`, `show-pointer=false`, `skip-confirmation=true`) are accepted.
 
-### Config `output {}` Blocks
+The older line form still works: `Ctrl+Alt+Left focus-column-left`, `Ctrl+Alt+1 switch-workspace 1`,
+`Mod+Shift+T spawn "wt.exe"`.  Like niri, a `binds {}` section replaces the built-in defaults: an omitted or empty block binds nothing.
+The wiri extension `extend-defaults` inside `binds {}` (the generated config has it) adds the built-in
+defaults: a bind in the config wins when it uses the same keys as a default, the other defaults stay.
+The same chord twice in one block is an error naming both lines; a bind in an included file overrides
+the same chord of the including file.
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `mode` | string | — | Display mode (e.g. `"1920x1080@60"`) |
-| `scale` | f64 | `1.0` | DPI scale factor |
-| `position` | i32 i32 | `0 0` | Monitor position (x y) |
-| `primary` | bool | `false` | Set as primary monitor |
+### `window-rule {}`
+
+```kdl
+window-rule {
+    match app-id=r#"^firefox"# title="^Picture-in-Picture$"   // one line: all properties must match
+    match app-id="^mpv"                                      // another line: either line may match
+    exclude title="Private"                                  // none of the exclude lines may match
+    open-floating true
+    open-on-workspace "chat"
+    opacity 0.9
+}
+```
+
+**Matching.**  A window matches a rule when it matches any `match` line (a rule without one matches
+every window) and none of the `exclude` lines; one line is the AND of its properties.  `app-id` is a
+regular expression searched in the program's file name (`firefox.exe`, and `firefox` without the
+extension) and, for Store apps and programs that name themselves, in the AppUserModelID
+(`Microsoft.WindowsTerminal_8wekyb3d8bbwe!App`); `title` is searched in the window title; `class-name` in
+the window class.  `is-active`, `is-focused`, `is-active-in-column`, `is-floating`, `is-urgent` and
+`at-startup` take `true` or `false` (`at-startup` is true for the windows that were already open when
+wiri started).  Regular expressions are Rust's, case sensitive like niri's (`(?i)` turns that off).
+When several rules match, a later rule wins for each property it sets.
+
+**What the properties do.**
+
+| Property | Effect |
+|---|---|
+| `open-on-output "\\.\DISPLAY1"` | the window opens on that monitor (`DISPLAY1` also works); a name no monitor has is ignored.  `wiri-ctl list-monitors` shows the names |
+| `open-on-workspace "chat"` | opens on the named workspace (`workspace "chat"` in the config; a name no workspace has is ignored).  When it is not the workspace you are on, the window is hidden there and your focus stays where it is |
+| `open-in-workspace 2` | wiri's variant: the workspace at that position from the top (the last one for a number past the end).  The older `workspace "2"` / `workspace "web"` key means the same, a number or a name |
+| `open-floating true` / `false` | opens floating, centred; `false` takes back a `float true` of an earlier rule |
+| `open-fullscreen true` | opens fullscreen |
+| `open-maximized true` | the column opens as wide as the view |
+| `open-maximized-to-edges true` | opens maximized to the edges of the work area, keeping its column (see "Fullscreen and maximize") |
+| `open-focused false` | the window that has the focus keeps it: when Windows hands the new window the focus, wiri gives it back (within 2.5 s of the window opening) |
+| `default-column-width { proportion 0.5; }` or `{ fixed 800; }` or `{}` | the width of the new column; a fixed size is the window's, the border comes on top; `{}` keeps the width the window opened with.  A floating window opens at that width |
+| `default-window-height { fixed 400; }` | the height of the tile in a column of several windows (a column of one always fills the view); a floating window opens at that height |
+| `min-width`, `max-width`, `min-height`, `max-height` | limits in pixels of the window; the column / tile is held to them, the minimum winning when they clash |
+| `opacity 0.8` | the window is drawn with that alpha (together with `dim-unfocused`) |
+| wiri's `float`, `blur`, `sticky`, `default-width`, `default-height` | as before (`default-width 800` is the width of the column in pixels) |
+
+The `open-*` and `default-*` properties apply once, when the window opens.  `opacity` and the size
+limits follow the window: they are worked out again when its **title** changes, when the **focus**
+moves (`is-focused`, `is-active`), when the window **floats** or tiles again (`is-floating`), when it
+starts or stops flashing in the taskbar (`is-urgent`), and when the config is reloaded.  Only the
+windows concerned are looked at, and only when some rule depends on that kind of state.
+
+The older forms work too: `class-name "x"` directly in the rule and
+`match { class-name "x"; process-name-regex "..."; is-active }` blocks.
+
+### `animations {}`
+
+`off` / `on`, `duration N`, `easing "ease-out-cubic"`; niri's per-animation blocks and `slowdown` are
+accepted with a warning.
+
+### `overview {}`
+
+```kdl
+overview {
+    zoom 0.5                      // 0 to 1; lower values make the workspaces smaller
+    backdrop-color "#262626"      // behind the workspaces
+    workspace-shadow {            // off; or softness / spread / offset / color
+        softness 40
+        spread 10
+        offset x=0 y=10
+        color "#00000050"
+    }
+}
+```
+
+The overview is a camera over the real workspaces, drawn by a session-local window of live DWM
+previews; applications keep their size. The opening and closing spring is `animations {
+overview-open-close { ... } }` (it follows `off` and `slowdown`). The host is opaque (previews of
+other applications need that), so an alpha in `backdrop-color` or the shadow colour blends with
+black, not with your wallpaper. In the overview: click a window to focus it, drag it onto a
+workspace or into the gap above, between or below workspaces, use the wheel to change workspace,
+drag with the right button to scroll the view; with a touchscreen the primary finger pans and
+resting on a window picks it up. All normal binds keep working.
+
+### `gestures {}`
+
+`hot-corners { top-left; top-right; bottom-left; bottom-right; off }` opens the overview when the
+pointer rests in a screen corner for about 120 ms (once per visit). With no name the top-left
+corner is on; naming a corner replaces that default; `off` switches them all off. An `output`
+block may carry its own `hot-corners {}`, which replaces the global one for that monitor.
+`dnd-edge-view-scroll` and `dnd-edge-workspace-switch` configure the drag-and-drop edge actions; an
+empty `gestures {}` or either of those blocks turns the drag-capture approximation on, a block
+holding only `hot-corners` does not.
+
+With `input { touchpad { } }` (a Precision Touchpad; set Windows' own three- and four-finger
+Swipes to Nothing first) three fingers move the view or switch workspace and a four-finger swipe up
+or down opens or closes the overview.
+
+### Programs to start
+
+`spawn-at-startup "prog" "arg" ...` (every argument its own string) and `spawn-sh-at-startup "command"`.
 
 ---
 
@@ -393,10 +441,18 @@ All default bindings use the `Ctrl+Alt` prefix:
 | T | `toggle-floating` | Toggle focused window floating |
 | H | `scroll-left` | Scroll workspace left |
 | L | `scroll-right` | Scroll workspace right |
-| Tab | `overview` | Toggle overview (zoom out) mode |
+| Space | `overview` | Toggle overview (zoom out) mode |
+| ` (Grave) | `focus-previous` | Focus the window you were on before (niri's `Mod+Tab`; with the Ctrl+Alt prefix that chord is Windows' task switcher) |
 | O | `overview-select` | Select window and exit overview |
 | Shift+Q | `quit` | Exit wiri |
 | 1–9 | `switch-workspace 1`–`9` | Switch to workspace |
+| , / . | `consume-window-into-column` / `expel-window-from-column` | niri: the first window of the column on the right moves under the focused window / the bottom window of the focused column gets a column of its own on the right |
+| Shift+[ / Shift+] | `consume-or-expel-window-left` / `consume-or-expel-window-right` | niri: a window alone in its column joins the column on that side (at the bottom); one of several leaves its column on that side |
+| K / J | `move-window-up` / `move-window-down` | niri: swap the window with the one above / below in its column |
+| Home / End | `focus-column-first` / `focus-column-last` | Focus the first / last column |
+| Shift+Home / Shift+End | `move-column-to-first` / `move-column-to-last` | Move the focused column to the start / end of the strip |
+| Shift+F | `maximize-column` | niri: the column is as wide as the view (toggle, also for a column of one window) |
+| M | `maximize-window-to-edges` | niri: the window fills the work area, no gap, no border, and keeps its column (toggle) |
 
 ### Mouse Bindings
 
@@ -413,10 +469,15 @@ All default bindings use the `Ctrl+Alt` prefix:
 | **Digits** | `0`–`9` |
 | **Arrows** | `Left`, `Right`, `Up`, `Down` |
 | **Arrow aliases** | `Arrow-Left`, `Arrow-Right`, `Arrow-Up`, `Arrow-Down` |
-| **Special** | `Enter`, `Return`, `Space`, `Tab`, `Escape`, `Esc`, `Backspace`, `Delete`, `Del`, `Home`, `End`, `Page-Up`, `Prior`, `Page-Down`, `Next`, `Insert`, `Ins` |
+| **Special** | `Enter`, `Return`, `Space`, `Tab`, `Escape`, `Esc`, `Backspace`, `Delete`, `Del`, `Home`, `End`, `Page-Up` (also `Page_Up`, `PageUp`), `Prior`, `Page-Down` (also `Page_Down`, `PageDown`), `Next`, `Insert`, `Ins` |
 | **Lock** | `Caps-Lock`, `Num-Lock`, `Scroll-Lock` |
-| **Function** | `F1`–`F12` |
+| **Function** | `F1`–`F24` |
 | **Other** | `Print`, `Print-Screen`, `Pause` |
+| **Punctuation** | `Comma`, `Period`, `Minus`, `Equal`, `Semicolon`, `Slash`, `Backslash`, `Bracket_Left`, `Bracket_Right`, `Apostrophe`, `Grave` (xkb names), or the character itself: `,` `.` `-` `=` `;` `/` `\` `[` `]` `'` |
+| **Keypad** | `KP_0`–`KP_9`, `KP_Add`, `KP_Subtract`, `KP_Multiply`, `KP_Divide`, `KP_Decimal`, `KP_Enter` |
+
+Names are matched case-insensitively and `_`, `-` and spaces are ignored, so `Bracket_Left`,
+`bracketleft` and `bracket-left` are the same key.
 
 ### Supported Action Names
 
@@ -424,34 +485,135 @@ All default bindings use the `Ctrl+Alt` prefix:
 |---|---|---|---|
 | `focus-column-left` | `focus-left` | — | Focus column left |
 | `focus-column-right` | `focus-right` | — | Focus column right |
-| `focus-up` | — | — | Focus tile above |
-| `focus-down` | — | — | Focus tile below |
+| `focus-up` | `focus-window-up` | — | Focus tile above |
+| `focus-down` | `focus-window-down` | — | Focus tile below |
+| `focus-column-first` | — | — | Focus the first column |
+| `focus-column-last` | — | — | Focus the last column |
 | `move-column-left` | `move-left` | — | Move column left |
 | `move-column-right` | `move-right` | — | Move column right |
+| `move-column-to-first` | — | — | Move the column to the start of the strip |
+| `move-column-to-last` | — | — | Move the column to the end of the strip |
+| `move-window-up` | — | — | Swap the window with the one above it in its column (a floating window moves by 50 px) |
+| `move-window-down` | — | — | Swap the window with the one below it in its column |
+| `consume-window-into-column` | `consume-window`, `consume-into-column` | — | The first window of the column on the right moves to the bottom of the focused column |
+| `expel-window-from-column` | `expel-window`, `expel-from-column` | — | The bottom window of the focused column becomes a column of its own on its right |
+| `consume-or-expel-window-left` | — | — | A window alone in its column joins the column on its left; one of several leaves its column to the left |
+| `consume-or-expel-window-right` | — | — | The same to the right |
+| `maximize-column` | `column-maximize`, `toggle-column-maximize` | — | Toggle: the column is as wide as the view (also for a column of one window); toggling again restores its width |
+| `set-column-width` | `set-window-width` | `"50%"`, `"+10%"`, `"-10%"`, `"1200"`, `"+100"` | niri's size argument (below); wiri's `"1/3"`, `"2/3"`, `"full"` and `"cycle"` work too. A floating window is resized |
+| `set-window-height` | — | the same | The window's height in its column (the others keep their proportions); a floating window is resized. A column of one window always fills the view |
+| `reset-window-height` | — | — | The window gets an equal share of its column again |
+| `switch-preset-column-width` | `column-width-preset`, `column-width-cycle` | — | niri: the column takes the next width of a third, a half, two thirds of the view (the first one wider than it is; it goes on from there when it was switched last) |
+| `switch-preset-column-width-back` | — | — | The same backwards |
+| `expand-column-to-available-width` | `expand-column-to-available`, `expand-column` | — | niri: the column takes the room that the other columns fully in view leave |
+| `maximize-window-to-edges` | — | — | niri 25.11: the window fills the work area of its monitor (no gap, no border) and keeps its place in its column; toggles (see "Fullscreen and maximize") |
 | `close-window` | `close` | — | Close focused window |
-| `toggle-fullscreen` | `fullscreen` | — | Toggle fullscreen |
-| `toggle-floating` | `float` | — | Toggle floating |
+| `toggle-fullscreen` | `fullscreen`, `fullscreen-window` | — | Toggle fullscreen: the window covers the monitor and the taskbar goes; it keeps its column (see "Fullscreen and maximize") |
+| `toggle-floating` | `float`, `toggle-window-floating` | — | Toggle floating |
+| `move-window-to-floating` | — | — | Float the window (nothing happens when it floats already) |
+| `move-window-to-tiling` | — | — | Put a floating window back into a column (nothing happens when it is tiled) |
 | `scroll-left` | — | — | Scroll workspace left |
 | `scroll-right` | — | — | Scroll workspace right |
 | `quit` | `exit` | — | Exit wiri |
-| `switch-workspace` | `workspace` | `n` | Focus workspace `n` (1–9) |
+| `switch-workspace` | `workspace` | `n` | Focus the `n`-th workspace from the top of the monitor (`Ctrl+Alt+1`–`9`); a number past the last workspace is the last one |
+| `focus-workspace-down` | `focus-workspace-next`, `workspace-next` | — | The workspace below (no wrapping) |
+| `focus-workspace-up` | `focus-workspace-prev`, `workspace-prev` | — | The workspace above (no wrapping) |
+| `focus-workspace-previous` | `focus-workspace-back` | — | niri: the workspace you were on before this one |
+| `focus-workspace` | — | `N` or `"name"` | niri: a number is the index of the workspace on the monitor, a quoted string is the name of a workspace (`focus-workspace 2` is the second workspace, `focus-workspace "2"` the one named 2) |
 | `move-workspace` | — | `n` | Move window to workspace `n` |
 | `spawn` | `exec` | `"cmd"` | Launch a program |
-| `maximize` | — | — | Maximize window |
+| `maximize` | — | — | wiri's older name: maximize the window to the edges (it is `maximize-window-to-edges` that only sets, not toggles) |
 | `minimize` | — | — | Minimize window |
 | `center-window` | — | — | Center window |
 | `switch-monitor` | — | — | Focus next monitor |
+| `focus-monitor-left` | — | — | niri: focus the monitor on the left (nothing at the edge) |
+| `focus-monitor-right` | — | — | niri: focus the monitor on the right |
+| `move-to-monitor-left` | `move-window-to-monitor-left` | — | Move the window to the monitor on the left |
+| `move-to-monitor-right` | `move-window-to-monitor-right` | — | Move the window to the monitor on the right |
+| `move-column-to-monitor-left` | — | — | Move the column to the monitor on the left |
+| `move-column-to-monitor-right` | — | — | Move the column to the monitor on the right |
 | `refresh` | — | — | Re-apply layout |
-| `overview` | `overview-toggle`, `zoom-out` | — | Enter/exit overview |
+| `column-toggle-tabbed` | `toggle-column-tabbed-display` | — | Switch the focused column between normal and tabbed display |
+| `set-column-display` | — | `"normal"` or `"tabbed"` | niri: set the focused column's display; choosing the current mode does nothing (the selected tab and the focus stay). `wiri-ctl set-column-display tabbed` and the typed `{"Action":{"SetColumnDisplay":{"display":"Tabbed"}}}` do the same |
+| `overview` | `overview-toggle`, `zoom-out`, `toggle-overview` | — | Enter/exit overview |
+| `open-overview` | — | — | Enter overview (nothing happens when it is open) |
+| `overview-exit` | `exit-overview`, `close-overview` | — | Leave overview (nothing happens when it is closed or already closing) |
 | `overview-left` | — | — | Navigate left in overview |
 | `overview-right` | — | — | Navigate right in overview |
 | `overview-select` | `overview-accept` | — | Select window, exit overview |
 
 ---
 
+### Fullscreen and maximize
+
+A fullscreen or maximized window stays a participant of the strip, like in niri:
+
+* **Its column stays.**  The window keeps its column and its place in it; the column is made as wide
+  as the view while the window is fullscreen or maximized (the state `maximize-column` toggles) and gets
+  its old width back afterwards.  A column that was maximized with `maximize-column` before stays
+  maximized.
+* **It is drawn over the monitor or the work area** instead of its tile: `fullscreen-window` covers the
+  whole monitor (the frame is taken away, the window is placed exactly, the shell is told with
+  `ITaskbarList2::MarkFullscreenWindow` so the taskbar goes while it is the foreground window and comes
+  back afterwards); `maximize-window-to-edges` fills the work area (the taskbar stays) with no gap and no
+  border.  The window is drawn where its slot is: focusing another column scrolls the strip by the least
+  that shows it (as in niri), the fullscreen window moves with its slot (it stays as wide as the monitor,
+  beside the neighbour, and goes off screen as the strip scrolls on) and covers the monitor again when it is
+  focused again.
+* **Nothing else is hidden.**  The other windows are not hidden, they stay in the taskbar and in
+  Alt+Tab; they are out of the way (a view away, parked like every column that is out of view).
+* Fullscreen wins over maximized; leaving fullscreen goes back to maximized when the window was.  A
+  floating window can be fullscreen (it covers the monitor and gets its rectangle back) but not maximized;
+  floating a fullscreen or maximized tile ends both.  A minimized window comes back as it was.
+* **Applications are followed, not fought.**  A window that covers its monitor on its own (a video player,
+  F11 in a browser, a game that goes borderless) is fullscreen for wiri too: its frame is not touched, the
+  taskbar goes, and when it shrinks again wiri tiles it.  When the maximize button of a title bar is pressed
+  (or the caption double-clicked), wiri takes the native maximized state away at once and keeps the window
+  maximized to the edges instead; the button again gives the window its tile back.  A window that opens
+  already maximized or as big as its monitor is treated the same.
+* The window rules `open-fullscreen`, `open-maximized` (the column as wide as the view) and
+  `open-maximized-to-edges` do the same when a window opens.  `wiri-ctl window-list` reports
+  `fullscreen` and `maximized` for every window.
+
+### Workspaces
+
+Workspaces are addressed by position, like in niri: `focus-workspace 2` is the second workspace from
+the top of the focused monitor, whichever workspace that is.  There is always one empty workspace at
+the bottom; an empty workspace in the middle goes away when you leave it.  A number past the last
+workspace is the last one.  `workspace "name"` in the config (with or without a block) declares a
+named workspace: it exists from the start, in the order declared, and stays when it is empty.
+`focus-workspace "name"` goes to it.  `input { workspace-auto-back-and-forth }` makes
+`focus-workspace` for the workspace you are on go back to the previous one.
+
+### niri's size argument
+
+`set-column-width` and `set-window-height` take niri's size argument:
+
+| Argument | Meaning |
+|---|---|
+| `"50%"` | that proportion of the view: two `"50%"` columns and the gap between them fill the view exactly, three `"33.333%"` columns too |
+| `"+10%"` / `"-10%"` | that much more or less (a proportion of the view) than now |
+| `"1200"` | the window gets 1200 px (the border around it comes on top) |
+| `"+100"` / `"-100"` | 100 px more or less than now |
+
+A column that is maximized loses that state when it gets a width of its own.  `wiri-ctl
+set-column-width 50%` and `wiri-ctl action set-window-height 70%` take the same words.
+
+### Porting a niri `binds {}` block
+
+A niri `binds {}` block loads as written: `Mod+T { spawn "alacritty"; }`, with niri's properties
+(`repeat=false`, `cooldown-ms=`, `hotkey-overlay-title=`, `allow-when-locked=`).  `Mod` is the
+`input { mod-key }` modifier (Ctrl+Alt unless set), `focus-workspace 2` is an index and
+`focus-workspace "2"` a name, and the size argument is niri's.  What wiri cannot do is reported when the
+config is loaded, with its line (`wiri-ctl validate-config` lists it): a niri action wiri lacks, a mouse
+or wheel trigger, an AltGr modifier and a media key are warnings and only that bind is dropped; a
+misspelled action or key is an error.  wiri's older line form (`Mod+Shift+T spawn "wt.exe"`) still works.
+
+---
+
 ## 6. IPC Protocol
 
-wiri exposes a **named pipe** at `\\.\pipe\wiri_control` for external control via the `wiri-ctl` CLI tool.
+wiri exposes a **named pipe** at `\\.\pipe\wiri_control_<user>_<session>` for external control via the `wiri-ctl` CLI tool.  The name carries the user and the session the daemon runs in, so that a second user logged in on the same machine does not collide with the first one; `WIRI_PIPE` overrides it.
 
 ### Connection
 
@@ -503,10 +665,31 @@ All messages use a `type`+`data` discriminated union format:
 {"type":"close_window","data":{"window_hwnd":123456}}
 ```
 
+**Run any action (niri's `Request::Action`):**
+```json
+{"type":"run_action","data":{"name":"set-column-width","args":["+10%"]}}
+{"type":"action","data":{"action":"focus-workspace","args":[2]}}
+{"type":"run_action","data":{"name":"fullscreen-window","args":["--id",123456]}}
+```
+The name is a niri action name and the arguments are the words after it in a `binds {}` line (numbers and
+booleans stand for their text; `"quoted":[true]` marks a workspace name written in quotes: `focus-workspace "2"`
+is the workspace named "2", `focus-workspace 2` the second one).  `--id <hwnd>` names the window to act on
+(`close-window --id` closes it and leaves the focus alone; any other action focuses the window first).
+
 **Subscribe to events:**
 ```json
-{"type":"subscribe_events","data":{"event_types":["window_created","window_destroyed"]}}
+{"type":"subscribe_events","data":{"event_types":["window_focus_changed","workspace_activated"]}}
 ```
+
+The stream is niri's: **the state first, then what changes.**  Right after the ack a subscriber gets
+`workspaces_changed`, `windows_changed`, `overview_opened_or_closed` and `config_loaded` (the whole state: every
+workspace and window with niri's fields, which window has the focus, how the config loaded), then
+`window_opened_or_changed`, `window_closed`, `window_focus_changed`, `window_urgency_changed`,
+`window_layouts_changed`, `workspace_activated`, `workspace_active_window_changed`, `workspace_urgency_changed`,
+`workspaces_changed` and `overview_opened_or_closed` as things change.  A client that keeps a model from them
+never has to ask or to poll.  wiri's older events (`window_opened`, `window_focused`, `workspace_switched`,
+`column_focused`, ...) are still sent.  Everything is in [IPC_PROTOCOL.md](IPC_PROTOCOL.md) (§6.2) and
+[IPC_SCHEMA.json](IPC_SCHEMA.json).
 
 ### Using wiri-ctl
 
@@ -517,6 +700,18 @@ wiri-ctl list                 # List all windows
 wiri-ctl focus 123456         # Focus a window
 wiri-ctl close 123456         # Close a window
 wiri-ctl state                # Dump engine state
+wiri-ctl windows              # The managed windows, in niri's shape
+wiri-ctl window-list          # The managed windows, in wiri's older shape
+wiri-ctl workspaces           # The workspaces, in niri's shape
+wiri-ctl focused-window       # The window that has the keyboard focus
+wiri-ctl overview-state       # Whether the overview is open
+wiri-ctl version              # The version of the daemon
+wiri-ctl action focus-column-left
+wiri-ctl action set-column-width +10%
+wiri-ctl action fullscreen-window --id 123456
+wiri-ctl action focus-workspace '"2"'   # the workspace named 2 (words in literal double quotes are names)
+wiri-ctl events --stream                # the state, then every change, one JSON object per line
+wiri-ctl events --stream --filter window_focus_changed,workspace_activated
 ```
 
 ---
@@ -968,34 +1163,39 @@ KDL configuration system with file watching.
 
 **Utility:** `parse_color(color_str)` → `Option<[u8; 4]>` RGBA — parses `#RRGGBB` and `#RRGGBBAA`.
 
-#### `parse.rs` — KDL Parser
+#### `kdl.rs` — KDL reader
 
-Parses KDL config text into `Config` struct.
+A dependency-free KDL reader (nodes, arguments, properties, children, `/-`, comments, raw strings,
+escapes, numbers, a BOM) that returns `Document { nodes }` with the `line:column` of every node,
+argument and property, or the first `SyntaxError`.  It reads niri's KDL v1 and the v2 spellings where
+they agree, plus wiri's older bare words and `key=value` lines.  Why not the `kdl` crate: niri's syntax
+is v1 while the crate reads v2 (and pulls `miette` and `winnow`), and Phase 4 counts binary weight.
 
-**Supported syntax:**
-- `key "value"` — Quoted string value
-- `key=value` — Equals syntax
-- `section { ... }` — Nested sections
-- `// comment` — Line comments
-- `key "value" // inline comment` — Inline comments (parsed correctly inside strings)
+#### `decode.rs` — document → `Config`
 
-**Section handling:**
-- `input { }` → `InputConfig`
-- `layout { }` → `LayoutConfig` (also handles sub-sections `gaps { }`, `borders { }`, `focus-ring { }`, `shadows { }`)
-- `animations { }` → `AnimationsConfig`
-- `binds { }` → Each line parsed as `HotkeyBinding`
-- `window-rules { }` → Each rule block parsed as `WindowRule`
-- `output "NAME" { }` → `OutputConfig`
+`decode_text(text, file, base_dir)` / `decode_file(path)` map the nodes onto `Config` and return
+`Decoded { config, issues, includes }`.  Every issue is a `ValidationIssue { severity, file, line,
+column, message }`: an *error* means the file is rejected, a *warning* means part of it is ignored.
+It knows niri's sections and keys (so an unsupported one is a warning and a typo is an error with a
+"did you mean"), wiri's older spellings, the `include` resolution (relative to the including file,
+cycle and depth checks, the include list for the watcher) and the bind grammar.
+
+#### `parse.rs` — entry points
+
+`parse_kdl_config(text)`, `validate_kdl_config(text)` and `validate_config_file(path)` — the names the
+rest of the code and `wiri-ctl validate-config` use, all over `decode.rs`.
 
 #### `loader.rs` — Config Loader
 
 File-based config loading with hot-reload:
-- `ConfigLoader::new(path)` — Load on construction, start watcher
-- `load()` / `reload()` — Read and parse config file
-- `get_config()` — Return current config (thread-safe via `Arc<RwLock<>>`)
-- `start_watching()` — Use `notify` crate to watch config file for changes
-- **Debounce**: 300ms debounce between reloads
-- **Error handling**: Falls back to `Config::default()` on parse errors
+- `Config::load(path)` — read and decode; the first error as `file:line:column: error: message`
+- `load_logged` / `load_quiet(path)` — the decoded config with all its issues (logged or not)
+- `ConfigLoader::new(path)` — the config as it is now (the defaults when it has errors)
+- `start_watching()` — `notify` watches the directory of the config and of every included file;
+  a trailing-edge debounce (`RELOAD_QUIET_MS` = 200 ms of quiet) reads the file once after the
+  last change, retries once when it has errors, then publishes a `ReloadOutcome` on `subscribe()`:
+  `Applied { config, warnings }` or `Failed { issues, summary }`
+- **Error handling**: a failed reload never touches the config in use
 
 ### 7.6 IPC (`src/ipc/`)
 
@@ -1023,7 +1223,8 @@ pub enum IpcMessage {
 
 **`IpcError`** — Typed error enum: `ConnectionFailed`, `ReadError`, `WriteError`, `SerializationError`, `PipeCreationFailed`, `ClientDisconnected`, `Timeout`, `InvalidMessage`, `WindowsError`.
 
-**Pipe path:** `\\.\pipe\wiri_control`
+**Pipe path:** `\\.\pipe\wiri_control_<user>_<session>` — the pipe of the user and the session
+the daemon runs in (`wiri::ipc::pipe_path()`; `WIRI_PIPE` overrides the name).
 
 ### 7.7 Hooks (`src/hooks/`)
 
@@ -1193,17 +1394,20 @@ WH_MOUSE_LL hook → MSLLHOOKSTRUCT
 ### Config Reload
 
 ```
-notify file watcher detects change
-  → ConfigLoader::reload()
-    → read file → parse KDL → new Config
-    → store in Arc<RwLock<Config>>
-    → send via reload_tx channel
-  → main loop receives new config
-    → engine.write().set_full_config()
-    → message_loop.reload_hotkeys()
+notify file watcher: a change to the config or to a file it includes
+  → the reload thread waits until the files have been quiet for 200 ms (trailing edge)
+    → read file(s) → decode → Decoded { config, issues, includes }
+    → errors: look once more after another quiet period, then
+        send ReloadOutcome::Failed { issues, summary } — the last good config stays
+    → no errors: store in Arc<RwLock<Config>>, send ReloadOutcome::Applied { config, warnings }
+  → main loop (ReloadCtx) receives the outcome
+    → Applied: engine.write().set_full_config(); message_loop.reload_hotkeys();
+        broadcast IpcEvent::ConfigLoaded { failed: false }
       → PostThreadMessage(WM_RELOAD_HOTKEYS)
         → message loop: UnregisterHotKey all → read config binds → RegisterHotKey all
-    → apply_layout_for_monitor()
+      → apply_layout_for_monitor()
+    → Failed: log every issue, tray balloon "file:line:column: error: message",
+        broadcast IpcEvent::ConfigLoaded { failed: true, error }
 ```
 
 ---
@@ -1401,8 +1605,8 @@ RUST_LOG=wiri=debug wiri
 RUST_LOG=wiri::layout=trace wiri
 RUST_LOG=wiri::input=debug wiri
 
-# Check log file
-cat wiri_log.txt
+# Check log file (PowerShell)
+Get-Content $env:LOCALAPPDATA\wiri\wiri.log -Tail 50
 ```
 
 Common debugging areas:

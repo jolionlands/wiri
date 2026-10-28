@@ -1,23 +1,27 @@
 use anyhow::Result;
-use std::sync::Arc;
-use tracing::{error, info, warn};
-use windows::Win32::Foundation::{HWND, WPARAM, LPARAM, LRESULT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, TranslateMessage,
-    WM_DESTROY, WM_USER, WM_DISPLAYCHANGE, WNDCLASSW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASS_STYLES,
-    ShowWindow, SetWindowPos, GetForegroundWindow, SW_MAXIMIZE, SW_MINIMIZE,
-    HWND_TOP, SWP_NOZORDER, SWP_NOACTIVATE,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+    GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, ShowWindow, TranslateMessage,
+    SW_MINIMIZE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_DISPLAYCHANGE, WM_USER, WNDCLASSW,
+    WNDCLASS_STYLES,
+};
 
 use super::BackendHandle;
-use crate::input::Action;
-use crate::layout::{TilingEngine, ScrollDirection};
+#[cfg(test)]
+use crate::input::keyboard::bind_may_fire;
+use crate::input::keyboard::{self, BindOptions};
+use crate::input::{Action, SizeChange};
+use crate::layout::{FocusLayer, ScrollDirection, TilingEngine};
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
 /// Custom message sent to the hotkey thread to trigger re-registration
@@ -44,49 +48,62 @@ const MOD_WIN: u32 = 0x0008;
 // `TilingEngine::is_over_gap` is implemented in `src/layout/engine.rs`.
 
 /// Resolve a `mod-key` config string to a (prefix, prefix+shift) pair of Win32 modifier flags.
+/// A value wiri does not know falls back to Ctrl+Alt (config loading already warned about it).
 fn resolve_mod_prefix(name: &str) -> (u32, u32) {
-    let prefix = match name.trim().to_lowercase().as_str() {
-        "alt" => MOD_ALT,
-        "ctrl" | "control" => MOD_CTRL,
-        "super" | "win" | "meta" => MOD_WIN,
-        "win-alt" | "super-alt" | "meta-alt" => MOD_WIN | MOD_ALT,
-        "ctrl-shift" => MOD_CTRL | MOD_SHIFT,
-        _ => MOD_CTRL | MOD_ALT, // "ctrl-alt" or anything unrecognized
-    };
+    let prefix = crate::input::mod_key_flags(name).unwrap_or(crate::input::DEFAULT_MOD_KEY);
     (prefix, prefix | MOD_SHIFT)
 }
 
+/// Turn one config bind into a `(modifiers, vk, action)` hotkey row, or say why
+/// it cannot become one.  `mod_key` is what `Mod` stands for.  A bind with a
+/// modifier wiri does not understand is refused, never registered as the bare
+/// key (which would steal that key from every application).
+fn bind_to_hotkey(
+    bind: &crate::config::HotkeyBinding,
+    mod_key: u32,
+) -> Result<(u32, u32, Action), String> {
+    let mods = bind
+        .resolve_modifiers(mod_key)
+        .map_err(|e| format!("{}: {}", bind.chord_text(), e))?;
+    let vk = bind
+        .vk_code()
+        .ok_or_else(|| format!("{}: unknown key '{}'", bind.chord_text(), bind.key))?;
+    let action = bind.parse_action().ok_or_else(|| {
+        format!(
+            "{}: unknown action or bad arguments '{} {}'",
+            bind.chord_text(),
+            bind.command,
+            bind.args.join(" ")
+        )
+    })?;
+    Ok((mods, vk, action))
+}
+
 /// Default hotkey bindings using the configured modifier prefix. The Mod+Enter
-/// terminal-spawn binding is parameterised by `terminal_cmd` so callers can
-/// pick up the user's preferred shell instead of always launching cmd.exe.
-fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u32, u32, Action)> {
+/// terminal-spawn binding is parameterised by `terminal` (see
+/// [`resolve_terminal_action`]) so callers pick up the user's preferred terminal
+/// instead of always launching the same one.
+fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal: Action) -> Vec<(u32, u32, Action)> {
     vec![
-        (prefix, 0x25, Action::FocusColumnLeft),       // Left
-        (prefix, 0x27, Action::FocusColumnRight),      // Right
-        (prefix, 0x26, Action::FocusUp),               // Up
-        (prefix, 0x28, Action::FocusDown),             // Down
+        (prefix, 0x25, Action::FocusColumnLeft),  // Left
+        (prefix, 0x27, Action::FocusColumnRight), // Right
+        (prefix, 0x26, Action::FocusUp),          // Up
+        (prefix, 0x28, Action::FocusDown),        // Down
         (shift_prefix, 0x25, Action::MoveColumnLeft),
         (shift_prefix, 0x27, Action::MoveColumnRight),
-        (prefix, 0x51, Action::CloseWindow),           // Q
-        (prefix, 0x0D, Action::Spawn(terminal_cmd.to_string())), // Enter
-        (prefix, 0x46, Action::ToggleFullscreen),      // F
-        (prefix, 0x54, Action::ToggleFloating),        // T
-        (prefix, 0x48, Action::ScrollLeft),            // H
-        (prefix, 0x4C, Action::ScrollRight),           // L
-        (shift_prefix, 0x51, Action::Quit),            // Shift+Q
-        (prefix, 0x20, Action::OverviewToggle),        // Space
-        // Bare Escape → OverviewToggle.  Conceptually wrong on its own
-        // (we don't want Escape to enter overview), so the WM_HOTKEY
-        // dispatcher in `run_message_loop` state-gates this binding: the
-        // action only fires when overview is already active.  Registered
-        // unconditionally so the OS knows the chord belongs to wiri while
-        // overview is on.
-        (0, 0x1B, Action::OverviewToggle),             // Escape (gated)
-        (prefix, 0x4F, Action::OverviewSelect),        // O
-        (prefix, 0xDC, Action::ColumnToggleTabbed),    // \
-        (prefix, 0xDD, Action::TabNext),               // ]
-        (prefix, 0xDB, Action::TabPrev),               // [
-        (prefix, 0x31, Action::FocusWorkspace(1)),     // 1
+        (prefix, 0x51, Action::CloseWindow),        // Q
+        (prefix, 0x0D, terminal),                   // Enter
+        (prefix, 0x46, Action::ToggleFullscreen),   // F
+        (prefix, 0x54, Action::ToggleFloating),     // T
+        (prefix, 0x48, Action::ScrollLeft),         // H
+        (prefix, 0x4C, Action::ScrollRight),        // L
+        (shift_prefix, 0x51, Action::Quit),         // Shift+Q
+        (prefix, 0x20, Action::OverviewToggle),     // Space
+        (prefix, 0x4F, Action::OverviewSelect),     // O
+        (prefix, 0xDC, Action::ColumnToggleTabbed), // \
+        (prefix, 0xDD, Action::TabNext),            // ]
+        (prefix, 0xDB, Action::TabPrev),            // [
+        (prefix, 0x31, Action::FocusWorkspace(1)),  // 1
         (prefix, 0x32, Action::FocusWorkspace(2)),
         (prefix, 0x33, Action::FocusWorkspace(3)),
         (prefix, 0x34, Action::FocusWorkspace(4)),
@@ -105,50 +122,52 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (shift_prefix, 0x37, Action::MoveToWorkspace(7)),
         (shift_prefix, 0x38, Action::MoveToWorkspace(8)),
         (shift_prefix, 0x39, Action::MoveToWorkspace(9)),
-        (prefix, 0x21, Action::FocusWorkspacePrevious),   // PageUp
-        (prefix, 0x22, Action::FocusWorkspaceNext),       // PageDown
-        (prefix, 0x52, Action::EnterResizeMode),          // R — niri-style interactive resize
-        (shift_prefix, 0x52, Action::CenterColumn),       // Shift+R — center-on-screen
-        (prefix, 0x57, Action::ColumnWidthPresetCycle),   // W
-        (prefix, 0xBD, Action::ResizeColumnLeft),         // VK_OEM_MINUS
-        (prefix, 0xBB, Action::ResizeColumnRight),        // VK_OEM_PLUS
+        (prefix, 0x21, Action::FocusWorkspacePrevious), // PageUp
+        (prefix, 0x22, Action::FocusWorkspaceNext),     // PageDown
+        (prefix, 0x52, Action::EnterResizeMode),        // R — niri-style interactive resize
+        (shift_prefix, 0x52, Action::CenterColumn),     // Shift+R — center-on-screen
+        (prefix, 0x57, Action::ColumnWidthPresetCycle), // W
+        (prefix, 0xBD, Action::ResizeColumnLeft),       // VK_OEM_MINUS
+        (prefix, 0xBB, Action::ResizeColumnRight),      // VK_OEM_PLUS
         // NOTE: Shift+H / Shift+L are repurposed below to Shrink/GrowColumnWidth
         // for niri parity. MoveToMonitorLeft/Right remain available via the
         // KDL `binds {}` block (e.g. Ctrl+Alt+Comma+Shift) or wiri-ctl.
         // ((shift_prefix, 0x48, Action::MoveToMonitorLeft) replaced)
         // ((shift_prefix, 0x4C, Action::MoveToMonitorRight) replaced)
-        // Niri-parity round-2: FocusPrevious (alt-tab MRU) and ToggleAlwaysOnTop
-        // NOTE: if prefix is Ctrl+Alt, prefix+Tab conflicts with the Windows system
-        // Ctrl+Alt+Tab switcher. RegisterHotKey will fail; that's OK — the warning
-        // will be logged and the action remains available via custom KDL binds.
-        (prefix, 0x09, Action::FocusPrevious),            // Tab
-        (prefix, 0x50, Action::Screenshot),               // P (capture desktop to file)
-        (prefix, 0x41, Action::ToggleAlwaysOnTop),        // A (always-on-top)
+        // Niri-parity round-2: FocusPrevious (alt-tab MRU) and ToggleAlwaysOnTop.
+        // niri's own chord is Mod+Tab, but with the default Ctrl+Alt prefix that is
+        // Windows' task switcher: RegisterHotKey refuses it ("already registered") and
+        // used to log a warning at every start.  The key above Tab stands in for it.
+        (prefix, 0xC0, Action::FocusPrevious), // ` (grave), the key above Tab
+        (prefix, 0x50, Action::Screenshot),    // P (capture desktop to file)
+        (prefix, 0x41, Action::ToggleAlwaysOnTop), // A (always-on-top)
         // niri-parity Round 4: rearrange / sizing actions.
-        //   Ctrl+Alt+Comma   → consume window into next column
-        //   Ctrl+Alt+Period  → expel window into a new column to the right
+        //   Ctrl+Alt+Comma   → consume-window-into-column: the first window of the
+        //                      column on the right moves under the focused one
+        //   Ctrl+Alt+Period  → expel-window-from-column: the bottom window of the
+        //                      focused column gets a column of its own on the right
         //   Ctrl+Alt+E       → expand column to fill leftover width
-        //   Ctrl+Alt+Shift+F → maximize column (full work-area height)
+        //   Ctrl+Alt+Shift+F → maximize-column: the column is as wide as the view
         //   Ctrl+Alt+Shift+L → grow column width (5%)
         //   Ctrl+Alt+Shift+H → shrink column width (5%)
         //   Ctrl+Alt+Shift+K → grow tile height (5%)
         //   Ctrl+Alt+Shift+J → shrink tile height (5%)
         //   Ctrl+Alt+Shift+PgUp/PgDn → move column to monitor left/right
-        (prefix, 0xBC, Action::ConsumeWindowIntoColumn),   // VK_OEM_COMMA  ","
-        (prefix, 0xBE, Action::ExpelWindowFromColumn),     // VK_OEM_PERIOD "."
-        (prefix, 0x45, Action::ExpandColumnToAvailable),   // E
-        (shift_prefix, 0x46, Action::MaximizeColumn),      // Shift+F
-        (shift_prefix, 0x4C, Action::GrowColumnWidth),     // Shift+L (overrides MoveToMonitorRight above)
-        (shift_prefix, 0x48, Action::ShrinkColumnWidth),   // Shift+H (overrides MoveToMonitorLeft above)
-        (shift_prefix, 0x4B, Action::GrowTileHeight),      // Shift+K
-        (shift_prefix, 0x4A, Action::ShrinkTileHeight),    // Shift+J
+        (prefix, 0xBC, Action::ConsumeWindowIntoColumn), // VK_OEM_COMMA  ","
+        (prefix, 0xBE, Action::ExpelWindowFromColumn),   // VK_OEM_PERIOD "."
+        (prefix, 0x45, Action::ExpandColumnToAvailable), // E
+        (shift_prefix, 0x46, Action::MaximizeColumn),    // Shift+F
+        (shift_prefix, 0x4C, Action::GrowColumnWidth), // Shift+L (overrides MoveToMonitorRight above)
+        (shift_prefix, 0x48, Action::ShrinkColumnWidth), // Shift+H (overrides MoveToMonitorLeft above)
+        (shift_prefix, 0x4B, Action::GrowTileHeight),    // Shift+K
+        (shift_prefix, 0x4A, Action::ShrinkTileHeight),  // Shift+J
         // Workspace swap (reorder the workspace stack) — niri-parity
         // `Mod+Ctrl+Page_Up/Down`.  Our default prefix is Ctrl+Alt, so the
         // shifted variant naturally lands on `Ctrl+Alt+Shift+Page_Up/Down`,
         // which is what we used to dedicate to move-column-to-monitor.  The
         // column-to-monitor chords move to Ctrl+Alt+Shift+Comma/Period below.
-        (shift_prefix, 0x21, Action::MoveWorkspaceUp),    // Shift+PageUp
-        (shift_prefix, 0x22, Action::MoveWorkspaceDown),  // Shift+PageDown
+        (shift_prefix, 0x21, Action::MoveWorkspaceUp), // Shift+PageUp
+        (shift_prefix, 0x22, Action::MoveWorkspaceDown), // Shift+PageDown
         // Niri parity: move focused column vertically between workspaces.
         // Ctrl+Alt+Shift+Up/Down (VK_UP=0x26, VK_DOWN=0x28).
         (shift_prefix, 0x26, Action::MoveColumnToWorkspaceUp),
@@ -162,6 +181,16 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
         (prefix, 0x53, Action::ToggleSticky),
         // Cheatsheet overlay: prefix+Shift+/ = prefix+?  (VK_OEM_2 = 0xBF)
         (shift_prefix, 0xBF, Action::ShowKeyBindings),
+        // niri keymap: first / last column, column moves to the ends of the strip,
+        // consume-or-expel and the window moves inside a column.
+        (prefix, 0x24, Action::FocusColumnFirst), // Home
+        (prefix, 0x23, Action::FocusColumnLast),  // End
+        (shift_prefix, 0x24, Action::MoveColumnToFirst), // Shift+Home
+        (shift_prefix, 0x23, Action::MoveColumnToLast), // Shift+End
+        (shift_prefix, 0xDB, Action::ConsumeOrExpelWindowLeft), // Shift+[
+        (shift_prefix, 0xDD, Action::ConsumeOrExpelWindowRight), // Shift+]
+        (prefix, 0x4B, Action::MoveWindowUp),     // K
+        (prefix, 0x4A, Action::MoveWindowDown),   // J
     ]
 }
 
@@ -177,8 +206,7 @@ fn default_hotkeys(prefix: u32, shift_prefix: u32, terminal_cmd: &str) -> Vec<(u
 /// When `extend_defaults` is false:
 ///   - Returns `parsed_config` verbatim (override count is the input length
 ///     so the caller can log it; the defaults are discarded).
-///   - If `parsed_config` is empty, returns `defaults` so the daemon never
-///     ships zero hotkeys after a bad reload.
+///   - An empty replacement remains empty, as in niri.
 fn merge_hotkeys(
     defaults: Vec<(u32, u32, Action)>,
     parsed_config: Vec<(u32, u32, Action)>,
@@ -186,9 +214,6 @@ fn merge_hotkeys(
 ) -> (Vec<(u32, u32, Action)>, usize) {
     use std::collections::{HashMap, HashSet};
     if !extend_defaults {
-        if parsed_config.is_empty() {
-            return (defaults, 0);
-        }
         let n = parsed_config.len();
         return (parsed_config, n);
     }
@@ -224,22 +249,25 @@ fn merge_hotkeys(
 
 /// Build hotkey list from config binds, optionally extending the built-in
 /// defaults so newly-shipped actions stay available to users with stale
-/// configs.
+/// configs.  The second value holds the options of the binds that have any.
 ///
 /// Resolution order:
-///   1. Read `binds.extend_defaults` (default `true`).
+///   1. Read `binds.extend_defaults` (default `false` for decoded config).
 ///   2. When `true`: build the default table, then walk config binds.
 ///      Each successfully-parsed config bind WINS on a `(mods, vk)`
 ///      collision with the defaults; otherwise the config bind is
 ///      appended.  Bindings the user could not parse (unknown key /
 ///      unknown action name) are logged and skipped.
-///   3. When `false`: behaviour matches the pre-2026-05-18 path —
-///      config binds replace defaults entirely (with the same skip-and-log
-///      semantics), and an empty surviving table falls back to defaults
-///      so the daemon never ships zero hotkeys after a bad reload.
-fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u32, u32, Action)> {
-    let terminal_cmd = resolve_terminal_command(engine);
+///   3. When `false`: config binds replace defaults entirely, including an
+///      empty table. Invalid reloads are rejected before this point.
+fn build_hotkey_list(
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+) -> (Vec<(u32, u32, Action)>, HashMap<(u32, u32), BindOptions>) {
+    let terminal = resolve_terminal_action(engine);
     let eng = engine.read();
+    if let Some(config) = eng.full_config() {
+        crate::input::pointer::ENGINE.lock().configure(config);
+    }
     let binds = eng.config_binds();
     let config_binds = &binds.hotkeys;
     let extend_defaults = binds.extend_defaults;
@@ -248,36 +276,54 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
         .map(|c| resolve_mod_prefix(&c.input.mod_key))
         .unwrap_or((MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT));
 
-    // Always materialise the defaults first so we can both A) return them
-    // verbatim when the user's binds block is missing, and B) merge with
-    // user binds when extend_defaults=true.
-    let defaults = default_hotkeys(prefix, shift_prefix, &terminal_cmd);
+    // Defaults are opt-in, including the separate emergency Config fallback.
+    let defaults = if extend_defaults {
+        default_hotkeys(prefix, shift_prefix, terminal)
+    } else {
+        Vec::new()
+    };
     let default_count = defaults.len();
 
-    if config_binds.is_empty() {
-        info!("Hotkeys: {} from defaults, 0 from config (0 overridden)", default_count);
-        return defaults;
+    if config_binds.is_empty() && extend_defaults {
+        info!(
+            "Hotkeys: {} from defaults, 0 from config (0 overridden)",
+            default_count
+        );
+        return (defaults, HashMap::new());
     }
 
     // Parse every config bind once.
     let mut parsed_config: Vec<(u32, u32, Action)> = Vec::with_capacity(config_binds.len());
+    let mut options: HashMap<(u32, u32), BindOptions> = HashMap::new();
     for bind in config_binds {
-        let mods = bind.mod_flags();
-        let vk = match bind.vk_code() {
-            Some(v) => v,
-            None => {
-                warn!("Config bind: unknown key '{}', skipping", bind.key);
-                continue;
+        if crate::input::pointer::parse_trigger(&bind.key).is_some() {
+            continue;
+        }
+        match bind_to_hotkey(bind, prefix) {
+            Ok(row) => {
+                if !bind.repeat
+                    || bind.release
+                    || !bind.allow_inhibiting
+                    || bind.cooldown_ms.is_some()
+                    || bind.hotkey_overlay_title.is_some()
+                {
+                    options.insert(
+                        (row.0, row.1),
+                        BindOptions {
+                            no_repeat: !bind.repeat,
+                            release: bind.release,
+                            allow_inhibiting: bind.allow_inhibiting,
+                            cooldown: bind
+                                .cooldown_ms
+                                .map(|ms| std::time::Duration::from_millis(ms as u64)),
+                            title: bind.hotkey_overlay_title.clone(),
+                        },
+                    );
+                }
+                parsed_config.push(row)
             }
-        };
-        let action = match bind.parse_action() {
-            Some(a) => a,
-            None => {
-                warn!("Config bind: unknown action '{}', skipping", bind.command);
-                continue;
-            }
-        };
-        parsed_config.push((mods, vk, action));
+            Err(why) => warn!("Config bind: {}, skipping", why),
+        }
     }
 
     let config_count = parsed_config.len();
@@ -295,11 +341,23 @@ fn build_hotkey_list(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Vec<(u3
             config_count,
         );
     }
-    if merged.is_empty() {
-        warn!("Hotkey table empty after merge; defaults reinstated");
-        return default_hotkeys(prefix, shift_prefix, &terminal_cmd);
-    }
-    merged
+    (merged, options)
+}
+
+/// Keep the low-level switcher hook on the same resolved ordinary bind table.
+fn publish_recent_input(
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    hotkeys: &[(u32, u32, Action)],
+) {
+    let eng = engine.read();
+    let config = eng.full_config();
+    crate::input::recent::publish_snapshot(crate::input::recent::InputSnapshot {
+        config: config.map(|c| c.recent_windows.clone()).unwrap_or_default(),
+        mod_key: config
+            .map(|c| resolve_mod_prefix(&c.input.mod_key).0)
+            .unwrap_or(MOD_CTRL | MOD_ALT),
+        hotkeys: hotkeys.to_vec(),
+    });
 }
 
 /// Chords that wiri must NEVER attempt to register.  These are reserved by
@@ -325,14 +383,22 @@ fn is_system_critical_hotkey(mods: u32, vk: u32) -> Option<&'static str> {
         .map(|(_, _, label)| *label)
 }
 
-/// Register a list of hotkeys with Windows, returning the IDs, action map,
-/// and the subset of hotkey ids that must be state-gated on overview mode
-/// (i.e. bare Escape → OverviewToggle, which should only fire when overview
-/// is already active so the user can press Esc to exit).
+/// A bare `Escape` bound to the overview toggle.  The low-level keyboard hook
+/// (`input::low_level_hook`) already delivers Escape to overview and resize
+/// mode *without consuming it*; registering it with `RegisterHotKey` as well
+/// would take Escape away from every application on the desktop (a registered
+/// hotkey is delivered to wiri only, never to the focused window), and made
+/// Escape unusable everywhere while wiri ran.
+fn is_overview_escape_binding(mods: u32, vk: u32, action: &Action) -> bool {
+    mods == 0 && vk == 0x1B && matches!(action, Action::OverviewToggle | Action::OverviewExit)
+}
+
+/// Register a list of hotkeys with Windows, returning the IDs and the action map
+/// of the ones that Windows accepted.
 fn register_hotkeys(
     hwnd: HWND,
     hotkeys: &[(u32, u32, Action)],
-) -> (Vec<i32>, HashMap<i32, Action>, std::collections::HashSet<i32>) {
+) -> (Vec<i32>, HashMap<i32, Action>) {
     let base_id = 32768i32;
     let mut registered_ids: Vec<i32> = Vec::new();
 
@@ -349,18 +415,37 @@ fn register_hotkeys(
             );
             continue;
         }
-        let result = unsafe {
-            RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(*mods), *vk)
-        };
+        if is_overview_escape_binding(*mods, *vk, action) {
+            info!(
+                "SKIP hotkey id={} Escape {:?} — handled by the keyboard hook (a registered \
+                 Escape would be swallowed in every application)",
+                id, action,
+            );
+            continue;
+        }
+        if !keyboard::ENGINE.lock().fallback_allowed((*mods, *vk)) {
+            continue;
+        }
+        let result = unsafe { RegisterHotKey(hwnd, id, HOT_KEY_MODIFIERS(*mods), *vk) };
         if result.is_ok() {
             registered_ids.push(id);
-            info!("OK hotkey id={} mods=0x{:X} vk=0x{:02X} {:?}", id, mods, vk, action);
+            info!(
+                "OK hotkey id={} mods=0x{:X} vk=0x{:02X} {:?}",
+                id, mods, vk, action
+            );
         } else {
             let err = std::io::Error::last_os_error();
-            warn!("FAIL hotkey id={} mods=0x{:X} vk=0x{:02X} {:?} os_err={}", id, mods, vk, action, err);
+            warn!(
+                "FAIL hotkey id={} mods=0x{:X} vk=0x{:02X} {:?} os_err={}",
+                id, mods, vk, action, err
+            );
         }
     }
-    info!("Hotkeys: {}/{} registered", registered_ids.len(), hotkeys.len());
+    info!(
+        "Hotkeys: {}/{} registered",
+        registered_ids.len(),
+        hotkeys.len()
+    );
 
     let action_map: HashMap<i32, Action> = hotkeys
         .iter()
@@ -369,28 +454,32 @@ fn register_hotkeys(
         .map(|(i, (_, _, action))| (base_id + i as i32, action.clone()))
         .collect();
 
-    // Detect bare-Escape → OverviewToggle bindings (mods=0, vk=0x1B) — those
-    // must be gated on `engine.is_overview()` so Esc remains usable outside
-    // overview mode.
-    let overview_exit_only: std::collections::HashSet<i32> = hotkeys
+    (registered_ids, action_map)
+}
+
+fn visible_binding_ids(
+    hotkeys: &[(u32, u32, Action)],
+    fallback: &[i32],
+    hook_active: bool,
+) -> Vec<i32> {
+    if !hook_active {
+        return fallback.to_vec();
+    }
+    let engine = keyboard::ENGINE.lock();
+    hotkeys
         .iter()
         .enumerate()
-        .filter(|(i, (mods, vk, action))| {
-            *mods == 0
-                && *vk == 0x1B
-                && matches!(action, Action::OverviewToggle)
-                && registered_ids.contains(&(base_id + *i as i32))
-        })
-        .map(|(i, _)| base_id + i as i32)
-        .collect();
-
-    (registered_ids, action_map, overview_exit_only)
+        .filter(|(_, (m, v, a))| engine.active((*m, *v)) && !is_overview_escape_binding(*m, *v, a))
+        .map(|(i, _)| 32768 + i as i32)
+        .collect()
 }
 
 /// Unregister all hotkeys by ID
 fn unregister_hotkeys(hwnd: HWND, ids: &[i32]) {
     for id in ids {
-        unsafe { let _ = UnregisterHotKey(hwnd, *id); }
+        unsafe {
+            let _ = UnregisterHotKey(hwnd, *id);
+        }
     }
 }
 
@@ -427,6 +516,9 @@ pub struct RegisteredBinding {
     /// Action this binding fires.  Held as a debug-formatted string so the
     /// IPC layer (which doesn't depend on `Action`'s serde impl) can ship it.
     pub action: String,
+    /// niri's `hotkey-overlay-title=`: `Some(Some(text))` is shown in the key-bindings overlay
+    /// instead of the action name, `Some(None)` hides the bind from it.
+    pub title: Option<Option<String>>,
 }
 
 /// Refresh the global REGISTERED_BINDINGS snapshot after a (re-)registration
@@ -435,6 +527,7 @@ pub struct RegisteredBinding {
 fn update_current_bindings_snapshot(
     hotkeys: &[(u32, u32, Action)],
     registered_ids: &[i32],
+    options: &HashMap<(u32, u32), BindOptions>,
 ) {
     let base_id = 32768i32;
     let mut snap: Vec<RegisteredBinding> = Vec::with_capacity(hotkeys.len());
@@ -448,9 +541,27 @@ fn update_current_bindings_snapshot(
             modifiers: *mods,
             vk_code: *vk,
             action: format!("{:?}", action),
+            title: options.get(&(*mods, *vk)).and_then(|o| o.title.clone()),
         });
     }
     *REGISTERED_BINDINGS.lock() = snap;
+}
+
+/// The rows of the key-bindings overlay: the chord and what it does, the action's name unless
+/// the bind has a `hotkey-overlay-title`, and no row for a bind whose title is `null`.
+#[cfg(test)]
+fn overlay_rows(bindings: &[RegisteredBinding]) -> Vec<(String, String)> {
+    bindings
+        .iter()
+        .filter_map(|b| {
+            let chord = crate::ipc::server::format_chord(b.modifiers, b.vk_code);
+            match &b.title {
+                Some(None) => None,
+                Some(Some(text)) => Some((chord, text.clone())),
+                None => Some((chord, b.action.clone())),
+            }
+        })
+        .collect()
 }
 
 /// Return a clone of every hotkey currently registered with Windows.
@@ -461,12 +572,20 @@ pub fn current_bindings() -> Vec<RegisteredBinding> {
 
 pub struct MessageLoop {
     running: Arc<Mutex<bool>>,
+    quit_tx: Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
 }
 
 impl MessageLoop {
     pub fn new() -> Result<Self> {
         let running = Arc::new(Mutex::new(false));
-        Ok(Self { running })
+        Ok(Self {
+            running,
+            quit_tx: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub fn set_quit_sender(&self, tx: mpsc::UnboundedSender<()>) {
+        *self.quit_tx.lock() = Some(tx);
     }
 
     pub fn start_hotkey_loop(
@@ -475,8 +594,9 @@ impl MessageLoop {
         backend_handle: BackendHandle,
     ) {
         let running = self.running.clone();
+        let quit_tx = self.quit_tx.clone();
         std::thread::spawn(move || {
-            Self::run_message_loop(running, engine, backend_handle);
+            Self::run_message_loop(running, engine, backend_handle, quit_tx);
         });
     }
 
@@ -484,6 +604,7 @@ impl MessageLoop {
         running: Arc<Mutex<bool>>,
         engine: Arc<parking_lot::RwLock<TilingEngine>>,
         backend_handle: BackendHandle,
+        quit_tx: Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
     ) {
         let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
 
@@ -494,14 +615,19 @@ impl MessageLoop {
             lpfnWndProc: Some(Self::window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
-            hInstance: unsafe { GetModuleHandleW(None) }.ok().map(|h| h.into()).unwrap_or_default(),
+            hInstance: unsafe { GetModuleHandleW(None) }
+                .ok()
+                .map(|h| h.into())
+                .unwrap_or_default(),
             hIcon: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
             hCursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR::default(),
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
             lpszMenuName: windows::core::PCWSTR::null(),
             lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
         };
-        unsafe { let _ = RegisterClassW(&wnd_class); }
+        unsafe {
+            let _ = RegisterClassW(&wnd_class);
+        }
 
         let window_name: Vec<u16> = "WiriHotkeyWindow\0".encode_utf16().collect();
         let hwnd = unsafe {
@@ -510,8 +636,12 @@ impl MessageLoop {
                 windows::core::PCWSTR(class_name.as_ptr()),
                 windows::core::PCWSTR(window_name.as_ptr()),
                 WINDOW_STYLE(0),
-                0, 0, 0, 0,
-                None, None,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
                 windows::Win32::Foundation::HMODULE::default(),
                 None,
             )
@@ -524,6 +654,10 @@ impl MessageLoop {
             }
         };
         info!("Hotkey window created");
+        crate::overlay::decor::layer::attach_message_thread();
+        crate::overlay::compositor::attach_message_thread();
+        crate::ipc::keyboard_notify::initialize(hwnd);
+        let switch_events = crate::hooks::switch_events::attach(hwnd, backend_handle.clone());
 
         // Store thread state for hot-reload support
         *HOTKEY_THREAD.lock() = Some(HotkeyThreadState {
@@ -533,14 +667,46 @@ impl MessageLoop {
 
         // Register initial hotkeys.  Keep `current_hotkeys` so the snapshot
         // and hot-reload paths share a single source of truth.
-        let current_hotkeys = build_hotkey_list(&engine);
-        let (mut registered_ids, mut action_map, mut overview_exit_only) =
-            register_hotkeys(hwnd, &current_hotkeys);
+        crate::input::dispatch::initialize(thread_id);
+        crate::input::focus::initialize(engine.clone(), backend_handle.clone(), hwnd);
+        crate::input::gestures::configure(engine.clone(), backend_handle.clone());
+        crate::input::dnd::configure(engine.clone(), backend_handle.clone());
+        crate::input::touchpen::configure(engine.clone(), backend_handle.clone());
+        let touchpad_enabled = engine
+            .read()
+            .full_config()
+            .is_some_and(|c| c.input.touchpad_enabled);
+        // Lane P: `toggle-touchpad` may have turned the touchpad off for this session.
+        let touchpad_enabled = crate::input::pointer_settings::touchpad_active(touchpad_enabled);
+        crate::input::touchpad::configure(touchpad_enabled, engine.clone(), backend_handle.clone());
+        crate::input::hot_corner::initialize(engine.clone(), backend_handle.clone(), hwnd);
+        let mut hook_active = false;
+        match crate::input::start_keyboard_hook() {
+            Ok(()) => hook_active = true,
+            Err(e) => warn!(
+                "Keyboard bind hook disabled; RegisterHotKey fallback only: {}",
+                e
+            ),
+        }
+        let (mut current_hotkeys, bind_options) = build_hotkey_list(&engine);
+        publish_recent_input(&engine, &current_hotkeys);
+        keyboard::ENGINE
+            .lock()
+            .configure(&current_hotkeys, &bind_options);
+        keyboard::configure_latin_fallback();
+        let (mut registered_ids, _) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
-        update_current_bindings_snapshot(&current_hotkeys, &registered_ids);
+        update_current_bindings_snapshot(
+            &current_hotkeys,
+            &visible_binding_ids(&current_hotkeys, &registered_ids, hook_active),
+            &bind_options,
+        );
 
         *running.lock() = true;
-        info!("Hotkey message loop started on thread {:?}", std::thread::current().id());
+        info!(
+            "Hotkey message loop started on thread {:?}",
+            std::thread::current().id()
+        );
 
         // Standard GetMessageW message loop
         unsafe {
@@ -553,39 +719,92 @@ impl MessageLoop {
                 if msg.message == WM_STOP_MESSAGE_LOOP {
                     break;
                 }
+                if crate::overlay::compositor::handle_message(msg.message) {
+                    continue;
+                }
+                if crate::overlay::decor::layer::handle_message(msg.message) {
+                    continue;
+                }
+                if crate::input::focus::handle_message(&msg)
+                    || crate::input::hot_corner::handle_message(&msg)
+                {
+                    continue;
+                }
                 if msg.message == WM_RELOAD_HOTKEYS {
+                    crate::input::focus::reload();
+                    crate::input::dnd::configure(engine.clone(), backend_handle.clone());
+                    crate::input::touchpen::shutdown();
+                    crate::input::touchpad::shutdown();
+                    crate::input::gestures::configure(engine.clone(), backend_handle.clone());
+                    let touchpad_enabled = engine
+                        .read()
+                        .full_config()
+                        .is_some_and(|c| c.input.touchpad_enabled);
+                    let touchpad_enabled =
+                        crate::input::pointer_settings::touchpad_active(touchpad_enabled);
+                    crate::input::touchpad::configure(
+                        touchpad_enabled,
+                        engine.clone(),
+                        backend_handle.clone(),
+                    );
+                    crate::input::touchpen::configure(engine.clone(), backend_handle.clone());
+                    crate::input::hot_corner::reload();
                     // Hot-reload: unregister old, re-read config, register new
                     info!("Hot-reloading keybindings...");
                     unregister_hotkeys(hwnd, &registered_ids);
-                    let new_hotkeys = build_hotkey_list(&engine);
-                    let (new_ids, new_map, new_exit_only) =
-                        register_hotkeys(hwnd, &new_hotkeys);
+                    let (new_hotkeys, new_options) = build_hotkey_list(&engine);
+                    publish_recent_input(&engine, &new_hotkeys);
+                    keyboard::ENGINE
+                        .lock()
+                        .configure(&new_hotkeys, &new_options);
+                    keyboard::configure_latin_fallback();
+                    let (new_ids, _) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
-                    action_map = new_map;
-                    overview_exit_only = new_exit_only;
-                    update_current_bindings_snapshot(&new_hotkeys, &registered_ids);
+                    update_current_bindings_snapshot(
+                        &new_hotkeys,
+                        &visible_binding_ids(&new_hotkeys, &registered_ids, hook_active),
+                        &new_options,
+                    );
+                    current_hotkeys = new_hotkeys;
                     info!("Hotkey reload complete");
                     continue;
                 }
-                if msg.message == 0x0312 { // WM_HOTKEY
-                    let hotkey_id = msg.wParam.0 as i32;
-                    if let Some(action) = action_map.get(&hotkey_id) {
-                        // Esc → OverviewToggle is registered globally but only
-                        // dispatched when overview is currently active OR
-                        // interactive resize-mode is engaged (Esc is the
-                        // canonical "exit resize mode" key).  Outside both
-                        // states the keypress is swallowed so Esc stays
-                        // available to other apps.
-                        if overview_exit_only.contains(&hotkey_id) {
-                            let eng = engine.read();
-                            let allow = eng.is_overview() || eng.is_resize_mode();
-                            drop(eng);
-                            if !allow {
-                                continue;
+                if msg.message == crate::input::dispatch::WM_INPUT_WORK {
+                    for work in crate::input::dispatch::take() {
+                        match work {
+                            crate::input::dispatch::Work::Action(action) => {
+                                info!("KEYHOOK -> {:?}", action);
+                                execute_action(&action, &engine, &backend_handle, &quit_tx);
                             }
+                            crate::input::dispatch::Work::Recent(input) => {
+                                let screenshot =
+                                    engine.write().recent_input(input, &backend_handle);
+                                if screenshot {
+                                    execute_action(
+                                        &Action::Screenshot,
+                                        &engine,
+                                        &backend_handle,
+                                        &quit_tx,
+                                    );
+                                }
+                            }
+                            crate::input::dispatch::Work::Task(task) => task(),
                         }
-                        info!("HOTKEY id={} -> {:?}", hotkey_id, action);
-                        execute_action(action, &engine, &backend_handle);
+                    }
+                } else if msg.message == 0x0312 {
+                    // WM_HOTKEY is fallback only: a down consumed by WH_KEYBOARD_LL
+                    // never generates it, so normal keys cannot double-fire.
+                    let index = (msg.wParam.0 as i32 - 32768) as usize;
+                    if let Some((mods, vk, _)) = current_hotkeys.get(index) {
+                        let action = keyboard::ENGINE.lock().fallback(
+                            (*mods, *vk),
+                            crate::input::last_press_was_repeat(*vk),
+                            std::time::Instant::now(),
+                        );
+                        if let Some(action) = action {
+                            info!("HOTKEY id={} -> {:?}", msg.wParam.0, action);
+                            execute_action(&action, &engine, &backend_handle, &quit_tx);
+                        }
                     }
                 } else {
                     let _ = TranslateMessage(&msg);
@@ -597,23 +816,49 @@ impl MessageLoop {
                 // engine lock semantics as keyboard hotkeys.
                 for action in crate::input::touch::take_pending_actions() {
                     info!("TOUCH -> {:?}", action);
-                    execute_action(&action, &engine, &backend_handle);
+                    execute_action(&action, &engine, &backend_handle, &quit_tx);
                 }
             }
         }
 
+        drop(switch_events); // Unregister power notifications on this pump, before DestroyWindow.
         unregister_hotkeys(hwnd, &registered_ids);
-        unsafe { let _ = DestroyWindow(hwnd); }
+        crate::ipc::keyboard_notify::shutdown(hwnd);
+        crate::input::stop_keyboard_hook();
+        crate::input::recent::reset();
+        crate::overlay::compositor::detach_message_thread();
+        crate::overlay::decor::layer::detach_message_thread();
+        crate::input::hot_corner::shutdown();
+        crate::input::focus::shutdown();
+        crate::input::dnd::shutdown();
+        crate::input::touchpen::shutdown();
+        crate::input::touchpad::shutdown();
+        crate::input::gestures::shutdown();
+        crate::input::dispatch::shutdown();
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
         *HOTKEY_THREAD.lock() = None;
         *running.lock() = false;
         info!("Hotkey message loop exited");
     }
 
     unsafe extern "system" fn window_proc(
-        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
     ) -> LRESULT {
+        crate::ipc::keyboard_notify::observe_message(msg, wparam.0, lparam.0);
+        if let Some(result) = crate::hooks::switch_events::handle_message(hwnd, msg, wparam, lparam)
+        {
+            return result;
+        }
         match msg {
-            WM_DESTROY => { PostQuitMessage(0); LRESULT(0) }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
             WM_DISPLAYCHANGE => {
                 // Monitor hot-plug: re-enumerate monitors and notify the backend
                 // via the static `backend::hooks::set_backend` handle that the
@@ -622,6 +867,7 @@ impl MessageLoop {
                 // diffs against the engine's known set, registers new monitors,
                 // and unregisters vanished ones (see `handle_backend_event`).
                 info!("WM_DISPLAYCHANGE received — monitor configuration changed");
+                crate::input::hot_corner::display_changed();
                 crate::backend::hooks::notify_display_change();
                 LRESULT(0)
             }
@@ -634,12 +880,7 @@ impl MessageLoop {
         let state = HOTKEY_THREAD.lock();
         if let Some(s) = &*state {
             unsafe {
-                let _ = PostThreadMessageW(
-                    s.thread_id,
-                    WM_RELOAD_HOTKEYS,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ = PostThreadMessageW(s.thread_id, WM_RELOAD_HOTKEYS, WPARAM(0), LPARAM(0));
             }
             info!("Sent WM_RELOAD_HOTKEYS to hotkey thread");
         }
@@ -647,20 +888,19 @@ impl MessageLoop {
 
     pub fn stop(&self) {
         *self.running.lock() = false;
+        crate::overlay::screenshot_ui::cancel();
+        crate::input::stop_keyboard_hook();
         let state = HOTKEY_THREAD.lock();
         if let Some(s) = &*state {
             unsafe {
-                let _ = PostThreadMessageW(
-                    s.thread_id,
-                    WM_STOP_MESSAGE_LOOP,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ = PostThreadMessageW(s.thread_id, WM_STOP_MESSAGE_LOOP, WPARAM(0), LPARAM(0));
             }
         }
     }
 
-    pub fn is_running(&self) -> bool { *self.running.lock() }
+    pub fn is_running(&self) -> bool {
+        *self.running.lock()
+    }
 
     /// Diagnostic accessor: return a clone of the currently registered hotkey
     /// table (after the most recent `register_hotkeys` pass).  Used by the
@@ -682,41 +922,100 @@ impl MessageLoop {
 }
 
 impl Drop for MessageLoop {
-    fn drop(&mut self) { self.stop(); }
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl Default for MessageLoop {
-    fn default() -> Self { Self::new().expect("Failed to create message loop") }
+    fn default() -> Self {
+        Self::new().expect("Failed to create message loop")
+    }
 }
-
-/// Key-repeat debounce state. Allows max 8 actions/sec for held keys.
-use std::sync::LazyLock;
-static LAST_ACTION: LazyLock<parking_lot::Mutex<(Action, std::time::Instant)>> =
-    LazyLock::new(|| {
-        // Start 60s in the past so the first real Action::Quit (or any action)
-        // within 125 ms of startup is never silently dropped.
-        let past = std::time::Instant::now() - std::time::Duration::from_secs(60);
-        parking_lot::Mutex::new((Action::Quit, past))
-    });
 
 fn execute_action(
     action: &Action,
     engine: &Arc<parking_lot::RwLock<TilingEngine>>,
     backend: &BackendHandle,
+    quit_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
 ) {
-    // Debounce key repeat: derive from config keyboard.repeat_rate (defaults to ~8/sec).
-    {
-        let debounce_ms = engine
-            .read()
-            .full_config()
-            .map(|c| crate::input::repeat_debounce_ms(&c.input))
-            .unwrap_or(125);
-        let mut last = LAST_ACTION.lock();
-        if last.0 == *action && last.1.elapsed() < std::time::Duration::from_millis(debounce_ms) {
-            return;
+    perform_action(action, engine, backend, quit_tx);
+}
+
+/// Run one action against the engine.  Hotkeys reach it through
+/// [`execute_action`] (which first drops key-repeat duplicates); the IPC
+/// `run_action` request calls it directly, so `wiri-ctl action <name>` behaves
+/// exactly like pressing the bound key.
+pub(crate) fn perform_action(
+    action: &Action,
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    quit_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
+) {
+    perform_action_on(action, engine, backend, quit_tx, None);
+}
+
+/// [`perform_action`], on a window the caller names (niri's `--id`) instead of the one the OS
+/// says is in the foreground: the window is what the action acts on whatever the OS reports,
+/// so that the action does not depend on how fast an activation request was carried out.
+pub(crate) fn perform_action_on(
+    action: &Action,
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    quit_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
+    window: Option<isize>,
+) {
+    // Event-stream clients are told what the action did to the windows and workspaces.
+    let _state_changed = crate::ipc::StateChangeGuard;
+    engine.write().cancel_composited_transitions(backend);
+    if let Action::System(system) = action {
+        let result = match system {
+            crate::input::system_actions::SystemAction::Quit { skip_confirmation } => {
+                let sender = quit_tx.clone();
+                crate::input::system_actions::request_quit(*skip_confirmation, move || {
+                    if let Some(tx) = sender.lock().as_ref() {
+                        let _ = tx.send(());
+                    }
+                })
+            }
+            _ => crate::input::system_actions::execute(system, engine, backend, window),
+        };
+        if let Err(error) = result {
+            warn!("System action failed: {}", error);
         }
-        *last = (action.clone(), std::time::Instant::now());
+        return;
     }
+    // The window the action acts on is the one the user is looking at: the OS foreground window
+    // (or the application window that owns it), a floating window as well as a tile.  The
+    // engine's own focus is only the fallback.  `close-window` refuses to guess when an
+    // unmanaged window (the Start menu, an elevated program) has the focus.
+    let foreground = match window {
+        Some(hwnd) => Some(crate::layout::ForegroundWindow {
+            hwnd,
+            root_owner: hwnd,
+            ignorable: false,
+        }),
+        None => crate::layout::query_foreground(),
+    };
+    let target = match action {
+        Action::Quit
+        | Action::Spawn(_)
+        | Action::SpawnCmd(_)
+        | Action::Screenshot
+        | Action::ScreenshotUi(_)
+        | Action::ScreenshotScreen
+        | Action::Capture(_)
+        | Action::WindowScreenshot
+        | Action::ScreenshotWindow
+        | Action::ShowKeyBindings
+        | Action::ToggleKeyboardShortcutsInhibit => None,
+        Action::CloseWindow => engine
+            .write()
+            .resolve_action_target_for(foreground, true, backend),
+        _ => engine
+            .write()
+            .resolve_action_target_for(foreground, false, backend),
+    };
 
     // niri-style interactive-resize mode: while engaged, the arrow-focus
     // chords resize the focused column / tile instead of moving focus.
@@ -736,19 +1035,22 @@ fn execute_action(
                 return;
             }
             Action::FocusUp => {
-                engine.write().resize_focused_tile_height_by_percent(-5, backend);
+                engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(-5, backend);
                 engine.write().apply_all(backend);
                 return;
             }
             Action::FocusDown => {
-                engine.write().resize_focused_tile_height_by_percent(5, backend);
+                engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(5, backend);
                 engine.write().apply_all(backend);
                 return;
             }
-            Action::OverviewToggle => {
-                // Bare Escape (which is registered as OverviewToggle and
-                // state-gated below) is the canonical "exit resize mode"
-                // chord.  Swallow the action so overview doesn't open.
+            Action::OverviewToggle | Action::OverviewExit => {
+                // Escape is the canonical "exit resize mode" chord. Swallow
+                // the action so overview doesn't open.
                 engine.write().exit_resize_mode();
                 return;
             }
@@ -762,6 +1064,29 @@ fn execute_action(
     }
 
     match action {
+        Action::System(_) => {
+            unreachable!("system actions dispatched before layout target resolution")
+        }
+        Action::LayoutFocus(action) => engine.write().focus_layout_action(action, backend),
+        Action::WorkspaceAction(action) => engine.write().workspace_layout_action(action, backend),
+        Action::MonitorAction(action) => engine.write().monitor_layout_action(action, backend),
+        Action::ToggleKeyboardShortcutsInhibit => {
+            keyboard::ENGINE.lock().toggle_inhibit();
+            info!(
+                "Keyboard shortcuts inhibited: {}",
+                keyboard::ENGINE.lock().inhibited()
+            );
+            if let Some(thread) = HOTKEY_THREAD.lock().as_ref() {
+                unsafe {
+                    let _ = PostThreadMessageW(
+                        thread.thread_id,
+                        WM_RELOAD_HOTKEYS,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        }
         Action::FocusColumnLeft => {
             engine.write().focus_left(backend);
         }
@@ -774,17 +1099,26 @@ fn execute_action(
         Action::FocusDown => {
             engine.write().focus_down(backend);
         }
-        Action::MoveColumnLeft => {
-            engine.write().move_column(ScrollDirection::Left, backend);
-        }
-        Action::MoveColumnRight => {
-            engine.write().move_column(ScrollDirection::Right, backend);
-        }
-        Action::CloseWindow => {
-            engine.write().close_focused_window(backend);
-        }
-        Action::Spawn(cmd) => {
-            spawn_process(cmd);
+        Action::MoveColumnLeft => match float_of(target) {
+            Some(window) => engine
+                .write()
+                .float_move_by(window, -FLOAT_STEP_PX, 0, backend),
+            None => engine.write().move_column(ScrollDirection::Left, backend),
+        },
+        Action::MoveColumnRight => match float_of(target) {
+            Some(window) => engine
+                .write()
+                .float_move_by(window, FLOAT_STEP_PX, 0, backend),
+            None => engine.write().move_column(ScrollDirection::Right, backend),
+        },
+        Action::CloseWindow => match target {
+            Some(t) => engine.write().close_target(t),
+            None => {
+                info!("close-window: the focused window is not managed by wiri; nothing closed")
+            }
+        },
+        Action::Spawn(argv) => {
+            spawn_process(argv);
         }
         Action::SpawnCmd(cmd) => {
             // niri-style `spawn-cmd "<command>"` — route through the
@@ -794,13 +1128,27 @@ fn execute_action(
             spawn_shell_command(cmd);
         }
         Action::ToggleFullscreen => {
-            engine.write().toggle_fullscreen(backend);
+            if let Some(t) = target {
+                engine.write().toggle_fullscreen_for(t.window, backend);
+            }
         }
         Action::Quit => {
-            std::process::exit(0);
+            let sender = quit_tx.clone();
+            if let Err(error) = crate::input::system_actions::request_quit(false, move || {
+                if let Some(tx) = sender.lock().as_ref() {
+                    let _ = tx.send(());
+                }
+            }) {
+                warn!("Quit failed: {}", error);
+            }
         }
-        Action::FocusWorkspace(id) => {
-            engine.write().switch_workspace(*id, backend);
+        Action::FocusWorkspace(number) => {
+            // `Ctrl+Alt+2` is the second workspace of the monitor (niri's index
+            // addressing), whatever its id is.
+            engine.write().focus_workspace_number(*number, backend);
+        }
+        Action::FocusWorkspaceLast => {
+            engine.write().focus_workspace_last_visited(backend);
         }
         Action::ScrollLeft => {
             engine.write().scroll(ScrollDirection::Left, backend);
@@ -809,10 +1157,19 @@ fn execute_action(
             engine.write().scroll(ScrollDirection::Right, backend);
         }
         Action::ToggleFloating => {
-            engine.write().toggle_floating(backend);
+            if let Some(t) = target {
+                engine.write().toggle_floating_for(t.window, backend);
+            }
         }
         Action::OverviewToggle => {
             engine.write().toggle_overview(backend);
+        }
+        Action::OverviewExit => {
+            // Explicit close is idempotent: while the camera is already closing,
+            // `toggle_overview` would reverse it and reopen the overview.
+            if engine.read().is_overview() {
+                engine.write().exit_overview(backend);
+            }
         }
         Action::OverviewLeft => {
             if engine.read().is_overview() {
@@ -832,90 +1189,65 @@ fn execute_action(
             engine.write().overview_select(backend);
         }
         Action::Maximize => {
-            // Maximize the currently focused window
-            let fg = unsafe { GetForegroundWindow() };
-            if !fg.0.is_null() {
-                unsafe { let _ = ShowWindow(fg, SW_MAXIMIZE); }
-                info!("Maximize: hwnd={:?}", fg);
-            } else {
-                warn!("Maximize: no foreground window");
+            // wiri's older `maximize`: the window fills the work area.  It is the engine's
+            // maximized-to-edges state now (the window keeps its place in its column), not
+            // the native one that the layout pass used to fight.
+            match target {
+                Some(t) if !t.floating => engine
+                    .write()
+                    .set_maximized_to_edges(t.window, true, backend),
+                Some(_) => info!("Maximize: a floating window stays a floating window"),
+                None => warn!("Maximize: no window to maximize"),
             }
         }
+        Action::MaximizeWindowToEdges => match target {
+            Some(t) if !t.floating => engine
+                .write()
+                .toggle_maximize_window_to_edges_for(t.window, backend),
+            Some(_) => info!("maximize-window-to-edges: a floating window stays a floating window"),
+            None => info!("maximize-window-to-edges: no window to maximize"),
+        },
         Action::Minimize => {
             // Minimize the currently focused window
             let fg = unsafe { GetForegroundWindow() };
             if !fg.0.is_null() {
-                unsafe { let _ = ShowWindow(fg, SW_MINIMIZE); }
+                unsafe {
+                    let _ = ShowWindow(fg, SW_MINIMIZE);
+                }
                 info!("Minimize: hwnd={:?}", fg);
             } else {
                 warn!("Minimize: no foreground window");
             }
         }
-        Action::CenterWindow => {
-            // Center the focused window on its current monitor's work area
-            let fg = unsafe { GetForegroundWindow() };
-            if fg.0.is_null() {
-                warn!("CenterWindow: no foreground window");
-            } else {
-                let hmon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
-                let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
-                mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-                if unsafe { GetMonitorInfoW(hmon, &mut mi).as_bool() } {
-                    let wa = mi.rcWork;
-                    let wa_w = wa.right - wa.left;
-                    let wa_h = wa.bottom - wa.top;
-                    // Place at 60% of work area, centered
-                    let win_w = wa_w * 6 / 10;
-                    let win_h = wa_h * 6 / 10;
-                    let x = wa.left + (wa_w - win_w) / 2;
-                    let y = wa.top + (wa_h - win_h) / 2;
-                    unsafe {
-                        let _ = SetWindowPos(
-                            fg, HWND_TOP, x, y, win_w, win_h,
-                            SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                    }
-                    info!("CenterWindow: hwnd={:?} x={} y={} w={} h={}", fg, x, y, win_w, win_h);
-                } else {
-                    warn!("CenterWindow: GetMonitorInfoW failed");
-                }
+        Action::CenterWindow => match float_of(target) {
+            Some(window) => engine.write().float_center(window, backend),
+            None => {
+                engine.write().center_focused_column(backend);
+                engine.write().apply_all(backend);
             }
-        }
-        Action::SwitchMonitor => {
-            // Generic "switch monitor" — cycle focus to the next monitor in
-            // x-order, wrapping around. Distinct from MoveToMonitorLeft/Right,
-            // which move the focused window across monitors.
-            let mut engine_w = engine.write();
-            let order: Vec<_> = {
-                let mut v: Vec<_> = engine_w.monitors().iter()
-                    .map(|(oid, m)| (m.bounds.loc.x, *oid))
-                    .collect();
-                v.sort_by_key(|(x, _)| *x);
-                v
-            };
-            if order.is_empty() {
-                return;
+        },
+        Action::SwitchMonitor => engine.write().monitor_layout_action(
+            &crate::input::MonitorAction::Focus(crate::input::MonitorTarget::Next),
+            backend,
+        ),
+        Action::MoveWorkspace(target_number) => {
+            // Move the focused window to workspace number `target_number` (no switch).
+            let workspace = engine.read().workspace_id_for_number(*target_number);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_move_to_workspace(window, workspace, backend),
+                None => engine.write().move_window_to_workspace(workspace, backend),
             }
-            let cur = engine_w.focused_output();
-            let next_idx = match cur {
-                Some(oid) => order.iter().position(|(_, o)| *o == oid)
-                    .map(|i| (i + 1) % order.len())
-                    .unwrap_or(0),
-                None => 0,
-            };
-            let target = order[next_idx].1;
-            engine_w.set_focused_output(target);
-            engine_w.apply_all(backend);
-            info!("SwitchMonitor: focused {:?}", target);
-        }
-        Action::MoveWorkspace(target_ws) => {
-            // Move the focused window to workspace `target_ws` (no switch).
-            engine.write().move_window_to_workspace(*target_ws, backend);
             engine.write().apply_all(backend);
         }
         Action::ColumnToggleTabbed => {
             engine.write().toggle_tabbed_for_focused_column(backend);
             engine.write().apply_all(backend);
+        }
+        Action::SetColumnDisplay { tabbed } => {
+            let mut engine = engine.write();
+            set_column_display(&mut engine, *tabbed, backend);
         }
         Action::TabNext => {
             engine.write().focused_column_next_tab(backend);
@@ -928,57 +1260,155 @@ fn execute_action(
         Action::Refresh => {
             engine.write().apply_all(backend);
         }
-        Action::MoveToWorkspace(id) => {
-            engine.write().move_window_to_workspace(*id, backend);
+        Action::MoveToWorkspace(number) => {
+            let workspace = engine.read().workspace_id_for_number(*number);
+            match float_of(target) {
+                Some(window) => engine
+                    .write()
+                    .float_move_to_workspace(window, workspace, backend),
+                None => engine.write().move_window_to_workspace(workspace, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::MoveToMonitorLeft => {
-            engine.write().move_window_to_monitor(crate::layout::ScrollDirection::Left, backend);
+            engine
+                .write()
+                .move_window_to_monitor(crate::layout::ScrollDirection::Left, backend);
             engine.write().apply_all(backend);
         }
         Action::MoveToMonitorRight => {
-            engine.write().move_window_to_monitor(crate::layout::ScrollDirection::Right, backend);
+            engine
+                .write()
+                .move_window_to_monitor(crate::layout::ScrollDirection::Right, backend);
             engine.write().apply_all(backend);
         }
         Action::CenterColumn => {
-            engine.write().center_focused_column(backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_center(window, backend),
+                None => engine.write().center_focused_column(backend),
+            }
             engine.write().apply_all(backend);
         }
-        Action::ColumnWidthPresetCycle => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::Cycle, backend);
-            engine.write().apply_all(backend);
+        Action::ColumnWidthPresetCycle | Action::ColumnWidthPresetCycleBack => {
+            // niri's presets: a third, a half and two thirds of the view.
+            let forwards = matches!(action, Action::ColumnWidthPresetCycle);
+            match float_of(target) {
+                Some(window) => engine.write().float_cycle_width(window, forwards, backend),
+                None => engine.write().switch_preset_column_width(forwards, backend),
+            }
         }
-        Action::ColumnWidthPresetHalf => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::Half, backend);
-            engine.write().apply_all(backend);
+        Action::WindowWidthPresetCycle | Action::WindowWidthPresetCycleBack => {
+            // niri `switch-preset-window-width`: in the scrolling layout a window is as wide
+            // as its column, so this is the same width request as the column presets.
+            let forwards = matches!(action, Action::WindowWidthPresetCycle);
+            match float_of(target) {
+                Some(window) => engine.write().float_cycle_width(window, forwards, backend),
+                None => engine.write().switch_preset_window_width(forwards, backend),
+            }
         }
-        Action::ColumnWidthPresetThird => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::OneThird, backend);
-            engine.write().apply_all(backend);
+        Action::WindowHeightPresetCycle | Action::WindowHeightPresetCycleBack => {
+            let forwards = matches!(action, Action::WindowHeightPresetCycle);
+            if float_of(target).is_some() {
+                // A floating window has no column to share: niri's presets are column shares.
+                info!("switch-preset-window-height: a floating window keeps its height");
+            } else {
+                engine
+                    .write()
+                    .switch_preset_window_height(forwards, backend);
+            }
         }
-        Action::ColumnWidthPresetTwoThirds => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::TwoThirds, backend);
-            engine.write().apply_all(backend);
+        // wiri's fractions are niri proportions of the view.
+        Action::ColumnWidthPresetQuarter
+        | Action::ColumnWidthPresetThird
+        | Action::ColumnWidthPresetHalf
+        | Action::ColumnWidthPresetTwoThirds
+        | Action::ColumnWidthPresetThreeQuarters
+        | Action::ColumnWidthPresetFull => {
+            let milli_percent = match action {
+                Action::ColumnWidthPresetQuarter => 25_000,
+                Action::ColumnWidthPresetThird => 33_333,
+                Action::ColumnWidthPresetHalf => 50_000,
+                Action::ColumnWidthPresetTwoThirds => 66_667,
+                Action::ColumnWidthPresetThreeQuarters => 75_000,
+                _ => 100_000,
+            };
+            change_size(
+                engine,
+                backend,
+                target,
+                crate::layout::SizeAxis::Width,
+                SizeChange::SetProportion(milli_percent),
+            );
         }
-        Action::ColumnWidthPresetFull => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::Full, backend);
-            engine.write().apply_all(backend);
+        Action::SetColumnWidth(change) => {
+            change_size(
+                engine,
+                backend,
+                target,
+                crate::layout::SizeAxis::Width,
+                *change,
+            );
+        }
+        Action::SetWindowHeight(change) => {
+            change_size(
+                engine,
+                backend,
+                target,
+                crate::layout::SizeAxis::Height,
+                *change,
+            );
+        }
+        Action::ResetWindowHeight => {
+            if float_of(target).is_none() {
+                engine.write().reset_window_height(backend);
+            }
+        }
+        Action::MoveWindowToFloating | Action::MoveWindowToTiling => {
+            if let Some(t) = target {
+                engine.write().set_window_floating(
+                    t.window,
+                    matches!(action, Action::MoveWindowToFloating),
+                    backend,
+                );
+            }
+        }
+        Action::FocusMonitorLeft | Action::FocusMonitorRight => {
+            let direction = if matches!(action, Action::FocusMonitorLeft) {
+                ScrollDirection::Left
+            } else {
+                ScrollDirection::Right
+            };
+            engine.write().focus_monitor_toward(direction, backend);
+        }
+        Action::OverviewOpen => {
+            // A closing camera still has a host: explicit open must reverse it,
+            // not mistake the pending retirement for an already-open overview.
+            engine.write().enter_overview(backend);
         }
         Action::ResizeColumnLeft => {
-            engine.write().resize_focused_column_by(-100, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_by(window, -100, 0, backend),
+                None => engine.write().resize_focused_column_by(-100, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ResizeColumnRight => {
-            engine.write().resize_focused_column_by(100, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_by(window, 100, 0, backend),
+                None => engine.write().resize_focused_column_by(100, backend),
+            }
             engine.write().apply_all(backend);
         }
+        // niri `focus-workspace-down` / `-up`: the workspace below / above, no wrapping.
         Action::FocusWorkspaceNext => {
-            engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Next, backend);
-            engine.write().apply_all(backend);
+            engine
+                .write()
+                .focus_workspace_relative(crate::layout::WorkspaceDirection::Next, backend);
         }
         Action::FocusWorkspacePrevious => {
-            engine.write().focus_workspace_relative(crate::layout::WorkspaceDirection::Previous, backend);
-            engine.write().apply_all(backend);
+            engine
+                .write()
+                .focus_workspace_relative(crate::layout::WorkspaceDirection::Previous, backend);
         }
         Action::FocusPrevious => {
             engine.write().focus_previous_window(backend);
@@ -989,61 +1419,182 @@ fn execute_action(
         }
         Action::FocusWorkspaceNamed(name) => {
             engine.write().focus_workspace_named(name, backend);
-            engine.write().apply_all(backend);
         }
         Action::SetAutoTileThreshold(t) => {
             engine.write().set_auto_tile_threshold(*t);
             engine.write().apply_all(backend);
         }
         Action::Screenshot => {
-            take_screenshot();
+            if let Err(error) = crate::overlay::screenshot_ui::open(Default::default()) {
+                warn!("Screenshot UI: {error:#}");
+            }
         }
-        Action::ColumnWidthPresetQuarter => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::OneQuarter, backend);
-            engine.write().apply_all(backend);
+        Action::ScreenshotUi(options) => {
+            if let Err(error) = crate::overlay::screenshot_ui::open(options.clone()) {
+                warn!("Screenshot UI: {error:#}");
+            }
         }
-        Action::ColumnWidthPresetThreeQuarters => {
-            engine.write().set_column_width_preset(crate::layout::ColumnWidthPreset::ThreeQuarters, backend);
-            engine.write().apply_all(backend);
+        Action::ScreenshotScreen => take_screenshot(),
+        Action::Capture(options) => {
+            if let Err(error) = options.run() {
+                warn!("Screenshot failed: {error:#}");
+            }
         }
+        // The column operations belong to the strip: a floating window has no column
+        // (niri does nothing for it either).
         Action::ConsumeWindowIntoColumn => {
-            engine.write().consume_window_into_column(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().consume_window_into_column(backend);
+            }
         }
         Action::ExpelWindowFromColumn => {
-            engine.write().expel_window_from_column(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().expel_window_from_column(backend);
+            }
+        }
+        Action::ConsumeOrExpelWindowLeft => {
+            if float_of(target).is_none() {
+                engine.write().consume_or_expel_window_left(backend);
+            }
+        }
+        Action::ConsumeOrExpelWindowRight => {
+            if float_of(target).is_none() {
+                engine.write().consume_or_expel_window_right(backend);
+            }
+        }
+        Action::MoveWindowUp => match float_of(target) {
+            Some(window) => engine
+                .write()
+                .float_move_by(window, 0, -FLOAT_STEP_PX, backend),
+            None => engine.write().move_window_in_column(-1, backend),
+        },
+        Action::MoveWindowDown => match float_of(target) {
+            Some(window) => engine
+                .write()
+                .float_move_by(window, 0, FLOAT_STEP_PX, backend),
+            None => engine.write().move_window_in_column(1, backend),
+        },
+        Action::FocusColumnFirst => {
+            engine.write().focus_column_first(backend);
+        }
+        Action::FocusColumnLast => {
+            engine.write().focus_column_last(backend);
+        }
+        Action::MoveColumnToFirst => {
+            if float_of(target).is_none() {
+                engine.write().move_column_to_edge(false, backend);
+            }
+        }
+        Action::MoveColumnToLast => {
+            if float_of(target).is_none() {
+                engine.write().move_column_to_edge(true, backend);
+            }
+        }
+        Action::MoveColumnToIndex(index) => {
+            if float_of(target).is_none() {
+                engine.write().move_column_to_index(*index, backend);
+            }
+        }
+        // niri `swap-window-left` / `-right`: a floating window has no column to swap
+        // with, so nothing happens for it (as for the other column operations).
+        Action::SwapWindowLeft => {
+            if float_of(target).is_none() {
+                engine.write().swap_window_toward(false, backend);
+            }
+        }
+        Action::SwapWindowRight => {
+            if float_of(target).is_none() {
+                engine.write().swap_window_toward(true, backend);
+            }
+        }
+        Action::CenterVisibleColumns => {
+            engine.write().center_visible_columns(backend);
+        }
+        Action::MoveWindowDownOrToWorkspaceDown => {
+            engine.write().move_window_or_to_workspace(true, backend);
+        }
+        Action::MoveWindowUpOrToWorkspaceUp => {
+            engine.write().move_window_or_to_workspace(false, backend);
+        }
+        Action::MoveColumnLeftOrToMonitorLeft => {
+            engine.write().move_column_or_to_monitor(false, backend);
+        }
+        Action::MoveColumnRightOrToMonitorRight => {
+            engine.write().move_column_or_to_monitor(true, backend);
+        }
+        Action::ToggleWindowRuleOpacity => match target {
+            Some(t) => {
+                engine.write().toggle_window_rule_opacity(t.window, backend);
+            }
+            None => info!("toggle-window-rule-opacity: no window to act on"),
+        },
+        Action::FocusFloating => {
+            engine
+                .write()
+                .focus_layer_action(FocusLayer::Floating, backend);
+        }
+        Action::FocusTiling => {
+            engine
+                .write()
+                .focus_layer_action(FocusLayer::Tiling, backend);
+        }
+        Action::SwitchFocusBetweenFloatingAndTiling => {
+            engine
+                .write()
+                .focus_layer_action(FocusLayer::Switch, backend);
         }
         Action::ExpandColumnToAvailable => {
-            engine.write().expand_column_to_available(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().expand_column_to_available(backend);
+            }
         }
         Action::MaximizeColumn => {
-            engine.write().toggle_maximize_focused_column(backend);
-            engine.write().apply_all(backend);
+            if float_of(target).is_none() {
+                engine.write().toggle_maximize_focused_column(backend);
+            }
         }
         Action::GrowColumnWidth => {
-            engine.write().resize_focused_column_by_percent(5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, 5, 0, backend),
+                None => engine.write().resize_focused_column_by_percent(5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ShrinkColumnWidth => {
-            engine.write().resize_focused_column_by_percent(-5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, -5, 0, backend),
+                None => engine.write().resize_focused_column_by_percent(-5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::GrowTileHeight => {
-            engine.write().resize_focused_tile_height_by_percent(5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, 0, 5, backend),
+                None => engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::ShrinkTileHeight => {
-            engine.write().resize_focused_tile_height_by_percent(-5, backend);
+            match float_of(target) {
+                Some(window) => engine.write().float_resize_percent(window, 0, -5, backend),
+                None => engine
+                    .write()
+                    .resize_focused_tile_height_by_percent(-5, backend),
+            }
             engine.write().apply_all(backend);
         }
         Action::MoveColumnToMonitorLeft => {
-            engine.write().move_column_to_monitor(crate::layout::ScrollDirection::Left, backend);
+            engine
+                .write()
+                .move_column_to_monitor(crate::layout::ScrollDirection::Left, backend);
             engine.write().apply_all(backend);
         }
         Action::MoveColumnToMonitorRight => {
-            engine.write().move_column_to_monitor(crate::layout::ScrollDirection::Right, backend);
+            engine
+                .write()
+                .move_column_to_monitor(crate::layout::ScrollDirection::Right, backend);
             engine.write().apply_all(backend);
         }
         Action::WindowScreenshot => {
@@ -1080,24 +1631,19 @@ fn execute_action(
             engine.write().apply_all(backend);
         }
         Action::SetWorkspaceLayout(mode) => {
-            // TODO(audit): need set_workspace_layout helper on TilingEngine.
-            // The engine agent may add engine.set_workspace_layout(id, mode).
-            // Until then, log the intent and no-op so the action arm is wired.
-            warn!("SetWorkspaceLayout({}): not yet wired — set_workspace_layout helper missing", mode);
-        }
-        Action::RenameWorkspace(name) => {
-            // Rename the currently-focused workspace.
-            let id = {
-                let eng = engine.read();
-                eng.focused_output()
-                    .and_then(|oid| eng.monitors().get(&oid))
-                    .map(|m| m.active_workspace_id())
-                    .unwrap_or(0)
-            };
-            if let Err(e) = engine.write().rename_workspace(id, name.as_str()) {
-                warn!("rename_workspace({:?}): {}", name, e);
+            let mut eng = engine.write();
+            match eng.set_workspace_layout(&mode) {
+                Ok(()) => eng.apply_all(backend),
+                Err(err) => warn!("SetWorkspaceLayout({}): {}", mode, err),
             }
         }
+        Action::RenameWorkspace(name) => engine.write().workspace_layout_action(
+            &crate::input::WorkspaceAction::SetName {
+                name: name.clone(),
+                workspace: None,
+            },
+            backend,
+        ),
         Action::ScreenshotWindow => {
             take_window_screenshot();
         }
@@ -1105,34 +1651,79 @@ fn execute_action(
             engine.write().toggle_backdrop_cycle(backend);
         }
         Action::ShowKeyBindings => {
-            // Build a binding row list from the live REGISTERED_BINDINGS snapshot
-            // (what Windows actually accepted) and toggle the cheatsheet overlay.
-            if let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet() {
-                let raw = current_bindings();
-                let rows: Vec<(String, String)> = if raw.is_empty() {
-                    // Engine not yet registered — show hardcoded defaults.
-                    let prefix_name = engine
-                        .read()
-                        .full_config()
-                        .map(|c| mod_prefix_display_name(&c.input.mod_key))
-                        .unwrap_or_else(|| "Ctrl+Alt".to_string());
-                    crate::overlay::bindings_cheatsheet::default_bindings_table(&prefix_name)
-                } else {
-                    raw.iter()
-                        .map(|b| {
-                            let chord = crate::ipc::server::format_chord(b.modifiers, b.vk_code);
-                            let action = b.action.clone();
-                            (chord, action)
-                        })
-                        .collect()
-                };
-                info!("ShowKeyBindings: toggling cheatsheet ({} rows)", rows.len());
-                cs.toggle(rows);
-            } else {
-                info!("ShowKeyBindings: cheatsheet overlay not installed (main.rs wiring missing)");
-            }
+            show_hotkey_overlay(engine);
         }
     }
+}
+
+/// Toggle the "Important Hotkeys" sheet from the live registered bindings and the config's
+/// `hotkey-overlay` options.  Shared by the `show-hotkey-overlay` action and the startup path in
+/// `main` (nothing is on screen at startup, so there the toggle only opens it).  Returns how many
+/// rows the sheet has.
+pub fn show_hotkey_overlay(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> usize {
+    let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet() else {
+        info!("ShowKeyBindings: cheatsheet overlay not installed (main.rs wiring missing)");
+        return 0;
+    };
+    // Build a binding row list from the live REGISTERED_BINDINGS snapshot (what Windows actually
+    // accepted); `hide-not-bound` drops the essential actions that have no key.
+    let raw = current_bindings();
+    let (prefix, hide_not_bound) = engine
+        .read()
+        .full_config()
+        .map(|c| {
+            (
+                resolve_mod_prefix(&c.input.mod_key).0,
+                c.hotkey_overlay.hide_not_bound,
+            )
+        })
+        .unwrap_or((crate::input::DEFAULT_MOD_KEY, false));
+    let rows = crate::overlay::hotkey_rows::curated_rows(&raw, prefix, hide_not_bound);
+    info!(
+        "ShowKeyBindings: toggling cheatsheet with {} rows (hide-not-bound {})",
+        rows.len(),
+        hide_not_bound
+    );
+    let count = rows.len();
+    let was_visible = cs.is_visible();
+    cs.toggle(rows);
+    // niri announces the hotkey list when it opens (not when it closes).
+    if !was_visible {
+        crate::a11y::announce_hotkey_list();
+    }
+    count
+}
+
+/// Apply a niri size change to the window an action targets: a floating window is
+/// resized (proportions are of its monitor's work area), a tile changes the width of its
+/// column or its own height inside the column.
+fn change_size(
+    engine: &Arc<parking_lot::RwLock<TilingEngine>>,
+    backend: &BackendHandle,
+    target: Option<crate::layout::ActionTarget>,
+    axis: crate::layout::SizeAxis,
+    change: SizeChange,
+) {
+    match (float_of(target), axis) {
+        (Some(window), axis) => engine
+            .write()
+            .float_apply_size_change(window, axis, change, backend),
+        (None, crate::layout::SizeAxis::Width) => {
+            engine.write().set_column_width_by(change, backend)
+        }
+        (None, crate::layout::SizeAxis::Height) => {
+            engine.write().set_window_height_by(change, backend)
+        }
+    }
+}
+
+/// How far a floating window moves for one `move-column-left` / `move-column-right` /
+/// `move-window-up` / `move-window-down` (niri nudges by 50).
+const FLOAT_STEP_PX: i32 = 50;
+
+/// The floating window an action targets, if it targets one.
+fn float_of(target: Option<crate::layout::ActionTarget>) -> Option<crate::utils::WindowId> {
+    target.filter(|t| t.floating).map(|t| t.window)
 }
 
 /// Capture the foreground window's bounding rect via the shared helper in
@@ -1151,6 +1742,21 @@ fn take_window_screenshot() {
     }
 }
 
+/// An explicit display request must not flip a column already in that mode or reset its tab.
+fn set_column_display(engine: &mut TilingEngine, tabbed: bool, backend: &BackendHandle) {
+    let current = engine.monitors().focused().and_then(|monitor| {
+        let column = monitor.workspace()?.columns.get(monitor.focus_column?)?;
+        Some(matches!(
+            column.display,
+            crate::layout::ColumnDisplay::Tabbed { .. }
+        ))
+    });
+    if current.is_some_and(|current| current != tabbed) {
+        engine.toggle_tabbed_for_focused_column(backend);
+        engine.apply_all(backend);
+    }
+}
+
 /// Item 3: capture the full virtual desktop to a BMP file via the shared
 /// helper in `crate::hooks::capture_screenshot_to_pictures` so the hotkey
 /// path and the tray-menu path obey identical destination-resolution rules.
@@ -1161,86 +1767,287 @@ fn take_screenshot() {
     }
 }
 
-fn spawn_process(cmd: &str) {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.is_empty() { return; }
-    match std::process::Command::new(parts[0]).args(&parts[1..]).spawn() {
-        Ok(_) => info!("Spawned: {}", cmd),
-        Err(e) => warn!("Spawn failed: {}", e),
+/// Run a program with its arguments intact (`Action::Spawn`).  Goes through the
+/// one shared spawner, so bind, `spawn-at-startup` and IPC `spawn` all quote and
+/// search the PATH the same way.
+fn spawn_process(argv: &[String]) {
+    match crate::hooks::spawner::spawn_argv(argv) {
+        Ok(pid) => info!("Spawned {:?} (pid {})", argv, pid),
+        Err(e) => warn!("Spawn failed for {:?}: {}", argv, e),
     }
 }
 
-/// Launch a single command line through `cmd.exe /C "<command>"`.
+/// Launch a single command line through `cmd.exe /d /s /c "<command>"`.
 ///
-/// Used by `Action::SpawnCmd` and the IPC `SpawnCommand` shell path.  The
-/// shell expands env vars (`%USERPROFILE%`, etc.), recognises built-ins
-/// (`start`, redirection, `&&`), and resolves PATH lookups for callers
-/// that don't want to deal with `std::process::Command`'s argv parsing.
+/// Used by `Action::SpawnCmd`.  The shell expands env vars (`%USERPROFILE%`,
+/// etc.), recognises built-ins (`start`, redirection, `&&`) and resolves PATH
+/// lookups for callers that want those.  The shell itself runs without a
+/// console window; whatever it starts shows its own.
 fn spawn_shell_command(cmd: &str) {
     if cmd.trim().is_empty() {
         return;
     }
-    match std::process::Command::new("cmd.exe")
-        .args(["/C", cmd])
-        .spawn()
-    {
-        Ok(_) => info!("SpawnCmd (cmd.exe /C): {}", cmd),
-        Err(e) => warn!("SpawnCmd failed: {}", e),
+    match crate::hooks::spawner::spawn_shell(cmd) {
+        Ok(pid) => info!("SpawnCmd (cmd.exe /c): {} (pid {})", cmd, pid),
+        Err(e) => warn!("SpawnCmd failed for {:?}: {}", cmd, e),
     }
 }
 
-/// Convert a `mod-key` config string to a human-readable prefix label such as
-/// `"Ctrl+Alt"`.  Used by `ShowKeyBindings` to build the fallback default table
-/// when no live registered-bindings snapshot is available.
-fn mod_prefix_display_name(name: &str) -> String {
-    match name.trim().to_lowercase().as_str() {
-        "alt" => "Alt".to_string(),
-        "ctrl" | "control" => "Ctrl".to_string(),
-        "super" | "win" | "meta" => "Win".to_string(),
-        "win-alt" | "super-alt" | "meta-alt" => "Win+Alt".to_string(),
-        "ctrl-shift" => "Ctrl+Shift".to_string(),
-        _ => "Ctrl+Alt".to_string(),
-    }
-}
+/// What `Mod+Enter` launches when the config does not say: Windows Terminal,
+/// falling back to PowerShell, so the user is never dropped into a bare cmd.exe.
+const DEFAULT_TERMINAL_COMMAND: &str = "start wt.exe || start powershell.exe";
 
-/// Resolve the user's preferred "terminal" command, falling back to `cmd.exe`.
+/// Resolve the user's preferred "terminal" launch action.
 ///
 /// Looked up from the engine's full config in this order:
-/// 1. The first `Spawn(...)` entry in the configured binds (so a user bind
-///    `Mod+Enter { spawn "wt.exe" }` overrides cmd.exe automatically).
+/// 1. The first `spawn` / `spawn-cmd` bind (so a user bind
+///    `Mod+Enter { spawn "wt.exe" }` is also what the built-in default runs).
 /// 2. The first non-empty entry in `spawn_at_startup` (rare, but if a user
 ///    has only declared their terminal there we still find it).
-/// 3. Literal `"cmd.exe"`.
-fn resolve_terminal_command(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> String {
+/// 3. [`DEFAULT_TERMINAL_COMMAND`].
+fn resolve_terminal_action(engine: &Arc<parking_lot::RwLock<TilingEngine>>) -> Action {
     let eng = engine.read();
-    if let Some(cfg) = eng.full_config() {
-        // 1. Look for a Spawn / SpawnCmd bind in the config — either flavour
-        // is treated as the user's terminal-launch preference for the
-        // Mod+Enter default.
+    terminal_action_from_config(eng.full_config())
+}
+
+/// Pure core of [`resolve_terminal_action`].
+fn terminal_action_from_config(cfg: Option<&crate::config::Config>) -> Action {
+    if let Some(cfg) = cfg {
         for bind in &cfg.binds.hotkeys {
             match bind.parse_action() {
-                Some(Action::Spawn(cmd)) | Some(Action::SpawnCmd(cmd)) => {
-                    if !cmd.trim().is_empty() {
-                        return cmd;
-                    }
+                Some(Action::Spawn(argv)) if !argv.is_empty() => return Action::Spawn(argv),
+                Some(Action::SpawnCmd(cmd)) if !cmd.trim().is_empty() => {
+                    return Action::SpawnCmd(cmd)
                 }
                 _ => {}
             }
         }
-        // 2. Look at spawn-at-startup entries.
         if let Some(entry) = cfg.spawn_at_startup.iter().find(|e| !e.is_empty()) {
-            return entry.join(" ");
+            return Action::Spawn(entry.clone());
         }
     }
-    "cmd.exe".to_string()
+    Action::SpawnCmd(DEFAULT_TERMINAL_COMMAND.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_overview_open_reverses_close_and_is_idempotent() {
+        use crate::layout::Monitor;
+        use crate::overlay::MockThumbnailOverview;
+        use crate::utils::{OutputId, Rect};
+
+        let output = OutputId::from_name("explicit-overview-test");
+        let mut e = TilingEngine::new(Default::default());
+        e.monitors_mut().insert(
+            output,
+            Monitor::new(
+                output,
+                Rect::new(0, 0, 1366, 768),
+                Rect::new(0, 0, 1366, 728),
+            ),
+        );
+        e.monitors_mut().set_focused(output);
+        let sink = MockThumbnailOverview::new();
+        e.install_thumbnail_overview(sink.clone());
+        e.set_animation_notifier(Arc::new(tokio::sync::Notify::new()));
+        let engine = Arc::new(parking_lot::RwLock::new(e));
+        let backend = BackendHandle::default_for_test();
+        let quit_tx = Arc::new(Mutex::new(None));
+
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        assert_eq!(sink.enter_calls(), 1);
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(70, &backend);
+        let zoom = engine.read().overview_zoom();
+        assert!(zoom > 0.5 && zoom < 1.0);
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        assert_eq!(engine.read().overview_zoom(), zoom);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        assert!(engine.read().is_overview());
+        assert_eq!(engine.read().overview_zoom(), 0.5);
+        assert_eq!(sink.enter_calls(), 1);
+        assert_eq!(sink.exit_calls(), 0);
+        assert!(!engine.read().has_active_animations());
+    }
+
+    #[test]
+    fn explicit_overview_close_is_idempotent_while_the_camera_is_closing() {
+        use crate::layout::Monitor;
+        use crate::overlay::MockThumbnailOverview;
+        use crate::utils::{OutputId, Rect};
+
+        let output = OutputId::from_name("explicit-close-test");
+        let mut e = TilingEngine::new(Default::default());
+        e.monitors_mut().insert(
+            output,
+            Monitor::new(
+                output,
+                Rect::new(0, 0, 1366, 768),
+                Rect::new(0, 0, 1366, 728),
+            ),
+        );
+        e.monitors_mut().set_focused(output);
+        let sink = MockThumbnailOverview::new();
+        e.install_thumbnail_overview(sink.clone());
+        e.set_animation_notifier(Arc::new(tokio::sync::Notify::new()));
+        let engine = Arc::new(parking_lot::RwLock::new(e));
+        let backend = BackendHandle::default_for_test();
+        let quit_tx = Arc::new(Mutex::new(None));
+
+        // Closing something that is not open does nothing.
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        assert_eq!((sink.enter_calls(), sink.exit_calls()), (0, 0));
+        perform_action(&Action::OverviewOpen, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(40, &backend);
+        let first = engine.read().overview_zoom();
+        // A second close (Escape pressed twice, `close-overview` twice) keeps closing:
+        // it must not take the toggle path, which reverses a closing camera.
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(40, &backend);
+        assert!(engine.read().overview_zoom() > first, "still closing");
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        assert!(!engine.read().is_overview());
+        assert_eq!((sink.enter_calls(), sink.exit_calls()), (1, 1));
+        // A toggle while closing, in contrast, is the documented reversal.
+        perform_action(&Action::OverviewToggle, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        perform_action(&Action::OverviewExit, &engine, &backend, &quit_tx);
+        engine.write().tick_animations_with_backend(40, &backend);
+        perform_action(&Action::OverviewToggle, &engine, &backend, &quit_tx);
+        engine
+            .write()
+            .tick_animations_with_backend(60_000, &backend);
+        assert!(engine.read().is_overview(), "toggle reversed the close");
+        assert_eq!(engine.read().overview_zoom(), 0.5);
+        assert_eq!((sink.enter_calls(), sink.exit_calls()), (2, 1));
+    }
+
+    #[test]
+    fn explicit_column_display_is_idempotent_and_preserves_focus_and_tab_selection() {
+        use crate::layout::{Column, ColumnDisplay, Monitor, Tile};
+        use crate::utils::{OutputId, Rect, WindowId};
+
+        let output = OutputId::from_name("column-display-test");
+        let mut engine = TilingEngine::new(Default::default());
+        let backend = BackendHandle::default_for_test();
+        let mut monitor = Monitor::new(
+            output,
+            Rect::new(0, 0, 1366, 768),
+            Rect::new(0, 0, 1366, 728),
+        );
+        let mut column = Column::new();
+        for id in 1..=3 {
+            column.add_tile(Tile::new(WindowId::new(id)));
+        }
+        let mut other = Column::new();
+        other.add_tile(Tile::new(WindowId::new(4)));
+        other.switch_to_tabbed();
+        monitor.workspace_mut().unwrap().columns = vec![column, other];
+        monitor.set_focus(WindowId::new(2));
+        engine.monitors_mut().insert(output, monitor);
+        engine.monitors_mut().set_focused(output);
+
+        let snapshot = |engine: &TilingEngine| {
+            let monitor = engine.monitors().focused().unwrap();
+            let columns = &monitor.workspace().unwrap().columns;
+            (
+                columns[0].display.clone(),
+                columns[0].active_window(),
+                monitor.focus_window,
+                monitor.focus_column,
+                columns[1].display.clone(),
+            )
+        };
+        let initial = snapshot(&engine);
+        set_column_display(&mut engine, false, &backend);
+        set_column_display(&mut engine, false, &backend);
+        assert_eq!(snapshot(&engine), initial);
+
+        set_column_display(&mut engine, true, &backend);
+        assert_eq!(
+            snapshot(&engine),
+            (
+                ColumnDisplay::Tabbed { active_tab: 1 },
+                Some(WindowId::new(2)),
+                Some(WindowId::new(2)),
+                Some(0),
+                ColumnDisplay::Tabbed { active_tab: 0 },
+            )
+        );
+        engine.focused_column_next_tab(&backend);
+        let selected = snapshot(&engine);
+        assert_eq!(selected.0, ColumnDisplay::Tabbed { active_tab: 2 });
+        assert_eq!(selected.2, Some(WindowId::new(3)));
+        set_column_display(&mut engine, true, &backend);
+        set_column_display(&mut engine, true, &backend);
+        assert_eq!(snapshot(&engine), selected);
+
+        set_column_display(&mut engine, false, &backend);
+        let normal = snapshot(&engine);
+        assert_eq!(normal.0, ColumnDisplay::Stacked);
+        assert_eq!(normal.1, selected.1);
+        assert_eq!(normal.2, selected.2);
+        assert_eq!(normal.3, selected.3);
+        assert_eq!(normal.4, selected.4);
+        set_column_display(&mut engine, false, &backend);
+        assert_eq!(snapshot(&engine), normal);
+    }
+
+    #[test]
+    fn explicit_column_display_without_a_focused_column_is_a_noop() {
+        use crate::layout::Monitor;
+        use crate::utils::{OutputId, Rect};
+
+        let mut engine = TilingEngine::new(Default::default());
+        let backend = BackendHandle::default_for_test();
+        for tabbed in [true, false] {
+            set_column_display(&mut engine, tabbed, &backend);
+        }
+        assert!(engine.monitors().focused().is_none());
+
+        let output = OutputId::from_name("empty-column-display-test");
+        let monitor = Monitor::new(
+            output,
+            Rect::new(0, 0, 1366, 768),
+            Rect::new(0, 0, 1366, 728),
+        );
+        engine.monitors_mut().insert(output, monitor);
+        engine.monitors_mut().set_focused(output);
+        for focus_column in [None, Some(0), Some(9)] {
+            engine.monitors_mut().get_mut(&output).unwrap().focus_column = focus_column;
+            for tabbed in [true, false] {
+                set_column_display(&mut engine, tabbed, &backend);
+            }
+            let monitor = engine.monitors().focused().unwrap();
+            assert!(monitor.workspace().unwrap().columns.is_empty());
+            assert_eq!(monitor.focus_column, focus_column);
+            assert_eq!(monitor.focus_window, None);
+        }
+    }
+
     fn d(mods: u32, vk: u32, label: &str) -> (u32, u32, Action) {
-        (mods, vk, Action::Spawn(label.to_string()))
+        (mods, vk, Action::Spawn(vec![label.to_string()]))
+    }
+
+    fn spawn_of(label: &str) -> Action {
+        Action::Spawn(vec![label.to_string()])
     }
 
     /// extend_defaults=true preserves every default chord AND appends the
@@ -1255,9 +2062,9 @@ mod tests {
         let (merged, overridden) = merge_hotkeys(defaults, config, true);
         assert_eq!(overridden, 0);
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged[0].2, Action::Spawn("default-left".to_string()));
-        assert_eq!(merged[1].2, Action::Spawn("default-right".to_string()));
-        assert_eq!(merged[2].2, Action::Spawn("config-alt-p".to_string()));
+        assert_eq!(merged[0].2, spawn_of("default-left"));
+        assert_eq!(merged[1].2, spawn_of("default-right"));
+        assert_eq!(merged[2].2, spawn_of("config-alt-p"));
     }
 
     /// extend_defaults=true: config wins on a (mods, vk) collision; the
@@ -1270,7 +2077,7 @@ mod tests {
         let (merged, overridden) = merge_hotkeys(defaults, config, true);
         assert_eq!(overridden, 1);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].2, Action::Spawn("config-left".to_string()));
+        assert_eq!(merged[0].2, spawn_of("config-left"));
     }
 
     /// extend_defaults=false drops every default and uses the config table
@@ -1284,18 +2091,40 @@ mod tests {
         let config = vec![d(0x0001, 0x50, "config-alt-p")];
         let (merged, _overridden) = merge_hotkeys(defaults, config, false);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].2, Action::Spawn("config-alt-p".to_string()));
+        assert_eq!(merged[0].2, spawn_of("config-alt-p"));
     }
 
-    /// Empty config + extend=true returns defaults untouched (a fresh user
-    /// install or a config with only `binds { }` should still get every
-    /// shipped default).
+    /// Empty config + explicit extend=true returns defaults untouched.
     #[test]
     fn merge_empty_config_returns_defaults() {
         let defaults = vec![d(0x0002, 0x25, "default-left")];
         let (merged, overridden) = merge_hotkeys(defaults.clone(), vec![], true);
         assert_eq!(overridden, 0);
         assert_eq!(merged, defaults);
+    }
+
+    #[test]
+    fn runtime_builder_keeps_omitted_empty_and_pointer_only_tables_empty() {
+        for source in [
+            "",
+            "binds {}",
+            "binds { WheelScrollDown { close-window; }; }",
+        ] {
+            let config = crate::config::parse_kdl_config(source).unwrap();
+            let mut engine = TilingEngine::new(crate::layout::LayoutConfig::from_config(&config));
+            engine.set_full_config(config);
+            let (hotkeys, options) = build_hotkey_list(&Arc::new(parking_lot::RwLock::new(engine)));
+            assert!(hotkeys.is_empty(), "{source}");
+            assert!(options.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn empty_replacement_never_restores_defaults() {
+        let defaults = vec![d(MOD_CTRL | MOD_ALT, 0x51, "close")];
+        let (merged, overridden) = merge_hotkeys(defaults, vec![], false);
+        assert!(merged.is_empty());
+        assert_eq!(overridden, 0);
     }
 
     /// System-critical chords (Win+L, Win+Shift+S, Win+D) must be flagged by
@@ -1329,6 +2158,243 @@ mod tests {
         assert!(
             is_system_critical_hotkey(0, 0x4C).is_none(),
             "Bare L without Win is not a system-critical hotkey"
+        );
+    }
+
+    #[test]
+    fn bare_escape_for_overview_is_left_to_the_keyboard_hook() {
+        // The shipped config binds `Escape` to the overview toggle.  Registering it
+        // with RegisterHotKey makes Escape unusable in every other application.
+        assert!(is_overview_escape_binding(0, 0x1B, &Action::OverviewToggle));
+        assert!(is_overview_escape_binding(0, 0x1B, &Action::OverviewExit));
+        // A modified Escape (Ctrl+Alt+Escape) does not steal the plain key.
+        assert!(!is_overview_escape_binding(
+            MOD_CTRL | MOD_ALT,
+            0x1B,
+            &Action::OverviewToggle
+        ));
+        // Other actions on a bare Escape are the user's explicit choice.
+        assert!(!is_overview_escape_binding(0, 0x1B, &Action::CloseWindow));
+        // Another bare key bound to the overview toggle is not Escape.
+        assert!(!is_overview_escape_binding(
+            0,
+            0x20,
+            &Action::OverviewToggle
+        ));
+    }
+
+    /// Chords Windows keeps for itself.  `RegisterHotKey` refuses them (os error 1409) or the
+    /// system takes them first, so a default bind on one logged a warning at every start and
+    /// never fired.
+    const RESERVED_BY_WINDOWS: &[(u32, u32, &str)] = &[
+        (MOD_CTRL | MOD_ALT, 0x09, "Ctrl+Alt+Tab (task switcher)"),
+        (MOD_CTRL | MOD_ALT, 0x2E, "Ctrl+Alt+Delete"),
+        (MOD_CTRL | MOD_SHIFT, 0x1B, "Ctrl+Shift+Esc (task manager)"),
+        (MOD_ALT, 0x09, "Alt+Tab"),
+        (MOD_ALT, 0x73, "Alt+F4"),
+        (MOD_WIN, 0x4C, "Win+L"),
+    ];
+
+    #[test]
+    fn no_default_hotkey_is_a_chord_windows_keeps_for_itself() {
+        let terminal = Action::SpawnCmd("t".to_string());
+        for (prefix, shift_prefix) in [
+            (MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT),
+            (MOD_WIN | MOD_ALT, MOD_WIN | MOD_ALT | MOD_SHIFT),
+            (MOD_ALT, MOD_ALT | MOD_SHIFT),
+        ] {
+            for (mods, vk, action) in default_hotkeys(prefix, shift_prefix, terminal.clone()) {
+                for (reserved_mods, reserved_vk, label) in RESERVED_BY_WINDOWS {
+                    assert!(
+                        !(mods == *reserved_mods && vk == *reserved_vk),
+                        "the default bind for {:?} is {}, which Windows keeps for itself",
+                        action,
+                        label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_hotkeys_do_not_share_a_chord() {
+        // Two binds on one chord: the second registration fails at every start.
+        let terminal = Action::SpawnCmd("t".to_string());
+        let defaults =
+            default_hotkeys(MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT, terminal);
+        let mut seen = std::collections::HashSet::new();
+        for (mods, vk, action) in &defaults {
+            assert!(
+                seen.insert((*mods, *vk)),
+                "{:?} shares its chord (mods {:#x}, vk {:#x}) with another default bind",
+                action,
+                mods,
+                vk
+            );
+        }
+    }
+
+    #[test]
+    fn focus_previous_has_a_default_chord_that_registers() {
+        // niri's Mod+Tab is Windows' own task switcher with the Ctrl+Alt prefix: the default
+        // is the key above Tab (grave), and every other prefix gets it as well.
+        let terminal = Action::SpawnCmd("t".to_string());
+        let defaults =
+            default_hotkeys(MOD_CTRL | MOD_ALT, MOD_CTRL | MOD_ALT | MOD_SHIFT, terminal);
+        let chords: Vec<(u32, u32)> = defaults
+            .iter()
+            .filter(|(_, _, a)| *a == Action::FocusPrevious)
+            .map(|(m, v, _)| (*m, *v))
+            .collect();
+        assert_eq!(chords, vec![(MOD_CTRL | MOD_ALT, 0xC0)]);
+    }
+
+    fn bind(chord: &str, command: &str, args: &[&str]) -> crate::config::HotkeyBinding {
+        let mut parts: Vec<String> = chord.split('+').map(|s| s.to_string()).collect();
+        let key = parts.pop().unwrap_or_default();
+        crate::config::HotkeyBinding {
+            modifiers: parts,
+            key,
+            command: command.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            ..crate::config::HotkeyBinding::default()
+        }
+    }
+
+    #[test]
+    fn repeat_false_and_cooldown_decide_whether_a_press_fires() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let no_repeat = BindOptions {
+            no_repeat: true,
+            ..BindOptions::default()
+        };
+        assert!(
+            bind_may_fire(&no_repeat, false, None, t0),
+            "the first press fires"
+        );
+        assert!(
+            !bind_may_fire(&no_repeat, true, Some(t0), t0),
+            "auto-repeat does not"
+        );
+        let repeating = BindOptions::default();
+        assert!(
+            bind_may_fire(&repeating, true, Some(t0), t0),
+            "binds repeat by default"
+        );
+        let cooldown = BindOptions {
+            cooldown: Some(Duration::from_millis(150)),
+            ..BindOptions::default()
+        };
+        assert!(bind_may_fire(&cooldown, false, None, t0));
+        assert!(!bind_may_fire(
+            &cooldown,
+            false,
+            Some(t0),
+            t0 + Duration::from_millis(100)
+        ));
+        assert!(bind_may_fire(
+            &cooldown,
+            false,
+            Some(t0),
+            t0 + Duration::from_millis(150)
+        ));
+        // The options of a config bind are found again by the hotkey id.
+        let hotkeys = vec![
+            (MOD_CTRL | MOD_ALT, 0x54u32, Action::ToggleFloating),
+            (MOD_CTRL | MOD_ALT, 0x51u32, Action::CloseWindow),
+        ];
+        let mut options = HashMap::new();
+        options.insert((MOD_CTRL | MOD_ALT, 0x51u32), cooldown.clone());
+        let mut keys = keyboard::KeyboardEngine::default();
+        keys.configure(&hotkeys, &options);
+        let chord = (MOD_CTRL | MOD_ALT, 0x51);
+        assert_eq!(keys.fallback(chord, false, t0), Some(Action::CloseWindow));
+        assert!(keys.fallback(chord, false, t0).is_none());
+        // Different binds do not share their cooldown, even for the same action.
+        assert_eq!(
+            keys.fallback((MOD_CTRL | MOD_ALT, 0x54), false, t0),
+            Some(Action::ToggleFloating)
+        );
+    }
+
+    #[test]
+    fn the_overlay_shows_titles_and_hides_null_titles() {
+        let row = |vk: u32, action: &str, title: Option<Option<&str>>| RegisteredBinding {
+            id: 32768,
+            modifiers: MOD_CTRL | MOD_ALT,
+            vk_code: vk,
+            action: action.to_string(),
+            title: title.map(|t| t.map(|s| s.to_string())),
+        };
+        let rows = overlay_rows(&[
+            row(0x54, "SpawnCmd(\"wt\")", Some(Some("Open a Terminal"))),
+            row(0x51, "CloseWindow", None),
+            row(0x58, "Quit", Some(None)),
+        ]);
+        assert_eq!(rows.len(), 2, "the null title hides its bind: {:?}", rows);
+        assert_eq!(rows[0].1, "Open a Terminal");
+        assert_eq!(rows[1].1, "CloseWindow");
+    }
+
+    #[test]
+    fn a_bind_with_an_unknown_modifier_never_becomes_a_hotkey() {
+        let mod_key = MOD_CTRL | MOD_ALT;
+        // `Hyper+T` must not turn into a bare `T`.
+        let err = bind_to_hotkey(&bind("Hyper+T", "close-window", &[]), mod_key).unwrap_err();
+        assert!(err.contains("Hyper"), "{}", err);
+        // `Mod` is the configured prefix; `Mod+Shift` adds Shift.
+        assert_eq!(
+            bind_to_hotkey(&bind("Mod+T", "toggle-floating", &[]), mod_key),
+            Ok((MOD_CTRL | MOD_ALT, 0x54, Action::ToggleFloating))
+        );
+        assert_eq!(
+            bind_to_hotkey(&bind("Mod+Shift+T", "toggle-floating", &[]), MOD_WIN),
+            Ok((MOD_WIN | MOD_SHIFT, 0x54, Action::ToggleFloating))
+        );
+        // A bare key stays a bare key: that is a legitimate bind (the shipped Escape).
+        assert_eq!(
+            bind_to_hotkey(&bind("Escape", "overview-toggle", &[]), mod_key),
+            Ok((0, 0x1B, Action::OverviewToggle))
+        );
+        // Unknown key / action are still refused.
+        assert!(bind_to_hotkey(&bind("Mod+Nonsense", "quit", &[]), mod_key).is_err());
+        assert!(bind_to_hotkey(&bind("Mod+T", "no-such-action", &[]), mod_key).is_err());
+    }
+
+    #[test]
+    fn the_default_terminal_follows_the_config_and_never_is_a_bare_cmd() {
+        // No config at all: Windows Terminal, then PowerShell.
+        assert_eq!(
+            terminal_action_from_config(None),
+            Action::SpawnCmd(DEFAULT_TERMINAL_COMMAND.to_string())
+        );
+        let mut cfg = crate::config::Config::default();
+        assert_eq!(
+            terminal_action_from_config(Some(&cfg)),
+            Action::SpawnCmd(DEFAULT_TERMINAL_COMMAND.to_string())
+        );
+        // A `spawn` bind with arguments is used as the terminal, arguments intact.
+        cfg.binds.hotkeys.push(bind(
+            "Ctrl+Alt+Return",
+            "spawn",
+            &["wt.exe", "-d", "C:\\My Projects"],
+        ));
+        assert_eq!(
+            terminal_action_from_config(Some(&cfg)),
+            Action::Spawn(vec![
+                "wt.exe".to_string(),
+                "-d".to_string(),
+                "C:\\My Projects".to_string()
+            ])
+        );
+        // spawn-at-startup is the fallback when no bind spawns anything.
+        let mut cfg = crate::config::Config::default();
+        cfg.spawn_at_startup
+            .push(vec!["alacritty.exe".to_string(), "--hold".to_string()]);
+        assert_eq!(
+            terminal_action_from_config(Some(&cfg)),
+            Action::Spawn(vec!["alacritty.exe".to_string(), "--hold".to_string()])
         );
     }
 }

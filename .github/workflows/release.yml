@@ -1,0 +1,256 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to release (not a branch)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  resolve:
+    name: Validate and resolve tag before checkout
+    runs-on: windows-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
+      tag_sha: ${{ steps.tag.outputs.tag_sha }}
+    steps:
+      - name: Require an existing, filename-safe tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_AFTER: ${{ github.event.after }}
+          PUSH_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') { $env:INPUT_TAG } else { $env:PUSH_TAG }
+          # Keep this policy in sync with package-release.ps1. No checkout of unvalidated input.
+          if ($tag -cnotmatch '\Av[A-Za-z0-9._+-]{0,127}\z' -or
+              $tag.Contains('..') -or $tag.EndsWith('.') -or
+              $tag.EndsWith('.lock', [StringComparison]::OrdinalIgnoreCase)) {
+              throw 'Tag must be a filename-safe v* tag (1-128 ASCII characters, no ref metacharacters).'
+          }
+          git check-ref-format "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Invalid tag ref' }
+          # Require the exact tag ref, not a branch or a partial ref match.
+          $refJson = gh api "repos/$env:GH_REPO/git/ref/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect tag ref' }
+          $remoteRef = ($refJson -join "`n") | ConvertFrom-Json
+          if ($remoteRef.ref -cne "refs/tags/$tag" -or $remoteRef.object.sha -cnotmatch '\A[0-9a-f]{40}\z') {
+              throw 'Tag must already exist as an exact tag ref'
+          }
+          $tagSha = $remoteRef.object.sha
+          # The commits endpoint peels annotated tags to their commit. Pin both identities;
+          # checkout and publication reject a moved tag, even a replacement at the same commit.
+          $ref = [Uri]::EscapeDataString("refs/tags/$tag")
+          $sha = gh api "repos/$env:GH_REPO/commits/$ref" --jq '.sha'
+          if ($LASTEXITCODE -ne 0 -or $sha -cnotmatch '\A[0-9a-f]{40}\z') { throw 'Tag must already exist and resolve to a commit' }
+          # Push metadata can identify the commit or the unpeeled annotated-tag object.
+          if ($env:EVENT_NAME -eq 'push' -and
+              ($env:EVENT_REF -cne "refs/tags/$tag" -or
+               $env:EVENT_SHA -cnotin @($sha, $tagSha) -or
+               $env:EVENT_AFTER -cnotin @($sha, $tagSha))) {
+              throw 'Tag no longer matches the pushed ref'
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "tag_sha=$tagSha" >> $env:GITHUB_OUTPUT
+
+  build:
+    name: Native release (${{ matrix.target }})
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+      RELEASE_TAG_SHA: ${{ needs.resolve.outputs.tag_sha }}
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+
+      - name: Verify checked-out tag object and commit
+        run: |
+          $tagSha = git rev-parse --verify "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0 -or $tagSha -cne $env:RELEASE_TAG_SHA) { throw 'Tag object changed before checkout' }
+          $sha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $sha -cne $env:RELEASE_SHA) { throw 'Tag commit changed before checkout' }
+
+      - name: Install native Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-${{ matrix.target }}
+
+      - name: Require the exact native runner and rustc host
+        env:
+          RELEASE_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          $wantedArch = if ($env:RELEASE_TARGET -clike 'aarch64-*') { 'ARM64' } else { 'X64' }
+          if ($env:RELEASE_RUNNER_ARCH -cne $wantedArch) {
+              throw "Expected a native $wantedArch runner, got $env:RELEASE_RUNNER_ARCH"
+          }
+          $version = rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw 'rustc -vV failed' }
+          $hostLines = @($version | Where-Object { $_ -cmatch '^host: ' })
+          if ($hostLines.Count -ne 1 -or $hostLines[0] -cne "host: $env:RELEASE_TARGET") {
+              throw "Expected native rustc host $env:RELEASE_TARGET; got: $version"
+          }
+
+      - name: Cache cargo registry, git and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Reuse main's native cache, but never replace it from a release tag.
+          shared-key: ci-${{ matrix.target }}
+          save-if: 'false'
+
+      - name: Check release (warnings denied)
+        run: cargo check --release --all-targets -j 2 --locked
+
+      - name: Test packaging fixtures (no executable launch)
+        run: ./scripts/ci/test-package-release.ps1
+
+      - name: Native release tests
+        run: cargo test --release -j 2 --locked
+
+      - name: Build both release binaries (warnings denied)
+        run: cargo build --release -j 2 --locked
+
+      - name: Package native release
+        run: |
+          ./scripts/ci/package-release.ps1 -Bin target/release -Out .scratch/release -Tag $env:RELEASE_TAG -Target $env:RELEASE_TARGET
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            .scratch/release/*.zip
+            .scratch/release/*.zip.sha256
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    name: Attach packages to a draft release
+    needs: [resolve, build]
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # Serialize this workflow's uploads for a given validated tag; never cancel an upload.
+    concurrency:
+      group: release-${{ needs.resolve.outputs.tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+      RELEASE_TAG_SHA: ${{ needs.resolve.outputs.tag_sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: .scratch/release
+
+      - name: Recompute all checksums from downloaded ZIP bytes
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:GITHUB_WORKSPACE '.scratch/release'
+          $targets = @('aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc')
+          $names = @($targets | ForEach-Object { "wiri-$env:RELEASE_TAG-$_.zip" })
+          $downloaded = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.zip' | ForEach-Object { $_.Name })
+          if (@(Compare-Object -CaseSensitive $names $downloaded).Count -ne 0) { throw 'Unexpected or missing release ZIPs' }
+          $lines = foreach ($name in $names) {
+              $zip = Join-Path $dir $name
+              if ((Get-Item -LiteralPath $zip).Length -eq 0) { throw "Empty release ZIP: $name" }
+              $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+              $line = "$hash  $name"
+              # Do not trust incoming sidecars; replace them with hashes of downloaded bytes.
+              [IO.File]::WriteAllText("$zip.sha256", "$line`n", [Text.UTF8Encoding]::new($false))
+              $line
+          }
+          [IO.File]::WriteAllText((Join-Path $dir 'SHA256SUMS'), (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+
+      - name: Create or update only a draft for the unchanged tag
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-ReleaseForTag {
+              # Listing includes drafts and paginates; failures must not masquerade as "not found".
+              $json = gh api --paginate --slurp "repos/$env:GH_REPO/releases?per_page=100"
+              if ($LASTEXITCODE -ne 0) { throw 'Could not inspect existing releases' }
+              $pages = ($json -join "`n") | ConvertFrom-Json
+              $matches = @($pages | ForEach-Object {
+                  foreach ($release in $_) {
+                      if ($release.tag_name -ceq $env:RELEASE_TAG) { $release }
+                  }
+              })
+              if ($matches.Count -gt 1) { throw 'Multiple releases found for tag' }
+              if ($matches.Count -eq 1) {
+                  if (-not $matches[0].draft) { throw 'Refusing to mutate an existing published release' }
+                  $matches[0]
+              }
+          }
+          function Assert-TagUnchanged {
+              $refJson = gh api "repos/$env:GH_REPO/git/ref/tags/$env:RELEASE_TAG"
+              if ($LASTEXITCODE -ne 0) { throw 'Could not recheck tag ref' }
+              $remoteRef = ($refJson -join "`n") | ConvertFrom-Json
+              if ($remoteRef.ref -cne "refs/tags/$env:RELEASE_TAG" -or $remoteRef.object.sha -cne $env:RELEASE_TAG_SHA) {
+                  throw 'Tag object changed since the build was resolved'
+              }
+              $ref = [Uri]::EscapeDataString("refs/tags/$env:RELEASE_TAG")
+              $sha = gh api "repos/$env:GH_REPO/commits/$ref" --jq '.sha'
+              if ($LASTEXITCODE -ne 0 -or $sha -cne $env:RELEASE_SHA) { throw 'Tag changed since the build was resolved' }
+          }
+          $release = Get-ReleaseForTag
+          Assert-TagUnchanged
+          if ($null -eq $release) {
+              gh release create $env:RELEASE_TAG --repo $env:GH_REPO --target $env:RELEASE_SHA --verify-tag --draft --generate-notes
+              if ($LASTEXITCODE -ne 0) { throw 'Could not create draft release' }
+          }
+          # Recheck draft status immediately before any clobber, including on reruns.
+          $release = Get-ReleaseForTag
+          if ($null -eq $release) { throw 'Draft disappeared before upload' }
+          $dir = Join-Path $env:GITHUB_WORKSPACE '.scratch/release'
+          $assets = @('aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc') | ForEach-Object {
+              $zip = Join-Path $dir "wiri-$env:RELEASE_TAG-$_.zip"
+              $zip
+              "$zip.sha256"
+          }
+          $assets += Join-Path $dir 'SHA256SUMS'
+          Assert-TagUnchanged
+          gh release upload $env:RELEASE_TAG @assets --repo $env:GH_REPO --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not upload draft release assets' }

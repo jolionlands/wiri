@@ -62,7 +62,9 @@ struct AccentCache {
 
 impl AccentCache {
     const fn new() -> Self {
-        Self { cached: Mutex::new(None) }
+        Self {
+            cached: Mutex::new(None),
+        }
     }
 
     /// Returns the cached accent colour, refreshing through `reader` when
@@ -205,7 +207,10 @@ mod tests {
     }
     impl MockReader {
         fn new(value: Option<[u8; 4]>) -> Self {
-            Self { value, calls: Mutex::new(0) }
+            Self {
+                value,
+                calls: Mutex::new(0),
+            }
         }
         fn call_count(&self) -> u32 {
             *self.calls.lock()

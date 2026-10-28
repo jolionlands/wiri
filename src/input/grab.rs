@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use crate::utils::{Point, Rect, Size, WindowId};
 
 /// Edge of a window for resize grabs
@@ -26,17 +31,89 @@ pub struct MoveGrab {
     pub initial_size: Size,
     /// Column index when the grab started
     pub initial_column: usize,
+    /// Modifiers that owned this gesture. Releasing one cancels insertion.
+    required_modifiers: u32,
+    /// Shared by queued motion snapshots so cancellation cannot resurrect a hint.
+    cancelled: Arc<AtomicBool>,
+    /// Lifecycle invalidation also forbids queued cancellation from restoring a reused HWND.
+    source_invalidated: Arc<AtomicBool>,
+    /// Once the niri pull-out threshold is crossed, returning to the origin is still a drag.
+    drag_started: Arc<AtomicBool>,
 }
 
 impl MoveGrab {
-    pub fn new(window_id: WindowId, cursor: Point, window_pos: Point, initial_size: Size, column: usize) -> Self {
+    pub fn new(
+        window_id: WindowId,
+        cursor: Point,
+        window_pos: Point,
+        initial_size: Size,
+        column: usize,
+    ) -> Self {
         Self {
             window_id,
             initial_cursor: cursor,
             initial_window_pos: window_pos,
             initial_size,
             initial_column: column,
+            required_modifiers: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            source_invalidated: Arc::new(AtomicBool::new(false)),
+            drag_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_modifiers(mut self, modifiers: u32) -> Self {
+        self.required_modifiers = modifiers;
+        self
+    }
+
+    pub fn modifiers_released(&self, modifiers: u32) -> bool {
+        self.required_modifiers != 0
+            && modifiers & self.required_modifiers != self.required_modifiers
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn invalidate_source(&self) {
+        self.source_invalidated.store(true, Ordering::Release);
+        self.cancel();
+    }
+
+    pub(crate) fn can_restore_source(&self) -> bool {
+        !self.source_invalidated.load(Ordering::Acquire)
+    }
+
+    /// Call while holding the engine lock, including after waiting for that lock.
+    pub(crate) fn can_process(&self, tracked: bool, minimized: bool) -> bool {
+        !self.is_cancelled() && tracked && !minimized
+    }
+
+    pub(crate) fn same_gesture(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
+    /// niri layout/mod.rs: squared logical displacement must reach 256 * 256
+    /// before a tiled window leaves its slot. A click/sub-threshold move is not a drop.
+    pub(crate) fn tiled_drag_started(&self, cursor: Point, scale: f64) -> bool {
+        if !self.drag_started.load(Ordering::Acquire) {
+            let scale = if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            };
+            let dx = (cursor.x as f64 - self.initial_cursor.x as f64) / scale;
+            let dy = (cursor.y as f64 - self.initial_cursor.y as f64) / scale;
+            if dx * dx + dy * dy >= 256.0 * 256.0 {
+                self.drag_started.store(true, Ordering::Release);
+            }
+        }
+        self.drag_started.load(Ordering::Acquire)
     }
 
     /// Calculate the delta from the initial cursor position
@@ -198,7 +275,11 @@ pub struct ColumnReorderGrab {
 
 impl ColumnReorderGrab {
     pub fn new(window_id: WindowId, source_col: usize, cursor: Point) -> Self {
-        Self { window_id, source_col, initial_cursor: cursor }
+        Self {
+            window_id,
+            source_col,
+            initial_cursor: cursor,
+        }
     }
 }
 
@@ -206,7 +287,11 @@ impl ColumnReorderGrab {
 ///
 /// Returns `None` if the point lies outside the window rect entirely, preventing
 /// spurious edge matches (e.g. a point left of the window matching Top/Bottom).
-pub fn resize_edge_from_point(point: Point, window_rect: Rect, border_size: i32) -> Option<ResizeEdge> {
+pub fn resize_edge_from_point(
+    point: Point,
+    window_rect: Rect,
+    border_size: i32,
+) -> Option<ResizeEdge> {
     // Guard: reject points that are outside the window bounds.
     if point.x < window_rect.loc.x
         || point.x > window_rect.right()
@@ -223,23 +308,155 @@ pub fn resize_edge_from_point(point: Point, window_rect: Rect, border_size: i32)
     let near_bottom = point.y >= window_rect.bottom() - border && point.y <= window_rect.bottom();
 
     match (near_left, near_right, near_top, near_bottom) {
-            // Corners take priority (check first)
-            (true, _, true, _) => Some(ResizeEdge::TopLeft),
-            (_, true, true, _) => Some(ResizeEdge::TopRight),
-            (true, _, _, true) => Some(ResizeEdge::BottomLeft),
-            (_, true, _, true) => Some(ResizeEdge::BottomRight),
-            // Edges
-            (true, _, false, false) => Some(ResizeEdge::Left),
-            (_, true, false, false) => Some(ResizeEdge::Right),
-            (false, false, true, _) => Some(ResizeEdge::Top),
-            (false, false, _, true) => Some(ResizeEdge::Bottom),
-            _ => None,
-        }
+        // Corners take priority (check first)
+        (true, _, true, _) => Some(ResizeEdge::TopLeft),
+        (_, true, true, _) => Some(ResizeEdge::TopRight),
+        (true, _, _, true) => Some(ResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(ResizeEdge::BottomRight),
+        // Edges
+        (true, _, false, false) => Some(ResizeEdge::Left),
+        (_, true, false, false) => Some(ResizeEdge::Right),
+        (false, false, true, _) => Some(ResizeEdge::Top),
+        (false, false, _, true) => Some(ResizeEdge::Bottom),
+        _ => None,
+    }
+}
+
+/// Borders preserve their precise edge; client interior selects its nearest corner.
+pub fn resize_edge_or_quadrant(point: Point, rect: Rect, border: i32) -> Option<ResizeEdge> {
+    if let Some(edge) = resize_edge_from_point(point, rect, border) {
+        return Some(edge);
+    }
+    if point.x < rect.loc.x
+        || point.x > rect.right()
+        || point.y < rect.loc.y
+        || point.y > rect.bottom()
+    {
+        return None;
+    }
+    Some(
+        match (
+            point.x < rect.loc.x + rect.size.w as i32 / 2,
+            point.y < rect.loc.y + rect.size.h as i32 / 2,
+        ) {
+            (true, true) => ResizeEdge::TopLeft,
+            (false, true) => ResizeEdge::TopRight,
+            (true, false) => ResizeEdge::BottomLeft,
+            (false, false) => ResizeEdge::BottomRight,
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_cancellation_is_shared_by_queued_snapshots_and_tracks_own_modifiers() {
+        let grab = MoveGrab::new(
+            WindowId::new(1),
+            Point::default(),
+            Point::default(),
+            Size::new(400, 300),
+            0,
+        )
+        .with_modifiers(1);
+        let queued = grab.clone();
+        assert!(!grab.modifiers_released(1 | 2));
+        assert!(grab.modifiers_released(2));
+        assert!(!queued.is_cancelled());
+        grab.cancel();
+        assert!(queued.is_cancelled());
+        let multi = MoveGrab::new(
+            WindowId::new(1),
+            Point::default(),
+            Point::default(),
+            Size::new(400, 300),
+            0,
+        )
+        .with_modifiers(1 | 2);
+        assert!(multi.modifiers_released(1));
+        assert!(!multi.modifiers_released(1 | 2));
+    }
+
+    #[test]
+    fn queued_moves_require_a_live_source_and_lifecycle_invalidation_forbids_restore() {
+        let grab = MoveGrab::new(
+            WindowId::new(1),
+            Point::default(),
+            Point::default(),
+            Size::new(400, 300),
+            0,
+        );
+        let queued = grab.clone();
+        assert!(queued.can_process(true, false));
+        assert!(!queued.can_process(false, false));
+        assert!(!queued.can_process(true, true));
+        grab.cancel();
+        assert!(!queued.can_process(true, false));
+        assert!(
+            queued.can_restore_source(),
+            "Escape may restore the old slot"
+        );
+        grab.invalidate_source();
+        assert!(
+            !queued.can_restore_source(),
+            "destroy/minimize must not restore it"
+        );
+        let reused = MoveGrab::new(
+            grab.window_id,
+            Point::default(),
+            Point::default(),
+            Size::new(400, 300),
+            0,
+        );
+        assert!(grab.same_gesture(&queued));
+        assert!(!grab.same_gesture(&reused));
+        assert!(
+            !queued.can_process(true, false),
+            "retracking the HWND cannot revive it"
+        );
+        assert!(reused.can_process(true, false));
+    }
+
+    #[test]
+    fn tiled_move_threshold_is_logical_latched_and_shared_with_queued_release() {
+        let origin = Point::new(-400, 100);
+        let grab = MoveGrab::new(WindowId::new(1), origin, origin, Size::new(400, 300), 0);
+        let queued = grab.clone();
+        assert!(!grab.tiled_drag_started(origin, 1.5));
+        assert!(!grab.tiled_drag_started(Point::new(-17, 100), 1.5));
+        assert!(grab.tiled_drag_started(Point::new(-16, 100), 1.5));
+        assert!(
+            queued.tiled_drag_started(origin, 1.5),
+            "returning to origin remains a drag"
+        );
+        for scale in [0.0, f64::NAN, f64::INFINITY] {
+            let grab = MoveGrab::new(WindowId::new(1), origin, origin, Size::new(400, 300), 0);
+            assert!(!grab.tiled_drag_started(Point::new(-145, 100), scale));
+            assert!(grab.tiled_drag_started(Point::new(-144, 100), scale));
+        }
+        let diagonal = MoveGrab::new(WindowId::new(1), origin, origin, Size::new(400, 300), 0);
+        assert!(diagonal.tiled_drag_started(Point::new(-218, 282), 1.0));
+    }
+
+    #[test]
+    fn client_quadrants_choose_resize_corners_without_losing_edges() {
+        let rect = Rect::new(100, 100, 400, 300);
+        assert_eq!(
+            resize_edge_or_quadrant(Point::new(180, 180), rect, 4),
+            Some(ResizeEdge::TopLeft)
+        );
+        assert_eq!(
+            resize_edge_or_quadrant(Point::new(420, 320), rect, 4),
+            Some(ResizeEdge::BottomRight)
+        );
+        assert_eq!(
+            resize_edge_or_quadrant(Point::new(498, 220), rect, 4),
+            Some(ResizeEdge::Right)
+        );
+        assert_eq!(resize_edge_or_quadrant(Point::new(99, 180), rect, 4), None);
+    }
 
     #[test]
     fn test_move_grab_delta() {
@@ -418,5 +635,4 @@ mod tests {
         let target = grab.target_column(Point::new(50, 100), 500, 8, 5);
         assert_eq!(target, 0);
     }
-
 }

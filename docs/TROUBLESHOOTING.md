@@ -6,8 +6,10 @@ A grab-bag of issues you may hit and how to recover.
 
 ### "Another wiri instance is already running"
 
-The IPC named pipe at `\\.\pipe\wiri_control` is held by another process. If
-you're sure wiri isn't running, the pipe may be orphaned. Either:
+The IPC named pipe at `\\.\pipe\wiri_control_<user>_<session>` is held by another
+process.  The name carries the user and the session, so the other instance is one
+of your own, in the same session.  If you're sure wiri isn't running, the pipe may
+be orphaned. Either:
 
 ```pwsh
 wiri-ctl quit         # graceful shutdown of the other instance
@@ -15,7 +17,43 @@ wiri-ctl quit         # graceful shutdown of the other instance
 Get-Process wiri | Stop-Process
 ```
 
-Then start wiri again.
+Then start wiri again.  The name of the pipe wiri listens on is in the log
+(`IPC server starting on \\.\pipe\...`); `WIRI_PIPE` names another one.
+
+### Where is wiri's log?
+
+`wiri.exe` is a GUI-subsystem program: it has no console of its own, and
+starting it from Explorer, the Run key or a shell opens no extra window.  Its
+log is `%LOCALAPPDATA%\wiri\wiri.log`; the file is rotated at 4 MB and the
+previous log is kept as `wiri.log.1`.  `RUST_LOG` and `-v` change the level
+as before.
+
+To watch the log live, start wiri from a shell with `-v`: it attaches to that
+shell's console and shows the log there as well (closing that console then
+stops wiri).  `wiri.exe -v 2> out.log` redirects it to a file instead.  A plain
+`wiri` never attaches to a console.
+
+### wiri was killed and some windows disappeared
+
+Windows on other workspaces are hidden, and windows scrolled out of view are
+parked below the screen.  If wiri is killed or crashes meanwhile, they stay
+that way until wiri runs again.  Every hide is recorded in
+`%LOCALAPPDATA%\wiri\hidden.json` (with the process id and window class, so a
+recycled window handle is never touched).  Just start wiri again: it shows
+those windows before it enumerates the desktop and tiles everything.
+`wiri-ctl quit`, the tray menu and a panic do the same on the way out.  The same
+file also records where every managed window was before wiri first moved it, and
+a restarted wiri takes that over for the windows that are still there: `quit`
+after a kill or a crash puts them back in their real places.  A window whose
+place is not known and that an earlier killed wiri left off-screen is moved back
+onto the work area (several of them cascaded, not stacked).
+
+With `layout { hide-method "cloak" }` the windows of other workspaces are not hidden
+but cloaked (still in the taskbar and Alt+Tab, not drawn).  If wiri is killed meanwhile
+they stay cloaked; `hidden.json` marks them, and starting wiri again uncloaks them
+before it enumerates the desktop.  If Windows does not offer the shell interfaces
+cloaking needs, the log says "does not offer the shell interfaces" once and the
+windows are hidden the plain way.
 
 ### Known hotkey conflicts on Windows
 
@@ -26,7 +64,7 @@ common offenders:
 
 | Chord                  | Captured by                                  |
 |------------------------|----------------------------------------------|
-| `Ctrl+Alt+Tab`         | Windows task switcher (accessibility)        |
+| `Ctrl+Alt+Tab`         | Windows task switcher (accessibility); wiri's `focus-previous` is ``Ctrl+Alt+` `` instead |
 | `Ctrl+Alt+Arrows`      | Intel HD Graphics + AMD Radeon rotation hotkeys (driver-level — wiri can't take them back) |
 | `Win+anything`         | Windows shell reserves the Win modifier      |
 | `Win+L`                | Lock workstation (unconditional)             |
@@ -48,9 +86,11 @@ If a binding doesn't fire:
 
 The default config (`resources/default_config.kdl`) uses `Ctrl+Alt+Space` and
 `Escape` for the overview toggle rather than `Ctrl+Alt+Tab` for exactly this
-reason.  `Escape` is state-gated — it only fires the overview toggle when
-overview is already active, so it stays available to other apps in normal
-mode.
+reason.  `Escape` leaves overview (and resize mode) through wiri's low-level
+keyboard hook, which sees the key without taking it away from the focused
+application; it is deliberately *not* registered with `RegisterHotKey`, because
+a registered `Escape` would be swallowed in every application.  For the same
+reason it is not listed by `wiri-ctl test-bindings`.
 
 ### How to verify wiri received your keypress
 
@@ -63,8 +103,9 @@ Two tools help isolate "didn't fire" issues:
 
 2. **Verbose log of WM_HOTKEY dispatches** — restart wiri with
    `RUST_LOG=wiri::backend::message_loop=trace .\wiri.exe -v 2>wiri.log`.
-   Every received WM_HOTKEY prints an `HOTKEY id=…` line.  If no line shows
-   up when you press the chord, Windows is intercepting it before wiri.
+   Every received WM_HOTKEY prints an `HOTKEY id=…` line (they are also in
+   `%LOCALAPPDATA%\wiri\wiri.log`).  If no line shows up when you press the
+   chord, Windows is intercepting it before wiri.
 
 ### Hotkeys don't fire on ARM64
 
@@ -87,6 +128,22 @@ the underlying OS error. Common causes:
 
 A `wiri-ctl reload-config` still works.
 
+### "wiri: config error" balloon, or my changes are not applied
+
+The config file has an error, so wiri did not apply it (at startup it uses its defaults; after an edit the
+previous config stays).  The balloon, the log (`%LOCALAPPDATA%\wiri\wiri.log`) and
+`wiri-ctl validate-config` all say where: `...\config.kdl:12:5: error: unknown option 'gapz' in 'layout'
+(did you mean 'gaps'?)` is line 12, column 5.  Fix the line and save; wiri re-reads the file about 200 ms
+after the last change.  Typical causes:
+
+- A misspelled option, section or action name (the message suggests the closest one).
+- A Windows path in a string that does not start like a path: `spawn-sh "echo hi > C:\x.txt"` has the
+  escape `\x`; write `\\` or use a raw string `r#"echo hi > C:\x.txt"#`.
+- A `{` or a string that was never closed (the error points at the opening one).
+
+A *warning* does not stop the file from loading: it says what wiri ignores (a niri option wiri does not
+have, a bind that cannot work on Windows).  `wiri-ctl validate-config` lists them.
+
 ## Window behaviour
 
 ### A window keeps respawning at the wrong size
@@ -97,8 +154,9 @@ log lines like `auto-floated <hwnd> after 3 SetWindowPos failures`. Add a
 window rule to make this explicit:
 
 ```kdl
-window-rules {
-    class "ProblemApp" { float true }
+window-rule {
+    match app-id="^ProblemApp"
+    open-floating true
 }
 ```
 
@@ -113,6 +171,20 @@ layout {
     shadow-enable true
 }
 ```
+
+### Columns are narrower than expected, or windows overlap
+
+In the default `column-width-mode "proportional"` the screen is shared by at
+most `max-visible-columns` columns (default 3): one window fills the screen,
+two get halves, three get thirds, and further windows scroll in at a third.
+`max-visible-columns 0` restores the old behaviour (every window gets an equal
+share, down to `column-width / 2`).  Resize one column with
+`wiri-ctl set-column-width 1/2` (`1/3`, `2/3`, `full`, `cycle`, `50%`, ...).
+
+Some applications refuse to get narrower than a minimum width: Windows Terminal
+needs about 460 px, while three columns on a 1366 px display are about 430 px
+wide, so a terminal overlaps its neighbour.  Use `max-visible-columns 2` on
+small displays.
 
 ### Borders aren't coloured on Windows 10
 
@@ -146,6 +218,14 @@ wiri-ctl --timeout 30 state
 If wiri *is* running, look for a deadlock — check `wiri-ctl state` for
 suspicious `failed_position` entries or zero monitors.
 
+### `wiri-ctl ...` says "wiri is busy"
+
+wiri answers every request within 1.5 s.  This message means the engine lock
+was still held after that time, typically because a layout pass is waiting on
+an unresponsive window.  The request stays queued and takes effect when the
+lock is free; repeat the command.  `%LOCALAPPDATA%\wiri\wiri.log` has a
+`replying 'busy'` line each time it happens.
+
 ### JSON output instead of formatted text
 
 Add `--json` if you wanted that, omit it if you didn't. Default is
@@ -176,4 +256,4 @@ Open an issue at <https://github.com/jolionlands/wiri/issues> with:
 - wiri version output (`wiri --version`)
 - The full output of `wiri-ctl list-monitors`
 - A minimal config that reproduces the issue
-- The tail of `wiri_log.txt` (or stderr captured with `-v`)
+- The tail of `%LOCALAPPDATA%\wiri\wiri.log`

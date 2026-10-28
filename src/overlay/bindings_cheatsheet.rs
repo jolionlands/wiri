@@ -1,500 +1,464 @@
-//! Key-bindings cheatsheet overlay — a large layered window that lists all
-//! registered hotkeys in a two-column table.  Toggle on/off via
-//! `BindingsCheatsheet::toggle`; the overlay is transparent to input and never
-//! steals focus.
-//!
-//! The global singleton is installed once from `main.rs` via
-//! `set_global_cheatsheet` and retrieved inside `execute_action` via
-//! `get_global_cheatsheet`.
-
-use std::sync::Arc;
+//! Important Hotkeys: a lazy, monitor-local, non-activating help surface.
+//! No HWND, thread, timer or font survives dismissal. The existing input hooks
+//! dismiss it; the key that dismisses it (including its release) is consumed.
+use crate::utils::Rect;
 use parking_lot::Mutex;
-
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, SelectObject, SetBkMode, SetTextColor, HFONT,
-    PAINTSTRUCT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
-};
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, RegisterClassExW,
-    SetWindowPos, ShowWindow, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, MSG, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOWNOACTIVATE,
-    WNDCLASSEXW, WM_CREATE, WM_DESTROY, WM_PAINT,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+use std::sync::{
+    atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+    Arc,
 };
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    GetMonitorInfoW, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS,
+    DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    TRANSPARENT,
+};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::WindowsAndMessaging::*;
 
-// Overlay logical dimensions at 96 DPI baseline (scaled up for HiDPI).
-const OVERLAY_W: i32 = 560;
-const OVERLAY_H: i32 = 720;
-
-// Column layout within the overlay (left margin + widths).
-const COL_MARGIN: i32 = 18;
-const COL_CHORD_W: i32 = 200; // left column: chord string
-const COL_GAP: i32 = 12;
-const ROW_H: i32 = 22; // row height (logical px at 96 DPI)
-const TITLE_H: i32 = 38; // title row height
-const HEADER_H: i32 = 26; // column-header row height
-
-/// One row in the cheatsheet: (chord, action-description).
 pub type BindingRow = (String, String);
 
-/// State shared between the public API and the window procedure.
-struct CheatsheetState {
-    /// Whether the overlay is currently visible.
-    visible: Mutex<bool>,
-    /// Binding rows to render — swapped on every `toggle(true)` call.
-    bindings: Mutex<Vec<BindingRow>>,
-    /// Raw HWND as `isize` so the struct stays `Send`.
-    hwnd: Mutex<Option<isize>>,
+#[derive(Debug, Clone, Copy)]
+struct SheetLayout {
+    bounds: Rect,
+    scale: f64,
+    columns: usize,
+    rows: usize,
+    row_height: i32,
+    header: i32,
+    footer: i32,
 }
-
-/// Public handle to the cheatsheet overlay.
-///
-/// Create with `BindingsCheatsheet::new()`, then call `overlay.clone().spawn()`
-/// once from `main`.  Afterwards, call `overlay.toggle(rows)` to show or hide.
-pub struct BindingsCheatsheet {
-    state: Arc<CheatsheetState>,
-}
-
-impl BindingsCheatsheet {
-    pub fn new() -> Self {
+impl SheetLayout {
+    fn fit(work: Rect, scale: f64, count: usize) -> Self {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let s = |n: f64| (n * scale).round().max(1.0) as u32;
+        let margin = s(12.0).min(work.size.w / 8).min(work.size.h / 8);
+        let max_w = work.size.w.saturating_sub(2 * margin).max(1);
+        let max_h = work.size.h.saturating_sub(2 * margin).max(1);
+        let header = s(64.0).min(max_h / 3) as i32;
+        let footer = s(28.0).min(max_h / 4) as i32;
+        let row_height = s(23.0).min(max_h.saturating_sub((header + footer) as u32).max(1)) as i32;
+        let capacity = ((max_h as i32 - header - footer) / row_height).max(1) as usize;
+        let columns = if count > capacity && max_w >= s(850.0) {
+            2
+        } else {
+            1
+        };
+        let rows = count.div_ceil(columns).clamp(1, capacity);
+        let width = s(if columns == 1 { 720.0 } else { 1200.0 }).min(max_w);
+        let height = (header + footer + rows as i32 * row_height).max(1) as u32;
+        let height = height.min(max_h);
         Self {
-            state: Arc::new(CheatsheetState {
-                visible: Mutex::new(false),
-                bindings: Mutex::new(Vec::new()),
-                hwnd: Mutex::new(None),
-            }),
+            bounds: Rect::new(
+                work.loc.x + (work.size.w - width) as i32 / 2,
+                work.loc.y + (work.size.h - height) as i32 / 2,
+                width,
+                height,
+            ),
+            scale,
+            columns,
+            rows,
+            row_height,
+            header,
+            footer,
         }
     }
-
-    /// Toggle visibility.  When becoming visible, `bindings` replaces the
-    /// current row set and the window is shown.  When hiding, the window is
-    /// hidden (the rows are kept so a fast re-show avoids a re-query).
-    pub fn toggle(&self, bindings: Vec<BindingRow>) {
-        let mut vis = self.state.visible.lock();
-        *vis = !*vis;
-        let showing = *vis;
-        drop(vis);
-
-        if showing {
-            *self.state.bindings.lock() = bindings;
-        }
-
-        if let Some(raw) = *self.state.hwnd.lock() {
-            unsafe {
-                let hwnd = HWND(raw as *mut _);
-                if showing {
-                    reposition_center(hwnd);
-                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    // Force a repaint so the new bindings list is drawn.
-                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
-                } else {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
+    fn page_size(self) -> usize {
+        self.columns * self.rows
+    }
+}
+struct Session {
+    closed: AtomicBool,
+    hwnd: AtomicIsize,
+    page: AtomicUsize,
+    rows: Vec<BindingRow>,
+    layout: SheetLayout,
+}
+#[derive(Default)]
+pub struct BindingsCheatsheet {
+    session: Mutex<Option<Arc<Session>>>,
+}
+impl BindingsCheatsheet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn is_visible(&self) -> bool {
+        self.session
+            .lock()
+            .as_ref()
+            .is_some_and(|s| !s.closed.load(Ordering::Acquire))
+    }
+    pub fn dismiss(&self) {
+        if let Some(s) = self.session.lock().take() {
+            s.closed.store(true, Ordering::Release);
+            let hwnd = s.hwnd.load(Ordering::Acquire);
+            if hwnd != 0 {
+                unsafe {
+                    let _ = PostMessageW(HWND(hwnd as *mut _), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
             }
         }
     }
-
-    /// Spawn the background thread that owns the HWND and pumps its messages.
-    /// Drop the returned `JoinHandle` — the thread lives until process exit.
-    pub fn spawn(self: Arc<Self>) -> std::thread::JoinHandle<()> {
-        let state = self.state.clone();
-        std::thread::spawn(move || run_window_loop(state))
+    pub fn toggle(&self, rows: Vec<BindingRow>) {
+        if self.is_visible() {
+            self.dismiss();
+            return;
+        }
+        let (work, scale) = focused_work_area();
+        let session = Arc::new(Session {
+            closed: AtomicBool::new(false),
+            hwnd: AtomicIsize::new(0),
+            page: AtomicUsize::new(0),
+            layout: SheetLayout::fit(work, scale, rows.len()),
+            rows,
+        });
+        *self.session.lock() = Some(session.clone());
+        let failed = session.clone();
+        if std::thread::Builder::new()
+            .name("wiri-hotkeys".into())
+            .spawn(move || unsafe { run(session) })
+            .is_err()
+        {
+            failed.closed.store(true, Ordering::Release);
+        }
+    }
+    pub fn scroll(&self, backwards: bool) {
+        let guard = self.session.lock();
+        let Some(s) = guard.as_ref().filter(|s| !s.closed.load(Ordering::Acquire)) else {
+            return;
+        };
+        let pages = s.rows.len().div_ceil(s.layout.page_size()).max(1);
+        let page = s.page.load(Ordering::Relaxed);
+        let next = if backwards {
+            page.saturating_sub(1)
+        } else {
+            (page + 1).min(pages - 1)
+        };
+        s.page.store(next, Ordering::Relaxed);
+        let hwnd = s.hwnd.load(Ordering::Acquire);
+        if hwnd != 0 {
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(
+                    HWND(hwnd as *mut _),
+                    None,
+                    false,
+                );
+            }
+        }
     }
 }
-
-impl Default for BindingsCheatsheet {
-    fn default() -> Self {
-        Self::new()
+impl Drop for BindingsCheatsheet {
+    fn drop(&mut self) {
+        self.dismiss();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Global singleton (set by main.rs, read by message_loop execute_action)
-// ---------------------------------------------------------------------------
-
-static GLOBAL_CHEATSHEET: parking_lot::Mutex<Option<Arc<BindingsCheatsheet>>> =
-    parking_lot::const_mutex(None);
-
-/// Install the global cheatsheet singleton.  Call once from `main.rs` after
-/// creating the overlay.
+static GLOBAL_CHEATSHEET: Mutex<Option<Arc<BindingsCheatsheet>>> = parking_lot::const_mutex(None);
 pub fn set_global_cheatsheet(cs: Arc<BindingsCheatsheet>) {
     *GLOBAL_CHEATSHEET.lock() = Some(cs);
 }
-
-/// Retrieve the global cheatsheet (if installed).  Used by `execute_action`.
 pub fn get_global_cheatsheet() -> Option<Arc<BindingsCheatsheet>> {
     GLOBAL_CHEATSHEET.lock().clone()
 }
-
-// ---------------------------------------------------------------------------
-// Win32 helpers
-// ---------------------------------------------------------------------------
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn primary_monitor_scale() -> f64 {
-    let dpi = unsafe { GetDpiForSystem() };
-    if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 }
-}
-
-/// Move the overlay so it is centred on the primary monitor.
-fn reposition_center(hwnd: HWND) {
-    let scale = primary_monitor_scale();
-    let sw = (OVERLAY_W as f64 * scale) as i32;
-    let sh = (OVERLAY_H as f64 * scale) as i32;
-    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let x = (screen_w - sw) / 2;
-    let y = (screen_h - sh) / 2;
-    unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+static CONSUMED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+/// Runs before double-Alt, recent-windows and normal binding dispatch.
+pub fn dismiss_on_key(vk: u32, down: bool) -> bool {
+    let key = &CONSUMED[(vk & 255) as usize];
+    if key.load(Ordering::Relaxed) {
+        if !down {
+            key.store(false, Ordering::Relaxed);
+        }
+        return true;
     }
+    if down {
+        if let Some(cs) = get_global_cheatsheet().filter(|cs| cs.is_visible()) {
+            key.store(true, Ordering::Relaxed);
+            cs.dismiss();
+            return true;
+        }
+    }
+    false
 }
-
-// ---------------------------------------------------------------------------
-// Window loop (background thread)
-// ---------------------------------------------------------------------------
-
-fn run_window_loop(state: Arc<CheatsheetState>) {
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+fn focused_work_area() -> (Rect, f64) {
     unsafe {
-        let class_name = wide("WiriBindingsCheatsheet");
-        let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-            .expect("GetModuleHandleW failed");
-
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(wnd_proc),
-            hInstance: hinstance.into(),
-            lpszClassName: PCWSTR(class_name.as_ptr()),
+        let fg = GetForegroundWindow();
+        let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        RegisterClassExW(&wc);
-
-        let scale = primary_monitor_scale();
-        let sw = (OVERLAY_W as f64 * scale) as i32;
-        let sh = (OVERLAY_H as f64 * scale) as i32;
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let x = (screen_w - sw) / 2;
-        let y = (screen_h - sh) / 2;
-
-        let ex_style = WS_EX_LAYERED
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_TRANSPARENT;
-
-        let state_ptr = Arc::into_raw(state.clone()) as *mut CheatsheetState;
-
-        let hwnd = CreateWindowExW(
-            ex_style,
-            PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide("").as_ptr()),
-            WS_POPUP,
-            x, y, sw, sh,
-            None, None,
-            hinstance,
-            Some(state_ptr as *const _),
-        )
-        .expect("CreateWindowExW failed for BindingsCheatsheet");
-
-        // Set opacity to 220/255 (~86%) so the desktop shines through slightly.
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetLayeredWindowAttributes(
-            hwnd,
-            COLORREF(0),
-            220,
-            windows::Win32::UI::WindowsAndMessaging::LWA_ALPHA,
-        );
-
-        *state.hwnd.lock() = Some(hwnd.0 as isize);
-
-        // Start hidden; caller decides when to show.
-        let _ = ShowWindow(hwnd, SW_HIDE);
-
-        let mut msg = MSG::default();
-        loop {
-            let ret = GetMessageW(&mut msg, None, 0, 0);
-            if ret.0 <= 0 { break; }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let r = info.rcWork;
+            let dpi = GetDpiForWindow(fg).max(96);
+            (
+                Rect::new(
+                    r.left,
+                    r.top,
+                    (r.right - r.left).max(1) as u32,
+                    (r.bottom - r.top).max(1) as u32,
+                ),
+                dpi as f64 / 96.0,
+            )
+        } else {
+            (Rect::new(0, 0, 1366, 728), 1.0)
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Window procedure
-// ---------------------------------------------------------------------------
-
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA,
+unsafe fn run(session: Arc<Session>) {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    let Ok(instance) = GetModuleHandleW(None) else {
+        session.closed.store(true, Ordering::Release);
+        return;
     };
-
+    let class = wide("WiriBindingsCheatsheet");
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(wnd_proc),
+        hInstance: instance.into(),
+        lpszClassName: PCWSTR(class.as_ptr()),
+        ..Default::default()
+    };
+    RegisterClassExW(&wc); // Class already registered on later sessions.
+    let b = session.layout.bounds;
+    let hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        PCWSTR(class.as_ptr()),
+        PCWSTR(wide("Important Hotkeys").as_ptr()),
+        WS_POPUP,
+        b.loc.x,
+        b.loc.y,
+        b.size.w as i32,
+        b.size.h as i32,
+        None,
+        None,
+        instance,
+        Some(Arc::as_ptr(&session) as *const _),
+    );
+    let Ok(hwnd) = hwnd else {
+        session.closed.store(true, Ordering::Release);
+        return;
+    };
+    session.hwnd.store(hwnd.0 as isize, Ordering::Release);
+    if session.closed.load(Ordering::Acquire) {
+        let _ = DestroyWindow(hwnd);
+        return;
+    }
+    crate::window::block_out::apply_to(
+        crate::window::block_out::Overlay::HotkeyList,
+        hwnd.0 as isize,
+    );
+    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    let mut msg = MSG::default();
+    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    session.closed.store(true, Ordering::Release);
+    session.hwnd.store(0, Ordering::Release);
+}
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let create = &*(l.0 as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+    }
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Session;
+    if ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, w, l);
+    }
+    let s = &*ptr;
     match msg {
-        WM_CREATE => {
-            let cs = &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-            LRESULT(0)
-        }
-
         WM_PAINT => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CheatsheetState;
-            if ptr.is_null() {
-                return DefWindowProcW(hwnd, msg, wparam, lparam);
-            }
-            let state = &*ptr;
-
-            let bindings_guard = state.bindings.lock();
-            let rows: Vec<BindingRow> = bindings_guard.clone();
-            drop(bindings_guard);
-
-            let scale = primary_monitor_scale();
-            let win_w = (OVERLAY_W as f64 * scale) as i32;
-            let win_h = (OVERLAY_H as f64 * scale) as i32;
-
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-
-            // ---- Background ----
-            let bg_brush = CreateSolidBrush(COLORREF(0x00_1E_1E_1E));
-            let mut full_rc = RECT { left: 0, top: 0, right: win_w, bottom: win_h };
-            FillRect(hdc, &full_rc, bg_brush);
-            let _ = DeleteObject(bg_brush);
-
-            // ---- Helper: scale logical px ----
-            let s = |px: i32| -> i32 { (px as f64 * scale) as i32 };
-
-            SetBkMode(hdc, TRANSPARENT);
-
-            // ---- Title ----
-            let title_font: HFONT = CreateFontW(
-                -(s(17)),
-                0, 0, 0,
-                700, // FW_BOLD
-                0, 0, 0, 1, 0, 0, 0, 0,
-                PCWSTR(wide("Segoe UI").as_ptr()),
-            );
-            let body_font: HFONT = CreateFontW(
-                -(s(13)),
-                0, 0, 0,
-                400, // FW_NORMAL
-                0, 0, 0, 1, 0, 0, 0, 0,
-                PCWSTR(wide("Segoe UI").as_ptr()),
-            );
-            let header_font: HFONT = CreateFontW(
-                -(s(12)),
-                0, 0, 0,
-                600, // semi-bold
-                0, 0, 0, 1, 0, 0, 0, 0,
-                PCWSTR(wide("Segoe UI").as_ptr()),
-            );
-
-            let old_font = SelectObject(hdc, title_font);
-            SetTextColor(hdc, COLORREF(0x00_FF_FF_FF));
-            let title_margin = s(COL_MARGIN);
-            let title_h_px = s(TITLE_H);
-            let mut title_rc = RECT {
-                left: title_margin,
-                top: 0,
-                right: win_w - title_margin,
-                bottom: title_h_px,
-            };
-            let mut title_text = "wiri key bindings".encode_utf16().collect::<Vec<u16>>();
-            let _ = DrawTextW(hdc, &mut title_text, &mut title_rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-            // ---- Divider line under title ----
-            let div_brush = CreateSolidBrush(COLORREF(0x00_44_44_44));
-            let div_rc = RECT {
-                left: title_margin,
-                top: title_h_px,
-                right: win_w - title_margin,
-                bottom: title_h_px + 1,
-            };
-            FillRect(hdc, &div_rc, div_brush);
-            let _ = DeleteObject(div_brush);
-
-            // ---- Column headers ----
-            let header_top = title_h_px + s(4);
-            let header_bot = header_top + s(HEADER_H);
-            SelectObject(hdc, header_font);
-            SetTextColor(hdc, COLORREF(0x00_88_88_88));
-
-            let col1_x = title_margin;
-            let col2_x = col1_x + s(COL_CHORD_W) + s(COL_GAP);
-
-            let mut hdr1 = "Chord".encode_utf16().collect::<Vec<u16>>();
-            let mut rc_hdr1 = RECT { left: col1_x, top: header_top, right: col1_x + s(COL_CHORD_W), bottom: header_bot };
-            let _ = DrawTextW(hdc, &mut hdr1, &mut rc_hdr1, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-            let mut hdr2 = "Action".encode_utf16().collect::<Vec<u16>>();
-            let mut rc_hdr2 = RECT { left: col2_x, top: header_top, right: win_w - title_margin, bottom: header_bot };
-            let _ = DrawTextW(hdc, &mut hdr2, &mut rc_hdr2, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-            // ---- Divider below headers ----
-            let div2_brush = CreateSolidBrush(COLORREF(0x00_33_33_33));
-            let div2_rc = RECT {
-                left: title_margin,
-                top: header_bot,
-                right: win_w - title_margin,
-                bottom: header_bot + 1,
-            };
-            FillRect(hdc, &div2_rc, div2_brush);
-            let _ = DeleteObject(div2_brush);
-
-            // ---- Binding rows ----
-            SelectObject(hdc, body_font);
-            let row_h_px = s(ROW_H);
-            let rows_start_y = header_bot + s(4);
-            let max_rows = ((win_h - rows_start_y - s(8)) / row_h_px).max(0) as usize;
-
-            for (i, (chord, action)) in rows.iter().take(max_rows).enumerate() {
-                let row_y = rows_start_y + (i as i32) * row_h_px;
-
-                // Alternate row background for readability
-                if i % 2 == 0 {
-                    let row_brush = CreateSolidBrush(COLORREF(0x00_28_28_28));
-                    let row_bg = RECT {
-                        left: 0,
-                        top: row_y,
-                        right: win_w,
-                        bottom: row_y + row_h_px,
-                    };
-                    FillRect(hdc, &row_bg, row_brush);
-                    let _ = DeleteObject(row_brush);
-                }
-
-                // Chord (left column, muted cyan)
-                SetTextColor(hdc, COLORREF(0x00_88_DD_CC));
-                let mut chord_text = chord.encode_utf16().collect::<Vec<u16>>();
-                let mut rc_chord = RECT {
-                    left: col1_x,
-                    top: row_y,
-                    right: col1_x + s(COL_CHORD_W),
-                    bottom: row_y + row_h_px,
-                };
-                let _ = DrawTextW(hdc, &mut chord_text, &mut rc_chord, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-                // Action (right column, white)
-                SetTextColor(hdc, COLORREF(0x00_DD_DD_DD));
-                let mut action_text = action.encode_utf16().collect::<Vec<u16>>();
-                let mut rc_action = RECT {
-                    left: col2_x,
-                    top: row_y,
-                    right: win_w - title_margin,
-                    bottom: row_y + row_h_px,
-                };
-                let _ = DrawTextW(hdc, &mut action_text, &mut rc_action, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            }
-
-            // ---- Footer ----
-            let footer_y = win_h - s(22);
-            SelectObject(hdc, header_font);
-            SetTextColor(hdc, COLORREF(0x00_55_55_55));
-            let mut footer_text = "Press prefix+? again to close".encode_utf16().collect::<Vec<u16>>();
-            let mut rc_footer = RECT {
-                left: title_margin,
-                top: footer_y,
-                right: win_w - title_margin,
-                bottom: win_h,
-            };
-            let _ = DrawTextW(hdc, &mut footer_text, &mut rc_footer, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-            // Clean up fonts
-            SelectObject(hdc, old_font);
-            let _ = DeleteObject(title_font);
-            let _ = DeleteObject(body_font);
-            let _ = DeleteObject(header_font);
-
-            let _ = EndPaint(hwnd, &ps);
+            paint(hwnd, s);
             LRESULT(0)
         }
-
+        WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_CLOSE => {
+            s.closed.store(true, Ordering::Release);
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CheatsheetState;
-            if !ptr.is_null() {
-                drop(Arc::from_raw(ptr));
-            }
-            windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+            s.hwnd.store(0, Ordering::Release);
+            PostQuitMessage(0);
             LRESULT(0)
         }
-
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        WM_NCDESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
+unsafe fn text(dc: HDC, value: &str, mut rect: RECT, color: u32) {
+    SetTextColor(dc, COLORREF(color));
+    let mut value: Vec<u16> = value.encode_utf16().collect();
+    DrawTextW(
+        dc,
+        &mut value,
+        &mut rect,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+    );
+}
+unsafe fn paint(hwnd: HWND, s: &Session) {
+    let g = s.layout;
+    let width = g.bounds.size.w as i32;
+    let height = g.bounds.size.h as i32;
+    let mut ps = PAINTSTRUCT::default();
+    let dc = BeginPaint(hwnd, &mut ps);
+    let brush = CreateSolidBrush(COLORREF(0x00201c1c));
+    FillRect(
+        dc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+        brush,
+    );
+    let _ = DeleteObject(brush);
+    SetBkMode(dc, TRANSPARENT);
+    let font = CreateFontW(
+        -(13.0 * g.scale).round().max(9.0) as i32,
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        PCWSTR(wide("Segoe UI").as_ptr()),
+    );
+    let title = CreateFontW(
+        -(19.0 * g.scale).round().max(10.0) as i32,
+        0,
+        0,
+        0,
+        600,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        PCWSTR(wide("Segoe UI").as_ptr()),
+    );
+    let old = SelectObject(dc, title);
+    let margin = (16.0 * g.scale).round() as i32;
+    text(
+        dc,
+        "Important Hotkeys",
+        RECT {
+            left: margin,
+            top: 0,
+            right: width - margin,
+            bottom: g.header,
+        },
+        0x00ffffff,
+    );
+    SelectObject(dc, font);
+    let page_size = g.page_size();
+    let first = s.page.load(Ordering::Relaxed) * page_size;
+    for (index, (chord, desc)) in s.rows.iter().skip(first).take(page_size).enumerate() {
+        let column = index / g.rows;
+        let row = index % g.rows;
+        let col_width = width / g.columns as i32;
+        let x = column as i32 * col_width + margin;
+        let y = g.header + row as i32 * g.row_height;
+        let split = x + (col_width * 40 / 100);
+        text(
+            dc,
+            chord,
+            RECT {
+                left: x,
+                top: y,
+                right: split - 8,
+                bottom: y + g.row_height,
+            },
+            0x00ccddee,
+        );
+        text(
+            dc,
+            desc,
+            RECT {
+                left: split,
+                top: y,
+                right: (column as i32 + 1) * col_width - margin,
+                bottom: y + g.row_height,
+            },
+            0x00eeeeee,
+        );
+    }
+    let pages = s.rows.len().div_ceil(page_size).max(1);
+    let footer = if pages > 1 {
+        format!(
+            "Any key or click to close  |  Wheel: page {}/{}",
+            first / page_size + 1,
+            pages
+        )
+    } else {
+        "Any key or click to close".into()
+    };
+    text(
+        dc,
+        &footer,
+        RECT {
+            left: margin,
+            top: height - g.footer,
+            right: width - margin,
+            bottom: height,
+        },
+        0x00aaaaaa,
+    );
+    SelectObject(dc, old);
+    let _ = DeleteObject(font);
+    let _ = DeleteObject(title);
+    let _ = EndPaint(hwnd, &ps);
+}
 
-// ---------------------------------------------------------------------------
-// Default bindings table (fallback when engine has no config binds)
-// ---------------------------------------------------------------------------
-
-/// Human-readable default binding table matching `default_hotkeys` in
-/// `message_loop.rs`.  `prefix_name` is a label like `"Ctrl+Alt"` used as
-/// the modifier prefix in the chord column.
-pub fn default_bindings_table(prefix_name: &str) -> Vec<BindingRow> {
-    let p = prefix_name;
-    let s = format!("{}+Shift", p);
-    vec![
-        (format!("{}+Left", p),         "focus-column-left".into()),
-        (format!("{}+Right", p),        "focus-column-right".into()),
-        (format!("{}+Up", p),           "focus-up".into()),
-        (format!("{}+Down", p),         "focus-down".into()),
-        (format!("{}+Left", s),         "move-column-left".into()),
-        (format!("{}+Right", s),        "move-column-right".into()),
-        (format!("{}+Q", p),            "close-window".into()),
-        (format!("{}+Enter", p),        "spawn (terminal)".into()),
-        (format!("{}+F", p),            "toggle-fullscreen".into()),
-        (format!("{}+T", p),            "toggle-floating".into()),
-        (format!("{}+H", p),            "scroll-left".into()),
-        (format!("{}+L", p),            "scroll-right".into()),
-        (format!("{}+Q", s),            "quit".into()),
-        (format!("{}+Space", p),        "overview-toggle".into()),
-        ("Escape".into(),               "overview-select / exit-resize".into()),
-        (format!("{}+O", p),            "overview-select".into()),
-        (format!("{}+\\", p),           "column-toggle-tabbed".into()),
-        (format!("{}+]", p),            "tab-next".into()),
-        (format!("{}+[", p),            "tab-prev".into()),
-        (format!("{}+1…9", p),          "focus-workspace-N".into()),
-        (format!("{}+1…9", s),          "move-to-workspace-N".into()),
-        (format!("{}+PageUp", p),       "focus-workspace-previous".into()),
-        (format!("{}+PageDown", p),     "focus-workspace-next".into()),
-        (format!("{}+R", p),            "enter-resize-mode".into()),
-        (format!("{}+R", s),            "center-column".into()),
-        (format!("{}+W", p),            "column-width-cycle".into()),
-        (format!("{}+-", p),            "resize-column-left".into()),
-        (format!("{}++", p),            "resize-column-right".into()),
-        (format!("{}+Tab", p),          "focus-previous (alt-tab)".into()),
-        (format!("{}+P", p),            "screenshot".into()),
-        (format!("{}+A", p),            "toggle-always-on-top".into()),
-        (format!("{}+,", p),            "consume-window-into-column".into()),
-        (format!("{}+.", p),            "expel-window-from-column".into()),
-        (format!("{}+E", p),            "expand-column-to-available".into()),
-        (format!("{}+F", s),            "maximize-column".into()),
-        (format!("{}+L", s),            "grow-column-width".into()),
-        (format!("{}+H", s),            "shrink-column-width".into()),
-        (format!("{}+K", s),            "grow-tile-height".into()),
-        (format!("{}+J", s),            "shrink-tile-height".into()),
-        (format!("{}+PageUp", s),       "move-workspace-up".into()),
-        (format!("{}+PageDown", s),     "move-workspace-down".into()),
-        (format!("{}+Up", s),           "move-column-to-workspace-up".into()),
-        (format!("{}+Down", s),         "move-column-to-workspace-down".into()),
-        (format!("{}+,", s),            "move-column-to-monitor-left".into()),
-        (format!("{}+.", s),            "move-column-to-monitor-right".into()),
-        (format!("{}+S", p),            "toggle-sticky".into()),
-        (format!("{}+?", s),            "show-key-bindings (this overlay)".into()),
-    ]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_dpi_and_negative_monitor_fits_with_no_dropped_page_rows() {
+        for dpi in [1.0, 1.25, 1.5, 2.0] {
+            for count in [0, 15, 24, 50, 250] {
+                let work = Rect::new(-1366, 32, 1366, 696);
+                let g = SheetLayout::fit(work, dpi, count);
+                assert!(g.bounds.loc.x >= work.loc.x && g.bounds.right() <= work.right());
+                assert!(g.bounds.loc.y >= work.loc.y && g.bounds.bottom() <= work.bottom());
+                assert!(g.page_size() > 0);
+                assert!(
+                    g.header + g.footer + g.rows as i32 * g.row_height <= g.bounds.size.h as i32
+                );
+                assert!(g.page_size() * count.div_ceil(g.page_size()) >= count);
+            }
+        }
+    }
+    #[test]
+    fn unused_overlay_allocates_no_host_and_dismiss_is_idempotent() {
+        let cs = BindingsCheatsheet::new();
+        assert!(!cs.is_visible());
+        cs.dismiss();
+        cs.dismiss();
+        assert!(cs.session.lock().is_none());
+    }
 }

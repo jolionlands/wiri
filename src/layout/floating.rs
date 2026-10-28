@@ -1,9 +1,8 @@
+use crate::utils::{Point, Rect, Size, WindowId};
 use std::collections::HashMap;
-use crate::utils::{Rect, Size, WindowId, Point};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsWindow, SetWindowPos, HWND_TOP,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE,
+    IsWindow, SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
 };
 
 /// PiP corner snap destinations (Item 3 — niri-parity).
@@ -102,9 +101,16 @@ impl FloatManager {
             if !IsWindow(hwnd).as_bool() {
                 return false;
             }
-            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-                .is_ok()
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .is_ok()
         }
     }
 
@@ -142,10 +148,7 @@ impl FloatManager {
     ) -> Rect {
         let margin: i32 = 24;
         let (x, y) = match corner {
-            FloatingCorner::TopLeft => (
-                work_rect.loc.x + margin,
-                work_rect.loc.y + margin,
-            ),
+            FloatingCorner::TopLeft => (work_rect.loc.x + margin, work_rect.loc.y + margin),
             FloatingCorner::TopRight => (
                 work_rect.loc.x + work_rect.size.w as i32 - win_size.w as i32 - margin,
                 work_rect.loc.y + margin,
@@ -223,8 +226,14 @@ mod tests {
         fm.insert(WindowId::new(1), Rect::new(0, 0, 100, 100));
         fm.insert(WindowId::new(2), Rect::new(200, 200, 100, 100));
 
-        assert_eq!(fm.find_window_at(Point::new(50, 50)), Some(WindowId::new(1)));
-        assert_eq!(fm.find_window_at(Point::new(250, 250)), Some(WindowId::new(2)));
+        assert_eq!(
+            fm.find_window_at(Point::new(50, 50)),
+            Some(WindowId::new(1))
+        );
+        assert_eq!(
+            fm.find_window_at(Point::new(250, 250)),
+            Some(WindowId::new(2))
+        );
         assert_eq!(fm.find_window_at(Point::new(150, 150)), None);
     }
 

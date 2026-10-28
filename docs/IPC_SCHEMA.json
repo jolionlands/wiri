@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jolionlands/wiri/raw/main/docs/IPC_SCHEMA.json",
   "title": "wiri IPC protocol",
-  "description": "JSON Schema for every IpcMessage request and IpcEvent variant in the wiri window manager named-pipe IPC. Both types use serde adjacent tagging: {\"type\": \"<variant>\", \"data\": {...}}.",
-  "version": "1.0",
+  "description": "wiri IPC 1.3: adjacent-tagged IpcMessage/IpcEvent and external NiriRequest/NiriReply/NiriEvent dialects. One UTF-8 JSON value per line, multiple requests per connection. The per-user/session named pipe is \\\\.\\pipe\\wiri_control_<user>_<session>; WIRI_PIPE overrides it. Unknown fields are generally ignored; unsupported variants and invalid fields return recoverable errors. Output actions validate strictly.",
+  "version": "1.3",
   "$defs": {
 
     "WindowInfoIpc": {
@@ -33,6 +33,156 @@
       }
     },
 
+    "WindowLayoutIpc": {
+      "type": "object",
+      "description": "Logical geometry before offscreen parking; sizes and offsets use output-scale logical pixels. window_size includes native Win32 decorations, not wiri's inset.",
+      "required": ["pos_in_scrolling_layout", "tile_size", "window_size", "tile_pos_in_workspace_view", "window_offset_in_tile"],
+      "properties": {
+        "pos_in_scrolling_layout": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 1 } }
+          ]
+        },
+        "tile_size": { "$ref": "#/$defs/LogicalPair" },
+        "window_size": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 0 } },
+        "tile_pos_in_workspace_view": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/LogicalPair" }] },
+        "window_offset_in_tile": { "$ref": "#/$defs/LogicalPair" }
+      }
+    },
+    "LogicalPair": {
+      "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number" }
+    },
+    "FocusTimestamp": {
+      "description": "Daemon-local monotonic duration since startup; null until managed-window focus is observed. Not wall time or comparable across restarts.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object", "required": ["secs", "nanos"],
+          "properties": {
+            "secs": { "type": "integer", "minimum": 0 },
+            "nanos": { "type": "integer", "minimum": 0, "maximum": 999999999 }
+          }
+        }
+      ]
+    },
+    "KeyboardLayoutsIpc": {
+      "type": "object", "required": ["names", "current_idx"],
+      "description": "Loaded layouts in OS order and foreground-thread index. Empty list uses index 0; names are localized when available, otherwise an honest HKL label.",
+      "properties": {
+        "names": { "type": "array", "items": { "type": "string" } },
+        "current_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "OutputModeIpc": {
+      "type": "object", "required": ["width", "height", "refresh_rate", "is_preferred"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "refresh_rate": { "type": "integer", "minimum": 1, "description": "Millihertz, preserving rational fractional rates." },
+        "is_preferred": { "type": "boolean" }
+      }
+    },
+    "LogicalOutputIpc": {
+      "type": "object", "required": ["x", "y", "width", "height", "scale", "transform"],
+      "properties": {
+        "x": { "type": "integer", "description": "Engine origin in Windows virtual-desktop coordinates." },
+        "y": { "type": "integer" },
+        "width": { "type": "integer", "minimum": 0, "description": "Output width divided by layout scale, rounded." },
+        "height": { "type": "integer", "minimum": 0 },
+        "scale": { "type": "number", "exclusiveMinimum": 0 },
+        "transform": { "enum": [null, "Normal", "90", "180", "270"] }
+      }
+    },
+    "OutputIpc": {
+      "type": "object",
+      "description": "Active Windows output. Unknown hardware fields (including VRR/max_bpc) are null; absent identity strings are empty.",
+      "required": ["name", "make", "model", "serial", "physical_size", "modes", "current_mode", "vrr_supported", "vrr_enabled", "max_bpc", "logical"],
+      "properties": {
+        "name": { "type": "string" },
+        "make": { "type": "string" },
+        "model": { "type": "string" },
+        "serial": { "type": "string" },
+        "physical_size": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 1 }, "description": "Width and height in millimetres." }
+          ]
+        },
+        "modes": { "type": "array", "items": { "$ref": "#/$defs/OutputModeIpc" } },
+        "current_mode": { "type": ["integer", "null"], "minimum": 0, "description": "Index into modes, or null when no current mode was reported." },
+        "vrr_supported": { "type": ["boolean", "null"] },
+        "vrr_enabled": { "type": ["boolean", "null"] },
+        "max_bpc": { "type": ["integer", "null"], "minimum": 0 },
+        "logical": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/LogicalOutputIpc" }] }
+      },
+      "examples": [{
+        "name": "DISPLAY1", "make": "", "model": "", "serial": "", "physical_size": null,
+        "modes": [{ "width": 1366, "height": 768, "refresh_rate": 59940, "is_preferred": true }],
+        "current_mode": 0, "vrr_supported": null, "vrr_enabled": null, "max_bpc": null,
+        "logical": { "x": 0, "y": 0, "width": 1366, "height": 768, "scale": 1.0, "transform": "Normal" }
+      }]
+    },
+    "OutputMap": { "type": "object", "additionalProperties": { "$ref": "#/$defs/OutputIpc" } },
+    "PickedColor": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object", "required": ["rgb"],
+          "description": "SDR desktop sRGB only; HDR conversion is not supported.",
+          "properties": { "rgb": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number", "minimum": 0, "maximum": 1 } } }
+        }
+      ]
+    },
+    "OutputsResponse": { "type": "object", "required": ["outputs"], "properties": { "outputs": { "$ref": "#/$defs/OutputMap" } } },
+    "FocusedOutputResponse": { "type": "object", "required": ["focused_output"], "properties": { "focused_output": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OutputIpc" }] } } },
+    "KeyboardLayoutsResponse": { "type": "object", "required": ["keyboard_layouts"], "properties": { "keyboard_layouts": { "$ref": "#/$defs/KeyboardLayoutsIpc" } } },
+    "PickWindowResponse": { "type": "object", "required": ["window"], "properties": { "window": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/WindowIpc" }] } } },
+    "PickColorResponse": { "type": "object", "required": ["color"], "properties": { "color": { "$ref": "#/$defs/PickedColor" } } },
+    "OutputResponse": { "type": "object", "required": ["output", "temporary"], "properties": { "output": { "type": "string" }, "temporary": { "const": true } } },
+
+    "WindowIpc": {
+      "type": "object",
+      "description": "A window as the event stream describes it: niri's Window, plus what wiri adds (class_name, output, is_fullscreen, is_maximized, is_minimized).",
+      "required": [
+        "id", "title", "app_id", "pid", "workspace_id", "is_focused", "is_floating", "is_urgent", "layout", "focus_timestamp",
+        "class_name", "output", "is_fullscreen", "is_maximized", "is_minimized"
+      ],
+      "properties": {
+        "id":           { "type": "integer", "minimum": 0, "description": "The window handle (HWND) as a number; what --id takes in run_action." },
+        "title":        { "type": ["string", "null"], "description": "The title; null while the window has none." },
+        "app_id":       { "type": ["string", "null"], "description": "File name of the window's program (WindowsTerminal.exe); null when it cannot be read." },
+        "pid":          { "type": ["integer", "null"], "minimum": 0 },
+        "workspace_id": { "type": ["integer", "null"], "minimum": 0, "description": "The workspace the window is on (WorkspaceIpc.id)." },
+        "is_focused":   { "type": "boolean", "description": "The window has the keyboard focus." },
+        "is_floating":  { "type": "boolean" },
+        "is_urgent":    { "type": "boolean" },
+        "layout":       { "$ref": "#/$defs/WindowLayoutIpc" },
+        "focus_timestamp": { "$ref": "#/$defs/FocusTimestamp" },
+        "class_name":   { "type": "string", "description": "Win32 window class." },
+        "output":       { "type": ["string", "null"], "description": "Device name of the monitor the window is on (\\\\.\\DISPLAY1)." },
+        "is_fullscreen": { "type": "boolean" },
+        "is_maximized":  { "type": "boolean", "description": "Maximized to the edges of the work area (niri maximize-window-to-edges)." },
+        "is_minimized":  { "type": "boolean" }
+      }
+    },
+
+    "WorkspaceIpc": {
+      "type": "object",
+      "description": "A workspace as the event stream describes it: niri's Workspace.",
+      "required": ["id", "idx", "name", "output", "is_urgent", "is_active", "is_focused", "active_window_id"],
+      "properties": {
+        "id":        { "type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Unique among all workspaces of all monitors, stable while the workspace exists, small enough for a JavaScript number." },
+        "idx":       { "type": "integer", "minimum": 1, "description": "Number of the workspace on its monitor, counted from 1 at the top: what focus-workspace 2 means." },
+        "name":      { "type": ["string", "null"] },
+        "output":    { "type": ["string", "null"], "description": "Device name of the monitor the workspace is on." },
+        "is_urgent": { "type": "boolean" },
+        "is_active": { "type": "boolean", "description": "The active workspace of its monitor." },
+        "is_focused": { "type": "boolean", "description": "The active workspace of the focused monitor." },
+        "active_window_id": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+
     "MonitorInfo": {
       "type": "object",
       "description": "Per-monitor diagnostics returned by monitor_list.",
@@ -43,6 +193,7 @@
       ],
       "properties": {
         "output_id":         { "type": "integer", "description": "Deterministic 64-bit name hash (OutputId)." },
+        "name":              { "type": "string",  "description": "Windows device name of the monitor (\\\\.\\DISPLAY1), as open-on-output names it; empty when the engine was not told." },
         "bounds_x":          { "type": "integer", "description": "Left edge of physical screen rect." },
         "bounds_y":          { "type": "integer", "description": "Top edge of physical screen rect." },
         "bounds_width":      { "type": "integer", "minimum": 0 },
@@ -76,8 +227,59 @@
       "description": "Generic success response with no result payload.",
       "required": ["success"],
       "properties": {
+        "schema_version": { "type": "string" },
         "success": { "const": true },
         "result":  {}
+      }
+    },
+
+    "WorkspacesResponse": {
+      "type": "object",
+      "description": "The result of the workspaces request: the workspaces of every monitor, in niri's shape.",
+      "required": ["workspaces"],
+      "properties": {
+        "workspaces": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceIpc" } }
+      }
+    },
+
+    "WindowsResponse": {
+      "type": "object",
+      "description": "The result of the windows request: every window wiri manages, in niri's shape.",
+      "required": ["windows"],
+      "properties": {
+        "windows": { "type": "array", "items": { "$ref": "#/$defs/WindowIpc" } }
+      }
+    },
+
+    "FocusedWindowResponse": {
+      "type": "object",
+      "description": "The result of the focused_window request: the focused window, or null when no managed window has the focus.",
+      "required": ["focused_window"],
+      "properties": {
+        "focused_window": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/WindowIpc" }
+          ]
+        }
+      }
+    },
+
+    "OverviewStateResponse": {
+      "type": "object",
+      "description": "The result of the overview_state request.",
+      "required": ["is_open"],
+      "properties": {
+        "is_open": { "type": "boolean", "description": "True while the overview is open." }
+      }
+    },
+
+    "VersionResponse": {
+      "type": "object",
+      "description": "The result of the version request: the version of the running daemon.",
+      "required": ["version"],
+      "properties": {
+        "version": { "type": "string", "description": "The crate version, and the commit it was built from when there is one." }
       }
     },
 
@@ -86,6 +288,7 @@
       "description": "Error response returned when the daemon cannot fulfil a request.",
       "required": ["success", "error"],
       "properties": {
+        "schema_version": { "type": "string" },
         "success": { "const": false },
         "error":   { "type": "string", "description": "Human-readable error description." }
       }
@@ -117,9 +320,78 @@
       "description": "Direction to an adjacent monitor."
     },
 
+    "NiriRequest": {
+      "description": "Externally tagged requests; supported typed Action and Output variants use PascalCase. Unknown requests receive Err without disconnecting.",
+      "oneOf": [
+        { "type": "string", "enum": ["Version", "Outputs", "Workspaces", "Windows", "KeyboardLayouts", "FocusedOutput", "FocusedWindow", "PickWindow", "PickColor", "EventStream", "ReturnError", "OverviewState"] },
+        { "type": "object", "minProperties": 1, "maxProperties": 1, "properties": { "Action": {"type": ["object", "string"]}, "Output": {"type": "object"} }, "additionalProperties": false }
+      ],
+      "examples": [
+        "Outputs", "FocusedOutput", "KeyboardLayouts", "PickWindow", "PickColor", "ReturnError", "EventStream",
+        { "Action": { "SetColumnWidth": { "change": { "AdjustProportion": 0.1 }, "id": 42 } } },
+        { "Output": { "output": "DISPLAY1", "action": { "Scale": { "scale": 1.25 } } } }
+      ]
+    },
+    "NiriReply": {
+      "oneOf": [
+        { "type": "object", "required": ["Ok"], "properties": {"Ok": { "$ref": "#/$defs/NiriResponse" }}, "additionalProperties": false },
+        { "type": "object", "required": ["Err"], "properties": {"Err": {"type": "string"}}, "additionalProperties": false }
+      ],
+      "examples": [
+        { "Ok": { "KeyboardLayouts": { "names": ["US"], "current_idx": 0 } } },
+        { "Ok": { "PickedWindow": null } },
+        { "Ok": { "PickedColor": { "rgb": [1.0, 0.5, 0.0] } } },
+        { "Ok": { "OutputConfigChanged": "Applied" } },
+        { "Err": "example error requested by ReturnError" }
+      ]
+    },
+    "NiriResponse": {
+      "oneOf": [
+        { "const": "Handled" },
+        {
+          "type": "object", "minProperties": 1, "maxProperties": 1, "additionalProperties": false,
+          "properties": {
+            "Version": { "type": "string" },
+            "Windows": { "type": "array", "items": { "$ref": "#/$defs/WindowIpc" } },
+            "Workspaces": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceIpc" } },
+            "FocusedWindow": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/WindowIpc" }] },
+            "Outputs": { "$ref": "#/$defs/OutputMap" },
+            "FocusedOutput": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OutputIpc" }] },
+            "KeyboardLayouts": { "$ref": "#/$defs/KeyboardLayoutsIpc" },
+            "OverviewState": { "$ref": "#/$defs/OverviewStateResponse" },
+            "PickedWindow": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/WindowIpc" }] },
+            "PickedColor": { "$ref": "#/$defs/PickedColor" },
+            "OutputConfigChanged": { "const": "Applied" }
+          }
+        }
+      ]
+    },
+    "NiriEvent": {
+      "description": "External event names; data has the corresponding IpcEvent data shape (including additive wiri window fields). Wiri-only variants are omitted.",
+      "type": "object", "minProperties": 1, "maxProperties": 1,
+      "propertyNames": {
+        "enum": ["WorkspacesChanged", "WorkspaceUrgencyChanged", "WorkspaceActivated", "WorkspaceActiveWindowChanged", "WindowsChanged", "WindowOpenedOrChanged", "WindowClosed", "WindowFocusChanged", "WindowFocusTimestampChanged", "WindowUrgencyChanged", "WindowLayoutsChanged", "KeyboardLayoutsChanged", "KeyboardLayoutSwitched", "OverviewOpenedOrClosed", "ConfigLoaded", "ScreenshotCaptured"]
+      },
+      "additionalProperties": { "type": "object" },
+      "examples": [
+        { "WindowFocusTimestampChanged": { "id": 42, "focus_timestamp": { "secs": 1, "nanos": 234 } } },
+        { "KeyboardLayoutsChanged": { "keyboard_layouts": { "names": ["US", "Dvorak"], "current_idx": 0 } } },
+        { "KeyboardLayoutSwitched": { "idx": 1 } },
+        { "WindowLayoutsChanged": { "changes": [[42, { "pos_in_scrolling_layout": [1, 1], "tile_size": [640.0, 704.0], "window_size": [638, 702], "tile_pos_in_workspace_view": [12.0, 12.0], "window_offset_in_tile": [1.0, 1.0] }]] } }
+      ]
+    },
+
     "IpcMessage": {
       "description": "Any request sent from a client to the wiri daemon.",
       "oneOf": [
+        {"type":"object","required":["type"],"properties":{"type":{"const":"outputs"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"focused_output"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"keyboard_layouts"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"pick_window"}}},
+        {"type":"object","required":["type"],"properties":{"type":{"const":"pick_color"}}},
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"output"},"data":{"type":"object","required":["output","action"],"properties":{"output":{"type":"string"},"action":{"type":["object","string"]}}}}},
+
+        {"type":"object","required":["type"],"properties":{"type":{"const":"return_error"}}},
 
         {
           "description": "Force a window into the tiling layout. Un-floats it if floating. Optionally moves it to the named workspace.",
@@ -478,7 +750,37 @@
             "data": {
               "type": "object",
               "required": ["command"],
-              "properties": { "command": { "type": "string", "description": "Command line to execute." } }
+              "properties": {
+                "command": { "type": "string", "description": "The program, or (when args is empty) a whole command line split with the Windows quoting rules." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments, each passed through intact. Optional." }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "Run any action by its niri name, as if its key were pressed (also accepted with type \"action\" and the name under \"action\").",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "enum": ["run_action", "action"] },
+            "data": {
+              "type": "object",
+              "anyOf": [ { "required": ["name"] }, { "required": ["action"] } ],
+              "properties": {
+                "name": { "type": "string", "description": "Action name, e.g. focus-column-left." },
+                "action": { "type": "string", "description": "Alias of name." },
+                "args": {
+                  "type": "array",
+                  "items": { "type": ["string", "number", "boolean"] },
+                  "description": "The words after the action name in a binds line; a number or a boolean stands for its text. niri's --id <hwnd> (or --window-id) names the window to act on. Optional."
+                },
+                "quoted": {
+                  "type": "array",
+                  "items": { "type": "boolean" },
+                  "description": "quoted[i] says that args[i] was written in double quotes: focus-workspace 2 is the second workspace, focus-workspace \"2\" the workspace named 2. Optional."
+                }
+              }
             }
           }
         },
@@ -652,7 +954,7 @@
         },
 
         {
-          "description": "Capture a wiri-tracked window to a BMP file using PrintWindow(PW_RENDERFULLCONTENT).",
+          "description": "Capture a wiri-tracked window to PNG and the clipboard using WGC with PrintWindow fallback.",
           "type": "object",
           "required": ["type", "data"],
           "properties": {
@@ -662,7 +964,7 @@
               "required": ["window_hwnd"],
               "properties": {
                 "window_hwnd": { "type": "integer", "description": "Must be tracked by wiri." },
-                "path": { "type": ["string", "null"], "description": "Output BMP path; null = Pictures folder default." }
+                "path": { "type": ["string", "null"], "description": "Output PNG path; null = screenshot-path setting (Pictures default or clipboard-only)." }
               }
             }
           }
@@ -791,7 +1093,7 @@
         },
 
         {
-          "description": "Capture a window (or the focused window) to a BMP file. Less restricted than capture_window.",
+          "description": "Capture a window (or the focused window) to PNG and the clipboard, using WGC with PrintWindow fallback. Less restricted than capture_window.",
           "type": "object",
           "required": ["type"],
           "properties": {
@@ -825,17 +1127,70 @@
           "type": "object",
           "required": ["type"],
           "properties": { "type": { "const": "get_bindings" } }
+        },
+
+        {
+          "description": "niri Workspaces: the workspaces of every monitor, in niri's shape. Answered from the engine's current state.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "workspaces" } }
+        },
+
+        {
+          "description": "niri Windows: the windows wiri manages, in niri's shape. Answered from the engine's current state.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "windows" } }
+        },
+
+        {
+          "description": "niri FocusedWindow: the window that has the keyboard focus, in niri's shape (null when no managed window has it).",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "focused_window" } }
+        },
+
+        {
+          "description": "niri OverviewState: whether the overview is open.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "overview_state" } }
+        },
+
+        {
+          "description": "niri Version: the version of the running daemon.",
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "version" } }
         }
 
       ]
     },
 
     "IpcEvent": {
-      "description": "Any event emitted by the wiri daemon to active subscribe_events subscribers.",
+      "description": "Any event emitted by the wiri daemon to active subscribe_events subscribers. A new subscriber is first told the state: workspaces_changed, windows_changed, overview_opened_or_closed, keyboard_layouts_changed and config_loaded, in that order (niri's event stream), then what changes.",
       "oneOf": [
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"window_focus_timestamp_changed"},"data":{"type":"object","required":["id","focus_timestamp"],"properties":{"id":{"type":"integer","minimum":0},"focus_timestamp":{"$ref":"#/$defs/FocusTimestamp"}}}}},
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"keyboard_layouts_changed"},"data":{"type":"object","required":["keyboard_layouts"],"properties":{"keyboard_layouts":{"$ref":"#/$defs/KeyboardLayoutsIpc"}}}}},
+        {"type":"object","required":["type","data"],"properties":{"type":{"const":"keyboard_layout_switched"},"data":{"type":"object","required":["idx"],"properties":{"idx":{"type":"integer","minimum":0}}}}},
+
 
         {
-          "description": "Emitted when the set of workspaces changes (create, delete, or rename).",
+          "description": "A screenshot was copied to the clipboard; path is null for clipboard-only or when saving failed.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "screenshot_captured" },
+            "data": {
+              "type": "object",
+              "required": ["path"],
+              "properties": { "path": { "type": ["string", "null"] } }
+            }
+          }
+        },
+
+        {
+          "description": "niri WorkspacesChanged: the workspaces were created, removed, renamed, moved or reordered. The full list replaces what the client knew.",
           "type": "object",
           "required": ["type", "data"],
           "properties": {
@@ -846,8 +1201,153 @@
               "properties": {
                 "workspaces": {
                   "type": "array",
-                  "items": { "$ref": "#/$defs/WorkspaceInfo" }
+                  "items": { "$ref": "#/$defs/WorkspaceIpc" }
                 }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri WorkspaceUrgencyChanged: a window of the workspace asked for attention, or the last one that did stopped.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "workspace_urgency_changed" },
+            "data": {
+              "type": "object",
+              "required": ["id", "urgent"],
+              "properties": {
+                "id":     { "type": "integer", "minimum": 0 },
+                "urgent": { "type": "boolean" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri WorkspaceActiveWindowChanged: the window that is the active one of the workspace changed.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "workspace_active_window_changed" },
+            "data": {
+              "type": "object",
+              "required": ["workspace_id", "active_window_id"],
+              "properties": {
+                "workspace_id":     { "type": "integer", "minimum": 0 },
+                "active_window_id": { "type": ["integer", "null"], "minimum": 0 }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri WindowsChanged: every window wiri manages; replaces what the client knew. Part of what a new subscriber is told first.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "windows_changed" },
+            "data": {
+              "type": "object",
+              "required": ["windows"],
+              "properties": {
+                "windows": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/WindowIpc" }
+                }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri WindowOpenedOrChanged: a window appeared, or its title, application, workspace, floating state, fullscreen, maximized or minimized state changed. Focus, urgency and the place in the strip have events of their own.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_opened_or_changed" },
+            "data": {
+              "type": "object",
+              "required": ["window"],
+              "properties": {
+                "window": { "$ref": "#/$defs/WindowIpc" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri WindowFocusChanged: the window that has the keyboard focus changed (null: a window wiri does not manage has it, or none).",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_focus_changed" },
+            "data": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {
+                "id": { "type": ["integer", "null"], "minimum": 0 }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri WindowUrgencyChanged: the window asks for attention, or stopped.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_urgency_changed" },
+            "data": {
+              "type": "object",
+              "required": ["id", "urgent"],
+              "properties": {
+                "id":     { "type": "integer", "minimum": 0 },
+                "urgent": { "type": "boolean" }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri WindowLayoutsChanged: the places of windows in their strips changed.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "window_layouts_changed" },
+            "data": {
+              "type": "object",
+              "required": ["changes"],
+              "properties": {
+                "changes": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "prefixItems": [
+                      { "type": "integer", "minimum": 0, "description": "Window id." },
+                      { "$ref": "#/$defs/WindowLayoutIpc" }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        {
+          "description": "niri OverviewOpenedOrClosed.",
+          "type": "object",
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "overview_opened_or_closed" },
+            "data": {
+              "type": "object",
+              "required": ["is_open"],
+              "properties": {
+                "is_open": { "type": "boolean" }
               }
             }
           }
@@ -870,7 +1370,7 @@
         },
 
         {
-          "description": "Emitted when a tiled window is destroyed or removed from the layout.",
+          "description": "niri WindowClosed: a window wiri managed is gone, destroyed or taken out of the layout. window_hwnd and id are the same number.",
           "type": "object",
           "required": ["type", "data"],
           "properties": {
@@ -879,23 +1379,25 @@
               "type": "object",
               "required": ["window_hwnd"],
               "properties": {
-                "window_hwnd": { "type": "integer" }
+                "window_hwnd": { "type": "integer" },
+                "id":          { "type": "integer", "minimum": 0, "description": "Same as window_hwnd; niri's name for it." }
               }
             }
           }
         },
 
         {
-          "description": "Emitted when a named workspace becomes active on any monitor.",
+          "description": "niri WorkspaceActivated: the workspace became the active one of its monitor. focused: it is now the focused workspace (the active one of the focused monitor). Also sent when the focus moves to another monitor.",
           "type": "object",
           "required": ["type", "data"],
           "properties": {
             "type": { "const": "workspace_activated" },
             "data": {
               "type": "object",
-              "required": ["workspace"],
+              "required": ["id", "focused"],
               "properties": {
-                "workspace": { "type": "string", "description": "Name of the activated workspace." }
+                "id":      { "type": "integer", "minimum": 0 },
+                "focused": { "type": "boolean" }
               }
             }
           }
@@ -911,7 +1413,10 @@
               "type": "object",
               "required": ["config_path"],
               "properties": {
-                "config_path": { "type": "string", "description": "Absolute path of the loaded config file." }
+                "config_path": { "type": "string", "description": "Absolute path of the config file." },
+                "failed": { "type": "boolean", "description": "True when the file has errors: it was not applied and the last good config stays in use." },
+                "error": { "type": ["string", "null"], "description": "When failed: file:line:column: error: message of the first error." },
+                "warnings": { "type": "integer", "minimum": 0, "description": "How many things in the file wiri ignores." }
               }
             }
           }

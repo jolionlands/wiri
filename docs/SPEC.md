@@ -267,8 +267,10 @@ The IPC module provides named pipe communication for external control.
 
 **Pipe Path:**
 ```
-\\.\pipe\wiri_control
+\\.\pipe\wiri_control_<user>_<session>
 ```
+The name carries the user and the session the daemon runs in (pipe names are
+machine-global on Windows); `WIRI_PIPE` overrides it.
 
 **Message Format:**
 ```json

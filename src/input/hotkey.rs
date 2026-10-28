@@ -74,7 +74,12 @@ mod tests {
 
     #[test]
     fn test_modifier_flags_all() {
-        let binding = HotkeyBinding::new(0, vec![ModKey::Ctrl, ModKey::Alt, ModKey::Shift, ModKey::Win], 0x41, Action::Quit);
+        let binding = HotkeyBinding::new(
+            0,
+            vec![ModKey::Ctrl, ModKey::Alt, ModKey::Shift, ModKey::Win],
+            0x41,
+            Action::Quit,
+        );
         let flags = binding.modifier_flags();
         assert_eq!(flags, MOD_CONTROL.0 | MOD_ALT.0 | MOD_SHIFT.0 | MOD_WIN.0);
     }
@@ -97,5 +102,4 @@ mod tests {
         let binding = HotkeyBinding::new(42, vec![], 0x41, Action::Quit);
         assert_eq!(binding.id.as_u32(), 42);
     }
-
 }

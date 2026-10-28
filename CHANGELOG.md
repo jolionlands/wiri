@@ -5,6 +5,612 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Official live cycle at cc3920d — 761/761 gates, measured event-driven baseline
+- The complete locked desktop cycle at `cc3920d` passed **761 of 761 enforced gates with 0 failures** (88 further information entries, 849 report cells). Every failure recorded by earlier cycles is gone: all six `h78_*` cursor-hiding gates, all five H31 focus-history gates including `h31_history_crosses_workspaces`, and lane V's tab gates (H65). `hidden_json_present_after_restart = False` stays **expected-pass** semantics: the crash record is deleted once the windows are back.
+- The same commit is clean under `-D warnings`: release build with 0 warnings, `cargo check --release --all-targets` clean, and **1792 tests passed / 0 failed / 1 ignored doctest**.
+- [PERF.md](docs/PERF.md#live-baseline) now records this commit as the live baseline: the event-driven perf pass (`0ebdebf`: bounded tokio runtime, event-driven main loop, event-woken backend handler, event-armed reconcile, lazy indicator pump) is what the numbers measure, with deltas against the `af3eb30` record. Measured idle cost in one 30 s window fell to `p_idle_cpu_ms = 0` (below the 15.625 ms counter increment) and `p_idle_context_switches_per_s = 9.16` (was 321.935/s), with threads 24/26 → 14/15 and handles 235/278 → 220/239. Private bytes and working set, and both executables, are **larger** than that record; the baseline states plainly that this run cannot explain the increase.
+- Matrix rows are updated only where this cycle supplies evidence, and the recount is one row: `set-column-display normal or tabbed` is now `done` (its only gap was live verification). The two `cursor {}` rows and the tablet stylus row keep `partial` for their documented Windows approximations; only their live-verification evidence changed.
+
+### Lane LAST — cursor hiding and tablet stylus binds
+- Decode niri's `cursor { hide-when-typing; hide-after-inactive-ms <ms> }` section (and keep `xcursor-theme`/`xcursor-size` as reported warnings: the Windows pointer scheme owns them). `hide-when-typing` is Windows' own per-user "hide pointer while typing": it goes through lane P's `PointerSettingsBackend`, so `SPI_GETMOUSEVANISH`/`SPI_SETMOUSEVANISH` is written only when the option is configured, the value the machine had is remembered, and it is restored on a graceful quit or when a reload drops the key (`WIRI_POINTER_SETTINGS_DRY_RUN` still records instead of writing).
+- `hide-after-inactive-ms` hides the global pointer after that many milliseconds without pointer movement and shows it on any movement or click. It rides the existing low-level mouse hook: one one-shot `SetTimer` on the hook's own message thread, re-armed by pointer activity, existing only while the pointer is visible and the option is set — nothing runs at rest. Hiding swaps all fourteen `OCR_*` system cursors for transparent copies (`SetSystemCursor`); showing and quitting reload the user's scheme (`SystemParametersInfoW(SPI_SETCURSORS)`). The user's cursors are restored on quit, on a reload that drops the option, from the panic hook (with a `try_lock` fallback so a panic inside the state machine cannot deadlock the hook) and once at startup in case a previous run died hidden. Every OS call goes through a small `CursorBackend` trait; unit tests drive a fake and assert the exact hide/show/restore sequences, and a Windows-only test creates the transparent cursor for real (a 32x64 monochrome mask, checked with `GetIconInfo`) without swapping any system cursor — `SetSystemCursor` itself is only exercised by the live gate.
+- Decode niri's `TabletStylusButton1`/`2`/`3` bind triggers and dispatch them from the promoted pen mouse events Windows delivers (`MI_WP_SIGNATURE` with the pen bit): the pen tip, the barrel button and a second barrel/eraser button. A stylus bind wins over the plain mouse button the event was promoted to, an unbound pen button keeps its ordinary mouse behaviour, and press/release pairing survives a modifier-first release or a reload.
+- Approximation, stated in the matrix: Windows has no global pen-button stream without UIAccess, so stylus binds see promoted mouse events only — no raw `WM_POINTER`, no pressure, and which physical button lands on which promoted button is the driver's choice.
+- Add the h78_* live phase (`scripts/live-phases/lane-last.ps1`, included before the lane-e-perf phase): `hide-when-typing` is checked only in dry-run mode (the audit shows the write and the restore) with the machine's real `SPI_GETMOUSEVANISH` value asserted unchanged, `hide-after-inactive-ms` runs one private daemon with a 400 ms timeout (the cursor object must change when wiri hides it, change again on an injected move and be restored after the quit; the phase's `finally` reloads the user's cursors unconditionally), and the stylus binds are decode+registration evidence only. All six gates passed in the 2026-10-27 official cycle at `cc3920d` (`hide_when_typing_dry_run`, `hide_when_typing_real_value_unchanged`, `cursor_hides_after_inactive_ms`, `cursor_shows_on_pointer_movement`, `cursor_restored_on_quit`, `tablet_stylus_bind_decode_and_registration`), in a cycle that passed 761/761 enforced gates with 0 failures; the release suite there is 1792 passed / 0 failed / 1 ignored doctest.
+
+### Live-gate fixes (34694e4-live)
+- Config strings: a quoted string that starts with three or more backslashes is KDL's escaped spelling of a UNC/device name (`"\\\\.\\DISPLAY1"` is `\\.\DISPLAY1`), not a literal path. The path-compat rule kept all four leading backslashes, so `output "\\\\.\\DISPLAY1" { hot-corners ... }` (the spelling in `docs/modules/CONFIG.md`) named no monitor and was silently ignored. The literal `"\\.\DISPLAY1"` is unchanged.
+
+### Lane C2 item 1 — config policy and diagnostics
+- Match explicit CLI → nonempty WIRI_CONFIG → compatibility NIRI_CONFIG → APPDATA selection; never create explicit paths. Notify after creating the implicit default and support `config-notification { disable-failed }` without hiding logs/events.
+- Reject duplicate singleton nodes with both source locations and invalid ranges/fractional integers. Render source labels, help and include chains in validation/logs. User binds replace defaults unless the wiri `extend-defaults` extension is explicit.
+- Add offline `wiri validate [-c path]`, generated shell completions, pure policy/validation tests and H66 offline checks; desktop evidence is tracked in `docs/parity/lane-c2-report.md`.
+
+### Lane C2 item 2 — binding identities and replacement
+- Keep omitted and empty bind tables empty at runtime; built-in defaults require explicit `extend-defaults=true` (emergency invalid-startup fallback remains separate).
+- Share canonical XKB/Win32/legacy key names and final-Mod chord identities across validation and input. Unknown modifiers and same-part duplicate aliases are errors with both source locations; included parts override earlier matching chords.
+- Distinguish Ctrl+right-Alt (AltGr/Mod5/ISO_Level3_Shift) from Ctrl+left-Alt in the existing hooks, never register the hook-only bit with RegisterHotKey, and reject indistinguishable level-5 modifiers. Add pure normalization/input regressions and H67 checks.
+
+### Lane C2 item 3 — explicit keyboard configuration
+- Apply only explicitly configured repeat delay/rate and an already-loaded foreground keyboard layout. Track original values through reload/removal/exit and relinquish ownership after external changes; Windows repeat granularity and asynchronous layout acceptance remain approximations. Native NumLock requests warn without changes because queue-relative toggle state cannot provide a trustworthy background-thread restoration baseline; dry-run models it only.
+- Add synthetic backend/lifecycle tests and a lifetime-stable `WIRI_KEYBOARD_DRY_RUN=1` adapter. The shared live harness always selects dry-run; no real native keyboard setting or layout mutation is part of validation.
+
+### Lane C2 item 4 — child environment and switch events
+- Apply string/null environment entries to every non-elevated argv/shell/startup/IPC launch through one Unicode Windows snapshot, including executable lookup. Keep the parent environment unchanged, label case-insensitive duplicates, and refuse UAC broker launches that cannot honor overrides.
+- Run shell startup commands through the same path, suppress both startup forms with `--no-autostart`, and never rerun them on reload. Observe configured lid/slate edges on the existing hidden-window pump, with no initial spurious edge, polling or extra thread; physical switches are synthetic-tested only.
+- Add H69 child snapshots and reload/startup checks using private profiles and PID-verified IPC.
+
+### Lane C2 item 5 — named workspace configuration
+- Resolve workspace-local layout after global and output settings throughout placement, targeted rules, sizing, presets, decorations and overview. Rebuild views on reload/removal without losing inherited values; reject output-only options in workspace layouts.
+- Preserve repeated `open-on-output` priority and reevaluate on config/output/name events, migrating columns, floats and minimized homes while keeping layout/focus state. Add nine synthetic integration regressions and overview geometry coverage, plus H70 single-display width/reload checks; multiple displays are not live-tested.
+
+### Lane C2 integration on the merged lanes
+- Port C2 onto the stable ordered workspaces: a `workspace` layout block is found by workspace *name*, so it follows renames, reordering and moves between outputs. Output preferences (repeated `open-on-output`, then the legacy `monitor`) are reevaluated on output and workspace-name events (a reload rebuilds the layout views but never re-places a realized workspace, as Lane F requires) by moving the whole live workspace through the same path as `move-workspace-to-monitor`; with no connected preference a workspace stays where it is.
+- The generated first-run config and `examples/minimal.kdl` now say `extend-defaults` in `binds {}` (the explicit extension C2 introduced), so a first run keeps the full built-in keymap instead of only the 53 written chords; README, DOCUMENTATION and PARITY describe the opt-in. Unit test `the_shipped_configs_opt_in_to_the_builtin_keymap`.
+
+### Lane V integration - overview and tabs on the stable-workspace head
+- Port Lane V onto lanes K, W, F2, T2 and FK. Overview workspaces are added by a fresh stable key (names, IPC ids, floating homes stay put), the host paints names and publishes IPC ids, and native drag-and-drop uses the configured overview stack instead of a fixed half scale.
+- `close-overview` and Escape are idempotent while the camera closes. A four-finger vertical swipe (Precision Touchpad opt-in) opens or closes the overview; a Windows-promoted touch pans it and a 500 ms rest picks a window up. `gestures { hot-corners }` alone no longer starts the drag-capture adapter.
+- The 2026-10-27 official cycle at `cc3920d` passed every enforced lane V gate (761/761 overall, 0 failed), so no lane V row stays `partial` for missing live verification; the rows that keep `partial` do so for their documented Windows approximations and unit-tested-only surfaces. Only `set-column-display normal or tabbed` became `done`; see `docs/parity/lane-v-report.md`.
+
+### Lane V item 4 - explicit tab display and clickable indicators
+- Add niri `set-column-display "normal"|"tabbed"` binds, ctl commands and typed IPC with idempotent selection/focus preservation.
+- Make tab indicators select/focus hidden tabs without activating the overlay. Apply pinned-niri geometry, signed gap/rounding, colours/gradients and reload semantics; ignore inter-tab gaps and margins.
+- Share fullscreen/maximize-to-edges across tabbed columns, suppressing both indicator and reservation until exit. Keep maximize-column distinct. Add pure regressions and H65 desktop checks; evidence and limits are in the Lane V report.
+
+### Lane V item 3 - event-driven overview hot corners
+- Enable niri's default top-left physical-pixel corner, named corners and global/per-output `hot-corners` policies. A 120 ms one-shot dwell toggles once per entry; parking or an IPC close cannot rearm it.
+- Reuse the existing low-level mouse hook and message thread; no idle timer, poller or worker. Add pure policy/dwell/negative-origin tests and H64 locked-desktop checks (results in the Lane V report).
+
+### Lane V item 2 — overview pointer and normal actions
+- Add captured click/drag handling, workspace/new-workspace drops above/between/below, drag dwell, high-resolution wheel workspace navigation and right-drag scrolling. Keep normal actions live and refresh DWM sources after model changes; floating previews participate too.
+- Cover pure hit/drag/scroll/insertion/source lifecycle logic and add H62/H63 desktop checks; live results remain explicitly pending in the Lane V report.
+
+### Lane V item 1 — configured overview camera
+- Implement niri's overview zoom, backdrop colour and workspace shadow, with a reversible open/close spring on the existing Phase 2B timeline/notifier. `overview-open-close` animation overrides, global off and slowdown apply; no frame clock runs after settling.
+- Add pure config, shadow-pixel and camera-lifecycle regressions. Desktop acceptance and compositor limits are recorded in `docs/parity/lane-v-report.md`.
+
+### Lane L2 — missing layout-action rows
+- Close eleven rows of the layout parity matrix through the one action grammar (binds, `wiri-ctl action`, typed IPC): `swap-window-left` / `-right`, `move-column-to-index`, `center-visible-columns`, `switch-preset-window-width` / `-back`, `switch-preset-window-height` / `-back` with `preset-window-heights`, `move-window-{down,up}-or-to-workspace-{down,up}`, `move-column-{left,right}-or-to-monitor-{left,right}`, `layout { empty-workspace-above-first }`, `toggle-window-rule-opacity`, `focus-floating` / `focus-tiling` / `switch-focus-between-floating-and-tiling`.
+- Add `layout { fullscreen-backdrop-color }`: the existing click-through decor layer fills the monitor's tiling view behind a fullscreen window in the configured colour, only while one is up.
+- Decode `animations { recent-windows-close }` and fade the recent-windows overlay out on close over the existing easing curves; one timer runs only while a fade lasts, so a daemon at rest is unchanged and animations-off keeps the immediate close.
+- Every action has pure unit tests covering the edges (first/last column, a single column, tabbed columns, floating windows, an empty workspace, the end of the workspace list). Release check with `-D warnings` is clean and the suite is green at 1520 library + 14 CLI tests. The new `h76_*` live gates (`scripts/live-phases/lane-l2.ps1`) are written and parse with zero errors but have not been run; the parity rows therefore say `partial (Lane L2; unit-tested; live pending lead cycle)`.
+
+### Lane P — pointer settings, hotkey sheet at startup, backdrop colours
+- Add niri's pointing-device options (`accel-profile`, `left-handed`, touchpad `dwt` and `disabled-on-external-mouse` reach Windows; the options Windows has no lever for are parsed, validated and reported) behind one backend trait, `WIRI_POINTER_SETTINGS_DRY_RUN=<file>` audit recording, remembered originals and restore on quit or when a reload stops naming an option. `toggle-touchpad` emits the niri `touchpad_toggled` event.
+- Show the Important Hotkeys sheet at startup with `hotkey-overlay { skip-at-startup; hide-not-bound }`, `--no-startup-overlay` (the live harness passes it) and `--no-autostart` also keeping it closed; decode `layout { background-color }` (and the deprecated per-output key, mapped with a warning). Add the h75_* live phase (`lane-p.ps1`).
+- Integration: the backdrop reaches the one overview host Lane V owns (`overview { backdrop-color }` wins, else the layout colour, else niri's default through `set_appearance`); Lane P adds no `overview` section, `OverviewContext` field or hot corner of its own.
+
+### Lane Z — floating layer survives delayed native raises
+- Repair actual workspace z-order inversions on native REORDER events, not only on focus/layout. Correct the SHOW/HIDE WinEvent IDs so REORDER is no longer misclassified as HIDE. Keep float MRU and tile keyboard focus with asynchronous relative-HWND placement, without TOPMOST, global float promotion, idle timers or new threads.
+- Add deterministic H45 delayed-raise coverage and opt-in repeated H3/H5/H45 evidence. The delayed-layer check fails 3/3 before and passes 4/4 after; the complete release desktop run passes 500 gates. Release validation passes 1210 library + 14 CLI tests. Record repeat pass rates, one unrelated Terminal focus interruption, measured resting cost and limits in `docs/parity/lane-z-report.md`.
+### Lane S item 1 — frozen screenshot selector
+- Add an on-demand focused-output screenshot UI with selection/Space-drag, pointer toggle, save/copy/cancel and absolute destinations through binds, CLI and typed IPC. Frames are frozen before the initially nonactivating host is shown; UI pixels never enter the saved crop.
+- Add pure geometry/options tests and H46 locked desktop checks: 9/9 passed in the interrupted run; full-suite sign-off remains pending. No new crate, timer or idle worker.
+- Finalize the last drag coordinate before reentrant mouse-capture release; held Space autorepeat cannot save when a move-drag ends. Two pure regressions pass.
+
+### Lane S item 2 — screenshot action options
+- Screen/window captures accept niri disk/pointer flags and absolute paths through binds, CLI and typed IPC. Explicit managed-window ids capture without activation; copy-only overrides a supplied destination.
+- Share the existing PNG/clipboard/event pipeline and composite the pointer only for its receiving window. Add six action tests and typed-wire coverage; all six H47 gates passed in the interrupted desktop run (full-suite sign-off pending).
+
+### Lane S item 3 — non-layout system actions
+- Add foreground keyboard-layout switching, managed-window urgency actions without focus changes, asynchronous quit confirmation with an explicit skip flag, active config-file switching, monitor power controls and suspend. Spawn expands only a leading home component in its executable, never the other arguments.
+- Add pure parser, typed-wire, layout-selection, quit-property and urgency tests. Typed IPC reaches every system-action executor; urgency flashes the taskbar without activation and clears on foreground before the separate hook event arrives. Legacy management `wiri-ctl quit` remains immediate; action/bind quit confirms unless skipped.
+- H48/H49 checks record events, config-file reload, literal spawn arguments, confirmation and dry-run power audits. Fix their missing F10 mapping and avoid serializing provider-decorated file strings. The interrupted run recorded 18/21 Lane S gates passing; its three failures have targeted corrections but no permitted rerun. See `docs/parity/lane-s-report.md`; no complete live pass is claimed.
+### Lane W — gradients and interactive insertion
+- Render all niri gradient spaces and OKLCH hue paths with strict syntax, premultiplied alpha and workspace-view coordinates. General Mod+left-drag shares its insertion-slot calculation with the lazy hint after niri's logical pull-out threshold; clicks stay put, release inserts a tile, and Escape/Mod release restores the untouched source. No new dependency, timer or thread.
+
+### Lane W — policy event delivery
+- Queue tagged wheel replacements after the low-level hook returns, avoiding duplicate original-plus-scaled delivery. Clear rejected late foreground flashes in the native urgency registry so the next background request is not lost. Both fixes use existing event pumps only; no added timer or thread.
+
+### Lane W — window-policy defaults
+- Add niri per-window column display, anchored first-floating position, application-wheel multiplier and latched ignore/set-urgent/focus policies for actual shell attention requests. Remember floating moves, preserve existing columns and never treat user focus as an application activation request; Windows cannot supply Wayland serials or veto OS-granted foreground.
+
+### Lane W — per-window appearance
+- Add sparse niri window-rule focus-ring, border, shadow and tab paints, four-corner geometry and opt-in native clipping with original-region restoration. Attention uses shell flashes/ALERT, not generic accessibility state changes. Changes follow existing rule/focus/resize events; no resting timer or thread. Foreign-HWND clipping is binary and can suppress DWM shadows; compositor blur remains unsupported.
+### Lane K — measured evidence and H22 diagnosis
+- Record the saved lane-local result (497 pass / 6 fail; all ten H54–H57 checks pass), animation CPU/frame samples and before/after idle/resources in the parity report and PERF.md. Cite the Terminal foreground takeover that aborted H22 and the separate stale shutdown-helper pipe; no code or gate changed. Keep Windows approximations and unmeasured costs explicit; integrated verification remains pending.
+
+### Lane K — desktop acceptance checks
+- Add H54–H57 lifecycle, two-frame workspace PNG, cancellation, cross-fade and global-off checks plus before/after 30-second idle/resource observations. H17 now observes the moving thumbnail rather than the already-final cloaked HWND; its unsupported-options fixture retains the unimplemented overlay warnings and separately requires open/close blocks to validate without warnings.
+
+### Lane K — part-time DWM compositor
+- Animate new tiled windows from half-size/transparent to their final frame while existing strip motion slides neighbours; temporary source cloaks and DWM thumbnails live on one lazy click-through, non-activating topmost layer.
+- Copy available pixels before a wiri close request, then fade/shrink the copy only after destruction. Never keep an application HWND alive or wait for an application capture; unavailable, protected and empty sources fall back without a black tile.
+- Slide outgoing and incoming workspaces vertically together, retaining their redirection sources until final layout/visibility reconciliation.
+- Cross-fade pre-resize content with the resized live thumbnail using the configured Phase 2B timeline. Input, actions, reload and quit snap/cancel; all thumbnails, snapshots and layer resources are released at rest, with no added idle clock, timer or thread.
+
+### Lane K — animation configuration
+- Decode niri's `window-open` and `window-close` blocks as independent easing/spring/off timelines, including global off/slowdown and legacy overrides. Defaults are 150 ms ease-out-expo for opening and 150 ms ease-out-quad for closing; absent animations remain disabled for wiri compatibility. Pure tests cover defaults, precedence and invalid/duplicate settings.
+### Lane F2 — integrated focus, workspaces and monitor actions
+- Connect the lane-F executors through the existing B/2B input and H IPC paths; preserve G's column/tile selection, logical width intent, tab visibility, effective view/struts and float geometry. Workspace identity, names and visible order survive reordering and synthetic hotplug/whole-workspace moves.
+- Previous-window focus uses stamped native occurrence order, not delayed delivery or requested activation time. Stale notices finish dwell history without undoing live focus; unconfirmed previous commands resume on observation, preserving exact cross-workspace endpoints without a retry timer.
+- Add fail-closed H30–H34 desktop checks through both CLI and typed IPC, plus pure queued-event, rollover, float-memory and visible-order regressions. The Lane F2 parity report separates desktop evidence, multi-monitor unit coverage and remaining gaps.
+
+### Lane F2 — ordered workspace foundation
+- Separate workspace order, monitor-local keys and session-stable IPC identities; runtime names belong to workspace objects. Retain Lane G's existing column/tile focus memory rather than adding duplicate state. Mutation executors are connected in the next part.
+
+### Lane F2 — structured layout action transport
+- Port lane F's shared focus/workspace/monitor grammar onto the integrated branch. Preserve quoted workspace names and carry explicit window-transfer targets through Lane H's typed action path without focus-first activation. Engine execution follows in the next integration part.
+
+- Lane T: opt-in `input { touch {} tablet {} }` promoted touch/pen Mod drags share move/drop and pixel scrolling; reported secondary touch IDs toggle floating. MI_WP_SIGNATURE decoding, mode selection and contact pairing are synthetic-tested only; no overlay or hardware-support claim.
+
+- Lane T: opt-in niri `gestures` DnD edge view/workspace settings, foreign-capture drag detection and 500 ms hover activation on the existing dispatcher; one-shot dwell and active-edge frames only.
+
+- Lane T: opt-in Precision Touchpad HID Raw Input assembles three-contact frames and feeds shared swipe inertia/snapping; registration and its message-only HWND are removed on disable/reload/quit. Windows gesture settings are never changed.
+
+- Lane T: system-time/rectangle edge double-clicks reset tiled height or toggle full width; Mod move/resize excludes layout writes while held and persists its drop, with right-click floating/tiling toggle.
+
+### Lane T — spatial pointer gestures
+- Configured Mod+middle drag follows the pointer horizontally or vertically after niri's axis lock. Release projects the 150 ms velocity history to column/workspace snaps, handing velocity to Phase 2B's spring; bounded end rubber-banding and pause-before-release are unit-tested. Explicit pointer/wheel binds retain precedence and niri syntax. No idle timer or extra frame thread. Native workspace previews still show only the active HWND scene, not niri's two-workspace compositor crop; see the Lane T report.
+
+### Phase 2B integration — desktop sign-off
+- Integrated release validation passes: 1114 library + 7 CLI tests, build and all-target check with warnings denied. The complete locked desktop run passes 440 gates, zero failures (102/102 Lane A checks; Lane B/D retained); perf collector errors and final H9 terminal overlaps are zero. Record earlier findings, measured resting cost and remaining limits in the Phase 2B report; recount matrix totals without claiming new features.
+
+### Phase 2B integration — guarded H5 input setup
+- Fix a real older H5 fixture race on the shared desktop: settle before requesting focus, not after, then require and record the float as foreground immediately before its real workspace-move chord. An unrelated terminal took focus during the old 1.5-second gap. Add a precondition gate and evidence without relaxing any existing assertion or changing product targeting.
+
+### Phase 2B integration — live fixture compatibility
+- H16 now configures Alt as Mod so its unchanged Ctrl+Alt input exercises lane B's Ctrl+Mod column-reorder gesture, rather than the plain Mod move gesture. The insert-hint assertion is unchanged.
+- Fix a real older perf-observer bug: give its owned child an explicit unique `WIRI_PIPE` endpoint and use that endpoint for every PID-validated request instead of the unused global pipe. No measurement thresholds or earlier gates change.
+
+### Phase 2B integration — single-instance probe
+- Resolve the startup probe and startup log with `ipc::pipe_path()`, matching the server/client user-session endpoint and `WIRI_PIPE` override instead of probing the unused global prefix. The server's listener check remains unchanged.
+
+### Phase 2B integration — desktop acceptance checks
+- Add the source lane's 102 H16–H21 checks through one Lane A entry point, retaining H22–H29, IPC and performance phases unchanged. Classify an intentional decoration host as passive only when both its class and all required extended styles match; H16 separately checks styles, shell exclusion and cleanup. No older assertion is weakened.
+
+### Phase 2B integration — look and feel on the shared input pump
+- Land configured spring/easing motion, unified passive decorations, active-only tabs, live overview/recent previews and Important Hotkeys from lane A. Preserve lane B's primary keyboard engine, pointer/focus handling, fallback bindings and message-thread dispatcher: no legacy keyboard relay thread/channel.
+- Modal dismissal and recent events keep physical modifier state and captured down/up pairs synchronized; tagged activation input cannot promote MRU. Keep lane D screenshots/output handling unchanged. See the Phase 2B report for source-run evidence, completed integrated validation and remaining limits.
+
+### Phase 2B integration — recent-window diagnostics
+- Preserve lane A's shell-collision-free recent-window fixture and foreground/preview diagnostics; no assertions are relaxed.
+
+### Phase 2B integration — recent-window service
+- Import the isolated recent-window session/config/preview model and desktop checks, ahead of re-hosting its keyboard events on lane B's input pump.
+
+### Phase 2B integration — overview host
+- Port the session-local DWM overview host, hit testing and H19 desktop fragment; resources are created only for an overview session.
+
+### Phase 2B integration — decoration foundation
+- Port the Phase 2B effects decoder, pure decoration model and passive layer foundation onto the integrated input/output base, retaining both backend module lists.
+### IPC 1.3 — transport compatibility (Lane H)
+- JSON-line connections accept repeated requests and one-line replies, including recoverable
+  unknown-request errors. Existing undelimited one-shot clients still receive EOF.
+- Niri's externally tagged requests, Ok/Err replies and event spelling coexist with wiri's
+  envelopes. ReturnError exercises client error handling; wiri replies name the IPC schema.
+- Spawned clients inherit WIRI_PIPE. Framing is bounded per line and subscriptions release on
+  disconnect without an idle timer.
+
+### IPC 1.3 — CLI and reusable client (Lane H)
+- Reusable connect/request/read-events client, per-request commands, optional `msg` prefix,
+  `--print-request`, raw JSON argument/stdin requests and schema mismatch guidance.
+  `windows` uses niri's objects; `window-list` retains wiri's geometry list.
+
+### IPC 1.3 — output and keyboard queries (Lane H)
+- Outputs and FocusedOutput expose connector/EDID identity, DXGI rational-rate modes and
+  logical geometry; unknown VRR/max-bpc capabilities remain null. KeyboardLayouts follows the foreground
+  thread with localized layout names, not the IPC caller's thread.
+- Temporary output requests reuse the conservative target-only executor; layout scale
+  never changes Windows DPI. Unsupported settings and last-display-off are errors.
+  Mutating output paths are synthetic-tested only, never applied on the shared laptop;
+  a successful temporary change answers `Ok.OutputConfigChanged: Applied`.
+
+### IPC 1.3 — interactive picks (Lane H)
+- PickWindow and SDR PickColor consume click down/up on the existing input hooks;
+  Escape returns null, disconnect cancels, concurrent picks fail, and release guards
+  survive completion. No extra overlay, idle timer, thread or dependency.
+
+### IPC 1.3 — complete state events (Lane H)
+- Window objects include daemon-relative monotonic focus timestamps and full logical
+  layout geometry before offscreen parking, with dedicated deduplicated delta events.
+- Keyboard layout state replays before deltas; foreground and shell language notifications
+  on the existing hotkey window produce list/switch events without polling.
+- Automated H35-H39 live gates cover both wire dialects, queries, timestamps/layouts,
+  click/Escape consumption and legacy CLI compatibility. A missing second loaded keyboard
+  layout is reported as an explicit skip, not a passed switch check.
+- The performance collector resolves `WIRI_PIPE` or the same per-user/session pipe as
+  the daemon instead of the retired global name, with a pure endpoint self-test; earlier
+  unavailable samples were collector timeouts, not measurements.
+### Lane G — strip layout and native window manipulation (2026-10-25)
+- **Strip policies and persistent widths.** niri centering modes, the single-column override,
+  mixed fixed/proportional presets and layout default widths act on the effective output view.
+  Explicit widths survive opening/closing neighbors; new columns insert right of the active one,
+  and stacked-tile/workspace activity survives navigation beyond the bounded MRU history.
+  Signed struts no longer wrap to an empty work area. Legacy equal-sharing remains compatible.
+- **Owned dialogs auto-float.** Dialogs center over their owner and follow its workspace/output
+  unless placement rules override; ordinary top-level apps stay tiled and `open-floating false`
+  suppresses the default. Existing workspace-float stacking, non-scrolling geometry and memory
+  are regression-tested rather than replaced.
+- **Native caption/edge drags reconcile on drop.** The app owns its HWND throughout the native
+  move/size loop. On release wiri adopts column width and stacked-tile height, preserving sibling
+  allocation and float geometry; a caption-only tiled move deliberately snaps back to its slot.
+  H40-H44 add real desktop checks, including refresh while the mouse is held. Regressions cover
+  restore/workspace/monitor transfers preserving requested width intent, small proportions not
+  being re-derived after a pixel minimum, `center-focused-column` acting on the effective output
+  even for first/last columns, inactive admission and `open-focused false` restoring the remembered
+  column/tile focus, unsorted float presets remembering their configured cycle, and legacy rule
+  widths outranking the layout default. No new dependency, idle timer, thread or resting window.
+  Limitations/evidence: `docs/parity/lane-g-report.md`.
+
+### The pipe belongs to the user and the session (2026-10-25)
+- **A second user can run wiri.**  The pipe name was machine-global
+  (`\\.\pipe\wiri_control`), so the second user logged in on the same machine (fast
+  user switching, an RDP session) could not create its pipe, was told "another wiri
+  instance is already running", and its clients would have talked to the first user's
+  daemon.  The pipe is now the pipe of one user in one session:
+  `\\.\pipe\wiri_control_<user>_<session>` (the account name and the session id, made
+  safe for a pipe name).  The server, the client and the single-instance check use the
+  same function (`wiri::ipc::pipe_path()`), and `WIRI_PIPE` overrides the name.
+
+### IPC 1.2 — niri's request/reply forms (2026-10-25)
+- **Five requests answer with niri's shapes.**  `workspaces`, `windows`, `focused_window`,
+  `overview_state` and `version` are answered from the engine's current state, with the
+  same description the event stream is built from: niri's `Workspace` and `Window` objects
+  (`id`, `idx`, `name`, `output`, `is_active`, `is_focused`, `active_window_id`; `id`,
+  `title`, `app_id`, `pid`, `workspace_id`, `is_focused`, `is_floating`, plus the
+  `is_urgent` and `layout` the stream already sends).  What Windows cannot tell is
+  `null`, never missing: a workspace without a name, the program of an elevated window,
+  the process of a window wiri does not know, the workspace of a float whose monitor is
+  away.  niri's `focus_timestamp` has no Windows meaning and is therefore not reported.
+  niri's own spelling of the request (`"Workspaces"`, `"Windows"`, `"FocusedWindow"`,
+  `"OverviewState"`, `"Version"`) is read as well.  The IPC schema is 1.2.
+- **`wiri-ctl workspaces`, `windows`, `focused-window`, `overview-state` and `version`.**
+  Each of them prints a readable table (or a line), and `--json` prints the raw reply.
+  `wiri-ctl windows` now answers with niri's shape; the older list (the class, the
+  geometry, the place in the strip) is `wiri-ctl window-list` now.
+### Phase 2C — Lane D screenshots and outputs (2026-10-25)
+- **Focused-output and focused-window PNG screenshots.** Hotkeys, tray and window-capture IPC share
+  one on-demand WIC PNG / clipboard pipeline. Windows.Graphics.Capture is tried first for windows,
+  with PrintWindow fallback; captures use request-local WinRT factories so a second capture stays
+  safe after COM teardown. `screenshot-path` accepts a strftime template, leading `~`, or `null`
+  (clipboard only); the default is the redirected Pictures\\Screenshots folder. Saved/copied tray
+  balloons and `screenshot_captured { path }` events cover both actions. Live H26-H28 verify PNGs,
+  content, clipboard, reload and null events. Interactive selection and per-action pointer/disk flags
+  remain outstanding; see `docs/parity/phase2c-lane-d-report.md`.
+- **Output configuration acts on startup/reload.** Connector or EDID identity matching is
+  case-insensitive and no longer falls back by index for an unmatched name. Unset scale keeps real
+  Windows DPI; startup focus follows config order. A conservative CCD planner applies only explicit
+  physical differences, preserves other timings, refuses the last-display-off and unsupported flips,
+  and never persists changes. H29 verifies matching, focus, reload and current-mode no-op; physical
+  mode/position/rotation/off preparation is synthetic-unit-tested only, never applied on the laptop.
+- **Terminal minimum-width regression.** An unanswered admission query can now retry when the
+  title becomes ready, still outside the engine lock and within the existing three-query cap.
+  Native visible minima include wiri's border in tile units, just like rule minima. Two pure
+  regressions and the unchanged live H9 gate verify three 466px terminals with no overlap.
+- **Safer autostart command and elevation guidance.** Run startup always quotes the executable,
+  including paths without spaces; four pure regressions cover spaced, unspaced, Unicode and UNC
+  paths without writing the registry. `docs/ELEVATION.md` compares normal integrity, an opt-in
+  interactive elevated task and signed uiAccess; no elevation mechanism is enabled.
+- **Shared-desktop live safety.** The harness refuses foreign daemons instead of killing them,
+  isolates AppData/temp inside the worktree, and retains interrupted-run recovery state. The
+  recovery metric checks this run's forms, not unrelated windows legitimately hidden again.
+### Phase 2C — input (lane B)
+- Keyboard binds now run before the shell in `WH_KEYBOARD_LL`, including configured Win chords;
+  Win+L, Win+D and Win+Shift+S remain Windows-owned. Bound down/up pairs, per-bind repeat/cooldown,
+  manual shortcut inhibition (`allow-inhibiting=false` escape hatches), and the wiri extension
+  `on-release=true` work without stealing unbound keys or faking modifier releases. RegisterHotKey
+  remains a down-only fallback; the hook uses the existing hotkey thread instead of two extra threads.
+- Mouse button and vertical/horizontal wheel binds use niri trigger names, paired suppression,
+  per-bind cooldown and per-axis consumption. High-resolution Windows touchpad wheel reports
+  accumulate into ticks (TouchpadScroll names alias that stream). Configured Mod+left/right
+  gestures work over nested client HWNDs, and resizing persists into floating/column/tile state.
+  The old hard-coded Alt/wheel shortcuts and per-wheel worker threads are removed.
+- Pointer focus is event-driven on the existing input pump: nested-window hit testing, a cancellable
+  one-shot dwell, `max-scroll-amount="N%"`, output entry and configured warp modes replace the
+  500 ms polling task. Foreground events cancel stale hover requests; pointer-driven focus never
+  warps and a hidden cursor stays hidden. Warp completion waits for asynchronous native geometry
+  against the submitted layout frame, not stale observed bounds. Zero-delay hover uses the hook's
+  logical point instead of the not-yet-updated native cursor position. Drag motion keeps the system
+  cursor moving while paired button edges stay captured. No new dependency, idle timer, thread
+  or resting HWND.
+
+### Phase 2A — a real config parser, window rules, fullscreen, IPC (2026-10-25)
+- **A real KDL config parser with visible errors.**  The line scanner is gone.  `src/config/kdl.rs` reads
+  KDL (nested blocks, `/-` slashdash, `/* */`, raw strings `r#"..."#`, escapes, numbers, a BOM, UTF-16
+  files) with no new dependency, and `src/config/decode.rs` maps it onto the config and reports every
+  problem with `line:column`.  niri's syntax loads as written: a `binds { Mod+T { spawn "wt.exe"; } }`
+  block with `repeat=false`, `cooldown-ms=`, `allow-when-locked=` and `hotkey-overlay-title=`, `input`,
+  `layout` (`gaps`, `border`, `focus-ring`, `shadow`, `struts`), `output`, `workspace`, `window-rule`,
+  `animations`, `spawn-at-startup`, `include`.  wiri's older spellings keep working.  An unknown section
+  or key, a value of the wrong type, a bad color, a misspelled action or key and a bad regular
+  expression are errors (with a "did you mean"); a niri option wiri lacks, a bind that cannot work on
+  Windows and a duplicate bind are warnings.  `cooldown-ms=` and `repeat=false` act (the keyboard hook
+  tells key auto-repeat from a first press), `hotkey-overlay-title=` titles the key-bindings overlay.
+- **A bad config is never applied half.**  At startup an erroneous config is not used: wiri starts with
+  its defaults and a tray balloon names the first error (`file:line:column`).  On a reload the last good
+  config stays in use, a balloon names the file and line, every error is in the log, and a
+  `config_loaded` IPC event with `failed: true` and the error text is sent.  The reload is a
+  trailing-edge debounce: the file is read once, 200 ms after the last change to it or to a file it
+  includes (included files in other directories are watched too), so an editor that saves in steps never
+  gets half a file applied.  `wiri-ctl validate-config [path]` runs the same parser and also checks the
+  included files; `wiri-ctl reload-config` answers with the first error.
+- The shipped `resources/default_config.kdl` and `examples/` are written in niri syntax.  A string that
+  starts like a Windows path keeps its backslashes (`"C:\Program Files\x"`), elsewhere a bad escape is an
+  error that points at it and a raw string always works.
+- **Window rules act.**  Several `match` lines are OR-ed and `exclude` lines veto (a window matches a
+  rule when it matches any `match` line and no `exclude` line); `app-id` and `title` are regular
+  expressions searched in the process's file name (`firefox.exe`, and without `.exe`) or the
+  AppUserModelID, and in the title.  The `open-*` properties were parsed and never read; now
+  `open-on-output` (a monitor by its device name, `wiri-ctl list-monitors` shows it), `open-on-workspace`
+  (by name) and `open-in-workspace` (by position; the older `workspace "2"` / `workspace "web"` key is a
+  position or a name, it used to be an internal id), `open-floating` (centred, at the size
+  `default-column-width` / `default-window-height` ask for), `open-fullscreen`, `open-maximized` and
+  `open-focused false` (the window that had the focus keeps it) all do what they say.
+  `default-column-width` (a proportion, a fixed size or the window's own), `default-window-height`
+  (used by the layout now: a tile of a column of several windows gets that height) and the limits
+  `min-width`, `max-width`, `min-height`, `max-height` hold columns and tiles; `opacity` multiplies with
+  `dim-unfocused`.  Opacity and the limits **follow the window**: they are worked out again when its
+  title changes, when the focus moves, when it floats or tiles again, when it starts or stops flashing
+  and when the config is reloaded - nothing polls, and only windows that a rule depends on are looked
+  at.  `wiri-ctl list-monitors` shows the device name of each monitor.  The process name the rules see is
+  the file name (`firefox.exe`; `process-name "firefox"` still matches).
+- **Fullscreen and maximize keep the window in the strip (niri).**  A fullscreen window used to hide every
+  other tile of its monitor (they left the taskbar and Alt+Tab).  Now it keeps its column and its place in
+  it, its column is made as wide as the view meanwhile (and gets its width back), the window is drawn
+  over the monitor in its slot and the other windows are neither hidden nor moved but out of the way:
+  focusing a neighbour scrolls the strip and the fullscreen window goes off screen with its slot.  The shell
+  is told (`ITaskbarList2::MarkFullscreenWindow`) so that the taskbar goes and comes back.  New niri action
+  `maximize-window-to-edges` (default bind `Mod+M`, rule `open-maximized-to-edges`): the window fills the
+  work area with no gap and no border and keeps its column; wiri's older `maximize` is the same state
+  instead of a native maximize that the layout fought.  An application that goes fullscreen on its own
+  (a video player, F11) or whose maximize button is pressed is followed: it is adopted into the same
+  states (its frame is not touched), and wiri tiles it again when it leaves them.  `wiri-ctl windows` shows
+  `fullscreen` and `maximized`.  `wiri-ctl focus-window` (and the IPC requests that focus a window first)
+  now scrolls the strip to show the window's column, as focusing it with the keyboard does.
+- **niri's event stream, and actions with niri's arguments (IPC 1.1).**  A client that subscribes to
+  `wiri-ctl events --stream` is told the state first - `workspaces_changed`, `windows_changed`,
+  `overview_opened_or_closed`, `config_loaded` - and then every change as niri's events:
+  `window_opened_or_changed`, `window_closed`, `window_focus_changed`, `window_urgency_changed`,
+  `window_layouts_changed`, `workspace_activated`, `workspace_active_window_changed`,
+  `workspace_urgency_changed`, `workspaces_changed`, `overview_opened_or_closed`.  The objects are niri's
+  `Window` and `Workspace` (`id`, `title`, `app_id`, `pid`, `workspace_id`, `is_focused`, `is_floating`,
+  `is_urgent`, `layout`; `id`, `idx`, `name`, `output`, `is_urgent`, `is_active`, `is_focused`,
+  `active_window_id`) plus wiri's `class_name`, `output`, `is_fullscreen`, `is_maximized`, `is_minimized`.
+  The events are worked out from the state of the layout once after whatever changed it (a key, the mouse,
+  an application, `wiri-ctl`, a config reload), only while somebody is subscribed, with no timer; a client
+  that falls behind is told the state again instead of silently missing events.  `workspaces_changed` and
+  `workspace_activated` were declared and never sent: they are sent now, with niri's payload.
+  `window_closed` is sent for the windows wiri managed (it was sent for every window that was destroyed) and
+  carries `id` as well as `window_hwnd`.  wiri's older events are unchanged.
+  `wiri-ctl action <name> [args]` (the `run_action` request, also spelled `action`) takes numbers and booleans
+  as arguments, `quoted` (`focus-workspace "2"` is a name, `focus-workspace 2` an index; in a shell
+  `wiri-ctl action focus-workspace '"2"'`) and niri's `--id <hwnd>` for the window to act on.  A live test
+  never runs twice at once on the test machine (a machine-wide lock; idea from Codex Sol's ee41d27).
+
+### Phase 1 — safe to daily-drive (2026-10-24)
+Each item is verified on a spare Windows 11 laptop with `scripts/live-test.ps1` (real key
+presses, `wiri-ctl`, window rectangles); the gate names are in `docs/parity/phase1-report.md`.
+- **Unknown modifiers are rejected.**  `Hyper+T`, `Mod5+T` or a typo such as `Crtl+T` used to be
+  dropped silently, which registered a bare global `T` hotkey and took that key away from every
+  application.  Such a bind is now ignored at parse time with a warning naming the bind and the
+  modifier (`wiri-ctl validate-config` reports it as an error), and nothing is registered.  niri's
+  `Mod` token is understood: it resolves to the `input { mod-key }` modifier (Ctrl+Alt unless set,
+  also `super`, `alt`, `win-alt`, `ctrl-shift`, `ctrl`), so `Mod+Shift+T` ports as written.  An
+  unknown `mod-key` value warns instead of silently becoming Ctrl+Alt.
+- **`spawn`, `spawn-at-startup` and `wiri-ctl spawn` share one spawner** that keeps every argument
+  (`spawn "wt.exe" "-d" "C:\My Projects"` used to run `wt.exe` alone), understands quoted paths with
+  spaces and backslashes (the Windows command-line rules, also for `spawn-at-startup` lines), and
+  finds programs on the PATH, so the default config's `wt.exe` works (`CreateProcessW` is given a
+  properly quoted command line and no application name; `.cmd` / `.bat` launchers are found through
+  PATHEXT).  A program started with `spawn` gets its own console window and starts in the user's
+  profile; `spawn-sh` runs `cmd.exe /d /s /c` without one.  `wiri-ctl spawn prog arg...` passes the
+  arguments through, `wiri-ctl spawn '"C:\x y\a.exe" -f'` takes a whole command line.  The built-in
+  `Mod+Enter` starts Windows Terminal and falls back to PowerShell instead of a bare `cmd.exe`.
+- **Actions act on the window you are looking at, a floating one included.**  The target of
+  `close-window`, `toggle-floating`, `fullscreen`, `center-window`, the width/height presets and the
+  float move/resize actions is resolved from `GetForegroundWindow()` first (the application window
+  that owns a dialog or popup is found through the owner chain), the engine's own focus second.
+  Before, a floating window never held the engine focus, so with a float in front `close-window`
+  closed the last focused *tile* behind it and a second `toggle-floating` floated the next tile
+  instead of putting the float back.  `close-window` with a dialog in front closes the dialog (like
+  Alt+F4), and it refuses to guess when an unmanaged window (the Start menu, an elevated program) has
+  the focus.  A floating window is moved by 50 px with `move-column-left/right`, resized with the
+  width/height actions and centred with `center-window`; `fullscreen` covers the monitor the window
+  lives on and gives a float its rectangle back.  A window floats where it floated last time (the
+  first time: its own size, in the middle of the work area) and is remembered per window.
+  `wiri-ctl focus-window <hwnd>` now raises a floating window (it used to answer "ok" and do
+  nothing), `wiri-ctl windows` reports the workspace of a floating window, and the new
+  `wiri-ctl action <name> [args]` (IPC `run_action`) runs any bindable action through the same code
+  as its hotkey, so scripts and status bars can drive wiri.
+- **A minimized window leaves no gap.**  wiri now listens to `EVENT_SYSTEM_MINIMIZESTART` and
+  `EVENT_SYSTEM_MINIMIZEEND`.  A window that is minimized leaves its column, the others close up and
+  the view keeps the focused column visible; when the window is restored it goes back where it sat:
+  into the column it shared with other windows at its old place, or into a column of its own, at its
+  old position and with its old width.  The place is found again by neighbour, not by index, so
+  windows that came and went in the meantime do not misplace it, and a whole desktop minimized at
+  once (Win+D) comes back in its old order whichever window is restored first.  Restored after the
+  user switched to another workspace, the window comes back on the workspace they are looking at.
+  A window that was fullscreen or floating keeps that state, and a window closed while minimized is
+  forgotten.  `wiri-ctl focus-window` restores a minimized window; `wiri-ctl windows` reports
+  `minimized` and the new `column` / `tile` position of every window.
+- **Floating windows belong to their workspace.**  A floating window is hidden when its workspace is
+  left and shown again, where it was, when the user comes back (it used to stay on screen on every
+  workspace), `move-window-to-workspace` / `Mod+Shift+N` move a float with its membership, and
+  `wiri-ctl windows` / `focus-window` know which workspace a float lives on (`focus-window` switches
+  to it).  Floats stay above the tiles: they are raised again whenever a tile takes the focus or a
+  workspace is entered (a tile that was just clicked used to cover the float), and a workspace that
+  holds only floating windows is no longer pruned as empty.  A window floats where it floated last
+  time.
+- **niri's column keymap.**  `consume-or-expel-window-left` / `-right` (a window alone in its column
+  joins the column on that side at the bottom, one of several leaves its column to that side),
+  `consume-window-into-column` (pulls the first window of the column on the right under the focused
+  one: it used to push the focused window into the right neighbour) and `expel-window-from-column`
+  (the bottom window leaves, it used to be the focused one), `move-window-up` / `move-window-down`
+  (swap inside the column, the window keeps the focus), `focus-column-first` / `focus-column-last`,
+  `move-column-to-first` / `move-column-to-last`, and the niri names `focus-window-up` /
+  `focus-window-down`.  `maximize-column` now makes the column as wide as the view, also for a
+  column of one window, and toggling gives the old width back; an explicit width ends it, a maximized
+  column follows the view, and a window expelled from it stays maximized.  The new chords:
+  `Ctrl+Alt+Home` / `End`, `Ctrl+Alt+Shift+Home` / `End`, `Ctrl+Alt+Shift+[` / `]`, `Ctrl+Alt+K` /
+  `J`.  A floating window has no column: the column actions leave it alone and `move-window-up` /
+  `down` nudge it by 50 px.
+- **niri's action names and argument grammar.**  A niri `binds {}` block now ports: `set-column-width`
+  and `set-window-width` take niri's size argument (`"50%"`, `"+10%"`, `"-10%"`, `"1200"`, `"+100"`; wiri's
+  `"1/3"`, `"full"`, `"cycle"` still work), `set-window-height` and `reset-window-height` change a
+  window's share of its column, `focus-workspace 2` is the second workspace while `focus-workspace "2"`
+  is the workspace named 2, and the niri names are accepted for what wiri already does:
+  `fullscreen-window`, `toggle-window-floating`, `move-window-to-floating` / `-tiling` (not toggles),
+  `toggle-overview` / `open-overview` / `close-overview`, `toggle-column-tabbed-display`,
+  `switch-preset-column-width` (and `-back`), `expand-column-to-available-width`,
+  `focus-window-previous`, `focus-workspace-up` / `-down`, `focus-monitor-left` / `-right`,
+  `move-window-to-monitor-left` / `-right`, `screenshot-screen`, `set-workspace-name`,
+  `show-hotkey-overlay`.  A proportion is niri's: two `"50%"` columns and the gap between them fill the
+  view exactly (the old presets were a gap too wide, so three thirds spilled off the screen); a fixed
+  size is the window's, the border comes on top.  `switch-preset-column-width` is niri's cycle (a third,
+  a half, two thirds, the first one wider than the column, going on from the last preset it set) instead
+  of the old quarter-to-full list.  `expand-column-to-available-width` counts only the columns that are
+  fully in view like niri (it subtracted the whole strip, which came out as 50 px on a long one) and
+  maximizes a column that is alone in view.  `wiri-ctl set-column-width` and the IPC request take the
+  same words.  A bind whose action is known but whose arguments are not now says so
+  (`unknown action or bad arguments`).
+- **Workspaces are addressed by position, like in niri.**  `focus-workspace 2`, `Ctrl+Alt+2`,
+  `move-to-workspace 2` and the numbers `wiri-ctl` and the status displays show are the position of the
+  workspace from the top of its monitor, not an id: once an empty workspace in the middle has gone (it
+  now goes as soon as you leave it) the second workspace used to be unreachable, and pressing
+  `Ctrl+Alt+2` made an empty one up.  A number past the last workspace is the last one (the empty
+  workspace at the bottom); nothing is made up.  `focus-workspace-up` / `-down` (PageUp / PageDown) no
+  longer wrap around, `focus-workspace-previous` is niri's (the workspace you were on before; wiri's
+  old meaning of the name is `focus-workspace-up`), and `input { workspace-auto-back-and-forth }`
+  makes asking for the workspace you are on go back to the previous one.  Named workspaces
+  (`workspace "mail"`, with or without a block) exist from the start on every monitor, in the order
+  they are declared, and are not removed when they are empty or left.  `move-workspace-up` / `-down`
+  take the floating and minimized windows of the workspace and (with one monitor) its name along, and
+  `move-column-to-workspace-up` / `-down` go to the next workspace that exists instead of an id that
+  may not.
+- **Windows Terminal no longer lies on top of its neighbour.**  wiri now asks every window how narrow
+  it can be: the `WM_GETMINMAXINFO` question the system itself puts to a window before each resize
+  (asked once when the window is added, outside the engine lock, with a 120 ms timeout that gives up
+  at once on a hung or higher-integrity window, and twice more at most when the window had no time to
+  answer and takes the focus).  A column is never narrower than its windows can be: in proportional
+  mode the other columns share what is left, in fixed mode the wide one just takes its width and the
+  strip moves over.  Three terminals on a 1366 px screen used to be asked for 440 px each, refused
+  (Windows Terminal will not go below about 462 px) and overlapped.  A width the user asked for that
+  is below the minimum is kept, and comes back when the limit goes.
+- **Fullscreen is exactly the monitor.**  A fullscreen window used to be 7 px larger than the monitor
+  on three sides: the invisible window border measured while it still had a frame was added to a
+  window that no longer has one.  It is placed exactly now, and its border is measured again when
+  the frame comes back.
+- **`Ctrl+Alt+Tab` is no longer a default.**  It is Windows' task switcher, so registering it failed
+  with a warning at every start; `focus-previous` (niri's `Mod+Tab`) is ``Ctrl+Alt+` `` (the key
+  above Tab) by default.  A test keeps every default chord off the ones Windows reserves and off
+  each other.
+- **After a crash, `quit` puts the windows back where they were.**  `hidden.json` now also records
+  the rectangle every managed window had before wiri first moved it.  A restarted wiri takes that
+  record over for the windows that are still there (the same handle, process and class), so a
+  `quit` after a kill or a crash restores the real places instead of piling the windows that the dead
+  wiri had parked below the screen into the middle of it (what is not known is still rescued, now
+  cascaded 32 px apart instead of stacked).  The record is written once for the startup pass, once
+  per new or closed window, and deleted by a graceful quit.
+- **A monitor that is unplugged keeps its windows.**  `unregister_monitor` used to throw the monitor
+  and its workspaces away: its windows stayed in `tiled_windows`, so nothing ever tiled them again
+  and they were orphaned until wiri was restarted.  Now the workspaces that hold something move to the
+  monitor that is left (niri does the same): below its own workspaces, a named one joining the
+  workspace of the same name, floating and minimized windows with them, empty ones dropped.  When the
+  monitor comes back (or another monitor appears after the last one went) the windows that are still
+  where they were put go back into the same columns with the same widths; a window that was closed or
+  moved by the user meanwhile is left alone.  The display-change handler registers the monitors that
+  are there before it removes the ones that went.  **Tested with engine unit tests only: the laptop
+  these changes are verified on has a single display, so no real unplug has been tried.**
+- **`layout { hide-method "cloak" }` (optional, off by default).**  The windows of the other
+  workspaces are hidden with `SW_HIDE`, which takes them out of the taskbar and out of Alt+Tab.  With
+  `hide-method "cloak"` the shell cloaks them instead (the way komorebi does, through the
+  undocumented `IApplicationView::SetCloak`): they stay visible to the system, keep their taskbar
+  button and their place in Alt+Tab, and are not drawn.  Alt+Tab (or a taskbar click) to a cloaked
+  window brings its workspace along, once the window has been hidden for a moment (a report right after
+  the hide is still Windows picking a replacement).  The shell interfaces are private and change
+  between builds of Windows: the view of a window is asked for by the IID wiri knows before its vtable
+  is used, the first refusal turns cloaking off for the run and the window is hidden the plain way.
+  `hidden.json` marks cloaked windows, so a wiri that is killed while windows are cloaked is
+  followed by one that uncloaks them (also a quit and a panic), and a window that is visible to the
+  system but cloaked is restored.  The default stays `hide`.
+- **Quit leaves the windows shown.**  A layout pass that ran between the restore and the end of the
+  process (the 750 ms reconciler and the IPC server keep running until then) hid the windows of the
+  other workspaces once more, so a quit could leave them hidden (with `hide-method "cloak"`, whose
+  restore takes a few milliseconds per window, the live test hit it every time).  After the restore
+  the engine lays nothing out any more.  A restart that shows the windows a killed wiri cloaked now
+  also waits until DWM has dropped the cloak before it enumerates the desktop (a cloaked window is
+  not tiled), and a window the shell would not uncloak is tried again at the next show.
+
+### Fixed — live-desktop shakedown (2026-10-24)
+First long run on a real desktop (Windows 11, 1366x768, Windows Terminal
+windows, one hung application) turned up nine defects.  Each is fixed with unit
+tests and was re-checked on that desktop.
+- **Repositioning loop (~68 log lines a second).**  Windows nested inside
+  another window (the XAML island in every Windows Terminal window, WebView
+  hosts) were tiled as columns of their own, and the host and the island passed
+  the foreground back and forth.  Child windows, wiri's own windows and a
+  console that only wiri is attached to are never tiled
+  (`window::classify_skip`).
+- **`wiri-ctl` starved for minutes behind a hung application.**  The layout
+  pass made synchronous cross-process calls (`DeferWindowPos`, `RedrawWindow`
+  with `RDW_UPDATENOW`, `ShowWindow`) while holding the engine lock.
+  Positioning is now one asynchronous `SetWindowPos` per window, redraw only
+  invalidates, show and hide use `ShowWindowAsync`, and every IPC request is
+  answered within 1.5 s ("wiri is busy" instead of a hung pipe).
+- **New windows were never tiled.**  Columns outside the visible strip were
+  skipped by the layout; they are parked below the screen instead, and a new
+  column is scrolled into view by the minimal amount.  A window that closes on
+  an inactive workspace no longer leaves a ghost tile.
+- **Foreground fight.**  The OS foreground is mirrored into the focus state
+  instead of being activated again.  Activation is attempted once per focus
+  target, escalates (`SetForegroundWindow`, an injected F24 key,
+  `AttachThreadInput`, `SwitchToThisWindow`) and a refusal is logged once.  The
+  focused tile's inset no longer differs, so a focus change cannot resize
+  anything.
+- **Key names.**  `Bracket_Left`, `Bracket_Right`, `Backslash`, `Comma`,
+  `Period`, `Page_Up` and `Page_Down` (the xkb/niri spellings; case, `_`, `-`
+  and spaces are ignored) are accepted, so the default config and both examples
+  load without unknown-key warnings.  `set-column-width` is an action.  In
+  `focus-ring {}` and `shadows {}` the keys `width` and `color` no longer
+  overwrite the border settings.
+- **`wiri.exe` is a GUI-subsystem program** (release builds): it opens no
+  console window that wiri could tile.  The log is
+  `%LOCALAPPDATA%\wiri\wiri.log`, rotated at 4 MB with one backup
+  (`wiri.log.1`).  `-v`, `--help`, `--version` and command-line errors attach
+  to the console of the shell that started wiri.
+- **`wiri-ctl` output** is folded to ASCII when stdout or stderr is a pipe or a
+  file (the box-drawing characters used to arrive garbled); a real console
+  keeps the Unicode tables.  `WIRI_ASCII=1` / `WIRI_UNICODE=1` override it and
+  `--json` is untouched.
+- **238 px columns on a 1366 px display.**  In proportional mode every window
+  got an equal share of the screen, down to `column-width / 2`.  The new
+  layout option `max-visible-columns` (default 3) bounds the split: one window
+  fills the screen, two get halves, three get thirds, further windows scroll
+  in at a third.  Explicit widths (`set-column-width`, grow/shrink) now apply
+  in proportional mode too.
+- **Workspace numbers are 1-based** at every user-visible edge (hotkeys,
+  `switch-workspace`, IPC replies, events).  `Ctrl+Alt+1` and
+  `switch-workspace 1` used to select the second workspace.
+- **Crash safety.**  Every hidden window is recorded in
+  `%LOCALAPPDATA%\wiri\hidden.json`; the next start, `wiri-ctl quit` and a
+  panic show them again, and a window an earlier killed wiri left off-screen
+  is moved onto the work area.
+
+Second pass, same day, with real key presses and a real mouse on the same desktop:
+- **Escape did not work in any other application while wiri ran.**  The shipped
+  config binds `Escape` to the overview toggle and wiri registered it with
+  `RegisterHotKey`, which delivers the key to wiri and to nobody else.  It is no
+  longer registered; the low-level keyboard hook leaves overview and resize mode
+  and passes the key on.
+- **Leaving overview with Escape froze wiri** (every `wiri-ctl` call timed out; the
+  original build does the same).  The DWM-thumbnail host window belonged to
+  whichever thread entered overview and was hidden from whichever thread left, a
+  cross-thread call that waits for the owner while the engine lock is held.  The
+  host window now lives on a thread of its own.  It was also fully transparent, so
+  the thumbnails were invisible; it is now a dark translucent backdrop.
+- **Leaving fullscreen** left the window as big as the screen (the fullscreen
+  rect bypassed the applied-state cache).
+- **`move-column-left` / `move-column-right`** merged the column into its
+  neighbour instead of swapping the two.
+- **`toggle-floating`** acts on the floating window that has the focus, and the
+  window just floated keeps the focus; a floated window can be put back with the
+  keyboard.
+- **`Ctrl+Alt+2`** could be undone at once by the foreground report of a window
+  wiri had just hidden.
+- `wiri-ctl get-focus` prints the focused window.
+
 ### Added — opus pass K (2026-05-18)
 - ✅ **DwmRegisterThumbnail-based overview** — niri-parity overview rendering
   that leaves the underlying HWNDs at their normal size and instead

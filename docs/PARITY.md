@@ -1,5 +1,10 @@
 # wiri ↔ niri parity
 
+> **Superseded on 2026-10-24.** Most of the "done" rows below did not hold up when the
+> code was checked against niri `main` (13 of 485 features done, 172 partial, 215
+> missing, 85 not applicable on Windows). See [docs/parity/](parity/README.md) for the
+> verified matrices and the plan. This page is kept for history.
+
 A frank stocktake of what wiri has shipped from
 [niri](https://github.com/YaLTeR/niri)'s feature set, what's missing, and
 what's intentionally out of scope.
@@ -97,13 +102,13 @@ Last refreshed: 2026-05-18 (commit `1392948`+, six opus polish passes).
 | Per-monitor `output { … }` config | ✅ | name + index match |
 | `output { scale }` validation (0.5–4.0) | ✅ | warns + clamps |
 | Default-config drop on first run | ✅ | `%APPDATA%\wiri\config.kdl` |
-| Merge-with-defaults for `binds {}` | ✅ | Default `extend-defaults true`; config wins on collision, additions are appended |
+| Merge-with-defaults for `binds {}` | ✅ | Opt-in `extend-defaults` (the generated config has it; niri has no built-in binds); config wins on collision, additions are appended |
 
 ## IPC
 
 | Feature | Status | Notes |
 | --- | :---: | --- |
-| Named-pipe IPC at `\\.\pipe\wiri_control` | ✅ | ACL: Admins + owner only |
+| Named-pipe IPC at `\\.\pipe\wiri_control_<user>_<session>` | ✅ | ACL: Admins + owner only; the name is per user and session, so a second user on the machine does not collide |
 | 30+ `wiri-ctl` subcommands, human + `--json` output | ✅ | |
 | Event streaming (`wiri-ctl events`) | ✅ | wall-clock timestamps |
 | Diagnostic `list-monitors` | ✅ | |

@@ -1,25 +1,46 @@
-pub mod workspace;
-pub mod floating;
-pub mod engine;
 pub mod animation;
+pub mod engine;
+pub mod floating;
 pub mod snap;
 pub mod snapshot;
+pub mod strip;
+pub mod workspace;
 
-pub use workspace::{Workspace, Column, ColumnDisplay, Tile, compute_column_layout, compute_workspace_layout};
-pub use workspace::{WorkspaceLayout};
-pub use floating::{FloatManager, FloatWindow};
-pub use floating::FloatingCorner;
-pub use engine::TilingEngine;
-pub use engine::LayoutConfig;
-pub use engine::ColumnWidthMode;
-pub use engine::AddWindowTarget;
-pub use engine::ColumnWidthPreset;
-pub use engine::WorkspaceDirection;
 pub use animation::{Animation, AnimationManager, AnimationTarget, Easing};
+pub use engine::AddWindowTarget;
+pub use engine::ColumnWidthMode;
+pub use engine::ColumnWidthPreset;
+pub use engine::FocusLayer;
+pub use engine::LayoutConfig;
+pub use engine::SizeAxis;
+pub use engine::TilingEngine;
+pub use engine::WorkspaceDirection;
+pub use engine::{query_foreground, ActionTarget, ForegroundWindow};
+pub use floating::FloatingCorner;
+pub use floating::{FloatManager, FloatWindow};
+pub use workspace::WorkspaceLayout;
+pub use workspace::{
+    compute_column_layout, compute_workspace_layout, Column, ColumnDisplay, Tile, Workspace,
+};
 
+use crate::utils::{OutputId, Rect, Size, WindowId};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use crate::utils::{Rect, Size, OutputId, WindowId};
+
+/// Workspace numbers are 1-based wherever a user types or reads one (the
+/// `Ctrl+Alt+1` hotkey, `wiri-ctl switch-workspace 2`, the IPC `id`
+/// fields), while the engine keeps 0-based ids and starts on id 0.  Without
+/// this conversion `Ctrl+Alt+1` went to the *second* workspace and
+/// `switch-workspace 1` after `switch-workspace 2` never brought the first
+/// workspace's windows back.
+pub fn workspace_id_from_number(number: i32) -> i32 {
+    (number - 1).max(0)
+}
+
+/// Inverse of [`workspace_id_from_number`]: the number shown to users.
+pub fn workspace_number(id: i32) -> i32 {
+    id + 1
+}
 
 /// MRU (most-recently-used) focus stack.
 /// The most recently focused window is at the front (index 0).
@@ -54,6 +75,16 @@ impl FocusRing {
         self.stack.retain(|&id| id != window_id);
     }
 
+    /// Put a window the user has not looked at (it opened without the focus) at the back
+    /// of the ring: nothing that was focused before it is displaced.  A window that is
+    /// in the ring already stays where it is.
+    pub fn push_back(&mut self, window_id: WindowId) {
+        if self.stack.contains(&window_id) || self.stack.len() >= self.capacity {
+            return;
+        }
+        self.stack.push(window_id);
+    }
+
     /// Return the most recently focused window (front of stack), if any.
     pub fn current(&self) -> Option<WindowId> {
         self.stack.first().copied()
@@ -62,6 +93,11 @@ impl FocusRing {
     /// Return the second entry (previous focus) without modifying the stack.
     pub fn previous(&self) -> Option<WindowId> {
         self.stack.get(1).copied()
+    }
+
+    /// Iterate from the most recently focused window to the least recent.
+    pub fn iter_mru(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.stack.iter().copied()
     }
 
     /// Number of entries in the ring.
@@ -113,7 +149,10 @@ pub struct ConfigureThrottle {
 
 impl ConfigureThrottle {
     pub fn new(min_interval: Duration) -> Self {
-        Self { last_send: None, min_interval }
+        Self {
+            last_send: None,
+            min_interval,
+        }
     }
 
     /// Default throttle: ~60 fps (16 ms between configures).
@@ -154,10 +193,18 @@ impl Default for ConfigureThrottle {
 pub trait LayoutElement {
     fn window_id(&self) -> WindowId;
     fn bounds(&self) -> Rect;
-    fn min_size(&self) -> Size { Size::new(50, 50) }
-    fn max_size(&self) -> Option<Size> { None }
-    fn is_focused(&self) -> bool { false }
-    fn is_urgent(&self) -> bool { false }
+    fn min_size(&self) -> Size {
+        Size::new(50, 50)
+    }
+    fn max_size(&self) -> Option<Size> {
+        None
+    }
+    fn is_focused(&self) -> bool {
+        false
+    }
+    fn is_urgent(&self) -> bool {
+        false
+    }
     fn configure_intent(&self) -> ConfigureIntent;
 }
 
@@ -226,7 +273,9 @@ where
     /// Iterate in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
         let map = &self.map;
-        self.order.iter().filter_map(move |k| map.get(k).map(|v| (k, v)))
+        self.order
+            .iter()
+            .filter_map(move |k| map.get(k).map(|v| (k, v)))
     }
 
     /// Iterate mutably in insertion order.
@@ -312,7 +361,8 @@ where
     type IntoIter = std::vec::IntoIter<(&'a K, &'a V)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.order.iter()
+        self.order
+            .iter()
             .filter_map(|k| self.map.get(k).map(|v| (k, v)))
             .collect::<Vec<_>>()
             .into_iter()
@@ -331,9 +381,7 @@ where
         let MonitorSet { map, order, .. } = self;
         let mut pairs: Vec<(&'a K, &'a mut V)> = map.iter_mut().collect();
         // Sort by insertion order (position in `order`) to match &MonitorSet's iteration order.
-        pairs.sort_by_key(|(k, _)| {
-            order.iter().position(|ok| ok == *k).unwrap_or(usize::MAX)
-        });
+        pairs.sort_by_key(|(k, _)| order.iter().position(|ok| ok == *k).unwrap_or(usize::MAX));
         pairs.into_iter()
     }
 }
@@ -353,7 +401,13 @@ pub struct Monitor {
     /// DPI scaling factor (1.0 = 96 DPI, 1.5 = 144 DPI, 2.0 = 192 DPI)
     pub scale_factor: f64,
     pub workspaces: HashMap<i32, Workspace>,
+    /// Visible order is independent of stable local keys and session IPC ids.
+    workspace_order: Vec<i32>,
     pub active_workspace: i32,
+    /// The workspace that was active before the current one (niri's
+    /// `focus-workspace-previous` and `workspace-auto-back-and-forth` go back to it).
+    /// It may have been removed since; callers check that it still exists.
+    pub previous_workspace: Option<i32>,
     pub focus_column: Option<usize>,
     pub focus_window: Option<WindowId>,
     /// MRU focus stack — most recently focused window is at the front.
@@ -365,7 +419,12 @@ impl Monitor {
         Self::with_scale(output_id, bounds, work_area, 1.0)
     }
 
-    pub fn with_scale(output_id: OutputId, bounds: Rect, work_area: Rect, scale_factor: f64) -> Self {
+    pub fn with_scale(
+        output_id: OutputId,
+        bounds: Rect,
+        work_area: Rect,
+        scale_factor: f64,
+    ) -> Self {
         let mut workspaces = HashMap::new();
         workspaces.insert(0, Workspace::new());
         Self {
@@ -374,7 +433,9 @@ impl Monitor {
             work_area,
             scale_factor,
             workspaces,
+            workspace_order: vec![0],
             active_workspace: 0,
+            previous_workspace: None,
             focus_column: None,
             focus_window: None,
             focus_ring: FocusRing::new(32),
@@ -393,13 +454,134 @@ impl Monitor {
         self.active_workspace
     }
 
+    /// Stable keys in visible order; discover legacy direct map insertions deterministically.
+    pub fn workspace_ids(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .workspace_order
+            .iter()
+            .copied()
+            .filter(|id| self.workspaces.contains_key(id))
+            .collect();
+        let mut discovered: Vec<i32> = self
+            .workspaces
+            .keys()
+            .copied()
+            .filter(|id| !ids.contains(id))
+            .collect();
+        discovered.sort_unstable();
+        ids.extend(discovered);
+        ids
+    }
+
+    pub fn insert_workspace(&mut self, id: i32, workspace: Workspace) {
+        self.workspace_order = self.workspace_ids();
+        if !self.workspace_order.contains(&id) {
+            self.workspace_order.push(id);
+        }
+        self.workspaces.insert(id, workspace);
+    }
+
+    pub fn remove_workspace(&mut self, id: i32) -> Option<Workspace> {
+        self.workspace_order.retain(|other| *other != id);
+        self.workspaces.remove(&id)
+    }
+
+    pub fn move_workspace_to_position(&mut self, id: i32, position: usize) {
+        let mut ids = self.workspace_ids();
+        let Some(from) = ids.iter().position(|other| *other == id) else {
+            return;
+        };
+        ids.remove(from);
+        ids.insert(position.min(ids.len()), id);
+        self.workspace_order = ids;
+    }
+
+    pub fn next_workspace_id(&self) -> i32 {
+        self.workspaces
+            .keys()
+            .copied()
+            .max()
+            .map_or(0, |id| id.saturating_add(1))
+    }
+
+    /// The number of workspace `id` on this monitor: its 1-based position from the top.
+    /// This is what `focus-workspace 2` counts and what the status displays show; the
+    /// ids themselves have gaps once an empty workspace in the middle has gone.
+    pub fn workspace_number_of(&self, id: i32) -> Option<i32> {
+        if !self.workspaces.contains_key(&id) {
+            return None;
+        }
+        self.workspace_ids()
+            .iter()
+            .position(|other| *other == id)
+            .map(|position| position as i32 + 1)
+    }
+
+    /// The id of the workspace at 1-based `number`; a number past the last workspace
+    /// is the last one (niri: the empty workspace at the bottom).
+    pub fn workspace_id_for_number(&self, number: i32) -> i32 {
+        let ids = self.workspace_ids();
+        let index = (number.max(1) as usize - 1).min(ids.len().saturating_sub(1));
+        ids.get(index).copied().unwrap_or(self.active_workspace)
+    }
+
+    /// The workspace above (`down == false`) or below `id`, if there is one.
+    pub fn workspace_next_to(&self, id: i32, down: bool) -> Option<i32> {
+        let ids = self.workspace_ids();
+        let position = ids.iter().position(|other| *other == id)?;
+        let next = if down {
+            position.checked_add(1)?
+        } else {
+            position.checked_sub(1)?
+        };
+        ids.get(next).copied()
+    }
+
     pub fn switch_workspace(&mut self, id: i32) {
         if !self.workspaces.contains_key(&id) {
             self.workspaces.insert(id, Workspace::new());
         }
+        if id != self.active_workspace {
+            self.previous_workspace = Some(self.active_workspace);
+        }
         self.active_workspace = id;
         self.focus_column = None;
         self.focus_window = None;
+        self.restore_focus_in_active_workspace();
+    }
+
+    /// Give the freshly activated workspace a focused window again: the one
+    /// that was focused most recently (per the MRU ring), else the first tile
+    /// of its first column.  An empty workspace keeps "no focus".  Without
+    /// this every workspace switch left the keyboard focus commands dead until
+    /// the OS happened to report a foreground change.
+    fn restore_focus_in_active_workspace(&mut self) {
+        let target = {
+            let workspace = match self.workspaces.get(&self.active_workspace) {
+                Some(w) if !w.columns.is_empty() => w,
+                _ => return,
+            };
+            workspace
+                .remembered_focus()
+                .or_else(|| {
+                    self.focus_ring
+                        .iter_mru()
+                        .find_map(|wid| workspace.find_window_column(wid).map(|col| (col, wid)))
+                })
+                .or_else(|| {
+                    workspace
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find_map(|(col, column)| {
+                            column.tiles.first().map(|tile| (col, tile.window_id))
+                        })
+                })
+        };
+        if let Some((col, wid)) = target {
+            self.focus_column = Some(col);
+            self.focus_window = Some(wid);
+        }
     }
 
     /// Get the logical width of the work area (accounts for DPI scaling).
@@ -425,7 +607,7 @@ impl Monitor {
         (logical as f64 * self.scale_factor) as i32
     }
 
-    /// Get a DPI-aware rect for positioning. 
+    /// Get a DPI-aware rect for positioning.
     /// Returns a rect suitable for use with SetWindowPos.
     /// Note: With PER_MONITOR_AWARE_V2, this returns the work_area as-is.
     pub fn positioning_rect(&self) -> Rect {
@@ -443,7 +625,7 @@ impl Monitor {
 
     pub fn add_window_with_width(&mut self, window_id: WindowId, width_hint: Option<u32>) {
         if let Some(workspace) = self.workspace_mut() {
-            let column_idx = workspace.add_window_to_new_column_with_width(window_id, width_hint);
+            let column_idx = workspace.insert_window_after_active(window_id, width_hint);
             self.focus_column = Some(column_idx);
             self.focus_window = Some(window_id);
         }
@@ -454,8 +636,10 @@ impl Monitor {
     pub fn set_focus(&mut self, window_id: WindowId) {
         self.focus_window = Some(window_id);
         self.focus_ring.push(window_id);
-        // Also update focus_column to match.
-        if let Some(workspace) = self.workspace() {
+        // The column remembers its active tile and the workspace its active column; in a
+        // tabbed column focus and visibility are the same selection (remember_focus shows the tab).
+        if let Some(workspace) = self.workspace_mut() {
+            workspace.remember_focus(window_id);
             if let Some(col_idx) = workspace.find_window_column(window_id) {
                 self.focus_column = Some(col_idx);
             }
@@ -465,6 +649,16 @@ impl Monitor {
     pub fn remove_window(&mut self, window_id: WindowId) {
         // Remove from MRU ring unconditionally.
         self.focus_ring.remove(window_id);
+
+        // A window that closes while it is parked on an inactive workspace must
+        // leave that workspace too; otherwise it lingers as a ghost tile that
+        // is positioned (and fails to position) on every later layout pass.
+        let active = self.active_workspace;
+        for (id, workspace) in self.workspaces.iter_mut() {
+            if *id != active {
+                workspace.remove_window(window_id);
+            }
+        }
 
         if let Some(workspace) = self.workspace_mut() {
             let removed = workspace.remove_window(window_id);
@@ -480,17 +674,22 @@ impl Monitor {
                             None
                         } else if let Some(mru_wid) = mru_candidate {
                             // Verify the MRU candidate still exists in this workspace.
-                            workspace.find_window_column(mru_wid)
+                            workspace
+                                .find_window_column(mru_wid)
                                 .map(|col| (col, Some(mru_wid)))
                         } else {
                             // No MRU entry — fall back to adjacent column.
                             let adj = col_idx.min(num_cols - 1);
-                            let focus_wid = workspace.columns.get(adj)
+                            let focus_wid = workspace
+                                .columns
+                                .get(adj)
                                 .and_then(|col| col.tiles.first())
                                 .map(|tile| tile.window_id);
                             Some((adj, focus_wid))
                         }
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some((adj, focus_wid)) = new_focus {
                         self.focus_column = Some(adj);
                         self.focus_window = focus_wid;
@@ -512,19 +711,20 @@ impl Monitor {
                             None
                         } else if let Some(fwid) = focused_wid {
                             // Find where the focused window ended up
-                            workspace.find_window_column(fwid)
-                                .map(|col| (col, fwid))
+                            workspace.find_window_column(fwid).map(|col| (col, fwid))
                         } else {
                             // No focused window — clamp focus_column to valid range
-                            let clamped = self.focus_column
-                                .unwrap_or(0)
-                                .min(num_cols - 1);
-                            let focus_wid = workspace.columns.get(clamped)
+                            let clamped = self.focus_column.unwrap_or(0).min(num_cols - 1);
+                            let focus_wid = workspace
+                                .columns
+                                .get(clamped)
                                 .and_then(|col| col.tiles.first())
                                 .map(|t| t.window_id);
                             focus_wid.map(|wid| (clamped, wid))
                         }
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some((col, wid)) = new_focus {
                         self.focus_column = Some(col);
                         self.focus_window = Some(wid);
@@ -535,9 +735,8 @@ impl Monitor {
                             if num_cols == 0 {
                                 self.focus_column = None;
                             } else {
-                                self.focus_column = Some(
-                                    self.focus_column.unwrap_or(0).min(num_cols - 1),
-                                );
+                                self.focus_column =
+                                    Some(self.focus_column.unwrap_or(0).min(num_cols - 1));
                             }
                         }
                     }
@@ -553,11 +752,9 @@ impl Monitor {
                 let new_focus = self
                     .workspace()
                     .and_then(|w| w.columns.get(col_idx - 1))
-                    .and_then(|c| c.tiles.first())
-                    .map(|t| t.window_id);
+                    .and_then(|c| c.active_window());
                 if let Some(wid) = new_focus {
-                    self.focus_window = Some(wid);
-                    self.focus_ring.push(wid);
+                    self.set_focus(wid);
                 }
             }
         }
@@ -568,18 +765,44 @@ impl Monitor {
             let info = self.workspace().and_then(|workspace| {
                 if col_idx < workspace.columns.len().saturating_sub(1) {
                     let new_col = col_idx + 1;
-                    workspace.columns.get(new_col).and_then(|col| {
-                        col.tiles.first().map(|tile| (new_col, tile.window_id))
-                    })
+                    workspace
+                        .columns
+                        .get(new_col)
+                        .and_then(|col| col.active_window().map(|wid| (new_col, wid)))
                 } else {
                     None
                 }
             });
             if let Some((new_col, window_id)) = info {
                 self.focus_column = Some(new_col);
-                self.focus_window = Some(window_id);
-                self.focus_ring.push(window_id);
+                self.set_focus(window_id);
             }
+        }
+    }
+
+    /// niri `focus-column-first`: the first tile of the first column.
+    pub fn focus_column_first(&mut self) {
+        self.focus_column_at(0);
+    }
+
+    /// niri `focus-column-last`: the first tile of the last column.
+    pub fn focus_column_last(&mut self) {
+        let last = self
+            .workspace()
+            .map(|w| w.columns.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.focus_column_at(last);
+    }
+
+    /// Focus the first tile of column `col` (nothing when there is no such column).
+    fn focus_column_at(&mut self, col: usize) {
+        let target = self
+            .workspace()
+            .and_then(|w| w.columns.get(col))
+            .and_then(|c| c.active_window());
+        if let Some(wid) = target {
+            self.focus_column = Some(col);
+            self.set_focus(wid);
         }
     }
 
@@ -601,12 +824,17 @@ impl Monitor {
                         }
                     }
                     found
-                } else { None }
-            } else { None }
-        } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(wid) = new_wid {
-            self.focus_window = Some(wid);
-            self.focus_ring.push(wid);
+            self.set_focus(wid);
         }
     }
 
@@ -628,12 +856,17 @@ impl Monitor {
                         }
                     }
                     found
-                } else { None }
-            } else { None }
-        } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(wid) = new_wid {
-            self.focus_window = Some(wid);
-            self.focus_ring.push(wid);
+            self.set_focus(wid);
         }
     }
 }
@@ -751,6 +984,97 @@ mod monitor_tests {
         // Window should still be there
         let ws = m.workspace().unwrap();
         assert_eq!(ws.columns.len(), 1);
+    }
+
+    #[test]
+    fn test_workspace_numbers_are_one_based_for_users() {
+        // `Ctrl+Alt+1` / `switch-workspace 1` is the workspace the engine starts on.
+        assert_eq!(workspace_id_from_number(1), 0);
+        assert_eq!(workspace_id_from_number(2), 1);
+        assert_eq!(workspace_id_from_number(9), 8);
+        // Nonsense input clamps to the first workspace instead of going negative.
+        assert_eq!(workspace_id_from_number(0), 0);
+        assert_eq!(workspace_id_from_number(-5), 0);
+        for id in 0..9 {
+            assert_eq!(workspace_id_from_number(workspace_number(id)), id);
+        }
+    }
+
+    #[test]
+    fn test_workspace_numbers_count_positions_when_the_ids_have_gaps() {
+        let mut m = make_monitor();
+        for id in [2, 3] {
+            m.workspaces.insert(id, Workspace::new());
+        }
+        // Workspaces 0, 2 and 3: the second one from the top is id 2.
+        assert_eq!(m.workspace_ids(), vec![0, 2, 3]);
+        assert_eq!(m.workspace_number_of(0), Some(1));
+        assert_eq!(m.workspace_number_of(2), Some(2));
+        assert_eq!(m.workspace_number_of(3), Some(3));
+        assert_eq!(m.workspace_number_of(1), None);
+        assert_eq!(m.workspace_id_for_number(1), 0);
+        assert_eq!(m.workspace_id_for_number(2), 2);
+        assert_eq!(m.workspace_id_for_number(3), 3);
+        // Past the last one: the last one.  Nonsense: the first.
+        assert_eq!(m.workspace_id_for_number(9), 3);
+        assert_eq!(m.workspace_id_for_number(0), 0);
+        assert_eq!(m.workspace_id_for_number(-4), 0);
+        // The neighbours skip the gap and stop at the ends.
+        assert_eq!(m.workspace_next_to(0, true), Some(2));
+        assert_eq!(m.workspace_next_to(2, true), Some(3));
+        assert_eq!(m.workspace_next_to(3, true), None);
+        assert_eq!(m.workspace_next_to(3, false), Some(2));
+        assert_eq!(m.workspace_next_to(2, false), Some(0));
+        assert_eq!(m.workspace_next_to(0, false), None);
+    }
+
+    #[test]
+    fn test_a_monitor_remembers_the_workspace_it_came_from() {
+        let mut m = make_monitor();
+        assert_eq!(m.previous_workspace, None);
+        m.switch_workspace(1);
+        assert_eq!(m.previous_workspace, Some(0));
+        m.switch_workspace(1); // not a change
+        assert_eq!(m.previous_workspace, Some(0));
+        m.switch_workspace(0);
+        assert_eq!(m.previous_workspace, Some(1));
+    }
+
+    #[test]
+    fn test_monitor_switch_back_restores_most_recent_focus() {
+        let mut m = make_monitor();
+        m.add_window(WindowId::new(100));
+        m.add_window(WindowId::new(101));
+        m.focus_left();
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+
+        m.switch_workspace(1);
+        assert!(m.focus_window.is_none());
+        m.switch_workspace(0);
+        // Without this the keyboard focus commands stayed dead after every
+        // workspace switch until the OS reported a foreground change.
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
+    }
+
+    #[test]
+    fn test_monitor_remove_window_on_inactive_workspace() {
+        let mut m = make_monitor();
+        m.add_window(WindowId::new(100));
+        m.switch_workspace(1);
+        m.add_window(WindowId::new(200));
+        // Window 100 closes while workspace 1 is the active one.
+        m.remove_window(WindowId::new(100));
+        m.switch_workspace(0);
+        assert_eq!(
+            m.workspace().unwrap().columns.len(),
+            0,
+            "the closed window must not linger on workspace 0"
+        );
+        // The window on the (then active) workspace is untouched.
+        m.switch_workspace(1);
+        assert_eq!(m.workspace().unwrap().columns.len(), 1);
+        assert_eq!(m.focus_window, Some(WindowId::new(200)));
     }
 
     #[test]
@@ -872,6 +1196,27 @@ mod monitor_tests {
         // Window 1 and 2 were evicted.
         ring.remove(WindowId::new(1)); // no-op, already gone
         assert_eq!(ring.len(), 4);
+    }
+
+    #[test]
+    fn test_focus_ring_push_back_displaces_nothing() {
+        let mut ring = FocusRing::new(3);
+        ring.push(WindowId::new(1));
+        ring.push(WindowId::new(2));
+        // A window that opened without the focus goes to the back...
+        ring.push_back(WindowId::new(9));
+        assert_eq!(ring.current(), Some(WindowId::new(2)));
+        assert_eq!(
+            ring.iter_mru().collect::<Vec<_>>(),
+            vec![WindowId::new(2), WindowId::new(1), WindowId::new(9)]
+        );
+        // ...a window that is in the ring stays where it is...
+        ring.push_back(WindowId::new(1));
+        assert_eq!(ring.iter_mru().nth(1), Some(WindowId::new(1)));
+        // ...and a full ring takes no more (the oldest focus is not thrown out for it).
+        ring.push_back(WindowId::new(10));
+        assert_eq!(ring.len(), 3);
+        assert!(!ring.iter_mru().any(|w| w == WindowId::new(10)));
     }
 
     #[test]
@@ -1019,4 +1364,3 @@ mod monitor_tests {
         assert_eq!(pairs[0], (b, 2));
     }
 }
-

@@ -1,5 +1,6 @@
 // Every wiri action bound to a memorable chord. Use this to learn the keymap;
 // strip the binds you don't want once you've internalised them.
+// The syntax is niri's (KDL): `Mod+Key { action; }`, with niri's bind properties.
 
 version "1.0"
 
@@ -9,79 +10,87 @@ input {
 
 binds {
     // --- Navigation ---
-    Ctrl+Alt+Left           focus-column-left
-    Ctrl+Alt+Right          focus-column-right
-    Ctrl+Alt+Up             focus-up
-    Ctrl+Alt+Down           focus-down
-    Ctrl+Alt+H              scroll-left
-    Ctrl+Alt+L              scroll-right
-    Ctrl+Alt+Tab            focus-previous              // alt-tab MRU
+    Mod+Left            { focus-column-left; }
+    Mod+Right           { focus-column-right; }
+    Mod+Up              { focus-window-up; }
+    Mod+Down            { focus-window-down; }
+    Mod+H               { scroll-left; }
+    Mod+L               { scroll-right; }
+    Mod+Grave           { focus-previous; }              // alt-tab MRU (Ctrl+Alt+Tab is Windows' own)
 
     // --- Move focused column ---
-    Ctrl+Alt+Shift+Left     move-column-left
-    Ctrl+Alt+Shift+Right    move-column-right
-    Ctrl+Alt+Shift+Page_Up  move-column-to-monitor-left
-    Ctrl+Alt+Shift+Page_Down move-column-to-monitor-right
+    Mod+Shift+Left      { move-column-left; }
+    Mod+Shift+Right     { move-column-right; }
+    Mod+Shift+Page_Up   { move-column-to-monitor-left; }
+    Mod+Shift+Page_Down { move-column-to-monitor-right; }
 
     // --- Window state ---
-    Ctrl+Alt+Q              close-window
-    Ctrl+Alt+F              toggle-fullscreen
-    Ctrl+Alt+T              toggle-floating
-    Ctrl+Alt+A              toggle-always-on-top
+    Mod+Q               { close-window; }
+    Mod+F               { fullscreen-window; }
+    Mod+T               { toggle-window-floating; }
+    Mod+A               { toggle-always-on-top; }
 
     // --- Column rearrange (niri) ---
-    Ctrl+Alt+Comma          consume-window-into-column   // merge into right column
-    Ctrl+Alt+Period         expel-window-from-column     // pop into new column
-    Ctrl+Alt+E              expand-column-to-available   // fill remaining width
-    Ctrl+Alt+Shift+F        maximize-column              // full work-area height
+    Mod+Comma           { consume-window-into-column; }   // pull the right column's first window under this one
+    Mod+Period          { expel-window-from-column; }     // bottom window gets a column of its own
+    Mod+Shift+Bracket_Left   { consume-or-expel-window-left; }   // lone window joins the left column / one of several leaves to the left
+    Mod+Shift+Bracket_Right  { consume-or-expel-window-right; }
+    Mod+K               { move-window-up; }               // swap with the window above
+    Mod+J               { move-window-down; }
+    Mod+Home            { focus-column-first; }
+    Mod+End             { focus-column-last; }
+    Mod+Shift+Home      { move-column-to-first; }
+    Mod+Shift+End       { move-column-to-last; }
+    Mod+E               { expand-column-to-available-width; }   // fill remaining width
+    Mod+Shift+F         { maximize-column; }              // column as wide as the view (toggle)
 
     // --- Keyboard resize ---
-    Ctrl+Alt+Shift+L        grow-column-width            // +5%
-    Ctrl+Alt+Shift+H        shrink-column-width          // -5%
-    Ctrl+Alt+Shift+K        grow-tile-height             // +5%
-    Ctrl+Alt+Shift+J        shrink-tile-height           // -5%
+    Mod+Shift+L         { grow-column-width; }            // +5%
+    Mod+Shift+H         { shrink-column-width; }          // -5%
+    Mod+Shift+K         { grow-tile-height; }             // +5%
+    Mod+Shift+J         { shrink-tile-height; }           // -5%
 
     // --- Column-width presets ---
-    Ctrl+Alt+Bracket_Left   set-column-width "1/3"
-    Ctrl+Alt+Bracket_Right  set-column-width "2/3"
-    Ctrl+Alt+Backslash      set-column-width "cycle"
+    Mod+Bracket_Left    { set-column-width "33.333%"; }
+    Mod+Bracket_Right   { set-column-width "66.667%"; }
+    Mod+Backslash       { switch-preset-column-width; }
 
     // --- Workspaces ---
-    Ctrl+Alt+1              switch-workspace 1
-    Ctrl+Alt+2              switch-workspace 2
-    Ctrl+Alt+3              switch-workspace 3
-    Ctrl+Alt+4              switch-workspace 4
-    Ctrl+Alt+5              switch-workspace 5
-    Ctrl+Alt+6              switch-workspace 6
-    Ctrl+Alt+7              switch-workspace 7
-    Ctrl+Alt+8              switch-workspace 8
-    Ctrl+Alt+9              switch-workspace 9
+    Mod+1               { focus-workspace 1; }
+    Mod+2               { focus-workspace 2; }
+    Mod+3               { focus-workspace 3; }
+    Mod+4               { focus-workspace 4; }
+    Mod+5               { focus-workspace 5; }
+    Mod+6               { focus-workspace 6; }
+    Mod+7               { focus-workspace 7; }
+    Mod+8               { focus-workspace 8; }
+    Mod+9               { focus-workspace 9; }
 
     // --- Overview / multi-workspace view ---
-    Ctrl+Alt+Space          overview-toggle
-    Ctrl+Alt+O              overview-select
-    // (Escape is registered automatically and only fires when overview is on.)
+    Mod+Space           { toggle-overview; }
+    Mod+O               { overview-select; }
+    // (Escape leaves the overview: the keyboard hook handles it, the key stays free for other programs.)
 
     // --- Capture ---
-    Ctrl+Alt+P              screenshot
-    Ctrl+Alt+Shift+S        window-screenshot
+    Mod+P               { screenshot; }
+    Mod+Shift+S         { screenshot-window; }
 
     // --- Spawn ---
-    Ctrl+Alt+Return         spawn "wt.exe"                // terminal
-    Ctrl+Alt+B              spawn "msedge.exe"            // browser
-    Ctrl+Alt+S              spawn-cmd "start ."           // explorer in cwd
+    Mod+Return          hotkey-overlay-title="Terminal" { spawn "wt.exe"; }
+    Mod+B               hotkey-overlay-title="Browser"  { spawn "msedge.exe"; }
+    Mod+S               repeat=false { spawn-sh "start ."; }      // explorer in the current directory
 
     // --- Lifecycle ---
-    Ctrl+Alt+Shift+Q        quit
+    Mod+Shift+Q         { quit; }
 }
 
-// --- Example window rules ---
-window-rules {
-    class "CalcFrame" {
-        float true
-    }
-    title "Picture-in-Picture" {
-        float true
-        sticky true
-    }
+// --- Example window rules (niri syntax) ---
+window-rule {
+    match app-id="^CalcFrame"
+    open-floating true
+}
+window-rule {
+    match title="Picture-in-Picture"
+    open-floating true
+    open-focused false
 }

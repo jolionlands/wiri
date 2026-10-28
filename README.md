@@ -37,11 +37,16 @@ Minimum Rust: stable 1.78+. No build-script magic.
 
 First run writes a default config to `%APPDATA%\wiri\config.kdl`. Edit it and save — wiri hot-reloads.
 
+`wiri.exe` is a GUI program: starting it opens no console window.  Its log is
+`%LOCALAPPDATA%\wiri\wiri.log`, and `-v` also shows it in the shell that started wiri.  If wiri is
+ever killed, start it again: windows it had hidden are shown again (see
+[Troubleshooting](docs/TROUBLESHOOTING.md)).
+
 To stop: `wiri-ctl quit`, the tray menu, or `Ctrl+Alt+Shift+Q`.
 
 ## Default key bindings
 
-All defaults use the `Ctrl+Alt` prefix. Override the whole set in the `binds {}` section of `config.kdl`.
+All defaults use the `Ctrl+Alt` prefix (`Mod` in a config). The config file wiri writes on first run lists them and starts `binds {}` with `extend-defaults`, a wiri extension that adds these built-in binds to the ones written there (a bind on the same keys wins). Like niri, a `binds {}` block without `extend-defaults` counts alone: an omitted or empty block binds nothing.
 
 | Key | Action |
 | --- | --- |
@@ -53,7 +58,8 @@ All defaults use the `Ctrl+Alt` prefix. Override the whole set in the `binds {}`
 | Enter | Spawn `cmd.exe` |
 | F | Toggle fullscreen |
 | T | Toggle floating |
-| Tab | Overview (zoom out) |
+| Space | Overview (zoom out) |
+| ` (grave) | Focus the previous window (niri's `Mod+Tab`; `Ctrl+Alt+Tab` is Windows' own) |
 | O | Select window in overview |
 | 1 – 9 | Switch workspace |
 | Shift+Q | Quit wiri |
@@ -62,42 +68,57 @@ All defaults use the `Ctrl+Alt` prefix. Override the whole set in the `binds {}`
 
 ## Configuration
 
-Configuration uses [KDL](https://kdl.dev). The default config in `resources/default_config.kdl` is the source of truth — copy it to `%APPDATA%\wiri\config.kdl` and edit. See `docs/DOCUMENTATION.md` for every supported field.
+Configuration uses [KDL](https://kdl.dev), the syntax niri uses: a niri `binds {}` block, `window-rule`s and `include`
+paste in as they are. The default config in `resources/default_config.kdl` is the source of truth — copy it to
+`%APPDATA%\wiri\config.kdl` and edit. See `docs/DOCUMENTATION.md` (section 4) for every supported option.
+A mistake in the file is reported with its line and column (tray balloon, log, `wiri-ctl validate-config`)
+and the last good config stays in use.
 
 Highlights:
 
 ```kdl
 layout {
+    gaps 16
     column-width 500
-    inner-gaps 16
-    outer-gaps 8
-    border-color "#333333"
-    border-color-focused "#0066cc"
+    border {
+        width 4
+        inactive-color "#333333"
+        active-color "#0066cc"
+    }
 }
 
 animations {
-    enabled true
+    on
     duration 200
     easing "ease-out-cubic"
 }
 
 binds {
-    Ctrl+Alt+Enter spawn "wt.exe"
-    Ctrl+Alt+B spawn "chrome.exe"
+    Mod+Return { spawn "wt.exe"; }
+    Mod+B hotkey-overlay-title="Browser" { spawn "chrome.exe"; }
 }
 
-window-rules {
-    class "CalcFrame" { float true }
+window-rule {
+    match app-id="^CalcFrame"
+    open-floating true
 }
 ```
 
 ## IPC
 
-wiri exposes a named pipe at `\\.\pipe\wiri_control`. The bundled `wiri-ctl` CLI is the friendly front end:
+wiri exposes a named pipe at `\\.\pipe\wiri_control_<user>_<session>` — the pipe of the
+user and the session the daemon runs in, so that a second user logged in on the same
+machine does not collide with the first one (`WIRI_PIPE` overrides the name). The
+bundled `wiri-ctl` CLI is the friendly front end:
 
 ```pwsh
 wiri-ctl state                       # current engine state
-wiri-ctl windows                     # list managed windows
+wiri-ctl windows                     # the managed windows, in niri's shape
+wiri-ctl window-list                 # the managed windows, in wiri's older shape
+wiri-ctl workspaces                  # the workspaces, in niri's shape
+wiri-ctl focused-window              # the window that has the focus
+wiri-ctl overview-state              # whether the overview is open
+wiri-ctl version                     # the version of the daemon
 wiri-ctl switch-workspace 2
 wiri-ctl focus-window <hwnd>
 wiri-ctl close-window <hwnd>

@@ -5,10 +5,16 @@ use tracing::warn;
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_WRITE, KEY_READ, REG_SZ,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
 
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+fn startup_command(exe_path: &str) -> String {
+    // Run values are command lines. Always quote the executable, even without spaces.
+    // A path from current_exe is unquoted and cannot contain a double quote on Windows.
+    format!("\"{exe_path}\"")
+}
 
 pub struct StartupManager {
     app_name: String,
@@ -74,7 +80,10 @@ impl StartupManager {
             );
 
             if let Err(e) = RegCloseKey(hkey).ok() {
-                warn!("StartupManager::get_registered_path: RegCloseKey failed: {:?}", e);
+                warn!(
+                    "StartupManager::get_registered_path: RegCloseKey failed: {:?}",
+                    e
+                );
             }
 
             if result.is_ok() {
@@ -106,7 +115,10 @@ impl StartupManager {
                 &mut hkey,
             );
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to open Run registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to open Run registry key: {:?}",
+                    result
+                ));
             }
 
             let value_name: Vec<u16> = OsStr::new(&self.app_name)
@@ -114,7 +126,8 @@ impl StartupManager {
                 .chain(std::iter::once(0))
                 .collect();
 
-            let path_bytes: Vec<u8> = OsStr::new(&self.exe_path)
+            let command = startup_command(&self.exe_path);
+            let path_bytes: Vec<u8> = OsStr::new(&command)
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .flat_map(|c| c.to_le_bytes())
@@ -129,12 +142,18 @@ impl StartupManager {
             );
             if result.is_err() {
                 let _ = RegCloseKey(hkey).ok();
-                return Err(anyhow::anyhow!("Failed to set registry value: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to set registry value: {:?}",
+                    result
+                ));
             }
 
             let result = RegCloseKey(hkey);
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to close registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to close registry key: {:?}",
+                    result
+                ));
             }
         }
 
@@ -157,7 +176,10 @@ impl StartupManager {
                 &mut hkey,
             );
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to open Run registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to open Run registry key: {:?}",
+                    result
+                ));
             }
 
             let value_name: Vec<u16> = OsStr::new(&self.app_name)
@@ -168,12 +190,18 @@ impl StartupManager {
             let result = RegDeleteValueW(hkey, PCWSTR::from_raw(value_name.as_ptr()));
             if result.is_err() {
                 let _ = RegCloseKey(hkey).ok();
-                return Err(anyhow::anyhow!("Failed to delete registry value: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to delete registry value: {:?}",
+                    result
+                ));
             }
 
             let result = RegCloseKey(hkey);
             if result.is_err() {
-                return Err(anyhow::anyhow!("Failed to close registry key: {:?}", result));
+                return Err(anyhow::anyhow!(
+                    "Failed to close registry key: {:?}",
+                    result
+                ));
             }
         }
 
@@ -184,5 +212,42 @@ impl StartupManager {
 impl Default for StartupManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_command;
+
+    #[test]
+    fn quotes_executable_paths_with_spaces() {
+        assert_eq!(
+            startup_command(r"C:\Program Files\wiri\wiri.exe"),
+            r#""C:\Program Files\wiri\wiri.exe""#
+        );
+    }
+
+    #[test]
+    fn quotes_executable_paths_without_spaces() {
+        assert_eq!(
+            startup_command(r"C:\wiri\wiri.exe"),
+            r#""C:\wiri\wiri.exe""#
+        );
+    }
+
+    #[test]
+    fn preserves_unicode_executable_paths() {
+        assert_eq!(
+            startup_command(r"C:\Users\Zoë\工具 🦀\wiri.exe"),
+            r#""C:\Users\Zoë\工具 🦀\wiri.exe""#
+        );
+    }
+
+    #[test]
+    fn preserves_unc_executable_paths() {
+        assert_eq!(
+            startup_command(r"\\server\shared apps\wiri.exe"),
+            r#""\\server\shared apps\wiri.exe""#
+        );
     }
 }

@@ -1,8 +1,11 @@
+use crate::utils::{Rect, Size, WindowId};
 use std::collections::HashMap;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
-use crate::utils::{Rect, Size, WindowId};
 
+pub mod block_out;
+pub mod rule_effects;
+pub mod rule_policy;
 pub mod rules;
 pub use rules::{resolve_window_rules, resolve_window_rules_legacy};
 
@@ -88,7 +91,9 @@ impl WindowHandle {
         let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
 
         let mut class_name_buf = [0u16; 256];
-        let class_len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class_name_buf) };
+        let class_len = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class_name_buf)
+        };
         let class_name = String::from_utf16_lossy(&class_name_buf[..class_len as usize]);
 
         let mut process_id = 0u32;
@@ -102,10 +107,15 @@ impl WindowHandle {
     }
 }
 
+/// What the window rules decide for one window: the properties of every rule that matches it,
+/// a later rule winning over an earlier one for the same property.
+///
+/// niri applies the `open-*` and `default-*` properties when the window opens and no later;
+/// the others (`opacity`, the size limits) follow the window while its title, its focus or
+/// its state changes ([`ResolvedWindowRules::same_dynamic_part`] is how the engine notices).
 #[derive(Debug, Clone)]
 pub struct ResolvedWindowRules {
     pub float: bool,
-    pub workspace: Option<i32>,
     pub column: Option<usize>,
     pub follow_cursor: bool,
     pub border: bool,
@@ -119,28 +129,56 @@ pub struct ResolvedWindowRules {
     /// is a legal value meaning "explicitly fully transparent".
     pub opacity: Option<f32>,
 
-    // ── niri-parity `open-*` placement hints (consumed by add_window) ──────
-    /// Place the window on the monitor with this device name on first map.
-    /// Falls through when None.
+    // ── niri `open-*` placement properties (consumed when the window opens) ──────
+    /// Open on the monitor with this device name (`\\.\DISPLAY1` or `DISPLAY1`); a name
+    /// that no monitor has is ignored.
     pub open_on_output: Option<String>,
-    /// Place the window on this 1-based workspace id on first map.
+    /// Open on the workspace at this 1-based position (wiri's `open-in-workspace 2`, and
+    /// `workspace "2"`).
     pub open_in_workspace: Option<i32>,
-    /// Start the window fullscreen.  None = engine default.
+    /// Open on the workspace with this name (niri's `open-on-workspace "web"`, and
+    /// `workspace "web"`); a name that no workspace has is ignored.
+    pub open_on_workspace: Option<String>,
+    /// Open fullscreen.  None = engine default.
     pub open_fullscreen: Option<bool>,
-    /// Start the window floating.  None = engine default (also see `float`
+    /// Open floating.  None = engine default (also see `float`
     /// flag, which is the resolved `floating` property from any matching
     /// rule; `open_floating` is the explicit `open-floating "…"` directive).
     pub open_floating: Option<bool>,
+    /// Open with its column as wide as the view.
+    pub open_maximized: Option<bool>,
+    /// Open maximized to the edges of the work area (niri 25.11).
+    pub open_maximized_to_edges: Option<bool>,
+    /// `Some(false)`: the window opens without taking the focus.
+    pub open_focused: Option<bool>,
     /// Cap the initial physical size of the window to `(width_px, height_px)`.
     /// Either dimension of `0` means "no cap on that axis".
     pub open_max_bounds: Option<(u32, u32)>,
+
+    // ── niri `default-*` size properties (the size the window opens with) ──────
+    /// `default-column-width`: `Some(Some(size))`, or `Some(None)` for the empty block (the
+    /// window opens with the width it has itself).
+    pub default_column_width: Option<Option<crate::config::types::SizeSpec>>,
+    /// `default-window-height`, the same forms.
+    pub default_window_height: Option<Option<crate::config::types::SizeSpec>>,
+    /// wiri's older `default-width 800`: the width of the column in pixels.
+    pub default_width_px: Option<u32>,
+    /// wiri's older `default-height 400`: the height of the tile in pixels.
+    pub default_height_px: Option<u32>,
+
+    // ── size limits in pixels (the size of the window, without its border) ──────
+    pub min_width: Option<u32>,
+    pub max_width: Option<u32>,
+    pub min_height: Option<u32>,
+    pub max_height: Option<u32>,
+    pub effects: rule_effects::RuleEffects,
+    pub policy: rule_policy::RulePolicy,
 }
 
 impl Default for ResolvedWindowRules {
     fn default() -> Self {
         Self {
             float: false,
-            workspace: None,
             column: None,
             follow_cursor: true,
             border: true,
@@ -148,10 +186,39 @@ impl Default for ResolvedWindowRules {
             opacity: None,
             open_on_output: None,
             open_in_workspace: None,
+            open_on_workspace: None,
             open_fullscreen: None,
             open_floating: None,
+            open_maximized: None,
+            open_maximized_to_edges: None,
+            open_focused: None,
             open_max_bounds: None,
+            default_column_width: None,
+            default_window_height: None,
+            default_width_px: None,
+            default_height_px: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
+            effects: Default::default(),
+            policy: Default::default(),
         }
+    }
+}
+
+impl ResolvedWindowRules {
+    /// True when `other` asks for the same of the properties that follow the window while
+    /// it lives (opacity and the size limits).  The `open-*` and `default-*` properties
+    /// are left out: they are applied once, when the window opens.
+    pub fn same_dynamic_part(&self, other: &ResolvedWindowRules) -> bool {
+        self.opacity == other.opacity
+            && self.min_width == other.min_width
+            && self.max_width == other.max_width
+            && self.min_height == other.min_height
+            && self.max_height == other.max_height
+            && self.effects == other.effects
+            && self.policy.same_dynamic_part(&other.policy)
     }
 }
 
@@ -359,7 +426,11 @@ impl WindowSet {
         self.mapped
             .values()
             .map(|m| WindowRef::Mapped(m.clone()))
-            .chain(self.unmapped.values().map(|u| WindowRef::Unmapped(u.clone())))
+            .chain(
+                self.unmapped
+                    .values()
+                    .map(|u| WindowRef::Unmapped(u.clone())),
+            )
     }
 
     pub fn mapped_count(&self) -> usize {
@@ -386,9 +457,20 @@ impl WindowSet {
         self.unmapped.contains_key(&window_id)
     }
 
-    pub fn promote_to_mapped(&mut self, window_id: WindowId, bounds: Rect, state: WindowState) -> Option<Mapped> {
+    pub fn promote_to_mapped(
+        &mut self,
+        window_id: WindowId,
+        bounds: Rect,
+        state: WindowState,
+    ) -> Option<Mapped> {
         let unmapped = self.unmapped.remove(&window_id)?;
-        let mapped = Mapped::new(window_id, unmapped.handle, bounds, state, unmapped.pending_rules);
+        let mapped = Mapped::new(
+            window_id,
+            unmapped.handle,
+            bounds,
+            state,
+            unmapped.pending_rules,
+        );
         self.mapped.insert(window_id, mapped.clone());
         Some(mapped)
     }
@@ -427,44 +509,213 @@ impl Default for WindowSet {
     }
 }
 
-pub fn should_skip_window(hwnd: HWND) -> bool {
+/// Everything `should_skip_window` needs to know about a window.  The Win32
+/// calls live in [`gather_skip_facts`]; the decision itself is the pure
+/// function [`classify_skip`] so it can be unit-tested without a desktop.
+#[derive(Debug, Clone, Default)]
+pub struct SkipFacts {
+    pub visible: bool,
+    pub tool_window: bool,
+    pub no_activate: bool,
+    pub topmost: bool,
+    pub cloaked: bool,
+    /// Owned top-level window without `WS_EX_APPWINDOW` (dialogs, popups).
+    pub owned_popup: bool,
+    /// `WS_CHILD`, or a parent other than the desktop: never a real top-level
+    /// window.  Hosted UI (the XAML island inside every Windows Terminal
+    /// window, WebView hosts, ...) shows up here and must never be tiled:
+    /// `SetWindowPos` on a child takes parent-relative coordinates, so tiling
+    /// it with screen coordinates mangles the host window.
+    pub child: bool,
+    /// The window belongs to wiri's own process (overlays, hotkey window).
+    pub own_process: bool,
+    /// The console window (or the terminal that hosts it) that wiri created
+    /// for itself.
+    pub own_console: bool,
+    pub width: u32,
+    pub height: u32,
+    pub class_name: String,
+}
+
+/// Window classes that are never managed.  Compared case-insensitively.
+const SKIP_CLASSES: &[&str] = &[
+    "Progman",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "Windows.UI.Core.CoreWindow",
+    "Windows.UI.Input.InputSite.WindowClass",
+    // XAML-island / WinUI bridge windows are children of a real top-level
+    // window; skipping the class is a second line of defence next to `child`.
+    "Windows.UI.Composition.DesktopWindowContentBridge",
+    "Microsoft.UI.Content.DesktopChildSiteBridge",
+    // Hidden helper window every console session owns.
+    "PseudoConsoleWindow",
+];
+
+/// Decide whether a window must be left alone.  Returns the reason when it
+/// must, `None` when it may be tiled.
+pub fn classify_skip(f: &SkipFacts) -> Option<&'static str> {
+    if f.own_process {
+        return Some("belongs to wiri itself");
+    }
+    if f.own_console {
+        return Some("wiri's own console window");
+    }
+    if f.child {
+        return Some("child window (not a top-level window)");
+    }
+    if !f.visible {
+        return Some("not visible");
+    }
+    if f.tool_window {
+        return Some("tool window");
+    }
+    if f.no_activate {
+        return Some("no-activate window");
+    }
+    if f.topmost {
+        return Some("topmost window");
+    }
+    if f.cloaked {
+        return Some("cloaked by DWM");
+    }
+    if f.width < 80 || f.height < 60 {
+        return Some("too small");
+    }
+    let class = f.class_name.to_ascii_lowercase();
+    if SKIP_CLASSES
+        .iter()
+        .any(|skip| class.contains(&skip.to_ascii_lowercase()))
+    {
+        return Some("system or hosted window class");
+    }
+    None
+}
+
+/// Dialog/parent hints correspond to niri's transient-parent auto-floating. An
+/// ordinary top-level (including a borderless app) must not float just because
+/// it lacks WS_THICKFRAME. Tool/child/no-activate windows are still excluded.
+pub fn should_auto_float(facts: &SkipFacts) -> bool {
+    classify_skip(facts).is_none()
+        && (facts.owned_popup || facts.class_name.eq_ignore_ascii_case("#32770"))
+}
+
+/// Console windows that only wiri is attached to, recorded once at startup.
+/// With the GUI-subsystem build this stays empty; it matters for a
+/// console-subsystem build (debug builds, `cargo run`), where Windows opens a
+/// console for wiri that must never end up as a tile.
+static OWN_CONSOLE_WINDOWS: std::sync::OnceLock<Vec<isize>> = std::sync::OnceLock::new();
+
+/// Record the console window wiri owns, if it owns one.  A console counts as
+/// wiri's own when wiri is the only process attached to it; a console wiri
+/// merely inherited from the shell that launched it belongs to the user.
+/// Call once, after any `AttachConsole`, before the first window is tiled.
+pub fn init_own_console() {
+    use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetWindow, GA_ROOTOWNER, GW_OWNER};
+
+    let mut own: Vec<isize> = Vec::new();
+    unsafe {
+        let console = GetConsoleWindow();
+        if !console.0.is_null() {
+            let mut pids = [0u32; 4];
+            let attached = GetConsoleProcessList(&mut pids);
+            if attached == 1 {
+                own.push(console.0 as isize);
+                // With Windows Terminal as the default terminal the console
+                // window is an invisible helper owned by the visible window.
+                if let Ok(owner) = GetWindow(console, GW_OWNER) {
+                    if !owner.0.is_null() {
+                        own.push(owner.0 as isize);
+                    }
+                }
+                let root = GetAncestor(console, GA_ROOTOWNER);
+                if !root.0.is_null() {
+                    own.push(root.0 as isize);
+                }
+            }
+        }
+    }
+    own.sort_unstable();
+    own.dedup();
+    let _ = OWN_CONSOLE_WINDOWS.set(own);
+}
+
+fn is_own_console_window(hwnd: HWND) -> bool {
+    OWN_CONSOLE_WINDOWS
+        .get()
+        .map(|windows| windows.contains(&(hwnd.0 as isize)))
+        .unwrap_or(false)
+}
+
+/// Collect the Win32 facts about `hwnd` that [`classify_skip`] judges.
+pub fn gather_skip_facts(hwnd: HWND) -> SkipFacts {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
     let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
 
-    if style & WS_VISIBLE.0 == 0 {
-        return true;
-    }
-    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
-        return true;
-    }
-    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
-        return true;
-    }
-    if ex_style & WS_EX_TOPMOST.0 != 0 {
-        return true;
-    }
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
+    let owned_popup =
+        owner.map(|owner| !owner.0.is_null()).unwrap_or(false) && ex_style & WS_EX_APPWINDOW.0 == 0;
+
+    let child = style & WS_CHILD.0 != 0 || {
+        let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
+        !parent.0.is_null() && parent != unsafe { GetDesktopWindow() }
+    };
+
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let own_process = pid != 0 && pid == unsafe { GetCurrentProcessId() };
+
+    let (width, height) = get_window_bounds(hwnd)
+        .map(|b| (b.size.w, b.size.h))
+        .unwrap_or((u32::MAX, u32::MAX));
 
     let mut class_name_buf = [0u16; 256];
     let class_len = unsafe { GetClassNameW(hwnd, &mut class_name_buf) };
     let class_name = String::from_utf16_lossy(&class_name_buf[..class_len as usize]);
 
-    let skip_classes = [
-        "Progman",
-        "Shell_TrayWnd",
-        "Windows.UI.Core.corewindow",
-        "ApplicationFrameWindow",
-        "Windows.UI.Input.InputSite.WindowClass",
-    ];
-
-    for skip in &skip_classes {
-        if class_name.contains(skip) {
-            return true;
-        }
+    SkipFacts {
+        visible: style & WS_VISIBLE.0 != 0,
+        tool_window: ex_style & WS_EX_TOOLWINDOW.0 != 0,
+        no_activate: ex_style & WS_EX_NOACTIVATE.0 != 0,
+        topmost: ex_style & WS_EX_TOPMOST.0 != 0,
+        cloaked: is_dwm_cloaked(hwnd),
+        owned_popup,
+        child,
+        own_process,
+        own_console: is_own_console_window(hwnd),
+        width,
+        height,
+        class_name,
     }
+}
 
-    false
+/// Why `hwnd` must not be tiled, or `None` when it may be.
+pub fn skip_reason(hwnd: HWND) -> Option<&'static str> {
+    classify_skip(&gather_skip_facts(hwnd))
+}
+
+pub fn should_skip_window(hwnd: HWND) -> bool {
+    skip_reason(hwnd).is_some()
+}
+
+fn is_dwm_cloaked(hwnd: HWND) -> bool {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+
+    let mut cloaked = 0u32;
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+
+    result.is_ok() && cloaked != 0
 }
 
 pub fn filter_visible_windows(windows: &[WindowId]) -> Vec<WindowId> {
@@ -577,13 +828,25 @@ mod tests {
 
         let id1 = WindowId::new(100);
         let handle1 = WindowHandle::new("Win1".to_string(), "Class1".to_string(), 1234);
-        let mapped1 = Mapped::new(id1, handle1, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped1 = Mapped::new(
+            id1,
+            handle1,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped1);
         assert_eq!(set.mapped_count(), 1);
 
         let id2 = WindowId::new(101);
         let handle2 = WindowHandle::new("Win2".to_string(), "Class2".to_string(), 1235);
-        let mapped2 = Mapped::new(id2, handle2, Rect::new(0, 0, 400, 300), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped2 = Mapped::new(
+            id2,
+            handle2,
+            Rect::new(0, 0, 400, 300),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped2);
         assert_eq!(set.mapped_count(), 2);
     }
@@ -593,7 +856,13 @@ mod tests {
         let mut set = WindowSet::new();
         let id = WindowId::new(100);
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
-        let mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped);
 
         assert!(set.get(id).is_some());
@@ -609,7 +878,13 @@ mod tests {
         assert!(!set.contains(id));
 
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
-        let mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         set.insert_mapped(mapped);
         assert!(set.contains(id));
     }
@@ -619,7 +894,13 @@ mod tests {
         let id = WindowId::new(100);
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
 
-        let mut mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mut mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         assert!(mapped.is_normal());
         assert!(!mapped.is_floating());
         assert!(!mapped.is_minimized());
@@ -633,7 +914,13 @@ mod tests {
     fn test_mapped_bounds_update() {
         let id = WindowId::new(100);
         let handle = WindowHandle::new("Test".to_string(), "TestClass".to_string(), 1234);
-        let mut mapped = Mapped::new(id, handle, Rect::new(0, 0, 800, 600), WindowState::Normal, ResolvedWindowRules::default());
+        let mut mapped = Mapped::new(
+            id,
+            handle,
+            Rect::new(0, 0, 800, 600),
+            WindowState::Normal,
+            ResolvedWindowRules::default(),
+        );
         assert_eq!(mapped.bounds.size.w, 800);
 
         mapped.set_bounds(Rect::new(100, 100, 1024, 768));
@@ -645,10 +932,123 @@ mod tests {
     fn test_resolved_window_rules_default() {
         let rules = ResolvedWindowRules::default();
         assert!(!rules.float);
-        assert!(rules.workspace.is_none());
+        assert!(rules.open_in_workspace.is_none());
+        assert!(rules.open_on_workspace.is_none());
         assert!(rules.column.is_none());
         assert!(rules.follow_cursor);
         assert!(rules.border);
     }
 
+    #[test]
+    fn only_the_properties_that_follow_the_window_count_as_its_dynamic_part() {
+        let base = ResolvedWindowRules::default();
+        let mut other = base.clone();
+        // What is applied once, when the window opens, is not part of it.
+        other.open_floating = Some(true);
+        other.open_on_workspace = Some("web".to_string());
+        other.default_width_px = Some(500);
+        other.open_focused = Some(false);
+        assert!(base.same_dynamic_part(&other));
+        // Opacity and the size limits are.
+        for change in [
+            (|r: &mut ResolvedWindowRules| r.opacity = Some(0.5)) as fn(&mut ResolvedWindowRules),
+            |r| r.min_width = Some(300),
+            |r| r.max_width = Some(900),
+            |r| r.min_height = Some(200),
+            |r| r.max_height = Some(700),
+        ] {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert!(!base.same_dynamic_part(&changed));
+        }
+    }
+
+    fn normal_window() -> SkipFacts {
+        SkipFacts {
+            visible: true,
+            width: 800,
+            height: 600,
+            class_name: "Notepad".to_string(),
+            ..SkipFacts::default()
+        }
+    }
+
+    #[test]
+    fn test_classify_skip_allows_an_ordinary_window() {
+        assert_eq!(classify_skip(&normal_window()), None);
+    }
+
+    #[test]
+    fn test_classify_skip_rejects_child_windows() {
+        // The XAML island inside every Windows Terminal window: tiling it with
+        // screen coordinates moved it inside its host and made wiri fight the
+        // terminal for focus forever.
+        let mut f = normal_window();
+        f.child = true;
+        f.class_name = "Windows.UI.Composition.DesktopWindowContentBridge".to_string();
+        assert!(classify_skip(&f).is_some());
+        // Even if the parent lookup were to fail, the class alone is enough.
+        f.child = false;
+        assert!(classify_skip(&f).is_some());
+    }
+
+    #[test]
+    fn test_classify_skip_rejects_wiri_own_windows_and_console() {
+        let mut f = normal_window();
+        f.own_process = true;
+        assert!(classify_skip(&f).is_some());
+
+        let mut f = normal_window();
+        f.own_console = true;
+        f.class_name = "CASCADIA_HOSTING_WINDOW_CLASS".to_string();
+        assert!(classify_skip(&f).is_some());
+    }
+
+    #[test]
+    fn test_classify_skip_rejects_system_and_transient_windows() {
+        for mutate in [
+            (|f: &mut SkipFacts| f.visible = false) as fn(&mut SkipFacts),
+            |f| f.tool_window = true,
+            |f| f.no_activate = true,
+            |f| f.topmost = true,
+            |f| f.cloaked = true,
+            |f| f.width = 79,
+            |f| f.height = 59,
+            |f| f.class_name = "Shell_TrayWnd".to_string(),
+            |f| f.class_name = "windows.ui.core.corewindow".to_string(),
+        ] {
+            let mut f = normal_window();
+            mutate(&mut f);
+            assert!(classify_skip(&f).is_some(), "{:?} must be skipped", f);
+        }
+    }
+
+    #[test]
+    fn dialogs_float_but_normal_toplevels_and_helpers_do_not() {
+        let mut facts = normal_window();
+        assert!(!should_auto_float(&facts));
+        facts.owned_popup = true;
+        assert_eq!(
+            classify_skip(&facts),
+            None,
+            "owned dialog is managed, not skipped"
+        );
+        assert!(should_auto_float(&facts));
+        facts.owned_popup = false;
+        facts.class_name = "#32770".into();
+        assert!(should_auto_float(&facts));
+        facts.child = true;
+        assert!(!should_auto_float(&facts));
+        facts.child = false;
+        facts.tool_window = true;
+        assert!(!should_auto_float(&facts));
+    }
+
+    #[test]
+    fn test_classify_skip_keeps_terminal_hosting_window() {
+        // A user's terminal window is a legitimate tile.
+        let mut f = normal_window();
+        f.class_name = "CASCADIA_HOSTING_WINDOW_CLASS".to_string();
+        assert_eq!(classify_skip(&f), None);
+    }
 }

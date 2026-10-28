@@ -23,27 +23,24 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor, HFONT,
-    PAINTSTRUCT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    HFONT, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, MSG, PostQuitMessage,
-    RegisterClassExW, SetLayeredWindowAttributes, SetWindowPos,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    LWA_ALPHA, SM_CXSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOWNOACTIVATE,
-    WNDCLASSEXW,
-    WM_CREATE, WM_DESTROY, WM_PAINT, WM_USER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
+    PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, MSG, SM_CXSCREEN, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_CREATE, WM_DESTROY, WM_PAINT, WM_USER,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::PCWSTR;
 
 use super::MonitorBounds;
 
@@ -86,9 +83,7 @@ impl OverviewBanner {
     pub fn new() -> Self {
         Self {
             state: Arc::new(BannerState {
-                text: Mutex::new(
-                    "Overview — Space or Esc to exit".to_string(),
-                ),
+                text: Mutex::new("Overview — Space or Esc to exit".to_string()),
                 visible: Mutex::new(false),
                 hwnd: Mutex::new(None),
                 monitor_bounds: Mutex::new(None),
@@ -170,7 +165,10 @@ fn reposition_to_monitor(hwnd: HWND, bounds: Option<MonitorBounds>) {
         let _ = SetWindowPos(
             hwnd,
             None,
-            x, y, BANNER_W, BANNER_H,
+            x,
+            y,
+            BANNER_W,
+            BANNER_H,
             SWP_NOACTIVATE | SWP_NOZORDER,
         );
     }
@@ -205,11 +203,8 @@ fn run_window_loop(state: Arc<BannerState>) {
         let x = (screen_w - BANNER_W) / 2;
         let y = 16;
 
-        let ex_style = WS_EX_LAYERED
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_TRANSPARENT;
+        let ex_style =
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
 
         let state_ptr = Arc::into_raw(state.clone()) as *mut BannerState;
 
@@ -239,6 +234,10 @@ fn run_window_loop(state: Arc<BannerState>) {
         );
 
         *state.hwnd.lock() = Some(hwnd.0 as isize);
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::OverviewBanner,
+            hwnd.0 as isize,
+        );
 
         // Start hidden — only `show()` should bring us on screen.
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
@@ -332,7 +331,7 @@ unsafe extern "system" fn wnd_proc(
                 0,
                 0,
                 0,
-                1,   // DEFAULT_CHARSET
+                1, // DEFAULT_CHARSET
                 0,
                 0,
                 0,

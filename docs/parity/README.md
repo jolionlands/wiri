@@ -1,0 +1,172 @@
+# niri parity: where wiri really stands (2026-10-24)
+
+These two matrices replace the claims in `docs/PARITY.md`. Each row was checked in
+wiri's code (config key parsed, then stored, then acted on), not taken from the docs,
+against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04).
+
+- [Layout and behaviour](niri-gaps-layout-behaviour.md): layout, sizing and arrangement
+  actions, focus, fullscreen and maximize, floating, workspaces, monitors, tabs, overview,
+  recent windows, window rules, effects, animations, gestures.
+- [Config, input and IPC](niri-gaps-config-input-ipc.md): config system and KDL, keyboard
+  and pointer input, key bindings, hotkey overlay, screenshots, IPC requests and events,
+  outputs, non-layout actions, misc and security.
+
+| Matrix | done | partial | missing | N/A on Windows |
+| --- | --- | --- | --- | --- |
+| Layout and behaviour (226 rows) | 164 | 45 | 0 | 17 |
+| Config, input and IPC (259 rows) | 139 | 48 | 0 | 72 |
+
+The counts are a recount of current feature-row statuses including integrated Phase 2B,
+retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates; they are not a
+full live sign-off. Official desktop cycles passed W+K (560/560) and F2 (601/602, H34 included);
+C2's H66-H70 gates passed in the 8c6c9b0 cycle and lane T's H58-H61 in the f4d2666 cycle.
+The 2026-10-27 cycle at `cc3920d` passed **761/761 enforced gates, 0 failed** (88 further
+information entries), including every `h78_*` cursor-hiding gate, all five H31
+focus-history gates (`h31_history_crosses_workspaces` included) and lane V's H62-H65 set.
+That first recount moved exactly one row to `done`: `set-column-display normal or tabbed`,
+whose only stated gap was that nothing was live-verified. The two `cursor {}` rows and
+the tablet stylus row stay `partial` for their recorded Windows approximations.
+
+**2026-10-28 recount, following the 761/761 `cc3920d` cycle.** 45 rows moved from `partial`
+to `done` — the class-(a-1) list surveyed in [next-lanes.md](next-lanes.md), whose live gates
+already existed, are dot-sourced into `scripts/live-test.ps1`, and passed in that cycle:
+23 in the layout matrix (lanes L2, T, G, F2, V plus lane B's `h23_*` wheel and lane S's
+`h48_*` urgency gates) and 22 in the config/input/IPC matrix. Every flip was cross-checked
+against the gate names that actually appear in `scripts/live-test.ps1` and
+`scripts/live-phases/*.ps1`. The matrices are now **164 done / 45 partial** (layout) and
+**139 done / 48 partial** (config, input and IPC); `missing` and `N/A` are unchanged. One
+surveyed row was left `partial`: `horizontal-view-movement`, because the only evidence the
+survey could name for it is the offline H17 config-decode fragment, which its own header says
+does not prove visible motion, and no live gate covers camera scroll.
+
+**2026-10-28 gate-hardening pass, `f4157d3`.** The 2026-10-28 cycle at `f4157d3` is the first
+fully green official run at the enlarged gate count: **769 enforced gates pass, 0 fail**, and
+the hosted x86_64 live-desktop job passed at the same commit. Reaching it took five gate-side
+fixes (h79 PowerShell 5.1 JSON unwrap, h60 idle-frame baseline and held-rect comparisons,
+h75 overlay find, h25 warp poll, h15 setup poll), each root-caused against daemon logs and
+per-gate evidence: the harness was racing the event-driven runtime's deferred effects, not
+finding product bugs. The diagnosis and the open event-chain-latency question are recorded
+in [live-gate-notes.md](../live-gate-notes.md).
+Lane V's H62-H65 rows no longer rest on unit tests alone: the 2026-10-27 cycle passed
+every enforced gate, and its record names the h78 cursor-hiding, h31 focus-history and H65
+tab sets explicitly. The rows keep `partial` only for the Windows approximations and
+unit-tested-only surfaces (four-finger swipe, promoted touch, multi-display) they document.
+Rows still marked "live pending" (lanes L2, P and A11Y: gates H75-H77) rest on unit tests
+until their own complete official cycle; V's first run was cut short when Windows Defender
+quarantined the test build mid-cycle.
+Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
+30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
+11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;
+phase-labelled rows relocate the changed code by function name. Each matrix ends with a list
+of the working-tree edits that were in flight during the original audit. The
+[Phase 1](phase1-report.md), [Phase 2A](phase2a-report.md) and
+[Phase 2C Lane D](phase2c-lane-d-report.md), [Lane H](lane-h-report.md) and
+[Lane S](lane-s-report.md) reports distinguish live verification from unit tests.
+
+## Plan
+
+**Phase 0, done (1532635..4b9d834):** wiri runs on a live desktop. No repositioning loop,
+IPC never blocks, every window is tiled, focus follows the OS, xkb/niri key names, a
+GUI-subsystem build with a log file, crash-safe hidden windows, Escape reaches
+applications, the overview no longer freezes, `move-column-left/right` swaps. Verified by
+`scripts/live-test.ps1` on a spare Windows 11 laptop.
+
+**Phase 1, done (`02e8aab`..`6ea45e4`, [report](phase1-report.md)), safe to daily-drive (P0):** unknown
+modifiers are rejected and `Mod` is tied to `mod-key`; `spawn` and `spawn-at-startup` keep their
+arguments and search PATH; every action targets the real foreground window, floating ones
+included; minimized windows leave no gap; floating windows belong to their workspace;
+niri's keymap semantics (`consume-or-expel`, `maximize-column`, first/last moves) and its
+action names and argument grammar (`focus-workspace 2`, `set-column-width "+10%"`);
+workspace model (index addressing, previous-workspace memory, real named workspaces); the Phase 0
+leftovers (a terminal's minimum width, an exact fullscreen, no `Ctrl+Alt+Tab` default, windows put
+back after a crash); monitor unplug keeps the windows (**unit-tested only: the test laptop has one
+display**); hiding inactive workspaces by shell cloaking so windows stay in the taskbar and Alt+Tab is
+there as the opt-in `hide-method "cloak"` (`SW_HIDE` stays the default).
+
+**Phase 2A, done (`0a0bb75`..`b702890`, [report](phase2a-report.md)):** a real KDL parser with visible
+errors (a bad config is never applied half; `cooldown-ms=` and `repeat=false` act); window rules that act
+(`open-on-output`, `open-on-workspace`, `open-floating`, `open-fullscreen`, `open-maximized`, `open-focused`,
+default sizes, size limits, opacity that follows the window); the fullscreen and maximize model (the window keeps
+its column, `maximize-window-to-edges`, an application that goes fullscreen or maximizes itself is followed);
+niri's IPC (the event stream: the state first, then every change; `wiri-ctl action` with niri's arguments, quoting
+and `--id`).
+
+**Phase 2B Lane A (P1), integrated and validated (`81ff35c`..`bd71c96`):** unified lazy decorations,
+configured analytic spring/easing motion, active-only tabbed columns, live DWM workspace/recent previews
+and a monitor-fitting Important Hotkeys sheet. The complete locked integrated run passed **440 gates,
+0 failed**, including all **102 H16–H21** checks and retained Lane B/D gates; 1114 library + 7 CLI tests
+pass. [The Phase 2B report](phase2b-report.md) separates current evidence, earlier-run findings and
+remaining compositor approximations. Recent/modal input uses Lane B's existing dispatcher, primary
+keyboard engine and pointer/focus architecture, not the older keyboard relay thread. No new dependency,
+idle timer or always-on thread; passive decoration HWNDs are lazy and transient UI is session-local.
+
+**Phase 2C Lane B ([report](phase2c-input-report.md)):** primary low-level keyboard bindings,
+mouse/wheel bindings and event-driven pointer focus are retained. Other Phase 2 work still includes
+full live sign-off of Lane S screenshot/system actions and the explicit partial rows in both matrices.
+
+**Phase 2C, Lane D ([report](phase2c-lane-d-report.md)):** focused-output and focused-window PNG
+screenshots, the clipboard, `screenshot-path` and capture events/notifications are implemented.
+H26-H28 verify both hotkeys, saved PNG content, clipboard and null-on-reload live. Output
+identity matching, startup focus, reload-to-real-DPI and explicit-current-mode no-op pass H29;
+physical mode/position/rotation/off changes are synthetic-unit-tested only and never exercised
+on this laptop. Screenshot selection UI/action flags and output limitations remain explicit in
+the matrices/report. Other Phase 2 lanes are separate work.
+
+**Lane S ([report](lane-s-report.md)), implementation with incomplete desktop sign-off:**
+frozen screenshot selection, per-capture options/nonfocusing ids and shared non-layout
+system actions are implemented. Warning-denied release build/check and 1241 library +
+14 CLI tests pass. The interrupted desktop run persisted 18/21 Lane S gates passing
+(including all H46/H47 checks), with three failures corrected but not rerun and four
+H49 gates unreached. No full summary or new integrated gate total is claimed. The
+formatter and locked rerun still require runner permission; real power mutations are
+never part of validation.
+**Phase 2C Lane F2 ([report](phase2c-lane-f-report.md)):** structured focus,
+workspace and monitor actions are connected to the integrated B/2B dispatcher and H IPC,
+retaining G's width intent, strip/strut policy and remembered tile/column selection.
+Workspace names, visible order and stable IPC identity are independent; native occurrence
+history drives debounced previous-window focus without a retry timer or stale focus replay.
+H30–H34 exercise CLI and typed IPC on the single-display desktop; cross-output actions,
+EDID preferences and hotplug are unit-tested only. Named fallback placement and nested
+workspace layout overrides remain open. The saved desktop run has 519 pass / 15 fail;
+the final floating-memory/target fixes and revised harness remain unvalidated live (see report).
+**Lane K, provisional ([report](lane-k-report.md)):** on-demand DWM thumbnail open,
+close, two-sided workspace and resize effects reuse the existing input pump/active-only
+driver. The saved lane-local run at `267a612` has **497 pass / 6 fail**, with all ten
+H54–H57 checks passing; the six H22 checks were not reached after another Terminal
+took foreground. This is not integrated sign-off. Section 14 records the implemented
+Windows approximations and remaining partial rows; matrix status totals are unchanged.
+[PERF.md](../PERF.md#lane-k-transient-compositor-checkpoint-2026-10-26) records individual
+animation samples and same-process idle endpoints, not a zero-cost or leak-free claim.
+
+**Lane V ([report](lane-v-report.md)):** the configured overview camera, pointer/touch/
+touchpad interaction, hot corners, explicit tab display and the clickable tab indicator,
+ported onto the stable-workspace head. Every row it touches is `partial (Lane V; ... live
+pending lead cycle)` until H62-H65 pass in the lead's locked desktop run; the totals
+table above is regenerated by the lead and does not yet count these status changes.
+
+**Phase 3, shine:** elevated windows (uiAccess or a task launch), per-user pipe names,
+ARM64 release builds, docs and a demo. Lane D fixed always-quoted Run autostart command
+construction (four pure tests; no real registry/logon test) and documented elevation choices
+in [ELEVATION.md](../ELEVATION.md); it does not enable elevation.
+
+**Phase 4, super lightweight and fast (owner, 2026-10-24: "full parity and functionality,
+super lightweight performant after core functionality is done"):** once the core works,
+measure first (added to the live test as info gates), then enforce budgets:
+- idle CPU about 0: event-driven only, no polling timers (today a 750 ms reconciler, a
+  500 ms focus-follows-mouse poll and overlay timers wake wiri while nothing happens);
+- few threads (the first live run showed 23 at idle; `tokio` is built with `full`), small
+  private memory and binary, fast cold start to the first tiled layout;
+- hotkey-to-`SetWindowPos` latency within one frame (16 ms) and no extra layout passes
+  per event (count `SetWindowPos` calls per action);
+- measured on the owner's ARM64 laptop as well as on x64.
+
+## How changes are verified
+
+`scripts/live-test.ps1` runs in an interactive desktop session: it starts the freshly
+built `wiri.exe`, opens test windows and terminals, drives wiri over `wiri-ctl` and real key
+presses, and writes `summary.json` plus screenshots. A change is done when `cargo test
+--release` and `cargo check --release --all-targets` with `RUSTFLAGS=-D warnings` pass and
+the live gates hold (no repositioning once settled, every test window tiled without
+overlap, no IPC timeouts, no unknown-key warnings, every window visible after quit and
+after a crash restart).  A live run holds a machine-wide lock, so two runs can never overlap
+and spoil each other.

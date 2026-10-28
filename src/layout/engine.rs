@@ -1,14 +1,61 @@
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, info, warn};
+use std::sync::Arc;
+use tracing::{debug, info};
 
 /// After this many consecutive `set_window_position` failures, the engine
 /// auto-floats the window and stops trying to tile it. Some windows (UAC
 /// dialogs, certain anti-cheat overlays, WireGuard's tunnel manager, etc.)
 /// reject SetWindowPos outright; without a circuit breaker we'd spin forever.
 const MAX_POSITION_FAILURES: u8 = 3;
-use crate::utils::{Rect, Point, OutputId, WindowId};
+use super::{ConfigureIntent, Monitor, MonitorSet, ScrollDirection, SizingMode, WorkspaceLayout};
 use crate::backend::{BackendHandle, WindowInfo};
-use super::{Monitor, MonitorSet, ScrollDirection, SizingMode, ConfigureIntent};
+use crate::input::{proportion_px, SizeChange};
+use crate::utils::{OutputId, Point, Rect, WindowId};
+
+// What the window rules do to a window: where it opens, how big, what keeps being true of it.
+mod rules;
+use rules::NO_ALPHA;
+// Fullscreen, maximized to the edges, and keeping the place in the strip while a window is either.
+mod sizing;
+use super::strip::CenterFocusedColumn;
+use sizing::DrawMode;
+// The windows and workspaces as the IPC event stream describes them (niri's `Window` and `Workspace`).
+mod action_dispatch;
+mod focus_actions;
+mod foreground;
+mod foreground_runtime;
+mod insert_move;
+mod ipcview;
+mod lane_l;
+pub use lane_l::FocusLayer;
+#[cfg(test)]
+mod lane_f_integration_tests;
+mod monitor_actions;
+#[cfg(test)]
+mod monitor_actions_tests;
+mod workspace_actions;
+#[cfg(test)]
+mod workspace_actions_tests;
+mod workspace_names;
+// What the overlay layer is asked to draw: the focus ring, the border and the shadow of each tile.
+mod decor;
+mod dnd;
+mod float_stack;
+mod gestures;
+mod interactive;
+mod motion;
+mod named_config;
+mod native_clip;
+mod native_move;
+mod overview;
+mod overview_input;
+mod presets;
+mod recent;
+mod rule_effects;
+mod rule_policy;
+mod strip_model;
+mod tabs;
+mod transitions;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
@@ -28,7 +75,16 @@ struct AppliedState {
     /// Last `DWMWA_SYSTEMBACKDROP_TYPE` value applied (0–4).
     /// 0xFFFF_FFFF = "never set" sentinel — triggers the first DWM call.
     backdrop: u32,
+    /// The `DWMWA_WINDOW_CORNER_PREFERENCE` last set (0 default, 1 square, 2 round, 3 small
+    /// round), `CORNER_UNSET` before anything was decided, `CORNER_NOT_ASKED` when the config
+    /// leaves the corners of windows alone.
+    corner: u32,
 }
+
+/// `AppliedState::corner` before anything was decided.
+const CORNER_UNSET: u32 = 0xFFFF_FFFF;
+/// `AppliedState::corner` when the config does not ask for a corner radius.
+const CORNER_NOT_ASKED: u32 = 0xFFFF_FFFE;
 
 impl AppliedState {
     fn unset() -> Self {
@@ -39,6 +95,154 @@ impl AppliedState {
             visible: false,
             focused: false,
             backdrop: 0xFFFF_FFFF,
+            corner: CORNER_UNSET,
+        }
+    }
+}
+
+/// Where a floating window lives: the monitor and workspace it belongs to, the
+/// rectangle it floats at, and its place in the stack of floating windows.
+#[derive(Debug, Clone)]
+struct FloatHome {
+    output: OutputId,
+    workspace: i32,
+    /// Where the window floats (visible rectangle, screen coordinates).
+    rect: Rect,
+    /// Position in the float stack: a higher number is raised more recently.
+    seq: u64,
+    /// Preset order is configured, not necessarily ascending by width.
+    width_preset_idx: Option<usize>,
+}
+
+/// A window the user minimized: out of the layout until it comes back, so that the
+/// others close the gap it would leave.
+#[derive(Debug, Clone)]
+struct MinimizedWindow {
+    output: OutputId,
+    workspace: i32,
+    /// Where it sat in its strip.  `None` for a floating window, which keeps its
+    /// float state and needs no place to come back to.
+    slot: Option<crate::layout::workspace::WindowSlot>,
+    /// It was fullscreen when it was minimized.
+    was_fullscreen: bool,
+}
+
+/// A monitor that was unplugged, kept until it comes back so that its windows go back to it.
+///
+/// While it is away its workspaces live on `host` (niri does the same): the windows keep their
+/// columns and their workspace, the empty unnamed workspaces are dropped.  `monitor` is what it
+/// looked like when it went, so a window that is still where it was put goes back into the
+/// same column of the same workspace.
+struct UnpluggedMonitor {
+    monitor: Monitor,
+    /// The monitor that took the workspaces; `None` when there was none (the last monitor
+    /// went): the workspaces wait in `monitor` until another one appears.
+    host: Option<OutputId>,
+    /// Where each workspace went on the host: (id on the unplugged monitor, id on the host).
+    moved: Vec<(i32, i32)>,
+    /// The floating windows of the monitor: their workspace and rectangle there.
+    floats: HashMap<WindowId, (i32, Rect)>,
+    /// The minimized windows of the monitor: their workspace there.
+    minimized: HashMap<WindowId, i32>,
+}
+
+/// What the window that has the keyboard focus looks like to the engine.
+///
+/// Built from `GetForegroundWindow()`: the window itself and the root of its
+/// owner chain (a dialog or popup is owned by the application window wiri
+/// manages), plus whether it is something wiri never acts on (the desktop, the
+/// taskbar, wiri's own windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundWindow {
+    pub hwnd: isize,
+    pub root_owner: isize,
+    pub ignorable: bool,
+}
+
+/// The application window that `hwnd` belongs to: the end of its owner chain (a
+/// dialog or popup is owned by the window that opened it).
+///
+/// `GetAncestor(GA_ROOTOWNER)` alone is not enough: it follows `GetParent`, which
+/// reports the owner only for `WS_POPUP` windows.  A dialog without that style (a
+/// WinForms or WPF form shown with an owner) would be its own root.  So the owner
+/// chain is walked with `GetWindow(GW_OWNER)` first, and `GA_ROOTOWNER` then
+/// resolves what is left (a child window, or a popup owned through its parent).
+pub fn root_owner_of(hwnd: isize) -> isize {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetWindow, GA_ROOTOWNER, GW_OWNER};
+    unsafe {
+        let mut current = HWND(hwnd as *mut std::ffi::c_void);
+        // Owner chains are short; the bound only guards against a cycle.
+        for _ in 0..16 {
+            match GetWindow(current, GW_OWNER) {
+                Ok(owner) if !owner.0.is_null() => current = owner,
+                _ => break,
+            }
+        }
+        let root = GetAncestor(current, GA_ROOTOWNER);
+        if root.0.is_null() {
+            current.0 as isize
+        } else {
+            root.0 as isize
+        }
+    }
+}
+
+/// Read the OS foreground window.  `None` when no window has the focus.
+pub fn query_foreground() -> Option<ForegroundWindow> {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return None;
+        }
+        let mut class = [0u16; 128];
+        let len = GetClassNameW(fg, &mut class).max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..len.min(class.len())]);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        let own = pid != 0 && pid == GetCurrentProcessId();
+        Some(ForegroundWindow {
+            hwnd: fg.0 as isize,
+            root_owner: root_owner_of(fg.0 as isize),
+            ignorable: own
+                || matches!(
+                    class.as_str(),
+                    "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+                ),
+        })
+    }
+}
+
+/// The managed window an action acts on, and which layer it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionTarget {
+    /// The window wiri manages (an application's main window).
+    pub window: WindowId,
+    /// It floats instead of sitting in a column.
+    pub floating: bool,
+    /// The window that really has the keyboard focus: `window` itself, or a
+    /// dialog / popup it owns.
+    pub focus_hwnd: isize,
+}
+
+impl ActionTarget {
+    fn tile(window: WindowId) -> Self {
+        Self {
+            window,
+            floating: false,
+            focus_hwnd: window.as_isize(),
+        }
+    }
+
+    fn float(window: WindowId) -> Self {
+        Self {
+            window,
+            floating: true,
+            focus_hwnd: window.as_isize(),
         }
     }
 }
@@ -51,6 +255,19 @@ fn parse_color_to_u32(color_hex: &str) -> u32 {
         ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
     } else {
         0xFFFF_FFFF
+    }
+}
+
+/// The rect to give a tile whose layout rect is `rect` while `view` is what is
+/// on screen.  A tile that intersects the view keeps its rect.  One that lies
+/// completely outside is parked at `park_y` (below every monitor) at the left
+/// edge of the view, keeping its size, so that it is out of sight on every
+/// monitor and its rect does not change while the strip is scrolled.
+fn parked_rect(rect: Rect, view: Rect, park_y: i32) -> Rect {
+    if rect.intersects(view) {
+        rect
+    } else {
+        Rect::new(view.loc.x, park_y, rect.size.w, rect.size.h)
     }
 }
 
@@ -137,6 +354,24 @@ impl Default for BorderColorMode {
 pub struct LayoutConfig {
     pub column_width: u32,
     pub column_width_mode: ColumnWidthMode,
+    pub default_tabbed: bool,
+    pub center_focused_column: CenterFocusedColumn,
+    pub always_center_single_column: bool,
+    pub preset_column_widths: Vec<crate::config::types::SizeSpec>,
+    /// `preset-window-heights`: the per-window height presets of
+    /// `switch-preset-window-height` (empty = niri's default thirds/half/two thirds).
+    pub preset_window_heights: Vec<crate::config::types::SizeSpec>,
+    /// `empty-workspace-above-first`: keep an empty workspace above the first one.
+    pub empty_workspace_above_first: bool,
+    /// `fullscreen-backdrop-color`: the colour behind a fullscreen window, as `#rrggbb(aa)`.
+    pub fullscreen_backdrop_color: Option<String>,
+    pub default_column_width: Option<Option<crate::config::types::SizeSpec>>,
+    /// Proportional mode only: never split the view among more than this many
+    /// columns.  With 3, one window fills the screen, two share it, three get a
+    /// third each, and a fourth window scrolls in instead of squeezing every
+    /// column narrower.  0 = no limit (the columns shrink to the `column_width`
+    /// floor, which is the historic behaviour).
+    pub max_visible_columns: u32,
     pub column_gap: i32,
     pub window_gap: i32,
     pub border_width: i32,
@@ -186,13 +421,20 @@ pub struct LayoutConfig {
     /// Pixels reserved at the top of every monitor's tiling work area.
     /// Applied before outer_gaps.  Set statically via `layout { reserve-top N }`
     /// or dynamically via the `reserve_area` IPC message.  Default 0.
-    pub reserve_top: u32,
+    pub reserve_top: i32,
     /// Pixels reserved at the bottom of every monitor's tiling work area.
-    pub reserve_bottom: u32,
+    pub reserve_bottom: i32,
     /// Pixels reserved at the left of every monitor's tiling work area.
-    pub reserve_left: u32,
+    pub reserve_left: i32,
     /// Pixels reserved at the right of every monitor's tiling work area.
-    pub reserve_right: u32,
+    pub reserve_right: i32,
+    /// What the overlay layer draws around the windows (niri's `focus-ring`, `border`,
+    /// `shadow`, `insert-hint` and `tab-indicator`).
+    pub effects: crate::config::Effects,
+    /// niri `layout { background-color }` (also where the deprecated per-output key maps):
+    /// the overview host paints it behind the workspaces unless `overview { backdrop-color }`
+    /// is set.  Windows owns the desktop behind the tiled windows themselves.
+    pub background_color: Option<crate::config::effects::Rgba8>,
 }
 
 impl Default for LayoutConfig {
@@ -200,6 +442,15 @@ impl Default for LayoutConfig {
         Self {
             column_width: 500,
             column_width_mode: ColumnWidthMode::Fixed,
+            default_tabbed: false,
+            center_focused_column: CenterFocusedColumn::Never,
+            always_center_single_column: false,
+            preset_column_widths: Vec::new(),
+            preset_window_heights: Vec::new(),
+            empty_workspace_above_first: false,
+            fullscreen_backdrop_color: None,
+            default_column_width: None,
+            max_visible_columns: 0,
             column_gap: 16,
             window_gap: 12,
             border_width: 4,
@@ -220,11 +471,19 @@ impl Default for LayoutConfig {
             reserve_bottom: 0,
             reserve_left: 0,
             reserve_right: 0,
+            effects: crate::config::Effects::default(),
+            background_color: None,
         }
     }
 }
 
 impl LayoutConfig {
+    /// The space between the edge of a tile and its window: the width of the `border`, which
+    /// is 0 when the border is off.
+    pub fn border_inset(&self) -> i32 {
+        self.border_width.max(0)
+    }
+
     pub fn from_config(config: &crate::config::Config) -> Self {
         let mut lc = Self::default();
         // inner_gaps controls spacing between columns and between stacked tiles
@@ -235,9 +494,14 @@ impl LayoutConfig {
         // Always apply from config
         let og = config.layout.outer_gaps as i32;
         lc.outer_gaps = (og, og, og, og);
-        if config.layout.border_width > 0 {
-            lc.border_width = config.layout.border_width as i32;
-        }
+        // The border block says how much room every window leaves around itself: its width,
+        // none when the border is off.
+        lc.effects = config.layout.effects.clone();
+        lc.border_width = if lc.effects.border.off {
+            0
+        } else {
+            lc.effects.border.width as i32
+        };
         if !config.layout.border_color.is_empty() {
             lc.border_color = config.layout.border_color.clone();
         }
@@ -257,9 +521,11 @@ impl LayoutConfig {
                 lc.border_color_focused_mode = BorderColorMode::Fixed;
             }
         }
-        if config.layout.focus_ring_width > 0 {
-            lc.focus_ring_width = config.layout.focus_ring_width as i32;
-        }
+        lc.focus_ring_width = if lc.effects.focus_ring.off {
+            0
+        } else {
+            lc.effects.focus_ring.width as i32
+        };
         if !config.layout.focus_ring_color.is_empty() {
             lc.focus_ring_color = config.layout.focus_ring_color.clone();
         }
@@ -268,10 +534,23 @@ impl LayoutConfig {
         }
         lc.scroll_step = config.layout.scroll_step as i32;
         lc.column_width = config.layout.column_width;
+        lc.max_visible_columns = config.layout.max_visible_columns;
+        lc.default_tabbed = config.layout.default_column_display == "tabbed";
         lc.column_width_mode = match config.layout.column_width_mode.as_str() {
             "fixed" => ColumnWidthMode::Fixed,
             _ => ColumnWidthMode::Proportional,
         };
+        lc.center_focused_column = match config.layout.center_focused_column.as_str() {
+            "always" => CenterFocusedColumn::Always,
+            "on-overflow" => CenterFocusedColumn::OnOverflow,
+            _ => CenterFocusedColumn::Never,
+        };
+        lc.always_center_single_column = config.layout.always_center_single_column;
+        lc.preset_column_widths = config.layout.preset_column_widths.clone();
+        lc.preset_window_heights = config.layout.preset_window_heights.clone();
+        lc.empty_workspace_above_first = config.layout.empty_workspace_above_first;
+        lc.fullscreen_backdrop_color = config.layout.fullscreen_backdrop_color.clone();
+        lc.default_column_width = config.layout.default_column_width;
         lc.strip_frame = config.layout.strip_frame;
         lc.shadow_enable = config.layout.shadow_enable;
         lc.smart_borders = config.layout.smart_borders;
@@ -285,6 +564,11 @@ impl LayoutConfig {
         lc.reserve_bottom = config.layout.reserve_bottom;
         lc.reserve_left = config.layout.reserve_left;
         lc.reserve_right = config.layout.reserve_right;
+        lc.background_color = config
+            .layout
+            .background_color
+            .as_deref()
+            .and_then(crate::config::parse_css_color);
         lc
     }
 }
@@ -298,8 +582,15 @@ pub enum ColumnWidthPreset {
     TwoThirds,     // ~67 %
     ThreeQuarters, // ~75 %
     Full,          // 100 %
-    /// Cycle through OneQuarter → OneThird → Half → TwoThirds → ThreeQuarters → Full → OneQuarter …
+    /// niri's `switch-preset-column-width`: the next of a third, a half and two thirds.
     Cycle,
+}
+
+/// The side of a window a size change applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeAxis {
+    Width,
+    Height,
 }
 
 /// Direction for relative workspace navigation.
@@ -321,7 +612,11 @@ pub enum AddWindowTarget {
     Workspace { output: OutputId, workspace_id: i32 },
     /// Insert as a tile in an existing column on the given monitor/workspace.
     /// If `column_idx` is out of range a new column is appended.
-    Column { output: OutputId, workspace_id: i32, column_idx: usize },
+    Column {
+        output: OutputId,
+        workspace_id: i32,
+        column_idx: usize,
+    },
     /// Place as a new column immediately to the right of the column containing `other_wid`.
     NextTo(WindowId),
 }
@@ -336,24 +631,106 @@ pub struct TilingEngine {
     /// reference to the per-monitor `LayoutConfig`; otherwise it falls
     /// through to the global `self.config`.
     config_per_monitor: HashMap<OutputId, LayoutConfig>,
+    /// Resolved global -> output -> named-workspace layouts (by workspace name, then by
+    /// connected output), including those of inactive workspaces.
+    config_per_workspace: named_config::WorkspaceLayouts,
     tiled_windows: HashMap<WindowId, WindowInfo>,
     fullscreen_windows: HashSet<WindowId>,
     floating_windows: HashSet<WindowId>,
+    /// Where each floating window lives (monitor + workspace), the rectangle it
+    /// floats at and its place in the float stack.  Every id in `floating_windows`
+    /// is expected to have an entry; a float without one (a test that fills the set
+    /// directly) is treated as living on the focused monitor's active workspace.
+    float_homes: HashMap<WindowId, FloatHome>,
+    /// Only populated during a native application's caption/edge modal loop.
+    native_moves: HashMap<WindowId, Rect>,
+    /// The geometry a window had the last time it floated, so that floating it
+    /// again puts it back where the user left it.
+    float_memory: HashMap<WindowId, Rect>,
+    /// Source of `FloatHome::seq`.
+    float_seq: u64,
+    /// Windows the user minimized, with the place they come back to.  They stay in
+    /// `tiled_windows` (wiri still knows them) but are in no column.
+    minimized: HashMap<WindowId, MinimizedWindow>,
+    /// The monitors that were unplugged, until they come back (or for good: the windows
+    /// they held are on another monitor meanwhile).
+    unplugged: HashMap<OutputId, UnpluggedMonitor>,
+    /// How the windows of inactive workspaces are hidden (from the config; the backend has
+    /// its own copy of the setting).
+    hide_method: crate::backend::cloak::HideMethod,
+    /// When wiri hid each window of an inactive workspace.
+    hidden_since: HashMap<WindowId, std::time::Instant>,
+    /// `restore_all` has put everything back: the process is on its way out, and no layout
+    /// pass may hide, move or cloak a window again (the 750 ms reconciler and the IPC server
+    /// run until the process ends, and a pass between the restore and the exit used to hide
+    /// the windows of the other workspaces once more).
+    shut_down: bool,
     window_sizing: HashMap<WindowId, SizingMode>,
     saved_styles: HashMap<WindowId, u32>,
     saved_ex_styles: HashMap<WindowId, u32>,
     window_rules: Vec<crate::config::WindowRule>,
+    /// Which kinds of window state the rules depend on (the title, the focus, floating,
+    /// urgency, an `app-id`): a change of one makes the engine look at the rules again.
+    rule_flags: rules::RuleFlags,
+    /// What the rules last decided for each managed window, and the facts about the window
+    /// they were decided from.
+    rule_state: HashMap<WindowId, rules::RuleState>,
+    /// The size limits the rules put on each window (the master copy: the tiles carry a copy
+    /// that `sync_min_widths` refreshes, as a tile is made anew when its window moves).
+    rule_limits: HashMap<WindowId, rules::RuleLimits>,
+    /// The height in pixels a rule asks for the tile of each window (`default-window-height`).
+    rule_heights: HashMap<WindowId, u32>,
+    /// Windows whose window-rule opacity `toggle-window-rule-opacity` switched off: the
+    /// window shows at the engine's own alpha (dimming only) until it is toggled back.  A
+    /// reload of the rules does not forget it (niri's toggle is a per-window override).
+    opacity_overridden: HashSet<WindowId>,
+    /// Which focus layer the focus is in (`focus-floating` / `focus-tiling`): the
+    /// `switch-focus-between-floating-and-tiling` action toggles this.  `None` until the
+    /// first layer action or a floating window is focused.
+    focus_layer: Option<crate::layout::FocusLayer>,
+    /// Windows that opened with `open-focused false`, for the first focus report they get.
+    unfocused_opens: HashMap<WindowId, rules::UnfocusedOpen>,
+    /// The device name of each monitor (`\\.\DISPLAY1`), as told by `set_output_name`.
+    output_names: HashMap<OutputId, String>,
+    /// Existing startup/reload output identities, reused without querying Windows.
+    output_identities: Vec<crate::backend::outputs::OutputIdentity>,
+    /// Windows maximized to the edges of the work area (niri `maximize-window-to-edges`).
+    maximized_edges: HashSet<WindowId>,
+    /// The windows of `fullscreen_windows` that went fullscreen on their own (a video player,
+    /// F11): their frame is not touched, and wiri follows them out of fullscreen.
+    app_fullscreen: HashSet<WindowId>,
+    /// Native fullscreen style state for tabs: hidden siblings defer changes until
+    /// selected. False means inherited fullscreen has not stripped this HWND yet.
+    tab_sizing_styles: HashMap<WindowId, bool>,
+    /// Windows whose column was made as wide as the view by sizing. Every tab keeps
+    /// ownership, so splitting it into a new column preserves width restoration.
+    slot_forced: HashSet<WindowId>,
+    /// A window that maximized itself was asked to give up the native state; the value is
+    /// whether it is to be maximized to the edges once it has.
+    unzoom_pending: HashMap<WindowId, bool>,
+    /// When each fullscreen window went fullscreen.
+    fullscreen_since: HashMap<WindowId, std::time::Instant>,
     full_config: Option<crate::config::Config>,
+    recent: recent::RecentState,
     animation: crate::layout::AnimationManager,
     /// Overview mode: None = normal, Some(state) = zoomed out (all workspaces stacked).
     /// See `OverviewState` for the per-workspace Y-offset layout.
     overview: Option<OverviewState>,
+    overview_camera: overview::OverviewCamera,
     /// Counts of consecutive `set_window_position` failures per window.
     /// After `MAX_POSITION_FAILURES` attempts the window is auto-floated and
     /// removed from the tile layout so it stops thrashing the Win32 API.
     failed_position: HashMap<WindowId, u8>,
     /// Last window activated via SetForegroundWindow — avoids spamming the API on every layout pass.
     last_activated: Option<WindowId>,
+    /// The window the OS last reported as the foreground one (managed or not, tiled
+    /// or floating).  Floating windows are not in the focus ring, so this is how
+    /// `toggle_floating` finds the floating window the user is looking at.
+    os_foreground: Option<WindowId>,
+    /// IPC focus history uses a monotonic daemon-local clock, never wall time.
+    focus_timestamps: HashMap<WindowId, std::time::Duration>,
+    focus_epoch: std::time::Instant,
+    last_focus_stamp: std::time::Duration,
     /// Optional channel to dispatch backend operations as `LayoutRequest`s instead of
     /// direct calls. When set, a sibling task on the backend drains this channel.
     /// When None, the engine continues to call `BackendApi` methods directly.
@@ -366,12 +743,19 @@ pub struct TilingEngine {
     /// Per-window cache of last-applied Win32 state. Used to skip redundant
     /// DwmSetWindowAttribute / SetLayeredWindowAttributes / SetWindowPos calls.
     applied_state: HashMap<WindowId, AppliedState>,
+    /// The overlay layer that draws the focus ring, the border and the shadow (and the tab
+    /// indicator and insert hint): `None` in tests and until the daemon installs one.
+    decor: Option<Arc<dyn crate::overlay::decor::DecorSink>>,
     /// Original window bounds at first registration. Used to restore windows
     /// when wiri exits so the user gets their layout back.
     original_bounds: HashMap<WindowId, Rect>,
-    /// Last column-width preset applied via `set_column_width_preset(Cycle, …)`.
-    /// Starts at `Half` so the first Cycle press → `TwoThirds`.
-    last_column_preset: ColumnWidthPreset,
+    /// The narrowest each window can be made (a visible width in pixels, what the window
+    /// answers to `WM_GETMINMAXINFO`).  The tiles carry a copy for the layout; this is
+    /// the master, because a tile is made anew when its window moves to another workspace.
+    window_min_widths: HashMap<WindowId, u32>,
+    /// How many times a window was asked for its minimum width (it may not answer in time
+    /// when it has just been created).
+    min_width_queries: HashMap<WindowId, u8>,
     // ---- Item 2: always-on-top tracking ----
     /// Windows that have been pinned as HWND_TOPMOST via toggle_always_on_top_for_focused.
     always_on_top: HashSet<WindowId>,
@@ -390,6 +774,8 @@ pub struct TilingEngine {
     /// Windows marked urgent (e.g. via WM_FLASHWINDOW or external hook).
     /// Populated by mark_urgent / cleared by clear_urgent.
     urgent_windows: HashSet<WindowId>,
+    /// Original foreign-window regions, allocated only for opt-in geometry clipping.
+    native_clips: native_clip::ClipState,
     /// Windows whose DWM shadow state has already been applied this session.
     /// `apply_shadow_for_window` is a one-shot per-HWND call: re-issuing the
     /// `DwmExtendFrameIntoClientArea` margins on every layout pass causes some
@@ -419,19 +805,30 @@ pub struct TilingEngine {
     /// intercepted by the WM_HOTKEY dispatcher to grow/shrink the focused
     /// column / tile, and Escape exits the mode.  Defaults to `false`.
     pub resize_mode: bool,
+    focus_history: focus_actions::FocusHistory,
+    foreground_observations: foreground::ForegroundReducer,
+    pending_previous: Option<(WindowId, u64)>,
     // ---- Item 1: per-window animation-to-target rects ----
     /// Per-window in-flight position animations: (start_rect, target_rect, start_time, duration).
     /// Populated by `apply_layout_for_monitor` when a tile's target rect differs from its
     /// last applied state and animations are enabled. Drained by `tick_animations`.
-    animating_rects: HashMap<WindowId, (Rect, Rect, std::time::Instant, std::time::Duration)>,
+    animating_rects: HashMap<WindowId, crate::layout::animation::RectAnimation>,
+    motion: crate::config::AnimationsConfig,
+    animation_wake: Option<Arc<tokio::sync::Notify>>,
+    /// The focused monitor's active workspace as the last layout pass saw it: the main loop's
+    /// workspace watch is woken (see `note_focused_workspace`) when this changes, instead of
+    /// the loop looking every 33 ms.
+    last_noted_workspace: Option<i32>,
+    frame_in_progress: bool,
+    transitions: transitions::Transitions,
+    gesture_output: Option<OutputId>,
+    gesture_workspace_offset: Option<(OutputId, f64)>,
     // ---- Item 3: sticky windows (visible on all workspaces) ----
     /// Windows marked sticky by the user; they float above all workspaces and
     /// are never hidden during workspace switches.
     sticky_windows: HashSet<WindowId>,
-    // ---- Item 4: workspace rename side-table ----
-    /// User-supplied names for workspaces, keyed by workspace id.
-    /// Consulted first by `workspace_name(id)`; falls through to config when absent.
-    workspace_names: HashMap<i32, String>,
+    /// Names reconciled this session; runtime names belong to workspace objects.
+    configured_workspace_names: HashSet<String>,
     /// Counter tracking how many Win32 calls were actually issued (for testing).
     #[cfg(test)]
     pub win32_call_count: u32,
@@ -443,33 +840,77 @@ impl TilingEngine {
             monitors: MonitorSet::new(),
             config,
             config_per_monitor: HashMap::new(),
+            config_per_workspace: HashMap::new(),
             tiled_windows: HashMap::new(),
             fullscreen_windows: HashSet::new(),
             floating_windows: HashSet::new(),
+            float_homes: HashMap::new(),
+            native_moves: HashMap::new(),
+            float_memory: HashMap::new(),
+            float_seq: 0,
+            minimized: HashMap::new(),
             window_sizing: HashMap::new(),
             saved_styles: HashMap::new(),
             saved_ex_styles: HashMap::new(),
             window_rules: Vec::new(),
+            rule_flags: rules::RuleFlags::default(),
+            rule_state: HashMap::new(),
+            rule_limits: HashMap::new(),
+            rule_heights: HashMap::new(),
+            opacity_overridden: HashSet::new(),
+            focus_layer: None,
+            unfocused_opens: HashMap::new(),
+            output_names: HashMap::new(),
+            output_identities: Vec::new(),
+            maximized_edges: HashSet::new(),
+            app_fullscreen: HashSet::new(),
+            tab_sizing_styles: HashMap::new(),
+            slot_forced: HashSet::new(),
+            unzoom_pending: HashMap::new(),
+            fullscreen_since: HashMap::new(),
             full_config: None,
+            recent: recent::RecentState::default(),
             animation: crate::layout::AnimationManager::disabled(),
             overview: None,
+            overview_camera: overview::OverviewCamera::default(),
             failed_position: HashMap::new(),
             last_activated: None,
+            os_foreground: None,
+            focus_timestamps: HashMap::new(),
+            focus_epoch: std::time::Instant::now(),
+            last_focus_stamp: std::time::Duration::ZERO,
             layout_request_tx: None,
             applied_state: HashMap::new(),
+            decor: None,
             original_bounds: HashMap::new(),
-            last_column_preset: ColumnWidthPreset::Half,
+            window_min_widths: HashMap::new(),
+            min_width_queries: HashMap::new(),
+            unplugged: HashMap::new(),
+            hide_method: crate::backend::cloak::HideMethod::Hide,
+            hidden_since: HashMap::new(),
+            shut_down: false,
             always_on_top: HashSet::new(),
             auto_tile_threshold: None,
             auto_tile_zoom: None,
             urgent_windows: HashSet::new(),
+            native_clips: Default::default(),
             shadow_applied: HashSet::new(),
             blur_applied: HashSet::new(),
             thumbnail_overview: None,
             resize_mode: false,
             animating_rects: HashMap::new(),
+            motion: Default::default(),
+            animation_wake: None,
+            last_noted_workspace: None,
+            frame_in_progress: false,
+            transitions: Default::default(),
+            gesture_output: None,
+            gesture_workspace_offset: None,
             sticky_windows: HashSet::new(),
-            workspace_names: HashMap::new(),
+            focus_history: focus_actions::FocusHistory::default(),
+            foreground_observations: foreground::ForegroundReducer::default(),
+            pending_previous: None,
+            configured_workspace_names: HashSet::new(),
             #[cfg(test)]
             win32_call_count: 0,
         }
@@ -521,7 +962,11 @@ impl TilingEngine {
             Some(o) => o,
             None => return,
         };
-        let wid = match self.monitors.get(&focused_output).and_then(|m| m.focus_window) {
+        let wid = match self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_window)
+        {
             Some(w) => w,
             None => return,
         };
@@ -540,59 +985,42 @@ impl TilingEngine {
     // Item 4 — Workspace renaming
     // =========================================================================
 
-    /// Return the display name for workspace `id`.
+    /// Set the focused monitor's active workspace layout mode.
     ///
-    /// Checks the side-table set by `rename_workspace` first; falls back to the
-    /// name stored in the first matching `WorkspaceConfig` in `full_config`.
-    /// Returns `None` when no name has been set for this workspace.
-    pub fn workspace_name(&self, id: i32) -> Option<String> {
-        // Side-table wins over config.
-        if let Some(name) = self.workspace_names.get(&id) {
-            return Some(name.clone());
-        }
-        // Fall through to full_config.workspace[].name
-        self.full_config.as_ref().and_then(|cfg| {
-            cfg.workspace
-                .iter()
-                .enumerate()
-                .find(|(pos, _ws)| *pos as i32 == id)
-                .and_then(|(_, ws)| {
-                    if ws.name.is_empty() { None } else { Some(ws.name.clone()) }
-                })
-        })
-    }
-
-    /// Assign a display name to workspace `workspace_id` on the focused monitor.
-    ///
-    /// The name is stored in a side-table (`workspace_names`) which
-    /// `workspace_name(id)` consults first.  If `full_config` has a
-    /// `WorkspaceConfig` entry whose positional index matches the id the
-    /// config entry is also updated in-place for consistency; otherwise the
-    /// side-table entry is the sole source of truth until the next
-    /// config reload.
-    ///
-    /// Returns `Err` if the focused monitor has no workspace with the given id.
-    pub fn rename_workspace(&mut self, workspace_id: i32, new_name: &str) -> Result<(), String> {
-        // Validate: the workspace must exist on the focused monitor.
-        let focused_output = self.monitors.focused_id()
-            .ok_or_else(|| "no focused monitor".to_string())?;
-        let monitor = self.monitors.get(&focused_output)
-            .ok_or_else(|| format!("monitor {:?} not found", focused_output))?;
-        if !monitor.workspaces.contains_key(&workspace_id) {
-            return Err(format!("workspace {} does not exist on the focused monitor", workspace_id));
-        }
-
-        // Update the side-table.
-        self.workspace_names.insert(workspace_id, new_name.to_string());
-
-        // Best-effort: sync to full_config when a matching entry exists.
-        if let Some(cfg) = self.full_config.as_mut() {
-            if let Some(entry) = cfg.workspace.get_mut(workspace_id as usize) {
-                entry.name = new_name.to_string();
+    /// Accepted modes are `scrolling`, `bstack`/`bottom-stack`, and `spiral`.
+    /// Returns an error instead of silently falling back when the mode is
+    /// unknown, so IPC and hotkeys can surface misconfigured bindings clearly.
+    pub fn set_workspace_layout(&mut self, mode: &str) -> Result<(), String> {
+        let layout_mode = match mode.trim().to_lowercase().as_str() {
+            "scrolling" | "scroll" | "default" => WorkspaceLayout::Scrolling,
+            "bstack" | "bottom-stack" | "bottomstack" => WorkspaceLayout::BStack,
+            "spiral" => WorkspaceLayout::Spiral,
+            other => {
+                return Err(format!(
+                    "unknown workspace layout {:?}; expected scrolling, bstack, or spiral",
+                    other
+                ));
             }
-        }
+        };
 
-        info!("Workspace {} renamed to {:?}", workspace_id, new_name);
+        let focused_output = self
+            .monitors
+            .focused_id()
+            .ok_or_else(|| "no focused monitor".to_string())?;
+        let monitor = self
+            .monitors
+            .get_mut(&focused_output)
+            .ok_or_else(|| format!("monitor {:?} not found", focused_output))?;
+        let workspace_id = monitor.active_workspace_id();
+        let workspace = monitor
+            .workspace_mut()
+            .ok_or_else(|| format!("workspace {} does not exist", workspace_id))?;
+
+        workspace.layout_mode = layout_mode;
+        info!(
+            "Workspace {} on monitor {} layout set to {:?}",
+            workspace_id, focused_output, layout_mode
+        );
         Ok(())
     }
 
@@ -647,31 +1075,449 @@ impl TilingEngine {
         }
     }
 
+    /// How the windows of inactive workspaces are hidden: `SW_HIDE` (they leave the taskbar
+    /// and Alt+Tab) or shell cloaking (they stay).  With cloaking, a window of another
+    /// workspace that takes the OS focus (Alt+Tab, a taskbar click) brings its workspace
+    /// along instead of being ignored.
+    pub fn set_hide_method(&mut self, method: crate::backend::cloak::HideMethod) {
+        self.hide_method = method;
+    }
+
     pub fn register_monitor(&mut self, output_id: OutputId, bounds: Rect, work_area: Rect) {
         self.register_monitor_with_scale(output_id, bounds, work_area, 1.0);
     }
 
-    pub fn register_monitor_with_scale(&mut self, output_id: OutputId, bounds: Rect, work_area: Rect, scale_factor: f64) {
-        info!("Registering monitor {} scale={:.1} bounds {:?}", output_id, scale_factor, bounds);
+    pub fn register_monitor_with_scale(
+        &mut self,
+        output_id: OutputId,
+        bounds: Rect,
+        work_area: Rect,
+        scale_factor: f64,
+    ) {
+        info!(
+            "Registering monitor {} scale={:.1} bounds {:?}",
+            output_id, scale_factor, bounds
+        );
         let monitor = Monitor::with_scale(output_id, bounds, work_area, scale_factor);
         self.monitors.insert(output_id, monitor);
         // Auto-focus the first registered monitor.
         if self.monitors.focused_id().is_none() {
             self.monitors.set_focused(output_id);
         }
+        // A monitor that was unplugged gets its windows back; a monitor that went when
+        // there was none to take its windows hands them to this one.
+        if let Some(kept) = self.unplugged.remove(&output_id) {
+            self.take_back_workspaces(kept, output_id);
+        }
+        self.adopt_homeless_workspaces(output_id);
+        // The workspaces the config names exist on every monitor.
+        self.ensure_named_workspaces();
+        self.refresh_named_config();
     }
 
+    pub fn sync_monitor_with_scale(
+        &mut self,
+        output_id: OutputId,
+        bounds: Rect,
+        work_area: Rect,
+        scale_factor: f64,
+    ) {
+        if let Some(monitor) = self.monitors.get_mut(&output_id) {
+            if monitor.bounds != bounds
+                || monitor.work_area != work_area
+                || (monitor.scale_factor - scale_factor).abs() > 1e-6
+            {
+                info!(
+                    "Updating monitor {} scale={:.1} bounds {:?}",
+                    output_id, scale_factor, bounds
+                );
+                monitor.bounds = bounds;
+                monitor.work_area = work_area;
+                monitor.scale_factor = scale_factor;
+            }
+        } else {
+            self.register_monitor_with_scale(output_id, bounds, work_area, scale_factor);
+        }
+    }
+
+    /// A monitor went away (unplugged, switched off, disabled in the config).  Its windows
+    /// stay: its workspaces move to a monitor that is left (the focused one), below the ones
+    /// it has, and come back when the monitor does.  Workspaces with nothing in them are
+    /// dropped; a named one joins the workspace of that name on the host.
     pub fn unregister_monitor(&mut self, output_id: &OutputId) {
         info!("Unregistering monitor {}", output_id);
         // MonitorSet.remove() already clears focused if this was the focused id.
-        let was_focused = self.monitors.focused_id().as_ref() == Some(output_id);
-        self.monitors.remove(output_id);
-        if was_focused {
+        let Some(gone) = self.monitors.remove(output_id) else {
+            return;
+        };
+        if self.monitors.focused_id().is_none() {
             // Re-focus the next available monitor (first in insertion order).
             let next_id = self.monitors.keys().next().copied();
             if let Some(next_id) = next_id {
                 self.monitors.set_focused(next_id);
             }
+        }
+        let host = self.monitors.focused_id();
+        let mut kept = UnpluggedMonitor {
+            monitor: gone,
+            host: None,
+            moved: Vec::new(),
+            floats: HashMap::new(),
+            minimized: HashMap::new(),
+        };
+        match host {
+            Some(host) => {
+                self.move_workspaces_to(&mut kept, host);
+                self.rebind_unplugged_host(*output_id, host);
+            }
+            None => tracing::warn!(
+                "Monitor {} went and no monitor is left: its windows wait for the next one",
+                output_id
+            ),
+        }
+        self.unplugged.insert(*output_id, kept);
+        self.refresh_named_config();
+    }
+
+    /// A host went away too. Earlier unplug records must follow the live copy of
+    /// their workspace to the new host, or reconnecting their monitor would recreate
+    /// the same IPC identity/name that still exists on the new host.
+    fn rebind_unplugged_host(&mut self, old_host: OutputId, new_host: OutputId) {
+        let live: Vec<(u64, i32)> = self
+            .monitors
+            .get(&new_host)
+            .map(|monitor| {
+                monitor
+                    .workspace_ids()
+                    .into_iter()
+                    .filter_map(|id| {
+                        monitor
+                            .workspaces
+                            .get(&id)
+                            .map(|workspace| (workspace.ipc_id, id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (gone, kept) in self.unplugged.iter_mut() {
+            if *gone == old_host || kept.host != Some(old_host) {
+                continue;
+            }
+            kept.host = Some(new_host);
+            let mut remap = HashMap::new();
+            let previous = std::mem::take(&mut kept.moved);
+            for (from, to) in previous {
+                let Some(ipc_id) = kept
+                    .monitor
+                    .workspaces
+                    .get(&from)
+                    .map(|workspace| workspace.ipc_id)
+                else {
+                    continue;
+                };
+                if let Some((_, new_key)) = live.iter().find(|(id, _)| *id == ipc_id) {
+                    remap.insert(to, *new_key);
+                    kept.moved.push((from, *new_key));
+                }
+            }
+            for window in kept.floats.keys() {
+                if let Some(home) = self.float_homes.get_mut(window) {
+                    if home.output == new_host {
+                        if let Some(new_key) = remap.get(&home.workspace) {
+                            home.workspace = *new_key;
+                        }
+                    }
+                }
+            }
+            for window in kept.minimized.keys() {
+                if let Some(minimized) = self.minimized.get_mut(window) {
+                    if minimized.output == new_host {
+                        if let Some(new_key) = remap.get(&minimized.workspace) {
+                            minimized.workspace = *new_key;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move what an unplugged monitor held to `host`: every workspace with a window, a
+    /// floating or a minimized window in it. Globally named workspaces move as objects too;
+    /// every migrated object retains its IPC identity and precedes the host's trailing empty
+    /// workspace, in its original order.
+    fn move_workspaces_to(&mut self, kept: &mut UnpluggedMonitor, host: OutputId) {
+        let gone = kept.monitor.output_id;
+        let Some(host_work) = self.monitors.get(&host).map(|m| m.work_area) else {
+            return;
+        };
+        kept.host = Some(host);
+        for from in kept.monitor.workspace_ids() {
+            let floats: Vec<(WindowId, Rect)> = self
+                .float_homes
+                .iter()
+                .filter(|(_, home)| home.output == gone && home.workspace == from)
+                .map(|(window, home)| (*window, home.rect))
+                .collect();
+            let minimized: Vec<WindowId> = self
+                .minimized
+                .iter()
+                .filter(|(_, m)| m.output == gone && m.workspace == from)
+                .map(|(window, _)| *window)
+                .collect();
+            let Some(workspace) = kept.monitor.workspaces.get(&from) else {
+                continue;
+            };
+            if workspace.name.is_none()
+                && workspace.columns.is_empty()
+                && floats.is_empty()
+                && minimized.is_empty()
+            {
+                continue;
+            }
+            let Some(target) = self.monitors.get(&host) else {
+                return;
+            };
+            let ids = target.workspace_ids();
+            let trailing = ids.last().filter(|id| {
+                target
+                    .workspaces
+                    .get(id)
+                    .is_some_and(|ws| ws.columns.is_empty() && ws.name.is_none())
+                    && !self
+                        .float_homes
+                        .values()
+                        .any(|home| home.output == host && home.workspace == **id)
+                    && !self
+                        .minimized
+                        .values()
+                        .any(|home| home.output == host && home.workspace == **id)
+            });
+            let position = ids.len().saturating_sub(usize::from(trailing.is_some()));
+            let target = self.monitors.get_mut(&host).expect("available host");
+            let to = target.next_workspace_id();
+            target.insert_workspace(to, workspace.clone());
+            target.move_workspace_to_position(to, position);
+            kept.moved.push((from, to));
+            for (window, rect) in floats {
+                if let Some(home) = self.float_homes.get_mut(&window) {
+                    home.output = host;
+                    home.workspace = to;
+                    home.rect = Self::fit_rect_into(home.rect, host_work);
+                }
+                kept.floats.insert(window, (from, rect));
+            }
+            for window in minimized {
+                if let Some(m) = self.minimized.get_mut(&window) {
+                    m.output = host;
+                    m.workspace = to;
+                }
+                kept.minimized.insert(window, from);
+            }
+        }
+        // A float or a minimized window whose workspace is not on the monitor any more still
+        // has to live somewhere: on the host's active workspace.
+        let active = self.monitors.get(&host).map_or(0, |m| m.active_workspace);
+        for home in self.float_homes.values_mut().filter(|h| h.output == gone) {
+            home.output = host;
+            home.workspace = active;
+            home.rect = Self::fit_rect_into(home.rect, host_work);
+        }
+        for m in self.minimized.values_mut().filter(|m| m.output == gone) {
+            m.output = host;
+            m.workspace = active;
+        }
+        self.maintain_empty_workspace(host);
+    }
+
+    /// The monitor `output` is plugged in again: the windows of its workspaces that are still
+    /// where they were put on the host (not closed, not moved by the user meanwhile) go back
+    /// into the columns they came from, and so do the floating and minimized ones.
+    fn take_back_workspaces(&mut self, kept: UnpluggedMonitor, output: OutputId) {
+        let UnpluggedMonitor {
+            monitor: mut old,
+            host,
+            moved,
+            floats,
+            minimized,
+        } = kept;
+        let Some((bounds, work_area, scale_factor)) = self
+            .monitors
+            .get(&output)
+            .map(|m| (m.bounds, m.work_area, m.scale_factor))
+        else {
+            return;
+        };
+
+        let workspaces: HashMap<i32, crate::layout::Workspace> = match host {
+            // It went when no monitor was left to take its windows: nothing moved.
+            None => old.workspaces.clone(),
+            Some(host) => {
+                let mut restored = HashMap::new();
+                for (from, to) in &moved {
+                    let Some(old_ws) = old.workspaces.get(from) else {
+                        continue;
+                    };
+                    // The migrated workspace is one live object, not a second copy
+                    // of its name/identity. Bring its current contents back, including
+                    // windows opened and metadata edited while this output was away.
+                    let same_object = self
+                        .monitors
+                        .get(&host)
+                        .and_then(|monitor| monitor.workspaces.get(to))
+                        .is_some_and(|workspace| workspace.ipc_id == old_ws.ipc_id);
+                    if same_object {
+                        if let Some(monitor) = self.monitors.get_mut(&host) {
+                            if let Some(mut workspace) = monitor.remove_workspace(*to) {
+                                for tile in workspace
+                                    .columns
+                                    .iter_mut()
+                                    .flat_map(|column| &mut column.tiles)
+                                {
+                                    tile.cached_bounds = Rect::default();
+                                    monitor.focus_ring.remove(tile.window_id);
+                                }
+                                restored.insert(*from, workspace);
+                            }
+                        }
+                        continue;
+                    }
+                    let mut columns = Vec::new();
+                    for col in &old_ws.columns {
+                        let mut back = col.clone();
+                        back.tiles.clear();
+                        for tile in &col.tiles {
+                            let still_there = self
+                                .monitors
+                                .get(&host)
+                                .and_then(|m| m.workspaces.get(to))
+                                .map_or(false, |ws| {
+                                    ws.find_window_column(tile.window_id).is_some()
+                                });
+                            if !still_there {
+                                continue;
+                            }
+                            if let Some(host_monitor) = self.monitors.get_mut(&host) {
+                                host_monitor.remove_window(tile.window_id);
+                            }
+                            let mut tile = tile.clone();
+                            tile.cached_bounds = Rect::default();
+                            back.tiles.push(tile);
+                        }
+                        if !back.tiles.is_empty() {
+                            back.clamp_active_tab();
+                            columns.push(back);
+                        }
+                    }
+                    let mut workspace = old_ws.clone();
+                    workspace.columns = columns;
+                    restored.insert(*from, workspace);
+                }
+                // The floating and minimized windows that are still on the workspace they
+                // were moved to go back as well, to where they floated.
+                let to_of = |from: &i32| moved.iter().find(|(f, _)| f == from).map(|(_, t)| *t);
+                for (window, (from, rect)) in &floats {
+                    if let (Some(to), Some(home)) = (to_of(from), self.float_homes.get_mut(window))
+                    {
+                        if home.output == host && home.workspace == to {
+                            home.output = output;
+                            home.workspace = *from;
+                            home.rect = Self::fit_rect_into(*rect, work_area);
+                        }
+                    }
+                }
+                for (window, from) in &minimized {
+                    if let (Some(to), Some(m)) = (to_of(from), self.minimized.get_mut(window)) {
+                        if m.output == host && m.workspace == to {
+                            m.output = output;
+                            m.workspace = *from;
+                        }
+                    }
+                }
+                // Floating/minimized windows admitted to a migrated object after
+                // unplug also belong to that object when it returns.
+                for (from, to) in &moved {
+                    if !restored.contains_key(from) {
+                        continue;
+                    }
+                    for home in self
+                        .float_homes
+                        .values_mut()
+                        .filter(|home| home.output == host && home.workspace == *to)
+                    {
+                        home.output = output;
+                        home.workspace = *from;
+                        home.rect = Self::fit_rect_into(home.rect, work_area);
+                    }
+                    for home in self
+                        .minimized
+                        .values_mut()
+                        .filter(|home| home.output == host && home.workspace == *to)
+                    {
+                        home.output = output;
+                        home.workspace = *from;
+                    }
+                }
+                restored
+            }
+        };
+
+        old.bounds = bounds;
+        old.work_area = work_area;
+        old.scale_factor = scale_factor;
+        old.workspaces = workspaces;
+        if old.workspaces.is_empty() {
+            old.workspaces.insert(0, crate::layout::Workspace::new());
+        }
+        if !old.workspaces.contains_key(&old.active_workspace) {
+            old.active_workspace = old.workspace_ids().first().copied().unwrap_or(0);
+        }
+        old.previous_workspace = old
+            .previous_workspace
+            .filter(|id| old.workspaces.contains_key(id));
+        // The window that had the focus may not have come back.
+        let focus = {
+            let workspace = old.workspace();
+            let kept_focus = old.focus_window.and_then(|window| {
+                workspace
+                    .and_then(|ws| ws.find_window_column(window))
+                    .map(|column| (window, column))
+            });
+            kept_focus.or_else(|| {
+                workspace
+                    .and_then(|ws| ws.columns.first())
+                    .and_then(|column| column.tiles.first())
+                    .map(|tile| (tile.window_id, 0))
+            })
+        };
+        old.focus_window = focus.map(|(window, _)| window);
+        old.focus_column = focus.map(|(_, column)| column);
+        self.monitors.insert(output, old);
+        self.maintain_empty_workspace(output);
+        if let Some(host) = host {
+            self.maintain_empty_workspace(host);
+        }
+        self.sync_min_widths();
+    }
+
+    /// A monitor that went when no monitor was left (so its windows had nowhere to go) hands
+    /// them to the monitor `host` that has just appeared.
+    fn adopt_homeless_workspaces(&mut self, host: OutputId) {
+        let homeless: Vec<OutputId> = self
+            .unplugged
+            .iter()
+            .filter(|(id, kept)| kept.host.is_none() && **id != host)
+            .map(|(id, _)| *id)
+            .collect();
+        for gone in &homeless {
+            if let Some(mut kept) = self.unplugged.remove(gone) {
+                self.move_workspaces_to(&mut kept, host);
+                self.unplugged.insert(*gone, kept);
+            }
+        }
+        // Records that were hosted by any of the just-adopted monitors follow the
+        // live copies to the new host as well.
+        for gone in homeless {
+            self.rebind_unplugged_host(gone, host);
         }
     }
 
@@ -686,112 +1532,165 @@ impl TilingEngine {
         self.add_window_with_target(window, AddWindowTarget::Auto, backend, true);
     }
 
-    pub fn add_window_with_target(&mut self, window: WindowInfo, target: AddWindowTarget, backend: &BackendHandle, at_startup: bool) {
+    pub fn add_window_with_target(
+        &mut self,
+        window: WindowInfo,
+        target: AddWindowTarget,
+        backend: &BackendHandle,
+        at_startup: bool,
+    ) {
         let window_id = WindowId::new(window.hwnd);
         let hwnd = window.hwnd; // Capture before move
+        let opened_frame = window.bounds;
+
+        // A window is managed once.  Two events (created, shown, foreground) and the
+        // reconcile pass can all find the same new window at the same moment; a second
+        // tile for it would be positioned over the first on every pass and would
+        // outlive the window's float / close / move (those remove one tile only).
+        if self.tiled_windows.contains_key(&window_id) {
+            debug!("add_window: {:?} is already managed", window_id);
+            return;
+        }
 
         // Capture original bounds (first registration only) so we can restore on quit.
-        self.original_bounds.entry(window_id).or_insert(window.bounds);
+        // A window that an earlier wiri run moved and left behind (it was killed, or crashed)
+        // is not where it was: that run recorded where it first saw the window (hidden.json),
+        // and the record is what counts.
+        if !self.original_bounds.contains_key(&window_id) {
+            let original = crate::backend::hidden::record_original(
+                window.hwnd,
+                window.process_id,
+                &window.class_name,
+                window.bounds,
+            );
+            self.original_bounds.insert(window_id, original);
+        }
 
-        // Wire is_active: compare hwnd against the current foreground window.
-        let is_active = unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-            let fg = GetForegroundWindow();
-            !fg.0.is_null() && fg.0 as isize == window.hwnd
+        // The facts the rules look at, asked once: the process (its file name) and, when some
+        // rule has an `app-id`, the AppUserModelID of the window.
+        let process_name: Option<String> = backend.process_name_for_pid(window.process_id);
+        let aumid: Option<String> = if self.rule_flags.aumid {
+            backend.aumid_for_window(hwnd)
+        } else {
+            None
         };
-
-        // Wire process_name: look up via QueryFullProcessImageNameW.
-        let process_name_owned: Option<String> = backend.process_name_for_pid(window.process_id);
-
-        let ctx = crate::config::types::MatcherContext {
-            class_name: &window.class_name,
-            title: &window.title,
-            // Win32 has no concept of "instance" in the X11/Wayland sense; the
-            // closest analogue is the process executable name, which we already
-            // populate as `process_name`. Leaving instance unset is correct.
-            // (Users matching apps should write rules against `class` or
-            // `process_name`, not `instance`.)
-            instance: None,
-            process_name: process_name_owned.as_deref(),
-            is_active,
-            // is_floating: at this point the window hasn't been added to floating_windows yet,
-            // so check against the existing set (covers re-adds after toggle_floating).
-            is_floating: self.floating_windows.contains(&window_id),
-            // Item 5: check urgent_windows set; also consult the FLASHWINFO helper stub.
-            is_urgent: self.urgent_windows.contains(&window_id)
-                || crate::window::is_window_flashing(
-                    windows::Win32::Foundation::HWND(hwnd as *mut std::ffi::c_void)
-                ),
+        let mut rules = self.resolve_rules_for_open(
+            &window,
+            process_name.as_deref(),
+            aumid.as_deref(),
             at_startup,
-        };
-        let rules = crate::window::resolve_window_rules(&self.window_rules, &ctx);
+        );
+        let auto_float = crate::window::should_auto_float(&crate::window::gather_skip_facts(
+            windows::Win32::Foundation::HWND(hwnd as *mut std::ffi::c_void),
+        )) && rules.open_floating != Some(false);
+        rules.float |= auto_float;
+        self.rule_state.insert(
+            window_id,
+            rules::RuleState {
+                process_name,
+                aumid,
+                resolved: rules.clone(),
+            },
+        );
 
-        // Item 8: extract default_width / default_height from matching window rules.
-        // ResolvedWindowRules deliberately doesn't surface these fields (they're a
-        // first-add-only hint, not part of the per-frame resolved state). We do a
-        // second pass here for the same rule list using the same `matches` predicate
-        // so behaviour is identical to a hypothetical resolved field.
-        let (rule_default_width, rule_default_height): (Option<u32>, Option<u32>) = {
-            let mut dw: Option<u32> = None;
-            let mut dh: Option<u32> = None;
-            for rule in &self.window_rules {
-                if rule.matches(&ctx) {
-                    if rule.default_width.is_some() { dw = rule.default_width; }
-                    if rule.default_height.is_some() { dh = rule.default_height; }
-                }
+        // Where it opens: `open-on-output`, `open-on-workspace` / `open-in-workspace`.  A caller
+        // that names the target has chosen; the rules only place a window that comes in the
+        // normal way.
+        let (mut rule_output, mut rule_workspace) = match &target {
+            AddWindowTarget::Auto => self.rule_placement(&window, &rules),
+            AddWindowTarget::Output(output) => (*output, None),
+            AddWindowTarget::Workspace {
+                output,
+                workspace_id,
             }
-            (dw, dh)
+            | AddWindowTarget::Column {
+                output,
+                workspace_id,
+                ..
+            } => (*output, Some(*workspace_id)),
+            AddWindowTarget::NextTo(other) => self
+                .locate_window(*other)
+                .map(|(output, workspace, _)| (output, Some(workspace)))
+                .unwrap_or_else(|| (self.get_target_output(&window), None)),
         };
+        let dialog_owner = auto_float
+            .then(|| WindowId::new(root_owner_of(hwnd)))
+            .filter(|id| id.as_isize() != hwnd);
+        if matches!(target, AddWindowTarget::Auto)
+            && rules.open_on_output.is_none()
+            && rules.open_on_workspace.is_none()
+            && rules.open_in_workspace.is_none()
+        {
+            if let Some((output, workspace)) = dialog_owner.and_then(|id| {
+                self.float_location(id)
+                    .or_else(|| self.locate_window(id).map(|(o, w, _)| (o, w)))
+            }) {
+                rule_output = output;
+                rule_workspace = Some(workspace);
+            }
+        }
+        let focus_before = self.focus_before(rule_output);
+        self.remember_open_rules(window_id, rule_output, rule_workspace, &window, &rules);
 
         if rules.float {
-            self.floating_windows.insert(window_id);
+            // A floating window belongs to a workspace like any other: the active one
+            // of the monitor it opens on, unless the rules name another.
+            let output_id = rule_output;
+            let workspace = rule_workspace.unwrap_or_else(|| {
+                self.monitors
+                    .get(&output_id)
+                    .map_or(0, |m| m.active_workspace)
+            });
+            let mut rect = self.open_float_rect(window_id, output_id, &window, &rules, at_startup);
+            if !at_startup && rules.policy.default_floating_position.is_none() {
+                if let Some(owner) = dialog_owner.and_then(Self::live_window_rect) {
+                    rect.loc.x = owner.loc.x + (owner.size.w as i32 - rect.size.w as i32) / 2;
+                    rect.loc.y = owner.loc.y + (owner.size.h as i32 - rect.size.h as i32) / 2;
+                    if let Some(monitor) = self.monitors.get(&output_id) {
+                        rect = Self::fit_rect_into(rect, monitor.work_area);
+                    }
+                }
+            }
+            self.register_float(window_id, output_id, workspace, rect);
+            if !at_startup {
+                // Centred, at the size the rules ask for: the window goes there.
+                let _ = backend.set_window_position(
+                    hwnd,
+                    rect,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+            }
             self.tiled_windows.insert(window_id, window);
             info!("Window {:?} started as floating (rule)", window_id);
+            self.act_on_open_rules(window_id, &rules, focus_before, at_startup, backend);
             return;
         }
 
         match target {
             AddWindowTarget::Auto => {
-                let output_id = self.get_target_output(&window);
+                let output_id = rule_output;
 
-                if let Some(ws_id) = rules.workspace {
-                    if let Some(monitor) = self.monitors.get_mut(&output_id) {
-                        if !monitor.workspaces.contains_key(&ws_id) {
-                            monitor.switch_workspace(ws_id);
+                // The width of the column: what the rules ask for, else the destination
+                // workspace's configured fixed width.
+                let cfg = rule_workspace.map_or_else(
+                    || self.active_workspace_config(output_id),
+                    |workspace| self.effective_config_for_workspace(output_id, workspace),
+                );
+                let width_hint = self
+                    .open_column_width(output_id, rule_workspace, &window, &rules)
+                    .or_else(|| {
+                        if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                            Some(cfg.column_width)
+                        } else {
+                            None
                         }
-                    }
-                }
-
-                // Item 8: prefer rule default_width over config fixed width.
-                let width_hint = rule_default_width.or_else(|| {
-                    if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                        Some(self.config.column_width)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(monitor) = self.monitors.get_mut(&output_id) {
-                    monitor.add_window_with_width(window_id, width_hint);
-                    // Item 8: store preferred_height on the newly added tile.
-                    if let Some(dh) = rule_default_height {
-                        if let Some(workspace) = monitor.workspace_mut() {
-                            // The tile was added to the last column.
-                            if let Some(col) = workspace.columns.last_mut() {
-                                if let Some(tile) = col.tiles.last_mut() {
-                                    tile.preferred_height = Some(dh);
-                                }
-                            }
-                        }
-                    }
+                    });
+                if self.place_new_tile(window_id, output_id, rule_workspace, width_hint) {
                     self.tiled_windows.insert(window_id, window);
                 }
                 self.strip_frame_for_tiling(hwnd);
                 self.apply_shadow_for_window(hwnd);
-                if let Some(o) = rules.opacity {
-                    // Explicit opacity override from a window-rule.
-                    // `Some(0.0)` is honoured as fully transparent.
-                    self.apply_window_opacity(window_id.as_isize(), o);
-                }
+                // The opacity of the rule is given by the layout pass (see `wanted_alpha`).
                 if rules.blur {
                     // niri-parity: apply DWM blur backdrop once per HWND.
                     self.apply_window_blur(hwnd, true);
@@ -799,22 +1698,22 @@ impl TilingEngine {
             }
 
             AddWindowTarget::Output(oid) => {
-                // Route to the active workspace of the given monitor.
-                let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                    Some(self.config.column_width)
+                // Route to the active workspace of the given monitor, falling back to
+                // Auto if the monitor is unavailable. Resolve widths on the actual output.
+                let output_id = if self.monitors.get(&oid).is_some() {
+                    oid
+                } else {
+                    self.get_target_output(&window)
+                };
+                let cfg = self.active_workspace_config(output_id);
+                let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                    Some(cfg.column_width)
                 } else {
                     None
                 };
-                if let Some(monitor) = self.monitors.get_mut(&oid) {
+                if let Some(monitor) = self.monitors.get_mut(&output_id) {
                     monitor.add_window_with_width(window_id, width_hint);
                     self.tiled_windows.insert(window_id, window);
-                } else {
-                    // Monitor not found — fall back to Auto.
-                    let output_id = self.get_target_output(&window);
-                    if let Some(monitor) = self.monitors.get_mut(&output_id) {
-                        monitor.add_window_with_width(window_id, width_hint);
-                        self.tiled_windows.insert(window_id, window);
-                    }
                 }
                 self.strip_frame_for_tiling(hwnd);
                 self.apply_shadow_for_window(hwnd);
@@ -828,20 +1727,27 @@ impl TilingEngine {
                 }
             }
 
-            AddWindowTarget::Workspace { output: oid, workspace_id } => {
+            AddWindowTarget::Workspace {
+                output: oid,
+                workspace_id,
+            } => {
+                // Resolve the destination config before mutably borrowing its monitor.
+                let cfg = self.effective_config_for_workspace(oid, workspace_id);
+                let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                    Some(cfg.column_width)
+                } else {
+                    None
+                };
                 // Ensure workspace exists; switch active workspace to it.
                 if let Some(monitor) = self.monitors.get_mut(&oid) {
                     if !monitor.workspaces.contains_key(&workspace_id) {
-                        monitor.workspaces.insert(workspace_id, crate::layout::Workspace::new());
+                        monitor
+                            .workspaces
+                            .insert(workspace_id, crate::layout::Workspace::new());
                     }
                     // Temporarily switch to the target workspace to add the window.
                     let previous_ws = monitor.active_workspace;
                     monitor.active_workspace = workspace_id;
-                    let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                        Some(self.config.column_width)
-                    } else {
-                        None
-                    };
                     monitor.add_window_with_width(window_id, width_hint);
                     // Restore previous active workspace (the window is parked in target ws).
                     monitor.active_workspace = previous_ws;
@@ -859,10 +1765,16 @@ impl TilingEngine {
                 }
             }
 
-            AddWindowTarget::Column { output: oid, workspace_id, column_idx } => {
+            AddWindowTarget::Column {
+                output: oid,
+                workspace_id,
+                column_idx,
+            } => {
                 if let Some(monitor) = self.monitors.get_mut(&oid) {
                     if !monitor.workspaces.contains_key(&workspace_id) {
-                        monitor.workspaces.insert(workspace_id, crate::layout::Workspace::new());
+                        monitor
+                            .workspaces
+                            .insert(workspace_id, crate::layout::Workspace::new());
                     }
                     let previous_ws = monitor.active_workspace;
                     monitor.active_workspace = workspace_id;
@@ -876,9 +1788,14 @@ impl TilingEngine {
                         }
                     }
                     // Focus the column.
-                    monitor.focus_column = Some(column_idx.min(
-                        monitor.workspace().map(|w| w.columns.len().saturating_sub(1)).unwrap_or(0)
-                    ));
+                    monitor.focus_column = Some(
+                        column_idx.min(
+                            monitor
+                                .workspace()
+                                .map(|w| w.columns.len().saturating_sub(1))
+                                .unwrap_or(0),
+                        ),
+                    );
                     monitor.focus_window = Some(window_id);
                     monitor.focus_ring.push(window_id);
                     monitor.active_workspace = previous_ws;
@@ -898,13 +1815,21 @@ impl TilingEngine {
 
             AddWindowTarget::NextTo(other_wid) => {
                 // Find the monitor and column containing `other_wid`.
-                let location: Option<(OutputId, i32, usize)> = self.monitors.iter().find_map(|(&oid, monitor)| {
-                    monitor.workspaces.iter().find_map(|(&ws_id, ws)| {
-                        ws.find_window_column(other_wid).map(|col_idx| (oid, ws_id, col_idx))
-                    })
-                });
+                let location: Option<(OutputId, i32, usize)> =
+                    self.monitors.iter().find_map(|(&oid, monitor)| {
+                        monitor.workspaces.iter().find_map(|(&ws_id, ws)| {
+                            ws.find_window_column(other_wid)
+                                .map(|col_idx| (oid, ws_id, col_idx))
+                        })
+                    });
 
                 if let Some((oid, ws_id, col_idx)) = location {
+                    let cfg = self.effective_config_for_workspace(oid, ws_id);
+                    let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                        Some(cfg.column_width)
+                    } else {
+                        None
+                    };
                     let insert_col = col_idx + 1;
                     if let Some(monitor) = self.monitors.get_mut(&oid) {
                         let previous_ws = monitor.active_workspace;
@@ -913,9 +1838,7 @@ impl TilingEngine {
                             // Insert a new column to the right of the found column.
                             let tile = crate::layout::Tile::new(window_id);
                             let mut col = crate::layout::Column::new();
-                            if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                                col.width = Some(self.config.column_width);
-                            }
+                            col.width = width_hint;
                             col.add_tile(tile);
                             workspace.columns.insert(insert_col, col);
                         }
@@ -928,8 +1851,9 @@ impl TilingEngine {
                 } else {
                     // `other_wid` not found — fall back to Auto on first available monitor.
                     let output_id = self.get_target_output(&window);
-                    let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                        Some(self.config.column_width)
+                    let cfg = self.active_workspace_config(output_id);
+                    let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+                        Some(cfg.column_width)
                     } else {
                         None
                     };
@@ -951,24 +1875,66 @@ impl TilingEngine {
             }
         }
 
+        self.remember_column_width_spec(
+            window_id,
+            rules.default_column_width,
+            rules.default_width_px,
+        );
+
+        // A window known to have a minimum width (it floated, or was added again) gets it on
+        // its new tile.
+        self.sync_min_widths();
+
         // Item 7: after adding a window, maintain exactly one trailing empty workspace
         // on the monitor that received the window.
         {
             // Find which monitor now holds this window_id.
-            let output_for_maintain: Option<OutputId> = self.monitors.iter()
-                .find_map(|(&oid, monitor)| {
-                    monitor.workspaces.values().any(|ws| ws.find_window_column(window_id).is_some())
+            let output_for_maintain: Option<OutputId> =
+                self.monitors.iter().find_map(|(&oid, monitor)| {
+                    monitor
+                        .workspaces
+                        .values()
+                        .any(|ws| ws.find_window_column(window_id).is_some())
                         .then_some(oid)
                 });
             if let Some(oid) = output_for_maintain {
                 self.maintain_empty_workspace(oid);
             }
         }
+
+        // A new column inherits the configured display; existing multi-window columns keep
+        // theirs. Selecting the new window also makes consume/add into tabbed columns visible.
+        self.apply_new_column_policy(window_id);
+
+        // A window that opens maximized or as big as its monitor (it was like that when wiri
+        // started, or its application restores that state) is followed like one that does it
+        // later.
+        self.adopt_app_sizing_at_open(window_id, opened_frame, backend);
+
+        // What the rules ask once the window is in its place: its column as wide as the view,
+        // no focus for it, fullscreen.
+        self.mark_window_opening(window_id, at_startup);
+        self.act_on_open_rules(window_id, &rules, focus_before, at_startup, backend);
     }
 
     pub fn remove_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        crate::input::low_level_hook::cancel_window_grab(window_id);
+        self.native_clips.remove(window_id);
+        // Preserve a tabbed column's sizing before deleting its former owner.
+        if let Some((output, _, _)) = self.locate_window(window_id) {
+            self.sync_tabbed_sizing(output);
+        }
+        self.native_moves.remove(&window_id);
+        self.animating_rects.remove(&window_id);
+        self.forget_rule_state(window_id);
+        self.forget_native_foreground(window_id);
+        self.focus_timestamps.remove(&window_id);
+        self.forget_sizing(window_id);
         self.fullscreen_windows.remove(&window_id);
+        self.minimized.remove(&window_id);
         self.floating_windows.remove(&window_id);
+        self.float_homes.remove(&window_id);
+        self.float_memory.remove(&window_id);
         self.window_sizing.remove(&window_id);
         self.saved_styles.remove(&window_id);
         self.saved_ex_styles.remove(&window_id);
@@ -985,23 +1951,342 @@ impl TilingEngine {
         // is about to be destroyed (and on auto-float, the window will keep
         // its blur — the user expects a floating "frosted glass" effect).
         self.blur_applied.remove(&window_id);
+        // A destroyed window needs no "show me again after a crash" record, and there is
+        // nothing left to put back.  (Its handle may be given to a new window.)
+        self.original_bounds.remove(&window_id);
+        self.window_min_widths.remove(&window_id);
+        self.min_width_queries.remove(&window_id);
+        self.hidden_since.remove(&window_id);
+        crate::backend::cloak::forget(window_id.as_isize());
+        crate::backend::hidden::forget(window_id.as_isize());
+
+        if self.last_activated == Some(window_id) {
+            // The window is gone; make sure the next focus target is activated
+            // even if it happens to be the same HWND value later.
+            self.last_activated = None;
+        }
+        if self.os_foreground == Some(window_id) {
+            self.os_foreground = None;
+        }
 
         if self.tiled_windows.remove(&window_id).is_some() {
-            let mut found_output = None;
-            for (output_id, monitor) in self.monitors.iter() {
-                if monitor.workspace().and_then(|w| w.find_window_column(window_id)).is_some() {
-                    found_output = Some(*output_id);
-                    break;
-                }
-            }
+            // Look on every workspace, not just the active one: a window can
+            // close while it is parked on an inactive workspace.
+            let found_output = self
+                .locate_window(window_id)
+                .map(|(output_id, _, _)| output_id);
             if let Some(output_id) = found_output {
                 if let Some(monitor) = self.monitors.get_mut(&output_id) {
                     monitor.remove_window(window_id);
                 }
                 // Item 7: maintain trailing empty workspace
                 self.maintain_empty_workspace(output_id);
+                // The strip got shorter: bring the survivors (and the newly
+                // focused column) back into view instead of leaving them
+                // scrolled off to the left.
+                self.reveal_focused_column(output_id);
                 self.apply_layout_for_monitor(output_id, backend);
             }
+        }
+        self.recent_window_removed(window_id, backend);
+    }
+
+    /// The widest minimum a window may claim: anything above is not a minimum width but
+    /// garbage (`WM_GETMINMAXINFO` answers are made by the applications).
+    const MAX_MIN_WIDTH_PX: u32 = 16_384;
+    /// How long a report that a window of another workspace became the foreground window is
+    /// taken for the OS picking a replacement for what wiri just hid.
+    const HIDE_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
+    /// How often a window is asked for its minimum width in all (it may not answer in time
+    /// when it has just been created; it is asked again when it takes the focus).
+    const MAX_MIN_WIDTH_QUERIES: u8 = 3;
+
+    /// The window cannot be made narrower than `width` (a visible width in pixels, from
+    /// its `WM_GETMINMAXINFO`): its column is at least that wide from now on, and the
+    /// columns after it move over instead of lying under it.  0 forgets the limit.
+    /// Returns true when the limit changed.  Lays nothing out: call it before the pass that
+    /// places a new window, or follow it with one (see [`Self::note_min_width_answer`]).
+    pub fn note_window_min_width(&mut self, window_id: WindowId, width: u32) -> bool {
+        let width = width.min(Self::MAX_MIN_WIDTH_PX);
+        let known = self.window_min_widths.get(&window_id).copied().unwrap_or(0);
+        if width == known {
+            return false;
+        }
+        if width == 0 {
+            self.window_min_widths.remove(&window_id);
+        } else {
+            self.window_min_widths.insert(window_id, width);
+        }
+        self.sync_min_widths();
+        true
+    }
+
+    /// wiri has hidden `wid`: the layout cache now says it is not visible, and the moment is
+    /// remembered.  A foreground report for a window that was hidden a moment ago is the OS
+    /// picking a replacement for it, a later one is the user asking for the window (Alt+Tab
+    /// or the taskbar, with `hide-method "cloak"`): see `sync_os_foreground`.
+    fn note_hidden(&mut self, wid: WindowId) {
+        if self.applied_state.get(&wid).map_or(true, |s| s.visible) {
+            self.hidden_since.insert(wid, std::time::Instant::now());
+        }
+        self.applied_state
+            .entry(wid)
+            .or_insert_with(AppliedState::unset)
+            .visible = false;
+    }
+
+    /// Copy what is known of each window onto its tile: the minimum width the window
+    /// answered, the size limits and the height its window rule asks for (a tile is made
+    /// anew when a window moves to another workspace or stops floating).  The minimum width
+    /// of a tile is the larger of what the window says and what its rule says; the limits
+    /// of a rule are for the window, so the border around it comes on top.
+    fn sync_min_widths(&mut self) {
+        self.sync_tile_limits(true);
+    }
+
+    /// Structural transfers refresh output-relative limits without erasing native/user
+    /// preferred heights. Rule/config updates retain their existing reset semantics.
+    fn sync_tile_limits(&mut self, reset_heights: bool) {
+        let known = &self.window_min_widths;
+        let limits = &self.rule_limits;
+        let heights = &self.rule_heights;
+        let global = &self.config;
+        let states = &self.rule_state;
+        let per_monitor = &self.config_per_monitor;
+        let per_workspace = &self.config_per_workspace;
+        for (output, monitor) in self.monitors.iter_mut() {
+            for workspace in monitor.workspaces.values_mut() {
+                let cfg = Self::workspace_layout_in(per_workspace, *output, workspace)
+                    .or_else(|| per_monitor.get(output))
+                    .unwrap_or(global);
+                let border = 2 * cfg.border_inset() as u32;
+                for column in workspace.columns.iter_mut() {
+                    for tile in column.tiles.iter_mut() {
+                        let border = states.get(&tile.window_id).map_or(border, |s| {
+                            2 * s
+                                .resolved
+                                .effects
+                                .border
+                                .inset(&cfg.effects.border, cfg.border_inset())
+                                as u32
+                        });
+                        let window_min = known.get(&tile.window_id).copied().unwrap_or(0);
+                        let rule = limits.get(&tile.window_id).copied().unwrap_or_default();
+                        // Both native and rule minima describe the visible window; a tile
+                        // also contains wiri's border, which placement subtracts again.
+                        tile.min_width =
+                            rules::RuleLimits::for_tile(window_min.max(rule.min_width), border);
+                        tile.max_width = rules::RuleLimits::for_tile(rule.max_width, border);
+                        tile.min_height = rules::RuleLimits::for_tile(rule.min_height, border);
+                        tile.max_height = rules::RuleLimits::for_tile(rule.max_height, border);
+                        if reset_heights || tile.preferred_height.is_none() {
+                            if tile.height_proportion.is_none() && tile.height_preset_idx.is_none()
+                            {
+                                tile.preferred_height = heights.get(&tile.window_id).copied();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Should `window_id` be asked for its minimum width (now, or when it takes the focus)?
+    /// Yes while it is managed, does not float, has not answered, and was asked fewer than
+    /// three times.
+    pub fn min_width_query_wanted(&self, window_id: WindowId) -> bool {
+        self.tiled_windows.contains_key(&window_id)
+            && !self.floating_windows.contains(&window_id)
+            && !self.window_min_widths.contains_key(&window_id)
+            && self.min_width_queries.get(&window_id).copied().unwrap_or(0)
+                < Self::MAX_MIN_WIDTH_QUERIES
+    }
+
+    /// The window was asked for its minimum width and answered `answer` (`None`: it did
+    /// not).  Returns true when the answer changed a column, so that the caller lays the
+    /// monitor out again.
+    pub fn note_min_width_answer(&mut self, window_id: WindowId, answer: Option<u32>) -> bool {
+        let asked = self.min_width_queries.entry(window_id).or_insert(0);
+        *asked = asked.saturating_add(1);
+        match answer {
+            Some(width) => self.note_window_min_width(window_id, width),
+            None => false,
+        }
+    }
+
+    /// [`Self::note_min_width_answer`], and the layout pass it asks for: the monitor the
+    /// window is on is laid out again (once per window that turns out to have a minimum, not
+    /// once per event).
+    pub fn learn_min_width(
+        &mut self,
+        window_id: WindowId,
+        answer: Option<u32>,
+        backend: &BackendHandle,
+    ) {
+        if !self.note_min_width_answer(window_id, answer) {
+            return;
+        }
+        if let Some((output, _, _)) = self.locate_window(window_id) {
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// The window was minimized (`EVENT_SYSTEM_MINIMIZESTART`).  It leaves the strip so
+    /// that the other windows close the gap it would leave, and its place is
+    /// remembered for [`Self::restore_window`].  A floating window keeps its float
+    /// state and is just left alone until it comes back.
+    pub fn minimize_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        if !self.tiled_windows.contains_key(&window_id) || self.minimized.contains_key(&window_id) {
+            return;
+        }
+        crate::input::low_level_hook::cancel_window_grab(window_id);
+        if self.native_moves.contains_key(&window_id) {
+            self.clear_window_insert(window_id);
+        }
+        let was_fullscreen = self.is_fullscreen(window_id);
+        // A minimized window is not fullscreen (the taskbar must come back), does not hold its
+        // column as wide as the view and comes back with the frame the application gave it;
+        // it is fullscreen (or maximized to the edges) again when it is restored.
+        self.leave_sizing_states(window_id, true);
+
+        if self.floating_windows.contains(&window_id) {
+            let Some((output, workspace)) = self.float_location(window_id) else {
+                return;
+            };
+            self.minimized.insert(
+                window_id,
+                MinimizedWindow {
+                    output,
+                    workspace,
+                    slot: None,
+                    was_fullscreen,
+                },
+            );
+            info!("Floating window {:?} minimized", window_id);
+            return;
+        }
+
+        let Some((output, workspace, _)) = self.locate_window(window_id) else {
+            return;
+        };
+        let Some(mut slot) = self
+            .monitors
+            .get(&output)
+            .and_then(|m| m.workspaces.get(&workspace))
+            .and_then(|w| w.slot_of(window_id))
+        else {
+            return;
+        };
+        // Windows minimized from this workspace before: where they sat relative to this
+        // one, so that all of them come back in the old order whichever is restored first.
+        for earlier in self
+            .minimized
+            .values()
+            .filter(|m| m.output == output && m.workspace == workspace)
+        {
+            if let Some(earlier_slot) = &earlier.slot {
+                slot.learn_from(earlier_slot);
+            }
+        }
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            monitor.remove_window(window_id);
+        }
+        self.minimized.insert(
+            window_id,
+            MinimizedWindow {
+                output,
+                workspace,
+                slot: Some(slot),
+                was_fullscreen,
+            },
+        );
+        self.applied_state.remove(&window_id);
+        if self.last_activated == Some(window_id) {
+            self.last_activated = None;
+        }
+        info!("Window {:?} minimized; the strip closes the gap", window_id);
+        self.maintain_empty_workspace(output);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// The window was restored (`EVENT_SYSTEM_MINIMIZEEND`): put it back where it sat.
+    ///
+    /// On the workspace it was minimized from it rejoins its column, or gets a column
+    /// of its own at its old place, with the width it had.  When the user has gone to
+    /// another workspace meanwhile, the window comes back where the user is looking
+    /// (they asked for it, and a window hidden at once on an inactive workspace would
+    /// look like the restore did nothing).  The restored window takes the focus.
+    pub fn restore_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some(minimized) = self.minimized.remove(&window_id) else {
+            return;
+        };
+        if !self.tiled_windows.contains_key(&window_id) {
+            return;
+        }
+        // Whatever the layout cache knows about the window is stale.
+        self.applied_state.remove(&window_id);
+        let MinimizedWindow {
+            output,
+            workspace,
+            slot,
+            was_fullscreen,
+        } = minimized;
+
+        let Some(slot) = slot else {
+            // A floating window comes back where it floated, on top of the float stack.
+            self.touch_float(window_id);
+            if let Some((float_output, _)) = self.float_location(window_id) {
+                self.apply_layout_for_monitor(float_output, backend);
+                self.raise_floats(float_output);
+            }
+            if was_fullscreen {
+                self.set_fullscreen(window_id, true, false, backend);
+            }
+            return;
+        };
+
+        let output = if self.monitors.contains_key(&output) {
+            output
+        } else {
+            match self.monitors.focused_id() {
+                Some(focused) => focused,
+                None => return,
+            }
+        };
+        {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let active = monitor.active_workspace;
+            let strip = monitor
+                .workspaces
+                .entry(active)
+                .or_insert_with(crate::layout::Workspace::new);
+            let column = if workspace == active {
+                strip.put_back(slot)
+            } else {
+                strip.insert_slot_after_active(slot)
+            };
+            strip.remember_focus(window_id);
+            monitor.focus_column = Some(column);
+            monitor.focus_window = Some(window_id);
+            monitor.focus_ring.push(window_id);
+        }
+        self.monitors.set_focused(output);
+        info!("Window {:?} restored into its column", window_id);
+        self.maintain_empty_workspace(output);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+        if self.maximized_edges.contains(&window_id) {
+            // It comes back maximized to the edges: its column is as wide as the view again.
+            self.hold_slot(window_id);
+            self.applied_state.remove(&window_id);
+            self.apply_layout_for_monitor(output, backend);
+        }
+        if was_fullscreen {
+            self.set_fullscreen(window_id, true, false, backend);
         }
     }
 
@@ -1016,12 +2301,144 @@ impl TilingEngine {
             }
         }
         self.monitors.focused_id().unwrap_or_else(|| {
-            self.monitors.keys().next().copied().unwrap_or(OutputId::from_name("default"))
+            self.monitors
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or(OutputId::from_name("default"))
         })
     }
 
     fn view_width_for_monitor(monitor: &Monitor, config: &LayoutConfig) -> i32 {
-        monitor.work_area.size.w as i32 - config.outer_gaps.1 - config.outer_gaps.3
+        Self::view_width_for_work_area(monitor.work_area, config)
+    }
+
+    fn view_width_for_work_area(work_area: Rect, config: &LayoutConfig) -> i32 {
+        Self::tiling_rect_in(work_area, config).size.w as i32
+    }
+
+    /// Y coordinate just below the bottom edge of every monitor: the parking
+    /// lot for tiles that are scrolled completely out of view.
+    fn parking_y(&self) -> i32 {
+        self.monitors
+            .values()
+            .map(|m| m.bounds.bottom())
+            .max()
+            .unwrap_or(0)
+            + 64
+    }
+
+    /// Find `window_id` on any monitor and workspace.
+    /// Returns `(monitor, workspace id, column index)`.
+    pub fn locate_window(&self, window_id: WindowId) -> Option<(OutputId, i32, usize)> {
+        for (output_id, monitor) in self.monitors.iter() {
+            for (workspace_id, workspace) in &monitor.workspaces {
+                if let Some(column_idx) = workspace.find_window_column(window_id) {
+                    return Some((*output_id, *workspace_id, column_idx));
+                }
+            }
+        }
+        None
+    }
+
+    /// Scroll the focused monitor's active workspace so that its focused column
+    /// is fully visible.  Called after a window was added (new windows take the
+    /// focus), so that a window opened beyond the right edge scrolls into view
+    /// instead of landing off screen.
+    pub fn reveal_focused(&mut self) {
+        if let Some(output_id) = self.monitors.focused_id() {
+            self.reveal_focused_column(output_id);
+        }
+    }
+
+    /// Scroll the active workspace of `focused_output` the least amount that
+    /// brings the focused column fully into view.  A column that is already
+    /// visible is left where it is (no scroll), and the offset stays inside the
+    /// valid range.
+    fn reveal_focused_column(&mut self, focused_output: OutputId) {
+        if self.gesture_output == Some(focused_output) {
+            return;
+        }
+        let from = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.workspace())
+            .map(|w| w.scroll_offset.x)
+            .unwrap_or(0);
+        self.refresh_strip_widths(focused_output);
+        let cfg = self.active_workspace_config(focused_output).clone();
+        let focus_col = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_column);
+        let view_width = self
+            .monitors
+            .get(&focused_output)
+            .map(|m| Self::view_width_for_monitor(m, &cfg));
+        let default_width = match (view_width, self.monitors.get(&focused_output)) {
+            (Some(vw), Some(m)) => m
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, &cfg)),
+            _ => None,
+        };
+
+        if let (Some(col_idx), Some(vw), Some(col_w)) = (focus_col, view_width, default_width) {
+            let gap = cfg.column_gap;
+            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+                let focused = monitor.focus_window;
+                if let Some(workspace) = monitor.workspace_mut() {
+                    if let Some(id) = focused {
+                        workspace.remember_focus(id);
+                    }
+                    workspace.reveal_with_policy(
+                        col_idx,
+                        col_w,
+                        gap,
+                        vw,
+                        cfg.center_focused_column,
+                        cfg.always_center_single_column,
+                    );
+                }
+            }
+        }
+        let target = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.workspace())
+            .map(|w| w.scroll_offset.x)
+            .unwrap_or(from);
+        self.queue_view(focused_output, from, target);
+    }
+
+    fn hide_inactive_workspace_windows_for_monitor(
+        &mut self,
+        output_id: OutputId,
+        backend: &BackendHandle,
+    ) {
+        let Some(monitor) = self.monitors.get(&output_id) else {
+            return;
+        };
+        let active_ws = monitor.active_workspace;
+        let to_hide: Vec<WindowId> = monitor
+            .workspaces
+            .iter()
+            .filter(|(ws_id, _)| **ws_id != active_ws)
+            .flat_map(|(_, ws)| ws.columns.iter())
+            .flat_map(|column| column.tiles.iter().map(|tile| tile.window_id))
+            .filter(|wid| !self.sticky_windows.contains(wid) && !self.transitions.retained(*wid))
+            .collect();
+
+        for wid in to_hide {
+            // Treat inactive-workspace visibility as authoritative rather than
+            // trusting applied_state. The shell/taskbar can re-show hidden HWNDs
+            // behind wiri's back, especially app-hosted terminal windows.
+            let _ = backend.show_window(wid.as_isize(), false);
+            #[cfg(test)]
+            {
+                self.win32_call_count += 1;
+            }
+            self.note_hidden(wid);
+        }
     }
 
     pub fn effective_column_width(
@@ -1035,15 +2452,193 @@ impl TilingEngine {
                 if num_columns == 0 {
                     config.column_width as i32
                 } else {
-                    let total_gaps = config.column_gap * (num_columns as i32 - 1).max(0);
-                    let available = view_width - total_gaps;
-                    (available / num_columns as i32).max(config.column_width as i32 / 2)
+                    Self::auto_column_width(
+                        &vec![None; num_columns],
+                        view_width,
+                        config.column_gap,
+                        config,
+                    )
                 }
             }
         }
     }
 
+    /// Narrowest column the equal split of proportional mode may produce.
+    ///
+    /// The historic floor is half of `column_width`.  With `max_visible_columns`
+    /// set (the default config uses 3) the floor is also the width at which that
+    /// many columns exactly fill the view, so a fourth window scrolls into view
+    /// instead of squeezing every column down to a sliver.
+    fn min_proportional_width(view_width: i32, gap: i32, cfg: &LayoutConfig) -> i32 {
+        let historic = cfg.column_width as i32 / 2;
+        if cfg.max_visible_columns == 0 {
+            return historic;
+        }
+        let k = cfg.max_visible_columns as i32;
+        let share = (view_width - gap * (k - 1)) / k;
+        historic.max(share)
+    }
+
+    /// Width of a column that has no explicit width of its own.
+    ///
+    /// Fixed mode: the configured pixel width.  Proportional mode: the columns
+    /// without an explicit width split whatever the explicitly sized ones leave
+    /// over, but never get narrower than [`Self::min_proportional_width`].
+    fn auto_column_width(
+        explicit: &[Option<u32>],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> i32 {
+        match cfg.column_width_mode {
+            ColumnWidthMode::Fixed => cfg.column_width as i32,
+            ColumnWidthMode::Proportional => {
+                let n_auto = explicit.iter().filter(|w| w.is_none()).count() as i32;
+                if n_auto == 0 {
+                    return cfg.column_width as i32;
+                }
+                let explicit_total: i32 = explicit.iter().flatten().map(|w| *w as i32).sum();
+                let total_gaps = gap * (explicit.len() as i32 - 1).max(0);
+                let available = view_width - total_gaps - explicit_total;
+                (available / n_auto).max(Self::min_proportional_width(view_width, gap, cfg))
+            }
+        }
+    }
+
+    /// Width of every column of a workspace, in order.  A column with an
+    /// explicit width (set by the width presets or the grow/shrink actions)
+    /// keeps it in both layout modes; the rest get [`Self::auto_column_width`].
+    pub fn column_widths(
+        explicit: &[Option<u32>],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> Vec<i32> {
+        Self::column_widths_with_minimums(explicit, &[], view_width, gap, cfg).0
+    }
+
+    /// [`Self::column_widths_with_limits`] without maximums: for columns that cannot be
+    /// made narrower than `mins` (the widest minimum of the windows in each; missing or 0 =
+    /// no limit), and the width a column without a width of its own gets.
+    pub fn column_widths_with_minimums(
+        explicit: &[Option<u32>],
+        mins: &[u32],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> (Vec<i32>, i32) {
+        Self::column_widths_with_limits(explicit, mins, &[], view_width, gap, cfg)
+    }
+
+    /// [`Self::column_widths`] for columns that cannot be made narrower than `mins` (the
+    /// widest minimum of the windows in each; missing or 0 = no limit) nor wider than
+    /// `maxs` (the smallest maximum of the windows in each; missing or 0 = no limit), and
+    /// the width a column without a width of its own gets.
+    ///
+    /// A column is never narrower than its minimum: asking a Windows Terminal window for
+    /// less than its ~462 px only makes it overlap its neighbour.  An explicit width below
+    /// the minimum is raised to it, one above the maximum (a window rule's `max-width`) is
+    /// cut to it; when a column's limits clash the minimum wins.  A column without a width
+    /// of its own whose limits are not met by the share it would get keeps its limit, and
+    /// the others split what is left (in proportional mode; in fixed mode the others keep
+    /// the configured width).
+    pub fn column_widths_with_limits(
+        explicit: &[Option<u32>],
+        mins: &[u32],
+        maxs: &[u32],
+        view_width: i32,
+        gap: i32,
+        cfg: &LayoutConfig,
+    ) -> (Vec<i32>, i32) {
+        let min_of = |i: usize| mins.get(i).copied().unwrap_or(0);
+        let max_of = |i: usize| maxs.get(i).copied().unwrap_or(0);
+        // `width` held to the limits of column `i`.
+        let held = |i: usize, width: u32| -> u32 {
+            let width = width.max(min_of(i));
+            match max_of(i) {
+                0 => width,
+                max => width.min(max.max(min_of(i))),
+            }
+        };
+        let mut fixed: Vec<Option<u32>> = explicit
+            .iter()
+            .enumerate()
+            .map(|(i, w)| w.map(|w| held(i, w)))
+            .collect();
+        let mut auto = Self::auto_column_width(&fixed, view_width, gap, cfg);
+        // Every pass fixes at least one more column or stops: at most one pass per column.
+        for _ in 0..fixed.len() {
+            let mut changed = false;
+            for (i, width) in fixed.iter_mut().enumerate() {
+                if width.is_none() {
+                    let wanted = held(i, auto.max(0) as u32);
+                    if wanted as i32 != auto {
+                        *width = Some(wanted);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+            auto = Self::auto_column_width(&fixed, view_width, gap, cfg);
+        }
+        let widths = fixed
+            .iter()
+            .map(|w| w.map(|w| w as i32).unwrap_or(auto))
+            .collect();
+        (widths, auto)
+    }
+
+    /// The explicit width, the minimum width and the maximum width of every column of
+    /// `workspace`, in order.
+    fn column_inputs(
+        workspace: &crate::layout::workspace::Workspace,
+    ) -> (Vec<Option<u32>>, Vec<u32>, Vec<u32>) {
+        let mut explicit = Vec::with_capacity(workspace.columns.len());
+        let mut mins = Vec::with_capacity(workspace.columns.len());
+        let mut maxs = Vec::with_capacity(workspace.columns.len());
+        for column in &workspace.columns {
+            explicit.push(column.width);
+            mins.push(column.min_width());
+            maxs.push(column.max_width());
+        }
+        (explicit, mins, maxs)
+    }
+
+    /// The width a column without explicit width gets on `workspace`.
+    fn workspace_default_width(
+        workspace: &crate::layout::workspace::Workspace,
+        view_width: i32,
+        cfg: &LayoutConfig,
+    ) -> i32 {
+        let (explicit, mins, maxs) = Self::column_inputs(workspace);
+        if explicit.is_empty() {
+            return Self::effective_column_width(0, view_width, cfg);
+        }
+        Self::column_widths_with_limits(&explicit, &mins, &maxs, view_width, cfg.column_gap, cfg).1
+    }
+
+    /// Wake the main loop's workspace watch when the focused monitor's active workspace is not
+    /// the one it was last told about.  A compare per layout pass; the notification is a
+    /// stored permit, so a change that nobody is waiting for yet is not lost.
+    fn note_focused_workspace(&mut self) {
+        let now = self.monitors.focused().map(|m| m.active_workspace_id());
+        if workspace_changed(&mut self.last_noted_workspace, now) {
+            crate::ipc::notify_workspace_maybe_changed();
+        }
+    }
+
     pub fn apply_layout_for_monitor(&mut self, output_id: OutputId, backend: &BackendHandle) {
+        self.note_focused_workspace();
+        self.refresh_strip_widths(output_id);
+        // After `restore_all` nothing is laid out any more (see `shut_down`).
+        if self.shut_down {
+            return;
+        }
+        // Tabbed sizing is a column property. Record inheritance before hiding/showing
+        // a selection or computing indicator reservations, including newly inserted tabs.
+        self.sync_tabbed_sizing(output_id);
         // -- Item 3: auto-tile threshold check (must run before borrowing monitor).
         // When threshold is set and the active workspace exceeds it, auto-engage
         // overview zoom so the user can see everything at a glance. We compute
@@ -1051,16 +2646,18 @@ impl TilingEngine {
         // this function then renders with the new zoom.
         if let Some(threshold) = self.auto_tile_threshold {
             if self.overview.is_none() {
-                let (col_count, vw) = match self.monitors.get(&output_id)
-                    .and_then(|m| m.workspace().map(|w| (w.columns.len(), Self::view_width_for_monitor(m, &self.config))))
-                {
+                let cfg = self.active_workspace_config(output_id);
+                let (col_count, vw) = match self.monitors.get(&output_id).and_then(|m| {
+                    m.workspace()
+                        .map(|w| (w.columns.len(), Self::view_width_for_monitor(m, cfg)))
+                }) {
                     Some(v) => v,
                     None => return,
                 };
                 if col_count > threshold {
-                    let cw = Self::effective_column_width(col_count, vw, &self.config);
-                    let total = col_count as i32 * cw
-                        + (col_count as i32 - 1).max(0) * self.config.column_gap;
+                    let cw = Self::effective_column_width(col_count, vw, cfg);
+                    let total =
+                        col_count as i32 * cw + (col_count as i32 - 1).max(0) * cfg.column_gap;
                     let zoom = if total > vw {
                         (vw as f64 / total as f64).min(1.0)
                     } else {
@@ -1086,6 +2683,18 @@ impl TilingEngine {
             }
         }
 
+        let overview_active = self.is_overview();
+        if overview_active {
+            self.refresh_overview_sources(output_id, backend);
+        }
+        if !overview_active {
+            self.hide_inactive_tabs_for_monitor(output_id, backend);
+            self.hide_inactive_workspace_windows_for_monitor(output_id, backend);
+            self.sync_tab_sizing_styles(output_id);
+            self.reconcile_floats(output_id, backend);
+        }
+        self.refresh_maximized_widths(output_id);
+
         let monitor = match self.monitors.get(&output_id) {
             Some(m) => m,
             None => return,
@@ -1102,30 +2711,16 @@ impl TilingEngine {
         // Win32 calls without fighting the borrow checker.  `LayoutConfig`
         // is a small struct (~20 fields, no large allocations) so the clone
         // cost is negligible vs the Win32 calls it gates.
-        let eff_cfg: LayoutConfig = self.effective_config(output_id).clone();
+        let eff_cfg: LayoutConfig = self.active_workspace_config(output_id).clone();
 
         // Subtract reserved screen-edge pixels (for external bars / panels)
         // before applying outer_gaps so the two insets compose correctly.
-        let rt = eff_cfg.reserve_top as i32;
-        let rb = eff_cfg.reserve_bottom as i32;
-        let rl = eff_cfg.reserve_left as i32;
-        let rr = eff_cfg.reserve_right as i32;
-        let work_rect = Rect::new(
-            monitor.work_area.loc.x + rl + eff_cfg.outer_gaps.3,
-            monitor.work_area.loc.y + rt + eff_cfg.outer_gaps.0,
-            monitor.work_area.size.w
-                .saturating_sub((rl + rr) as u32)
-                .saturating_sub((eff_cfg.outer_gaps.1 + eff_cfg.outer_gaps.3) as u32),
-            monitor.work_area.size.h
-                .saturating_sub((rt + rb) as u32)
-                .saturating_sub((eff_cfg.outer_gaps.0 + eff_cfg.outer_gaps.2) as u32),
-        );
+        let work_rect = Self::tiling_work_rect(monitor, &eff_cfg);
 
         // Collect the window IDs on this monitor's active workspace.  In
         // overview mode we also need the union across every workspace so the
         // fullscreen-hide check (below) and the final cached_bounds write-back
         // know which tiles to consider.
-        let overview_active = self.is_overview();
         let monitor_window_ids: std::collections::HashSet<WindowId> = if overview_active {
             monitor
                 .workspaces
@@ -1141,21 +2736,15 @@ impl TilingEngine {
                 .collect()
         };
 
-        for window_id in &self.fullscreen_windows {
-            // Only position fullscreen windows that belong to this monitor
-            if !monitor_window_ids.contains(window_id) {
-                continue;
-            }
-            let fullscreen_rect = Rect::new(
-                monitor.bounds.loc.x, monitor.bounds.loc.y,
-                monitor.bounds.size.w, monitor.bounds.size.h,
-            );
-            let _ = backend.set_window_position(
-                window_id.as_isize(), fullscreen_rect,
-                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-            );
-        }
+        // Fullscreen and maximized tiles keep their slot in the strip: it is laid out like any
+        // other, and the window is drawn over the monitor (fullscreen) or the work area
+        // (maximized to the edges) in its place, shifted by whatever the strip is scrolled by
+        // (see `sizing.rs`).  Nothing else is hidden or moved for them.
+        let draw_modes: HashMap<WindowId, DrawMode> = if overview_active {
+            HashMap::new()
+        } else {
+            self.sizing_draw_modes(&monitor_window_ids)
+        };
 
         // Snapshot the per-tile ConfigureThrottle intents before positioning.
         // We need an immutable borrow of the workspace to get tile intents, then a
@@ -1165,14 +2754,18 @@ impl TilingEngine {
         let tile_intents: HashMap<WindowId, ConfigureIntent> = {
             let monitor = self.monitors.get(&output_id).unwrap();
             if overview_active {
-                monitor.workspaces.values()
+                monitor
+                    .workspaces
+                    .values()
                     .flat_map(|ws| ws.columns.iter())
                     .flat_map(|col| col.tiles.iter())
                     .map(|tile| (tile.window_id, tile.configure_throttle.intent()))
                     .collect()
             } else {
                 let workspace = monitor.workspace().unwrap();
-                workspace.columns.iter()
+                workspace
+                    .columns
+                    .iter()
                     .flat_map(|col| col.tiles.iter())
                     .map(|tile| (tile.window_id, tile.configure_throttle.intent()))
                     .collect()
@@ -1184,14 +2777,17 @@ impl TilingEngine {
         // its precomputed vertical section, and union the per-workspace
         // position lists.  Outside overview we keep the original behaviour
         // (active workspace only, no Y offset).
-        let positions: Vec<(WindowId, Rect)> = if overview_active {
+        let positions: Vec<(WindowId, Rect)> = if overview_active
+            && self.thumbnail_overview.is_some()
+        {
+            self.workspace_overview_scene(output_id)
+        } else if overview_active {
             let monitor = self.monitors.get(&output_id).unwrap();
             let mut out: Vec<(WindowId, Rect)> = Vec::new();
-            // Sort by workspace id so the on-screen stack matches the
-            // numerical "Workspace 1, Workspace 2, …" labels.
-            let mut ws_ids: Vec<i32> = monitor.workspaces.keys().copied().collect();
-            ws_ids.sort();
-            // Per-workspace section height + gap come from `OverviewState`.
+            // Visible order, not stable keys, supplies workspace numbers.
+            let ws_ids = monitor.workspace_ids();
+            // Keep full work-area sections aligned with the overview height
+            // budget, but resolve each workspace's reserved edges and gaps.
             let zoom = self.overview_zoom();
             const INTER_WORKSPACE_GAP: i32 = 50;
             let nominal_section_height = monitor.work_area.size.h as i32;
@@ -1206,12 +2802,18 @@ impl TilingEngine {
                 if ws.columns.is_empty() {
                     continue; // skip empty workspaces, no Y consumption
                 }
+                let cfg = self.effective_config_for_workspace(output_id, ws_id);
+                let mut ws_work_rect = Self::tiling_work_rect(monitor, cfg);
+                // The helper scales the section height, not its origin. Scale
+                // the top inset too so it stays inside this workspace's section.
+                ws_work_rect.loc.y = monitor.work_area.loc.y
+                    + ((ws_work_rect.loc.y as f64 - monitor.work_area.loc.y as f64) * zoom) as i32;
                 let mut ws_positions = self.calculate_positions_in_section(
                     ws,
-                    work_rect,
+                    ws_work_rect,
                     section_y,
-                    nominal_section_height,
-                    &eff_cfg,
+                    ws_work_rect.size.h as i32,
+                    cfg,
                 );
                 out.append(&mut ws_positions);
                 section_y += scaled_section_h + scaled_gap;
@@ -1224,14 +2826,25 @@ impl TilingEngine {
                 WorkspaceLayout::BStack => {
                     self.calculate_positions_bstack(workspace, work_rect, &eff_cfg)
                 }
-                WorkspaceLayout::Spiral => {
-                    self.calculate_positions_spiral(workspace, work_rect)
-                }
+                WorkspaceLayout::Spiral => self.calculate_positions_spiral(workspace, work_rect),
                 WorkspaceLayout::Scrolling => {
                     self.calculate_positions(workspace, work_rect, &eff_cfg)
                 }
             }
         };
+
+        let positions: Vec<(WindowId, Rect)> =
+            if draw_modes.is_empty() || self.effective_zoom() < 1.0 {
+                positions
+            } else {
+                Self::apply_sizing_states(
+                    positions,
+                    &draw_modes,
+                    work_rect,
+                    monitor.work_area,
+                    monitor.bounds,
+                )
+            };
 
         // Workspace-slide animation bias (niri parity).  While a workspace
         // switch is in flight the engine reads `workspace_slide_offset(oid)`
@@ -1240,7 +2853,12 @@ impl TilingEngine {
         // in overview mode (overview already lays out workspaces vertically)
         // and when no slide is active (returns 0.0).
         let slide_offset_y = if !overview_active {
-            self.animation.workspace_slide_offset(output_id) as i32
+            self.gesture_workspace_offset
+                .filter(|(output, _)| *output == output_id)
+                .map_or_else(
+                    || self.animation.workspace_slide_offset(output_id),
+                    |(_, value)| value,
+                ) as i32
         } else {
             0
         };
@@ -1248,12 +2866,7 @@ impl TilingEngine {
             positions
                 .into_iter()
                 .map(|(wid, r)| {
-                    let shifted = Rect::new(
-                        r.loc.x,
-                        r.loc.y + slide_offset_y,
-                        r.size.w,
-                        r.size.h,
-                    );
+                    let shifted = Rect::new(r.loc.x, r.loc.y + slide_offset_y, r.size.w, r.size.h);
                     (wid, shifted)
                 })
                 .collect()
@@ -1261,34 +2874,31 @@ impl TilingEngine {
             positions
         };
 
+        // Park columns that are scrolled completely out of view below every
+        // monitor, so they neither show up on a neighbouring monitor nor lie on
+        // top of the visible tiles.  The parked rect is independent of the
+        // scroll offset, so scrolling does not re-position invisible windows.
+        // (Not while overview or a workspace slide is positioning tiles
+        // outside the monitor on purpose.)
+        let positions: Vec<(WindowId, Rect)> = if overview_active || slide_offset_y != 0 {
+            positions
+        } else {
+            let view = monitor.bounds;
+            let park_y = self.parking_y();
+            positions
+                .into_iter()
+                .map(|(wid, r)| (wid, parked_rect(r, view, park_y)))
+                .collect()
+        };
+
         // Snapshot positions for later write-back to Tile.cached_bounds so that
         // LayoutElement::bounds() returns the most recently computed rect.
         let position_map: HashMap<WindowId, Rect> = positions.iter().copied().collect();
-        let focused = self.monitors.values().find_map(|m| m.focus_window);
-        // ^ iterates in insertion order via MonitorSet::values()
-        let border_w = eff_cfg.border_width.max(1);
-
-        // Resolve the focused border colour for this pass.  When the user
-        // opted into `border-color-focused "accent"` we read the live
-        // Windows accent (cached for 30 s) and convert it to a `#rrggbb`
-        // literal so the rest of the pipeline (cache compare, DWM call)
-        // keeps treating it as a normal colour.  If the registry lookup
-        // fails we fall through to the configured literal.
-        let resolved_focused_color: String = match eff_cfg.border_color_focused_mode {
-            BorderColorMode::Fixed => eff_cfg.border_color_focused.clone(),
-            BorderColorMode::WindowsAccent => {
-                match crate::backend::accent::current_windows_accent_rgba() {
-                    Some([r, g, b, _a]) => format!("#{:02x}{:02x}{:02x}", r, g, b),
-                    None => eff_cfg.border_color_focused.clone(),
-                }
-            }
+        let focused = if Some(output_id) == self.monitors.focused_id() {
+            monitor.focus_window
+        } else {
+            None
         };
-
-        // Pre-compute target colors (as packed u32) for this pass.
-        let border_color_focused_u32 = parse_color_to_u32(&resolved_focused_color);
-        let border_color_normal_u32  = parse_color_to_u32(&eff_cfg.border_color);
-        let border_color_urgent_u32  = parse_color_to_u32(&eff_cfg.border_color_urgent);
-
         // niri-parity smart borders: when the active workspace has exactly
         // one column with exactly one tile, suppress the per-tile DWM border
         // colour (gives more usable space when there's nothing to delimit).
@@ -1306,10 +2916,6 @@ impl TilingEngine {
             false
         };
 
-        // Pre-compute target opacity values as u8 for comparison.
-        let opacity_full: u32 = 255;
-        let opacity_dim: u32 = (eff_cfg.dim_unfocused * 255.0).round().clamp(0.0, 255.0) as u32;
-
         // When `true`, the overview pass routes per-tile geometry to the
         // installed DWM-thumbnail sink instead of resizing live HWNDs.
         // This leaves the real windows alone (no SetWindowPos, no
@@ -1324,14 +2930,22 @@ impl TilingEngine {
         // With the batched positioning path the per-window failure tracking is
         // delegated to set_window_positions_batched's internal fallback; this vec
         // is kept for API compatibility with the auto-float block below.
-        let windows_to_auto_float: Vec<WindowId> = Vec::new();
+        let mut windows_to_auto_float: Vec<WindowId> = Vec::new();
         // Batch-positioning accumulator: collect (hwnd, inset_rect, flags, window_id) tuples
         // during the tile loop, then commit all positions in a single render frame via
         // BeginDeferWindowPos / DeferWindowPos / EndDeferWindowPos after the loop.
         // Each entry also carries the window_id so we can update applied_state afterwards.
-        let mut batch_positions: Vec<(isize, Rect, windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS, WindowId)> = Vec::new();
+        let mut batch_positions: Vec<(
+            isize,
+            Rect,
+            windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
+            WindowId,
+        )> = Vec::new();
 
         for (window_id, rect) in positions {
+            if self.native_move_resize_active(window_id) {
+                continue;
+            }
             // niri-parity thumbnail overview: route every tile's rect
             // to the sink and DON'T touch the source HWND.  The sink
             // composites scaled live previews via DwmRegisterThumbnail
@@ -1343,20 +2957,40 @@ impl TilingEngine {
                 }
                 continue;
             }
-            if self.fullscreen_windows.contains(&window_id) {
-                // Hide tiled windows when another window on this monitor is fullscreen.
-                let prior = self.applied_state.get(&window_id);
-                let was_visible = prior.map(|p| p.visible).unwrap_or(true);
-                if was_visible {
-                    let _ = backend.show_window(window_id.as_isize(), false);
-                    #[cfg(test)] { self.win32_call_count += 1; }
-                    self.applied_state.entry(window_id).or_insert_with(AppliedState::unset).visible = false;
-                }
-                continue;
-            }
             if self.floating_windows.contains(&window_id) {
                 continue;
             }
+            // Overview includes inactive workspaces: resolve each tile's styling
+            // from its owning workspace, not from the active workspace's config.
+            // Clone before updating applied_state so no config borrow spans writes.
+            let overview_cfg = if overview_active {
+                self.locate_window(window_id).map(|(output, ws_id, _)| {
+                    self.effective_config_for_workspace(output, ws_id).clone()
+                })
+            } else {
+                None
+            };
+            let eff_cfg = overview_cfg.as_ref().unwrap_or(&eff_cfg);
+
+            // Resolve the focused colour for this tile, including the live
+            // Windows accent (cached for 30 s) and its configured fallback.
+            let resolved_focused_color: String = match eff_cfg.border_color_focused_mode {
+                BorderColorMode::Fixed => eff_cfg.border_color_focused.clone(),
+                BorderColorMode::WindowsAccent => {
+                    match crate::backend::accent::current_windows_accent_rgba() {
+                        Some([r, g, b, _a]) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+                        None => eff_cfg.border_color_focused.clone(),
+                    }
+                }
+            };
+            let border_color_focused_u32 = parse_color_to_u32(&resolved_focused_color);
+            let border_color_normal_u32 = parse_color_to_u32(&eff_cfg.border_color);
+            let border_color_urgent_u32 = parse_color_to_u32(&eff_cfg.border_color_urgent);
+
+            let draw_mode = draw_modes
+                .get(&window_id)
+                .copied()
+                .unwrap_or(DrawMode::Inset);
 
             let is_focused = focused == Some(window_id);
             let should_be_visible = true;
@@ -1366,7 +3000,7 @@ impl TilingEngine {
             // 2. urgent windows get the urgent (red) colour regardless of focus.
             // 3. focused → focused colour; otherwise → normal colour.
             let is_urgent = self.urgent_windows.contains(&window_id);
-            let new_border_color = if smart_no_border {
+            let new_border_color = if smart_no_border || eff_cfg.effects.border.off {
                 SMART_BORDERS_SENTINEL
             } else if is_urgent {
                 border_color_urgent_u32
@@ -1375,16 +3009,29 @@ impl TilingEngine {
             } else {
                 border_color_normal_u32
             };
-            let new_opacity: u32 = if eff_cfg.dim_unfocused < 1.0 {
-                if is_focused { opacity_full } else { opacity_dim }
-            } else {
-                // dim_unfocused == 1.0 means "no dimming"; use sentinel so we
-                // never issue SetLayeredWindowAttributes unnecessarily.
-                0xFFFF_FFFF
-            };
+            // The alpha: the opacity of the window's rule times the dimming of an unfocused
+            // window.  Nothing asking for either keeps the sentinel, so that no
+            // SetLayeredWindowAttributes is issued unnecessarily.
+            let new_opacity: u32 = rules::wanted_alpha(
+                eff_cfg.dim_unfocused,
+                is_focused,
+                self.effective_rule_opacity(window_id),
+                self.applied_state
+                    .get(&window_id)
+                    .map_or(NO_ALPHA, |s| s.opacity),
+            );
 
-            // Focused windows get a wider border for visual emphasis.
-            let inset = if is_focused { border_w + eff_cfg.focus_ring_width } else { border_w };
+            // Every tile gets the same inset, focused or not.  A focus-
+            // dependent size means each focus change resizes two windows
+            // (terminals re-wrap their text, browsers re-layout) and lets a
+            // focus flap turn into an endless SetWindowPos storm.  Focus is
+            // shown with the DWM border colour instead of with geometry.
+            // A tile that is fullscreen or maximized to the edges has no border around it.
+            let inset = if draw_mode == DrawMode::Inset {
+                self.rule_border_inset(window_id, &eff_cfg)
+            } else {
+                0
+            };
             let inset_rect = Rect::new(
                 rect.loc.x + inset,
                 rect.loc.y + inset,
@@ -1392,12 +3039,33 @@ impl TilingEngine {
                 rect.size.h.saturating_sub(inset as u32 * 2),
             );
 
+            // The corner radius the config asks for, as the preference DWM understands (windows
+            // keep what they have when it asks for none, and on Windows 10 there is nothing to ask).
+            let new_corner: u32 = match self
+                .rule_corner_radius(window_id, output_id)
+                .or(eff_cfg.effects.corner_radius)
+            {
+                Some(n) if crate::backend::osversion::supports_rounded_corners() => {
+                    decor::dwm_corner_for(n).0 as u32
+                }
+                _ => CORNER_NOT_ASKED,
+            };
+
             // Check configure throttle intent — skip position if NotNeeded or Throttled.
-            let intent = tile_intents.get(&window_id).copied().unwrap_or(ConfigureIntent::ShouldSend);
-            let skip_pos = matches!(intent, ConfigureIntent::NotNeeded | ConfigureIntent::Throttled);
+            let intent = tile_intents
+                .get(&window_id)
+                .copied()
+                .unwrap_or(ConfigureIntent::ShouldSend);
+            let skip_pos = matches!(
+                intent,
+                ConfigureIntent::NotNeeded | ConfigureIntent::Throttled
+            );
 
             // ---- Applied-state cache lookup ----
-            let prior = self.applied_state.get(&window_id).cloned()
+            let prior = self
+                .applied_state
+                .get(&window_id)
+                .cloned()
                 .unwrap_or_else(AppliedState::unset);
 
             // Fast-path: everything is identical — no Win32 calls needed.
@@ -1409,9 +3077,24 @@ impl TilingEngine {
                 && prior.opacity == new_opacity
                 && prior.focused == is_focused
                 && prior.backdrop == new_backdrop
+                && prior.corner == new_corner
                 && pos_identical
             {
                 continue;
+            }
+
+            // 0. Corner preference (once per change of the request).
+            if prior.corner != new_corner {
+                if new_corner != CORNER_NOT_ASKED {
+                    self.apply_corner_for_window(window_id.as_isize(), new_corner as i32);
+                } else if prior.corner != CORNER_UNSET {
+                    // The request went away: give the window DWM's own choice back.
+                    self.apply_corner_for_window(window_id.as_isize(), 0);
+                }
+                self.applied_state
+                    .entry(window_id)
+                    .or_insert_with(AppliedState::unset)
+                    .corner = new_corner;
             }
 
             // ---- Selective Win32 calls ----
@@ -1419,8 +3102,14 @@ impl TilingEngine {
             // 1. Visibility
             if prior.visible != should_be_visible {
                 let _ = backend.show_window(window_id.as_isize(), should_be_visible);
-                #[cfg(test)] { self.win32_call_count += 1; }
-                self.applied_state.entry(window_id).or_insert_with(AppliedState::unset).visible = should_be_visible;
+                #[cfg(test)]
+                {
+                    self.win32_call_count += 1;
+                }
+                self.applied_state
+                    .entry(window_id)
+                    .or_insert_with(AppliedState::unset)
+                    .visible = should_be_visible;
             }
 
             // 2. Border color
@@ -1440,55 +3129,91 @@ impl TilingEngine {
                     };
                     self.set_dwm_border_color(window_id.as_isize(), color_str);
                 }
-                #[cfg(test)] { self.win32_call_count += 1; }
-                self.applied_state.entry(window_id).or_insert_with(AppliedState::unset).border_color = new_border_color;
+                #[cfg(test)]
+                {
+                    self.win32_call_count += 1;
+                }
+                self.applied_state
+                    .entry(window_id)
+                    .or_insert_with(AppliedState::unset)
+                    .border_color = new_border_color;
             }
 
             // 3. Opacity (only when dimming is active)
             if new_opacity != 0xFFFF_FFFF && prior.opacity != new_opacity {
                 let opacity_f32 = new_opacity as f32 / 255.0;
                 self.apply_window_opacity(window_id.as_isize(), opacity_f32);
-                #[cfg(test)] { self.win32_call_count += 1; }
-                self.applied_state.entry(window_id).or_insert_with(AppliedState::unset).opacity = new_opacity;
+                #[cfg(test)]
+                {
+                    self.win32_call_count += 1;
+                }
+                self.applied_state
+                    .entry(window_id)
+                    .or_insert_with(AppliedState::unset)
+                    .opacity = new_opacity;
             }
 
             // 4. Position (subject to ConfigureIntent throttle)
             if !skip_pos && prior.rect != inset_rect {
-                debug!("Positioning window {} at ({},{}) {}x{}", window_id, inset_rect.loc.x, inset_rect.loc.y, inset_rect.size.w, inset_rect.size.h);
+                debug!(
+                    "Positioning window {} at ({},{}) {}x{}",
+                    window_id,
+                    inset_rect.loc.x,
+                    inset_rect.loc.y,
+                    inset_rect.size.w,
+                    inset_rect.size.h
+                );
 
-                // Item 1: when animations are enabled and the window already has
-                // a known position (i.e. this is not a first-ever placement),
-                // record the (start, target) pair in `animating_rects` and skip
-                // the immediate SetWindowPos so `tick_animations` can drive it.
-                let animate_transition = self.animation.is_enabled()
-                    && prior.rect != Rect::new(0, 0, 0, 0);
-                if animate_transition && !self.animating_rects.contains_key(&window_id) {
-                    // Only insert if no animation is already in flight for this window.
-                    self.animating_rects.insert(
-                        window_id,
-                        (
-                            prior.rect,
+                if draw_mode == DrawMode::Exact {
+                    // The frame of a fullscreen window is gone: it is placed exactly, at once
+                    // (an animation frame would be placed with the invisible border of the old
+                    // frame added), and its z-order is left alone.
+                    let placed = backend
+                        .set_window_position_exact(
+                            window_id.as_isize(),
                             inset_rect,
-                            std::time::Instant::now(),
-                            std::time::Duration::from_millis(
-                                self.animation
-                                    .is_enabled()
-                                    .then(|| {
-                                        self.full_config
-                                            .as_ref()
-                                            .map(|c| c.animations.duration as u64)
-                                            .unwrap_or(200)
-                                    })
-                                    .unwrap_or(200),
-                            ),
-                        ),
-                    );
+                            windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                                | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                        )
+                        .is_ok();
+                    #[cfg(test)]
+                    {
+                        self.win32_call_count += 1;
+                    }
+                    self.animating_rects.remove(&window_id);
+                    if placed {
+                        self.applied_state
+                            .entry(window_id)
+                            .or_insert_with(AppliedState::unset)
+                            .rect = inset_rect;
+                    }
                     applied_windows.insert(window_id);
-                    // Update the target in applied_state so the cache considers it
-                    // "in progress" and doesn't re-trigger a new animation.
-                    self.applied_state.entry(window_id).or_insert_with(AppliedState::unset).rect = inset_rect;
-                    continue; // tick_animations will issue SetWindowPos
+                    self.applied_state
+                        .entry(window_id)
+                        .or_insert_with(AppliedState::unset)
+                        .focused = is_focused;
+                    continue;
                 }
+
+                // Scalar camera/workspace frames already supply their displayed geometry.
+                let scalar_frame = self
+                    .animation
+                    .get_value(&crate::layout::AnimationTarget::WorkspaceX(output_id))
+                    .is_some();
+                let opening = self.begin_window_open(window_id, inset_rect, output_id);
+                if !opening
+                    && prior.rect != Rect::new(0, 0, 0, 0)
+                    && !scalar_frame
+                    && self.queue_rect(window_id, prior.rect, inset_rect)
+                {
+                    applied_windows.insert(window_id);
+                    self.applied_state
+                        .entry(window_id)
+                        .or_insert_with(AppliedState::unset)
+                        .rect = inset_rect;
+                    continue;
+                }
+                self.animating_rects.remove(&window_id);
 
                 // Accumulate into the batch rather than calling SetWindowPos immediately.
                 // The batch is committed atomically after the tile loop via
@@ -1518,7 +3243,10 @@ impl TilingEngine {
             }
 
             // Update focus flag in cache.
-            self.applied_state.entry(window_id).or_insert_with(AppliedState::unset).focused = is_focused;
+            self.applied_state
+                .entry(window_id)
+                .or_insert_with(AppliedState::unset)
+                .focused = is_focused;
         }
 
         // Item 3: skip Win32 call entirely when nothing changed (all cache hits).
@@ -1528,22 +3256,47 @@ impl TilingEngine {
             // BeginDeferWindowPos / DeferWindowPos / EndDeferWindowPos ensures the
             // OS composites the new geometry for all tiles simultaneously, eliminating
             // the per-tile stutter visible on startup with 10+ windows.
-            let batch_slice: Vec<(isize, Rect, windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS)> =
-                batch_positions.iter().map(|(hwnd, rect, flags, _)| (*hwnd, *rect, *flags)).collect();
-            let _positioned = backend.set_window_positions_batched(&batch_slice);
-            #[cfg(test)] { self.win32_call_count += 1; }
+            let batch_slice: Vec<(
+                isize,
+                Rect,
+                windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
+            )> = batch_positions
+                .iter()
+                .map(|(hwnd, rect, flags, _)| (*hwnd, *rect, *flags))
+                .collect();
+            let positioned = backend.set_window_positions_batched_with_results(&batch_slice);
+            #[cfg(test)]
+            {
+                self.win32_call_count += 1;
+            }
 
             // Post-batch cache updates: mark applied_state.rect, clear failure counters,
             // and paint title strips. We do this for all attempted entries regardless of
             // individual DeferWindowPos success — the batch either commits atomically or
             // falls back to one-by-one inside set_window_positions_batched.
             for (hwnd, inset_rect, _, window_id) in &batch_positions {
-                self.applied_state.entry(*window_id).or_insert_with(AppliedState::unset).rect = *inset_rect;
+                if !positioned.contains(hwnd) {
+                    let failures = self.failed_position.entry(*window_id).or_insert(0);
+                    *failures = failures.saturating_add(1);
+                    if *failures >= MAX_POSITION_FAILURES {
+                        debug!(
+                            "Auto-floating {} after {} consecutive positioning failures",
+                            window_id, failures
+                        );
+                        windows_to_auto_float.push(*window_id);
+                    }
+                    continue;
+                }
+                self.applied_state
+                    .entry(*window_id)
+                    .or_insert_with(AppliedState::unset)
+                    .rect = *inset_rect;
                 // Clear any pending failure counter — the window is co-operating again.
                 self.failed_position.remove(window_id);
                 // Paint title strip in the DWM frame area when strip_frame is on.
                 let is_focused = focused == Some(*window_id);
-                let title = self.tiled_windows
+                let title = self
+                    .tiled_windows
                     .get(window_id)
                     .map(|info| info.title.clone())
                     .unwrap_or_default();
@@ -1592,7 +3345,19 @@ impl TilingEngine {
         // mid-iteration. The window stays in `tiled_windows` (so it's still
         // tracked) but is removed from the column layout and added to floating.
         for wid in windows_to_auto_float {
-            self.floating_windows.insert(wid);
+            // It floats where it is, on the workspace it was tiled on.
+            let workspace = self
+                .monitors
+                .get(&output_id)
+                .map_or(0, |m| m.active_workspace);
+            let rect = self
+                .applied_state
+                .get(&wid)
+                .map(|s| s.rect)
+                .filter(|r| r.size.w > 0 && r.size.h > 0)
+                .or_else(|| self.tiled_windows.get(&wid).map(|w| w.bounds))
+                .unwrap_or_else(|| Rect::new(0, 0, 800, 600));
+            self.register_float(wid, output_id, workspace, rect);
             self.window_sizing.insert(wid, SizingMode::Normal);
             // Drop the failure counter so toggle-floating back to tiled can try again.
             self.failed_position.remove(&wid);
@@ -1609,23 +3374,204 @@ impl TilingEngine {
             let _ = backend.show_window(sticky_wid.as_isize(), true);
         }
 
+        // Include cache-hit placements: an observed resize or DPI change can alter the
+        // region without changing the requested layout. No GDI work for unchanged masks.
+        for &window in position_map.keys() {
+            self.sync_native_clip(window);
+        }
+
+        // The overlay layer draws the focus ring, the border and the shadow around the tiles
+        // as they are now.
+        self.refresh_decorations(
+            output_id,
+            &position_map,
+            &draw_modes,
+            work_rect,
+            overview_active || self.transitions.workspace_active(output_id),
+        );
+
         // Bring the focused window to the foreground if it changed since last layout.
-        // Only the focused monitor's focus drives Win32 activation.
+        // Only the focused monitor's focus drives Win32 activation.  The attempt is
+        // made once per focus target (success or not): retrying a refused request on
+        // every layout pass is what used to flood the log and fight the foreground lock.
         if Some(output_id) == self.monitors.focused_id() {
-            let current_focus = self
-                .monitors
-                .get(&output_id)
-                .and_then(|m| m.focus_window);
-            if current_focus.is_some() && current_focus != self.last_activated {
-                if let Some(wid) = current_focus {
-                    if let Err(e) = backend.activate_window(wid.as_isize()) {
-                        debug!("activate_window({}) failed: {:?}", wid, e);
-                    } else {
-                        self.last_activated = Some(wid);
-                    }
+            let current_focus = self.monitors.get(&output_id).and_then(|m| m.focus_window);
+            if let Some(wid) = current_focus {
+                if Some(wid) != self.last_activated {
+                    self.activate_now(wid, backend);
                 }
             }
         }
+    }
+
+    /// Ask Windows to make `wid` the foreground window and remember that we did.
+    ///
+    /// Called for every user-driven focus change (hotkeys, IPC) and, once per
+    /// focus target, from the layout pass.  A refusal (foreground lock) is
+    /// logged once here and never retried until the focus target changes again.
+    fn activate_now(&mut self, wid: WindowId, backend: &BackendHandle) {
+        self.remember_action_focus(wid);
+        self.last_activated = Some(wid);
+        if let Err(e) = backend.activate_window(wid.as_isize()) {
+            tracing::warn!(
+                "Could not bring {} to the foreground: {} (not retrying until focus moves)",
+                wid,
+                e
+            );
+        }
+    }
+
+    /// Mirror the OS foreground window into the engine's focus state.
+    ///
+    /// Called when Windows reports that `window_id` became the foreground
+    /// window (the user clicked it, alt-tabbed to it, an app activated itself,
+    /// or wiri's own activation request took effect).  The window already *is*
+    /// the foreground window, so no activation of our own is issued - issuing
+    /// one made wiri and apps with several top-level windows hand the focus
+    /// back and forth forever.
+    ///
+    /// Returns `(column index, workspace id)` when the window is tiled, `None`
+    /// for windows wiri does not manage.
+    pub fn sync_os_foreground(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) -> Option<(usize, i32)> {
+        // A window that opened with `open-focused false` and was handed the focus by
+        // Windows gives it back, once, within a moment of opening.
+        if self.refuse_unwanted_focus(window_id, backend) {
+            return None;
+        }
+        let previous = self.os_foreground;
+        let result = self.follow_os_foreground(window_id, backend);
+        // Do not wait for the separate hook-registry clear event: IPC and rules
+        // must already see the foreground window as no longer asking for attention.
+        if self.is_urgent(window_id) {
+            self.set_window_urgent(window_id, false, backend);
+        }
+        // The rules that depend on the focus look at the two windows again.
+        self.rules_after_focus_change(previous, window_id, backend);
+        self.recent_foreground_changed(window_id, backend);
+        result
+    }
+
+    /// [`Self::sync_os_foreground`] without the window rules.
+    fn follow_os_foreground(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) -> Option<(usize, i32)> {
+        // Whatever the window is (tiled, floating, unmanaged), it is what the user is
+        // looking at now.
+        self.record_ipc_foreground(window_id);
+        if self.floating_windows.contains(&window_id) {
+            // niri's focus layers: a float the user selected is the floating layer.
+            self.focus_layer = Some(FocusLayer::Floating);
+            // The user is looking at a floating window: it goes to the top of the float stack.
+            // Not a float of an inactive workspace that wiri itself hid: Windows reports it as
+            // the foreground window when it picks a replacement for a window hidden a moment
+            // ago (a workspace switch hides two floats; the second becomes the foreground), and
+            // touching it would reorder the stack the user comes back to.
+            let on_inactive_workspace = self.float_homes.get(&window_id).map_or(false, |home| {
+                self.monitors
+                    .get(&home.output)
+                    .map_or(false, |m| m.active_workspace != home.workspace)
+            });
+            let hidden_by_wiri = !self
+                .applied_state
+                .get(&window_id)
+                .map_or(true, |s| s.visible);
+            if !(on_inactive_workspace || hidden_by_wiri) {
+                self.touch_float(window_id);
+                self.remember_action_focus(window_id);
+            }
+            return None;
+        }
+        let (output_id, workspace_id, column_idx) = self.locate_window(window_id)?;
+        // A tiled window that the OS reports as the foreground one is the tiling layer.
+        self.focus_layer = Some(FocusLayer::Tiling);
+
+        // A window on an inactive workspace that wiri itself hid is not the user asking
+        // to go there: Windows reports it as the foreground window when it picks a
+        // replacement for the window that was hidden a moment ago.  Following that report
+        // would switch straight back and undo the workspace switch that hid it.
+        let on_inactive_workspace = self
+            .monitors
+            .get(&output_id)
+            .map_or(false, |m| m.active_workspace != workspace_id);
+        let hidden_by_wiri = !self
+            .applied_state
+            .get(&window_id)
+            .map_or(true, |s| s.visible);
+        // A cloaked window is still in Alt+Tab and on the taskbar: once it has been hidden for
+        // a moment, a report that it is the foreground window is the user asking for it, and
+        // its workspace comes with it.  (A window hidden with SW_HIDE cannot be asked for.)
+        let just_hidden = self
+            .hidden_since
+            .get(&window_id)
+            .map_or(true, |t| t.elapsed() < Self::HIDE_GRACE);
+        let inactive_tab = self
+            .monitors
+            .get(&output_id)
+            .and_then(|m| m.workspaces.get(&workspace_id))
+            .and_then(|ws| ws.columns.get(column_idx))
+            .map_or(false, |col| {
+                matches!(
+                    col.display,
+                    crate::layout::workspace::ColumnDisplay::Tabbed { .. }
+                ) && col.active_window() != Some(window_id)
+            });
+        if inactive_tab && hidden_by_wiri && just_hidden {
+            return None;
+        }
+        if on_inactive_workspace && hidden_by_wiri {
+            debug!(
+                "foreground report for window {} of workspace {}: just hidden {}, method {:?}",
+                window_id.as_isize(),
+                workspace_id,
+                just_hidden,
+                self.hide_method
+            );
+        }
+        if on_inactive_workspace
+            && hidden_by_wiri
+            && (self.hide_method != crate::backend::cloak::HideMethod::Cloak || just_hidden)
+        {
+            return None;
+        }
+
+        self.remember_action_focus(window_id);
+
+        // The OS is the authority on who is activated: remember it so the
+        // layout pass does not try to "fix" the focus it just reported.
+        self.last_activated = Some(window_id);
+
+        let unchanged = self.monitors.focused_id() == Some(output_id)
+            && self.monitors.get(&output_id).map_or(false, |m| {
+                m.active_workspace == workspace_id
+                    && m.focus_window == Some(window_id)
+                    && m.focus_column == Some(column_idx)
+            });
+        if unchanged {
+            // The tile (already the engine focus) just came to the top, perhaps over a
+            // floating window: floats stay above the tiles.
+            self.raise_floats(output_id);
+            return Some((column_idx, workspace_id));
+        }
+
+        {
+            let monitor = self.monitors.get_mut(&output_id)?;
+            if monitor.active_workspace != workspace_id {
+                monitor.switch_workspace(workspace_id);
+            }
+            monitor.set_focus(window_id);
+        }
+        self.monitors.set_focused(output_id);
+        self.reveal_focused_column(output_id);
+        self.apply_layout_for_monitor(output_id, backend);
+        // The tile that just got the focus is on top now; floating windows stay above tiles.
+        self.raise_floats(output_id);
+        Some((column_idx, workspace_id))
     }
 
     /// Calculate window positions for a workspace.
@@ -1667,7 +3613,11 @@ impl TilingEngine {
         let work_h = work_rect.size.h as i32;
 
         // Main column: left half (or full width when there is only one column).
-        let main_w = if num_columns == 1 { work_w } else { (work_w - gap) / 2 };
+        let main_w = if num_columns == 1 {
+            work_w
+        } else {
+            (work_w - gap) / 2
+        };
         let stack_x = work_rect.loc.x + main_w + gap;
         let stack_w = (work_w - main_w - gap).max(0);
 
@@ -1815,39 +3765,57 @@ impl TilingEngine {
         section_height: i32,
         cfg: &LayoutConfig,
     ) -> Vec<(WindowId, Rect)> {
+        self.calculate_positions_at_zoom(
+            workspace,
+            work_rect,
+            section_y_offset,
+            section_height,
+            cfg,
+            self.effective_zoom(),
+        )
+    }
+
+    fn calculate_positions_at_zoom(
+        &self,
+        workspace: &crate::layout::workspace::Workspace,
+        work_rect: Rect,
+        section_y_offset: i32,
+        section_height: i32,
+        cfg: &LayoutConfig,
+        zoom: f64,
+    ) -> Vec<(WindowId, Rect)> {
         let mut positions = Vec::new();
         let column_gap = cfg.column_gap;
         let window_gap = cfg.window_gap;
         let num_columns = workspace.columns.len();
-        if num_columns == 0 { return positions; }
+        if num_columns == 0 {
+            return positions;
+        }
 
         // Item 4: use effective_zoom so auto_tile_zoom is consulted when no manual
         // overview is active.  Falls back to overview_zoom() when overview is on.
-        let zoom = self.effective_zoom();
 
-        let proportional_width = {
-            let total_gaps = column_gap * (num_columns as i32 - 1).max(0);
-            let available = work_rect.size.w as i32 - total_gaps;
-            (available / num_columns as i32).max(cfg.column_width as i32 / 2)
-        };
-
-        let col_widths: Vec<i32> = workspace.columns.iter().map(|col| {
-            match cfg.column_width_mode {
-                ColumnWidthMode::Proportional => proportional_width,
-                ColumnWidthMode::Fixed => {
-                    col.width.map(|w| w as i32).unwrap_or(cfg.column_width as i32)
-                }
-            }
-        }).collect();
+        let (explicit_widths, min_widths, max_widths) = Self::column_inputs(workspace);
+        let (col_widths, _) = Self::column_widths_with_limits(
+            &explicit_widths,
+            &min_widths,
+            &max_widths,
+            work_rect.size.w as i32,
+            column_gap,
+            cfg,
+        );
 
         let mut col_x: Vec<i32> = Vec::with_capacity(num_columns);
         let mut x = 0i32;
         for (i, w) in col_widths.iter().enumerate() {
             col_x.push(x);
-            if i < num_columns - 1 { x += w + column_gap; }
+            if i < num_columns - 1 {
+                x += w + column_gap;
+            }
         }
 
-        let total_content_width = col_x.last().copied().unwrap_or(0) + col_widths.last().copied().unwrap_or(0);
+        let total_content_width =
+            col_x.last().copied().unwrap_or(0) + col_widths.last().copied().unwrap_or(0);
 
         let center_offset = if zoom < 1.0 && total_content_width > 0 {
             let scaled_total = (total_content_width as f64 * zoom) as i32;
@@ -1875,20 +3843,22 @@ impl TilingEngine {
             let screen_x = work_rect.loc.x + scaled_x;
             let scaled_w = (cw as f64 * zoom) as u32;
 
-            if zoom >= 1.0 &&
-                (screen_x + (scaled_w as i32) < work_rect.loc.x
-                    || screen_x > work_rect.loc.x + work_rect.size.w as i32)
-            {
+            // Columns scrolled out of view are NOT skipped here.  A window that
+            // is left out of the layout keeps whatever position it last had -
+            // usually on top of the visible tiles.  `apply_layout_for_monitor`
+            // parks the fully-off-screen ones out of sight instead.
+
+            if column.tiles.is_empty() {
                 continue;
             }
-
-            if column.tiles.is_empty() { continue; }
 
             // In Tabbed mode only the active tile occupies the full column height.
             // In Stacked mode all tiles share the column height equally.
             let visible_indices = column.visible_tile_indices();
             let visible_count = visible_indices.len();
-            if visible_count == 0 { continue; }
+            if visible_count == 0 {
+                continue;
+            }
 
             // Effective per-section work height.  In normal mode this is
             // `work_rect.size.h`.  In overview it is the post-zoom section
@@ -1910,35 +3880,36 @@ impl TilingEngine {
             let available_height = (work_height - total_gap_height).max(0);
             // Per-tile heights honor `Tile.height_weight` so the keyboard
             // resize actions (`Action::GrowTileHeight` / `ShrinkTileHeight`)
-            // can re-bias a column's vertical distribution. When the column
-            // is `maximized`, weights are ignored and the tiles share the
-            // full work-area height equally (treating maximize as a reset).
-            let force_equal = column.maximized || visible_count == 1;
-            let weights: Vec<f32> = visible_indices
+            // can re-bias a column's vertical distribution; a tile whose window rule
+            // asks for a height of its own keeps it and the others share the rest
+            // (`default-window-height`), and `min-height` / `max-height` hold a tile.
+            // In overview the pixel sizes are zoomed like the column.
+            let height_scale = if zoom < 1.0 { zoom as f32 } else { 1.0 };
+            let scaled = |px: u32| -> i32 { ((px as f32) * height_scale).round() as i32 };
+            let specs: Vec<rules::HeightSpec> = visible_indices
                 .iter()
-                .map(|&i| {
-                    if force_equal {
-                        1.0
-                    } else {
-                        column.tiles.get(i).map(|t| t.height_weight.max(0.1)).unwrap_or(1.0)
-                    }
+                .map(|&i| match column.tiles.get(i) {
+                    Some(t) => rules::HeightSpec {
+                        fixed: t.preferred_height.map(&scaled).or_else(|| {
+                            t.height_proportion.map(|share| {
+                                proportion_px(available_height, scaled_gap, share).max(1)
+                            })
+                        }),
+                        weight: t.height_weight.max(0.1),
+                        min: scaled(t.min_height),
+                        max: scaled(t.max_height),
+                    },
+                    None => rules::HeightSpec {
+                        fixed: None,
+                        weight: 1.0,
+                        min: 0,
+                        max: 0,
+                    },
                 })
                 .collect();
-            let weight_sum: f32 = weights.iter().sum::<f32>().max(0.1);
-            // Pre-compute integer heights, last slot absorbs rounding remainder
-            // so the column always uses the full available height exactly.
-            let mut tile_heights: Vec<i32> = weights
-                .iter()
-                .map(|w| ((available_height as f32) * (w / weight_sum)).floor() as i32)
-                .collect();
-            let leading_sum: i32 = if tile_heights.len() > 1 {
-                tile_heights[..tile_heights.len() - 1].iter().sum()
-            } else {
-                0
-            };
-            if let Some(last) = tile_heights.last_mut() {
-                *last = (available_height - leading_sum).max(0);
-            }
+            // The rounding the shares leave goes to the last tile, so that the column uses
+            // the full available height exactly.
+            let tile_heights: Vec<i32> = rules::distribute_heights(available_height, &specs);
 
             let y_centre_offset = if zoom < 1.0 {
                 let total_used: i32 = tile_heights.iter().sum::<i32>()
@@ -1953,8 +3924,16 @@ impl TilingEngine {
             for (slot_idx, &tile_idx) in visible_indices.iter().enumerate() {
                 if let Some(tile) = column.tiles.get(tile_idx) {
                     let window_height = tile_heights.get(slot_idx).copied().unwrap_or(0).max(0);
-                    let base_y = work_rect.loc.y + section_y_offset + y_centre_offset + accumulated_y;
+                    let base_y =
+                        work_rect.loc.y + section_y_offset + y_centre_offset + accumulated_y;
                     let rect = Rect::new(screen_x, base_y, scaled_w, window_height as u32);
+                    let rect = tabs::reserve_indicator(
+                        rect,
+                        column,
+                        &cfg.effects.tab_indicator,
+                        zoom,
+                        self.column_sizing_mode(column),
+                    );
                     positions.push((tile.window_id, rect));
                     accumulated_y += window_height + effective_gap;
                 }
@@ -1969,6 +3948,7 @@ impl TilingEngine {
             None => return,
         };
 
+        let cfg = self.active_workspace_config(focused_output).clone();
         // Do scroll work, then apply layout
         {
             let monitor = match self.monitors.get_mut(&focused_output) {
@@ -1980,15 +3960,13 @@ impl TilingEngine {
                 None => return,
             };
 
-            let amount = self.config.scroll_step;
+            let amount = cfg.scroll_step;
             match direction {
                 ScrollDirection::Left => {
-                    workspace.scroll_offset.x =
-                        workspace.scroll_offset.x.saturating_sub(amount)
+                    workspace.scroll_offset.x = workspace.scroll_offset.x.saturating_sub(amount)
                 }
                 ScrollDirection::Right => {
-                    workspace.scroll_offset.x =
-                        workspace.scroll_offset.x.saturating_add(amount)
+                    workspace.scroll_offset.x = workspace.scroll_offset.x.saturating_add(amount)
                 }
             }
 
@@ -1999,15 +3977,13 @@ impl TilingEngine {
         // Clamp scroll after releasing mutable borrow
         {
             let monitor = self.monitors.get_mut(&focused_output).unwrap();
-            let view_width = Self::view_width_for_monitor(monitor, &self.config);
-            let num_cols = monitor.workspace().map(|w| w.columns.len()).unwrap_or(0);
-            let col_w = Self::effective_column_width(num_cols, view_width, &self.config);
+            let view_width = Self::view_width_for_monitor(monitor, &cfg);
+            let col_w = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, view_width, &cfg))
+                .unwrap_or_else(|| Self::effective_column_width(0, view_width, &cfg));
             if let Some(workspace) = monitor.workspace_mut() {
-                workspace.clamp_scroll(
-                    col_w,
-                    self.config.column_gap,
-                    view_width,
-                );
+                workspace.clamp_scroll(col_w, cfg.column_gap, view_width);
             }
         }
 
@@ -2016,106 +3992,59 @@ impl TilingEngine {
 
     /// Focus the window to the left. Returns the newly focused WindowId.
     pub fn focus_left(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.focus_left();
-            }
-        }
-        self.scroll_to_focused_column(focused_output, backend)
+        self.focus_step(focus_actions::FocusStep::Left, backend)
     }
 
     /// Focus the window to the right. Returns the newly focused WindowId.
     pub fn focus_right(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.focus_right();
-            }
-        }
-        self.scroll_to_focused_column(focused_output, backend)
+        self.focus_step(focus_actions::FocusStep::Right, backend)
     }
 
     /// Focus the window above. Returns the newly focused WindowId.
     pub fn focus_up(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        let focused_wid = {
-            let monitor = self.monitors.get_mut(&focused_output)?;
-            monitor.focus_up();
-            monitor.focus_window
-        };
-        if let Some(wid) = focused_wid {
-            if let Some(window) = self.tiled_windows.get(&wid) {
-                self.activate_window(window.hwnd);
-            }
-            self.apply_layout_for_monitor(focused_output, backend);
-        }
-        focused_wid
+        self.focus_step(focus_actions::FocusStep::Up, backend)
     }
 
     /// Focus the window below. Returns the newly focused WindowId.
     pub fn focus_down(&mut self, backend: &BackendHandle) -> Option<WindowId> {
-        let focused_output = self.monitors.focused_id()?;
-        let focused_wid = {
-            let monitor = self.monitors.get_mut(&focused_output)?;
-            monitor.focus_down();
-            monitor.focus_window
-        };
-        if let Some(wid) = focused_wid {
-            if let Some(window) = self.tiled_windows.get(&wid) {
-                self.activate_window(window.hwnd);
-            }
-            self.apply_layout_for_monitor(focused_output, backend);
-        }
-        focused_wid
+        self.focus_step(focus_actions::FocusStep::Down, backend)
     }
 
     /// Scroll workspace to make the focused column visible, then activate and re-apply layout
-    fn scroll_to_focused_column(&mut self, focused_output: OutputId, backend: &BackendHandle) -> Option<WindowId> {
-        // Step 1: Get focus column, work area, and column count
-        let focus_col = self.monitors.get(&focused_output).and_then(|m| m.focus_column);
-        let view_width = self.monitors.get(&focused_output)
-            .map(|m| Self::view_width_for_monitor(m, &self.config));
-        let num_cols = self.monitors.get(&focused_output)
-            .and_then(|m| m.workspace().map(|w| w.columns.len()));
+    fn scroll_to_focused_column(
+        &mut self,
+        focused_output: OutputId,
+        backend: &BackendHandle,
+    ) -> Option<WindowId> {
+        // Steps 1-2: scroll the workspace to show the focused column.
+        self.reveal_focused_column(focused_output);
 
-        // Step 2: Scroll workspace to show focused column
-        if let (Some(col_idx), Some(vw), Some(nc)) = (focus_col, view_width, num_cols) {
-            let col_w = Self::effective_column_width(nc, vw, &self.config);
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    workspace.scroll_to_column(
-                        col_idx,
-                        col_w,
-                        self.config.column_gap,
-                        vw,
-                    );
-                    // Clamp to valid scroll range
-                    workspace.clamp_scroll(
-                        col_w,
-                        self.config.column_gap,
-                        vw,
-                    );
-                }
-            }
-        }
+        // Show a newly selected tab before attempting native activation.
+        self.apply_layout_for_monitor(focused_output, backend);
 
         // Step 3: Activate the focused window
-        let hwnd_to_activate = self.monitors.get(&focused_output)
+        let window_to_activate = self
+            .monitors
+            .get(&focused_output)
             .and_then(|m| m.focus_window)
-            .and_then(|wid| self.tiled_windows.get(&wid).map(|w| w.hwnd));
+            .filter(|wid| self.tiled_windows.contains_key(wid));
 
-        if let Some(hwnd) = hwnd_to_activate {
-            self.activate_window(hwnd);
+        if let Some(wid) = window_to_activate {
+            self.activate_now(wid, backend);
         }
 
-        // Step 4: Apply layout
-        self.apply_layout_for_monitor(focused_output, backend);
-        self.monitors.get(&focused_output).and_then(|m| m.focus_window)
+        self.monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_window)
     }
 
     /// Switch to a specific workspace
     pub fn switch_workspace(&mut self, workspace_id: i32, backend: &BackendHandle) {
+        if self.switch_workspace_in_overview(workspace_id, backend)
+            || self.switch_workspace_composited(workspace_id, backend)
+        {
+            return;
+        }
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
@@ -2127,11 +4056,19 @@ impl TilingEngine {
         // end at 0); going to a lower-numbered workspace, it slides in from
         // ABOVE (start at -work_area_height).  When animations are disabled
         // or this is the same workspace we skip the call (no-op).
-        let (prev_ws_id, work_area_h) = self
+        let (prev_ws_id, work_area_h, moves_down) = self
             .monitors
             .get(&focused_output)
-            .map(|m| (m.active_workspace, m.work_area.size.h as i32))
-            .unwrap_or((workspace_id, 0));
+            .map(|m| {
+                let from = m.workspace_number_of(m.active_workspace);
+                let to = m.workspace_number_of(workspace_id);
+                (
+                    m.active_workspace,
+                    m.work_area.size.h as i32,
+                    to.unwrap_or(i32::MAX) > from.unwrap_or(0),
+                )
+            })
+            .unwrap_or((workspace_id, 0, false));
         let want_slide = self.animation.is_enabled()
             && self
                 .full_config
@@ -2142,18 +4079,27 @@ impl TilingEngine {
             && work_area_h > 0;
 
         // Get current workspace windows to hide
-        let current_windows: Vec<WindowId> = self.monitors.get(&focused_output)
-            .map(|m| m.workspace()
-                .map(|w| w.columns.iter()
-                    .flat_map(|c| c.tiles.iter().map(|t| t.window_id))
-                    .collect())
-                .unwrap_or_default())
+        let current_windows: Vec<WindowId> = self
+            .monitors
+            .get(&focused_output)
+            .map(|m| {
+                m.workspace()
+                    .map(|w| {
+                        w.columns
+                            .iter()
+                            .flat_map(|c| c.tiles.iter().map(|t| t.window_id))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
             .unwrap_or_default();
 
         // Switch workspace
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             monitor.switch_workspace(workspace_id);
         }
+        // An empty workspace in the middle disappears once the user has left it (niri).
+        self.maintain_empty_workspace(focused_output);
 
         // Hide old workspace windows, show new ones.
         // Item 3: skip sticky windows — they remain visible across workspace switches.
@@ -2162,16 +4108,42 @@ impl TilingEngine {
                 continue; // sticky windows stay visible at all times
             }
             let _ = backend.show_window(wid.as_isize(), false);
+            // Remember that wiri hid it, and when: see `sync_os_foreground`.
+            self.note_hidden(wid);
         }
 
+        let remembered_float = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.workspace())
+            .and_then(|ws| ws.active_float)
+            .filter(|window| {
+                self.float_location(*window) == Some((focused_output, workspace_id))
+                    && !self.minimized.contains_key(window)
+            });
+        if let Some(window) = remembered_float {
+            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+                monitor.focus_window = Some(window);
+                monitor.focus_column = None;
+            }
+        }
+
+        let mut shown: Vec<WindowId> = Vec::new();
         if let Some(monitor) = self.monitors.get(&focused_output) {
             if let Some(workspace) = monitor.workspace() {
                 for col in &workspace.columns {
                     for tile in &col.tiles {
                         let _ = backend.show_window(tile.window_id.as_isize(), true);
+                        shown.push(tile.window_id);
                     }
                 }
             }
+        }
+        for wid in shown {
+            self.applied_state
+                .entry(wid)
+                .or_insert_with(AppliedState::unset)
+                .visible = true;
         }
 
         // Kick off the workspace-slide animation now that the engine has
@@ -2179,7 +4151,7 @@ impl TilingEngine {
         // `workspace_slide_offset(oid)` and bias every tile's Y position by
         // the returned value, producing the slide in/out effect.
         if want_slide {
-            let from_offset = if workspace_id > prev_ws_id {
+            let from_offset = if moves_down {
                 work_area_h as f64
             } else {
                 -(work_area_h as f64)
@@ -2189,26 +4161,35 @@ impl TilingEngine {
                 .start_workspace_slide(focused_output, from_offset, 0.0, 0);
         }
 
+        self.reveal_focused_column(focused_output);
         self.apply_layout_for_monitor(focused_output, backend);
 
         // Activate the focused window on the new workspace
-        let hwnd_to_activate = self.monitors.get(&focused_output)
+        let window_to_activate = self
+            .monitors
+            .get(&focused_output)
             .and_then(|m| m.focus_window)
-            .and_then(|wid| self.tiled_windows.get(&wid).map(|w| w.hwnd));
+            .filter(|wid| self.tiled_windows.contains_key(wid));
 
-        if let Some(hwnd) = hwnd_to_activate {
-            self.activate_window(hwnd);
+        if let Some(wid) = window_to_activate {
+            self.activate_now(wid, backend);
         }
+        // Activating a tile brings it above the floating windows of the workspace.
+        self.raise_floats(focused_output);
     }
 
-    /// Move the focused window left/right
+    /// Move the focused column one place left or right (niri `move-column-left`
+    /// / `move-column-right`): it swaps places with its neighbour, taking all
+    /// its stacked tiles along.  Moving a window *into* the neighbouring column
+    /// is `consume-window-into-column`, a separate action.  At the edge of the
+    /// strip this does nothing.
     pub fn move_column(&mut self, direction: ScrollDirection, backend: &BackendHandle) {
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
         };
 
-        let (moved, window_id) = {
+        let new_col = {
             let monitor = match self.monitors.get_mut(&focused_output) {
                 Some(m) => m,
                 None => return,
@@ -2217,165 +4198,787 @@ impl TilingEngine {
                 Some(c) => c,
                 None => return,
             };
-            let window_id = match monitor.focus_window {
-                Some(id) => id,
-                None => return,
+            let delta = match direction {
+                ScrollDirection::Left => -1,
+                ScrollDirection::Right => 1,
             };
             let workspace = match monitor.workspace_mut() {
                 Some(w) => w,
                 None => return,
             };
-            let target_col = match direction {
-                ScrollDirection::Left => focus_col.saturating_sub(1),
-                ScrollDirection::Right => focus_col + 1,
-            };
-            (workspace.move_window(window_id, target_col, 0), window_id)
-        };
-
-        if moved {
-            // After move_window, the window is now at target_col.
-            // The source column may have been removed (if it became empty),
-            // so focus_column could be stale. Find the window's new position.
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                // Find where the moved window ended up
-                if let Some(workspace) = monitor.workspace() {
-                    let new_col = workspace.find_window_column(window_id);
-                    if let Some(col) = new_col {
-                        monitor.focus_column = Some(col);
-                    }
-                }
-            }
-            self.apply_layout_for_monitor(focused_output, backend);
-        }
-    }
-
-    /// Close the focused window
-    pub fn close_focused_window(&mut self, _backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        let hwnd = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
+            match workspace.move_column_by(focus_col, delta) {
+                Some(col) => col,
                 None => return,
-            };
-            match monitor.focus_window {
-                Some(wid) => self.tiled_windows.get(&wid).map(|w| w.hwnd),
-                None => None,
             }
         };
-        if let Some(hwnd) = hwnd {
-            self.close_window(hwnd);
-            // Note: the actual removal from layout happens when we receive
-            // the WindowDestroyed event from the WinEvent hook.
+
+        // The focused tile moved with its column; only its index changed.
+        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+            monitor.focus_column = Some(new_col);
         }
-    }
-
-    /// Toggle fullscreen for the focused window
-    pub fn toggle_fullscreen(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // Get window info before mutating
-        let (window_id, hwnd, is_fullscreen, monitor_bounds) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            let wid = match monitor.focus_window {
-                Some(id) => id,
-                None => return,
-            };
-            let window = match self.tiled_windows.get(&wid) {
-                Some(w) => w,
-                None => return,
-            };
-            (
-                wid,
-                window.hwnd,
-                self.fullscreen_windows.contains(&wid),
-                monitor.bounds,
-            )
-        };
-
-        if is_fullscreen {
-            // Exit fullscreen
-            self.fullscreen_windows.remove(&window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
-            self.restore_window_style(hwnd);
-            info!("Exiting fullscreen for window {}", hwnd);
-        } else {
-            // Enter fullscreen
-            self.fullscreen_windows.insert(window_id);
-            self.window_sizing.insert(window_id, SizingMode::Fullscreen);
-            let fullscreen_rect = Rect::new(
-                monitor_bounds.loc.x,
-                monitor_bounds.loc.y,
-                monitor_bounds.size.w,
-                monitor_bounds.size.h,
-            );
-            self.make_fullscreen(hwnd, fullscreen_rect, backend);
-            info!("Entering fullscreen for window {}", hwnd);
-        }
-
+        self.reveal_focused_column(focused_output);
         self.apply_layout_for_monitor(focused_output, backend);
     }
 
-    /// Toggle floating for the focused window.
-    /// Floating windows are not managed by the tiling layout
-    /// and can be freely positioned.
-    pub fn toggle_floating(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
+    // =========================================================================
+    // Which window does an action act on?
+    //
+    // The window the user is looking at: the OS foreground window (or the
+    // application window that owns it), floating windows included.  The engine's
+    // own idea of the focus is only the fallback, for when the foreground is the
+    // desktop, the taskbar or wiri itself.
+    // =========================================================================
 
-        // Check if the currently focused window is floating, OR if no tiled
-        // window is focused but there's a recently floated window we can un-float.
-        let (window_id, is_floating) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            if let Some(wid) = monitor.focus_window {
-                (wid, self.floating_windows.contains(&wid))
+    /// The managed window that `foreground` (a window, or a dialog/popup it is
+    /// owned by) belongs to.
+    pub fn managed_window_for(&self, foreground: isize, root_owner: isize) -> Option<WindowId> {
+        [foreground, root_owner]
+            .into_iter()
+            .map(WindowId::new)
+            .find(|wid| self.tiled_windows.contains_key(wid))
+    }
+
+    /// Resolve a managed foreground window (including its owned dialogs), with
+    /// the usual engine-state fallback, without synchronizing or moving focus.
+    /// Urgency changes must not activate a window or alter remembered selection.
+    pub fn window_for_non_focusing_action(
+        &self,
+        foreground: Option<ForegroundWindow>,
+    ) -> Option<WindowId> {
+        foreground
+            .and_then(|fg| self.managed_window_for(fg.hwnd, fg.root_owner))
+            .or_else(|| self.state_target().map(|target| target.window))
+    }
+
+    /// The target the engine's own state points at: the floating window the OS last
+    /// reported as the foreground one, else the focused tile, else the topmost
+    /// floating window.  This is what an action acts on when it cannot ask the OS.
+    pub fn state_target(&self) -> Option<ActionTarget> {
+        if let Some(wid) = self
+            .os_foreground
+            .filter(|w| self.floating_windows.contains(w) && self.tiled_windows.contains_key(w))
+        {
+            return Some(ActionTarget::float(wid));
+        }
+        if let Some(wid) = self
+            .monitors
+            .focused()
+            .and_then(|m| m.focus_window)
+            .filter(|w| self.tiled_windows.contains_key(w))
+        {
+            return Some(if self.floating_windows.contains(&wid) {
+                ActionTarget::float(wid)
             } else {
-                // No focused tiled window — check if any floating window exists
-                // on this monitor that we can un-float
-                let float_on_monitor: Vec<WindowId> = self.floating_windows.iter()
-                    .filter(|wid| self.tiled_windows.contains_key(wid))
-                    .copied()
-                    .collect();
-                match float_on_monitor.first() {
-                    Some(wid) => (*wid, true),
-                    None => return,
+                ActionTarget::tile(wid)
+            });
+        }
+        self.floating_windows
+            .iter()
+            .filter(|w| self.tiled_windows.contains_key(*w) && !self.minimized.contains_key(*w))
+            .max_by_key(|w| self.float_homes.get(*w).map_or(0, |h| h.seq))
+            .map(|w| ActionTarget::float(*w))
+    }
+
+    /// Resolve the window an action acts on from the OS foreground window and, when
+    /// it is a tile, make it the engine's focus (the OS already has it activated, so
+    /// no activation request is sent).  `strict` refuses to guess when the
+    /// foreground is an ordinary window wiri does not manage (the Start menu, an
+    /// elevated program): closing a background tile then would be a surprise.
+    /// Otherwise, and when the foreground is the desktop, the taskbar or wiri
+    /// itself, the engine's own focus decides.
+    pub fn resolve_action_target_for(
+        &mut self,
+        foreground: Option<ForegroundWindow>,
+        strict: bool,
+        backend: &BackendHandle,
+    ) -> Option<ActionTarget> {
+        if let Some(fg) = foreground {
+            if let Some(wid) = self.managed_window_for(fg.hwnd, fg.root_owner) {
+                if self.floating_windows.contains(&wid) {
+                    self.record_ipc_foreground(wid);
+                    self.touch_float(wid);
+                    return Some(ActionTarget {
+                        window: wid,
+                        floating: true,
+                        focus_hwnd: fg.hwnd,
+                    });
+                }
+                self.sync_os_foreground(wid, backend);
+                if self.locate_window(wid).is_some() {
+                    return Some(ActionTarget {
+                        window: wid,
+                        floating: false,
+                        focus_hwnd: fg.hwnd,
+                    });
+                }
+                // Managed, but not in any strip right now (it is minimized): the
+                // engine's focus decides.
+            } else if strict && !fg.ignorable {
+                return None;
+            }
+        }
+        self.state_target()
+    }
+
+    /// [`Self::resolve_action_target_for`] for the real OS foreground window.
+    pub fn resolve_action_target(&mut self, backend: &BackendHandle) -> Option<ActionTarget> {
+        self.resolve_action_target_for(query_foreground(), false, backend)
+    }
+
+    /// Like [`Self::resolve_action_target`], but `None` when an unmanaged window has
+    /// the focus.  For actions that destroy something (`close-window`).
+    pub fn resolve_action_target_strict(
+        &mut self,
+        backend: &BackendHandle,
+    ) -> Option<ActionTarget> {
+        self.resolve_action_target_for(query_foreground(), true, backend)
+    }
+
+    // =========================================================================
+    // Floating windows: they belong to a workspace, stay above the tiles and
+    // remember where they were
+    // =========================================================================
+
+    /// The (monitor, workspace) a floating window lives on.  A float without
+    /// bookkeeping (it predates it, or a test filled the set directly) lives on the
+    /// focused monitor's active workspace.
+    fn float_location(&self, window_id: WindowId) -> Option<(OutputId, i32)> {
+        if !self.floating_windows.contains(&window_id) {
+            return None;
+        }
+        if let Some(home) = self.float_homes.get(&window_id) {
+            return Some((home.output, home.workspace));
+        }
+        let output = self.monitors.focused_id()?;
+        let workspace = self.monitors.get(&output)?.active_workspace;
+        Some((output, workspace))
+    }
+
+    fn next_float_seq(&mut self) -> u64 {
+        self.float_seq += 1;
+        self.float_seq
+    }
+
+    /// Put `window_id` on top of the float stack (the user just looked at it).
+    fn touch_float(&mut self, window_id: WindowId) {
+        let seq = self.next_float_seq();
+        if let Some(home) = self.float_homes.get_mut(&window_id) {
+            home.seq = seq;
+        }
+    }
+
+    /// Start tracking `window_id` as a floating window of `workspace` on `output`.
+    fn register_float(
+        &mut self,
+        window_id: WindowId,
+        output: OutputId,
+        workspace: i32,
+        rect: Rect,
+    ) {
+        let seq = self.next_float_seq();
+        self.floating_windows.insert(window_id);
+        self.float_homes.insert(
+            window_id,
+            FloatHome {
+                output,
+                workspace,
+                rect,
+                seq,
+                width_preset_idx: None,
+            },
+        );
+    }
+
+    /// Where a window floats the first time: its own size (at most 90 percent of
+    /// the work area), centred on the monitor.
+    fn initial_float_rect(&self, window_id: WindowId, output_id: OutputId) -> Rect {
+        let work = self
+            .monitors
+            .get(&output_id)
+            .map(|m| m.work_area)
+            .unwrap_or_else(|| Rect::new(0, 0, 1280, 720));
+        let own = self
+            .original_bounds
+            .get(&window_id)
+            .copied()
+            .or_else(|| self.tiled_windows.get(&window_id).map(|w| w.bounds))
+            .unwrap_or_else(|| Rect::new(0, 0, work.size.w * 6 / 10, work.size.h * 6 / 10));
+        let max_w = (work.size.w * 9 / 10).max(1);
+        let max_h = (work.size.h * 9 / 10).max(1);
+        let w = own.size.w.clamp(240u32.min(max_w), max_w);
+        let h = own.size.h.clamp(160u32.min(max_h), max_h);
+        Rect::new(
+            work.loc.x + (work.size.w as i32 - w as i32) / 2,
+            work.loc.y + (work.size.h as i32 - h as i32) / 2,
+            w,
+            h,
+        )
+    }
+
+    /// `rect` moved (and shrunk, when it is larger) so that it lies inside `work`.
+    fn fit_rect_into(rect: Rect, work: Rect) -> Rect {
+        let w = rect.size.w.min(work.size.w).max(1);
+        let h = rect.size.h.min(work.size.h).max(1);
+        let x = rect
+            .loc
+            .x
+            .clamp(work.loc.x, work.loc.x + work.size.w as i32 - w as i32);
+        let y = rect
+            .loc
+            .y
+            .clamp(work.loc.y, work.loc.y + work.size.h as i32 - h as i32);
+        Rect::new(x, y, w, h)
+    }
+
+    /// The rectangle a window occupies on screen right now (its visible frame),
+    /// when it can be read: not for a minimized or hidden window, nor for one that
+    /// is gone.
+    fn live_window_rect(window_id: WindowId) -> Option<Rect> {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow};
+        let hwnd = HWND(window_id.as_isize() as *mut std::ffi::c_void);
+        unsafe {
+            if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                return None;
+            }
+            let mut r = RECT::default();
+            let framed = DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut r as *mut _ as *mut _,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .is_ok();
+            if !framed && GetWindowRect(hwnd, &mut r).is_err() {
+                return None;
+            }
+            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            if w <= 0 || h <= 0 || r.left <= -30000 {
+                return None;
+            }
+            Some(Rect::new(r.left, r.top, w as u32, h as u32))
+        }
+    }
+
+    /// Where a floating window is now: on screen if that can be read, else where
+    /// wiri last put it.
+    fn float_rect_of(&self, window_id: WindowId) -> Option<Rect> {
+        Self::live_window_rect(window_id)
+            .or_else(|| self.float_homes.get(&window_id).map(|h| h.rect))
+    }
+
+    /// Show the floating windows of the active workspace of `output_id` and hide
+    /// the ones of its other workspaces.  Part of every layout pass, next to the
+    /// same job for tiles: a floating window is not left behind on screen when its
+    /// workspace is left.
+    fn reconcile_floats(&mut self, output_id: OutputId, backend: &BackendHandle) {
+        let Some(active) = self.monitors.get(&output_id).map(|m| m.active_workspace) else {
+            return;
+        };
+        let mut to_hide: Vec<WindowId> = Vec::new();
+        let mut to_show: Vec<WindowId> = Vec::new();
+        for (wid, home) in &self.float_homes {
+            if home.output != output_id
+                || self.sticky_windows.contains(wid)
+                || self.minimized.contains_key(wid)
+                || self.transitions.retained(*wid)
+            {
+                continue;
+            }
+            if home.workspace == active {
+                to_show.push(*wid);
+            } else {
+                to_hide.push(*wid);
+            }
+        }
+        for wid in to_hide {
+            // Authoritative, like for tiles: the shell may re-show a hidden window.
+            let _ = backend.show_window(wid.as_isize(), false);
+            self.note_hidden(wid);
+        }
+        let mut newly_shown = false;
+        for wid in to_show {
+            let visible = self.applied_state.get(&wid).map_or(false, |s| s.visible);
+            if !visible {
+                let _ = backend.show_window(wid.as_isize(), true);
+                self.applied_state
+                    .entry(wid)
+                    .or_insert_with(AppliedState::unset)
+                    .visible = true;
+                newly_shown = true;
+            }
+        }
+        if newly_shown {
+            self.raise_floats(output_id);
+        }
+    }
+
+    /// Take a tiled window out of its column and float it, where it floated last
+    /// time (or, the first time, at its own size in the middle of the work area).
+    fn float_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some((output, workspace, _)) = self.locate_window(window_id) else {
+            return;
+        };
+        // A fullscreen or maximized tile that floats is neither any more (niri: they cannot be
+        // floating), and its column gets its width back.
+        self.leave_sizing_states(window_id, false);
+        let work = self.monitors.get(&output).map(|m| m.work_area);
+        let rect = match (self.float_memory.get(&window_id).copied(), work) {
+            (Some(remembered), Some(work)) => Self::fit_rect_into(remembered, work),
+            (Some(remembered), None) => remembered,
+            _ => self.first_float_position(
+                window_id,
+                output,
+                self.initial_float_rect(window_id, output),
+            ),
+        };
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            monitor.remove_window(window_id);
+            // The tile memory must not keep pointing at a window that now floats:
+            // otherwise returning to this workspace falls back to the bounded MRU
+            // ring (and finally to the first tile) instead of the last tile.
+            let next_tile = monitor.focus_window;
+            if let Some(workspace) = monitor.workspaces.get_mut(&workspace) {
+                if workspace.active_window == Some(window_id) {
+                    let replacement = next_tile.or_else(|| {
+                        workspace.columns.iter().find_map(|column| {
+                            column
+                                .active_window
+                                .filter(|window| column.index_of(*window).is_some())
+                                .or_else(|| column.tiles.first().map(|tile| tile.window_id))
+                        })
+                    });
+                    workspace.active_window = replacement
+                        .filter(|window| workspace.find_window_column(*window).is_some());
                 }
             }
-        };
+        }
+        self.window_sizing.insert(window_id, SizingMode::Normal);
+        self.register_float(window_id, output, workspace, rect);
+        // The window just floated keeps the keyboard focus (as in niri).  The layout pass
+        // would hand the foreground to the next tile, which then also takes the next
+        // toggle-floating; pretend that tile is already activated.
+        if self.os_foreground == Some(window_id) {
+            // Conversion preserves native focus without another foreground event.
+            // Remember the new layer now, including for floating-only workspaces.
+            self.remember_action_focus(window_id);
+            self.last_activated = self.monitors.get(&output).and_then(|m| m.focus_window);
+        }
+        let on_active_workspace = self
+            .monitors
+            .get(&output)
+            .map_or(false, |m| m.active_workspace == workspace);
+        if on_active_workspace {
+            // No SWP_NOZORDER: it comes to the top, above the tiles.
+            let _ = backend.set_window_position(
+                window_id.as_isize(),
+                rect,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+            );
+        }
+        // The layout cache must forget the tile rectangle it holds: when the window is tiled
+        // again the layout pass would find that rectangle "already applied" and leave the window
+        // where it floats.
+        let was_visible = self
+            .applied_state
+            .get(&window_id)
+            .map_or(false, |s| s.visible);
+        let mut cached = AppliedState::unset();
+        cached.visible = on_active_workspace || was_visible;
+        self.applied_state.insert(window_id, cached);
+        info!("Floating window {:?} at {:?}", window_id, rect);
+        self.maintain_empty_workspace(output);
+        self.apply_layout_for_monitor(output, backend);
+        self.rules_after_float_change(window_id, backend);
+    }
 
-        if is_floating {
-            // Float -> Tiled: re-add to the workspace layout
-            self.floating_windows.remove(&window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
-            // Re-add the window to the active workspace
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.add_window(window_id);
+    /// Put a floating window back into the strip of the workspace it belongs to,
+    /// and remember where it floated.
+    fn unfloat_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some((output, workspace)) = self.float_location(window_id) else {
+            return;
+        };
+        if let Some(rect) = self.float_rect_of(window_id) {
+            self.float_memory.insert(window_id, rect);
+        }
+        self.float_homes.remove(&window_id);
+        self.floating_windows.remove(&window_id);
+        if let Some(ws) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspaces.get_mut(&workspace))
+        {
+            if ws.active_float == Some(window_id) {
+                ws.active_float = None;
             }
-            info!("Un-floating window {:?}", window_id);
-            self.apply_layout_for_monitor(focused_output, backend);
+        }
+        self.window_sizing.insert(window_id, SizingMode::Normal);
+        // Whatever the layout cache knows about the window is stale: it was moved around as a
+        // float.  The next layout pass places it from scratch.
+        self.applied_state.remove(&window_id);
+        let destination_workspace = self.monitors.get(&output).map(|monitor| {
+            if monitor.workspaces.contains_key(&workspace) {
+                workspace
+            } else {
+                monitor.active_workspace
+            }
+        });
+        let cfg = destination_workspace
+            .map(|id| self.effective_config_for_workspace(output, id))
+            .unwrap_or(&self.config);
+        let width_hint = if cfg.column_width_mode == ColumnWidthMode::Fixed {
+            Some(cfg.column_width)
         } else {
-            // Tiled -> Floating: remove from layout but keep visible
-            self.floating_windows.insert(window_id);
-            self.window_sizing.insert(window_id, SizingMode::Normal);
-            // Remove from workspace columns
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                monitor.remove_window(window_id);
+            None
+        };
+        let Some(monitor) = self.monitors.get_mut(&output) else {
+            return;
+        };
+        let workspace = if monitor.workspaces.contains_key(&workspace) {
+            workspace
+        } else {
+            monitor.active_workspace
+        };
+        let column = monitor
+            .workspaces
+            .entry(workspace)
+            .or_insert_with(crate::layout::Workspace::new)
+            .insert_window_after_active(window_id, width_hint);
+        if monitor.active_workspace == workspace {
+            monitor.focus_column = Some(column);
+            monitor.focus_window = Some(window_id);
+            monitor.focus_ring.push(window_id);
+        }
+        info!("Un-floating window {:?}", window_id);
+        self.rules_after_float_change(window_id, backend);
+        self.apply_new_column_policy(window_id);
+        self.sync_min_widths();
+        self.maintain_empty_workspace(output);
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// Float `window_id` if it is tiled, tile it if it floats.
+    pub fn toggle_floating_for(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        if !self.tiled_windows.contains_key(&window_id) {
+            return;
+        }
+        if self.floating_windows.contains(&window_id) {
+            self.unfloat_window(window_id, backend);
+        } else {
+            self.float_window(window_id, backend);
+        }
+    }
+
+    /// Toggle floating for the window the engine's own state points at (see
+    /// [`Self::state_target`]).  The hotkey path resolves the OS foreground window
+    /// first and calls [`Self::toggle_floating_for`].
+    pub fn toggle_floating(&mut self, backend: &BackendHandle) {
+        if let Some(target) = self.state_target() {
+            self.toggle_floating_for(target.window, backend);
+        }
+    }
+
+    /// Set the rectangle of a floating window (kept on its monitor's work area).
+    fn place_float(&mut self, window_id: WindowId, rect: Rect, backend: &BackendHandle) {
+        if self.native_move_resize_active(window_id) {
+            return;
+        }
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        // The size limits of the window's rules hold a float too (the window's size, with no
+        // border of wiri's around it).
+        let rect = match self.rule_limits.get(&window_id) {
+            Some(limits) => {
+                let (w, h) = limits.clamp(rect.size.w, rect.size.h);
+                Rect::new(rect.loc.x, rect.loc.y, w, h)
             }
-            info!("Floating window {:?}", window_id);
-            self.apply_layout_for_monitor(focused_output, backend);
+            None => rect,
+        };
+        let rect = match self.monitors.get(&output).map(|m| m.work_area) {
+            Some(work) => Self::fit_rect_into(rect, work),
+            None => rect,
+        };
+        let _ = backend.set_window_position(
+            window_id.as_isize(),
+            rect,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+        if let Some(home) = self.float_homes.get_mut(&window_id) {
+            if home.rect.size.w != rect.size.w {
+                home.width_preset_idx = None;
+            }
+            home.rect = rect;
+        }
+        self.float_memory.insert(window_id, rect);
+        self.sync_native_clip(window_id);
+    }
+
+    /// Absolute pointer-grab writeback; shares floating memory, rule limits and work-area
+    /// clamping with keyboard moves instead of rereading a potentially queued HWND move.
+    pub(crate) fn place_float_from_pointer(
+        &mut self,
+        window: WindowId,
+        rect: Rect,
+        backend: &BackendHandle,
+    ) {
+        self.place_float(window, rect, backend);
+    }
+
+    /// Move a floating window by `(dx, dy)` pixels (niri nudges by 50).
+    pub fn float_move_by(
+        &mut self,
+        window_id: WindowId,
+        dx: i32,
+        dy: i32,
+        backend: &BackendHandle,
+    ) {
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        self.place_float(
+            window_id,
+            Rect::new(rect.loc.x + dx, rect.loc.y + dy, rect.size.w, rect.size.h),
+            backend,
+        );
+    }
+
+    /// Resize a floating window by `(dw, dh)` pixels; the top-left corner stays.
+    pub fn float_resize_by(
+        &mut self,
+        window_id: WindowId,
+        dw: i32,
+        dh: i32,
+        backend: &BackendHandle,
+    ) {
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let w = (rect.size.w as i32 + dw).max(120) as u32;
+        let h = (rect.size.h as i32 + dh).max(80) as u32;
+        self.place_float(window_id, Rect::new(rect.loc.x, rect.loc.y, w, h), backend);
+    }
+
+    /// Resize a floating window by a percentage of its monitor's work area.
+    pub fn float_resize_percent(
+        &mut self,
+        window_id: WindowId,
+        width_percent: i32,
+        height_percent: i32,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        self.float_resize_by(
+            window_id,
+            work.size.w as i32 * width_percent / 100,
+            work.size.h as i32 * height_percent / 100,
+            backend,
+        );
+    }
+
+    /// Give a floating window the width `fraction` of its monitor's work area.
+    pub fn float_set_width_fraction(
+        &mut self,
+        window_id: WindowId,
+        fraction: f64,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let w = ((work.size.w as f64 * fraction).round() as u32).max(120);
+        self.place_float(
+            window_id,
+            Rect::new(rect.loc.x, rect.loc.y, w, rect.size.h),
+            backend,
+        );
+    }
+
+    /// Give a floating window the keyboard focus (switching to its workspace first
+    /// when that is not the active one) and bring it to the top of the float stack.
+    /// `false` when `window_id` is not a floating window.
+    pub fn focus_float(&mut self, window_id: WindowId, backend: &BackendHandle) -> bool {
+        if !self.floating_windows.contains(&window_id) {
+            return false;
+        }
+        if let Some((output, workspace)) = self.float_location(window_id) {
+            self.monitors.set_focused(output);
+            let needs_switch = self
+                .monitors
+                .get(&output)
+                .map_or(false, |m| m.active_workspace != workspace);
+            if needs_switch {
+                self.switch_workspace(workspace, backend);
+            }
+            self.touch_float(window_id);
+            self.record_ipc_foreground(window_id);
+            self.activate_now(window_id, backend);
+            // The tile that holds the engine focus is not the target of this activation: the
+            // layout pass must not hand the foreground to it now.
+            self.last_activated = self
+                .monitors
+                .get(&output)
+                .and_then(|m| m.focus_window)
+                .or(Some(window_id));
+            self.raise_floats(output);
+        }
+        true
+    }
+
+    /// Switch a floating window between niri's width presets: a third, a half and
+    /// two thirds of its monitor's work area (`forwards`: the next wider one, else the
+    /// next narrower one).
+    pub fn float_cycle_width(
+        &mut self,
+        window_id: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, workspace)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
+        let widths: Vec<i32> = self
+            .column_presets_for_workspace(output, workspace)
+            .iter()
+            .map(|spec| match spec {
+                crate::config::types::SizeSpec::Proportion(p) => {
+                    (work.size.w as f64 * p).round() as i32
+                }
+                crate::config::types::SizeSpec::Fixed(px) => (*px as f64 * scale).round() as i32,
+            })
+            .collect();
+        let remembered = self
+            .float_homes
+            .get(&window_id)
+            .and_then(|home| home.width_preset_idx);
+        let next = Self::next_preset_index(remembered, rect.size.w as i32, &widths, forwards);
+        self.place_float(
+            window_id,
+            Rect::new(
+                rect.loc.x,
+                rect.loc.y,
+                widths[next].max(50) as u32,
+                rect.size.h,
+            ),
+            backend,
+        );
+        if let Some(home) = self.float_homes.get_mut(&window_id) {
+            home.width_preset_idx = Some(next);
+        }
+    }
+
+    /// Centre a floating window on its monitor's work area, keeping its size.
+    pub fn float_center(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        self.place_float(
+            window_id,
+            Rect::new(
+                work.loc.x + (work.size.w as i32 - rect.size.w as i32) / 2,
+                work.loc.y + (work.size.h as i32 - rect.size.h as i32) / 2,
+                rect.size.w,
+                rect.size.h,
+            ),
+            backend,
+        );
+    }
+
+    /// Move a floating window to workspace id `workspace_id` of its monitor.  The
+    /// window disappears with its old workspace and shows up with the new one.
+    pub fn float_move_to_workspace(
+        &mut self,
+        window_id: WindowId,
+        workspace_id: i32,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let rect = self.float_rect_of(window_id);
+        let seq = self.next_float_seq();
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            monitor
+                .workspaces
+                .entry(workspace_id)
+                .or_insert_with(crate::layout::Workspace::new);
+        }
+        match self.float_homes.get_mut(&window_id) {
+            Some(home) => {
+                home.workspace = workspace_id;
+                home.seq = seq;
+            }
+            None => {
+                let rect = rect.unwrap_or_else(|| self.initial_float_rect(window_id, output));
+                self.float_homes.insert(
+                    window_id,
+                    FloatHome {
+                        output,
+                        workspace: workspace_id,
+                        rect,
+                        seq,
+                        width_preset_idx: None,
+                    },
+                );
+            }
+        }
+        self.maintain_empty_workspace(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// Ask a window to close.  For a dialog or popup that has the focus the dialog is
+    /// closed, not the application window that owns it (like Alt+F4).
+    pub fn close_target(&mut self, target: ActionTarget) {
+        let hwnd = if target.focus_hwnd != 0 {
+            target.focus_hwnd
+        } else {
+            target.window.as_isize()
+        };
+        if hwnd == target.window.as_isize() {
+            self.prepare_close_transition(target.window);
+        }
+        self.close_window(hwnd);
+        // The window leaves the layout when its destroy event arrives.
+    }
+
+    /// Close the window the engine's own state points at.
+    pub fn close_focused_window(&mut self, _backend: &BackendHandle) {
+        if let Some(target) = self.state_target() {
+            self.close_target(target);
+        }
+    }
+
+    /// Toggle fullscreen for the window the engine's own state points at.
+    pub fn toggle_fullscreen(&mut self, backend: &BackendHandle) {
+        if let Some(target) = self.state_target() {
+            self.toggle_fullscreen_for(target.window, backend);
         }
     }
 
@@ -2406,7 +5009,15 @@ impl TilingEngine {
             return;
         }
 
-        let margins = if self.config.shadow_enable {
+        let config = self
+            .locate_window(window_id)
+            .map(|(output, _, _)| output)
+            .or_else(|| self.float_homes.get(&window_id).map(|home| home.output))
+            .or_else(|| self.minimized.get(&window_id).map(|window| window.output))
+            .map(|output| self.config_for_window(window_id, output))
+            .unwrap_or(&self.config)
+            .clone();
+        let margins = if config.shadow_enable {
             // 1 px top extension — the smallest value that re-enables DWM's
             // drop shadow without producing a visible gap inside the window.
             MARGINS {
@@ -2487,14 +5098,21 @@ impl TilingEngine {
     ///
     /// TODO(audit): app will overdraw; future fix is sibling overlay window per tile.
     fn paint_title_for_tile(&self, hwnd: isize, rect: Rect, title: &str, is_focused: bool) {
-        if !self.config.strip_frame {
+        let window_id = WindowId::new(hwnd);
+        let config = self
+            .locate_window(window_id)
+            .map(|(output, _, _)| output)
+            .or_else(|| self.float_homes.get(&window_id).map(|home| home.output))
+            .or_else(|| self.minimized.get(&window_id).map(|window| window.output))
+            .map(|output| self.config_for_window(window_id, output))
+            .unwrap_or(&self.config);
+        if !config.strip_frame {
             return;
         }
-        use windows::Win32::Foundation::{HWND, RECT, COLORREF};
+        use windows::Win32::Foundation::{COLORREF, HWND, RECT};
         use windows::Win32::Graphics::Gdi::{
-            GetDC, ReleaseDC, CreateSolidBrush, DeleteObject,
-            FillRect, SetBkMode, SetTextColor, DrawTextW,
-            TRANSPARENT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+            CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetDC, ReleaseDC, SetBkMode,
+            SetTextColor, DT_LEFT, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
         };
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
         unsafe {
@@ -2528,7 +5146,12 @@ impl TilingEngine {
                 bottom: 28,
             };
             let mut wide: Vec<u16> = title.encode_utf16().collect();
-            let _ = DrawTextW(hdc, &mut wide, &mut text_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            let _ = DrawTextW(
+                hdc,
+                &mut wide,
+                &mut text_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
 
             let _ = ReleaseDC(hwnd_win, hdc);
         }
@@ -2542,18 +5165,25 @@ impl TilingEngine {
         // Frame stripping is opt-in via config — many apps (Windows Terminal,
         // Edge, some Electron) render their content area black after style
         // changes until they receive a fresh paint. Default off for compatibility.
-        if !self.config.strip_frame {
+        let window_id = WindowId::new(hwnd);
+        let config = self
+            .locate_window(window_id)
+            .map(|(output, _, _)| output)
+            .or_else(|| self.float_homes.get(&window_id).map(|home| home.output))
+            .or_else(|| self.minimized.get(&window_id).map(|window| window.output))
+            .map(|output| self.config_for_window(window_id, output))
+            .unwrap_or(&self.config)
+            .clone();
+        if !config.strip_frame {
             return;
         }
 
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongW, SetWindowLongW, GWL_STYLE, GWL_EXSTYLE,
-            WS_CAPTION, WS_THICKFRAME, WS_MAXIMIZEBOX, WS_SYSMENU,
-            WS_MINIMIZEBOX,
-        };
         use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, GWL_STYLE, WS_CAPTION, WS_MAXIMIZEBOX,
+            WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+        };
 
-        let window_id = WindowId::new(hwnd);
         // Only strip if we haven't already saved styles for this window
         if self.saved_styles.contains_key(&window_id) {
             return;
@@ -2571,10 +5201,12 @@ impl TilingEngine {
             // Remove ALL frame decorations: caption, thick frame, sysmenu, min/max
             // WS_THICKFRAME is the key one — it adds invisible 7px resize borders
             // that cause overlap even after SetWindowPos positions the window exactly.
-            let new_style = style & !(
-                WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 |
-                WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0
-            );
+            let new_style = style
+                & !(WS_CAPTION.0
+                    | WS_THICKFRAME.0
+                    | WS_SYSMENU.0
+                    | WS_MINIMIZEBOX.0
+                    | WS_MAXIMIZEBOX.0);
             SetWindowLongW(hwnd_win, GWL_STYLE, new_style as i32);
 
             // Remove WS_EX_WINDOWEDGE and WS_EX_CLIENTEDGE — these also add borders
@@ -2586,7 +5218,7 @@ impl TilingEngine {
             // so DWM keeps painting the drop-shadow.  With -1 margins the DWM
             // shadow is stripped along with the invisible 7-px border.
             // When shadow_enable is false, use -1 to remove the invisible border.
-            let margins = if self.config.shadow_enable {
+            let margins = if config.shadow_enable {
                 windows::Win32::UI::Controls::MARGINS {
                     cxLeftWidth: 0,
                     cxRightWidth: 0,
@@ -2601,20 +5233,21 @@ impl TilingEngine {
                     cyBottomHeight: -1,
                 }
             };
-            let _ = windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea(
-                hwnd_win, &margins,
-            );
+            let _ = windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea(hwnd_win, &margins);
 
             // Force frame recalculation
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                 hwnd_win,
                 windows::Win32::UI::WindowsAndMessaging::HWND_NOTOPMOST,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE
-                | windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED,
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED,
             );
         }
         info!("Stripped frame for tiled window {}", hwnd);
@@ -2622,12 +5255,11 @@ impl TilingEngine {
 
     /// Make a window fullscreen by removing its frame and covering the monitor
     fn make_fullscreen(&mut self, hwnd: isize, rect: Rect, backend: &BackendHandle) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongW, SetWindowLongW, GWL_STYLE, GWL_EXSTYLE,
-            WS_CAPTION, WS_THICKFRAME, WS_SYSMENU, WS_MINIMIZEBOX, WS_MAXIMIZEBOX,
-            WS_EX_APPWINDOW,
-        };
         use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, GWL_STYLE, WS_CAPTION, WS_EX_APPWINDOW,
+            WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+        };
 
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
 
@@ -2642,7 +5274,9 @@ impl TilingEngine {
 
             // Remove caption, thick frame, sysmenu, min/max boxes
             let new_style = style
-                & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0
+                & !(WS_CAPTION.0
+                    | WS_THICKFRAME.0
+                    | WS_SYSMENU.0
                     | WS_MINIMIZEBOX.0
                     | WS_MAXIMIZEBOX.0);
             SetWindowLongW(hwnd_win, GWL_STYLE, new_style as i32);
@@ -2652,8 +5286,12 @@ impl TilingEngine {
             SetWindowLongW(hwnd_win, GWL_EXSTYLE, new_ex_style as i32);
         }
 
-        // Position window to cover entire monitor
-        let _ = backend.set_window_position(
+        // Position window to cover entire monitor.  The frame is gone, so the frame IS
+        // the visible window: place it exactly (the invisible border measured while it
+        // still had a frame made it 7 px larger than the monitor), and measure it afresh
+        // the next time it is placed with one.
+        crate::backend::forget_shadow_margins(hwnd);
+        let _ = backend.set_window_position_exact(
             hwnd,
             rect,
             windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
@@ -2664,11 +5302,11 @@ impl TilingEngine {
 
     /// Restore a window's original style after exiting fullscreen
     fn restore_window_style(&self, hwnd: isize) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowLongW, SetWindowPos, GWL_STYLE, GWL_EXSTYLE,
-            HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        };
         use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        };
 
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
         let window_id = WindowId::new(hwnd);
@@ -2689,11 +5327,19 @@ impl TilingEngine {
             let _ = SetWindowPos(
                 hwnd_win,
                 HWND_TOP,
-                0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
                     | windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED,
             );
         }
+        // The frame is back: its invisible border has to be measured again.
+        crate::backend::forget_shadow_margins(hwnd);
     }
 
     /// Get all monitors (mutable)
@@ -2712,9 +5358,9 @@ impl TilingEngine {
         self.monitors.focused_id()
     }
 
-    /// Check if a window is fullscreen
+    /// Fullscreen is column-wide while the window belongs to a tabbed column.
     pub fn is_fullscreen(&self, window_id: WindowId) -> bool {
-        self.fullscreen_windows.contains(&window_id)
+        self.effective_fullscreen(window_id)
     }
 
     /// Check if a window is floating
@@ -2722,14 +5368,82 @@ impl TilingEngine {
         self.floating_windows.contains(&window_id)
     }
 
+    /// The user minimized this window; it is in no column until it is restored.
+    pub fn is_minimized(&self, window_id: WindowId) -> bool {
+        self.minimized.contains_key(&window_id)
+    }
+
+    /// The workspace id (not the user's number) a minimized window comes back to.
+    pub fn minimized_workspace(&self, window_id: WindowId) -> Option<i32> {
+        self.minimized.get(&window_id).map(|m| m.workspace)
+    }
+
+    /// The number (position from the top of its monitor) of the workspace a floating
+    /// window belongs to.
+    pub fn float_workspace_number(&self, window_id: WindowId) -> Option<i32> {
+        if !self.floating_windows.contains(&window_id) {
+            return None;
+        }
+        let (output, workspace) = self.float_location(window_id)?;
+        Some(self.workspace_number_on(output, workspace))
+    }
+
+    /// The number of the workspace a minimized window comes back to.
+    pub fn minimized_workspace_number(&self, window_id: WindowId) -> Option<i32> {
+        let minimized = self.minimized.get(&window_id)?;
+        Some(self.workspace_number_on(minimized.output, minimized.workspace))
+    }
+
+    /// The workspace id (not the user's number) a floating window belongs to.
+    pub fn float_workspace(&self, window_id: WindowId) -> Option<i32> {
+        if !self.floating_windows.contains(&window_id) {
+            return None;
+        }
+        self.float_location(window_id)
+            .map(|(_, workspace)| workspace)
+    }
+
     /// Get all tiled windows (for IPC queries)
     pub fn tiled_windows(&self) -> &HashMap<WindowId, WindowInfo> {
         &self.tiled_windows
     }
 
-    /// Get the sizing mode for a window
+    pub fn update_window_bounds(&mut self, window_id: WindowId, bounds: Rect) -> bool {
+        let mut updated = false;
+        if let Some(info) = self.tiled_windows.get_mut(&window_id) {
+            info.bounds = bounds;
+            updated = true;
+        }
+
+        for monitor in self.monitors.values_mut() {
+            for workspace in monitor.workspaces.values_mut() {
+                for column in &mut workspace.columns {
+                    for tile in &mut column.tiles {
+                        if tile.window_id == window_id {
+                            tile.cached_bounds = bounds;
+                            updated = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.sync_native_clip(window_id);
+        updated
+    }
+
+    /// Effective sizing follows the selected tab without changing the column's state.
     pub fn window_sizing_mode(&self, window_id: WindowId) -> SizingMode {
-        self.window_sizing.get(&window_id).copied().unwrap_or(SizingMode::Normal)
+        if self.effective_fullscreen(window_id) {
+            SizingMode::Fullscreen
+        } else if self.is_maximized_to_edges(window_id) {
+            SizingMode::Maximized
+        } else {
+            self.window_sizing
+                .get(&window_id)
+                .copied()
+                .unwrap_or(SizingMode::Normal)
+        }
     }
 
     /// Set the focused output (e.g., when clicking on a monitor).
@@ -2742,19 +5456,36 @@ impl TilingEngine {
     /// Update the layout configuration (e.g., on config reload)
     pub fn update_config(&mut self, config: LayoutConfig) {
         self.config = config;
+        // Runtime ReserveArea changes reach cached output/workspace views too.
+        self.refresh_layout_views();
     }
 
     /// Update animation settings from config
-    pub fn update_animation_settings(&mut self, enabled: bool, duration_ms: u32, easing: crate::layout::Easing) {
+    pub fn update_animation_settings(
+        &mut self,
+        enabled: bool,
+        duration_ms: u32,
+        easing: crate::layout::Easing,
+    ) {
         self.animation.set_enabled(enabled);
         self.animation.set_duration(duration_ms);
         self.animation.set_easing(easing);
+        self.motion.enabled = enabled;
+        self.motion.legacy_easing = true;
+        self.motion.duration = duration_ms;
+        self.motion.default_kind = Some(crate::layout::animation::AnimationKind::Easing {
+            duration_ms,
+            curve: easing,
+        });
     }
 
     /// Check if animations are enabled and any are currently active (AnimationManager or
     /// per-window rect animations from `animating_rects`).
     pub fn has_active_animations(&self) -> bool {
-        self.animation.has_active() || !self.animating_rects.is_empty()
+        self.animation.has_active()
+            || !self.animating_rects.is_empty()
+            || self.transitions.active()
+            || self.overview_camera.animating()
     }
 
     /// Convenience alias for `has_active_animations` — exposes whether any rect
@@ -2830,137 +5561,6 @@ impl TilingEngine {
         self.animation.has_active() || !self.animating_rects.is_empty()
     }
 
-    /// Full-power variant of `tick_animations` that issues `SetWindowPos` via
-    /// `backend` for every in-flight rect animation.  This is the method the
-    /// main event loop should prefer once it has a `BackendHandle` available.
-    pub fn tick_animations_with_backend(&mut self, delta_ms: u32, backend: &BackendHandle) -> bool {
-        // ---- Item 1: drive per-window rect animations ----
-        let now = std::time::Instant::now();
-        let easing = self.animation.is_enabled().then_some(()).map(|_| {
-            // Read easing from full_config when available, fall back to CubicOut.
-            self.full_config
-                .as_ref()
-                .map(|_| crate::layout::Easing::CubicOut)
-                .unwrap_or(crate::layout::Easing::CubicOut)
-        }).unwrap_or(crate::layout::Easing::CubicOut);
-
-        let mut finished_ids: Vec<WindowId> = Vec::new();
-        for (&wid, &(start_rect, target_rect, start_time, duration)) in &self.animating_rects {
-            let elapsed = now.duration_since(start_time);
-            let t_raw = if duration.is_zero() {
-                1.0f64
-            } else {
-                (elapsed.as_secs_f64() / duration.as_secs_f64()).min(1.0)
-            };
-            // Apply easing
-            let t = {
-                let tc = t_raw.clamp(0.0, 1.0);
-                match easing {
-                    crate::layout::Easing::Linear => tc,
-                    crate::layout::Easing::EaseIn => tc * tc * tc,
-                    crate::layout::Easing::EaseOut | crate::layout::Easing::CubicOut =>
-                        1.0 - (1.0 - tc).powi(3),
-                    crate::layout::Easing::EaseInOut => {
-                        if tc < 0.5 { 4.0 * tc * tc * tc }
-                        else { 1.0 - (-2.0 * tc + 2.0_f64).powi(3) / 2.0 }
-                    }
-                    crate::layout::Easing::None => 1.0,
-                }
-            };
-
-            let lerp = |a: i32, b: i32| -> i32 { a + ((b - a) as f64 * t).round() as i32 };
-            let lerp_u = |a: u32, b: u32| -> u32 {
-                let diff = b as f64 - a as f64;
-                (a as f64 + diff * t).round().max(0.0) as u32
-            };
-
-            let interp_rect = Rect::new(
-                lerp(start_rect.loc.x, target_rect.loc.x),
-                lerp(start_rect.loc.y, target_rect.loc.y),
-                lerp_u(start_rect.size.w, target_rect.size.w),
-                lerp_u(start_rect.size.h, target_rect.size.h),
-            );
-
-            if t >= 1.0 {
-                // Animation complete — snap to target.
-                let _ = backend.set_window_position(
-                    wid.as_isize(),
-                    target_rect,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
-                finished_ids.push(wid);
-            } else {
-                let _ = backend.set_window_position(
-                    wid.as_isize(),
-                    interp_rect,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
-            }
-        }
-        for wid in finished_ids {
-            self.animating_rects.remove(&wid);
-        }
-
-        // ---- Legacy AnimationManager tick ----
-        if !self.animation.is_enabled() {
-            return !self.animating_rects.is_empty();
-        }
-        let results = self.animation.tick(delta_ms);
-        // Apply animated values to state
-        for (target, value) in results {
-            match target {
-                crate::layout::AnimationTarget::ScrollX(output_id) => {
-                    if let Some(monitor) = self.monitors.get_mut(&output_id) {
-                        if let Some(workspace) = monitor.workspace_mut() {
-                            workspace.scroll_offset.x = value as i32;
-                        }
-                    }
-                }
-                crate::layout::AnimationTarget::WindowX(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.loc.x = value as i32;
-                    }
-                }
-                crate::layout::AnimationTarget::WindowY(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.loc.y = value as i32;
-                    }
-                }
-                crate::layout::AnimationTarget::WindowW(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.size.w = value as u32;
-                    }
-                }
-                crate::layout::AnimationTarget::WindowH(window_id) => {
-                    if let Some(info) = self.tiled_windows.get_mut(&window_id) {
-                        info.bounds.size.h = value as u32;
-                    }
-                }
-                crate::layout::AnimationTarget::Opacity(window_id) => {
-                    // Opacity animations are applied directly to the window via
-                    // SetLayeredWindowAttributes — there is no cached opacity field on
-                    // WindowInfo (it would be redundant with `applied_state.opacity`).
-                    // The `value` parameter here is in 0..=255, so feed it straight in.
-                    if let Some(info) = self.tiled_windows.get(&window_id) {
-                        let alpha = (value as f32 / 255.0).clamp(0.0, 1.0);
-                        self.apply_window_opacity(info.hwnd, alpha);
-                    }
-                }
-                crate::layout::AnimationTarget::WorkspaceX(output_id) => {
-                    // Workspace-transition slide: tracked by Agent F's animation
-                    // module. The current per-monitor offset is consulted at
-                    // layout time via `AnimationManager::get_value(...)` to bias
-                    // column positions; here we just trigger a re-layout so the
-                    // active monitor reflects the new offset.
-                    let _ = output_id; // consumed by the next apply_layout call
-                }
-            }
-        }
-        self.animation.has_active() || !self.animating_rects.is_empty()
-    }
-
     /// Record that a window should animate from its current rect to `target_rect`.
     /// Called externally before `apply_layout_for_monitor` to pre-seed the animation;
     /// also used internally by `apply_layout_for_monitor` when animations are enabled.
@@ -2968,42 +5568,34 @@ impl TilingEngine {
         if !self.animation.is_enabled() {
             return;
         }
-        let start_rect = self.applied_state
+        let start_rect = self
+            .applied_state
             .get(&wid)
             .map(|s| s.rect)
             .unwrap_or(Rect::new(0, 0, 0, 0));
         if start_rect == target_rect {
             return;
         }
-        let duration_ms = self.full_config
-            .as_ref()
-            .map(|c| c.animations.duration as u64)
-            .unwrap_or(200);
-        self.animating_rects.insert(
-            wid,
-            (
-                start_rect,
-                target_rect,
-                std::time::Instant::now(),
-                std::time::Duration::from_millis(duration_ms),
-            ),
-        );
+        self.queue_rect(wid, start_rect, target_rect);
     }
 
     /// Trigger scroll animation for a monitor's workspace.
     /// Call before changing scroll_offset directly.
     pub fn animate_scroll(&mut self, output_id: OutputId, target_offset: i32) {
-        let current_offset = self.monitors.get(&output_id)
+        let current_offset = self
+            .monitors
+            .get(&output_id)
             .and_then(|m| m.workspace())
             .map(|w| w.scroll_offset.x)
             .unwrap_or(0);
-        
+
         if current_offset == target_offset {
             return;
         }
-        
+
         let target = crate::layout::AnimationTarget::ScrollX(output_id);
-        self.animation.animate(target, current_offset as f64, target_offset as f64);
+        self.animation
+            .animate(target, current_offset as f64, target_offset as f64);
     }
 
     /// Trigger focus animation for a window.
@@ -3014,9 +5606,16 @@ impl TilingEngine {
         }
         // Read the current position from the workspace's calculated layout
         // (not the stale cached info.bounds which is only updated at registration time).
-        let default_w = self.config.column_width as i32;
-        let gap = self.config.column_gap;
-        let current_pos = self.monitors.focused_id()
+        let cfg = self
+            .monitors
+            .focused_id()
+            .map(|output| self.active_workspace_config(output))
+            .unwrap_or(&self.config);
+        let default_w = cfg.column_width as i32;
+        let gap = cfg.column_gap;
+        let current_pos = self
+            .monitors
+            .focused_id()
             .and_then(|oid| self.monitors.get(&oid))
             .and_then(|m| m.workspace())
             .and_then(|ws| ws.current_position_for(window_id, default_w, gap));
@@ -3054,7 +5653,9 @@ impl TilingEngine {
 
     /// Toggle overview mode — zooms out to show all columns in a grid
     pub fn toggle_overview(&mut self, backend: &BackendHandle) {
-        if self.overview.is_some() {
+        if self.overview_camera.closing && self.thumbnail_overview.is_some() {
+            self.enter_overview(backend);
+        } else if self.overview.is_some() {
             self.exit_overview(backend);
         } else {
             self.enter_overview(backend);
@@ -3071,6 +5672,13 @@ impl TilingEngine {
     /// resets `scroll_offset.x` on the active workspace so the view starts at
     /// column 0 when overview opens.
     pub fn enter_overview(&mut self, backend: &BackendHandle) {
+        if self.thumbnail_overview.is_some() {
+            self.enter_workspace_overview(backend);
+            return;
+        }
+        if self.is_overview() {
+            return;
+        }
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
@@ -3096,7 +5704,8 @@ impl TilingEngine {
                 })
                 .collect();
             entries.sort_by_key(|(id, _)| *id);
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
+            let vw =
+                Self::view_width_for_monitor(monitor, self.active_workspace_config(focused_output));
             let vh = monitor.work_area.size.h as i32;
             (entries, vw, vh)
         };
@@ -3109,10 +5718,15 @@ impl TilingEngine {
         // The widest workspace's stripe sets the horizontal content width.
         let widest_total: i32 = sorted_ws
             .iter()
-            .map(|(_id, n_cols)| {
-                let col_width = Self::effective_column_width(*n_cols, view_width, &self.config);
-                *n_cols as i32 * col_width
-                    + (*n_cols as i32 - 1).max(0) * self.config.column_gap
+            .map(|(id, n_cols)| {
+                let cfg = self.effective_config_for_workspace(focused_output, *id);
+                let workspace_view_width = self
+                    .monitors
+                    .get(&focused_output)
+                    .map(|monitor| Self::view_width_for_monitor(monitor, cfg))
+                    .unwrap_or(view_width);
+                let col_width = Self::effective_column_width(*n_cols, workspace_view_width, cfg);
+                *n_cols as i32 * col_width + (*n_cols as i32 - 1).max(0) * cfg.column_gap
             })
             .max()
             .unwrap_or(0);
@@ -3124,8 +5738,8 @@ impl TilingEngine {
         const INTER_WORKSPACE_GAP: i32 = 50;
         let n_ws = sorted_ws.len() as i32;
         let nominal_section_height = view_height;
-        let total_content_height: i32 = n_ws * nominal_section_height
-            + (n_ws - 1).max(0) * INTER_WORKSPACE_GAP;
+        let total_content_height: i32 =
+            n_ws * nominal_section_height + (n_ws - 1).max(0) * INTER_WORKSPACE_GAP;
 
         // Pick the smaller of the two scale factors so EVERYTHING fits.
         let zoom_w = if widest_total > view_width && widest_total > 0 {
@@ -3154,13 +5768,19 @@ impl TilingEngine {
 
         info!(
             "Entering overview: zoom={:.2} ({} workspaces, widest={}px, total_h={}px, view {}x{})",
-            zoom, sorted_ws.len(), widest_total, total_content_height, view_width, view_height
+            zoom,
+            sorted_ws.len(),
+            widest_total,
+            total_content_height,
+            view_width,
+            view_height
         );
 
         self.overview = Some(OverviewState {
             zoom,
             workspace_offsets,
         });
+        crate::a11y::announce_overview(true);
 
         // niri-parity DWM-thumbnail overview.  When a sink is installed,
         // open a session and register a thumbnail for every visible
@@ -3184,14 +5804,12 @@ impl TilingEngine {
         // Banner: show on the focused monitor.  No-op when the global
         // banner singleton hasn't been wired (unit tests, --headless paths).
         if let Some(m) = self.monitors.get(&focused_output) {
-            crate::overlay::overview_banner::global_show(Some(
-                crate::overlay::MonitorBounds {
-                    x: m.bounds.loc.x,
-                    y: m.bounds.loc.y,
-                    w: m.bounds.size.w as i32,
-                    h: m.bounds.size.h as i32,
-                },
-            ));
+            crate::overlay::overview_banner::global_show(Some(crate::overlay::MonitorBounds {
+                x: m.bounds.loc.x,
+                y: m.bounds.loc.y,
+                w: m.bounds.size.w as i32,
+                h: m.bounds.size.h as i32,
+            }));
         }
 
         // Reset scroll offset — in overview, we show everything from the start
@@ -3213,6 +5831,14 @@ impl TilingEngine {
     /// the next `apply_layout_for_monitor` pass re-issues `show_window(true)`
     /// when the user switches workspaces back.
     pub fn exit_overview(&mut self, backend: &BackendHandle) {
+        if self.begin_overview_close() {
+            return;
+        }
+        self.finish_overview_close(backend);
+    }
+
+    fn finish_overview_close(&mut self, backend: &BackendHandle) {
+        self.overview_camera = overview::OverviewCamera::default();
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
@@ -3220,12 +5846,17 @@ impl TilingEngine {
 
         info!("Exiting overview mode");
         self.overview = None;
+        crate::a11y::announce_overview(false);
         crate::overlay::overview_banner::global_hide();
         // niri-parity DWM-thumbnail overview: tear down the host window
         // and unregister every thumbnail.  No-op when no sink is wired.
         if let Some(sink) = self.thumbnail_overview.clone() {
             sink.exit();
         }
+        // Moving around the overview can leave an empty workspace behind in the middle of
+        // the stack (niri drops it once you have left it). Restore the one-trailing-empty
+        // invariant on the way out, before deciding which tiles to hide.
+        self.maintain_empty_workspace(focused_output);
 
         // Hide every tile that isn't on the active workspace of the focused
         // monitor.  Other monitors' active workspaces stay visible.
@@ -3248,11 +5879,11 @@ impl TilingEngine {
         };
         for wid in to_hide {
             let _ = backend.show_window(wid.as_isize(), false);
-            #[cfg(test)] { self.win32_call_count += 1; }
-            self.applied_state
-                .entry(wid)
-                .or_insert_with(AppliedState::unset)
-                .visible = false;
+            #[cfg(test)]
+            {
+                self.win32_call_count += 1;
+            }
+            self.note_hidden(wid);
         }
 
         // Re-scroll to the focused column
@@ -3299,9 +5930,14 @@ impl TilingEngine {
                 let num_cols = monitor.workspace().map(|w| w.columns.len()).unwrap_or(0);
                 if let Some(col) = monitor.focus_column {
                     // Wrap around
-                    monitor.focus_column = if col == 0 { Some(num_cols.saturating_sub(1)) } else { Some(col - 1) };
+                    monitor.focus_column = if col == 0 {
+                        Some(num_cols.saturating_sub(1))
+                    } else {
+                        Some(col - 1)
+                    };
                     if let Some(workspace) = monitor.workspace() {
-                        if let Some(new_col) = workspace.columns.get(monitor.focus_column.unwrap()) {
+                        if let Some(new_col) = workspace.columns.get(monitor.focus_column.unwrap())
+                        {
                             if let Some(tile) = new_col.tiles.first() {
                                 monitor.focus_window = Some(tile.window_id);
                             }
@@ -3311,7 +5947,9 @@ impl TilingEngine {
             }
         }
         self.apply_layout_for_monitor(focused_output, backend);
-        self.monitors.get(&focused_output).and_then(|m| m.focus_window)
+        self.monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_window)
     }
 
     /// In overview mode, focus navigation wraps around
@@ -3322,9 +5960,14 @@ impl TilingEngine {
                 let num_cols = monitor.workspace().map(|w| w.columns.len()).unwrap_or(0);
                 if let Some(col) = monitor.focus_column {
                     // Wrap around
-                    monitor.focus_column = if col >= num_cols.saturating_sub(1) { Some(0) } else { Some(col + 1) };
+                    monitor.focus_column = if col >= num_cols.saturating_sub(1) {
+                        Some(0)
+                    } else {
+                        Some(col + 1)
+                    };
                     if let Some(workspace) = monitor.workspace() {
-                        if let Some(new_col) = workspace.columns.get(monitor.focus_column.unwrap()) {
+                        if let Some(new_col) = workspace.columns.get(monitor.focus_column.unwrap())
+                        {
                             if let Some(tile) = new_col.tiles.first() {
                                 monitor.focus_window = Some(tile.window_id);
                             }
@@ -3334,13 +5977,18 @@ impl TilingEngine {
             }
         }
         self.apply_layout_for_monitor(focused_output, backend);
-        self.monitors.get(&focused_output).and_then(|m| m.focus_window)
+        self.monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_window)
     }
 
     /// Select the focused window in overview mode and exit overview
     pub fn overview_select(&mut self, backend: &BackendHandle) -> Option<WindowId> {
         let focused_output = self.monitors.focused_id()?;
-        let focused_wid = self.monitors.get(&focused_output).and_then(|m| m.focus_window);
+        let focused_wid = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_window);
         self.exit_overview(backend);
         focused_wid
     }
@@ -3367,7 +6015,8 @@ impl TilingEngine {
 
     /// Get the keybindings from configuration
     pub fn config_binds(&self) -> crate::config::BindsConfig {
-        self.full_config.as_ref()
+        self.full_config
+            .as_ref()
             .map(|c| c.binds.clone())
             .unwrap_or_default()
     }
@@ -3377,8 +6026,10 @@ impl TilingEngine {
         self.full_config.as_ref()
     }
 
-    /// Set the window rules from configuration
+    /// Set the window rules from configuration.  The windows that are managed keep what the
+    /// old rules decided until [`Self::reevaluate_all_window_rules`] looks at them again.
     pub fn set_window_rules(&mut self, rules: Vec<crate::config::WindowRule>) {
+        self.rule_flags = rules::RuleFlags::of(&rules);
         self.window_rules = rules;
     }
 
@@ -3390,28 +6041,14 @@ impl TilingEngine {
     /// `LayoutConfig::from_config`.  Subsequent layout passes consult
     /// `effective_config(oid)` to pick the right config per monitor.
     pub fn set_full_config(&mut self, config: crate::config::Config) {
-        self.window_rules = config.window_rules.clone();
-
-        // Rebuild per-monitor overrides from `config.output[*].layout_override`.
-        self.config_per_monitor.clear();
-        for out in &config.output {
-            let Some(partial) = out.layout_override.as_ref() else { continue };
-            if out.name.is_empty() {
-                continue;
-            }
-            // Fold the partial onto a clone of the global layout, then
-            // produce the engine's runtime `LayoutConfig` from the merged
-            // view so colour parsing / column-width-mode mapping match the
-            // default code path verbatim.
-            let merged_config_layout = partial.apply_to(&config.layout);
-            let mut shim = config.clone();
-            shim.layout = merged_config_layout;
-            let engine_cfg = LayoutConfig::from_config(&shim);
-            let oid = OutputId::from_name(&out.name);
-            self.config_per_monitor.insert(oid, engine_cfg);
-        }
+        self.recent_reset();
+        self.configure_motion(&config.animations);
+        self.set_window_rules(config.window_rules.clone());
 
         self.full_config = Some(config);
+        self.ensure_named_workspaces();
+        // A reload rebuilds the layout views; it never re-places a realized workspace.
+        self.refresh_layout_views();
     }
 
     /// Take a snapshot of the current monitor / workspace / column / tile
@@ -3429,11 +6066,8 @@ impl TilingEngine {
     /// After load, callers should run `apply_all(backend)` to repaint the
     /// restored layout.
     pub fn apply_snapshot(&mut self, snap: &crate::layout::snapshot::Snapshot) {
-        let surviving: std::collections::HashSet<isize> = self
-            .tiled_windows
-            .keys()
-            .map(|w| w.as_isize())
-            .collect();
+        let surviving: std::collections::HashSet<isize> =
+            self.tiled_windows.keys().map(|w| w.as_isize()).collect();
         for snap_mon in &snap.monitors {
             // Match by OutputId u64 — survives device-name → from_name re-hash.
             let mut found: Option<OutputId> = None;
@@ -3444,8 +6078,7 @@ impl TilingEngine {
                 }
             }
             let Some(oid) = found else { continue };
-            let rebuilt =
-                crate::layout::snapshot::rebuild_workspaces(snap_mon, &surviving);
+            let rebuilt = crate::layout::snapshot::rebuild_workspaces(snap_mon, &surviving);
             if let Some(monitor) = self.monitors.get_mut(&oid) {
                 monitor.workspaces = rebuilt;
                 monitor.active_workspace = snap_mon.active_workspace;
@@ -3470,6 +6103,7 @@ impl TilingEngine {
                 }
             }
         }
+        self.sync_min_widths();
     }
 
     // -----------------------------------------------------------------------
@@ -3483,7 +6117,7 @@ impl TilingEngine {
     /// The returned value can be serialised to JSON via serde and later fed
     /// to [`TilingEngine::restore_snapshot`] to recreate the layout.
     pub fn snapshot_current_workspace(&self) -> Option<crate::layout::snapshot::LayoutSnapshot> {
-        use crate::layout::snapshot::{LayoutSnapshot, WorkspaceSnapshot, ColumnSnapshot};
+        use crate::layout::snapshot::{ColumnSnapshot, LayoutSnapshot, WorkspaceSnapshot};
         use crate::layout::workspace::ColumnDisplay;
 
         let oid = self.monitors.focused_id()?;
@@ -3491,17 +6125,21 @@ impl TilingEngine {
         let ws_id = monitor.active_workspace;
         let ws = monitor.workspace()?;
 
-        let columns: Vec<ColumnSnapshot> = ws.columns.iter().map(|col| {
-            let display_str = match col.display {
-                ColumnDisplay::Stacked => "stacked".to_string(),
-                ColumnDisplay::Tabbed { active_tab } => format!("tabbed:{}", active_tab),
-            };
-            ColumnSnapshot {
-                width: col.width,
-                display: display_str,
-                tiles: col.tiles.iter().map(|t| t.window_id.as_isize()).collect(),
-            }
-        }).collect();
+        let columns: Vec<ColumnSnapshot> = ws
+            .columns
+            .iter()
+            .map(|col| {
+                let display_str = match col.display {
+                    ColumnDisplay::Stacked => "stacked".to_string(),
+                    ColumnDisplay::Tabbed { active_tab } => format!("tabbed:{}", active_tab),
+                };
+                ColumnSnapshot {
+                    width: col.width,
+                    display: display_str,
+                    tiles: col.tiles.iter().map(|t| t.window_id.as_isize()).collect(),
+                }
+            })
+            .collect();
 
         Some(LayoutSnapshot {
             workspaces: vec![WorkspaceSnapshot {
@@ -3527,20 +6165,27 @@ impl TilingEngine {
         snap: &crate::layout::snapshot::LayoutSnapshot,
         backend: &crate::backend::BackendHandle,
     ) -> Result<(), String> {
-        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-        use windows::Win32::Foundation::HWND;
         use crate::layout::workspace::{Column, ColumnDisplay, Tile, Workspace};
         use crate::utils::WindowId;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-        let oid = self.monitors.focused_id()
+        let oid = self
+            .monitors
+            .focused_id()
             .ok_or_else(|| "no focused monitor".to_string())?;
 
         for snap_ws in &snap.workspaces {
             // Ensure the workspace exists on the focused monitor.
             {
-                let monitor = self.monitors.get_mut(&oid)
+                let monitor = self
+                    .monitors
+                    .get_mut(&oid)
                     .ok_or_else(|| "focused monitor disappeared".to_string())?;
-                monitor.workspaces.entry(snap_ws.id).or_insert_with(Workspace::new);
+                monitor
+                    .workspaces
+                    .entry(snap_ws.id)
+                    .or_insert_with(Workspace::new);
             }
 
             // Build new columns from the snapshot, dropping dead HWNDs.
@@ -3573,7 +6218,9 @@ impl TilingEngine {
             }
 
             // Swap the workspace's columns for the rebuilt set.
-            let monitor = self.monitors.get_mut(&oid)
+            let monitor = self
+                .monitors
+                .get_mut(&oid)
                 .ok_or_else(|| "focused monitor disappeared".to_string())?;
             if let Some(ws) = monitor.workspaces.get_mut(&snap_ws.id) {
                 ws.columns = new_columns;
@@ -3583,7 +6230,9 @@ impl TilingEngine {
 
         // Switch to the snapshot's focused workspace when specified.
         if let Some(fws) = snap.focused_workspace {
-            let monitor = self.monitors.get_mut(&oid)
+            let monitor = self
+                .monitors
+                .get_mut(&oid)
                 .ok_or_else(|| "focused monitor disappeared".to_string())?;
             if monitor.workspaces.contains_key(&fws) {
                 monitor.active_workspace = fws;
@@ -3605,6 +6254,7 @@ impl TilingEngine {
             }
         }
 
+        self.sync_min_widths();
         self.apply_all(backend);
         Ok(())
     }
@@ -3627,24 +6277,32 @@ impl TilingEngine {
     /// Called from `src/input/low_level_hook.rs` to decide whether to consume
     /// a no-modifier `WM_MOUSEWHEEL` event as `Action::ScrollLeft/Right`.
     pub fn is_over_gap(&self, x: i32, y: i32) -> bool {
-        let Some(oid) = self.monitors.focused_id() else { return false };
-        let Some(monitor) = self.monitors.get(&oid) else { return false };
+        let Some(oid) = self.monitors.focused_id() else {
+            return false;
+        };
+        let Some(monitor) = self.monitors.get(&oid) else {
+            return false;
+        };
 
         // Confirm the point falls on this monitor's work area.
         let wa = monitor.work_area;
-        if x < wa.loc.x || x >= wa.loc.x + wa.size.w as i32
-            || y < wa.loc.y || y >= wa.loc.y + wa.size.h as i32
+        if x < wa.loc.x
+            || x >= wa.loc.x + wa.size.w as i32
+            || y < wa.loc.y
+            || y >= wa.loc.y + wa.size.h as i32
         {
             return false;
         }
 
-        let Some(ws) = monitor.workspace() else { return false };
+        let Some(ws) = monitor.workspace() else {
+            return false;
+        };
         if ws.columns.len() < 2 {
             // A single column (or empty workspace) has no inter-column gap.
             return false;
         }
 
-        let eff_cfg = self.effective_config(oid);
+        let eff_cfg = self.active_workspace_config(oid);
         let gap = eff_cfg.column_gap;
         // Half-gap slop so the cursor doesn't have to land pixel-perfectly.
         let half_gap = (gap / 2).max(1);
@@ -3657,18 +6315,22 @@ impl TilingEngine {
         let view_width = wa.size.w as i32
             - eff_cfg.outer_gaps.1  // right outer gap
             - eff_cfg.outer_gaps.3; // left outer gap
-        let col_widths: Vec<i32> = ws.columns.iter().map(|col| {
-            col.width.map(|w| w as i32).unwrap_or_else(|| {
-                match eff_cfg.column_width_mode {
-                    ColumnWidthMode::Proportional => {
-                        let total_gaps = gap * (num_columns as i32 - 1).max(0);
-                        let available = view_width - total_gaps;
-                        (available / num_columns as i32).max(eff_cfg.column_width as i32 / 2)
-                    }
-                    ColumnWidthMode::Fixed => eff_cfg.column_width as i32,
-                }
+        let col_widths: Vec<i32> = ws
+            .columns
+            .iter()
+            .map(|col| {
+                col.width
+                    .map(|w| w as i32)
+                    .unwrap_or_else(|| match eff_cfg.column_width_mode {
+                        ColumnWidthMode::Proportional => {
+                            let total_gaps = gap * (num_columns as i32 - 1).max(0);
+                            let available = view_width - total_gaps;
+                            (available / num_columns as i32).max(eff_cfg.column_width as i32 / 2)
+                        }
+                        ColumnWidthMode::Fixed => eff_cfg.column_width as i32,
+                    })
             })
-        }).collect();
+            .collect();
 
         // Walk the column layout and check if (x) lands in any gap zone.
         let scroll_x = ws.scroll_offset.x;
@@ -3677,7 +6339,7 @@ impl TilingEngine {
             if i + 1 < num_columns {
                 // The gap in screen-space starts right after this column.
                 let gap_screen_start = work_x + cursor + cw - scroll_x;
-                let gap_screen_end   = gap_screen_start + gap;
+                let gap_screen_end = gap_screen_start + gap;
                 // Extend the zone by half_gap of slop on each side.
                 if x >= gap_screen_start - half_gap && x < gap_screen_end + half_gap {
                     return true;
@@ -3702,50 +6364,17 @@ impl TilingEngine {
             .unwrap_or(&self.config)
     }
 
-    /// Activate a window (bring to foreground).
-    /// Uses multiple strategies to work around Windows' foreground lock restrictions:
-    /// Activate a window (bring to foreground)
-    fn activate_window(&self, hwnd: isize) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SetForegroundWindow, BringWindowToTop,
-            GetWindowThreadProcessId, IsIconic,
-        };
-        use windows::Win32::System::Threading::{GetCurrentThreadId, AttachThreadInput};
-        use windows::Win32::Foundation::HWND;
-
-        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
-        unsafe {
-            // If minimized, restore first
-            if IsIconic(hwnd_win).as_bool() {
-                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd_win,
-                    windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
-                );
-            }
-
-            // AttachThreadInput trick to bypass foreground lock
-            let mut target_pid: u32 = 0;
-            let target_tid = GetWindowThreadProcessId(hwnd_win, Some(&mut target_pid));
-            let current_tid = GetCurrentThreadId();
-
-            if target_tid != 0 && current_tid != 0 && target_tid != current_tid {
-                let attached = AttachThreadInput(current_tid, target_tid, true);
-                let _ = SetForegroundWindow(hwnd_win);
-                if attached.as_bool() {
-                    let _ = AttachThreadInput(current_tid, target_tid, false);
-                }
-            } else {
-                let _ = SetForegroundWindow(hwnd_win);
-            }
-
-            // Fallback
-            let _ = BringWindowToTop(hwnd_win);
-        }
-    }
-
     /// Apply opacity to a window using DWMWA_EXCLUDED_FROM_PEEK + layered window
     /// Set the DWM border color for a window (Windows 11+).
     /// Falls back silently on older Windows.
+    ///
+    /// Terminal-style apps (Windows Terminal / Cascadia, mintty, ConsoleWindow,
+    /// Alacritty, WezTerm) extend their content into the non-client area via
+    /// `ExtendsContentIntoTitleBar`, which paints over the DWMWA_BORDER_COLOR
+    /// outline so the user sees no border on them.  For those classes we also
+    /// set DWMWA_CAPTION_COLOR (attr 35) so the top edge is recoloured to
+    /// match — gives the user *something* visible to indicate the tile is
+    /// wiri-managed.  See `is_border_unfriendly_class`.
     fn set_dwm_border_color(&self, hwnd: isize, color_hex: &str) {
         use windows::Win32::Foundation::HWND;
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
@@ -3762,7 +6391,78 @@ impl TilingEngine {
                     std::mem::size_of::<u32>() as u32,
                 )
             };
+
+            // Belt-and-braces for terminal-style apps that draw over the DWM
+            // border: also colour the caption (DWMWA_CAPTION_COLOR, attr 35).
+            // Caption-color is honoured even on windows with
+            // ExtendsContentIntoTitleBar so the user gets a visible focus
+            // indicator on Windows Terminal / mintty / Alacritty / WezTerm.
+            //
+            // Also flip DWMWA_USE_IMMERSIVE_DARK_MODE based on the requested
+            // colour's brightness so any system-painted accent (e.g. the
+            // 1-px chrome at window edges some apps still rely on) inherits a
+            // contrasting tone instead of always defaulting to light.
+            if self.is_border_unfriendly_window(hwnd) {
+                const DWMWA_CAPTION_COLOR: i32 = 35;
+                let caption_attr =
+                    windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_CAPTION_COLOR);
+                let _ = unsafe {
+                    windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                        hwnd_win,
+                        caption_attr,
+                        &colorref as *const _ as *const _,
+                        std::mem::size_of::<u32>() as u32,
+                    )
+                };
+
+                // brightness ≈ 0.299R + 0.587G + 0.114B (Rec. 601 luma)
+                let luma = (299 * r as u32 + 587 * g as u32 + 114 * b as u32) / 1000;
+                let use_dark: i32 = if luma < 128 { 1 } else { 0 };
+                const DWMWA_USE_IMMERSIVE_DARK_MODE: i32 = 20;
+                let dark_attr = windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                );
+                let _ = unsafe {
+                    windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                        hwnd_win,
+                        dark_attr,
+                        &use_dark as *const _ as *const _,
+                        std::mem::size_of::<i32>() as u32,
+                    )
+                };
+            }
         }
+    }
+
+    /// True for tile windows whose class is known to paint over the DWM-managed
+    /// non-client area, hiding DWMWA_BORDER_COLOR.  Currently:
+    ///
+    /// * `CASCADIA_HOSTING_WINDOW_CLASS` — Windows Terminal / wt.exe
+    /// * `mintty` — Cygwin / Git-for-Windows terminal
+    /// * `ConsoleWindowClass` — classic conhost (rarely tiled directly)
+    /// * `Alacritty` — Alacritty Windows port
+    /// * `org.wezfurlong.wezterm` — WezTerm
+    ///
+    /// Class matching is case-insensitive and uses `starts_with` so future
+    /// suffixes (e.g. CASCADIA_HOSTING_WINDOW_CLASS_v2) don't fall through.
+    fn is_border_unfriendly_window(&self, hwnd: isize) -> bool {
+        let window_id = WindowId::new(hwnd);
+        let class = self
+            .tiled_windows
+            .get(&window_id)
+            .map(|info| info.class_name.to_lowercase())
+            .unwrap_or_default();
+        if class.is_empty() {
+            return false;
+        }
+        const NEEDLES: &[&str] = &[
+            "cascadia_hosting_window_class",
+            "mintty",
+            "consolewindowclass",
+            "alacritty",
+            "org.wezfurlong.wezterm",
+        ];
+        NEEDLES.iter().any(|n| class.starts_with(n))
     }
 
     /// Push the "no colour" sentinel COLORREF to DWMWA_BORDER_COLOR so the
@@ -3806,12 +6506,12 @@ impl TilingEngine {
     /// Unknown strings fall back to 0 (`DWMSBT_AUTO`).
     pub fn backdrop_str_to_u32(name: &str) -> u32 {
         match name.to_lowercase().trim() {
-            "auto"    => 0,
-            "none"    => 1,
-            "mica"    => 2,
+            "auto" => 0,
+            "none" => 1,
+            "mica" => 2,
             "acrylic" => 3,
-            "tabbed"  => 4,
-            _         => 0,
+            "tabbed" => 4,
+            _ => 0,
         }
     }
 
@@ -3842,11 +6542,11 @@ impl TilingEngine {
     /// preview of each effect.
     pub fn toggle_backdrop_cycle(&mut self, backend: &BackendHandle) {
         let next = match self.config.backdrop.to_lowercase().trim() {
-            "auto"    => "none",
-            "none"    => "mica",
-            "mica"    => "acrylic",
+            "auto" => "none",
+            "none" => "mica",
+            "mica" => "acrylic",
             "acrylic" => "tabbed",
-            _         => "auto",
+            _ => "auto",
         };
         info!("Cycling backdrop: {:?} → {:?}", self.config.backdrop, next);
         self.config.backdrop = next.to_string();
@@ -3880,9 +6580,8 @@ impl TilingEngine {
         let monitor = self.monitors.get(&oid)?;
         let workspace = monitor.workspace()?;
         for (idx, col) in workspace.columns.iter().enumerate() {
-            if let Some(tile) = col.tiles.first() {
-                let b = tile.cached_bounds;
-                if x >= b.loc.x && x < b.loc.x + b.size.w as i32 {
+            if let Some(b) = decor::column_drop_bounds(col) {
+                if x >= b.loc.x && x < b.right() {
                     return Some(idx);
                 }
             }
@@ -3930,7 +6629,7 @@ impl TilingEngine {
         self.apply_layout_for_monitor(oid, backend);
     }
 
-        fn apply_window_opacity(&self, hwnd: isize, opacity: f32) {
+    fn apply_window_opacity(&self, hwnd: isize, opacity: f32) {
         use windows::Win32::Foundation::HWND;
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
         // Use DWMWA_EXCLUDED_FROM_PEEK as a marker, and set per-frame opacity
@@ -3958,8 +6657,8 @@ impl TilingEngine {
 
     /// Close a window
     fn close_window(&self, hwnd: isize) {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-        use windows::Win32::Foundation::{HWND, WPARAM, LPARAM};
         unsafe {
             let _ = PostMessageW(
                 HWND(hwnd as *mut std::ffi::c_void),
@@ -3974,62 +6673,15 @@ impl TilingEngine {
     // Wired from `Action::{ColumnToggleTabbed, TabNext, TabPrev}` in
     // `backend::message_loop::execute_action`.
 
-    /// Toggle the focused column between Stacked and Tabbed display modes.
-    pub fn toggle_tabbed_for_focused_column(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        use crate::layout::workspace::ColumnDisplay;
-                        match &column.display {
-                            ColumnDisplay::Tabbed { .. } => column.switch_to_stacked(),
-                            ColumnDisplay::Stacked => column.switch_to_tabbed(),
-                        }
-                    }
-                }
-            }
-        }
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
-    /// Advance to the next tab in the focused column (wraps around).
-    pub fn focused_column_next_tab(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        column.next_tab();
-                    }
-                }
-            }
-        }
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
-    /// Go to the previous tab in the focused column (wraps around).
-    pub fn focused_column_prev_tab(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        column.prev_tab();
-                    }
-                }
-            }
-        }
-        self.apply_layout_for_monitor(focused_output, backend);
+    /// The latest visible-frame placement submitted by layout (including an
+    /// animation's target). Observed WindowInfo bounds can still be stale while
+    /// asynchronous Win32 positioning completes. Input uses this only to avoid
+    /// warping to a parked or superseded rectangle; owned dialogs have no entry.
+    pub(crate) fn pointer_warp_target(&self, window: WindowId) -> Option<Rect> {
+        self.applied_state
+            .get(&window)
+            .map(|state| state.rect)
+            .filter(|rect| rect.size.w > 0 && rect.size.h > 0)
     }
 
     /// Returns true if the applied_state cache is non-empty.
@@ -4064,56 +6716,6 @@ impl TilingEngine {
     // Item 1 — move_window_to_workspace
     // -------------------------------------------------------------------------
 
-    /// Move the focused window to the given workspace (on the same monitor).
-    /// The active workspace does not change — the window silently migrates.
-    pub fn move_window_to_workspace(&mut self, workspace_id: i32, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        let (window_id, src_ws_id) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            let wid = match monitor.focus_window {
-                Some(id) => id,
-                None => {
-                    debug!("move_window_to_workspace: no focused window");
-                    return;
-                }
-            };
-            (wid, monitor.active_workspace)
-        };
-
-        if workspace_id == src_ws_id {
-            return; // no-op — already on that workspace
-        }
-
-        // Remove from source workspace
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            monitor.remove_window(window_id);
-            // Ensure target workspace exists
-            monitor.workspaces.entry(workspace_id).or_insert_with(crate::layout::Workspace::new);
-            // Add to the end of column 0 (new column) on the target workspace
-            let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-                Some(self.config.column_width)
-            } else {
-                None
-            };
-            // Temporarily switch active workspace to target so add_window_with_width works
-            let prev_ws = monitor.active_workspace;
-            monitor.active_workspace = workspace_id;
-            monitor.add_window_with_width(window_id, width_hint);
-            // Restore active workspace
-            monitor.active_workspace = prev_ws;
-        }
-
-        self.maintain_empty_workspace(focused_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
     // -------------------------------------------------------------------------
     // Item 2 — move_window_to_monitor
     // -------------------------------------------------------------------------
@@ -4121,66 +6723,11 @@ impl TilingEngine {
     /// Move the focused window to the monitor in the given direction (Left/Right),
     /// ordered by the monitor's left edge (bounds.loc.x).
     pub fn move_window_to_monitor(&mut self, direction: ScrollDirection, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
+        let target = match direction {
+            ScrollDirection::Left => monitor_actions::MonitorTarget::Left,
+            ScrollDirection::Right => monitor_actions::MonitorTarget::Right,
         };
-
-        let window_id = match self.monitors.get(&focused_output).and_then(|m| m.focus_window) {
-            Some(id) => id,
-            None => {
-                debug!("move_window_to_monitor: no focused window");
-                return;
-            }
-        };
-
-        // Build sorted list of (x_position, output_id)
-        let mut monitor_order: Vec<(i32, OutputId)> = self.monitors.iter()
-            .map(|(&oid, m)| (m.bounds.loc.x, oid))
-            .collect();
-        monitor_order.sort_by_key(|(x, _)| *x);
-
-        let src_pos = monitor_order.iter().position(|(_, oid)| *oid == focused_output);
-        let src_pos = match src_pos {
-            Some(p) => p,
-            None => return,
-        };
-
-        let target_pos: Option<usize> = match direction {
-            ScrollDirection::Left  => src_pos.checked_sub(1),
-            ScrollDirection::Right => {
-                let next = src_pos + 1;
-                if next < monitor_order.len() { Some(next) } else { None }
-            }
-        };
-
-        let target_output = match target_pos {
-            Some(p) => monitor_order[p].1,
-            None => return, // no monitor in that direction
-        };
-
-        // Remove from source monitor's active workspace
-        if let Some(src_monitor) = self.monitors.get_mut(&focused_output) {
-            src_monitor.remove_window(window_id);
-        }
-
-        // Add to target monitor's active workspace
-        let width_hint = if self.config.column_width_mode == ColumnWidthMode::Fixed {
-            Some(self.config.column_width)
-        } else {
-            None
-        };
-        if let Some(dst_monitor) = self.monitors.get_mut(&target_output) {
-            dst_monitor.add_window_with_width(window_id, width_hint);
-        }
-
-        // Maintain trailing empty workspaces on both monitors
-        self.maintain_empty_workspace(focused_output);
-        self.maintain_empty_workspace(target_output);
-
-        // Apply layout to both monitors
-        self.apply_layout_for_monitor(focused_output, backend);
-        self.apply_layout_for_monitor(target_output, backend);
+        self.move_window_to_monitor_action(None, &target, backend);
     }
 
     // -------------------------------------------------------------------------
@@ -4195,7 +6742,9 @@ impl TilingEngine {
             None => return,
         };
 
-        let (focus_col, view_width, col_w, gap) = {
+        self.refresh_strip_widths(focused_output);
+        let cfg = self.active_workspace_config(focused_output).clone();
+        let (focus_col, view_width, col_w) = {
             let monitor = match self.monitors.get(&focused_output) {
                 Some(m) => m,
                 None => return,
@@ -4204,88 +6753,391 @@ impl TilingEngine {
                 Some(c) => c,
                 None => return,
             };
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            let cw = Self::effective_column_width(nc, vw, &self.config);
-            (fc, vw, cw, self.config.column_gap)
+            let vw = Self::view_width_for_monitor(monitor, &cfg);
+            let cw = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, &cfg))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, &cfg));
+            (fc, vw, cw)
         };
 
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(workspace) = monitor.workspace_mut() {
-                let (col_x, col_width) = workspace.column_x_and_width(focus_col, col_w, gap);
-                // Center: scroll so that col_center == view_center
-                let new_scroll = col_x + col_width / 2 - view_width / 2;
-                workspace.scroll_offset.x = new_scroll.max(0);
-                workspace.clamp_scroll(col_w, gap, view_width);
-            }
+        if let Some(workspace) = self
+            .monitors
+            .get_mut(&focused_output)
+            .and_then(|m| m.workspace_mut())
+        {
+            workspace.reveal_with_policy(
+                focus_col,
+                col_w,
+                cfg.column_gap,
+                view_width,
+                CenterFocusedColumn::Always,
+                false,
+            );
         }
 
         self.apply_layout_for_monitor(focused_output, backend);
     }
 
     // -------------------------------------------------------------------------
-    // Item 4 — set_column_width_preset
+    // niri's size grammar: set-column-width, set-window-height and the presets
     // -------------------------------------------------------------------------
 
-    /// Set the focused column's width to a preset fraction of the work_rect,
-    /// or cycle through presets.
-    pub fn set_column_width_preset(&mut self, preset: ColumnWidthPreset, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
+    /// niri's default `preset-column-widths`: a third, a half and two thirds of the view.
+    const PRESET_COLUMN_PROPORTIONS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
 
-        let view_width = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            Self::view_width_for_monitor(monitor, &self.config)
-        };
+    /// niri's default `preset-window-heights`: the same shares, of the column's height.
+    const PRESET_WINDOW_PROPORTIONS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
 
-        // Resolve Cycle → a concrete preset. Niri-style cycle order:
-        //   1/4 → 1/3 → 1/2 → 2/3 → 3/4 → full → 1/4 …
-        let concrete = match preset {
-            ColumnWidthPreset::Cycle => {
-                let next = match self.last_column_preset {
-                    ColumnWidthPreset::OneQuarter    => ColumnWidthPreset::OneThird,
-                    ColumnWidthPreset::OneThird      => ColumnWidthPreset::Half,
-                    ColumnWidthPreset::Half          => ColumnWidthPreset::TwoThirds,
-                    ColumnWidthPreset::TwoThirds    => ColumnWidthPreset::ThreeQuarters,
-                    ColumnWidthPreset::ThreeQuarters => ColumnWidthPreset::Full,
-                    ColumnWidthPreset::Full          => ColumnWidthPreset::OneQuarter,
-                    ColumnWidthPreset::Cycle         => ColumnWidthPreset::Half,
-                };
-                self.last_column_preset = next;
-                next
+    /// The narrowest column a size change makes.
+    const MIN_COLUMN_PX: i32 = 50;
+    /// The widest one (niri has the same limit).
+    const MAX_COLUMN_PX: i32 = 100_000;
+
+    /// The focused column of `output` and what a size change needs to know about it:
+    /// its index and width, the width of the view, the gap between columns and the room
+    /// the borders take around a window.
+    fn focused_column_metrics(&self, output: OutputId) -> Option<(usize, i32, i32, i32, i32)> {
+        let monitor = self.monitors.get(&output)?;
+        let cfg = self.active_workspace_config(output);
+        let col_idx = monitor.focus_column?;
+        let view = Self::view_width_for_monitor(monitor, cfg);
+        let workspace = monitor.workspace()?;
+        let column = workspace.columns.get(col_idx)?;
+        let current = column.resolved_width(Self::workspace_default_width(workspace, view, cfg));
+        Some((
+            col_idx,
+            current,
+            view,
+            cfg.column_gap,
+            2 * cfg.border_inset(),
+        ))
+    }
+
+    /// niri `set-column-width` / `set-window-width`: change the width of the focused
+    /// column (`"50%"`, `"+10%"`, `"1200"`, `"+100"`).  A column with a width of its own
+    /// is not maximized any more.
+    pub fn set_column_width_by(&mut self, change: SizeChange, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let Some((col_idx, current, view, gap, extra)) = self.focused_column_metrics(output) else {
+            return;
+        };
+        let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
+        let physical_change = match change {
+            SizeChange::SetFixed(px) => SizeChange::SetFixed((px as f64 * scale).round() as i32),
+            SizeChange::AdjustFixed(px) => {
+                SizeChange::AdjustFixed((px as f64 * scale).round() as i32)
             }
-            other => {
-                self.last_column_preset = other;
-                other
-            }
+            other => other,
         };
-
-        let target_w: u32 = match concrete {
-            ColumnWidthPreset::OneQuarter    => (view_width / 4).max(50) as u32,
-            ColumnWidthPreset::OneThird      => (view_width / 3).max(50) as u32,
-            ColumnWidthPreset::Half          => (view_width / 2).max(50) as u32,
-            ColumnWidthPreset::TwoThirds     => (view_width * 2 / 3).max(50) as u32,
-            ColumnWidthPreset::ThreeQuarters => (view_width * 3 / 4).max(50) as u32,
-            ColumnWidthPreset::Full          => view_width.max(50) as u32,
-            ColumnWidthPreset::Cycle         => unreachable!("Cycle resolved above"),
-        };
-
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            if let Some(focus_col) = monitor.focus_column {
-                if let Some(workspace) = monitor.workspace_mut() {
-                    if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        column.width = Some(target_w);
-                    }
+        let width = physical_change.resolve(current, view, gap, extra);
+        if let Some(column) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+            .and_then(|w| w.columns.get_mut(col_idx))
+        {
+            // Keep the request, not a proportion reverse-engineered from a
+            // minimum-clamped pixel cache. A small request can grow with the view.
+            match change {
+                SizeChange::SetProportion(milli) => {
+                    column.set_proportion((milli as f64 / 100_000.0).max(0.0), view, gap);
                 }
+                SizeChange::AdjustProportion(milli) => {
+                    let current = column
+                        .width_proportion
+                        .unwrap_or_else(|| (current + gap) as f64 / (view + gap).max(1) as f64);
+                    column.set_proportion((current + milli as f64 / 100_000.0).max(0.0), view, gap);
+                }
+                SizeChange::SetFixed(px) => {
+                    column.set_fixed_logical(px.max(0) as f64, scale, extra)
+                }
+                SizeChange::AdjustFixed(_) => column.set_fixed_logical(
+                    ((width as f64 - extra as f64) / scale).max(0.0),
+                    scale,
+                    extra,
+                ),
             }
         }
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
 
-        self.apply_layout_for_monitor(focused_output, backend);
+    /// The index of the preset a column takes next.  `remembered` is the preset the
+    /// column was switched to last (and has not been resized since): the next one goes
+    /// on from there.  Any other column gets the first preset wider than it is, going
+    /// forwards, and the last one narrower than it, going back (niri's `toggle_width`).
+    fn next_preset_index(
+        remembered: Option<usize>,
+        current_px: i32,
+        resolved: &[i32],
+        forwards: bool,
+    ) -> usize {
+        let len = resolved.len().max(1);
+        match remembered {
+            Some(idx) if forwards => (idx + 1) % len,
+            Some(idx) => (idx + len - 1) % len,
+            None if forwards => resolved
+                .iter()
+                .position(|&w| current_px + 1 < w)
+                .unwrap_or(0),
+            None => resolved
+                .iter()
+                .rposition(|&w| w + 1 < current_px)
+                .unwrap_or(len - 1),
+        }
+    }
+
+    /// niri `switch-preset-column-width` (`forwards`) and `-back`: the focused column
+    /// takes the next preset width (a third, a half, two thirds of the view).
+    pub fn switch_preset_column_width(&mut self, forwards: bool, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let Some((col_idx, current, view, gap, _)) = self.focused_column_metrics(output) else {
+            return;
+        };
+        let cfg = self.active_workspace_config(output).clone();
+        let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
+        let presets = self.column_presets(output);
+        let resolved: Vec<i32> = presets
+            .iter()
+            .map(|spec| match spec {
+                crate::config::types::SizeSpec::Proportion(p) => proportion_px(view, gap, *p),
+                crate::config::types::SizeSpec::Fixed(px) => {
+                    (*px as f64 * scale).round() as i32 + 2 * cfg.border_width.max(1)
+                }
+            })
+            .collect();
+        let Some((maximized, remembered)) = self
+            .monitors
+            .get(&output)
+            .and_then(|m| m.workspace())
+            .and_then(|w| w.columns.get(col_idx))
+            .map(|c| (c.maximized, c.preset_idx))
+        else {
+            return;
+        };
+        // A maximized column counts as a column as wide as the view.
+        let idx = if maximized {
+            Self::next_preset_index(None, view, &resolved, forwards)
+        } else {
+            Self::next_preset_index(remembered, current, &resolved, forwards)
+        };
+        let width = resolved[idx].clamp(Self::MIN_COLUMN_PX, Self::MAX_COLUMN_PX) as u32;
+        if let Some(column) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+            .and_then(|w| w.columns.get_mut(col_idx))
+        {
+            match presets[idx] {
+                crate::config::types::SizeSpec::Proportion(p) => {
+                    column.set_proportion(p, view, gap)
+                }
+                crate::config::types::SizeSpec::Fixed(px) => {
+                    column.set_fixed_logical(px as f64, scale, 2 * cfg.border_width.max(1))
+                }
+            }
+            column.width = Some(width);
+            column.preset_idx = Some(idx);
+        }
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// Set the focused column's width to a fraction of the view (the older wiri
+    /// presets), or switch to the next preset width.
+    pub fn set_column_width_preset(&mut self, preset: ColumnWidthPreset, backend: &BackendHandle) {
+        let milli_percent = match preset {
+            ColumnWidthPreset::Cycle => {
+                self.switch_preset_column_width(true, backend);
+                return;
+            }
+            ColumnWidthPreset::OneQuarter => 25_000,
+            ColumnWidthPreset::OneThird => 33_333,
+            ColumnWidthPreset::Half => 50_000,
+            ColumnWidthPreset::TwoThirds => 66_667,
+            ColumnWidthPreset::ThreeQuarters => 75_000,
+            ColumnWidthPreset::Full => 100_000,
+        };
+        self.set_column_width_by(SizeChange::SetProportion(milli_percent), backend);
+    }
+
+    /// niri `set-window-height`: change the height of the focused window inside its
+    /// column.  Heights are kept as weights, so the window gets the share of the column
+    /// that the new height is and the others keep their proportions.  A column of one
+    /// window (or a tabbed one) always fills the view: nothing happens there.
+    pub fn set_window_height_by(&mut self, change: SizeChange, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let (view_h, gap, extra) = {
+            let Some(monitor) = self.monitors.get(&output) else {
+                return;
+            };
+            let cfg = self.active_workspace_config(output);
+            let view_h = monitor.work_area.size.h as i32
+                - cfg.outer_gaps.0
+                - cfg.outer_gaps.2
+                - cfg.reserve_top as i32
+                - cfg.reserve_bottom as i32;
+            (view_h, cfg.window_gap, 2 * cfg.border_inset())
+        };
+        let changed = {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let (Some(col_idx), Some(window)) = (monitor.focus_column, monitor.focus_window) else {
+                return;
+            };
+            let Some(column) = monitor
+                .workspace_mut()
+                .and_then(|w| w.columns.get_mut(col_idx))
+            else {
+                return;
+            };
+            if column.tiles.len() < 2
+                || matches!(
+                    column.display,
+                    crate::layout::workspace::ColumnDisplay::Tabbed { .. }
+                )
+            {
+                return;
+            }
+            let Some(idx) = column.index_of(window) else {
+                return;
+            };
+            let available = (view_h - gap * (column.tiles.len() as i32 - 1)).max(1) as f32;
+            let weights: Vec<f32> = column
+                .tiles
+                .iter()
+                .map(|t| t.height_weight.max(0.1))
+                .collect();
+            let total: f32 = weights.iter().sum();
+            let mine = weights[idx];
+            let others = total - mine;
+            let current_px = (available * mine / total).round() as i32;
+            let target_px = change.resolve(current_px, view_h, gap, extra);
+            // The share of the column the window gets, and the weight that makes it so.
+            let share = (target_px as f32 / available).clamp(0.05, 0.95);
+            column.tiles[idx].height_weight = (share / (1.0 - share) * others).clamp(0.1, 10.0);
+            // The height the user chose replaces the one a window rule or a preset asked for.
+            column.tiles[idx].preferred_height = None;
+            column.tiles[idx].height_proportion = None;
+            column.tiles[idx].height_preset_idx = None;
+            Some(window)
+        };
+        if let Some(window) = changed {
+            self.rule_heights.remove(&window);
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// niri `reset-window-height`: the focused window gets the default weight again.
+    pub fn reset_window_height(&mut self, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let reset = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|monitor| {
+                let (col_idx, window) = (monitor.focus_column?, monitor.focus_window?);
+                monitor
+                    .workspace_mut()?
+                    .columns
+                    .get_mut(col_idx)?
+                    .tiles
+                    .iter_mut()
+                    .find(|t| t.window_id == window)
+            })
+            .map(|tile| {
+                tile.height_weight = 1.0;
+                // The height a window rule asked for is gone too: "default" is auto.
+                tile.preferred_height = None;
+                tile.height_proportion = None;
+                tile.height_preset_idx = None;
+                tile.window_id
+            });
+        if let Some(window) = reset {
+            self.rule_heights.remove(&window);
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// Change the width or the height of a floating window (`set-column-width` /
+    /// `set-window-height` on a float): proportions are of its monitor's work area.
+    pub fn float_apply_size_change(
+        &mut self,
+        window_id: WindowId,
+        axis: SizeAxis,
+        change: SizeChange,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, _)) = self.float_location(window_id) else {
+            return;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return;
+        };
+        let Some(rect) = self.float_rect_of(window_id) else {
+            return;
+        };
+        let (current, view, least) = match axis {
+            SizeAxis::Width => (rect.size.w as i32, work.size.w as i32, 120),
+            SizeAxis::Height => (rect.size.h as i32, work.size.h as i32, 80),
+        };
+        let size = change
+            .resolve(current, view, 0, 0)
+            .clamp(least, view.max(least)) as u32;
+        let resized = match axis {
+            SizeAxis::Width => Rect::new(rect.loc.x, rect.loc.y, size, rect.size.h),
+            SizeAxis::Height => Rect::new(rect.loc.x, rect.loc.y, rect.size.w, size),
+        };
+        self.place_float(window_id, resized, backend);
+        if axis == SizeAxis::Width {
+            if let Some(home) = self.float_homes.get_mut(&window_id) {
+                home.width_preset_idx = None;
+            }
+        }
+    }
+
+    /// niri `move-window-to-floating` / `move-window-to-tiling`: float or tile a window
+    /// (unlike `toggle-window-floating` nothing happens when it already is).
+    pub fn set_window_floating(
+        &mut self,
+        window_id: WindowId,
+        floating: bool,
+        backend: &BackendHandle,
+    ) {
+        if !self.tiled_windows.contains_key(&window_id) {
+            return;
+        }
+        match (floating, self.floating_windows.contains(&window_id)) {
+            (true, false) => self.float_window(window_id, backend),
+            (false, true) => self.unfloat_window(window_id, backend),
+            _ => {}
+        }
+    }
+
+    /// niri `focus-monitor-left` / `focus-monitor-right`: focus the monitor next to the
+    /// focused one (the monitors are ordered from left to right; nothing happens at the
+    /// edge) and give its focused window the keyboard.  `true` when the focus moved.
+    pub fn focus_monitor_toward(
+        &mut self,
+        direction: ScrollDirection,
+        backend: &BackendHandle,
+    ) -> bool {
+        let before = self.monitors.focused_id();
+        let target = match direction {
+            ScrollDirection::Left => monitor_actions::MonitorTarget::Left,
+            ScrollDirection::Right => monitor_actions::MonitorTarget::Right,
+        };
+        self.focus_monitor_action(&target, backend);
+        before != self.monitors.focused_id()
     }
 
     // -------------------------------------------------------------------------
@@ -4300,25 +7152,27 @@ impl TilingEngine {
             None => return,
         };
 
-        let (view_width, num_cols) = {
+        let (_view_width, default_col_w) = {
             let monitor = match self.monitors.get(&focused_output) {
                 Some(m) => m,
                 None => return,
             };
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            (vw, nc)
+            let cfg = self.active_workspace_config(focused_output);
+            let vw = Self::view_width_for_monitor(monitor, cfg);
+            let dw = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, cfg))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, cfg));
+            (vw, dw)
         };
-
-        let default_col_w = Self::effective_column_width(num_cols, view_width, &self.config);
 
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             if let Some(focus_col) = monitor.focus_column {
                 if let Some(workspace) = monitor.workspace_mut() {
                     if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        let current = column.width.map(|w| w as i32).unwrap_or(default_col_w);
+                        let current = column.resolved_width(default_col_w);
                         let new_w = (current + delta_px).max(50) as u32;
-                        column.width = Some(new_w);
+                        column.set_width(Some(new_w));
                     }
                 }
             }
@@ -4331,122 +7185,329 @@ impl TilingEngine {
     // niri-parity Round 4: column / tile rearrangement
     // -------------------------------------------------------------------------
 
-    /// Take the focused tile out of its column and append it to the column
-    /// immediately to the right. No-op when there is no column to the right
-    /// or no focused window. The moved tile is re-focused after the op.
+    /// The focused monitor and the tile the column operations act on (the engine
+    /// focus, which the action dispatcher has just synced with the OS foreground).
+    fn column_op_target(&self) -> Option<(OutputId, WindowId)> {
+        let output = self.monitors.focused_id()?;
+        let window = self.monitors.get(&output)?.focus_window?;
+        Some((output, window))
+    }
+
+    /// After a column operation: the focus window stays where it is wherever its
+    /// column went, so re-anchor the focus column, keep it in view and lay out.
+    fn finish_column_op(&mut self, output: OutputId, backend: &BackendHandle) {
+        if let Some(monitor) = self.monitors.get_mut(&output) {
+            let col = monitor
+                .focus_window
+                .and_then(|wid| monitor.workspace().and_then(|w| w.find_window_column(wid)));
+            if col.is_some() {
+                monitor.focus_column = col;
+            }
+        }
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// niri `consume-or-expel-window-left`: a window that is alone in its column
+    /// joins the column on its left (at the bottom); one that shares its column
+    /// leaves it as a column of its own on the left.  The window keeps the focus.
+    pub fn consume_or_expel_window_left(&mut self, backend: &BackendHandle) {
+        self.consume_or_expel_window(false, backend);
+    }
+
+    /// niri `consume-or-expel-window-right`.
+    pub fn consume_or_expel_window_right(&mut self, backend: &BackendHandle) {
+        self.consume_or_expel_window(true, backend);
+    }
+
+    fn consume_or_expel_window(&mut self, right: bool, backend: &BackendHandle) {
+        let Some((output, window)) = self.column_op_target() else {
+            return;
+        };
+        let from_multi = self
+            .locate_window(window)
+            .and_then(|(o, w, c)| self.monitors.get(&o)?.workspaces.get(&w)?.columns.get(c))
+            .is_some_and(|c| c.tiles.len() > 1);
+        let moved = {
+            let Some(workspace) = self
+                .monitors
+                .get_mut(&output)
+                .and_then(|m| m.workspace_mut())
+            else {
+                return;
+            };
+            if right {
+                workspace.consume_or_expel_right(window)
+            } else {
+                workspace.consume_or_expel_left(window)
+            }
+        };
+        if moved.is_some() {
+            if from_multi {
+                self.apply_new_column_policy(window);
+            }
+            self.finish_column_op(output, backend);
+        }
+    }
+
+    /// niri `consume-window-into-column`: the first window of the column on the
+    /// right of the focused one moves to the bottom of the focused column.  The
+    /// focus stays on the window that had it.  Nothing happens in the last column.
     pub fn consume_window_into_column(&mut self, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
-
-        let window_id = match self.monitors.get(&focused_output).and_then(|m| m.focus_window) {
-            Some(id) => id,
-            None => return,
+        let Some(output) = self.monitors.focused_id() else {
+            return;
         };
-
         let moved = {
-            let Some(monitor) = self.monitors.get_mut(&focused_output) else { return };
-            let Some(workspace) = monitor.workspace_mut() else { return };
-            workspace.consume_window_into_right_column(window_id)
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let Some(col) = monitor.focus_column else {
+                return;
+            };
+            let Some(workspace) = monitor.workspace_mut() else {
+                return;
+            };
+            workspace.consume_into_column(col)
         };
-
-        if moved {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                if let Some(workspace) = monitor.workspace() {
-                    if let Some(new_col) = workspace.find_window_column(window_id) {
-                        monitor.focus_column = Some(new_col);
-                        monitor.focus_window = Some(window_id);
-                    }
-                }
-            }
-            self.apply_layout_for_monitor(focused_output, backend);
+        if moved.is_some() {
+            self.finish_column_op(output, backend);
         }
     }
 
-    /// Take the focused tile out of its column and place it in a brand-new
-    /// column immediately to the right of the source. No-op when the column
-    /// only hosts a single tile (nothing to expel) or there is no focus.
+    /// niri `expel-window-from-column`: the BOTTOM window of the focused column
+    /// becomes a column of its own on its right.  The focus stays in the column it
+    /// was in (on the window above when the bottom window had it).  Nothing happens
+    /// in a column with a single window.
     pub fn expel_window_from_column(&mut self, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let expelled = {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let Some(col) = monitor.focus_column else {
+                return;
+            };
+            let Some(workspace) = monitor.workspace_mut() else {
+                return;
+            };
+            let Some(expelled) = workspace.expel_from_column(col) else {
+                return;
+            };
+            if monitor.focus_window == Some(expelled) {
+                let above = monitor
+                    .workspace()
+                    .and_then(|w| w.columns.get(col))
+                    .and_then(|c| c.tiles.last())
+                    .map(|t| t.window_id);
+                if let Some(wid) = above {
+                    monitor.focus_window = Some(wid);
+                    monitor.focus_ring.push(wid);
+                }
+            }
+            expelled
+        };
+        self.apply_new_column_policy(expelled);
+        self.finish_column_op(output, backend);
+    }
 
-        let window_id = match self.monitors.get(&focused_output).and_then(|m| m.focus_window) {
-            Some(id) => id,
+    /// niri `move-window-up` / `move-window-down`: the focused window changes
+    /// places with its neighbour in the column and keeps the focus.
+    pub fn move_window_in_column(&mut self, delta: i32, backend: &BackendHandle) {
+        let Some((output, window)) = self.column_op_target() else {
+            return;
+        };
+        let moved = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+            .map_or(false, |w| w.move_tile_within_column(window, delta));
+        if moved {
+            self.finish_column_op(output, backend);
+        }
+    }
+
+    /// niri `focus-column-first`.
+    pub fn focus_column_first(&mut self, backend: &BackendHandle) -> Option<WindowId> {
+        self.focus_step(focus_actions::FocusStep::FirstColumn, backend)
+    }
+
+    /// niri `focus-column-last`.
+    pub fn focus_column_last(&mut self, backend: &BackendHandle) -> Option<WindowId> {
+        self.focus_step(focus_actions::FocusStep::LastColumn, backend)
+    }
+
+    /// niri `move-column-to-first` / `move-column-to-last`: the focused column
+    /// (all its windows) goes to the start / end of the strip and keeps the focus.
+    pub fn move_column_to_edge(&mut self, last: bool, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let moved = {
+            let Some(monitor) = self.monitors.get_mut(&output) else {
+                return;
+            };
+            let Some(col) = monitor.focus_column else {
+                return;
+            };
+            let Some(workspace) = monitor.workspace_mut() else {
+                return;
+            };
+            let target = if last {
+                workspace.columns.len().saturating_sub(1)
+            } else {
+                0
+            };
+            workspace.move_column_to(col, target)
+        };
+        if let Some(new_col) = moved {
+            if let Some(monitor) = self.monitors.get_mut(&output) {
+                monitor.focus_column = Some(new_col);
+            }
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// niri `expand-column-to-available-width`: the focused column takes the room that the
+    /// other columns on screen leave, without resizing them.  Only columns that are fully
+    /// in view count (a column scrolled half out of it does not take room away), and the
+    /// focused column has to be fully in view itself.  When it is the only column on
+    /// screen it becomes maximized, so that `maximize-column` brings its width back.  A
+    /// column that is maximized already is left alone.
+    pub fn expand_column_to_available(&mut self, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        // (focused column, its width, the room left, others on screen, where the leftmost
+        // column that is fully in view starts, width of the view)
+        let (active, active_width, available, others, leftmost_x, view) = {
+            let Some(monitor) = self.monitors.get(&output) else {
+                return;
+            };
+            let cfg = self.active_workspace_config(output);
+            let (Some(active), Some(workspace)) = (monitor.focus_column, monitor.workspace())
+            else {
+                return;
+            };
+            if workspace.columns.get(active).map_or(true, |c| c.maximized) {
+                return;
+            }
+            let view = Self::view_width_for_monitor(monitor, cfg);
+            let gap = cfg.column_gap;
+            let (explicit, mins, maxs) = Self::column_inputs(workspace);
+            let (widths, _) =
+                Self::column_widths_with_limits(&explicit, &mins, &maxs, view, gap, cfg);
+            let scroll = workspace.scroll_offset.x;
+            let mut x = 0;
+            let mut taken = 0;
+            let mut leftmost = None;
+            let mut active_seen = false;
+            let mut others = false;
+            for (idx, w) in widths.iter().enumerate() {
+                let col_x = x;
+                x += w + gap;
+                if col_x < scroll {
+                    continue; // scrolled out on the left
+                }
+                if col_x + w > scroll + view {
+                    break; // runs out of the view on the right
+                }
+                leftmost.get_or_insert(col_x);
+                if idx == active {
+                    active_seen = true;
+                } else {
+                    others = true;
+                }
+                taken += w + gap;
+            }
+            if !active_seen {
+                return;
+            }
+            // What is left of the view once the columns in it and the gaps after them are
+            // counted (the gap after the last column is not part of the view).
+            let available = view + gap - taken;
+            if available <= 0 {
+                return;
+            }
+            (
+                active,
+                widths[active],
+                available,
+                others,
+                leftmost.unwrap_or(0),
+                view.max(Self::MIN_COLUMN_PX) as u32,
+            )
+        };
+
+        if let Some(workspace) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|m| m.workspace_mut())
+        {
+            if let Some(column) = workspace.columns.get_mut(active) {
+                if others {
+                    column.set_width(Some(
+                        (active_width + available).max(Self::MIN_COLUMN_PX) as u32
+                    ));
+                    // Keep the columns that were in view in view: the leftmost stays at the
+                    // left edge, the focused column grows to the right.
+                    workspace.scroll_offset.x = leftmost_x.max(0);
+                } else {
+                    column.toggle_maximized(view);
+                }
+            }
+        }
+        self.reveal_focused_column(output);
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// niri `maximize-column`: the focused column becomes as wide as the view
+    /// (whatever its width and however many windows it has, one included); toggling
+    /// it again gives the column the width it had.  Distinct from window-fullscreen,
+    /// which covers the whole monitor.
+    pub fn toggle_maximize_focused_column(&mut self, backend: &BackendHandle) {
+        let Some(focused_output) = self.monitors.focused_id() else {
+            return;
+        };
+        let view_width = match self.monitors.get(&focused_output) {
+            Some(monitor) => {
+                Self::view_width_for_monitor(monitor, self.active_workspace_config(focused_output))
+                    .max(50) as u32
+            }
             None => return,
         };
-
-        let moved = {
-            let Some(monitor) = self.monitors.get_mut(&focused_output) else { return };
-            let Some(workspace) = monitor.workspace_mut() else { return };
-            workspace.expel_window_into_new_column(window_id)
-        };
-
-        if moved {
-            if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-                if let Some(workspace) = monitor.workspace() {
-                    if let Some(new_col) = workspace.find_window_column(window_id) {
-                        monitor.focus_column = Some(new_col);
-                        monitor.focus_window = Some(window_id);
-                    }
-                }
-            }
-            self.apply_layout_for_monitor(focused_output, backend);
-        }
-    }
-
-    /// Expand the focused column so it fills the remaining horizontal space
-    /// inside the work area after all other columns and inter-column gaps
-    /// are accounted for. In `Proportional` mode this is effectively a
-    /// "grow to viewport" — the engine's automatic redistribution leaves
-    /// the column at full viewport width on the next layout pass.
-    pub fn expand_column_to_available(&mut self, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
-
-        let (view_width, num_cols) = {
-            let Some(monitor) = self.monitors.get(&focused_output) else { return };
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            (vw, nc)
-        };
-
-        let default_col_w = Self::effective_column_width(num_cols, view_width, &self.config);
-        let gap = self.config.column_gap;
-
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            let Some(focus_col_idx) = monitor.focus_column else { return };
-            if let Some(workspace) = monitor.workspace_mut() {
-                let other_columns_sum: i32 = workspace
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| *idx != focus_col_idx)
-                    .map(|(_, c)| c.width.map(|w| w as i32).unwrap_or(default_col_w))
-                    .sum();
-                let other_count = (workspace.columns.len() as i32 - 1).max(0);
-                let total_gaps = gap * other_count;
-                let target_w = (view_width - other_columns_sum - total_gaps).max(50) as u32;
-                if let Some(column) = workspace.columns.get_mut(focus_col_idx) {
-                    column.width = Some(target_w);
-                }
-            }
-        }
-
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
-    /// Toggle the per-column maximize flag on the focused column.
-    /// Maximized columns visually occupy the full work-area height (any
-    /// per-tile `height_weight` adjustments are ignored while maximized).
-    /// Distinct from window-fullscreen, which covers the whole monitor.
-    pub fn toggle_maximize_focused_column(&mut self, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             if let Some(focus_col_idx) = monitor.focus_column {
                 if let Some(workspace) = monitor.workspace_mut() {
                     if let Some(column) = workspace.columns.get_mut(focus_col_idx) {
-                        column.maximized = !column.maximized;
+                        column.toggle_maximized(view_width);
                     }
                 }
             }
         }
+        self.reveal_focused_column(focused_output);
         self.apply_layout_for_monitor(focused_output, backend);
+    }
+
+    /// A maximized column is as wide as the view, and the view can change (another
+    /// monitor, other gaps or reserved edges): follow it.
+    fn refresh_maximized_widths(&mut self, output_id: OutputId) {
+        let Some(view_width) = self.monitors.get(&output_id).map(|m| {
+            Self::view_width_for_monitor(m, self.active_workspace_config(output_id)).max(50) as u32
+        }) else {
+            return;
+        };
+        if let Some(monitor) = self.monitors.get_mut(&output_id) {
+            for workspace in monitor.workspaces.values_mut() {
+                for column in workspace.columns.iter_mut().filter(|c| c.maximized) {
+                    if column.width != Some(view_width) {
+                        column.width = Some(view_width);
+                    }
+                }
+            }
+        }
     }
 
     /// Resize the focused column by a percentage of the work-area width.
@@ -4458,16 +7519,22 @@ impl TilingEngine {
         delta_percent: i32,
         backend: &BackendHandle,
     ) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
-
-        let (view_width, num_cols) = {
-            let Some(monitor) = self.monitors.get(&focused_output) else { return };
-            let vw = Self::view_width_for_monitor(monitor, &self.config);
-            let nc = monitor.workspace().map(|w| w.columns.len()).unwrap_or(1);
-            (vw, nc)
+        let Some(focused_output) = self.monitors.focused_id() else {
+            return;
         };
 
-        let default_col_w = Self::effective_column_width(num_cols, view_width, &self.config);
+        let (view_width, default_col_w) = {
+            let Some(monitor) = self.monitors.get(&focused_output) else {
+                return;
+            };
+            let cfg = self.active_workspace_config(focused_output);
+            let vw = Self::view_width_for_monitor(monitor, cfg);
+            let dw = monitor
+                .workspace()
+                .map(|w| Self::workspace_default_width(w, vw, cfg))
+                .unwrap_or_else(|| Self::effective_column_width(1, vw, cfg));
+            (vw, dw)
+        };
         // 10% .. 95% of view_width, but never smaller than 50 px.
         let min_w = ((view_width as f32) * 0.10).round().max(50.0) as i32;
         let max_w = ((view_width as f32) * 0.95).round() as i32;
@@ -4477,9 +7544,9 @@ impl TilingEngine {
             if let Some(focus_col) = monitor.focus_column {
                 if let Some(workspace) = monitor.workspace_mut() {
                     if let Some(column) = workspace.columns.get_mut(focus_col) {
-                        let current = column.width.map(|w| w as i32).unwrap_or(default_col_w);
+                        let current = column.resolved_width(default_col_w);
                         let new_w = (current + delta_px).clamp(min_w, max_w) as u32;
-                        column.width = Some(new_w);
+                        column.set_width(Some(new_w));
                     }
                 }
             }
@@ -4497,12 +7564,20 @@ impl TilingEngine {
         delta_percent: i32,
         backend: &BackendHandle,
     ) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
+        let Some(focused_output) = self.monitors.focused_id() else {
+            return;
+        };
 
         let (focus_col_idx, focus_wid) = {
-            let Some(monitor) = self.monitors.get(&focused_output) else { return };
-            let Some(col) = monitor.focus_column else { return };
-            let Some(wid) = monitor.focus_window else { return };
+            let Some(monitor) = self.monitors.get(&focused_output) else {
+                return;
+            };
+            let Some(col) = monitor.focus_column else {
+                return;
+            };
+            let Some(wid) = monitor.focus_window else {
+                return;
+            };
             (col, wid)
         };
 
@@ -4518,10 +7593,8 @@ impl TilingEngine {
                     let count = column.tiles.len() as f32;
                     let weight_delta = (count * (delta_percent as f32) / 100.0).max(-0.9).min(0.9);
 
-                    if let Some(focused_tile) = column
-                        .tiles
-                        .iter_mut()
-                        .find(|t| t.window_id == focus_wid)
+                    if let Some(focused_tile) =
+                        column.tiles.iter_mut().find(|t| t.window_id == focus_wid)
                     {
                         focused_tile.height_weight =
                             (focused_tile.height_weight + weight_delta).clamp(0.1, 10.0);
@@ -4537,303 +7610,42 @@ impl TilingEngine {
     /// is appended to the destination workspace, focus follows along, and
     /// both monitors are re-laid out. No-op when no monitor exists in the
     /// requested direction.
-    pub fn move_column_to_monitor(
-        &mut self,
-        direction: ScrollDirection,
-        backend: &BackendHandle,
-    ) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
-
-        let focus_col_idx = match self.monitors.get(&focused_output).and_then(|m| m.focus_column) {
-            Some(i) => i,
-            None => return,
+    pub fn move_column_to_monitor(&mut self, direction: ScrollDirection, backend: &BackendHandle) {
+        let target = match direction {
+            ScrollDirection::Left => monitor_actions::MonitorTarget::Left,
+            ScrollDirection::Right => monitor_actions::MonitorTarget::Right,
         };
-
-        // Build sorted list of (x_position, output_id)
-        let mut monitor_order: Vec<(i32, OutputId)> = self
-            .monitors
-            .iter()
-            .map(|(&oid, m)| (m.bounds.loc.x, oid))
-            .collect();
-        monitor_order.sort_by_key(|(x, _)| *x);
-
-        let src_pos = monitor_order.iter().position(|(_, oid)| *oid == focused_output);
-        let src_pos = match src_pos {
-            Some(p) => p,
-            None => return,
-        };
-
-        let target_pos: Option<usize> = match direction {
-            ScrollDirection::Left => src_pos.checked_sub(1),
-            ScrollDirection::Right => {
-                let next = src_pos + 1;
-                if next < monitor_order.len() { Some(next) } else { None }
-            }
-        };
-
-        let target_output = match target_pos {
-            Some(p) => monitor_order[p].1,
-            None => return, // no monitor in that direction
-        };
-
-        // Extract the column wholesale.
-        let column_taken = {
-            let Some(src_monitor) = self.monitors.get_mut(&focused_output) else { return };
-            let Some(src_ws) = src_monitor.workspace_mut() else { return };
-            if focus_col_idx >= src_ws.columns.len() {
-                return;
-            }
-            let col = src_ws.columns.remove(focus_col_idx);
-            // Clear focus on source monitor (will be re-applied on dst).
-            src_monitor.focus_column = None;
-            src_monitor.focus_window = None;
-            col
-        };
-
-        // Capture the window ids (for MRU bookkeeping + post-move focus).
-        let moved_wids: Vec<WindowId> = column_taken.tiles.iter().map(|t| t.window_id).collect();
-
-        // Drop tracking on the source MRU ring.
-        if let Some(src_monitor) = self.monitors.get_mut(&focused_output) {
-            for wid in &moved_wids {
-                src_monitor.focus_ring.remove(*wid);
-            }
-        }
-
-        // Append to destination active workspace.
-        if let Some(dst_monitor) = self.monitors.get_mut(&target_output) {
-            if let Some(dst_ws) = dst_monitor.workspace_mut() {
-                dst_ws.columns.push(column_taken);
-                let new_col_idx = dst_ws.columns.len() - 1;
-                dst_monitor.focus_column = Some(new_col_idx);
-                // Focus the first tile in the moved column.
-                if let Some(first) = moved_wids.first().copied() {
-                    dst_monitor.focus_window = Some(first);
-                    dst_monitor.focus_ring.push(first);
-                }
-            }
-        }
-
-        // Make the destination the focused monitor.
-        self.monitors.set_focused(target_output);
-
-        // Maintain trailing empty workspaces + re-tile both monitors.
-        self.maintain_empty_workspace(focused_output);
-        self.maintain_empty_workspace(target_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-        self.apply_layout_for_monitor(target_output, backend);
+        self.move_column_to_monitor_action(&target, backend);
     }
 
     // -------------------------------------------------------------------------
     // Niri-parity: move the focused column vertically between workspaces
     // -------------------------------------------------------------------------
 
-    /// Move every tile in the focused column out of the current workspace and
-    /// append them as a single new column to `current_workspace_id + delta`.
-    /// The destination workspace is created if missing.  No-op when the focused
-    /// monitor has no focused column, or when the destination workspace id
-    /// would land on a non-positive value going up (i.e. `delta < 0` and
-    /// `current <= 0`).  Focus follows the moved column to the destination.
-    ///
-    /// Used by `Action::MoveColumnToWorkspaceUp` (delta = -1) and
-    /// `Action::MoveColumnToWorkspaceDown` (delta = +1).
-    pub fn move_focused_column_to_workspace(&mut self, delta: i32, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
-
-        // Resolve focused column index + source workspace id up-front.
-        let (focus_col_idx, src_ws_id) = match self.monitors.get(&focused_output) {
-            Some(m) => match m.focus_column {
-                Some(i) => (i, m.active_workspace),
-                None => return,
-            },
-            None => return,
-        };
-        let dst_ws_id = src_ws_id + delta;
-        // Refuse to step to a negative workspace id (workspace 0 is the
-        // implicit "lowest" wiri default; user-facing labels are still
-        // 1-based via the niri convention, but the engine HashMap can carry
-        // anything).  Without this guard, "move-column-up" from workspace 0
-        // would silently create workspace -1 and strand tiles there.
-        if delta < 0 && dst_ws_id < 0 {
-            return;
-        }
-        if dst_ws_id == src_ws_id {
-            return; // delta == 0 → no-op
-        }
-
-        // Take the column from the source workspace.
-        let column_taken = {
-            let Some(monitor) = self.monitors.get_mut(&focused_output) else { return };
-            let Some(src_ws) = monitor.workspaces.get_mut(&src_ws_id) else { return };
-            if focus_col_idx >= src_ws.columns.len() {
-                return;
-            }
-            let col = src_ws.columns.remove(focus_col_idx);
-            // Clear focus on the source workspace; it will be re-anchored
-            // either to whatever is still here, or to the destination below.
-            monitor.focus_column = None;
-            monitor.focus_window = None;
-            col
-        };
-
-        let moved_wids: Vec<WindowId> = column_taken.tiles.iter().map(|t| t.window_id).collect();
-
-        // Append the column to the destination workspace (creating it if
-        // necessary).  After the append, point focus at the new column on the
-        // destination workspace and switch the monitor's active workspace to
-        // match so the user follows their tiles.
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            let dst_ws = monitor
-                .workspaces
-                .entry(dst_ws_id)
-                .or_insert_with(crate::layout::Workspace::new);
-            dst_ws.columns.push(column_taken);
-            let new_col_idx = dst_ws.columns.len() - 1;
-            monitor.active_workspace = dst_ws_id;
-            monitor.focus_column = Some(new_col_idx);
-            if let Some(first) = moved_wids.first().copied() {
-                monitor.focus_window = Some(first);
-                monitor.focus_ring.push(first);
-            }
-        }
-
-        self.maintain_empty_workspace(focused_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
-
     // -------------------------------------------------------------------------
     // Niri-parity: workspace move/swap (reorder the workspace stack)
     // -------------------------------------------------------------------------
-
-    /// Swap the focused workspace with the workspace at
-    /// `focused_workspace_id + delta` on the same monitor.  Focus follows the
-    /// moved workspace so the user stays on the original tiles.  No-op when
-    /// the swap target is the same as the source, when no monitor is focused,
-    /// or when the resulting move would clobber a workspace that does not
-    /// exist (i.e. `delta < 0` and source is the lowest workspace).
-    pub fn move_active_workspace(&mut self, delta: i32, backend: &BackendHandle) {
-        let Some(focused_output) = self.monitors.focused_id() else { return };
-
-        let src_ws_id = match self.monitors.get(&focused_output) {
-            Some(m) => m.active_workspace,
-            None => return,
-        };
-        let dst_ws_id = src_ws_id + delta;
-        if dst_ws_id == src_ws_id {
-            return;
-        }
-        // Edge guard: refuse to step to a negative workspace id (workspace 0
-        // is the implicit lowest in wiri).  Without this guard the swap
-        // would silently create a workspace at id == -1 and leave the user
-        // stranded on a negative-numbered slot.
-        if delta < 0 && dst_ws_id < 0 {
-            return;
-        }
-
-        // Perform the swap.  Either workspace may or may not exist; we
-        // materialise both before swapping so users can also swap a populated
-        // workspace into a still-empty slot.
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            let src_ws = monitor
-                .workspaces
-                .remove(&src_ws_id)
-                .unwrap_or_else(crate::layout::Workspace::new);
-            let dst_ws = monitor
-                .workspaces
-                .remove(&dst_ws_id)
-                .unwrap_or_else(crate::layout::Workspace::new);
-            monitor.workspaces.insert(dst_ws_id, src_ws);
-            monitor.workspaces.insert(src_ws_id, dst_ws);
-            // Focus follows the moved workspace.
-            monitor.active_workspace = dst_ws_id;
-            // Anchor focus_column to the first column of the relocated
-            // workspace (or None when it has no columns).
-            let new_focus = monitor
-                .workspaces
-                .get(&dst_ws_id)
-                .and_then(|w| w.columns.first().and_then(|c| c.tiles.first()).map(|t| (0usize, t.window_id)));
-            match new_focus {
-                Some((col_idx, wid)) => {
-                    monitor.focus_column = Some(col_idx);
-                    monitor.focus_window = Some(wid);
-                    monitor.focus_ring.push(wid);
-                }
-                None => {
-                    monitor.focus_column = None;
-                    monitor.focus_window = None;
-                }
-            }
-        }
-
-        self.maintain_empty_workspace(focused_output);
-        self.apply_layout_for_monitor(focused_output, backend);
-    }
 
     // -------------------------------------------------------------------------
     // Item 6 — focus_workspace_relative
     // -------------------------------------------------------------------------
 
-    /// Switch to the next or previous workspace on the focused monitor (wraps).
-    pub fn focus_workspace_relative(&mut self, direction: WorkspaceDirection, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // Collect sorted workspace IDs present on this monitor
-        let (sorted_ids, active_id) = {
-            let monitor = match self.monitors.get(&focused_output) {
-                Some(m) => m,
-                None => return,
-            };
-            let mut ids: Vec<i32> = monitor.workspaces.keys().copied().collect();
-            ids.sort();
-            (ids, monitor.active_workspace)
-        };
-
-        if sorted_ids.is_empty() { return; }
-
-        let cur_pos = sorted_ids.iter().position(|&id| id == active_id).unwrap_or(0);
-        let new_pos = match direction {
-            WorkspaceDirection::Next =>
-                (cur_pos + 1) % sorted_ids.len(),
-            WorkspaceDirection::Previous =>
-                cur_pos.checked_sub(1).unwrap_or(sorted_ids.len() - 1),
-        };
-        let new_id = sorted_ids[new_pos];
-
-        // Hide windows on current workspace, switch, show new workspace windows
-        let current_windows: Vec<WindowId> = self.monitors.get(&focused_output)
-            .and_then(|m| m.workspace())
-            .map(|w| w.columns.iter().flat_map(|c| c.tiles.iter().map(|t| t.window_id)).collect())
-            .unwrap_or_default();
-
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
-            monitor.switch_workspace(new_id);
-        }
-
-        for wid in current_windows {
-            let _ = backend.show_window(wid.as_isize(), false);
-        }
-
-        if let Some(monitor) = self.monitors.get(&focused_output) {
-            if let Some(workspace) = monitor.workspace() {
-                for col in &workspace.columns {
-                    for tile in &col.tiles {
-                        let _ = backend.show_window(tile.window_id.as_isize(), true);
-                    }
-                }
-            }
-        }
-
-        self.apply_layout_for_monitor(focused_output, backend);
-
-        // Activate focused window on new workspace
-        let hwnd_to_activate = self.monitors.get(&focused_output)
-            .and_then(|m| m.focus_window)
-            .and_then(|wid| self.tiled_windows.get(&wid).map(|w| w.hwnd));
-        if let Some(hwnd) = hwnd_to_activate {
-            self.activate_window(hwnd);
+    /// niri `focus-workspace-down` (`Next`) / `focus-workspace-up` (`Previous`): switch
+    /// to the workspace below / above the active one.  Nothing happens at the top and
+    /// at the bottom (niri does not wrap).
+    pub fn focus_workspace_relative(
+        &mut self,
+        direction: WorkspaceDirection,
+        backend: &BackendHandle,
+    ) {
+        let target = self.monitors.focused().and_then(|monitor| {
+            monitor.workspace_next_to(
+                monitor.active_workspace,
+                matches!(direction, WorkspaceDirection::Next),
+            )
+        });
+        if let Some(id) = target {
+            self.switch_workspace(id, backend);
         }
     }
 
@@ -4841,54 +7653,61 @@ impl TilingEngine {
     // Item 7 — maintain_empty_workspace
     // -------------------------------------------------------------------------
 
-    /// Ensure there is exactly one empty workspace at `highest_non_empty_id + 1`.
-    /// Empty workspaces beyond that (except the active one) are removed.
-    pub fn maintain_empty_workspace(&mut self, monitor_id: OutputId) {
-        let monitor = match self.monitors.get_mut(&monitor_id) {
-            Some(m) => m,
-            None => return,
-        };
-
-        let active_ws = monitor.active_workspace;
-
-        // Find the highest workspace ID that has at least one window.
-        let highest_non_empty: i32 = monitor.workspaces.iter()
-            .filter(|(_, ws)| !ws.columns.is_empty())
-            .map(|(&id, _)| id)
-            .max()
-            .unwrap_or(-1);
-
-        let trailing_id = highest_non_empty + 1;
-
-        // Ensure the trailing empty workspace exists.
-        monitor.workspaces.entry(trailing_id).or_insert_with(crate::layout::Workspace::new);
-
-        // Remove surplus empty workspaces (anything empty that isn't the trailing one
-        // and isn't what the user is currently looking at).
-        let to_remove: Vec<i32> = monitor.workspaces.iter()
-            .filter(|(&id, ws)| ws.columns.is_empty() && id != trailing_id && id != active_ws)
-            .map(|(&id, _)| id)
-            .collect();
-        for id in to_remove {
-            monitor.workspaces.remove(&id);
-        }
-    }
-
     /// Restore all tiled windows to their original positions and styles.
     /// Called on graceful shutdown so the user gets their layout back instead
     /// of windows frozen in the wiri tile positions.
     pub fn restore_all(&mut self, backend: &BackendHandle) {
+        self.cancel_composited_transitions(backend);
+        self.native_clips.restore_all();
+        self.recent_reset();
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowLongW, GWL_STYLE, GWL_EXSTYLE, SetWindowPos, SWP_NOMOVE,
-            SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED,
-            HWND_NOTOPMOST,
-        };
         use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
         use windows::Win32::UI::Controls::MARGINS;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, SWP_FRAMECHANGED,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        };
 
-        info!("Restoring {} windows to original positions/styles",
-            self.original_bounds.len());
+        info!(
+            "Restoring {} windows to original positions/styles",
+            self.original_bounds.len()
+        );
+        // From here on no layout pass runs: it would hide the windows of the other
+        // workspaces again before the process is gone.
+        self.shut_down = true;
+
+        // The overlay windows go, and the windows get DWM's own corners back.
+        self.clear_decorations();
+        let rounded: Vec<WindowId> = self
+            .applied_state
+            .iter()
+            .filter(|(_, st)| st.corner != CORNER_UNSET && st.corner != CORNER_NOT_ASKED)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in rounded {
+            self.apply_corner_for_window(id.as_isize(), 0);
+        }
+
+        // The shell must not go on believing that a window is fullscreen (and keep the
+        // taskbar away) when wiri is gone.
+        for window_id in &self.fullscreen_windows {
+            crate::backend::taskbar::mark_fullscreen(window_id.as_isize(), false);
+        }
+
+        // Show every window wiri hid (inactive workspaces, the fullscreen
+        // cover-up, parked columns are merely moved).  Before this a quit with
+        // another workspace active left those windows hidden for good.
+        let mut shown: HashSet<isize> = HashSet::new();
+        for window_id in self.tiled_windows.keys() {
+            let _ = backend.show_window(window_id.as_isize(), true);
+            shown.insert(window_id.as_isize());
+        }
+        for hidden in crate::backend::hidden::snapshot() {
+            if shown.insert(hidden.hwnd) {
+                let _ = backend.show_window(hidden.hwnd, true);
+            }
+        }
+        crate::backend::hidden::restore_all_hidden();
 
         // Restore styles first (un-strips frames if strip_frame was enabled)
         for (window_id, &orig_style) in &self.saved_styles {
@@ -4899,24 +7718,47 @@ impl TilingEngine {
                     SetWindowLongW(hwnd, GWL_EXSTYLE, orig_ex as i32);
                 }
                 // Reset DWM frame inset (default 0 margins).
-                let m = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 0 };
+                let m = MARGINS {
+                    cxLeftWidth: 0,
+                    cxRightWidth: 0,
+                    cyTopHeight: 0,
+                    cyBottomHeight: 0,
+                };
                 let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
                 // Force frame recalc.
                 let _ = SetWindowPos(
-                    hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                    hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
             }
         }
 
-        // Restore original bounds.
-        for (window_id, &rect) in &self.original_bounds {
-            let _ = backend.set_window_position(
-                window_id.as_isize(),
-                rect,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+        // Restore original bounds (plain GetWindowRect rectangles, so no
+        // shadow-margin compensation).  Windows that no longer exist are skipped.
+        // A window whose original place is off every screen is rescued into the middle of
+        // one; several of them are cascaded instead of stacked on one another.
+        let work_areas: Vec<Rect> = self.monitors.values().map(|m| m.work_area).collect();
+        let mut originals: Vec<(WindowId, Rect)> = self
+            .original_bounds
+            .iter()
+            .map(|(id, rect)| (*id, *rect))
+            .collect();
+        originals.sort_by_key(|(id, _)| id.as_isize());
+        let mut rescued = 0usize;
+        for (window_id, rect) in originals {
+            let target = restorable_bounds(rect, &work_areas, rescued);
+            if target != rect {
+                rescued += 1;
+            }
+            let _ = backend.restore_window_rect(window_id.as_isize(), target);
         }
+        // Everything is back where it was: nothing is left to remember for the next run.
+        crate::backend::hidden::clear_originals();
     }
 
     // -------------------------------------------------------------------------
@@ -4927,43 +7769,7 @@ impl TilingEngine {
     /// Reads `focus_ring.previous()` from the focused monitor, locates that window
     /// across all workspaces, updates focus state, and re-applies layout.
     pub fn focus_previous_window(&mut self, backend: &BackendHandle) {
-        let focused_output = match self.monitors.focused_id() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // Peek at the previous window without modifying the ring yet.
-        let prev_wid = match self.monitors.get(&focused_output).and_then(|m| m.focus_ring.previous()) {
-            Some(wid) => wid,
-            None => return, // no previous — no-op
-        };
-
-        // Find which monitor + workspace + column hosts that window.
-        // It might be on a different workspace (though the MRU ring is per-monitor).
-        let location: Option<(OutputId, i32, usize)> = self.monitors.iter().find_map(|(&oid, monitor)| {
-            monitor.workspaces.iter().find_map(|(&ws_id, ws)| {
-                ws.find_window_column(prev_wid).map(|col_idx| (oid, ws_id, col_idx))
-            })
-        });
-
-        let (target_output, _ws_id, col_idx) = match location {
-            Some(loc) => loc,
-            None => return, // window no longer alive — no-op
-        };
-
-        // Update focus on the target monitor.
-        if let Some(monitor) = self.monitors.get_mut(&target_output) {
-            monitor.focus_window = Some(prev_wid);
-            monitor.focus_column = Some(col_idx);
-            monitor.focus_ring.push(prev_wid);
-        }
-
-        // Activate the window at the OS level.
-        if let Some(hwnd) = self.tiled_windows.get(&prev_wid).map(|w| w.hwnd) {
-            self.activate_window(hwnd);
-        }
-
-        self.apply_layout_for_monitor(target_output, backend);
+        self.focus_previous_with_debounce(750, backend);
     }
 
     // -------------------------------------------------------------------------
@@ -4975,15 +7781,18 @@ impl TilingEngine {
     pub fn toggle_always_on_top_for_focused(&mut self, _backend: &BackendHandle) {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE,
-            HWND_TOPMOST, HWND_NOTOPMOST,
+            SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
         };
 
         let focused_output = match self.monitors.focused_id() {
             Some(o) => o,
             None => return,
         };
-        let wid = match self.monitors.get(&focused_output).and_then(|m| m.focus_window) {
+        let wid = match self
+            .monitors
+            .get(&focused_output)
+            .and_then(|m| m.focus_window)
+        {
             Some(id) => id,
             None => return,
         };
@@ -5055,7 +7864,9 @@ impl TilingEngine {
         backend: &BackendHandle,
     ) {
         // Find the focused window.
-        let focused_wid = match self.monitors.focused_id()
+        let focused_wid = match self
+            .monitors
+            .focused_id()
             .and_then(|oid| self.monitors.get(&oid))
             .and_then(|m| m.focus_window)
         {
@@ -5068,7 +7879,10 @@ impl TilingEngine {
 
         // Only operate on floating windows.
         if !self.floating_windows.contains(&focused_wid) {
-            debug!("snap_floating_to_corner: focused window {:?} is not floating", focused_wid);
+            debug!(
+                "snap_floating_to_corner: focused window {:?} is not floating",
+                focused_wid
+            );
             return;
         }
 
@@ -5080,7 +7894,9 @@ impl TilingEngine {
         let win_size = win_info.bounds.size;
 
         // Find the monitor that owns this output to get the work area.
-        let work_rect = match self.monitors.focused_id()
+        let work_rect = match self
+            .monitors
+            .focused_id()
             .and_then(|oid| self.monitors.get(&oid))
         {
             Some(m) => m.work_area,
@@ -5091,10 +7907,7 @@ impl TilingEngine {
         use crate::layout::floating::FloatingCorner;
         let margin: i32 = 24;
         let (x, y) = match corner {
-            FloatingCorner::TopLeft => (
-                work_rect.loc.x + margin,
-                work_rect.loc.y + margin,
-            ),
+            FloatingCorner::TopLeft => (work_rect.loc.x + margin, work_rect.loc.y + margin),
             FloatingCorner::TopRight => (
                 work_rect.loc.x + work_rect.size.w as i32 - win_size.w as i32 - margin,
                 work_rect.loc.y + margin,
@@ -5136,33 +7949,131 @@ impl TilingEngine {
     // Item 4 — focus_workspace_named
     // -------------------------------------------------------------------------
 
-    /// Switch to a workspace identified by its KDL config name.
-    /// The index of the matching `WorkspaceConfig` entry is used as the workspace ID
-    /// (consistent with how workspaces are created from config at startup).
+    /// Switch to a workspace identified by its KDL config name. Names are global,
+    /// so the destination keeps its own output: a local key is never replayed on
+    /// the monitor that happened to be focused.
     /// Logs a warning and returns silently when the name is not found.
     pub fn focus_workspace_named(&mut self, name: &str, backend: &BackendHandle) {
         use tracing::warn;
-        let ws_id: Option<i32> = self.full_config.as_ref().and_then(|cfg| {
-            cfg.workspace
-                .iter()
-                .enumerate()
-                .find_map(|(idx, ws_cfg)| {
-                    if ws_cfg.name == name {
-                        Some(idx as i32)
-                    } else {
-                        None
-                    }
+        let Some(source) = self.monitors.focused_id() else {
+            return;
+        };
+        let Some((output, id)) = self.resolve_workspace_reference(
+            source,
+            &crate::input::WorkspaceRef::Name(name.to_string()),
+        ) else {
+            warn!("workspace name not found: {}", name);
+            return;
+        };
+        let same_output = source == output;
+        let id = if same_output {
+            self.auto_back_and_forth(id)
+        } else {
+            id
+        };
+        if !same_output {
+            self.set_focused_output(output);
+            let window = self
+                .monitors
+                .get(&output)
+                .and_then(|monitor| monitor.workspaces.get(&id))
+                .and_then(|workspace| {
+                    workspace
+                        .active_window
+                        .filter(|window| workspace.find_window_column(*window).is_some())
+                        .or_else(|| {
+                            workspace
+                                .columns
+                                .iter()
+                                .find_map(|column| column.tiles.first())
+                                .map(|tile| tile.window_id)
+                        })
                 })
-        });
-        match ws_id {
-            Some(id) => self.switch_workspace(id, backend),
-            None => warn!("workspace name not found: {}", name),
+                .or_else(|| {
+                    self.float_homes
+                        .iter()
+                        .filter(|(_, home)| home.output == output && home.workspace == id)
+                        .max_by_key(|(_, home)| home.seq)
+                        .map(|(window, _)| *window)
+                });
+            if let Some(window) = window {
+                self.focus_action_window(window, backend);
+                return;
+            }
         }
+        self.switch_workspace(id, backend);
+    }
+
+    /// niri `focus-workspace N` (1-based; a number past the last workspace is the
+    /// last one).
+    pub fn focus_workspace_number(&mut self, number: i32, backend: &BackendHandle) {
+        let id = self.auto_back_and_forth(self.workspace_id_for_number(number));
+        self.switch_workspace(id, backend);
+    }
+
+    /// niri's `workspace-auto-back-and-forth`: asking for the workspace the user is on
+    /// goes back to the previous one instead (`input { workspace-auto-back-and-forth }`).
+    fn auto_back_and_forth(&self, target: i32) -> i32 {
+        let enabled = self
+            .full_config
+            .as_ref()
+            .map_or(false, |c| c.input.workspace_auto_back_and_forth);
+        match self.monitors.focused() {
+            Some(monitor) if enabled && monitor.active_workspace == target => monitor
+                .previous_workspace
+                .filter(|previous| monitor.workspaces.contains_key(previous))
+                .unwrap_or(target),
+            _ => target,
+        }
+    }
+
+    /// niri `focus-workspace-previous`: the workspace the user was on before this one
+    /// (nothing happens when there is none, or it is gone).
+    pub fn focus_workspace_last_visited(&mut self, backend: &BackendHandle) {
+        let Some(monitor) = self.monitors.focused() else {
+            return;
+        };
+        let Some(previous) = monitor
+            .previous_workspace
+            .filter(|p| *p != monitor.active_workspace && monitor.workspaces.contains_key(p))
+        else {
+            return;
+        };
+        self.switch_workspace(previous, backend);
     }
 
     // -------------------------------------------------------------------------
     // Item 5 — urgent-window API
     // -------------------------------------------------------------------------
+
+    /// Set or reset urgency for a managed window without changing focus.
+    /// Focused windows cannot become urgent. Both the hook registry and the
+    /// engine view are updated before urgency-dependent rules are reevaluated.
+    /// Returns false for an unmanaged window, leaving its state untouched.
+    pub fn set_window_urgent(
+        &mut self,
+        window: WindowId,
+        urgent: bool,
+        backend: &BackendHandle,
+    ) -> bool {
+        if !self.tiled_windows.contains_key(&window) {
+            return false;
+        }
+        let urgent = urgent && self.os_foreground != Some(window);
+        crate::backend::hooks::set_urgent(window.as_isize(), urgent);
+        if urgent {
+            self.urgent_windows.insert(window);
+        } else {
+            self.urgent_windows.remove(&window);
+        }
+        // An explicit urgency request is not an activation request: refresh the
+        // urgency-dependent rules without applying the window's activation policy.
+        if self.rule_flags.urgency {
+            self.reevaluate_window_rules(window, backend);
+        }
+        self.refresh_rule_effects(window, backend);
+        true
+    }
 
     /// Mark a window as urgent (e.g. after receiving a WM_FLASHWINDOW notification).
     pub fn mark_urgent(&mut self, window_id: WindowId) {
@@ -5197,10 +8108,85 @@ impl Default for TilingEngine {
     }
 }
 
+/// Where to put a window back when wiri lets go of it.
+///
+/// Normally that is the rectangle it had when wiri first saw it.  But a window
+/// that an earlier wiri run (one that was killed, or crashed, before it could
+/// restore anything) left parked below the screen is first seen *there*, and
+/// "restoring" it to where it already is would leave it lost.  A rectangle with
+/// less than 64x64 px on any work area is therefore replaced by one centred on
+/// the first work area, at most 70% of its size.
+///
+/// `nth` counts the windows that had to be rescued before this one (0 for the first): each
+/// is shifted 32 px right and down from the one before (eight steps, then it starts over),
+/// so a whole desktop of rescued windows is not one pile.
+fn restorable_bounds(original: Rect, work_areas: &[Rect], nth: usize) -> Rect {
+    const MIN_VISIBLE: i32 = 64;
+    const CASCADE_PX: i32 = 32;
+    const CASCADE_STEPS: usize = 8;
+    let overlap = |a_start: i32, a_end: i32, b_start: i32, b_end: i32| {
+        a_end.min(b_end) - a_start.max(b_start)
+    };
+    let usable = work_areas.iter().any(|wa| {
+        overlap(original.loc.x, original.right(), wa.loc.x, wa.right()) >= MIN_VISIBLE
+            && overlap(original.loc.y, original.bottom(), wa.loc.y, wa.bottom()) >= MIN_VISIBLE
+    });
+    let Some(wa) = work_areas.first() else {
+        return original;
+    };
+    if usable {
+        return original;
+    }
+    let w = original.size.w.min(wa.size.w * 7 / 10).max(200);
+    let h = original.size.h.min(wa.size.h * 7 / 10).max(150);
+    let step = (nth % CASCADE_STEPS) as i32 * CASCADE_PX;
+    // The centred position, moved down and right but never off the work area.
+    let x = (wa.loc.x + (wa.size.w as i32 - w as i32) / 2 + step).min(wa.right() - w as i32);
+    let y = (wa.loc.y + (wa.size.h as i32 - h as i32) / 2 + step).min(wa.bottom() - h as i32);
+    Rect::new(x.max(wa.loc.x), y.max(wa.loc.y), w, h)
+}
+
+/// True when `now` is not what was `last` noted; `last` follows `now`.
+fn workspace_changed(last: &mut Option<i32>, now: Option<i32>) -> bool {
+    if *last == now {
+        false
+    } else {
+        *last = now;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::utils::Rect;
+
+    #[test]
+    fn workspace_watch_fires_only_when_the_focused_workspace_differs() {
+        let mut last = None;
+        assert!(!workspace_changed(&mut last, None), "nothing to report yet");
+        assert!(workspace_changed(&mut last, Some(0)), "the first workspace");
+        assert!(!workspace_changed(&mut last, Some(0)), "same workspace");
+        assert!(workspace_changed(&mut last, Some(1)));
+        assert!(workspace_changed(&mut last, Some(0)), "back again");
+        assert!(
+            workspace_changed(&mut last, None),
+            "the focused monitor went away"
+        );
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn a_layout_pass_notes_the_workspace_a_switch_ended_on() {
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.apply_all(&backend);
+        assert_eq!(engine.last_noted_workspace, Some(0));
+        engine.switch_workspace(1, &backend);
+        assert_eq!(engine.last_noted_workspace, Some(1));
+        engine.switch_workspace(0, &backend);
+        assert_eq!(engine.last_noted_workspace, Some(0));
+    }
 
     fn make_engine() -> TilingEngine {
         let mut engine = TilingEngine::new(LayoutConfig::default());
@@ -5238,6 +8224,26 @@ mod tests {
         let window = make_window(100, 500, 400);
         engine.add_window(window, &BackendHandle::default_for_test());
         assert_eq!(engine.tiled_windows().len(), 1);
+    }
+
+    #[test]
+    fn test_adding_a_window_twice_adds_one_tile() {
+        // Two events (and the reconcile pass) can find the same new window at the same
+        // moment: it must not get two tiles, or floating / closing it would leave one behind.
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 0, 0), &be);
+        engine.add_window(make_window(100, 500, 400), &be);
+        let oid = engine.focused_output().unwrap();
+        assert_eq!(engine.tiled_windows().len(), 2);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+        // ... and it is still removable and addable again afterwards.
+        engine.remove_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        engine.add_window(make_window(100, 500, 400), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101], vec![100]]);
     }
 
     #[test]
@@ -5364,8 +8370,7 @@ mod tests {
     #[test]
     fn test_accent_reader_fallback_to_fixed_when_lookup_fails() {
         use crate::backend::accent::{
-            current_windows_accent_rgba_with, invalidate_accent_cache_for_test,
-            AccentReader,
+            current_windows_accent_rgba_with, invalidate_accent_cache_for_test, AccentReader,
         };
         struct FailingReader;
         impl AccentReader for FailingReader {
@@ -5461,7 +8466,12 @@ mod tests {
             let r = sink.last_dst_rect(WindowId::new(i));
             assert!(r.is_some(), "tile {} missing update_thumbnail call", i);
             let r = r.unwrap();
-            assert!(r.size.w > 0 && r.size.h > 0, "tile {} got zero-sized rect {:?}", i, r);
+            assert!(
+                r.size.w > 0 && r.size.h > 0,
+                "tile {} got zero-sized rect {:?}",
+                i,
+                r
+            );
         }
     }
 
@@ -5591,7 +8601,11 @@ mod tests {
         for (_, rect) in &positions {
             // Fixed mode: each column is config.column_width (500px) minus optional inset.
             // Allow 50px tolerance for border/inset rounding.
-            assert!(rect.size.w >= 500 - 50, "window too narrow: {}", rect.size.w);
+            assert!(
+                rect.size.w >= 500 - 50,
+                "window too narrow: {}",
+                rect.size.w
+            );
             assert!(rect.size.h > 100, "window too short: {}", rect.size.h);
         }
         // Columns must be ordered left-to-right.
@@ -5640,12 +8654,18 @@ mod tests {
         let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
         assert_eq!(positions.len(), 10);
         for (_, rect) in &positions {
-            assert!(rect.loc.x >= work_rect.loc.x,
-                "window x={} < work x={}", rect.loc.x, work_rect.loc.x);
-            assert!((rect.loc.x + rect.size.w as i32) <= work_rect.loc.x + work_rect.size.w as i32 + 10,
+            assert!(
+                rect.loc.x >= work_rect.loc.x,
+                "window x={} < work x={}",
+                rect.loc.x,
+                work_rect.loc.x
+            );
+            assert!(
+                (rect.loc.x + rect.size.w as i32) <= work_rect.loc.x + work_rect.size.w as i32 + 10,
                 "window right={} > work right={}",
                 rect.loc.x + rect.size.w as i32,
-                work_rect.loc.x + work_rect.size.w as i32);
+                work_rect.loc.x + work_rect.size.w as i32
+            );
         }
     }
 
@@ -5695,6 +8715,27 @@ mod tests {
         engine.focus_right(&BackendHandle::default_for_test());
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_column, Some(3));
+    }
+
+    #[test]
+    fn pointer_warp_uses_submitted_frame_not_stale_observation() {
+        let mut engine = make_engine();
+        let window = WindowId::new(100);
+        let observed = make_window(100, 500, 400);
+        let stale_bounds = observed.bounds;
+        engine.tiled_windows.insert(window, observed);
+        assert_eq!(engine.pointer_warp_target(window), None);
+        engine.applied_state.insert(window, AppliedState::unset());
+        assert_eq!(engine.pointer_warp_target(window), None);
+        let target = Rect::new(923, 12, 431, 704);
+        engine.applied_state.get_mut(&window).unwrap().rect = target;
+        assert_eq!(engine.pointer_warp_target(window), Some(target));
+        assert_eq!(
+            engine.tiled_windows.get(&window).unwrap().bounds,
+            stale_bounds
+        );
+        assert_ne!(stale_bounds, target);
+        assert_eq!(engine.pointer_warp_target(WindowId::new(101)), None);
     }
 
     #[test]
@@ -5780,6 +8821,32 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_layout_hides_windows_on_inactive_workspaces() {
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        let oid = engine.focused_output().unwrap();
+
+        engine.add_window_with_target(
+            make_window(100, 500, 400),
+            AddWindowTarget::Workspace {
+                output: oid,
+                workspace_id: 1,
+            },
+            &backend,
+            false,
+        );
+
+        engine.apply_all(&backend);
+
+        let state = engine.applied_state.get(&WindowId::new(100));
+        assert!(
+            state.map(|s| !s.visible).unwrap_or(false),
+            "inactive workspace window should be hidden, got {:?}",
+            state
+        );
+    }
+
+    #[test]
     fn test_remove_window_updates_focus() {
         let mut engine = make_engine();
         let w1 = make_window(100, 500, 400);
@@ -5801,16 +8868,28 @@ mod tests {
         let mut engine = TilingEngine::new(LayoutConfig::default());
         let oid1 = OutputId::from_name("Monitor1");
         let oid2 = OutputId::from_name("Monitor2");
-        engine.register_monitor(oid1, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
-        engine.register_monitor(oid2, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            oid1,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        engine.register_monitor(
+            oid2,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
 
         assert_eq!(engine.monitors().len(), 2);
         assert!(engine.focused_output().is_some());
 
         let target = engine.get_target_output(&WindowInfo {
-            hwnd: 100, title: "test".into(), class_name: "test".into(),
-            process_id: 0, bounds: Rect::new(960, 400, 800, 600),
-            state: crate::backend::WindowState::Normal, is_visible: true,
+            hwnd: 100,
+            title: "test".into(),
+            class_name: "test".into(),
+            process_id: 0,
+            bounds: Rect::new(960, 400, 800, 600),
+            state: crate::backend::WindowState::Normal,
+            is_visible: true,
         });
         assert_eq!(target, oid1);
     }
@@ -5854,7 +8933,11 @@ mod tests {
         let col_w = TilingEngine::effective_column_width(3, 1280, &config);
         assert_eq!(col_w, 500);
         let total = 3 * 500 + 2 * 8;
-        let zoom = if total > 1280 { 1280.0 / total as f64 } else { 1.0 };
+        let zoom = if total > 1280 {
+            1280.0 / total as f64
+        } else {
+            1.0
+        };
         assert!((zoom - 0.844).abs() < 0.01);
         assert!(zoom < 1.0);
     }
@@ -5893,9 +8976,44 @@ mod tests {
     fn test_register_monitor_with_scale() {
         let mut engine = TilingEngine::new(LayoutConfig::default());
         let oid = OutputId::from_name("HiDPI");
-        engine.register_monitor_with_scale(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040), 1.5);
+        engine.register_monitor_with_scale(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+            1.5,
+        );
         let monitor = engine.monitors().get(&oid).unwrap();
         assert!((monitor.scale_factor - 1.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sync_monitor_with_scale_updates_geometry_without_replacing_workspace() {
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        let oid = OutputId::from_name("Display");
+        engine.register_monitor_with_scale(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+            1.0,
+        );
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .switch_workspace(2);
+
+        engine.sync_monitor_with_scale(
+            oid,
+            Rect::new(1920, 0, 2560, 1440),
+            Rect::new(1920, 0, 2560, 1400),
+            1.25,
+        );
+
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.bounds, Rect::new(1920, 0, 2560, 1440));
+        assert_eq!(monitor.work_area, Rect::new(1920, 0, 2560, 1400));
+        assert!((monitor.scale_factor - 1.25).abs() < 0.01);
+        assert_eq!(monitor.active_workspace_id(), 2);
     }
 
     #[test]
@@ -5903,8 +9021,16 @@ mod tests {
         let mut engine = TilingEngine::new(LayoutConfig::default());
         let oid1 = OutputId::from_name("M1");
         let oid2 = OutputId::from_name("M2");
-        engine.register_monitor(oid1, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
-        engine.register_monitor(oid2, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            oid1,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        engine.register_monitor(
+            oid2,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
         assert_eq!(engine.monitors().len(), 2);
 
         engine.unregister_monitor(&oid1);
@@ -5913,6 +9039,27 @@ mod tests {
         assert_eq!(engine.focused_output(), Some(oid2));
     }
 
+    #[test]
+    fn test_update_window_bounds_updates_window_info_and_tile_cache() {
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 10, 20), &BackendHandle::default_for_test());
+        let new_bounds = Rect::new(30, 40, 500, 300);
+
+        assert!(engine.update_window_bounds(WindowId::new(100), new_bounds));
+        assert_eq!(
+            engine
+                .tiled_windows()
+                .get(&WindowId::new(100))
+                .unwrap()
+                .bounds,
+            new_bounds
+        );
+
+        let oid = engine.focused_output().unwrap();
+        let monitor = engine.monitors().get(&oid).unwrap();
+        let workspace = monitor.workspace().unwrap();
+        assert_eq!(workspace.columns[0].tiles[0].cached_bounds, new_bounds);
+    }
 
     // --- Bug-revealing tests ---
 
@@ -5937,6 +9084,54 @@ mod tests {
         // Focus should be on the moved window (102) at its new position (col1)
         assert_eq!(monitor.focus_window, Some(WindowId::new(102)));
         assert_eq!(monitor.focus_column, Some(1));
+        // The column swapped places with its neighbour; nothing was merged.
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![101]]
+        );
+    }
+
+    /// The window ids of every column of the focused monitor's active workspace.
+    fn column_windows(engine: &TilingEngine, oid: OutputId) -> Vec<Vec<isize>> {
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_move_column_takes_the_stacked_tiles_along() {
+        let mut engine = make_engine();
+        for i in 100..103 {
+            let window = make_window(i, 500, 400);
+            engine.add_window(window, &BackendHandle::default_for_test());
+        }
+        let oid = engine.focused_output().unwrap();
+        // 101 pulls 102 (the first window of the column on its right) under itself; focus stays on 101.
+        engine.focus_left(&BackendHandle::default_for_test());
+        engine.consume_window_into_column(&BackendHandle::default_for_test());
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101, 102]]
+        );
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.focus_column, Some(1));
+        assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
+
+        engine.move_column(ScrollDirection::Left, &BackendHandle::default_for_test());
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101, 102], vec![100]]
+        );
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.focus_column, Some(0));
+        assert_eq!(monitor.focus_window, Some(WindowId::new(101)));
     }
 
     #[test]
@@ -5960,6 +9155,10 @@ mod tests {
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_window, Some(WindowId::new(100)));
         assert_eq!(monitor.focus_column, Some(1));
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101], vec![100], vec![102]]
+        );
     }
 
     #[test]
@@ -6093,7 +9292,11 @@ mod tests {
         };
         let mut engine = TilingEngine::new(config);
         let oid = OutputId::from_name("TestMonitor");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
 
         // Add 10 windows — definitely won't fit in 1920px
         for i in 100..110 {
@@ -6108,7 +9311,11 @@ mod tests {
             let monitor = engine.monitors().get(&oid).unwrap();
             monitor.workspace().unwrap().scroll_offset.x
         };
-        assert!(scroll_before > 0, "scroll should be > 0 with 10 fixed columns, got {}", scroll_before);
+        assert!(
+            scroll_before > 0,
+            "scroll should be > 0 with 10 fixed columns, got {}",
+            scroll_before
+        );
 
         // Enter overview
         engine.enter_overview(&BackendHandle::default_for_test());
@@ -6118,7 +9325,6 @@ mod tests {
         engine.exit_overview(&BackendHandle::default_for_test());
         assert!(!engine.is_overview());
     }
-
 
     // --- Edge case and lifecycle tests ---
 
@@ -6178,6 +9384,881 @@ mod tests {
     }
 
     #[test]
+    fn test_toggle_floating_twice_puts_the_same_window_back() {
+        // Floating the focused window moves the engine focus to the next tile.  The OS
+        // keeps reporting the floated window as the foreground one, and the second
+        // toggle must act on it - not float that next tile as well.
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 500, 400), &be);
+        let oid = engine.focused_output().unwrap();
+        // Window 101 has the focus and the OS agrees.
+        engine.sync_os_foreground(WindowId::new(101), &be);
+
+        engine.toggle_floating(&be);
+        assert!(engine.is_floating(WindowId::new(101)));
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().focus_window,
+            Some(WindowId::new(100)),
+            "the engine focus moved on to the remaining tile"
+        );
+        // ...and wiri does not hand the foreground to that tile behind the user's back.
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+
+        // The OS still says: the floating window is what the user is looking at.
+        engine.sync_os_foreground(WindowId::new(101), &be);
+        engine.toggle_floating(&be);
+        assert!(
+            !engine.is_floating(WindowId::new(101)),
+            "back in the layout"
+        );
+        assert!(
+            !engine.is_floating(WindowId::new(100)),
+            "the other tile is untouched"
+        );
+        assert_eq!(column_windows(&engine, oid).len(), 2);
+    }
+
+    #[test]
+    fn test_toggle_floating_acts_on_a_tile_when_a_tile_is_in_the_foreground() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 500, 400), &be);
+        engine.sync_os_foreground(WindowId::new(101), &be);
+        engine.toggle_floating(&be); // 101 floats, focus moves to 100
+                                     // The user clicks the tile 100 and presses toggle-floating again.
+        engine.sync_os_foreground(WindowId::new(100), &be);
+        engine.toggle_floating(&be);
+        assert!(
+            engine.is_floating(WindowId::new(100)),
+            "the foreground tile floats"
+        );
+        assert!(
+            engine.is_floating(WindowId::new(101)),
+            "the first floating window stays floating"
+        );
+    }
+
+    // --- Which window does an action act on? ---
+
+    fn foreground(hwnd: isize, root_owner: isize) -> Option<ForegroundWindow> {
+        Some(ForegroundWindow {
+            hwnd,
+            root_owner,
+            ignorable: false,
+        })
+    }
+
+    /// An engine with the tiles 100 and 101; the OS and the engine focus 101.
+    fn engine_with_two_tiles() -> TilingEngine {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        engine.add_window(make_window(100, 500, 400), &be);
+        engine.add_window(make_window(101, 500, 400), &be);
+        engine.sync_os_foreground(WindowId::new(101), &be);
+        engine
+    }
+
+    fn focus_window_of(engine: &TilingEngine) -> Option<WindowId> {
+        let oid = engine.focused_output().unwrap();
+        engine.monitors().get(&oid).unwrap().focus_window
+    }
+
+    #[test]
+    fn test_managed_window_for_maps_a_dialog_to_the_window_that_owns_it() {
+        let engine = engine_with_two_tiles();
+        assert_eq!(
+            engine.managed_window_for(100, 100),
+            Some(WindowId::new(100))
+        );
+        // A dialog (999) owned by the application window 101.
+        assert_eq!(
+            engine.managed_window_for(999, 101),
+            Some(WindowId::new(101))
+        );
+        // Neither the window nor its owner is managed.
+        assert_eq!(engine.managed_window_for(998, 997), None);
+    }
+
+    #[test]
+    fn test_action_target_is_the_os_foreground_tile_not_the_engine_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+
+        // The user clicked 100 and the OS says so, but wiri has not heard the event yet.
+        let target = engine
+            .resolve_action_target_for(foreground(100, 100), false, &be)
+            .expect("a target");
+        assert_eq!(
+            target,
+            ActionTarget {
+                window: WindowId::new(100),
+                floating: false,
+                focus_hwnd: 100
+            }
+        );
+        assert_eq!(
+            focus_window_of(&engine),
+            Some(WindowId::new(100)),
+            "the engine focus follows the OS"
+        );
+    }
+
+    #[test]
+    fn test_action_target_is_a_floating_window_in_the_foreground() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating(&be); // 101 floats; the engine focus moves on to the tile 100
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(100)));
+
+        let target = engine
+            .resolve_action_target_for(foreground(101, 101), false, &be)
+            .expect("a target");
+        assert!(target.floating);
+        assert_eq!(target.window, WindowId::new(101));
+        assert_eq!(
+            focus_window_of(&engine),
+            Some(WindowId::new(100)),
+            "looking at a floating window leaves the tile focus alone"
+        );
+    }
+
+    #[test]
+    fn test_action_target_is_the_window_that_owns_the_foreground_dialog() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        // A save dialog (999) owned by the tile 100 has the focus.
+        let target = engine
+            .resolve_action_target_for(foreground(999, 100), false, &be)
+            .expect("a target");
+        assert_eq!(target.window, WindowId::new(100));
+        assert!(!target.floating);
+        assert_eq!(
+            target.focus_hwnd, 999,
+            "the dialog is what has the focus, so close-window closes the dialog"
+        );
+
+        // The same for a dialog of a floating window.
+        engine.toggle_floating_for(WindowId::new(101), &be);
+        let target = engine
+            .resolve_action_target_for(foreground(888, 101), false, &be)
+            .expect("a target");
+        assert!(target.floating);
+        assert_eq!(target.window, WindowId::new(101));
+        assert_eq!(target.focus_hwnd, 888);
+    }
+
+    #[test]
+    fn test_strict_action_target_refuses_an_unmanaged_foreground_window() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        // The Start menu or an elevated program has the focus: close-window must not
+        // guess and close a tile in the background.
+        let unmanaged = foreground(777, 777);
+        assert_eq!(engine.resolve_action_target_for(unmanaged, true, &be), None);
+        // Actions that do no harm fall back to the engine focus.
+        let target = engine
+            .resolve_action_target_for(unmanaged, false, &be)
+            .expect("the engine focus");
+        assert_eq!(target.window, WindowId::new(101));
+    }
+
+    #[test]
+    fn test_action_target_falls_back_to_the_engine_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        // The desktop, the taskbar and wiri's own windows are never a target.
+        let ignorable = Some(ForegroundWindow {
+            hwnd: 5,
+            root_owner: 5,
+            ignorable: true,
+        });
+        for strict in [false, true] {
+            let target = engine
+                .resolve_action_target_for(ignorable, strict, &be)
+                .expect("the engine focus");
+            assert_eq!(target.window, WindowId::new(101));
+            assert!(!target.floating);
+        }
+        // So is no foreground window at all.
+        let target = engine
+            .resolve_action_target_for(None, true, &be)
+            .expect("the engine focus");
+        assert_eq!(target.window, WindowId::new(101));
+    }
+
+    #[test]
+    fn test_action_target_with_no_windows_is_none() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        assert_eq!(engine.state_target(), None);
+        assert_eq!(engine.resolve_action_target_for(None, false, &be), None);
+        assert_eq!(
+            engine.resolve_action_target_for(foreground(5, 5), true, &be),
+            None
+        );
+    }
+
+    #[test]
+    fn test_state_target_prefers_the_floating_window_the_os_reported() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating(&be); // 101 floats, the engine focus is the tile 100
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::float(WindowId::new(101)))
+        );
+        // The user clicks the tile: it is the target again.
+        engine.sync_os_foreground(WindowId::new(100), &be);
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::tile(WindowId::new(100)))
+        );
+    }
+
+    #[test]
+    fn test_state_target_is_the_topmost_floating_window_when_no_tile_is_left() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating_for(WindowId::new(101), &be);
+        engine.toggle_floating_for(WindowId::new(100), &be);
+        engine.os_foreground = None;
+        // 100 floated last, so it is on top of the stack...
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::float(WindowId::new(100)))
+        );
+        // ...until the other one is raised.
+        engine.touch_float(WindowId::new(101));
+        assert_eq!(
+            engine.state_target(),
+            Some(ActionTarget::float(WindowId::new(101)))
+        );
+    }
+
+    #[test]
+    fn test_toggle_floating_for_ignores_a_window_wiri_does_not_manage() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating_for(WindowId::new(999), &be);
+        assert!(!engine.is_floating(WindowId::new(999)));
+        assert!(!engine.is_floating(WindowId::new(100)));
+        assert!(!engine.is_floating(WindowId::new(101)));
+    }
+
+    // --- Floating windows: geometry, workspace, stacking ---
+
+    #[test]
+    fn test_a_window_floats_at_its_own_size_in_the_middle_of_the_work_area() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.toggle_floating_for(WindowId::new(100), &be);
+        let rect = engine.float_homes.get(&WindowId::new(100)).unwrap().rect;
+        assert_eq!((rect.size.w, rect.size.h), (800, 600));
+        assert_eq!(rect.loc.x, (1920 - 800) / 2);
+        assert_eq!(rect.loc.y, (1040 - 600) / 2);
+    }
+
+    #[test]
+    fn test_root_owner_of_an_unknown_window_is_the_window_itself() {
+        // Neither an owner nor a root can be found for a handle that is not a window.
+        assert_eq!(root_owner_of(0x7777_0001), 0x7777_0001);
+    }
+
+    #[test]
+    fn test_floating_makes_the_layout_cache_forget_the_tile_rect() {
+        // Found live: the window floated and was tiled again, but the layout found its old tile
+        // rectangle "already applied" in the cache and never moved it back.
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        engine.apply_all(&be);
+        let wid = WindowId::new(101);
+        let tile_rect = engine.applied_state.get(&wid).unwrap().rect;
+        assert_ne!(tile_rect, Rect::new(0, 0, 0, 0));
+
+        engine.toggle_floating_for(wid, &be);
+        let cached = engine.applied_state.get(&wid).unwrap();
+        assert_eq!(
+            cached.rect,
+            Rect::new(0, 0, 0, 0),
+            "the float is not at the tile rect"
+        );
+        assert!(cached.visible);
+
+        engine.toggle_floating_for(wid, &be);
+        let cached = engine.applied_state.get(&wid).unwrap();
+        assert_ne!(
+            cached.rect,
+            Rect::new(0, 0, 0, 0),
+            "the layout placed the tile again"
+        );
+        assert!(cached.visible);
+    }
+
+    #[test]
+    fn test_focus_float_keeps_the_layout_from_activating_the_tile_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        // The tile 100 holds the engine focus; the user focuses the float.
+        assert!(engine.focus_float(float, &be));
+        // Not the float: the layout pass must find nothing left to activate (it would hand the
+        // foreground to the tile 100 straight away).
+        assert_eq!(
+            engine.last_activated,
+            Some(WindowId::new(100)),
+            "the tile focus counts as already activated"
+        );
+        engine.apply_all(&be);
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+        assert_eq!(engine.os_foreground, Some(float));
+    }
+
+    #[test]
+    fn test_a_floating_window_remembers_where_it_floated() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be);
+        let first = engine.float_homes.get(&wid).unwrap().rect;
+
+        engine.float_move_by(wid, 50, -30, &be);
+        let moved = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!(
+            (moved.loc.x, moved.loc.y),
+            (first.loc.x + 50, first.loc.y - 30)
+        );
+        assert_eq!(moved.size, first.size);
+
+        engine.toggle_floating_for(wid, &be); // back into a column
+        assert!(!engine.is_floating(wid));
+        assert!(!engine.float_homes.contains_key(&wid));
+        engine.toggle_floating_for(wid, &be); // float again
+        assert_eq!(
+            engine.float_homes.get(&wid).unwrap().rect,
+            moved,
+            "it floats where it floated last time"
+        );
+    }
+
+    #[test]
+    fn test_remembered_float_geometry_is_pulled_back_onto_the_monitor() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        // Remembered on a bigger desktop that is gone.
+        engine
+            .float_memory
+            .insert(wid, Rect::new(3000, 2000, 800, 600));
+        engine.toggle_floating_for(wid, &be);
+        let rect = engine.float_homes.get(&wid).unwrap().rect;
+        assert!(rect.loc.x >= 0 && rect.loc.y >= 0);
+        assert!(rect.loc.x + rect.size.w as i32 <= 1920);
+        assert!(rect.loc.y + rect.size.h as i32 <= 1040);
+        assert_eq!(rect.size, Rect::new(0, 0, 800, 600).size);
+    }
+
+    #[test]
+    fn test_float_resize_and_centre_work_on_the_remembered_rectangle() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be);
+        engine.float_resize_by(wid, 100, -50, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!((r.size.w, r.size.h), (900, 550));
+
+        engine.float_set_width_fraction(wid, 0.5, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!(r.size.w, 960);
+
+        engine.float_move_by(wid, -2000, -2000, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!((r.loc.x, r.loc.y), (0, 0), "kept on the work area");
+
+        engine.float_center(wid, &be);
+        let r = engine.float_homes.get(&wid).unwrap().rect;
+        assert_eq!(r.loc.x, (1920 - 960) / 2);
+        assert_eq!(r.loc.y, (1040 - 550) / 2);
+    }
+
+    #[test]
+    fn test_float_cycle_width_walks_through_a_third_a_half_and_two_thirds() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be); // 800 wide
+        let mut widths = Vec::new();
+        for _ in 0..4 {
+            engine.float_cycle_width(wid, true, &be);
+            widths.push(engine.float_homes.get(&wid).unwrap().rect.size.w);
+        }
+        // 800 -> a half (960) -> two thirds (1280) -> a third (640) -> a half again.
+        assert_eq!(widths, vec![960, 1280, 640, 960]);
+    }
+
+    #[test]
+    fn test_floating_windows_are_hidden_with_their_workspace_and_shown_with_it() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.apply_all(&be);
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+
+        engine.switch_workspace(crate::layout::workspace_id_from_number(2), &be);
+        assert!(
+            !engine.applied_state.get(&float).unwrap().visible,
+            "left behind on screen when its workspace was left"
+        );
+        assert!(
+            !engine
+                .applied_state
+                .get(&WindowId::new(100))
+                .unwrap()
+                .visible
+        );
+
+        engine.switch_workspace(crate::layout::workspace_id_from_number(1), &be);
+        assert!(
+            engine.applied_state.get(&float).unwrap().visible,
+            "back with its workspace"
+        );
+    }
+
+    #[test]
+    fn test_a_hidden_float_reported_as_foreground_keeps_the_float_stack() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let (older, newer) = (WindowId::new(100), WindowId::new(101));
+        engine.toggle_floating_for(older, &be);
+        engine.toggle_floating_for(newer, &be);
+        engine.apply_all(&be);
+        let seq = |e: &TilingEngine, w: WindowId| e.float_homes.get(&w).unwrap().seq;
+        assert!(seq(&engine, newer) > seq(&engine, older));
+
+        // Leaving the workspace hides both floats; Windows hands the foreground to one of
+        // them as the replacement for the other.  That is not the user looking at it.
+        engine.switch_workspace(crate::layout::workspace_id_from_number(2), &be);
+        engine.follow_os_foreground(older, &be);
+        assert!(
+            seq(&engine, newer) > seq(&engine, older),
+            "the stack the user comes back to is unchanged"
+        );
+
+        // Back on its workspace, a float that becomes the foreground goes on top.
+        engine.switch_workspace(crate::layout::workspace_id_from_number(1), &be);
+        engine.follow_os_foreground(older, &be);
+        assert!(seq(&engine, older) > seq(&engine, newer));
+    }
+
+    #[test]
+    fn test_a_floating_window_moved_to_another_workspace_leaves_this_one() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.apply_all(&be);
+        let ws2 = crate::layout::workspace_id_from_number(2);
+
+        assert_eq!(engine.float_workspace(float), Some(0));
+        engine.float_move_to_workspace(float, ws2, &be);
+        assert_eq!(engine.float_homes.get(&float).unwrap().workspace, ws2);
+        assert_eq!(engine.float_workspace(float), Some(ws2));
+        assert_eq!(engine.float_workspace(WindowId::new(100)), None, "a tile");
+        assert!(
+            !engine.applied_state.get(&float).unwrap().visible,
+            "it is hidden on the workspace it left"
+        );
+        assert!(engine.is_floating(float));
+
+        engine.switch_workspace(ws2, &be);
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+        engine.switch_workspace(crate::layout::workspace_id_from_number(1), &be);
+        assert!(!engine.applied_state.get(&float).unwrap().visible);
+    }
+
+    #[test]
+    fn test_a_floating_window_is_tiled_again_on_its_own_workspace() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        let oid = engine.focused_output().unwrap();
+        let ws2 = crate::layout::workspace_id_from_number(2);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_to_workspace(float, ws2, &be);
+
+        // The workspace 1 is active, the float lives on workspace 2: toggling it tiles it
+        // there, not into the strip the user is looking at.
+        engine.toggle_floating_for(float, &be);
+        assert!(!engine.is_floating(float));
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(monitor.workspaces.get(&ws2).unwrap().columns.len(), 1);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100]]);
+    }
+
+    #[test]
+    fn test_a_workspace_that_holds_only_a_floating_window_is_not_pruned() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let oid = engine.focused_output().unwrap();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        // Workspace id 2 gets no tile, only this float.
+        engine.float_move_to_workspace(float, 2, &be);
+        engine.maintain_empty_workspace(oid);
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert!(
+            monitor.workspaces.contains_key(&2),
+            "the workspace of a float is not empty: pruning it would orphan the float"
+        );
+        assert!(
+            monitor.workspaces.contains_key(&3),
+            "the trailing empty workspace comes after it"
+        );
+        // And it is a real place to go to: the float shows up when the user gets there.
+        engine.switch_workspace(2, &be);
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+        engine.switch_workspace(0, &be);
+        assert!(!engine.applied_state.get(&float).unwrap().visible);
+        assert!(engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspaces
+            .contains_key(&2));
+    }
+
+    #[test]
+    fn test_removing_a_window_forgets_its_floating_state() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_by(float, 10, 10, &be);
+        assert!(engine.float_memory.contains_key(&float));
+
+        engine.remove_window(float, &be);
+        assert!(!engine.is_floating(float));
+        assert!(!engine.float_homes.contains_key(&float));
+        assert!(!engine.float_memory.contains_key(&float));
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100))
+        );
+    }
+
+    #[test]
+    fn test_a_window_that_floats_by_rule_belongs_to_the_active_workspace() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        let mut rule = crate::config::WindowRule::default();
+        rule.class = Some("TestClass".to_string());
+        rule.floating = true;
+        engine.set_window_rules(vec![rule]);
+        engine.add_window(make_window(200, 500, 400), &be);
+
+        let home = engine.float_homes.get(&WindowId::new(200)).expect("a home");
+        assert_eq!(home.workspace, 0);
+        assert_eq!(Some(home.output), engine.focused_output());
+        assert!(home.rect.loc.x >= 0 && home.rect.loc.y >= 0);
+        assert!(home.rect.loc.x + home.rect.size.w as i32 <= 1920);
+        assert!(home.rect.loc.y + home.rect.size.h as i32 <= 1040);
+    }
+
+    #[test]
+    fn test_focus_float_goes_to_the_workspace_the_window_lives_on() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        let oid = engine.focused_output().unwrap();
+        let ws2 = crate::layout::workspace_id_from_number(2);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_to_workspace(float, ws2, &be);
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace, 0);
+
+        assert!(engine.focus_float(float, &be));
+        assert_eq!(engine.monitors().get(&oid).unwrap().active_workspace, ws2);
+        assert_eq!(engine.os_foreground, Some(float));
+        assert!(engine.applied_state.get(&float).unwrap().visible);
+        // A tile is not a floating window.
+        assert!(!engine.focus_float(WindowId::new(100), &be));
+    }
+
+    #[test]
+    fn test_fullscreen_of_a_floating_window_gives_it_its_rectangle_back() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.float_move_by(float, 40, 20, &be);
+        let before = engine.float_homes.get(&float).unwrap().rect;
+
+        engine.toggle_fullscreen_for(float, &be);
+        assert!(engine.is_fullscreen(float));
+        assert!(engine.is_floating(float), "still a floating window");
+        engine.toggle_fullscreen_for(float, &be);
+        assert!(!engine.is_fullscreen(float));
+        assert_eq!(engine.float_homes.get(&float).unwrap().rect, before);
+    }
+
+    #[test]
+    fn test_toggle_fullscreen_for_acts_on_the_given_window_not_the_focused_one() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+        engine.toggle_fullscreen_for(WindowId::new(100), &be);
+        assert!(engine.is_fullscreen(WindowId::new(100)));
+        assert!(!engine.is_fullscreen(WindowId::new(101)));
+    }
+
+    // --- Minimized windows leave no gap ---
+
+    /// An engine with one tile per id (one column each), the last one focused.
+    fn engine_with_tiles(ids: &[isize]) -> TilingEngine {
+        let be = BackendHandle::default_for_test();
+        let mut engine = make_engine();
+        for id in ids {
+            engine.add_window(make_window(*id, 500, 400), &be);
+        }
+        if let Some(last) = ids.last() {
+            engine.sync_os_foreground(WindowId::new(*last), &be);
+        }
+        engine
+    }
+
+    #[test]
+    fn test_a_minimized_window_leaves_no_gap_and_comes_back_in_its_place() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101, 102]);
+        let oid = engine.focused_output().unwrap();
+        engine.sync_os_foreground(WindowId::new(101), &be);
+
+        engine.minimize_window(WindowId::new(101), &be);
+        assert!(engine.is_minimized(WindowId::new(101)));
+        assert!(
+            engine.tiled_windows().contains_key(&WindowId::new(101)),
+            "wiri still knows the window"
+        );
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![102]]);
+        assert!(engine.locate_window(WindowId::new(101)).is_none());
+        // The focus moved on to a window that is still there.
+        let focus = focus_window_of(&engine).expect("a focus");
+        assert!(focus == WindowId::new(100) || focus == WindowId::new(102));
+
+        engine.restore_window(WindowId::new(101), &be);
+        assert!(!engine.is_minimized(WindowId::new(101)));
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![102]]
+        );
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+        assert!(
+            engine
+                .applied_state
+                .get(&WindowId::new(101))
+                .unwrap()
+                .visible,
+            "the layout placed it again"
+        );
+    }
+
+    #[test]
+    fn test_a_minimized_window_keeps_its_column_width_and_stack() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101, 102, 103]);
+        let oid = engine.focused_output().unwrap();
+        // 101 and 102 share a column of their own.
+        {
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(102), 1, 1));
+            ws.columns[1].width = Some(640);
+        }
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101, 102], vec![103]]
+        );
+
+        engine.minimize_window(WindowId::new(102), &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![103]]
+        );
+        engine.restore_window(WindowId::new(102), &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101, 102], vec![103]]
+        );
+
+        // The sole window of a column: the column and its width come back.
+        engine.minimize_window(WindowId::new(103), &be);
+        engine.minimize_window(WindowId::new(101), &be);
+        engine.minimize_window(WindowId::new(102), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100]]);
+        engine.restore_window(WindowId::new(101), &be);
+        assert_eq!(
+            engine
+                .monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[1]
+                .width,
+            Some(640),
+            "the column it lived in is rebuilt with its width"
+        );
+    }
+
+    #[test]
+    fn test_several_minimized_windows_come_back_in_their_old_order() {
+        // Win+D minimizes everything; the restore order is up to the shell.
+        let orders = [
+            [100, 101, 102],
+            [102, 101, 100],
+            [101, 100, 102],
+            [101, 102, 100],
+        ];
+        for restore_order in orders {
+            let be = BackendHandle::default_for_test();
+            let mut engine = engine_with_tiles(&[100, 101, 102]);
+            let oid = engine.focused_output().unwrap();
+            for id in [100, 101, 102] {
+                engine.minimize_window(WindowId::new(id), &be);
+            }
+            assert_eq!(column_windows(&engine, oid), Vec::<Vec<isize>>::new());
+            for id in restore_order {
+                engine.restore_window(WindowId::new(id), &be);
+            }
+            assert_eq!(
+                column_windows(&engine, oid),
+                vec![vec![100], vec![101], vec![102]],
+                "restored in the order {:?}",
+                restore_order
+            );
+        }
+    }
+
+    #[test]
+    fn test_minimizing_twice_or_an_unknown_window_changes_nothing() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        engine.minimize_window(WindowId::new(999), &be);
+        engine.restore_window(WindowId::new(999), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+
+        engine.minimize_window(WindowId::new(100), &be);
+        engine.minimize_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        // Restoring a window that is not minimized does nothing either.
+        engine.restore_window(WindowId::new(101), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        engine.restore_window(WindowId::new(100), &be);
+        engine.restore_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+    }
+
+    #[test]
+    fn test_a_window_closed_while_minimized_is_forgotten() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        engine.minimize_window(WindowId::new(100), &be);
+        engine.remove_window(WindowId::new(100), &be);
+        assert!(!engine.is_minimized(WindowId::new(100)));
+        assert!(!engine.tiled_windows().contains_key(&WindowId::new(100)));
+        engine.restore_window(WindowId::new(100), &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+    }
+
+    #[test]
+    fn test_a_window_restored_on_another_workspace_comes_back_where_the_user_is() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        engine.minimize_window(WindowId::new(101), &be);
+        engine.switch_workspace(crate::layout::workspace_id_from_number(2), &be);
+        assert_eq!(engine.minimized_workspace(WindowId::new(101)), Some(0));
+
+        engine.restore_window(WindowId::new(101), &be);
+        // The user is on workspace 2 and asked for the window: it is shown there.
+        assert_eq!(column_windows(&engine, oid), vec![vec![101]]);
+        assert_eq!(focus_window_of(&engine), Some(WindowId::new(101)));
+        let monitor = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            monitor.workspaces.get(&0).unwrap().columns.len(),
+            1,
+            "100 stays on workspace 1"
+        );
+    }
+
+    #[test]
+    fn test_a_minimized_fullscreen_window_leaves_fullscreen_and_returns_to_it() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let wid = WindowId::new(101);
+        engine.toggle_fullscreen_for(wid, &be);
+        assert!(engine.is_fullscreen(wid));
+
+        engine.minimize_window(wid, &be);
+        assert!(
+            !engine.is_fullscreen(wid),
+            "it no longer hides the other tile"
+        );
+        engine.restore_window(wid, &be);
+        assert!(
+            engine.is_fullscreen(wid),
+            "and covers the monitor again when restored"
+        );
+    }
+
+    #[test]
+    fn test_a_minimized_floating_window_stays_floating_and_is_no_target() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_tiles(&[100, 101]);
+        let float = WindowId::new(101);
+        engine.toggle_floating_for(float, &be);
+        engine.os_foreground = None;
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100))
+        );
+        engine.toggle_floating_for(WindowId::new(100), &be);
+        engine.os_foreground = None;
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100))
+        );
+
+        engine.minimize_window(WindowId::new(100), &be);
+        assert!(engine.is_minimized(WindowId::new(100)));
+        assert!(
+            engine.is_floating(WindowId::new(100)),
+            "still a floating window"
+        );
+        // The topmost float that is not minimized is what an action acts on.
+        assert_eq!(engine.state_target().map(|t| t.window), Some(float));
+
+        engine.restore_window(WindowId::new(100), &be);
+        assert!(!engine.is_minimized(WindowId::new(100)));
+        assert_eq!(
+            engine.state_target().map(|t| t.window),
+            Some(WindowId::new(100)),
+            "it is on top of the float stack again"
+        );
+    }
+
+    #[test]
     fn test_toggle_fullscreen_roundtrip() {
         let mut engine = make_engine();
         let window = make_window(100, 500, 400);
@@ -6188,6 +10269,50 @@ mod tests {
         assert!(engine.is_fullscreen(WindowId::new(100)));
         engine.toggle_fullscreen(&BackendHandle::default_for_test());
         assert!(!engine.is_fullscreen(WindowId::new(100)));
+    }
+
+    #[test]
+    fn test_leaving_fullscreen_reapplies_the_tile_rect() {
+        // Fullscreen is positioned outside the applied-state cache.  If the cache keeps
+        // its old entry, leaving fullscreen finds the tile rect "already applied" and
+        // never moves the window back: it stays as big as the screen.
+        let mut engine = make_engine();
+        engine.add_window(
+            make_window(100, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
+        engine.add_window(
+            make_window(101, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
+        engine.apply_all(&BackendHandle::default_for_test());
+        let wid = WindowId::new(101);
+        assert!(
+            engine
+                .applied_state
+                .get(&wid)
+                .expect("tiled and applied")
+                .visible
+        );
+        let tile_rect = engine.applied_state.get(&wid).expect("applied").rect;
+
+        engine.toggle_fullscreen(&BackendHandle::default_for_test());
+        assert!(engine.is_fullscreen(wid));
+        assert!(
+            engine
+                .applied_state
+                .get(&wid)
+                .map_or(true, |state| state.rect != tile_rect),
+            "entering fullscreen must drop the cached tile rectangle"
+        );
+
+        engine.toggle_fullscreen(&BackendHandle::default_for_test());
+        assert!(!engine.is_fullscreen(wid));
+        let after = engine
+            .applied_state
+            .get(&wid)
+            .expect("the layout pass after leaving fullscreen re-applies the window");
+        assert!(after.visible, "shown again as a tile");
     }
 
     #[test]
@@ -6274,7 +10399,10 @@ mod tests {
         let mut engine = make_engine();
         let window = make_window(100, 500, 400);
         engine.add_window(window, &BackendHandle::default_for_test());
-        assert_eq!(engine.window_sizing_mode(WindowId::new(100)), SizingMode::Normal);
+        assert_eq!(
+            engine.window_sizing_mode(WindowId::new(100)),
+            SizingMode::Normal
+        );
     }
 
     #[test]
@@ -6289,8 +10417,16 @@ mod tests {
         let mut engine = TilingEngine::new(LayoutConfig::default());
         let oid1 = OutputId::from_name("M1");
         let oid2 = OutputId::from_name("M2");
-        engine.register_monitor(oid1, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
-        engine.register_monitor(oid2, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            oid1,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        engine.register_monitor(
+            oid2,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
 
         engine.set_focused_output(oid2);
         assert_eq!(engine.focused_output(), Some(oid2));
@@ -6303,9 +10439,15 @@ mod tests {
     #[test]
     fn test_effective_column_width_edge_cases() {
         // 0 columns
-        assert_eq!(TilingEngine::effective_column_width(0, 1920, &LayoutConfig::default()), 500);
+        assert_eq!(
+            TilingEngine::effective_column_width(0, 1920, &LayoutConfig::default()),
+            500
+        );
         // 1 column
-        let config = LayoutConfig { column_width_mode: ColumnWidthMode::Proportional, ..LayoutConfig::default() };
+        let config = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            ..LayoutConfig::default()
+        };
         let w = TilingEngine::effective_column_width(1, 1920, &config);
         assert_eq!(w, 1920);
         // 100 columns — should still produce positive width
@@ -6338,7 +10480,8 @@ mod tests {
     fn test_calculate_positions_empty_workspace() {
         let engine = make_engine();
         let ws = crate::layout::Workspace::new();
-        let positions = engine.calculate_positions(&ws, Rect::new(0, 0, 1920, 1080), &engine.config);
+        let positions =
+            engine.calculate_positions(&ws, Rect::new(0, 0, 1920, 1080), &engine.config);
         assert!(positions.is_empty());
     }
 
@@ -6408,7 +10551,10 @@ mod tests {
         // We create ws 2 explicitly via switch_workspace so it appears in the
         // workspaces map but stays empty.
         if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
-            monitor.workspaces.entry(2).or_insert_with(crate::layout::Workspace::new);
+            monitor
+                .workspaces
+                .entry(2)
+                .or_insert_with(crate::layout::Workspace::new);
         }
 
         // ws 3: one window
@@ -6463,13 +10609,25 @@ mod tests {
         let mut y = 0;
         for ws_id in ws_ids {
             if let Some(ws) = monitor.workspaces.get(&ws_id) {
-                if ws.columns.is_empty() { continue; }
-                let mut p = engine.calculate_positions_in_section(ws, work_rect, y, nominal, &engine.config);
+                if ws.columns.is_empty() {
+                    continue;
+                }
+                let mut p = engine.calculate_positions_in_section(
+                    ws,
+                    work_rect,
+                    y,
+                    nominal,
+                    &engine.config,
+                );
                 total.append(&mut p);
                 y += scaled_section + gap;
             }
         }
-        assert_eq!(total.len(), 4, "overview must position every workspace's tiles");
+        assert_eq!(
+            total.len(),
+            4,
+            "overview must position every workspace's tiles"
+        );
     }
 
     #[test]
@@ -6522,20 +10680,30 @@ mod tests {
         };
         let mut engine = TilingEngine::new(config);
         let oid = OutputId::from_name("Test");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
 
         // Eight workspaces, each with one 500px column.  Stacked they need
         // 8 * 1040 + 7 * 50 = 8670px tall vs 1040 available → zoom_h ~0.12.
         for i in 0..8 {
-            engine.add_window(make_window(100 + i, 0, 0), &BackendHandle::default_for_test());
+            engine.add_window(
+                make_window(100 + i, 0, 0),
+                &BackendHandle::default_for_test(),
+            );
             engine.move_window_to_workspace(i as i32 + 100, &BackendHandle::default_for_test());
         }
 
         engine.enter_overview(&BackendHandle::default_for_test());
         assert!(engine.is_overview());
         let zoom = engine.overview_zoom();
-        assert!(zoom < 0.5,
-            "8 stacked workspaces must force zoom < 0.5; got {}", zoom);
+        assert!(
+            zoom < 0.5,
+            "8 stacked workspaces must force zoom < 0.5; got {}",
+            zoom
+        );
     }
 
     #[test]
@@ -6548,7 +10716,9 @@ mod tests {
         let oid = engine.focused_output().unwrap();
 
         // Go to col 0
-        for _ in 0..2 { engine.focus_left(&BackendHandle::default_for_test()); }
+        for _ in 0..2 {
+            engine.focus_left(&BackendHandle::default_for_test());
+        }
         let monitor = engine.monitors().get(&oid).unwrap();
         assert_eq!(monitor.focus_column, Some(0));
 
@@ -6568,12 +10738,25 @@ mod tests {
         let mut engine = TilingEngine::new(LayoutConfig::default());
         let oid1 = OutputId::from_name("M1");
         let oid2 = OutputId::from_name("M2");
-        engine.register_monitor(oid1, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
-        engine.register_monitor(oid2, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            oid1,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        engine.register_monitor(
+            oid2,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
 
         // Window is in the bounds of monitor 1 but we force it to monitor 2.
         let window = make_window(100, 200, 200);
-        engine.add_window_with_target(window, AddWindowTarget::Output(oid2), &BackendHandle::default_for_test(), false);
+        engine.add_window_with_target(
+            window,
+            AddWindowTarget::Output(oid2),
+            &BackendHandle::default_for_test(),
+            false,
+        );
 
         // Should be in monitor 2's workspace, not monitor 1's.
         let m2 = engine.monitors().get(&oid2).unwrap();
@@ -6592,7 +10775,10 @@ mod tests {
         let window = make_window(100, 200, 200);
         engine.add_window_with_target(
             window,
-            AddWindowTarget::Workspace { output: oid, workspace_id: 3 },
+            AddWindowTarget::Workspace {
+                output: oid,
+                workspace_id: 3,
+            },
             &BackendHandle::default_for_test(),
             false,
         );
@@ -6661,8 +10847,11 @@ mod tests {
     #[test]
     fn test_default_config_is_fixed_mode() {
         let config = LayoutConfig::default();
-        assert_eq!(config.column_width_mode, ColumnWidthMode::Fixed,
-            "Default column_width_mode must be Fixed (niri invariant)");
+        assert_eq!(
+            config.column_width_mode,
+            ColumnWidthMode::Fixed,
+            "Default column_width_mode must be Fixed (niri invariant)"
+        );
     }
 
     #[test]
@@ -6675,22 +10864,36 @@ mod tests {
         }
         engine.enter_overview(&BackendHandle::default_for_test());
         assert!(engine.is_overview());
-        assert!(engine.overview_zoom() < 1.0, "10 Fixed-500px columns must need zoom-out");
+        assert!(
+            engine.overview_zoom() < 1.0,
+            "10 Fixed-500px columns must need zoom-out"
+        );
 
         let oid = engine.focused_output().unwrap();
         let monitor = engine.monitors().get(&oid).unwrap();
         let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
         let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
-        assert_eq!(positions.len(), 10, "all 10 windows must be positioned in overview");
+        assert_eq!(
+            positions.len(),
+            10,
+            "all 10 windows must be positioned in overview"
+        );
         let work_right = work_rect.loc.x + work_rect.size.w as i32;
         for (_, rect) in &positions {
-            assert!(rect.loc.x >= work_rect.loc.x,
-                "window x={} left of work area x={}", rect.loc.x, work_rect.loc.x);
+            assert!(
+                rect.loc.x >= work_rect.loc.x,
+                "window x={} left of work area x={}",
+                rect.loc.x,
+                work_rect.loc.x
+            );
             // Allow 10px slop for integer rounding.
-            assert!(rect.loc.x + rect.size.w as i32 <= work_right + 10,
+            assert!(
+                rect.loc.x + rect.size.w as i32 <= work_right + 10,
                 "window right={} exceeds work right={}+10",
-                rect.loc.x + rect.size.w as i32, work_right);
+                rect.loc.x + rect.size.w as i32,
+                work_right
+            );
         }
     }
 
@@ -6746,8 +10949,16 @@ mod tests {
         let mut engine = TilingEngine::new(LayoutConfig::default());
         let oid1 = OutputId::from_name("Primary");
         let oid2 = OutputId::from_name("Secondary");
-        engine.register_monitor(oid1, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
-        engine.register_monitor(oid2, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            oid1,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        engine.register_monitor(
+            oid2,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
 
         // Primary is first inserted.
         assert_eq!(engine.monitors().primary_id(), Some(oid1));
@@ -6781,8 +10992,10 @@ mod tests {
             let monitor = engine.monitors().get(&oid).unwrap();
             let workspace = monitor.workspace().unwrap();
             let tile = &workspace.columns[0].tiles[0];
-            assert!(tile.configure_throttle.last_send.is_some(),
-                "last_send should be set after first apply");
+            assert!(
+                tile.configure_throttle.last_send.is_some(),
+                "last_send should be set after first apply"
+            );
         }
 
         // Second apply: default min_interval is 16ms and we're well within that window,
@@ -6794,8 +11007,11 @@ mod tests {
             let monitor = engine.monitors().get(&oid).unwrap();
             let workspace = monitor.workspace().unwrap();
             let tile = &workspace.columns[0].tiles[0];
-            assert_ne!(tile.configure_throttle.intent(), ConfigureIntent::ShouldSend,
-                "intent should not be ShouldSend on the second immediate apply");
+            assert_ne!(
+                tile.configure_throttle.intent(),
+                ConfigureIntent::ShouldSend,
+                "intent should not be ShouldSend on the second immediate apply"
+            );
         }
     }
 
@@ -6887,13 +11103,17 @@ mod tests {
 
         // Prime the cache.
         engine.apply_all(&BackendHandle::default_for_test());
-        assert!(engine.applied_state.contains_key(&WindowId::new(100)),
-            "cache must contain entry after first apply");
+        assert!(
+            engine.applied_state.contains_key(&WindowId::new(100)),
+            "cache must contain entry after first apply"
+        );
 
         // Remove the window.
         engine.remove_window(WindowId::new(100), &BackendHandle::default_for_test());
-        assert!(!engine.applied_state.contains_key(&WindowId::new(100)),
-            "cache entry must be removed when window is removed");
+        assert!(
+            !engine.applied_state.contains_key(&WindowId::new(100)),
+            "cache entry must be removed when window is removed"
+        );
     }
 
     // =========================================================================
@@ -6951,11 +11171,19 @@ mod tests {
     #[test]
     fn test_move_window_to_monitor_left_with_two_monitors() {
         let mut engine = TilingEngine::new(LayoutConfig::default());
-        let oid_left  = OutputId::from_name("Left");
+        let oid_left = OutputId::from_name("Left");
         let oid_right = OutputId::from_name("Right");
         // Left monitor at x=0, right monitor at x=1920
-        engine.register_monitor(oid_left,  Rect::new(0,    0, 1920, 1080), Rect::new(0,    0, 1920, 1040));
-        engine.register_monitor(oid_right, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1040));
+        engine.register_monitor(
+            oid_left,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        engine.register_monitor(
+            oid_right,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
         // Focus the right monitor and add a window there
         engine.set_focused_output(oid_right);
 
@@ -6970,11 +11198,17 @@ mod tests {
         engine.move_window_to_monitor(ScrollDirection::Left, &BackendHandle::default_for_test());
 
         let left_mon = engine.monitors().get(&oid_left).unwrap();
-        assert_eq!(left_mon.workspace().unwrap().columns.len(), 1,
-            "window should have moved to left monitor");
+        assert_eq!(
+            left_mon.workspace().unwrap().columns.len(),
+            1,
+            "window should have moved to left monitor"
+        );
         let right_mon = engine.monitors().get(&oid_right).unwrap();
-        assert_eq!(right_mon.workspace().unwrap().columns.len(), 0,
-            "right monitor should now be empty");
+        assert_eq!(
+            right_mon.workspace().unwrap().columns.len(),
+            0,
+            "right monitor should now be empty"
+        );
     }
 
     #[test]
@@ -6988,8 +11222,11 @@ mod tests {
         engine.move_window_to_monitor(ScrollDirection::Left, &BackendHandle::default_for_test());
 
         let monitor = engine.monitors().get(&oid).unwrap();
-        assert_eq!(monitor.workspace().unwrap().columns.len(), 1,
-            "single monitor: column count unchanged");
+        assert_eq!(
+            monitor.workspace().unwrap().columns.len(),
+            1,
+            "single monitor: column count unchanged"
+        );
     }
 
     // --- Item 3: center_focused_column ---
@@ -7004,7 +11241,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         // Add 5 windows — each in its own 500px column
         for i in 100..105 {
@@ -7025,70 +11266,408 @@ mod tests {
         // work_rect width = 1920, center=960
         // expected scroll = 2314 - 960 = 1354
         // (clamped: total=5*500+4*16=2564, max_scroll=2564-1920=644)
-        assert!(scroll > 0, "scroll should be positive when centering column 4; got {}", scroll);
+        assert!(
+            scroll > 0,
+            "scroll should be positive when centering column 4; got {}",
+            scroll
+        );
     }
 
-    // --- set_column_width_preset ---
+    // --- niri's size grammar: set-column-width, the presets, set-window-height ---
+
+    /// An engine (1920 x 1080 monitor, no outer gaps, 16 px between columns, 4 px borders)
+    /// with one tile in each of the given windows' columns.
+    fn engine_with_columns_16(ids: &[isize]) -> TilingEngine {
+        let mut engine = TilingEngine::new(LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            outer_gaps: (0, 0, 0, 0),
+            ..LayoutConfig::default()
+        });
+        engine.register_monitor(
+            OutputId::from_name("M"),
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
+        for id in ids {
+            engine.add_window(make_window(*id, 0, 0), &BackendHandle::default_for_test());
+        }
+        engine
+    }
+
+    fn column_width_of(engine: &TilingEngine, col: usize) -> Option<u32> {
+        let oid = engine.focused_output().unwrap();
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[col]
+            .width
+    }
 
     #[test]
     fn test_column_width_preset_half() {
-        let mut engine = TilingEngine::new(LayoutConfig {
-            column_width_mode: ColumnWidthMode::Fixed,
-            column_width: 500,
-            outer_gaps: (0, 0, 0, 0),
-            ..LayoutConfig::default()
-        });
-        let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
-
-        let window = make_window(100, 500, 400);
-        engine.add_window(window, &BackendHandle::default_for_test());
-
+        let mut engine = engine_with_columns_16(&[100]);
         engine.set_column_width_preset(ColumnWidthPreset::Half, &BackendHandle::default_for_test());
-
-        let oid_e = engine.focused_output().unwrap();
-        let monitor = engine.monitors().get(&oid_e).unwrap();
-        let col_w = monitor.workspace().unwrap().columns[0].width.unwrap();
-        // 50% of 1920 = 960
-        assert_eq!(col_w, 960, "Half preset should set width to 960 (50% of 1920)");
+        // Half of the view, minus half of the 16 px gap: two of them and the gap fill 1920.
+        assert_eq!(column_width_of(&engine, 0), Some(952));
     }
 
     #[test]
-    fn test_column_width_preset_cycle() {
-        let mut engine = TilingEngine::new(LayoutConfig {
-            column_width_mode: ColumnWidthMode::Fixed,
-            column_width: 500,
-            outer_gaps: (0, 0, 0, 0),
-            ..LayoutConfig::default()
-        });
-        let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+    fn test_set_column_width_proportions_make_columns_fill_the_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100, 101, 102]);
+        for id in [100, 101] {
+            focus_window(&mut engine, id);
+            engine.set_column_width_by(SizeChange::SetProportion(50_000), &be);
+        }
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        assert_eq!(column_width_of(&engine, 1), Some(952));
+        assert_eq!(
+            952 + 16 + 952,
+            1920,
+            "two halves and the gap fill the view exactly"
+        );
+        // A third and two thirds fill it too (within the rounding of a pixel).
+        engine.set_column_width_by(SizeChange::SetProportion(33_333), &be);
+        focus_window(&mut engine, 102);
+        engine.set_column_width_by(SizeChange::SetProportion(66_667), &be);
+        let (third, two_thirds) = (
+            column_width_of(&engine, 1).unwrap() as i32,
+            column_width_of(&engine, 2).unwrap() as i32,
+        );
+        assert_eq!((third, two_thirds), (629, 1275));
+        assert_eq!(third + 16 + two_thirds, 1920);
+    }
 
-        let window = make_window(100, 500, 400);
-        engine.add_window(window, &BackendHandle::default_for_test());
+    #[test]
+    fn test_set_column_width_adjusts_and_sets_pixels() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        engine.set_column_width_by(SizeChange::SetProportion(50_000), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        // +10 % of the view (and the gap), then -10 % brings it back.
+        engine.set_column_width_by(SizeChange::AdjustProportion(10_000), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(1146));
+        engine.set_column_width_by(SizeChange::AdjustProportion(-10_000), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        // A fixed width is the window's: the 4 px borders around it come on top.
+        engine.set_column_width_by(SizeChange::SetFixed(600), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(608));
+        engine.set_column_width_by(SizeChange::AdjustFixed(100), &be);
+        assert_eq!(column_width_of(&engine, 0), Some(708));
+        engine.set_column_width_by(SizeChange::AdjustFixed(-5000), &be);
+        assert_eq!(
+            column_width_of(&engine, 0),
+            Some(50),
+            "never narrower than 50 px"
+        );
+        // The window really gets the width (the layout insets the column by the border).
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.set_column_width_by(SizeChange::SetFixed(600), &be);
+        let rect = engine.applied_state.get(&WindowId::new(100)).unwrap().rect;
+        assert_eq!(rect.size.w, 600);
+    }
 
-        // Niri-style cycle order:
-        //   1/4 → 1/3 → 1/2 → 2/3 → 3/4 → full → 1/4 …
-        // Default last_column_preset is Half → first Cycle → TwoThirds (1280).
-        engine.set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let oid_e = engine.focused_output().unwrap();
-        let w1 = engine.monitors().get(&oid_e).unwrap().workspace().unwrap().columns[0].width.unwrap();
-        assert_eq!(w1, 1280, "first Cycle from Half should be TwoThirds (1280)");
+    #[test]
+    fn test_a_size_change_ends_the_maximized_state_and_goes_on_from_the_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        engine.toggle_maximize_focused_column(&be);
+        engine.set_column_width_by(SizeChange::AdjustProportion(-50_000), &be);
+        let oid = engine.focused_output().unwrap();
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
+        assert!(!col.maximized);
+        // From a column as wide as the view (1920), minus half of it: 1920 / 2 - 8.
+        assert_eq!(col.width, Some(952));
+    }
 
-        // Second Cycle → ThreeQuarters (1440 = 1920 * 3/4)
-        engine.set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let w2 = engine.monitors().get(&oid_e).unwrap().workspace().unwrap().columns[0].width.unwrap();
-        assert_eq!(w2, 1440, "second Cycle should be ThreeQuarters (1440)");
+    #[test]
+    fn test_switch_preset_column_width_follows_niri() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        // A third, a half and two thirds of the view, with the gap: 629, 952, 1275.
+        // The 500 px column gets the first preset that is wider, then the cycle goes on.
+        let mut widths = Vec::new();
+        for _ in 0..4 {
+            engine.switch_preset_column_width(true, &be);
+            widths.push(column_width_of(&engine, 0).unwrap());
+        }
+        assert_eq!(widths, vec![629, 952, 1275, 629]);
+        // Backwards from the first preset: the last one, then down.
+        let mut widths = Vec::new();
+        for _ in 0..3 {
+            engine.switch_preset_column_width(false, &be);
+            widths.push(column_width_of(&engine, 0).unwrap());
+        }
+        assert_eq!(widths, vec![1275, 952, 629]);
 
-        // Third Cycle → Full (1920)
-        engine.set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let w3 = engine.monitors().get(&oid_e).unwrap().workspace().unwrap().columns[0].width.unwrap();
-        assert_eq!(w3, 1920, "third Cycle should be Full (1920)");
+        // A width of its own forgets the preset: 700 px -> the first preset wider (952),
+        // and going back from 700 -> the last one narrower (629).
+        engine.set_column_width_by(SizeChange::SetFixed(692), &be); // 692 + 8 = 700
+        engine.switch_preset_column_width(true, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(952));
+        engine.set_column_width_by(SizeChange::SetFixed(692), &be);
+        engine.switch_preset_column_width(false, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(629));
 
-        // Fourth Cycle wraps → OneQuarter (480 = 1920 / 4)
-        engine.set_column_width_preset(ColumnWidthPreset::Cycle, &BackendHandle::default_for_test());
-        let w4 = engine.monitors().get(&oid_e).unwrap().workspace().unwrap().columns[0].width.unwrap();
-        assert_eq!(w4, 480, "fourth Cycle should wrap to OneQuarter (480)");
+        // A maximized column counts as one as wide as the view: forwards starts over at
+        // the first preset, backwards takes the last.
+        engine.toggle_maximize_focused_column(&be);
+        engine.switch_preset_column_width(true, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(629));
+        engine.toggle_maximize_focused_column(&be);
+        engine.switch_preset_column_width(false, &be);
+        assert_eq!(column_width_of(&engine, 0), Some(1275));
+    }
+
+    #[test]
+    fn test_next_preset_index() {
+        let presets = [629, 952, 1275];
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 500, &presets, true),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 629, &presets, true),
+            1,
+            "equal is not wider"
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 700, &presets, true),
+            1
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 1275, &presets, true),
+            0,
+            "wraps"
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 2000, &presets, true),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 700, &presets, false),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 629, &presets, false),
+            2,
+            "wraps"
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(None, 2000, &presets, false),
+            2
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(Some(2), 1275, &presets, true),
+            0
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(Some(0), 629, &presets, false),
+            2
+        );
+        assert_eq!(
+            TilingEngine::next_preset_index(Some(1), 5, &presets, true),
+            2,
+            "remembered wins"
+        );
+    }
+
+    /// A column of two tiles on an engine with one monitor; the first tile is focused.
+    fn engine_with_one_column_of_two() -> TilingEngine {
+        let mut engine = engine_with_columns_16(&[100, 101]);
+        {
+            let oid = engine.focused_output().unwrap();
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(101), 0, 1));
+        }
+        focus_window(&mut engine, 100);
+        engine
+    }
+
+    fn tile_weights(engine: &TilingEngine) -> Vec<f32> {
+        let oid = engine.focused_output().unwrap();
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles
+            .iter()
+            .map(|t| t.height_weight)
+            .collect()
+    }
+
+    #[test]
+    fn test_set_window_height_gives_the_window_a_share_of_the_column() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_one_column_of_two();
+        // Column: 1080 px high, 12 px gap between the tiles: 1068 px to share.
+        // 75 % of the view is 0.75 * (1080 + 12) - 12 = 807 px: a share of 807 / 1068.
+        engine.set_window_height_by(SizeChange::SetProportion(75_000), &be);
+        let w = tile_weights(&engine);
+        let share = w[0] / (w[0] + w[1]);
+        assert!((share - 807.0 / 1068.0).abs() < 0.002, "{:?}", w);
+        assert_eq!(w[1], 1.0, "the other window keeps its weight");
+
+        // A fixed height is the window's (the 4 px borders come on top): 300 + 8 px.
+        engine.set_window_height_by(SizeChange::SetFixed(300), &be);
+        let w = tile_weights(&engine);
+        assert!(
+            (w[0] / (w[0] + w[1]) - 308.0 / 1068.0).abs() < 0.002,
+            "{:?}",
+            w
+        );
+
+        // +100 px from there, and -10 % of the view.
+        engine.set_window_height_by(SizeChange::AdjustFixed(100), &be);
+        let w = tile_weights(&engine);
+        assert!(
+            (w[0] / (w[0] + w[1]) - 408.0 / 1068.0).abs() < 0.002,
+            "{:?}",
+            w
+        );
+        engine.set_window_height_by(SizeChange::AdjustProportion(-10_000), &be);
+        let w = tile_weights(&engine);
+        assert!(
+            (w[0] / (w[0] + w[1]) - (408.0 - 109.2) / 1068.0).abs() < 0.003,
+            "{:?}",
+            w
+        );
+    }
+
+    #[test]
+    fn test_reset_window_height_restores_the_default_weight() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_one_column_of_two();
+        engine.set_window_height_by(SizeChange::SetProportion(80_000), &be);
+        assert!(tile_weights(&engine)[0] > 2.0);
+        engine.reset_window_height(&be);
+        assert_eq!(tile_weights(&engine), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_a_lone_window_has_no_height_to_change() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns_16(&[100]);
+        focus_window(&mut engine, 100);
+        engine.set_window_height_by(SizeChange::SetProportion(30_000), &be);
+        assert_eq!(tile_weights(&engine), vec![1.0]);
+    }
+
+    #[test]
+    fn test_float_size_changes_use_the_work_area() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.toggle_floating_for(wid, &be); // 800 x 600, in the middle of 1920 x 1040
+        let rect = |e: &TilingEngine| e.float_homes.get(&wid).unwrap().rect;
+        engine.float_apply_size_change(
+            wid,
+            SizeAxis::Width,
+            SizeChange::SetProportion(50_000),
+            &be,
+        );
+        assert_eq!(rect(&engine).size.w, 960);
+        engine.float_apply_size_change(
+            wid,
+            SizeAxis::Width,
+            SizeChange::AdjustProportion(10_000),
+            &be,
+        );
+        assert_eq!(rect(&engine).size.w, 1152);
+        engine.float_apply_size_change(wid, SizeAxis::Width, SizeChange::SetFixed(700), &be);
+        assert_eq!(rect(&engine).size.w, 700);
+        engine.float_apply_size_change(
+            wid,
+            SizeAxis::Height,
+            SizeChange::SetProportion(50_000),
+            &be,
+        );
+        assert_eq!(rect(&engine).size.h, 520);
+        engine.float_apply_size_change(wid, SizeAxis::Height, SizeChange::AdjustFixed(-100), &be);
+        assert_eq!(rect(&engine).size.h, 420);
+    }
+
+    #[test]
+    fn test_move_window_to_floating_and_tiling_are_not_toggles() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_two_tiles();
+        let wid = WindowId::new(100);
+        engine.set_window_floating(wid, false, &be);
+        assert!(!engine.is_floating(wid), "already tiled: nothing happens");
+        engine.set_window_floating(wid, true, &be);
+        engine.set_window_floating(wid, true, &be);
+        assert!(
+            engine.is_floating(wid),
+            "a second `to floating` does not tile it again"
+        );
+        engine.set_window_floating(wid, false, &be);
+        engine.set_window_floating(wid, false, &be);
+        assert!(!engine.is_floating(wid));
+        assert_eq!(
+            engine.locate_window(wid).map(|l| l.2),
+            Some(1),
+            "back in a column of its own"
+        );
+    }
+
+    #[test]
+    fn test_focus_monitor_left_and_right_stop_at_the_edges() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        let (a, b, c) = (
+            OutputId::from_name("A"),
+            OutputId::from_name("B"),
+            OutputId::from_name("C"),
+        );
+        // Registered out of order: the monitors are ordered by their position.
+        engine.register_monitor(
+            b,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
+        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(
+            c,
+            Rect::new(3840, 0, 1920, 1080),
+            Rect::new(3840, 0, 1920, 1040),
+        );
+        engine.set_focused_output(b);
+        assert!(engine.focus_monitor_toward(ScrollDirection::Right, &be));
+        assert_eq!(engine.focused_output(), Some(c));
+        assert!(
+            !engine.focus_monitor_toward(ScrollDirection::Right, &be),
+            "no monitor further right"
+        );
+        assert_eq!(engine.focused_output(), Some(c));
+        assert!(engine.focus_monitor_toward(ScrollDirection::Left, &be));
+        assert!(engine.focus_monitor_toward(ScrollDirection::Left, &be));
+        assert_eq!(engine.focused_output(), Some(a));
+        assert!(
+            !engine.focus_monitor_toward(ScrollDirection::Left, &be),
+            "no wrapping around"
+        );
+        assert_eq!(engine.focused_output(), Some(a));
     }
 
     // --- Item 5: resize_focused_column_by ---
@@ -7102,26 +11681,51 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         let window = make_window(100, 500, 400);
         engine.add_window(window, &BackendHandle::default_for_test());
 
         // Column starts at config width 500.
         let oid_e = engine.focused_output().unwrap();
-        let init_w = engine.monitors().get(&oid_e).unwrap()
-            .workspace().unwrap().columns[0].width.unwrap_or(500);
+        let init_w = engine
+            .monitors()
+            .get(&oid_e)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap_or(500);
 
         // Grow by 100px
         engine.resize_focused_column_by(100, &BackendHandle::default_for_test());
-        let new_w = engine.monitors().get(&oid_e).unwrap()
-            .workspace().unwrap().columns[0].width.unwrap();
+        let new_w = engine
+            .monitors()
+            .get(&oid_e)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert_eq!(new_w as i32, init_w as i32 + 100);
 
         // Shrink by 50px
         engine.resize_focused_column_by(-50, &BackendHandle::default_for_test());
-        let new_w2 = engine.monitors().get(&oid_e).unwrap()
-            .workspace().unwrap().columns[0].width.unwrap();
+        let new_w2 = engine
+            .monitors()
+            .get(&oid_e)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert_eq!(new_w2 as i32, init_w as i32 + 50);
     }
 
@@ -7134,56 +11738,352 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         let window = make_window(100, 100, 400);
         engine.add_window(window, &BackendHandle::default_for_test());
 
         // Shrink by a huge amount — should clamp to 50
         engine.resize_focused_column_by(-9999, &BackendHandle::default_for_test());
         let oid_e = engine.focused_output().unwrap();
-        let w = engine.monitors().get(&oid_e).unwrap()
-            .workspace().unwrap().columns[0].width.unwrap();
+        let w = engine
+            .monitors()
+            .get(&oid_e)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert_eq!(w, 50, "minimum column width must be 50px");
     }
 
-    // --- Item 6: focus_workspace_relative ---
+    // --- Item 6: focus_workspace_relative (niri `focus-workspace-down` / `-up`) ---
 
-    #[test]
-    fn test_focus_workspace_next_wraps() {
+    /// A one-monitor engine with a window on each of the given workspace ids (the first
+    /// window on the first id, and so on) and the empty workspace below the last one.
+    fn engine_with_workspaces(ids: &[i32]) -> (TilingEngine, OutputId) {
+        let be = BackendHandle::default_for_test();
         let mut engine = make_engine();
         let oid = engine.focused_output().unwrap();
-        // Create workspaces 0 and 1 on the monitor
-        if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
-            monitor.workspaces.insert(1, crate::layout::Workspace::new());
+        for (n, id) in ids.iter().enumerate() {
+            engine.add_window_with_target(
+                make_window(100 + n as isize, 0, 0),
+                AddWindowTarget::Workspace {
+                    output: oid,
+                    workspace_id: *id,
+                },
+                &be,
+                false,
+            );
         }
+        engine.maintain_empty_workspace(oid);
+        (engine, oid)
+    }
 
-        // Currently on ws 0. Next → ws 1.
-        engine.focus_workspace_relative(WorkspaceDirection::Next, &BackendHandle::default_for_test());
-        {
-            let monitor = engine.monitors().get(&oid).unwrap();
-            assert_eq!(monitor.active_workspace, 1, "should have moved to workspace 1");
-        }
+    fn workspace_ids_of(engine: &TilingEngine, oid: OutputId) -> Vec<i32> {
+        engine.monitors().get(&oid).unwrap().workspace_ids()
+    }
 
-        // Next from ws 1 → wraps to ws 0 (only 2 workspaces: 0, 1).
-        engine.focus_workspace_relative(WorkspaceDirection::Next, &BackendHandle::default_for_test());
-        {
-            let monitor = engine.monitors().get(&oid).unwrap();
-            assert_eq!(monitor.active_workspace, 0, "should wrap from ws 1 back to ws 0");
-        }
+    fn active_workspace_of(engine: &TilingEngine, oid: OutputId) -> i32 {
+        engine.monitors().get(&oid).unwrap().active_workspace
     }
 
     #[test]
-    fn test_focus_workspace_previous_wraps() {
+    fn test_focus_workspace_down_and_up_stop_at_the_ends() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2]);
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            0,
+            "nothing above the first (no wrapping)"
+        );
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "nothing below the empty one at the bottom"
+        );
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+    }
+
+    #[test]
+    fn test_workspace_up_and_down_skip_the_gaps_of_the_ids() {
+        let be = BackendHandle::default_for_test();
+        // Workspace 1 never existed (or went away): the second workspace is id 2.
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3]);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2);
+        engine.focus_workspace_relative(WorkspaceDirection::Next, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 3);
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        engine.focus_workspace_relative(WorkspaceDirection::Previous, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+    }
+
+    #[test]
+    fn test_focus_workspace_number_counts_positions_not_ids() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        // Positions from the top: 0 is the first, 2 the second, the empty one below is the third.
+        assert_eq!(engine.workspace_number_on(oid, 0), 1);
+        assert_eq!(engine.workspace_number_on(oid, 2), 2);
+        assert_eq!(engine.workspace_number_on(oid, 3), 3);
+        assert_eq!(engine.workspace_id_for_number(2), 2);
+        engine.focus_workspace_number(2, &be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "workspace 2 is the second one, not id 1"
+        );
+        engine.focus_workspace_number(3, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 3);
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+        // A number past the last workspace is the last one (the empty one at the bottom):
+        // no workspace 9 is made up.
+        engine.focus_workspace_number(9, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 3);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn test_an_empty_workspace_in_the_middle_goes_when_it_is_left() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        // Keys are not positions. Explicitly insert an empty workspace between the
+        // occupied ones rather than relying on numeric key sorting.
+        let monitor = engine.monitors.get_mut(&oid).unwrap();
+        monitor.insert_workspace(1, crate::layout::Workspace::new());
+        monitor.move_workspace_to_position(1, 1);
+        engine.switch_workspace(1, &be);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2, 3]);
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(
+            workspace_ids_of(&engine, oid),
+            vec![0, 2, 3],
+            "it vanished as the user left it"
+        );
+    }
+
+    #[test]
+    fn test_focus_workspace_previous_goes_back_to_the_last_visited_one() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            0,
+            "nothing visited yet: nothing happens"
+        );
+        engine.focus_workspace_number(2, &be);
+        engine.focus_workspace_number(3, &be);
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "back and forth between the last two"
+        );
+        engine.focus_workspace_last_visited(&be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+    }
+
+    #[test]
+    fn test_workspace_auto_back_and_forth_returns_to_the_previous_workspace() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        // Off (the default): asking for the workspace you are on stays there.
+        engine.focus_workspace_number(2, &be);
+        engine.focus_workspace_number(2, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+
+        let mut config = crate::config::Config::default();
+        config.input.workspace_auto_back_and_forth = true;
+        engine.set_full_config(config);
+        engine.focus_workspace_number(2, &be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            0,
+            "the second workspace again: back to the first"
+        );
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            1,
+            "the first workspace again: back to the second"
+        );
+        // Nothing to go back to: stays.
+        let (mut fresh, foid) = engine_with_workspaces(&[0, 1]);
+        let mut config = crate::config::Config::default();
+        config.input.workspace_auto_back_and_forth = true;
+        fresh.set_full_config(config);
+        fresh.focus_workspace_number(1, &be);
+        assert_eq!(active_workspace_of(&fresh, foid), 0);
+    }
+
+    fn named_workspaces_config(names: &[&str]) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.workspace = names
+            .iter()
+            .map(|name| crate::config::types::WorkspaceConfig {
+                name: name.to_string(),
+                follow_on_focus: false,
+                ..Default::default()
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn test_named_workspaces_exist_from_the_start_and_are_never_pruned() {
+        let be = BackendHandle::default_for_test();
+        // The config comes first, the monitor appears afterwards (as at startup).
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        engine.set_full_config(named_workspaces_config(&["web", "chat"]));
+        let oid = OutputId::from_name("M");
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        assert_eq!(
+            workspace_ids_of(&engine, oid),
+            vec![0, 1, 2],
+            "both named workspaces exist, empty, with the empty one below them"
+        );
+        // Leave them: they stay, empty as they are.
+        engine.focus_workspace_named("chat", &be);
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        engine.focus_workspace_number(3, &be);
+        assert_eq!(active_workspace_of(&engine, oid), 2);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2]);
+        engine.focus_workspace_number(1, &be);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2]);
+        // A window on the empty workspace below them opens a new empty one.
+        engine.focus_workspace_number(3, &be);
+        engine.add_window(make_window(100, 0, 0), &be);
+        engine.maintain_empty_workspace(oid);
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1, 2, 3]);
+        // The names are the positions' names: the second workspace is "chat".
+        assert_eq!(engine.workspace_id_by_name("chat"), Some(1));
+        assert_eq!(engine.workspace_label(oid, 1), "chat");
+        assert_eq!(engine.workspace_label(oid, 2), "Workspace 3");
+    }
+
+    #[test]
+    fn test_named_workspaces_appear_on_a_config_reload_and_on_a_new_monitor() {
         let mut engine = make_engine();
         let oid = engine.focused_output().unwrap();
-        if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
-            monitor.workspaces.insert(1, crate::layout::Workspace::new());
-            monitor.workspaces.insert(2, crate::layout::Workspace::new());
-        }
-        // On ws 0. Previous → wraps to ws 2.
-        engine.focus_workspace_relative(WorkspaceDirection::Previous, &BackendHandle::default_for_test());
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0]);
+        engine.set_full_config(named_workspaces_config(&["web"]));
+        assert_eq!(workspace_ids_of(&engine, oid), vec![0, 1]);
+        let second = OutputId::from_name("Second");
+        engine.register_monitor(
+            second,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
+        // Configured names are globally unique objects, not cloned per output.
+        assert_eq!(workspace_ids_of(&engine, second), vec![0]);
+        assert_eq!(engine.workspace_name_on(oid, 0).as_deref(), Some("web"));
+        assert_eq!(engine.workspace_name_on(second, 0), None);
+    }
+
+    #[test]
+    fn test_moving_a_workspace_takes_its_floats_and_its_name_along() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.rename_workspace(0, "web").unwrap();
+        let float = WindowId::new(100);
+        engine.toggle_floating_for(float, &be); // workspace 0 now holds only a float
+        assert_eq!(engine.float_workspace(float), Some(0));
+        assert_eq!(engine.workspace_name(0).as_deref(), Some("web"));
+        let identity = engine.monitors.get(&oid).unwrap().workspaces[&0].ipc_id;
+
+        engine.move_active_workspace(1, &be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            0,
+            "the object key is stable"
+        );
+        assert_eq!(
+            engine.float_workspace(float),
+            Some(0),
+            "the float stays on its object"
+        );
+        assert_eq!(engine.workspace_name(0).as_deref(), Some("web"));
+        assert_eq!(engine.workspace_name(1), None);
+        assert_eq!(engine.workspace_id_by_name("web"), Some(0));
+        // Workspace 1 is first now, without changing its identity or tiles.
         let monitor = engine.monitors().get(&oid).unwrap();
-        assert_eq!(monitor.active_workspace, 2, "should wrap backward to last workspace");
+        assert_eq!(monitor.workspace_ids(), vec![1, 0, 2]);
+        assert_eq!(monitor.workspaces[&0].ipc_id, identity);
+        assert_eq!(
+            monitor.workspaces.get(&1).unwrap().columns[0].tiles[0].window_id,
+            WindowId::new(101)
+        );
+        // It is the second workspace now.  Moved into the empty one at the bottom it is
+        // still the second: the empty one it traded places with goes away (niri).
+        assert_eq!(
+            engine.workspace_number_on(oid, active_workspace_of(&engine, oid)),
+            2
+        );
+        engine.move_active_workspace(1, &be);
+        let active = active_workspace_of(&engine, oid);
+        assert_eq!(engine.workspace_number_on(oid, active), 2);
+        assert_eq!(
+            engine.float_workspace(float),
+            Some(active),
+            "the float still goes along"
+        );
+        assert_eq!(engine.workspace_id_by_name("web"), Some(active));
+        assert_eq!(
+            workspace_ids_of(&engine, oid).len(),
+            3,
+            "one empty workspace below the last"
+        );
+    }
+
+    #[test]
+    fn test_move_column_to_the_workspace_below_and_above_skips_the_gaps() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 2]);
+        focus_window(&mut engine, 100);
+        engine.move_focused_column_to_workspace(-1, &be);
+        assert_eq!(
+            workspace_ids_of(&engine, oid),
+            vec![0, 2, 3],
+            "nothing above the first workspace"
+        );
+        engine.move_focused_column_to_workspace(1, &be);
+        assert_eq!(
+            active_workspace_of(&engine, oid),
+            2,
+            "the next workspace below is id 2"
+        );
+        let monitor = engine.monitors().get(&oid).unwrap();
+        let on_two: Vec<isize> = monitor
+            .workspaces
+            .get(&2)
+            .unwrap()
+            .columns
+            .iter()
+            .flat_map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()))
+            .collect();
+        assert_eq!(on_two, vec![101, 100]);
     }
 
     // --- Item 7: maintain_empty_workspace ---
@@ -7201,10 +12101,14 @@ mod tests {
 
         let monitor = engine.monitors().get(&oid).unwrap();
         // There should be a workspace at id 1 (highest_non_empty=0 → trailing=1)
-        assert!(monitor.workspaces.contains_key(&1),
-            "maintain should create trailing empty workspace at id 1");
-        assert!(monitor.workspaces.get(&1).unwrap().columns.is_empty(),
-            "trailing workspace must be empty");
+        assert!(
+            monitor.workspaces.contains_key(&1),
+            "maintain should create trailing empty workspace at id 1"
+        );
+        assert!(
+            monitor.workspaces.get(&1).unwrap().columns.is_empty(),
+            "trailing workspace must be empty"
+        );
     }
 
     #[test]
@@ -7217,17 +12121,30 @@ mod tests {
         engine.add_window(window, &BackendHandle::default_for_test());
 
         if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
-            monitor.workspaces.insert(5, crate::layout::Workspace::new());
-            monitor.workspaces.insert(6, crate::layout::Workspace::new());
+            monitor
+                .workspaces
+                .insert(5, crate::layout::Workspace::new());
+            monitor
+                .workspaces
+                .insert(6, crate::layout::Workspace::new());
         }
 
         engine.maintain_empty_workspace(oid);
 
         let monitor = engine.monitors().get(&oid).unwrap();
         // highest_non_empty = 0 → trailing = 1. Ws 5 and 6 should be removed.
-        assert!(!monitor.workspaces.contains_key(&5), "surplus ws 5 should be removed");
-        assert!(!monitor.workspaces.contains_key(&6), "surplus ws 6 should be removed");
-        assert!(monitor.workspaces.contains_key(&1), "trailing ws 1 should remain");
+        assert!(
+            !monitor.workspaces.contains_key(&5),
+            "surplus ws 5 should be removed"
+        );
+        assert!(
+            !monitor.workspaces.contains_key(&6),
+            "surplus ws 6 should be removed"
+        );
+        assert!(
+            monitor.workspaces.contains_key(&1),
+            "trailing ws 1 should remain"
+        );
     }
 
     #[test]
@@ -7237,7 +12154,9 @@ mod tests {
 
         // Switch to ws 5 (making it active) but leave it empty
         if let Some(monitor) = engine.monitors_mut().get_mut(&oid) {
-            monitor.workspaces.insert(5, crate::layout::Workspace::new());
+            monitor
+                .workspaces
+                .insert(5, crate::layout::Workspace::new());
             monitor.active_workspace = 5;
         }
 
@@ -7245,8 +12164,10 @@ mod tests {
 
         let monitor = engine.monitors().get(&oid).unwrap();
         // Active workspace (5) must not be deleted even if empty
-        assert!(monitor.workspaces.contains_key(&5),
-            "active workspace must never be removed by maintain");
+        assert!(
+            monitor.workspaces.contains_key(&5),
+            "active workspace must never be removed by maintain"
+        );
     }
 
     // --- Item 8: default_width from window rule ---
@@ -7260,7 +12181,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         // Rule: windows with class "WideApp" get default_width = 800
         let mut rule = crate::config::WindowRule::default();
@@ -7284,7 +12209,11 @@ mod tests {
         let monitor = engine.monitors().get(&oid_e).unwrap();
         let col_w = monitor.workspace().unwrap().columns[0].width;
         // The rule default_width (800) should override config fixed width (500)
-        assert_eq!(col_w, Some(800), "rule default_width should override config column_width");
+        assert_eq!(
+            col_w,
+            Some(800),
+            "rule default_width should override config column_width"
+        );
     }
 
     #[test]
@@ -7296,7 +12225,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         // Rule: windows with class "TallApp" get default_height = 400
         let mut rule = crate::config::WindowRule::default();
@@ -7318,7 +12251,11 @@ mod tests {
         let oid_e = engine.focused_output().unwrap();
         let monitor = engine.monitors().get(&oid_e).unwrap();
         let tile_pref_h = monitor.workspace().unwrap().columns[0].tiles[0].preferred_height;
-        assert_eq!(tile_pref_h, Some(400), "preferred_height should be stored on the tile");
+        assert_eq!(
+            tile_pref_h,
+            Some(400),
+            "preferred_height should be stored on the tile"
+        );
     }
 
     // =========================================================================
@@ -7330,24 +12267,46 @@ mod tests {
     #[test]
     fn test_focus_previous_window_basic() {
         let mut engine = make_engine();
-        // Add two windows: w1 then w2. Focus ring: [w2, w1].
-        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
-        engine.add_window(make_window(101, 600, 400), &BackendHandle::default_for_test());
+        // History records actual focus visits, not merely window admission.
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 500, 400), &backend);
+        engine.seed_native_foreground(100, 100, 0, &backend);
+        engine.add_window(make_window(101, 600, 400), &backend);
+        engine.observe_native_foreground_at(
+            101,
+            101,
+            crate::backend::ForegroundStamp {
+                uptime_ms: 1000,
+                sequence: 1,
+            },
+            true,
+            1000,
+            &backend,
+        );
 
         let oid = engine.focused_output().unwrap();
         // Current focus is on w2 (WindowId 101).
-        assert_eq!(engine.monitors().get(&oid).unwrap().focus_window, Some(WindowId::new(101)));
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().focus_window,
+            Some(WindowId::new(101))
+        );
 
-        // Calling focus_previous_window should shift focus to w1 (WindowId 100).
-        engine.focus_previous_window(&BackendHandle::default_for_test());
-        assert_eq!(engine.monitors().get(&oid).unwrap().focus_window, Some(WindowId::new(100)));
+        // Immediate switching is opt-in: the default ignores visits under 750 ms.
+        engine.focus_previous_for_at(WindowId::new(101), 0, 1010, &backend);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().focus_window,
+            Some(WindowId::new(100))
+        );
     }
 
     #[test]
     fn test_focus_previous_window_no_previous_noop() {
         // Only one window — no previous in ring. Should be a no-op.
         let mut engine = make_engine();
-        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(100, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
 
         let oid = engine.focused_output().unwrap();
         let before = engine.monitors().get(&oid).unwrap().focus_window;
@@ -7355,7 +12314,10 @@ mod tests {
         engine.focus_previous_window(&BackendHandle::default_for_test());
 
         let after = engine.monitors().get(&oid).unwrap().focus_window;
-        assert_eq!(before, after, "focus should not change when there is no previous window");
+        assert_eq!(
+            before, after,
+            "focus should not change when there is no previous window"
+        );
     }
 
     // --- Item 2: toggle_always_on_top ---
@@ -7363,7 +12325,10 @@ mod tests {
     #[test]
     fn test_toggle_always_on_top_round_trip() {
         let mut engine = make_engine();
-        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(100, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
         let wid = WindowId::new(100);
 
         // Initially not always-on-top.
@@ -7371,11 +12336,17 @@ mod tests {
 
         // Toggle on (Win32 call will silently fail on fake HWND — that is fine).
         engine.toggle_always_on_top_for_focused(&BackendHandle::default_for_test());
-        assert!(engine.is_always_on_top(wid), "window should be in always_on_top after first toggle");
+        assert!(
+            engine.is_always_on_top(wid),
+            "window should be in always_on_top after first toggle"
+        );
 
         // Toggle off.
         engine.toggle_always_on_top_for_focused(&BackendHandle::default_for_test());
-        assert!(!engine.is_always_on_top(wid), "window should not be in always_on_top after second toggle");
+        assert!(
+            !engine.is_always_on_top(wid),
+            "window should not be in always_on_top after second toggle"
+        );
     }
 
     // --- Item 3: auto_tile_threshold ---
@@ -7411,15 +12382,13 @@ mod tests {
         config.workspace = vec![
             crate::config::types::WorkspaceConfig {
                 name: "web".to_string(),
-                layout: "tile".to_string(),
-                monitor: String::new(),
                 follow_on_focus: false,
+                ..Default::default()
             },
             crate::config::types::WorkspaceConfig {
                 name: "code".to_string(),
-                layout: "tile".to_string(),
-                monitor: String::new(),
                 follow_on_focus: false,
+                ..Default::default()
             },
         ];
         engine.set_full_config(config);
@@ -7429,25 +12398,301 @@ mod tests {
         // Currently on workspace 0. Switching to "code" (index 1 → ws id 1).
         engine.focus_workspace_named("code", &BackendHandle::default_for_test());
         let monitor = engine.monitors().get(&oid).unwrap();
-        assert_eq!(monitor.active_workspace, 1, "should have switched to workspace id 1 ('code')");
+        assert_eq!(
+            monitor.active_workspace, 1,
+            "should have switched to workspace id 1 ('code')"
+        );
 
         // Switching to "web" (index 0 → ws id 0).
         engine.focus_workspace_named("web", &BackendHandle::default_for_test());
         let monitor = engine.monitors().get(&oid).unwrap();
-        assert_eq!(monitor.active_workspace, 0, "should have switched to workspace id 0 ('web')");
+        assert_eq!(
+            monitor.active_workspace, 0,
+            "should have switched to workspace id 0 ('web')"
+        );
 
         // Switching to unknown name — should be a no-op (stays on ws 0).
         engine.focus_workspace_named("nosuchworkspace", &BackendHandle::default_for_test());
         let monitor = engine.monitors().get(&oid).unwrap();
-        assert_eq!(monitor.active_workspace, 0, "unknown name should not change active workspace");
+        assert_eq!(
+            monitor.active_workspace, 0,
+            "unknown name should not change active workspace"
+        );
+    }
+
+    #[test]
+    fn test_workspace_id_by_name_uses_runtime_rename_before_config() {
+        let mut engine = make_engine();
+        let mut config = crate::config::Config::default();
+        config.workspace = vec![crate::config::types::WorkspaceConfig {
+            name: "web".to_string(),
+            follow_on_focus: false,
+            ..Default::default()
+        }];
+        engine.set_full_config(config);
+        assert_eq!(engine.workspace_id_by_name("web"), Some(0));
+
+        engine.rename_workspace(0, "main").unwrap();
+
+        assert_eq!(engine.workspace_id_by_name("main"), Some(0));
+        assert_eq!(engine.workspace_id_by_name("web"), None);
+        assert_eq!(engine.workspace_id_by_name("missing"), None);
     }
 
     // --- Item 5: urgent window lifecycle ---
 
+    // Seed only managed-window bookkeeping: these tests must not call Win32.
+    fn make_urgency_test_engine(hwnd: isize) -> TilingEngine {
+        let mut engine = make_engine();
+        engine
+            .tiled_windows
+            .insert(WindowId::new(hwnd), make_window(hwnd, 0, 0));
+        crate::backend::hooks::clear_urgent(hwnd);
+        engine
+    }
+
+    #[test]
+    fn test_non_focusing_action_uses_foreground_and_owner_without_changing_selection() {
+        let selected_hwnd = -73_900_007;
+        let foreground_hwnd = -73_900_008;
+        let selected = WindowId::new(selected_hwnd);
+        let foreground_window = WindowId::new(foreground_hwnd);
+        let mut engine = make_urgency_test_engine(selected_hwnd);
+        engine
+            .tiled_windows
+            .insert(foreground_window, make_window(foreground_hwnd, 0, 0));
+        let output = engine.focused_output().unwrap();
+        engine.monitors.get_mut(&output).unwrap().focus_window = Some(selected);
+        engine.os_foreground = Some(selected);
+        for (hwnd, root_owner) in [
+            (foreground_hwnd, foreground_hwnd),
+            (-73_900_009, foreground_hwnd),
+        ] {
+            let foreground = Some(ForegroundWindow {
+                hwnd,
+                root_owner,
+                ignorable: false,
+            });
+            assert_eq!(
+                engine.window_for_non_focusing_action(foreground),
+                Some(foreground_window)
+            );
+            assert_eq!(engine.os_foreground, Some(selected));
+            assert_eq!(engine.focused_output(), Some(output));
+            assert_eq!(
+                engine.monitors.get(&output).unwrap().focus_window,
+                Some(selected)
+            );
+        }
+        engine.floating_windows.insert(foreground_window);
+        assert_eq!(
+            engine.window_for_non_focusing_action(Some(ForegroundWindow {
+                hwnd: foreground_hwnd,
+                root_owner: foreground_hwnd,
+                ignorable: false,
+            })),
+            Some(foreground_window)
+        );
+        assert_eq!(engine.window_for_non_focusing_action(None), Some(selected));
+        assert_eq!(
+            engine.window_for_non_focusing_action(Some(ForegroundWindow {
+                hwnd: -73_900_010,
+                root_owner: -73_900_010,
+                ignorable: false,
+            })),
+            Some(selected)
+        );
+        assert_eq!(engine.os_foreground, Some(selected));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().focus_window,
+            Some(selected)
+        );
+        crate::backend::hooks::clear_urgent(selected_hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_syncs_and_survives_refresh() {
+        let hwnd = -73_900_002;
+        let other_hwnd = -73_900_003;
+        let window = WindowId::new(hwnd);
+        let other = WindowId::new(other_hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        crate::backend::hooks::set_urgent(other_hwnd, true);
+        engine.mark_urgent(other);
+
+        // A monitor's remembered selection is not necessarily OS foreground.
+        let output = engine.focused_output().unwrap();
+        engine.monitors.get_mut(&output).unwrap().focus_window = Some(window);
+        engine.os_foreground = Some(other);
+        for _ in 0..2 {
+            assert!(engine.set_window_urgent(window, true, &backend));
+            assert!(engine.is_urgent(window));
+            assert!(crate::backend::hooks::is_urgent_hwnd(hwnd));
+            engine.refresh_urgent_states();
+            assert!(engine.is_urgent(window));
+        }
+        for _ in 0..2 {
+            assert!(engine.set_window_urgent(window, false, &backend));
+            assert!(!engine.is_urgent(window));
+            assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+            engine.refresh_urgent_states();
+            assert!(!engine.is_urgent(window));
+            assert!(engine.is_urgent(other));
+        }
+        assert_eq!(engine.os_foreground, Some(other));
+        assert_eq!(engine.focused_output(), Some(output));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().focus_window,
+            Some(window)
+        );
+        crate::backend::hooks::clear_urgent(other_hwnd);
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_never_applies_the_activation_policy() {
+        let hwnd = -73_900_005;
+        let other = WindowId::new(-73_900_006);
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.rule_state.insert(
+            window,
+            rules::RuleState {
+                process_name: None,
+                aumid: None,
+                resolved: Default::default(),
+            },
+        );
+        engine
+            .rule_state
+            .get_mut(&window)
+            .unwrap()
+            .resolved
+            .policy
+            .on_xdg_activate = Some(crate::window::rule_policy::OnXdgActivate::Focus);
+        let output = engine.focused_output().unwrap();
+        engine.monitors.get_mut(&output).unwrap().focus_window = Some(other);
+        engine.os_foreground = Some(other);
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert!(engine.is_urgent(window));
+        assert!(crate::backend::hooks::is_urgent_hwnd(hwnd));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().focus_window,
+            Some(other)
+        );
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_suppresses_os_foreground() {
+        let hwnd = -73_900_004;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.os_foreground = Some(window);
+        // Repair stale urgency in both views, even when asked to set it.
+        engine.mark_urgent(window);
+        crate::backend::hooks::set_urgent(hwnd, true);
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert!(!engine.is_urgent(window));
+        assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+        engine.refresh_urgent_states();
+        assert!(!engine.is_urgent(window));
+        assert!(engine.set_window_urgent(window, false, &backend));
+        assert_eq!(engine.os_foreground, Some(window));
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_foreground_clears_urgency_before_the_hook_clear_is_delivered() {
+        let hwnd = -73_900_010;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.set_window_rules(vec![crate::config::WindowRule {
+            matchers: vec![crate::config::types::Matcher::IsUrgent],
+            open_focused: Some(false),
+            ..Default::default()
+        }]);
+        engine.rule_state.insert(
+            window,
+            rules::RuleState {
+                process_name: None,
+                aumid: None,
+                resolved: Default::default(),
+            },
+        );
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert_eq!(
+            engine.rule_state[&window].resolved.open_focused,
+            Some(false)
+        );
+        engine.sync_os_foreground(window, &backend);
+        assert!(!engine.is_urgent(window));
+        assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+        assert_eq!(engine.rule_state[&window].resolved.open_focused, None);
+        engine.refresh_urgent_states();
+        assert!(!engine.is_urgent(window));
+        assert_eq!(engine.os_foreground, Some(window));
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_ignores_unmanaged_windows() {
+        let hwnd = -73_900_005;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        crate::backend::hooks::clear_urgent(hwnd);
+        assert!(!engine.set_window_urgent(window, true, &backend));
+        assert!(!engine.is_urgent(window));
+        assert!(!crate::backend::hooks::is_urgent_hwnd(hwnd));
+        crate::backend::hooks::set_urgent(hwnd, true);
+        assert!(!engine.set_window_urgent(window, false, &backend));
+        assert!(crate::backend::hooks::is_urgent_hwnd(hwnd));
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
+    #[test]
+    fn test_set_window_urgent_reevaluates_rules_on_set_and_reset() {
+        let hwnd = -73_900_006;
+        let window = WindowId::new(hwnd);
+        let mut engine = make_urgency_test_engine(hwnd);
+        let backend = BackendHandle::default_for_test();
+        engine.set_window_rules(vec![crate::config::WindowRule {
+            matchers: vec![crate::config::types::Matcher::IsUrgent],
+            // Observe resolution without applying any dynamic Win32 properties.
+            open_focused: Some(false),
+            ..Default::default()
+        }]);
+        engine.rule_state.insert(
+            window,
+            rules::RuleState {
+                process_name: None,
+                aumid: None,
+                resolved: Default::default(),
+            },
+        );
+        assert!(engine.set_window_urgent(window, true, &backend));
+        assert_eq!(
+            engine.rule_state[&window].resolved.open_focused,
+            Some(false)
+        );
+        assert!(engine.set_window_urgent(window, false, &backend));
+        assert_eq!(engine.rule_state[&window].resolved.open_focused, None);
+        assert_eq!(engine.os_foreground, None);
+        crate::backend::hooks::clear_urgent(hwnd);
+    }
+
     #[test]
     fn test_urgent_window_lifecycle() {
         let mut engine = make_engine();
-        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(100, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
         let wid = WindowId::new(100);
 
         // Initially not urgent.
@@ -7455,11 +12700,17 @@ mod tests {
 
         // Mark urgent.
         engine.mark_urgent(wid);
-        assert!(engine.is_urgent(wid), "window should be urgent after mark_urgent");
+        assert!(
+            engine.is_urgent(wid),
+            "window should be urgent after mark_urgent"
+        );
 
         // Clear urgent.
         engine.clear_urgent(wid);
-        assert!(!engine.is_urgent(wid), "window should not be urgent after clear_urgent");
+        assert!(
+            !engine.is_urgent(wid),
+            "window should not be urgent after clear_urgent"
+        );
 
         // `refresh_urgent_states` now syncs from the WinEvent-driven registry
         // in `backend::hooks`. With no hook events recorded the registry is
@@ -7484,7 +12735,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         engine
     }
 
@@ -7514,14 +12769,14 @@ mod tests {
 
         let oid = engine.focused_output().unwrap();
         let m = engine.monitors().get(&oid).unwrap();
-        let ws = m.workspace().unwrap();
-        // Original col0 (100) merged into col1: now col0 should host [101, 100], col1 = [102]
-        assert_eq!(ws.columns.len(), 2);
-        assert_eq!(ws.columns[0].tiles.len(), 2);
-        assert!(ws.columns[0].tiles.iter().any(|t| t.window_id == WindowId::new(100)));
-        assert_eq!(ws.columns[1].tiles.len(), 1);
-        // Focus follows the moved window.
+        // niri: the first window of the column on the RIGHT (101) goes under the focused one.
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100, 101], vec![102]]
+        );
+        // The focus stays where it was.
         assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
     }
 
     #[test]
@@ -7553,21 +12808,55 @@ mod tests {
                 ws.add_window_to_column(0, WindowId::new(101));
             }
         }
-        engine.tiled_windows.insert(WindowId::new(101), make_window(101, 0, 0));
+        engine
+            .tiled_windows
+            .insert(WindowId::new(101), make_window(101, 0, 0));
         engine.add_window(make_window(102, 0, 0), &BackendHandle::default_for_test());
 
         focus_window(&mut engine, 101);
         engine.expel_window_from_column(&BackendHandle::default_for_test());
 
+        // The BOTTOM window (101) leaves for a column of its own on the right.
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![102]]
+        );
+        // It had the focus, which stays in the column it was in: on the window above.
         let m = engine.monitors().get(&oid).unwrap();
-        let ws = m.workspace().unwrap();
-        // After expel, col0 = [100], col1 = [101] (new), col2 = [102]
-        assert_eq!(ws.columns.len(), 3);
-        assert_eq!(ws.columns[0].tiles.len(), 1);
-        assert_eq!(ws.columns[0].tiles[0].window_id, WindowId::new(100));
-        assert_eq!(ws.columns[1].tiles.len(), 1);
-        assert_eq!(ws.columns[1].tiles[0].window_id, WindowId::new(101));
-        assert_eq!(m.focus_window, Some(WindowId::new(101)));
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
+    }
+
+    #[test]
+    fn test_expel_takes_the_bottom_window_not_the_focused_one() {
+        let mut engine = make_engine_fixed_1920();
+        for i in 100..103 {
+            engine.add_window(make_window(i, 0, 0), &BackendHandle::default_for_test());
+        }
+        let oid = engine.focused_output().unwrap();
+        // One column of three: [100, 101, 102]
+        {
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(101), 0, 1));
+            assert!(ws.move_window(WindowId::new(102), 0, 2));
+        }
+        focus_window(&mut engine, 100);
+        engine.expel_window_from_column(&BackendHandle::default_for_test());
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100, 101], vec![102]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            m.focus_window,
+            Some(WindowId::new(100)),
+            "the focus did not move"
+        );
     }
 
     #[test]
@@ -7582,6 +12871,162 @@ mod tests {
         let ws = engine.monitors().get(&oid).unwrap().workspace().unwrap();
         // Each column already had one tile — no new column should appear.
         assert_eq!(ws.columns.len(), 2);
+    }
+
+    // ---- niri column keymap: consume-or-expel, move-window, first / last ----
+
+    /// An engine (1920 px wide, fixed 500 px columns) with one single-window column per id.
+    fn engine_with_columns(ids: &[isize]) -> TilingEngine {
+        let mut engine = make_engine_fixed_1920();
+        for id in ids {
+            engine.add_window(make_window(*id, 0, 0), &BackendHandle::default_for_test());
+        }
+        engine
+    }
+
+    #[test]
+    fn test_consume_or_expel_window_left_and_right_keep_the_focus_on_the_window() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 101);
+
+        engine.consume_or_expel_window_left(&be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100, 101], vec![102]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(0), Some(WindowId::new(101)))
+        );
+
+        // Now it shares a column: it is expelled again, to the right this time.
+        engine.consume_or_expel_window_right(&be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![101], vec![102]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(1), Some(WindowId::new(101)))
+        );
+
+        // Right into the last column, and no further.
+        focus_window(&mut engine, 101);
+        engine.consume_or_expel_window_right(&be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102, 101]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(1), Some(WindowId::new(101)))
+        );
+        engine.consume_or_expel_window_right(&be); // shares a column: expelled to the right
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![101]]
+        );
+        engine.consume_or_expel_window_right(&be); // alone in the last column: nothing
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![101]]
+        );
+    }
+
+    #[test]
+    fn test_consume_or_expel_window_left_in_the_first_column_does_nothing() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 100);
+        engine.consume_or_expel_window_left(&be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100], vec![101]]);
+    }
+
+    #[test]
+    fn test_move_window_up_and_down_swap_inside_the_column_and_keep_the_focus() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102]);
+        let oid = engine.focused_output().unwrap();
+        {
+            let ws = engine
+                .monitors_mut()
+                .get_mut(&oid)
+                .unwrap()
+                .workspace_mut()
+                .unwrap();
+            assert!(ws.move_window(WindowId::new(101), 0, 1));
+            assert!(ws.move_window(WindowId::new(102), 0, 2));
+        }
+        focus_window(&mut engine, 101);
+        engine.move_window_in_column(-1, &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![101, 100, 102]]);
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            m.focus_window,
+            Some(WindowId::new(101)),
+            "the moved window keeps the focus"
+        );
+        engine.move_window_in_column(-1, &be); // at the top already
+        assert_eq!(column_windows(&engine, oid), vec![vec![101, 100, 102]]);
+        engine.move_window_in_column(1, &be);
+        engine.move_window_in_column(1, &be);
+        assert_eq!(column_windows(&engine, oid), vec![vec![100, 102, 101]]);
+        engine.move_window_in_column(1, &be); // at the bottom already
+        assert_eq!(column_windows(&engine, oid), vec![vec![100, 102, 101]]);
+    }
+
+    #[test]
+    fn test_focus_column_first_and_last_and_move_column_to_the_edges() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102, 103]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 101);
+
+        assert_eq!(engine.focus_column_first(&be), Some(WindowId::new(100)));
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(0), Some(WindowId::new(100)))
+        );
+        assert_eq!(engine.focus_column_last(&be), Some(WindowId::new(103)));
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(3), Some(WindowId::new(103)))
+        );
+
+        focus_window(&mut engine, 101);
+        engine.move_column_to_edge(true, &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![100], vec![102], vec![103], vec![101]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(3), Some(WindowId::new(101)))
+        );
+        engine.move_column_to_edge(false, &be);
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101], vec![100], vec![102], vec![103]]
+        );
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(
+            (m.focus_column, m.focus_window),
+            (Some(0), Some(WindowId::new(101)))
+        );
+        engine.move_column_to_edge(false, &be); // already first
+        assert_eq!(
+            column_windows(&engine, oid),
+            vec![vec![101], vec![100], vec![102], vec![103]]
+        );
     }
 
     // ---- Expand column ----
@@ -7602,6 +13047,105 @@ mod tests {
         assert_eq!(ws.columns[1].width, Some(888));
     }
 
+    /// The strip of `engine_with_columns` scrolled so that its left edge is at `x`.
+    fn scroll_strip_to(engine: &mut TilingEngine, x: i32) {
+        let oid = engine.focused_output().unwrap();
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .workspace_mut()
+            .unwrap()
+            .scroll_offset
+            .x = x;
+    }
+
+    fn strip_scroll(engine: &TilingEngine) -> i32 {
+        let oid = engine.focused_output().unwrap();
+        engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .scroll_offset
+            .x
+    }
+
+    #[test]
+    fn test_expand_column_counts_only_the_columns_fully_in_view() {
+        let be = BackendHandle::default_for_test();
+        // Six columns of 500 px with 16 px between them: 0, 516, 1032 are fully in a
+        // 1920 px view that starts at 0, the fourth one (1548 .. 2048) is not.
+        let mut engine = engine_with_columns(&[100, 101, 102, 103, 104, 105]);
+        scroll_strip_to(&mut engine, 0);
+        focus_window(&mut engine, 101);
+        engine.expand_column_to_available(&be);
+        // 1920 + 16 - 3 * (500 + 16) = 388 more: the three columns that are off screen
+        // do not take room away (they used to: the width came out as the 50 px minimum).
+        assert_eq!(column_width_of(&engine, 1), Some(888));
+        assert_eq!(
+            column_width_of(&engine, 0),
+            Some(500),
+            "the others are not resized"
+        );
+        assert_eq!(strip_scroll(&engine), 0);
+
+        // Scrolled by 300 px the first column is cut off; the next three are in view and
+        // the leftmost of them stays at the left edge afterwards.
+        let mut engine = engine_with_columns(&[100, 101, 102, 103, 104, 105]);
+        scroll_strip_to(&mut engine, 300);
+        focus_window(&mut engine, 102);
+        engine.expand_column_to_available(&be);
+        assert_eq!(column_width_of(&engine, 2), Some(888));
+        assert_eq!(strip_scroll(&engine), 516);
+    }
+
+    #[test]
+    fn test_expand_column_does_nothing_when_the_column_is_not_fully_in_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101, 102, 103, 104]);
+        scroll_strip_to(&mut engine, 0);
+        focus_window(&mut engine, 103); // 1548 .. 2048: runs out of the view
+        engine.expand_column_to_available(&be);
+        assert_eq!(column_width_of(&engine, 3), Some(500));
+    }
+
+    #[test]
+    fn test_expand_a_lone_column_maximizes_it_and_a_maximized_one_is_left_alone() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100]);
+        focus_window(&mut engine, 100);
+        engine.expand_column_to_available(&be);
+        let oid = engine.focused_output().unwrap();
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
+        assert!(col.maximized, "like niri: only this column is in view");
+        assert_eq!(col.width, Some(1920));
+        // Pressed again nothing happens (maximize-column is the way back).
+        engine.expand_column_to_available(&be);
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
+        assert!(col.maximized);
+        assert_eq!(col.width, Some(1920));
+        engine.toggle_maximize_focused_column(&be);
+        assert_eq!(
+            column_width_of(&engine, 0),
+            Some(500),
+            "back to the width it had"
+        );
+    }
+
     // ---- Maximize column ----
 
     #[test]
@@ -7612,13 +13156,133 @@ mod tests {
 
         let oid = engine.focused_output().unwrap();
         // Initially not maximized
-        assert!(!engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].maximized);
+        assert!(
+            !engine
+                .monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[0]
+                .maximized
+        );
 
         engine.toggle_maximize_focused_column(&BackendHandle::default_for_test());
-        assert!(engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].maximized);
+        assert!(
+            engine
+                .monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[0]
+                .maximized
+        );
 
         engine.toggle_maximize_focused_column(&BackendHandle::default_for_test());
-        assert!(!engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].maximized);
+        assert!(
+            !engine
+                .monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[0]
+                .maximized
+        );
+    }
+
+    #[test]
+    fn test_maximize_column_makes_even_a_one_window_column_as_wide_as_the_view() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100, 101]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 101);
+        let width_of = |engine: &TilingEngine, col: usize| {
+            engine
+                .monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .columns[col]
+                .width
+        };
+        let before = width_of(&engine, 1);
+        let other_before = width_of(&engine, 0);
+
+        // The configure throttle (16 ms) would hide a layout pass that follows the
+        // previous one too closely.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.toggle_maximize_focused_column(&be);
+        assert_eq!(
+            width_of(&engine, 1),
+            Some(1920),
+            "as wide as the view (1920 px, no gaps)"
+        );
+        assert_eq!(
+            width_of(&engine, 0),
+            other_before,
+            "the other column is untouched"
+        );
+        let rect = engine.applied_state.get(&WindowId::new(101)).unwrap().rect;
+        assert!(rect.size.w >= 1900, "the window got the width: {:?}", rect);
+
+        // The configure throttle (16 ms) would hide the second layout pass.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.toggle_maximize_focused_column(&be);
+        assert_eq!(
+            width_of(&engine, 1),
+            before,
+            "toggling again restores the width"
+        );
+        let rect = engine.applied_state.get(&WindowId::new(101)).unwrap().rect;
+        assert!(rect.size.w < 600, "{:?}", rect);
+    }
+
+    #[test]
+    fn test_a_width_change_ends_the_maximized_state_of_a_column() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 100);
+        engine.toggle_maximize_focused_column(&be);
+        engine.resize_focused_column_by(-100, &be);
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
+        assert!(!col.maximized);
+        assert_eq!(col.width, Some(1820));
+    }
+
+    #[test]
+    fn test_a_maximized_column_follows_the_view_width() {
+        let be = BackendHandle::default_for_test();
+        let mut engine = engine_with_columns(&[100]);
+        let oid = engine.focused_output().unwrap();
+        focus_window(&mut engine, 100);
+        engine.toggle_maximize_focused_column(&be);
+        // Gaps appear at both sides: the maximized column shrinks with the view.
+        engine.update_config(LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            outer_gaps: (0, 100, 0, 100),
+            ..LayoutConfig::default()
+        });
+        engine.apply_all(&be);
+        let col = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0];
+        assert!(col.maximized);
+        assert_eq!(col.width, Some(1720));
     }
 
     // ---- Resize column / tile by percentage ----
@@ -7633,21 +13297,45 @@ mod tests {
         // Start width unset → defaults to column_width = 500
         engine.resize_focused_column_by_percent(5, &BackendHandle::default_for_test());
         // 500 + (1920 * 0.05 = 96) = 596
-        let w = engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].width.unwrap();
+        let w = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert_eq!(w, 596);
 
         // Hammer growth — should clamp at 95% of 1920 = 1824
         for _ in 0..50 {
             engine.resize_focused_column_by_percent(5, &BackendHandle::default_for_test());
         }
-        let w = engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].width.unwrap();
+        let w = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert_eq!(w, 1824);
 
         // Hammer shrink — should clamp at 10% of 1920 = 192
         for _ in 0..50 {
             engine.resize_focused_column_by_percent(-5, &BackendHandle::default_for_test());
         }
-        let w = engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].width.unwrap();
+        let w = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert_eq!(w, 192);
     }
 
@@ -7657,11 +13345,25 @@ mod tests {
         engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         focus_window(&mut engine, 100);
         let oid = engine.focused_output().unwrap();
-        let before = engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].tiles[0].height_weight;
+        let before = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles[0]
+            .height_weight;
         engine.resize_focused_tile_height_by_percent(5, &BackendHandle::default_for_test());
-        let after = engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].tiles[0].height_weight;
+        let after = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles[0]
+            .height_weight;
         assert_eq!(before, after, "single-tile column should not adjust weight");
     }
 
@@ -7675,12 +13377,21 @@ mod tests {
                 ws.add_window_to_column(0, WindowId::new(101));
             }
         }
-        engine.tiled_windows.insert(WindowId::new(101), make_window(101, 0, 0));
+        engine
+            .tiled_windows
+            .insert(WindowId::new(101), make_window(101, 0, 0));
 
         focus_window(&mut engine, 100);
         engine.resize_focused_tile_height_by_percent(5, &BackendHandle::default_for_test());
-        let w = engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].tiles[0].height_weight;
+        let w = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles[0]
+            .height_weight;
         assert!(w > 1.0, "weight should grow from 1.0 after positive delta");
     }
 
@@ -7693,15 +13404,36 @@ mod tests {
         focus_window(&mut engine, 100);
         let oid = engine.focused_output().unwrap();
 
-        engine.set_column_width_preset(ColumnWidthPreset::OneQuarter,
-            &BackendHandle::default_for_test());
-        let w = engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].width.unwrap();
-        assert_eq!(w, 480, "OneQuarter on 1920px = 480");
+        engine.set_column_width_preset(
+            ColumnWidthPreset::OneQuarter,
+            &BackendHandle::default_for_test(),
+        );
+        let w = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
+        // A quarter of the view, minus a quarter of the 16 px gaps: 0.25 * (1920 + 16) - 16.
+        assert_eq!(w, 468, "OneQuarter on 1920px = 468");
 
-        engine.set_column_width_preset(ColumnWidthPreset::ThreeQuarters,
-            &BackendHandle::default_for_test());
-        let w = engine.monitors().get(&oid).unwrap().workspace().unwrap().columns[0].width.unwrap();
-        assert_eq!(w, 1440, "ThreeQuarters on 1920px = 1440");
+        engine.set_column_width_preset(
+            ColumnWidthPreset::ThreeQuarters,
+            &BackendHandle::default_for_test(),
+        );
+        let w = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
+        assert_eq!(w, 1436, "ThreeQuarters on 1920px = 1436");
     }
 
     // ---- Move column to monitor ----
@@ -7717,8 +13449,16 @@ mod tests {
         });
         let oid_a = OutputId::from_name("A");
         let oid_b = OutputId::from_name("B");
-        engine.register_monitor(oid_a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
-        engine.register_monitor(oid_b, Rect::new(1920, 0, 1920, 1080), Rect::new(1920, 0, 1920, 1080));
+        engine.register_monitor(
+            oid_a,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
+        engine.register_monitor(
+            oid_b,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1080),
+        );
         // Both monitors start on left (set_focused_output requires it to exist).
         engine.set_focused_output(oid_a);
 
@@ -7729,7 +13469,9 @@ mod tests {
                 ws.add_window_to_column(0, WindowId::new(101));
             }
         }
-        engine.tiled_windows.insert(WindowId::new(101), make_window(101, 0, 0));
+        engine
+            .tiled_windows
+            .insert(WindowId::new(101), make_window(101, 0, 0));
 
         focus_window(&mut engine, 100);
         engine.move_column_to_monitor(ScrollDirection::Right, &BackendHandle::default_for_test());
@@ -7827,7 +13569,10 @@ mod tests {
         // Also check identity-by-pointer when no override is present.
         let p_eff = eff as *const LayoutConfig;
         let p_default = &engine.config as *const LayoutConfig;
-        assert_eq!(p_eff, p_default, "fall-through must return the same &LayoutConfig");
+        assert_eq!(
+            p_eff, p_default,
+            "fall-through must return the same &LayoutConfig"
+        );
     }
 
     /// A single-field override (column_width) is applied on top of the global.
@@ -7836,11 +13581,18 @@ mod tests {
         let mut engine = make_engine_fixed_1920();
         let oid_name = "M-OVR-1";
         let oid = OutputId::from_name(oid_name);
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         let mut cfg = crate::config::Config::default();
         cfg.output.push(crate::config::OutputConfig {
             name: oid_name.to_string(),
+            position_set: false,
+            focus_at_startup: false,
+            hot_corners: None,
             position: crate::config::types::Position::default(),
             width: 0,
             height: 0,
@@ -7861,7 +13613,10 @@ mod tests {
         let eff = engine.effective_config(oid);
         assert_eq!(eff.column_width, 800, "override field wins");
         // Other fields fall through to the (built-from-config) base.
-        assert!(eff.border_width >= 1, "fall-through populates default border width");
+        assert!(
+            eff.border_width >= 1,
+            "fall-through populates default border width"
+        );
     }
 
     /// Multi-field override populates each Some(_) field correctly.
@@ -7870,11 +13625,18 @@ mod tests {
         let mut engine = make_engine_fixed_1920();
         let oid_name = "M-OVR-2";
         let oid = OutputId::from_name(oid_name);
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         let mut cfg = crate::config::Config::default();
         cfg.output.push(crate::config::OutputConfig {
             name: oid_name.to_string(),
+            position_set: false,
+            focus_at_startup: false,
+            hot_corners: None,
             position: crate::config::types::Position::default(),
             width: 0,
             height: 0,
@@ -7907,16 +13669,28 @@ mod tests {
         let mut engine = make_engine_fixed_1920();
         let oid_name = "M-OVR-3";
         let oid = OutputId::from_name(oid_name);
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         let mk_cfg = |w: u32| {
             let mut c = crate::config::Config::default();
             c.output.push(crate::config::OutputConfig {
                 name: oid_name.to_string(),
+                position_set: false,
+                focus_at_startup: false,
+                hot_corners: None,
                 position: crate::config::types::Position::default(),
-                width: 0, height: 0, scale: 1.0,
-                mode: String::new(), vrr: false, primary: false,
-                transform: "normal".to_string(), enable: true,
+                width: 0,
+                height: 0,
+                scale: 1.0,
+                mode: String::new(),
+                vrr: false,
+                primary: false,
+                transform: "normal".to_string(),
+                enable: true,
                 layout_override: Some(crate::config::types::LayoutConfigPartial {
                     column_width: Some(w),
                     ..Default::default()
@@ -7936,7 +13710,10 @@ mod tests {
         engine.set_full_config(bare);
         let p_eff = engine.effective_config(oid) as *const LayoutConfig;
         let p_default = &engine.config as *const LayoutConfig;
-        assert_eq!(p_eff, p_default, "reload without override falls back to global");
+        assert_eq!(
+            p_eff, p_default,
+            "reload without override falls back to global"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -7958,7 +13735,9 @@ mod tests {
                 ws.add_window_to_column(0, WindowId::new(102));
             }
         }
-        engine.tiled_windows.insert(WindowId::new(102), make_window(102, 0, 0));
+        engine
+            .tiled_windows
+            .insert(WindowId::new(102), make_window(102, 0, 0));
         let snap = engine.snapshot();
         // Remove HWND 101 (simulate window closed).
         engine.tiled_windows.remove(&WindowId::new(101));
@@ -7971,12 +13750,17 @@ mod tests {
         // must be skipped, but 100 + 102 should come back.
         engine.apply_snapshot(&snap);
         let ws = engine.monitors().get(&oid).unwrap().workspace().unwrap();
-        let restored: Vec<isize> = ws.columns.iter()
+        let restored: Vec<isize> = ws
+            .columns
+            .iter()
             .flat_map(|c| c.tiles.iter().map(|t| t.window_id.as_isize()))
             .collect();
         assert!(restored.contains(&100), "HWND 100 must be restored");
         assert!(restored.contains(&102), "HWND 102 must be restored");
-        assert!(!restored.contains(&101), "missing HWND 101 must NOT be restored");
+        assert!(
+            !restored.contains(&101),
+            "missing HWND 101 must NOT be restored"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -8012,21 +13796,42 @@ mod tests {
         engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         focus_window(&mut engine, 100);
         let oid = engine.focused_output().unwrap();
-        let original_w = engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].width
+        let original_w = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
             .unwrap_or(engine.config.column_width);
         engine.toggle_resize_mode();
         engine.resize_focused_column_by_percent(5, &BackendHandle::default_for_test());
-        let grown = engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].width.unwrap();
+        let grown = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert!(
             grown > original_w,
             "+5% resize should grow the column (was {} → {})",
-            original_w, grown
+            original_w,
+            grown
         );
         engine.resize_focused_column_by_percent(-5, &BackendHandle::default_for_test());
-        let shrunk = engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].width.unwrap();
+        let shrunk = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .width
+            .unwrap();
         assert!(shrunk < grown);
     }
 
@@ -8048,25 +13853,48 @@ mod tests {
                 ws.add_window_to_column(0, WindowId::new(102));
             }
         }
-        engine.tiled_windows.insert(WindowId::new(101), make_window(101, 0, 0));
-        engine.tiled_windows.insert(WindowId::new(102), make_window(102, 0, 0));
+        engine
+            .tiled_windows
+            .insert(WindowId::new(101), make_window(101, 0, 0));
+        engine
+            .tiled_windows
+            .insert(WindowId::new(102), make_window(102, 0, 0));
         focus_window(&mut engine, 100);
 
         // Start in Stacked.
-        let disp = &engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].display;
+        let disp = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .display;
         assert!(matches!(disp, ColumnDisplay::Stacked));
 
         // First toggle → Tabbed.
         engine.toggle_tabbed_for_focused_column(&BackendHandle::default_for_test());
-        let disp = engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].display.clone();
+        let disp = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .display
+            .clone();
         assert!(matches!(disp, ColumnDisplay::Tabbed { .. }));
 
         // Second toggle → back to Stacked.
         engine.toggle_tabbed_for_focused_column(&BackendHandle::default_for_test());
-        let disp = &engine.monitors().get(&oid).unwrap()
-            .workspace().unwrap().columns[0].display;
+        let disp = &engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .display;
         assert!(matches!(disp, ColumnDisplay::Stacked));
     }
 
@@ -8111,7 +13939,10 @@ mod tests {
         assert!(
             (mid_y - expected).abs() <= 1,
             "mid-slide Y={} should approx rest_y={} + offset={} (expected {})",
-            mid_y, rest_y, mid_slide_offset as i32, expected,
+            mid_y,
+            rest_y,
+            mid_slide_offset as i32,
+            expected,
         );
     }
 
@@ -8132,9 +13963,16 @@ mod tests {
         let oid = engine.focused_output().unwrap();
         let m = engine.monitors().get(&oid).unwrap();
         // Focus + active workspace should now be on the destination (ws 1).
-        assert_eq!(m.active_workspace, 1, "focus follows the moved column to ws 1");
+        assert_eq!(
+            m.active_workspace, 1,
+            "focus follows the moved column to ws 1"
+        );
         let dst = m.workspaces.get(&1).expect("ws 1 must exist after move");
-        assert_eq!(dst.columns.len(), 1, "destination ws should host one column");
+        assert_eq!(
+            dst.columns.len(),
+            1,
+            "destination ws should host one column"
+        );
         assert_eq!(dst.columns[0].tiles[0].window_id, WindowId::new(100));
         // Source workspace should still hold the second tile in its own column.
         let src = m.workspaces.get(&0).expect("ws 0 still tracked");
@@ -8143,24 +13981,35 @@ mod tests {
     }
 
     #[test]
-    fn test_move_focused_column_to_workspace_up_creates_destination() {
+    fn test_move_focused_column_to_workspace_up_goes_to_the_workspace_above() {
         let mut engine = make_engine_fixed_1920();
-        // Start on workspace 2 with one tile; up = ws 1 which doesn't exist yet.
+        // A tile on workspace 0 and one on id 2 (the second workspace: id 1 never
+        // existed); the workspace above id 2 is id 0, nothing is made up in between.
+        engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         let oid = engine.focused_output().unwrap();
-        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(2);
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .switch_workspace(2);
         engine.add_window(make_window(200, 0, 0), &BackendHandle::default_for_test());
         focus_window(&mut engine, 200);
 
         engine.move_focused_column_to_workspace(-1, &BackendHandle::default_for_test());
 
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!(m.active_workspace, 1, "focus relocates to ws 1");
-        let dst = m.workspaces.get(&1).expect("ws 1 was created");
-        assert_eq!(dst.columns.len(), 1);
-        assert_eq!(dst.columns[0].tiles[0].window_id, WindowId::new(200));
-        // Source ws 2 is now empty (and may have been reaped, but not before
-        // maintain_empty_workspace runs — we don't assert one way or the other
-        // beyond "destination has the tile").
+        assert_eq!(
+            m.active_workspace, 0,
+            "focus relocates to the workspace above"
+        );
+        let dst = m.workspaces.get(&0).expect("ws 0 exists");
+        assert_eq!(dst.columns.len(), 2);
+        assert_eq!(dst.columns[1].tiles[0].window_id, WindowId::new(200));
+        assert_eq!(
+            m.workspace_ids(),
+            vec![0, 2],
+            "the emptied workspace itself is retained as the trailing empty object"
+        );
     }
 
     #[test]
@@ -8196,22 +14045,30 @@ mod tests {
         // 0 ↔ 1 and the contents should follow.
         engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         let oid = engine.focused_output().unwrap();
-        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(1);
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .switch_workspace(1);
         engine.add_window(make_window(200, 0, 0), &BackendHandle::default_for_test());
         // Back to ws 0 and swap it with ws 1.
-        engine.monitors_mut().get_mut(&oid).unwrap().switch_workspace(0);
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .switch_workspace(0);
 
         engine.move_active_workspace(1, &BackendHandle::default_for_test());
 
         let m = engine.monitors().get(&oid).unwrap();
-        // Focus follows the moved workspace.
-        assert_eq!(m.active_workspace, 1, "focus relocates to ws 1");
+        // Focus follows the same object to position 2; keys and windows do not swap.
+        assert_eq!(m.active_workspace, 0);
+        assert_eq!(m.workspace_ids(), vec![1, 0, 2]);
+        assert_eq!(m.workspace_number_of(m.active_workspace), Some(2));
         let ws0 = m.workspaces.get(&0).expect("ws 0 still exists");
         let ws1 = m.workspaces.get(&1).expect("ws 1 still exists");
-        // ws 1 should now host the originally-on-ws-0 window 100.
-        assert_eq!(ws1.columns[0].tiles[0].window_id, WindowId::new(100));
-        // ws 0 should now host the originally-on-ws-1 window 200.
-        assert_eq!(ws0.columns[0].tiles[0].window_id, WindowId::new(200));
+        assert_eq!(ws0.columns[0].tiles[0].window_id, WindowId::new(100));
+        assert_eq!(ws1.columns[0].tiles[0].window_id, WindowId::new(200));
     }
 
     #[test]
@@ -8251,8 +14108,9 @@ mod tests {
         engine.move_active_workspace(1, &BackendHandle::default_for_test());
 
         let m = engine.monitors().get(&oid).unwrap();
-        assert_eq!(m.active_workspace, 1);
-        // Focused window stays the same after the swap.
+        assert_eq!(m.active_workspace, 0);
+        assert_eq!(m.workspace_number_of(m.active_workspace), Some(1));
+        // A lone occupied workspace cannot move below the trailing empty one.
         assert_eq!(m.focus_window, Some(WindowId::new(100)));
     }
 
@@ -8272,7 +14130,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         focus_window(&mut engine, 100);
         engine.apply_all(&BackendHandle::default_for_test());
@@ -8299,7 +14161,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         engine.add_window(make_window(101, 0, 0), &BackendHandle::default_for_test());
         focus_window(&mut engine, 100);
@@ -8329,7 +14195,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         engine.add_window(make_window(100, 0, 0), &BackendHandle::default_for_test());
         focus_window(&mut engine, 100);
         engine.apply_all(&BackendHandle::default_for_test());
@@ -8389,7 +14259,10 @@ mod tests {
 
         // Second enable is a no-op (already in the set).
         engine.apply_window_blur(hwnd, true);
-        assert!(engine.blur_applied.contains(&wid), "set still contains HWND");
+        assert!(
+            engine.blur_applied.contains(&wid),
+            "set still contains HWND"
+        );
         assert_eq!(engine.blur_applied.len(), 1, "no duplicate entries");
 
         engine.apply_window_blur(hwnd, false);
@@ -8412,7 +14285,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
 
         let before = engine.win32_call_count;
         // hwnd=0 is an invalid handle — on real Win32 GetDC(NULL) returns the
@@ -8442,11 +14319,19 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         engine.set_auto_tile_threshold(Some(2));
 
         // Initially no zoom.
-        assert_eq!(engine.auto_tile_zoom(), None, "no auto-zoom before threshold exceeded");
+        assert_eq!(
+            engine.auto_tile_zoom(),
+            None,
+            "no auto-zoom before threshold exceeded"
+        );
 
         // Add 3 windows (3 columns at 500px each = 1500 + 32 gaps = 1532, which fits in 1920).
         for i in 100..103 {
@@ -8469,7 +14354,11 @@ mod tests {
             "auto_tile_zoom should be Some when columns exceed view width"
         );
         let z = zoom.unwrap();
-        assert!(z < 1.0, "zoom factor must be < 1.0 to fit columns; got {}", z);
+        assert!(
+            z < 1.0,
+            "zoom factor must be < 1.0 to fit columns; got {}",
+            z
+        );
         assert!(z > 0.0, "zoom must be positive");
     }
 
@@ -8483,16 +14372,27 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         engine.set_auto_tile_threshold(Some(2));
 
         // Force auto_tile_zoom to be set by direct write (to avoid needing many windows).
         engine.auto_tile_zoom = Some(0.5);
 
         // A single-column workspace is below threshold — layout pass should clear zoom.
-        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(100, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
         engine.apply_layout_for_monitor(oid, &BackendHandle::default_for_test());
-        assert_eq!(engine.auto_tile_zoom(), None, "zoom should clear when column count <= threshold");
+        assert_eq!(
+            engine.auto_tile_zoom(),
+            None,
+            "zoom should clear when column count <= threshold"
+        );
     }
 
     // =========================================================================
@@ -8509,8 +14409,8 @@ mod tests {
             outer_gaps: (0, 0, 0, 0),
             ..LayoutConfig::default()
         };
+        use crate::layout::workspace::WorkspaceLayout;
         use crate::layout::Workspace;
-        use crate::layout::workspace::{WorkspaceLayout, Column, Tile};
         let mut ws = Workspace::with_layout(WorkspaceLayout::BStack);
         // Add 3 columns, each with 1 tile.
         for i in 0..3usize {
@@ -8525,14 +14425,29 @@ mod tests {
         assert_eq!(positions.len(), 3, "all 3 tiles must be positioned");
 
         // Main column (w1): left half, full height.
-        let main_rect = positions.iter().find(|(wid, _)| *wid == WindowId::new(1)).unwrap().1;
+        let main_rect = positions
+            .iter()
+            .find(|(wid, _)| *wid == WindowId::new(1))
+            .unwrap()
+            .1;
         assert_eq!(main_rect.loc.x, 0, "main col starts at left edge");
-        assert_eq!(main_rect.size.w, 960, "main col takes half the width (gap=0)");
+        assert_eq!(
+            main_rect.size.w, 960,
+            "main col takes half the width (gap=0)"
+        );
         assert_eq!(main_rect.size.h, 1080, "main col takes full height");
 
         // Stack columns (w2, w3): right half, stacked vertically.
-        let r2 = positions.iter().find(|(wid, _)| *wid == WindowId::new(2)).unwrap().1;
-        let r3 = positions.iter().find(|(wid, _)| *wid == WindowId::new(3)).unwrap().1;
+        let r2 = positions
+            .iter()
+            .find(|(wid, _)| *wid == WindowId::new(2))
+            .unwrap()
+            .1;
+        let r3 = positions
+            .iter()
+            .find(|(wid, _)| *wid == WindowId::new(3))
+            .unwrap()
+            .1;
         assert_eq!(r2.loc.x, 960, "stack col starts at mid-point");
         assert_eq!(r3.loc.x, 960, "stack col starts at mid-point");
         assert_eq!(r2.size.w, 960, "stack cols fill the right half");
@@ -8553,7 +14468,7 @@ mod tests {
             outer_gaps: (0, 0, 0, 0),
             ..LayoutConfig::default()
         };
-        use crate::layout::workspace::{WorkspaceLayout, Workspace};
+        use crate::layout::workspace::{Workspace, WorkspaceLayout};
         let mut ws = Workspace::with_layout(WorkspaceLayout::BStack);
         ws.add_window_to_new_column(WindowId::new(1));
 
@@ -8565,6 +14480,47 @@ mod tests {
         assert_eq!(r.size.h, 1080, "single column should take full height");
     }
 
+    #[test]
+    fn test_set_workspace_layout_updates_active_workspace() {
+        let mut engine = make_engine_fixed_1920();
+        let oid = engine.focused_output().unwrap();
+
+        engine
+            .set_workspace_layout("spiral")
+            .expect("spiral layout should be accepted");
+        let mode = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .layout_mode;
+        assert_eq!(mode, WorkspaceLayout::Spiral);
+
+        engine
+            .set_workspace_layout("bottom-stack")
+            .expect("bstack alias should be accepted");
+        let mode = engine
+            .monitors()
+            .get(&oid)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .layout_mode;
+        assert_eq!(mode, WorkspaceLayout::BStack);
+    }
+
+    #[test]
+    fn test_set_workspace_layout_rejects_unknown_mode() {
+        let mut engine = make_engine_fixed_1920();
+        let err = engine.set_workspace_layout("grid").unwrap_err();
+        assert!(
+            err.contains("unknown workspace layout"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
     // =========================================================================
     // Item 3 — snap_floating_to_corner (engine-level)
     // =========================================================================
@@ -8573,7 +14529,10 @@ mod tests {
     fn test_snap_floating_to_corner_no_op_when_not_floating() {
         // A tiled window — snap_floating_to_corner must be a no-op (no panic).
         let mut engine = make_engine();
-        engine.add_window(make_window(100, 500, 400), &BackendHandle::default_for_test());
+        engine.add_window(
+            make_window(100, 500, 400),
+            &BackendHandle::default_for_test(),
+        );
         let oid = engine.focused_output().unwrap();
         if let Some(m) = engine.monitors_mut().get_mut(&oid) {
             m.focus_window = Some(WindowId::new(100));
@@ -8605,14 +14564,18 @@ mod tests {
         let target = Rect::new(960, 0, 500, 1080);
 
         // Seed applied_state so the transition has a non-zero start.
-        engine.applied_state.insert(wid, AppliedState {
-            rect: start,
-            border_color: 0xFFFF_FFFF,
-            opacity: 0xFFFF_FFFF,
-            visible: true,
-            focused: false,
-            backdrop: 0xFFFF_FFFF,
-        });
+        engine.applied_state.insert(
+            wid,
+            AppliedState {
+                rect: start,
+                border_color: 0xFFFF_FFFF,
+                opacity: 0xFFFF_FFFF,
+                visible: true,
+                focused: false,
+                backdrop: 0xFFFF_FFFF,
+                corner: CORNER_UNSET,
+            },
+        );
 
         engine.animating_to_target(wid, target);
 
@@ -8627,10 +14590,13 @@ mod tests {
         );
 
         // The start and target rects stored in animating_rects must be distinct.
-        if let Some(&(s, t, _, _)) = engine.animating_rects.get(&wid) {
-            assert_ne!(s, t, "start and target rects must differ");
-            assert_eq!(s, start, "stored start rect matches what we seeded");
-            assert_eq!(t, target, "stored target rect matches the requested target");
+        if let Some(rect) = engine.animating_rects.get(&wid) {
+            assert_ne!(rect.from, rect.target, "start and target rects must differ");
+            assert_eq!(rect.from, start, "stored start rect matches what we seeded");
+            assert_eq!(
+                rect.target, target,
+                "stored target rect matches the requested target"
+            );
         }
     }
 
@@ -8640,7 +14606,7 @@ mod tests {
 
     #[test]
     fn test_spiral_layout_three_tiles() {
-        use crate::layout::workspace::{WorkspaceLayout, Workspace};
+        use crate::layout::workspace::{Workspace, WorkspaceLayout};
         let work_rect = Rect::new(0, 0, 1920, 1080);
         let mut ws = Workspace::with_layout(WorkspaceLayout::Spiral);
         ws.add_window_to_new_column(WindowId::new(1));
@@ -8652,18 +14618,30 @@ mod tests {
         assert_eq!(positions.len(), 3, "spiral must position all 3 tiles");
 
         // Tile 1 (index 0): left half of full rect → x=0, w=960.
-        let r1 = positions.iter().find(|(w, _)| *w == WindowId::new(1)).unwrap().1;
+        let r1 = positions
+            .iter()
+            .find(|(w, _)| *w == WindowId::new(1))
+            .unwrap()
+            .1;
         assert_eq!(r1.loc.x, 0, "tile 1 starts at left edge");
         assert_eq!(r1.size.w, 960, "tile 1 takes left half width");
         assert_eq!(r1.size.h, 1080, "tile 1 takes full height");
 
         // Tile 2 (index 1): top half of the right-half remainder → y=0, h=540.
-        let r2 = positions.iter().find(|(w, _)| *w == WindowId::new(2)).unwrap().1;
+        let r2 = positions
+            .iter()
+            .find(|(w, _)| *w == WindowId::new(2))
+            .unwrap()
+            .1;
         assert_eq!(r2.loc.x, 960, "tile 2 starts at the right half x");
         assert_eq!(r2.size.h, 540, "tile 2 takes top half of remainder height");
 
         // Tile 3 (index 2): fills whatever remains.
-        let r3 = positions.iter().find(|(w, _)| *w == WindowId::new(3)).unwrap().1;
+        let r3 = positions
+            .iter()
+            .find(|(w, _)| *w == WindowId::new(3))
+            .unwrap()
+            .1;
         assert_eq!(r3.loc.x, 960, "tile 3 is in the right half");
         assert_eq!(r3.loc.y, 540, "tile 3 starts below tile 2");
 
@@ -8676,24 +14654,30 @@ mod tests {
 
     #[test]
     fn test_spiral_layout_single_tile_fills_work_rect() {
-        use crate::layout::workspace::{WorkspaceLayout, Workspace};
+        use crate::layout::workspace::{Workspace, WorkspaceLayout};
         let work_rect = Rect::new(0, 0, 1920, 1080);
         let mut ws = Workspace::with_layout(WorkspaceLayout::Spiral);
         ws.add_window_to_new_column(WindowId::new(42));
         let engine = make_engine_fixed_1920();
         let positions = engine.calculate_positions_spiral(&ws, work_rect);
         assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].1, work_rect, "single tile must fill the whole work rect");
+        assert_eq!(
+            positions[0].1, work_rect,
+            "single tile must fill the whole work rect"
+        );
     }
 
     #[test]
     fn test_spiral_layout_empty_workspace_returns_empty() {
-        use crate::layout::workspace::{WorkspaceLayout, Workspace};
+        use crate::layout::workspace::{Workspace, WorkspaceLayout};
         let work_rect = Rect::new(0, 0, 1920, 1080);
         let ws = Workspace::with_layout(WorkspaceLayout::Spiral);
         let engine = make_engine_fixed_1920();
         let positions = engine.calculate_positions_spiral(&ws, work_rect);
-        assert!(positions.is_empty(), "empty workspace produces no positions");
+        assert!(
+            positions.is_empty(),
+            "empty workspace produces no positions"
+        );
     }
 
     // =========================================================================
@@ -8710,9 +14694,15 @@ mod tests {
 
         assert!(!engine.is_sticky(wid), "window is not sticky initially");
         engine.toggle_sticky(&BackendHandle::default_for_test());
-        assert!(engine.is_sticky(wid), "window should be sticky after first toggle");
+        assert!(
+            engine.is_sticky(wid),
+            "window should be sticky after first toggle"
+        );
         engine.toggle_sticky(&BackendHandle::default_for_test());
-        assert!(!engine.is_sticky(wid), "window should be non-sticky after second toggle");
+        assert!(
+            !engine.is_sticky(wid),
+            "window should be non-sticky after second toggle"
+        );
     }
 
     /// Sticky windows are not hidden when switching workspaces.
@@ -8752,7 +14742,11 @@ mod tests {
         assert_eq!(engine.workspace_name(0), None, "no name set initially");
 
         let result = engine.rename_workspace(0, "Main");
-        assert!(result.is_ok(), "rename of existing workspace must succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "rename of existing workspace must succeed: {:?}",
+            result
+        );
         assert_eq!(engine.workspace_name(0), Some("Main".to_string()));
 
         // Renaming a non-existent workspace must return Err.
@@ -8767,7 +14761,11 @@ mod tests {
     #[test]
     fn test_workspace_name_returns_none_when_unset() {
         let engine = make_engine_fixed_1920();
-        assert_eq!(engine.workspace_name(5), None, "unknown workspace has no name");
+        assert_eq!(
+            engine.workspace_name(5),
+            None,
+            "unknown workspace has no name"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -8792,7 +14790,11 @@ mod tests {
             ..LayoutConfig::default()
         });
         let oid = OutputId::from_name("M");
-        engine.register_monitor(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        engine.register_monitor(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         engine.add_window(make_window(200, 0, 0), &BackendHandle::default_for_test());
         focus_window(&mut engine, 200);
 
@@ -8839,12 +14841,36 @@ mod tests {
     #[test]
     fn test_backdrop_cycle() {
         // Verify backdrop_str_to_u32 returns the correct DWMSBT_* enum values.
-        assert_eq!(TilingEngine::backdrop_str_to_u32("auto"),    0, "auto → DWMSBT_AUTO");
-        assert_eq!(TilingEngine::backdrop_str_to_u32("none"),    1, "none → DWMSBT_NONE");
-        assert_eq!(TilingEngine::backdrop_str_to_u32("mica"),    2, "mica → DWMSBT_MAINWINDOW");
-        assert_eq!(TilingEngine::backdrop_str_to_u32("acrylic"), 3, "acrylic → DWMSBT_TRANSIENTWINDOW");
-        assert_eq!(TilingEngine::backdrop_str_to_u32("tabbed"),  4, "tabbed → DWMSBT_TABBEDWINDOW");
-        assert_eq!(TilingEngine::backdrop_str_to_u32("bogus"),   0, "unknown → fallback DWMSBT_AUTO");
+        assert_eq!(
+            TilingEngine::backdrop_str_to_u32("auto"),
+            0,
+            "auto → DWMSBT_AUTO"
+        );
+        assert_eq!(
+            TilingEngine::backdrop_str_to_u32("none"),
+            1,
+            "none → DWMSBT_NONE"
+        );
+        assert_eq!(
+            TilingEngine::backdrop_str_to_u32("mica"),
+            2,
+            "mica → DWMSBT_MAINWINDOW"
+        );
+        assert_eq!(
+            TilingEngine::backdrop_str_to_u32("acrylic"),
+            3,
+            "acrylic → DWMSBT_TRANSIENTWINDOW"
+        );
+        assert_eq!(
+            TilingEngine::backdrop_str_to_u32("tabbed"),
+            4,
+            "tabbed → DWMSBT_TABBEDWINDOW"
+        );
+        assert_eq!(
+            TilingEngine::backdrop_str_to_u32("bogus"),
+            0,
+            "unknown → fallback DWMSBT_AUTO"
+        );
 
         // Verify the cycle order: auto → none → mica → acrylic → tabbed → auto.
         let mut engine = make_engine();
@@ -8863,7 +14889,10 @@ mod tests {
         assert_eq!(engine.config.backdrop, "tabbed");
 
         engine.toggle_backdrop_cycle(&BackendHandle::default_for_test());
-        assert_eq!(engine.config.backdrop, "auto", "cycle wraps from 'tabbed' back to 'auto'");
+        assert_eq!(
+            engine.config.backdrop, "auto",
+            "cycle wraps from 'tabbed' back to 'auto'"
+        );
     }
 
     // =========================================================================
@@ -8881,7 +14910,11 @@ mod tests {
         {
             let m = engine.monitors().get(&oid).unwrap();
             let ws = m.workspace().unwrap();
-            assert_eq!(ws.columns.len(), 2, "two columns after two add_window calls");
+            assert_eq!(
+                ws.columns.len(),
+                2,
+                "two columns after two add_window calls"
+            );
             assert_eq!(ws.columns[0].tiles[0].window_id, WindowId::new(100));
             assert_eq!(ws.columns[1].tiles[0].window_id, WindowId::new(101));
         }
@@ -8897,14 +14930,23 @@ mod tests {
         let m = engine.monitors().get(&oid).unwrap();
         let ws = m.workspace().unwrap();
         assert_eq!(ws.columns.len(), 2, "column count unchanged after swap");
-        assert_eq!(ws.columns[0].tiles[0].window_id, WindowId::new(101),
-            "column 0 should now hold w101 after swap");
-        assert_eq!(ws.columns[1].tiles[0].window_id, WindowId::new(100),
-            "column 1 should now hold w100 after swap");
+        assert_eq!(
+            ws.columns[0].tiles[0].window_id,
+            WindowId::new(101),
+            "column 0 should now hold w101 after swap"
+        );
+        assert_eq!(
+            ws.columns[1].tiles[0].window_id,
+            WindowId::new(100),
+            "column 1 should now hold w100 after swap"
+        );
 
         // Focus should have followed col 0 (now at idx 1).
-        assert_eq!(m.focus_column, Some(1),
-            "focus_column should follow the moved column from idx 0 → idx 1");
+        assert_eq!(
+            m.focus_column,
+            Some(1),
+            "focus_column should follow the moved column from idx 0 → idx 1"
+        );
     }
 
     #[test]
@@ -8918,8 +14960,16 @@ mod tests {
         engine.swap_columns(0, 0, &BackendHandle::default_for_test());
 
         let ws = engine.monitors().get(&oid).unwrap().workspace().unwrap();
-        assert_eq!(ws.columns[0].tiles[0].window_id, WindowId::new(100), "col order unchanged");
-        assert_eq!(ws.columns[1].tiles[0].window_id, WindowId::new(101), "col order unchanged");
+        assert_eq!(
+            ws.columns[0].tiles[0].window_id,
+            WindowId::new(100),
+            "col order unchanged"
+        );
+        assert_eq!(
+            ws.columns[1].tiles[0].window_id,
+            WindowId::new(101),
+            "col order unchanged"
+        );
     }
 
     #[test]
@@ -8948,7 +14998,8 @@ mod tests {
         engine.add_window(make_window(200, 0, 0), &BackendHandle::default_for_test());
         engine.add_window(make_window(201, 0, 0), &BackendHandle::default_for_test());
 
-        let snap = engine.snapshot_current_workspace()
+        let snap = engine
+            .snapshot_current_workspace()
             .expect("snapshot should succeed with focused monitor");
 
         assert_eq!(snap.workspaces.len(), 1, "one workspace snapshot");
@@ -8966,21 +15017,19 @@ mod tests {
     /// columns since all HWNDs are fake.
     #[test]
     fn test_restore_snapshot_skips_dead_hwnds() {
-        use crate::layout::snapshot::{LayoutSnapshot, WorkspaceSnapshot, ColumnSnapshot};
+        use crate::layout::snapshot::{ColumnSnapshot, LayoutSnapshot, WorkspaceSnapshot};
 
         let mut engine = make_engine_fixed_1920();
         // No real windows registered — all HWNDs in the snapshot are dead.
         let snap = LayoutSnapshot {
             workspaces: vec![WorkspaceSnapshot {
                 id: 0,
-                columns: vec![
-                    ColumnSnapshot {
-                        width: None,
-                        display: "stacked".to_string(),
-                        // HWNDs 0xDEAD and 0xBEEF are not real windows.
-                        tiles: vec![0xDEAD, 0xBEEF],
-                    },
-                ],
+                columns: vec![ColumnSnapshot {
+                    width: None,
+                    display: "stacked".to_string(),
+                    // HWNDs 0xDEAD and 0xBEEF are not real windows.
+                    tiles: vec![0xDEAD, 0xBEEF],
+                }],
                 scroll_offset_x: 0,
             }],
             focused_workspace: Some(0),
@@ -8988,7 +15037,11 @@ mod tests {
 
         // restore_snapshot should succeed without panicking.
         let result = engine.restore_snapshot(&snap, &BackendHandle::default_for_test());
-        assert!(result.is_ok(), "restore with dead HWNDs should not error: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "restore with dead HWNDs should not error: {:?}",
+            result
+        );
 
         let oid = engine.focused_output().unwrap();
         let ws = engine.monitors().get(&oid).unwrap().workspace().unwrap();
@@ -9041,5 +15094,1201 @@ mod tests {
             !engine_single.is_over_gap(mid_gap_x, mid_y),
             "single-column workspace has no gap",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime-defect regression tests (live desktop: focus loop, ghost tiles,
+    // windows left behind, narrow columns)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parked_rect_keeps_visible_tiles_and_parks_off_screen_ones() {
+        let view = Rect::new(0, 0, 1366, 768);
+        let visible = Rect::new(100, 8, 400, 700);
+        assert_eq!(parked_rect(visible, view, 832), visible);
+        // Partly on screen: keeps its place (the strip is clipped by the edge).
+        let partly = Rect::new(-200, 8, 400, 700);
+        assert_eq!(parked_rect(partly, view, 832), partly);
+        // Completely off to the left or the right: parked below the screen.
+        let left = Rect::new(-500, 8, 400, 700);
+        assert_eq!(parked_rect(left, view, 832), Rect::new(0, 832, 400, 700));
+        let right = Rect::new(1366, 8, 400, 700);
+        assert_eq!(parked_rect(right, view, 832), Rect::new(0, 832, 400, 700));
+        // How far out of view a tile is does not matter: scrolling must not
+        // re-position windows nobody can see.
+        let far = Rect::new(9000, 8, 400, 700);
+        assert_eq!(parked_rect(far, view, 832), parked_rect(right, view, 832));
+    }
+
+    #[test]
+    fn test_restorable_bounds_rescues_windows_left_off_screen() {
+        let work = [Rect::new(0, 0, 1366, 728)];
+        // A normal original position is kept.
+        let normal = Rect::new(104, 104, 520, 380);
+        assert_eq!(restorable_bounds(normal, &work, 0), normal);
+        // Partly off the edge but still plenty visible: kept.
+        let edge = Rect::new(-300, 40, 520, 380);
+        assert_eq!(restorable_bounds(edge, &work, 0), edge);
+        // Parked below the screen by an earlier, killed wiri: brought back,
+        // centred, at its own size.
+        let parked = Rect::new(4, 836, 445, 711);
+        let rescued = restorable_bounds(parked, &work, 0);
+        assert_eq!(rescued.size.w, 445);
+        assert_eq!(rescued.size.h, 509); // capped at 70% of the 728 px work area
+        assert!(
+            rescued.loc.y >= 0 && rescued.bottom() <= 728,
+            "{:?}",
+            rescued
+        );
+        assert!(
+            rescued.loc.x >= 0 && rescued.right() <= 1366,
+            "{:?}",
+            rescued
+        );
+        // A sliver of a few pixels does not count as visible.
+        let sliver = Rect::new(-510, 100, 520, 380);
+        assert_ne!(restorable_bounds(sliver, &work, 0), sliver);
+        // No monitors known: nothing to correct against.
+        assert_eq!(restorable_bounds(parked, &[], 0), parked);
+    }
+
+    #[test]
+    fn test_rescued_windows_are_cascaded_not_stacked() {
+        let work = [Rect::new(0, 0, 1366, 728)];
+        let parked = Rect::new(4, 836, 445, 711);
+        let first = restorable_bounds(parked, &work, 0);
+        let second = restorable_bounds(parked, &work, 1);
+        let third = restorable_bounds(parked, &work, 2);
+        assert_eq!(
+            first.loc.x,
+            (1366 - first.size.w as i32) / 2,
+            "the first one is centred"
+        );
+        assert_eq!(
+            (second.loc.x - first.loc.x, second.loc.y - first.loc.y),
+            (32, 32)
+        );
+        assert_eq!(
+            (third.loc.x - second.loc.x, third.loc.y - second.loc.y),
+            (32, 32)
+        );
+        assert_eq!(second.size, first.size, "they keep their size");
+        // However many there are, every one stays on the work area.
+        for nth in 0..40 {
+            let r = restorable_bounds(parked, &work, nth);
+            assert!(r.loc.x >= 0 && r.right() <= 1366, "{} {:?}", nth, r);
+            assert!(r.loc.y >= 0 && r.bottom() <= 728, "{} {:?}", nth, r);
+        }
+        // The cascade starts over after eight steps.
+        assert_eq!(restorable_bounds(parked, &work, 8), first);
+    }
+
+    #[test]
+    fn test_removing_a_window_forgets_where_it_was() {
+        // A destroyed window handle can be handed to a new window: the new one must not
+        // inherit the old window's original rectangle.
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(4100, 30, 40), &be);
+        assert_eq!(
+            engine.original_bounds.get(&WindowId::new(4100)),
+            Some(&Rect::new(30, 40, 800, 600))
+        );
+        engine.remove_window(WindowId::new(4100), &be);
+        assert!(engine.original_bounds.get(&WindowId::new(4100)).is_none());
+        engine.add_window(make_window(4100, 500, 60), &be);
+        assert_eq!(
+            engine.original_bounds.get(&WindowId::new(4100)),
+            Some(&Rect::new(500, 60, 800, 600)),
+            "the new window with the same handle is remembered where it is"
+        );
+    }
+
+    // --- Minimum widths (WM_GETMINMAXINFO) ---
+
+    fn proportional_cfg() -> LayoutConfig {
+        LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 640,
+            max_visible_columns: 0,
+            ..LayoutConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_a_column_is_never_narrower_than_its_minimum_in_fixed_mode() {
+        let cfg = LayoutConfig {
+            column_width: 440,
+            ..LayoutConfig::default()
+        };
+        let (widths, auto) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 462, 0],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![440, 462, 440]);
+        assert_eq!(auto, 440);
+        // An explicit width below the minimum is raised to it; a wider one stays.
+        let (widths, _) = TilingEngine::column_widths_with_minimums(
+            &[Some(300), Some(900)],
+            &[462, 462],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![462, 900]);
+        // No minimums at all is what column_widths always gave.
+        assert_eq!(
+            TilingEngine::column_widths_with_minimums(&[None, Some(700)], &[], 1366, 16, &cfg).0,
+            TilingEngine::column_widths(&[None, Some(700)], 1366, 16, &cfg)
+        );
+    }
+
+    #[test]
+    fn test_columns_with_minimums_share_the_view_in_proportional_mode() {
+        let cfg = proportional_cfg();
+        // Three columns on 1366 px: an equal share is 444 px.  Two terminals cannot be
+        // narrower than 462 px, so they keep 462 and the third column gets what is left.
+        let (widths, auto) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 462, 462],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![410, 462, 462]);
+        assert_eq!(auto, 410);
+        assert_eq!(
+            widths.iter().sum::<i32>() + 2 * 16,
+            1366,
+            "the strip still fills the view exactly"
+        );
+        // Without minimums nothing changes, and a minimum below the share changes nothing.
+        assert_eq!(
+            TilingEngine::column_widths(&[None, None, None], 1366, 16, &cfg),
+            vec![444, 444, 444]
+        );
+        let (widths, _) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 300, 0],
+            1366,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths, vec![444, 444, 444]);
+    }
+
+    #[test]
+    fn test_a_minimum_that_squeezes_another_column_below_its_own_is_honoured_too() {
+        // 1000 px, three auto columns: 322 px each.  A (600) cannot, so B gets (968-600)/2
+        // = 184 px, which is below B's own minimum (300): B keeps its minimum as well.
+        let cfg = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 200,
+            ..LayoutConfig::default()
+        };
+        let (widths, _) = TilingEngine::column_widths_with_minimums(
+            &[None, None, None],
+            &[0, 600, 300],
+            1000,
+            16,
+            &cfg,
+        );
+        assert_eq!(widths[1], 600);
+        assert_eq!(widths[2], 300);
+        assert!(
+            widths[0] >= 100,
+            "the rest is not squeezed out of existence"
+        );
+    }
+
+    #[test]
+    fn test_a_window_that_cannot_get_narrower_widens_its_column_and_the_rest_move_over() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        for hwnd in [5001, 5002, 5003] {
+            engine.add_window(make_window(hwnd, 10, 10), &be);
+        }
+        let work = Rect::new(8, 8, 1904, 1024);
+        let rects = |engine: &TilingEngine| -> HashMap<isize, Rect> {
+            let out = engine.monitors.focused_id().unwrap();
+            let ws = engine
+                .monitors
+                .get(&out)
+                .and_then(|m| m.workspace())
+                .unwrap();
+            engine
+                .calculate_positions(ws, work, &engine.config)
+                .into_iter()
+                .map(|(id, r)| (id.as_isize(), r))
+                .collect()
+        };
+        let before = rects(&engine);
+        assert_eq!(before[&5002].size.w, 500);
+
+        assert!(engine.note_window_min_width(WindowId::new(5002), 700));
+        let after = rects(&engine);
+        let border = 2 * engine.config.border_width.max(1);
+        assert_eq!(
+            after[&5001], before[&5001],
+            "the column before it does not move"
+        );
+        assert_eq!(
+            after[&5002].size.w,
+            (700 + border) as u32,
+            "the window plus its border"
+        );
+        assert_eq!(
+            after[&5003].loc.x,
+            before[&5003].loc.x + 200 + border,
+            "the column after it moves over instead of lying under it"
+        );
+        assert!(
+            after[&5002].right() + 16 <= after[&5003].loc.x,
+            "no overlap: {:?} {:?}",
+            after[&5002],
+            after[&5003]
+        );
+
+        // The limit goes away again.
+        assert!(
+            !engine.note_window_min_width(WindowId::new(5002), 700),
+            "no change"
+        );
+        assert!(engine.note_window_min_width(WindowId::new(5002), 0));
+        assert_eq!(rects(&engine), before);
+        assert!(!engine.note_window_min_width(WindowId::new(5002), 0));
+    }
+
+    #[test]
+    fn test_a_user_width_below_the_minimum_is_kept_but_not_used() {
+        // The user asked for 400 px; the window will not go below 650 px. The column
+        // also contains its border. The requested 400 px comes back when the limit goes
+        // (niri keeps the requested width the same way).
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(5031, 10, 10), &be);
+        let out = engine.monitors.focused_id().unwrap();
+        engine
+            .monitors
+            .get_mut(&out)
+            .and_then(|m| m.workspace_mut())
+            .unwrap()
+            .columns[0]
+            .set_width(Some(400));
+        engine.note_window_min_width(WindowId::new(5031), 650);
+        let ws = engine
+            .monitors
+            .get(&out)
+            .and_then(|m| m.workspace())
+            .unwrap();
+        assert_eq!(ws.columns[0].width, Some(400));
+        let tile_width = 650 + 2 * engine.config.border_width.max(1);
+        assert_eq!(ws.columns[0].resolved_width(500), tile_width);
+        let positions = engine.calculate_positions(ws, Rect::new(8, 8, 1904, 1024), &engine.config);
+        assert_eq!(positions[0].1.size.w, tile_width as u32);
+        engine.note_window_min_width(WindowId::new(5031), 0);
+        let ws = engine
+            .monitors
+            .get(&out)
+            .and_then(|m| m.workspace())
+            .unwrap();
+        assert_eq!(ws.columns[0].resolved_width(500), 400);
+    }
+
+    fn tile_min(engine: &TilingEngine, id: isize) -> Option<u32> {
+        engine
+            .monitors
+            .values()
+            .flat_map(|m| m.workspaces.values())
+            .flat_map(|w| w.columns.iter())
+            .flat_map(|c| c.tiles.iter())
+            .find(|t| t.window_id == WindowId::new(id))
+            .map(|t| t.min_width)
+    }
+
+    #[test]
+    fn test_the_minimum_width_follows_the_window_to_another_workspace_and_back_from_floating() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(5011, 10, 10), &be);
+        engine.note_window_min_width(WindowId::new(5011), 650);
+        let minimum = 650 + 2 * engine.config.border_width.max(1) as u32;
+        assert_eq!(tile_min(&engine, 5011), Some(minimum));
+        // Moved to another workspace: the tile is made anew, with the same limit.
+        engine.move_window_to_workspace(1, &be);
+        assert_eq!(tile_min(&engine, 5011), Some(minimum));
+        // Floated (no tile) and tiled again.
+        engine.toggle_floating_for(WindowId::new(5011), &be);
+        assert_eq!(
+            tile_min(&engine, 5011),
+            None,
+            "a floating window has no tile"
+        );
+        engine.toggle_floating_for(WindowId::new(5011), &be);
+        assert_eq!(tile_min(&engine, 5011), Some(minimum));
+    }
+
+    #[test]
+    fn test_a_closed_window_takes_its_limit_with_it() {
+        // Window handles are recycled: the next window with this handle starts without a limit.
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        engine.add_window(make_window(5021, 10, 10), &be);
+        engine.note_window_min_width(WindowId::new(5021), 650);
+        engine.remove_window(WindowId::new(5021), &be);
+        engine.add_window(make_window(5021, 10, 10), &be);
+        assert_eq!(tile_min(&engine, 5021), Some(0));
+        assert!(
+            engine.min_width_query_wanted(WindowId::new(5021)),
+            "asked afresh"
+        );
+    }
+
+    #[test]
+    fn test_a_window_that_does_not_answer_is_asked_again_but_not_forever() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        let id = WindowId::new(5041);
+        assert!(
+            !engine.min_width_query_wanted(id),
+            "not managed: nothing to ask"
+        );
+        engine.add_window(make_window(5041, 10, 10), &be);
+        assert!(engine.min_width_query_wanted(id));
+        // Asked once when it opened, and again twice when it took the focus: no answer.
+        for _ in 0..3 {
+            assert!(engine.min_width_query_wanted(id));
+            assert!(!engine.note_min_width_answer(id, None));
+        }
+        assert!(
+            !engine.min_width_query_wanted(id),
+            "three tries are all it gets"
+        );
+        // An answer ends the asking, and a limit above the layout's own changes the layout.
+        engine.add_window(make_window(5042, 10, 10), &be);
+        let other = WindowId::new(5042);
+        assert!(engine.note_min_width_answer(other, Some(600)));
+        assert!(!engine.min_width_query_wanted(other));
+        let border = 2 * engine.config.border_width.max(1) as u32;
+        assert_eq!(tile_min(&engine, 5042), Some(600 + border));
+        // An absurd visible-window answer is capped before adding the tile border.
+        assert!(engine.note_window_min_width(other, 1_000_000));
+        assert_eq!(tile_min(&engine, 5042), Some(16_384 + border));
+    }
+
+    #[test]
+    fn native_readiness_answer_widens_three_terminal_tiles_including_borders() {
+        let mut engine = TilingEngine::new(LayoutConfig {
+            column_width: 431,
+            column_width_mode: ColumnWidthMode::Fixed,
+            border_width: 4,
+            column_gap: 24,
+            ..LayoutConfig::default()
+        });
+        let output = OutputId::from_name("1366px");
+        let work = Rect::new(0, 0, 1366, 720);
+        engine.register_monitor(output, work, work);
+        let be = BackendHandle::default_for_test();
+        for hwnd in [5051, 5052, 5053] {
+            let id = WindowId::new(hwnd);
+            engine.add_window(make_window(hwnd, 0, 0), &be);
+            assert!(
+                !engine.note_min_width_answer(id, None),
+                "not ready on admission"
+            );
+            assert!(
+                engine.min_width_query_wanted(id),
+                "a native readiness hint may retry"
+            );
+            assert!(engine.note_min_width_answer(id, Some(466)));
+            assert!(
+                !engine.note_min_width_answer(id, Some(466)),
+                "no duplicate relayout"
+            );
+            assert!(
+                !engine.min_width_query_wanted(id),
+                "a successful answer ends retries"
+            );
+            assert_eq!(tile_min(&engine, hwnd), Some(474));
+        }
+        let ws = engine
+            .monitors
+            .get(&output)
+            .and_then(|m| m.workspace())
+            .unwrap();
+        let positions = engine.calculate_positions(ws, work, &engine.config);
+        assert_eq!(positions.len(), 3);
+        for (_, rect) in &positions {
+            assert_eq!(
+                rect.size.w - 8,
+                466,
+                "placement leaves the native visible minimum"
+            );
+        }
+        for pair in positions.windows(2) {
+            assert!(
+                pair[0].1.right() + 24 <= pair[1].1.loc.x,
+                "tiles scroll, never overlap"
+            );
+        }
+        assert!(positions[2].1.right() - positions[0].1.loc.x > work.size.w as i32);
+    }
+
+    #[test]
+    fn native_and_rule_minima_use_the_larger_window_width_before_adding_border() {
+        let mut engine = make_engine();
+        let be = BackendHandle::default_for_test();
+        let id = WindowId::new(5061);
+        engine.add_window(make_window(5061, 0, 0), &be);
+        engine.rule_limits.insert(
+            id,
+            rules::RuleLimits {
+                min_width: 800,
+                ..Default::default()
+            },
+        );
+        engine.note_window_min_width(id, 650);
+        let border = 2 * engine.config.border_width.max(1) as u32;
+        assert_eq!(tile_min(&engine, 5061), Some(800 + border));
+        engine.note_window_min_width(id, 900);
+        assert_eq!(tile_min(&engine, 5061), Some(900 + border));
+    }
+
+    // --- A monitor is unplugged: its windows stay, and go back when it comes back ---
+    //
+    // Engine only.  The laptop these tests are run live on has one display, so unplugging a
+    // second monitor has never been done on a real desktop; what is tested is the
+    // engine's answer to `unregister_monitor` / `register_monitor` (what the display-change
+    // handler in main.rs calls), with fabricated monitors and windows.
+
+    fn two_monitors() -> (TilingEngine, OutputId, OutputId) {
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        let a = OutputId::from_name("A");
+        let b = OutputId::from_name("B");
+        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        engine.register_monitor(
+            b,
+            Rect::new(1920, 0, 1920, 1080),
+            Rect::new(1920, 0, 1920, 1040),
+        );
+        (engine, a, b)
+    }
+
+    fn plug_b_in_again(engine: &mut TilingEngine, b: OutputId) {
+        engine.register_monitor(
+            b,
+            Rect::new(1920, 0, 2560, 1440),
+            Rect::new(1920, 0, 2560, 1400),
+        );
+    }
+
+    fn put_on(engine: &mut TilingEngine, hwnd: isize, output: OutputId) {
+        engine.add_window_with_target(
+            make_window(hwnd, 0, 0),
+            AddWindowTarget::Output(output),
+            &BackendHandle::default_for_test(),
+            false,
+        );
+    }
+
+    fn where_is(engine: &TilingEngine, hwnd: isize) -> Option<(OutputId, i32, usize)> {
+        engine.locate_window(WindowId::new(hwnd))
+    }
+
+    #[test]
+    fn test_unplugging_a_monitor_keeps_its_windows_on_the_one_that_is_left() {
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 101, a);
+        put_on(&mut engine, 201, b);
+        put_on(&mut engine, 202, b);
+
+        engine.unregister_monitor(&b);
+
+        assert_eq!(engine.monitors().len(), 1);
+        assert_eq!(engine.focused_output(), Some(a));
+        // Nothing was lost: every window is still managed and sits in a column of the monitor
+        // that is left.
+        for hwnd in [101, 201, 202] {
+            assert!(engine.tiled_windows().contains_key(&WindowId::new(hwnd)));
+            assert_eq!(
+                where_is(&engine, hwnd).map(|w| w.0),
+                Some(a),
+                "window {}",
+                hwnd
+            );
+        }
+        // Its own window did not move.  The unplugged monitor's windows have a workspace of
+        // their own below it, in their old order, and the empty workspace is below that.
+        let (_, ws_own, _) = where_is(&engine, 101).unwrap();
+        let (_, ws_first, col_first) = where_is(&engine, 201).unwrap();
+        let (_, ws_second, col_second) = where_is(&engine, 202).unwrap();
+        assert_eq!(ws_own, 0);
+        assert!(ws_first > ws_own);
+        assert_eq!(ws_first, ws_second, "they stay together");
+        assert_eq!((col_first, col_second), (0, 1), "in their old order");
+        assert_eq!(
+            workspace_ids_of(&engine, a),
+            vec![0, ws_first, 1],
+            "the host's original trailing empty object is retained"
+        );
+        assert_eq!(
+            active_workspace_of(&engine, a),
+            0,
+            "the user's workspace did not change"
+        );
+    }
+
+    #[test]
+    fn test_a_monitor_that_comes_back_gets_its_windows_back_as_they_were() {
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 101, a);
+        put_on(&mut engine, 201, b);
+        put_on(&mut engine, 202, b);
+        engine
+            .monitors
+            .get_mut(&b)
+            .and_then(|m| m.workspace_mut())
+            .unwrap()
+            .columns[1]
+            .set_width(Some(700));
+
+        engine.unregister_monitor(&b);
+        plug_b_in_again(&mut engine, b);
+
+        assert_eq!(engine.monitors().len(), 2);
+        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)));
+        assert_eq!(where_is(&engine, 202), Some((b, 0, 1)));
+        let restored = engine.monitors().get(&b).unwrap();
+        assert_eq!(
+            restored.work_area,
+            Rect::new(1920, 0, 2560, 1400),
+            "the new screen"
+        );
+        assert_eq!(
+            restored.workspace().unwrap().columns[1].width,
+            Some(700),
+            "the column kept its width"
+        );
+        assert_eq!(workspace_ids_of(&engine, b), vec![0, 1]);
+        // A is as it was: its own window and the empty workspace below it.
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(workspace_ids_of(&engine, a), vec![0, 1]);
+        // And the monitor that came back is not the focused one.
+        assert_eq!(engine.focused_output(), Some(a));
+    }
+
+    #[test]
+    fn test_windows_closed_or_moved_while_the_monitor_was_away_do_not_come_back() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        for hwnd in [201, 202, 203] {
+            put_on(&mut engine, hwnd, b);
+        }
+        engine.unregister_monitor(&b);
+        // One window is closed; the user moves another to the workspace they work on.
+        engine.remove_window(WindowId::new(202), &be);
+        {
+            let host = engine.monitors.get_mut(&a).unwrap();
+            host.remove_window(WindowId::new(203));
+            host.workspaces
+                .get_mut(&0)
+                .unwrap()
+                .add_window_to_new_column(WindowId::new(203));
+        }
+
+        plug_b_in_again(&mut engine, b);
+
+        assert_eq!(
+            where_is(&engine, 201),
+            Some((b, 0, 0)),
+            "still where it was put: back"
+        );
+        assert_eq!(where_is(&engine, 202), None, "closed: gone");
+        assert!(!engine.tiled_windows().contains_key(&WindowId::new(202)));
+        assert_eq!(
+            where_is(&engine, 203).map(|w| (w.0, w.1)),
+            Some((a, 0)),
+            "moved by the user: stays where they put it"
+        );
+        assert_eq!(workspace_ids_of(&engine, b), vec![0, 1], "no ghost columns");
+    }
+
+    #[test]
+    fn test_a_floating_window_of_the_unplugged_monitor_follows_it_and_comes_back() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 301, b);
+        put_on(&mut engine, 302, b);
+        let float = WindowId::new(301);
+        engine.toggle_floating_for(float, &be);
+        let on_b = engine.float_rect_of(float).unwrap();
+        assert_eq!(engine.float_location(float), Some((b, 0)));
+
+        engine.unregister_monitor(&b);
+        let (home_output, home_workspace) = engine.float_location(float).unwrap();
+        assert_eq!(home_output, a, "it floats on the monitor that is left");
+        assert_ne!(
+            home_workspace, 0,
+            "on the workspace the unplugged monitor's windows went to"
+        );
+        let on_a = engine.float_rect_of(float).unwrap();
+        let work_a = engine.monitors().get(&a).unwrap().work_area;
+        assert!(
+            on_a.loc.x >= work_a.loc.x && on_a.right() <= work_a.right(),
+            "kept on screen: {:?} in {:?}",
+            on_a,
+            work_a
+        );
+        assert_eq!(
+            where_is(&engine, 302).map(|w| (w.0, w.1)),
+            Some((a, home_workspace)),
+            "the tile that shared the workspace is there too"
+        );
+
+        plug_b_in_again(&mut engine, b);
+        assert_eq!(
+            engine.float_location(float),
+            Some((b, 0)),
+            "back on its own monitor"
+        );
+        let back = engine.float_rect_of(float).unwrap();
+        let work_b = engine.monitors().get(&b).unwrap().work_area;
+        assert!(
+            back.loc.x >= work_b.loc.x && back.right() <= work_b.right(),
+            "{:?}",
+            back
+        );
+        assert_eq!(back.size, on_b.size, "its size is what it was");
+    }
+
+    #[test]
+    fn test_a_minimized_window_of_the_unplugged_monitor_follows_it_and_comes_back() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        put_on(&mut engine, 401, b);
+        put_on(&mut engine, 402, b);
+        let window = WindowId::new(401);
+        engine.minimize_window(window, &be);
+        assert_eq!(engine.minimized.get(&window).map(|m| m.output), Some(b));
+
+        engine.unregister_monitor(&b);
+        let moved = engine.minimized.get(&window).unwrap();
+        assert_eq!(moved.output, a);
+        let (_, workspace_of_402, _) = where_is(&engine, 402).unwrap();
+        assert_eq!(
+            moved.workspace, workspace_of_402,
+            "next to the window it shared a strip with"
+        );
+
+        plug_b_in_again(&mut engine, b);
+        let back = engine.minimized.get(&window).unwrap();
+        assert_eq!((back.output, back.workspace), (b, 0));
+        // Restored, it goes into the strip of its own monitor again.
+        engine.restore_window(window, &be);
+        assert_eq!(where_is(&engine, 401).map(|w| w.0), Some(b));
+    }
+
+    #[test]
+    fn test_a_named_workspace_keeps_one_live_identity_across_unplug_and_return() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, a, b) = two_monitors();
+        engine.set_focused_output(b);
+        engine.rename_workspace(0, "mail").unwrap();
+        let identity = engine.monitors.get(&b).unwrap().workspaces[&0].ipc_id;
+        put_on(&mut engine, 101, a);
+        put_on(&mut engine, 201, b);
+
+        engine.unregister_monitor(&b);
+        let (_, migrated, _) = where_is(&engine, 201).unwrap();
+        assert_ne!(
+            migrated, 0,
+            "globally unique names never merge by local key"
+        );
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(
+            engine.monitors.get(&a).unwrap().workspaces[&migrated].ipc_id,
+            identity
+        );
+        assert_eq!(
+            engine.workspace_name_on(a, migrated).as_deref(),
+            Some("mail")
+        );
+        // Changes made to the live object while away return with it, not an old clone.
+        engine.switch_workspace(migrated, &be);
+        engine.add_window(make_window(202, 0, 0), &be);
+        engine.add_window(make_window(203, 0, 0), &be);
+        engine.toggle_floating_for(WindowId::new(203), &be);
+
+        plug_b_in_again(&mut engine, b);
+        assert_eq!(where_is(&engine, 201), Some((b, 0, 0)));
+        assert_eq!(where_is(&engine, 202), Some((b, 0, 1)));
+        assert_eq!(engine.float_location(WindowId::new(203)), Some((b, 0)));
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(engine.workspace_name_on(b, 0).as_deref(), Some("mail"));
+        assert_eq!(engine.workspace_name_on(a, 0), None);
+        let snapshot = engine.ipc_snapshot();
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|ws| ws.id == identity)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|ws| ws.name.as_deref() == Some("mail"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_the_last_monitor_going_loses_nothing() {
+        let mut engine = make_engine();
+        let a = engine.focused_output().unwrap();
+        engine.add_window(
+            make_window(101, 100, 100),
+            &BackendHandle::default_for_test(),
+        );
+
+        engine.unregister_monitor(&a);
+        assert!(engine.monitors().is_empty());
+        assert!(
+            engine.tiled_windows().contains_key(&WindowId::new(101)),
+            "the window is still known"
+        );
+
+        // A different monitor appears: it takes the windows.
+        let c = OutputId::from_name("C");
+        engine.register_monitor(c, Rect::new(0, 0, 1280, 800), Rect::new(0, 0, 1280, 760));
+        let (output, workspace, _) = where_is(&engine, 101).expect("adopted by the new monitor");
+        assert_eq!(output, c);
+        assert_ne!(
+            workspace, 0,
+            "on a workspace of its own below the new monitor's"
+        );
+
+        // The old one comes back: the window goes back to it.
+        engine.register_monitor(
+            a,
+            Rect::new(1280, 0, 1920, 1080),
+            Rect::new(1280, 0, 1920, 1040),
+        );
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(
+            workspace_ids_of(&engine, c),
+            vec![0],
+            "the new monitor is as it was: one empty workspace"
+        );
+    }
+
+    #[test]
+    fn test_the_same_monitor_coming_straight_back_gets_everything_back() {
+        // No other monitor at all: nothing moved, the monitor is restored as it was (a
+        // display that blinks off and on again).
+        let mut engine = make_engine();
+        let a = engine.focused_output().unwrap();
+        engine.add_window(
+            make_window(101, 100, 100),
+            &BackendHandle::default_for_test(),
+        );
+        engine.add_window(
+            make_window(102, 100, 100),
+            &BackendHandle::default_for_test(),
+        );
+        engine.unregister_monitor(&a);
+        engine.register_monitor(a, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1040));
+        assert_eq!(where_is(&engine, 101), Some((a, 0, 0)));
+        assert_eq!(where_is(&engine, 102), Some((a, 0, 1)));
+        assert_eq!(engine.focused_output(), Some(a));
+    }
+
+    #[test]
+    fn test_nothing_is_hidden_again_once_the_windows_have_been_restored() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.apply_layout_for_monitor(oid, &be);
+        assert!(engine.hidden_since.contains_key(&WindowId::new(101)));
+
+        engine.restore_all(&be);
+        // A pass that runs after the restore (the reconciler does, until the process is
+        // gone) must not hide the window of the other workspace again.
+        engine.hidden_since.clear();
+        let calls = engine.win32_call_count;
+        engine.apply_layout_for_monitor(oid, &be);
+        engine.apply_all(&be);
+        assert!(engine.hidden_since.is_empty(), "no window was hidden again");
+        assert_eq!(engine.win32_call_count, calls, "and no window was touched");
+    }
+
+    // --- hide-method: a cloaked window can be reached through Alt+Tab or the taskbar ---
+
+    #[test]
+    fn test_with_cloaking_a_foreground_report_for_a_hidden_window_brings_its_workspace_along() {
+        use crate::backend::cloak::HideMethod;
+        use std::time::{Duration, Instant};
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        let hidden = WindowId::new(101); // on workspace 1; workspace 0 is the active one
+        engine.apply_layout_for_monitor(oid, &be);
+        assert!(
+            engine.hidden_since.contains_key(&hidden),
+            "the pass that hides a window notes when it did"
+        );
+
+        // The plain way (SW_HIDE): a window that cannot be reached is no report to follow,
+        // however long ago it was hidden - Windows picks a replacement for what was hidden.
+        engine
+            .hidden_since
+            .insert(hidden, Instant::now() - Duration::from_secs(5));
+        assert!(engine.sync_os_foreground(hidden, &be).is_none());
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+
+        // Cloaked: a report right after the hide is still the OS picking a replacement...
+        engine.set_hide_method(HideMethod::Cloak);
+        engine.hidden_since.insert(hidden, Instant::now());
+        assert!(engine.sync_os_foreground(hidden, &be).is_none());
+        assert_eq!(active_workspace_of(&engine, oid), 0);
+
+        // ...a later one is the user asking for the window (Alt+Tab, the taskbar): its
+        // workspace comes along.
+        engine
+            .hidden_since
+            .insert(hidden, Instant::now() - Duration::from_secs(5));
+        assert!(engine.sync_os_foreground(hidden, &be).is_some());
+        assert_eq!(active_workspace_of(&engine, oid), 1);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().focus_window,
+            Some(hidden)
+        );
+    }
+
+    #[test]
+    fn test_switching_workspace_notes_when_the_windows_were_hidden() {
+        // The pass that hides inactive windows is not the only way a window gets hidden:
+        // leaving a workspace hides its windows itself, and that must be noted too, or a
+        // report that such a window is the foreground window is taken for the OS picking a
+        // replacement however late it comes.
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.apply_layout_for_monitor(oid, &be); // window 100 is shown, 101 is hidden
+        engine.hidden_since.clear();
+        engine.switch_workspace(1, &be);
+        assert!(
+            engine.hidden_since.contains_key(&WindowId::new(100)),
+            "the window of the workspace that was left"
+        );
+        assert!(!engine.hidden_since.contains_key(&WindowId::new(101)));
+    }
+
+    #[test]
+    fn test_a_window_that_closes_forgets_when_it_was_hidden() {
+        let be = BackendHandle::default_for_test();
+        let (mut engine, oid) = engine_with_workspaces(&[0, 1]);
+        engine.apply_layout_for_monitor(oid, &be);
+        assert!(engine.hidden_since.contains_key(&WindowId::new(101)));
+        engine.remove_window(WindowId::new(101), &be);
+        assert!(!engine.hidden_since.contains_key(&WindowId::new(101)));
+    }
+
+    #[test]
+    fn test_column_widths_proportional_stop_shrinking_at_max_visible_columns() {
+        let cfg = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 500,
+            max_visible_columns: 3,
+            ..LayoutConfig::default()
+        };
+        let widths = |n: usize| TilingEngine::column_widths(&vec![None; n], 1350, 16, &cfg);
+        assert_eq!(widths(1), vec![1350]);
+        assert_eq!(widths(2), vec![667, 667]);
+        assert_eq!(widths(3), vec![439, 439, 439]);
+        // From the fourth window on the columns stop shrinking and the strip
+        // scrolls: this is the "238 px columns on a 1366 px display" fix.
+        assert_eq!(widths(4), vec![439; 4]);
+        assert_eq!(widths(8), vec![439; 8]);
+
+        // Without the cap the historic floor (column_width / 2) applies.
+        let uncapped = LayoutConfig {
+            max_visible_columns: 0,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            TilingEngine::column_widths(&vec![None; 8], 1350, 16, &uncapped),
+            vec![250; 8]
+        );
+    }
+
+    #[test]
+    fn test_column_widths_explicit_width_wins_in_proportional_mode() {
+        let cfg = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Proportional,
+            column_width: 500,
+            max_visible_columns: 3,
+            ..LayoutConfig::default()
+        };
+        // The width presets and grow/shrink actions set an explicit width; the
+        // proportional mode used to ignore it, so those keys did nothing.
+        assert_eq!(
+            TilingEngine::column_widths(&[Some(300), None], 1350, 16, &cfg),
+            vec![300, 1034]
+        );
+        assert_eq!(
+            TilingEngine::column_widths(&[Some(600), None, None], 1350, 16, &cfg),
+            vec![600, 439, 439]
+        );
+        // Fixed mode is unchanged: explicit width or the configured one.
+        let fixed = LayoutConfig {
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_width: 500,
+            ..LayoutConfig::default()
+        };
+        assert_eq!(
+            TilingEngine::column_widths(&[Some(300), None], 1350, 16, &fixed),
+            vec![300, 500]
+        );
+    }
+
+    #[test]
+    fn test_focus_change_does_not_change_tile_geometry() {
+        // A focus-dependent inset made every focus change resize two windows,
+        // and turned a focus flap into an endless SetWindowPos storm.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        engine.apply_all(&backend);
+        let rects = |e: &TilingEngine| -> HashMap<WindowId, Rect> {
+            e.applied_state.iter().map(|(k, v)| (*k, v.rect)).collect()
+        };
+        let before = rects(&engine);
+        assert_eq!(before.len(), 2);
+
+        // The configure throttle (16 ms) would hide a changed rect by simply
+        // not sending it, so let it expire before each pass: a focus-dependent
+        // inset then shows up as a different applied rect.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.sync_os_foreground(WindowId::new(100), &backend);
+        engine.apply_all(&backend);
+        assert_eq!(before, rects(&engine), "focus must not resize tiles");
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        engine.sync_os_foreground(WindowId::new(101), &backend);
+        engine.apply_all(&backend);
+        assert_eq!(before, rects(&engine), "focus must not resize tiles");
+    }
+
+    #[test]
+    fn test_sync_os_foreground_mirrors_the_os_without_reactivating() {
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        let oid = engine.focused_output().unwrap();
+        {
+            // 101 was added last and holds the focus.
+            let m = engine.monitors().get(&oid).unwrap();
+            assert_eq!(m.focus_window, Some(WindowId::new(101)));
+        }
+
+        // Windows reports window 100 as the foreground window.
+        let located = engine.sync_os_foreground(WindowId::new(100), &backend);
+        assert_eq!(located, Some((0, 0)));
+        let m = engine.monitors().get(&oid).unwrap();
+        assert_eq!(m.focus_window, Some(WindowId::new(100)));
+        assert_eq!(m.focus_column, Some(0));
+        // The OS already activated it: the layout pass must not issue an
+        // activation of its own (that is what ping-ponged the focus).
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+
+        // Reporting the same window again changes nothing.
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(100), &backend),
+            Some((0, 0))
+        );
+
+        // Windows wiri does not manage are ignored.
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(555), &backend),
+            None
+        );
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+    }
+
+    #[test]
+    fn test_os_foreground_report_for_a_window_wiri_hid_does_not_undo_the_workspace_switch() {
+        // Switching workspace hides the windows of the old one.  Windows then picks a
+        // replacement foreground window - very often one of those windows, whose
+        // report arrives after the switch.  Following it would switch back.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        let oid = engine.focused_output().unwrap();
+
+        engine.switch_workspace(1, &backend);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            1
+        );
+
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(101), &backend),
+            None
+        );
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            1,
+            "the late report for a hidden window switched the workspace back"
+        );
+
+        // Coming back shows the windows again; now their reports are welcome.
+        engine.switch_workspace(0, &backend);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            0
+        );
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(100), &backend),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn test_os_foreground_report_for_a_visible_window_on_another_workspace_switches_to_it() {
+        // An application that shows and activates its own window (a notification click)
+        // is the user asking for that window: follow it to its workspace.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        engine.add_window(make_window(101, 0, 0), &backend);
+        let oid = engine.focused_output().unwrap();
+        engine.apply_all(&backend);
+        // Move the engine to workspace 1 without wiri hiding anything.
+        engine
+            .monitors_mut()
+            .get_mut(&oid)
+            .unwrap()
+            .switch_workspace(1);
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            1
+        );
+
+        assert_eq!(
+            engine.sync_os_foreground(WindowId::new(100), &backend),
+            Some((0, 0))
+        );
+        assert_eq!(
+            engine.monitors().get(&oid).unwrap().active_workspace_id(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_failed_activation_is_attempted_once_per_focus_target() {
+        // HWNDs in unit tests are fake, so every activation fails - like a
+        // foreground lock that refuses wiri.  The layout pass must try once for
+        // a given focus target and then leave it alone.
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        engine.add_window(make_window(100, 0, 0), &backend);
+        assert_eq!(engine.last_activated, None);
+        engine.apply_all(&backend);
+        // The attempt is recorded even though it failed...
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+        // ...so later passes do not try again for the same target.
+        engine.apply_all(&backend);
+        engine.apply_all(&backend);
+        assert_eq!(engine.last_activated, Some(WindowId::new(100)));
+    }
+
+    #[test]
+    fn test_remove_window_clears_ghost_tiles_on_inactive_workspaces() {
+        let mut engine = make_engine();
+        let backend = BackendHandle::default_for_test();
+        let oid = engine.focused_output().unwrap();
+        engine.add_window_with_target(
+            make_window(100, 0, 0),
+            AddWindowTarget::Workspace {
+                output: oid,
+                workspace_id: 1,
+            },
+            &backend,
+            false,
+        );
+        assert!(engine.locate_window(WindowId::new(100)).is_some());
+
+        // The window closes while workspace 1 is not the active one.
+        engine.remove_window(WindowId::new(100), &backend);
+        assert!(
+            engine.locate_window(WindowId::new(100)).is_none(),
+            "a closed window left a ghost tile on its inactive workspace"
+        );
+        assert!(engine.tiled_windows().is_empty());
+    }
+
+    #[test]
+    fn test_columns_beyond_the_view_are_positioned_not_left_behind() {
+        // Windows whose column is scrolled out of view were skipped by the
+        // layout and stayed wherever they were created - on top of the tiles.
+        let mut engine = make_engine(); // fixed 500 px columns, 1904 px view
+        let backend = BackendHandle::default_for_test();
+        for i in 100..108 {
+            engine.add_window(make_window(i, 52, 52), &backend);
+        }
+        engine.apply_all(&backend);
+        for i in 100..108 {
+            let st = engine
+                .applied_state
+                .get(&WindowId::new(i))
+                .unwrap_or_else(|| panic!("window {} was never positioned", i));
+            assert_ne!(
+                st.rect,
+                Rect::new(0, 0, 0, 0),
+                "window {} not positioned",
+                i
+            );
+        }
+        // The first columns are on screen; the last ones are parked below it.
+        let first = engine.applied_state.get(&WindowId::new(100)).unwrap();
+        assert!(first.rect.loc.y < 1080, "first column should be visible");
+        let last = engine.applied_state.get(&WindowId::new(107)).unwrap();
+        assert!(
+            last.rect.loc.y >= 1080,
+            "an off-screen column must be parked below the monitor, got y={}",
+            last.rect.loc.y
+        );
+    }
+
+    #[test]
+    fn test_reveal_focused_scrolls_a_new_window_into_view() {
+        let mut engine = make_engine(); // 500 px columns, 16 px gaps, 1904 px view
+        let backend = BackendHandle::default_for_test();
+        let oid = engine.focused_output().unwrap();
+        for i in 100..105 {
+            engine.add_window(make_window(i, 0, 0), &backend);
+        }
+        let scroll = |e: &TilingEngine| {
+            e.monitors()
+                .get(&oid)
+                .unwrap()
+                .workspace()
+                .unwrap()
+                .scroll_offset
+                .x
+        };
+        // Nothing scrolls on its own...
+        assert_eq!(scroll(&engine), 0);
+        // ...until the caller reveals the focused (newest) column: its right
+        // edge (5 * 500 + 4 * 16 = 2564) lines up with the view's (1904).
+        engine.reveal_focused();
+        assert_eq!(scroll(&engine), 2564 - 1904);
     }
 }

@@ -7,23 +7,21 @@
 //! belongs to a sibling agent doing the overview banner; segregating the
 //! file paths keeps merge conflicts away.
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG,
-    PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetWindowPos,
-    ShowWindow, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOZORDER, WM_DESTROY, WM_PAINT,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
+    RegisterClassExW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_DESTROY, WM_PAINT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::PCWSTR;
 
 /// Width in pixels of the on-screen snap line.
 const GUIDE_W: i32 = 2;
@@ -86,9 +84,7 @@ impl SnapGuide {
                     height,
                     SWP_NOACTIVATE | SWP_NOZORDER,
                 );
-                let _ = SetLayeredWindowAttributes(
-                    hwnd, COLORREF(0), GUIDE_ALPHA, LWA_ALPHA,
-                );
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), GUIDE_ALPHA, LWA_ALPHA);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             }
         }
@@ -119,9 +115,8 @@ fn wide(s: &str) -> Vec<u16> {
 fn run_window_loop(state: Arc<GuideState>) {
     unsafe {
         let class_name = wide("WiriSnapGuide");
-        let hinstance =
-            windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                .expect("GetModuleHandleW failed");
+        let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+            .expect("GetModuleHandleW failed");
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -133,11 +128,8 @@ fn run_window_loop(state: Arc<GuideState>) {
         };
         RegisterClassExW(&wc);
 
-        let ex_style = WS_EX_LAYERED
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_TRANSPARENT;
+        let ex_style =
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
 
         let hwnd = CreateWindowExW(
             ex_style,
@@ -156,9 +148,7 @@ fn run_window_loop(state: Arc<GuideState>) {
         .expect("CreateWindowExW failed");
 
         // Initial alpha so we render solid colour when shown.
-        let _ = SetLayeredWindowAttributes(
-            hwnd, COLORREF(0), GUIDE_ALPHA, LWA_ALPHA,
-        );
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), GUIDE_ALPHA, LWA_ALPHA);
 
         *state.hwnd.lock() = Some(hwnd.0 as isize);
 
@@ -185,7 +175,12 @@ unsafe extern "system" fn wnd_proc(
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
             let brush = CreateSolidBrush(COLORREF(GUIDE_COLOR_BGR));
-            let rc = RECT { left: 0, top: 0, right: GUIDE_W, bottom: 4096 };
+            let rc = RECT {
+                left: 0,
+                top: 0,
+                right: GUIDE_W,
+                bottom: 4096,
+            };
             FillRect(hdc, &rc, brush);
             let _ = DeleteObject(brush);
             let _ = EndPaint(hwnd, &ps);
@@ -220,6 +215,13 @@ pub fn guide() -> SnapGuide {
     g
 }
 
+/// Hide without allocating a guide window/thread for a drag that never snapped.
+pub fn hide_if_created() {
+    if let Some(guide) = GLOBAL_GUIDE.lock().as_ref() {
+        guide.hide();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime snap config (read by the low-level hook on every WM_MOUSEMOVE).
 // ---------------------------------------------------------------------------
@@ -235,7 +237,10 @@ pub struct SnapRuntimeConfig {
 
 impl Default for SnapRuntimeConfig {
     fn default() -> Self {
-        Self { enabled: true, threshold_px: 20 }
+        Self {
+            enabled: true,
+            threshold_px: 20,
+        }
     }
 }
 
@@ -284,7 +289,10 @@ mod tests {
     #[test]
     fn snap_runtime_round_trip() {
         let prev = snap_config();
-        set_snap_config(SnapRuntimeConfig { enabled: false, threshold_px: 7 });
+        set_snap_config(SnapRuntimeConfig {
+            enabled: false,
+            threshold_px: 7,
+        });
         let read = snap_config();
         assert!(!read.enabled);
         assert_eq!(read.threshold_px, 7);
@@ -300,7 +308,7 @@ mod tests {
         assert!(note_snap_x(Some(200))); // change
         assert!(note_snap_x(None)); // hide
         assert!(!note_snap_x(None)); // dedup hide
-        // Cleanup for any later tests in this module.
+                                     // Cleanup for any later tests in this module.
         let _ = note_snap_x(None);
     }
 
@@ -312,4 +320,3 @@ mod tests {
         let _g = SnapGuide::new();
     }
 }
-

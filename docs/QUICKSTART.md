@@ -58,7 +58,8 @@ All bindings can be remapped in `config.kdl`.  The default modifier is
 | `Ctrl+Alt+Shift+←/→` | Move the focused column left / right    |
 | `Ctrl+Alt+H/L`       | Scroll the view left / right (vim-keys) |
 | `Ctrl+Alt+1..9`      | Switch to workspace N                   |
-| `Ctrl+Alt+Tab`       | Toggle overview (zoom out)              |
+| `Ctrl+Alt+Space`     | Toggle overview (zoom out)              |
+| ``Ctrl+Alt+` ``      | Focus the previous window               |
 | `Ctrl+Alt+F`         | Toggle fullscreen                       |
 | `Ctrl+Alt+T`         | Toggle floating                         |
 | `Ctrl+Alt+Q`         | Close the focused window                |
@@ -94,7 +95,9 @@ for scripting.
 
 ```powershell
 wiri-ctl state                          # summary block
-wiri-ctl windows                        # aligned columns
+wiri-ctl windows                        # the managed windows, in niri's shape
+wiri-ctl window-list                    # the managed windows, in wiri's older shape
+wiri-ctl workspaces                     # the workspaces, in niri's shape
 wiri-ctl switch-workspace 3
 wiri-ctl spawn 'wt.exe'
 wiri-ctl set-column-width 1/2

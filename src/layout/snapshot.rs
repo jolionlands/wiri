@@ -13,11 +13,11 @@
 //! key — there is no class/title fuzzy matching today.  Stale snapshots
 //! still load cleanly; their tiles just don't materialise.
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-use crate::utils::{OutputId, WindowId};
 use super::workspace::{Column, ColumnDisplay, Tile, Workspace};
+use crate::utils::{OutputId, WindowId};
 
 /// One tile inside a snapshot.  We persist only the bits the engine
 /// actually needs to rebuild the layout — bounds and visual state are
@@ -30,7 +30,9 @@ pub struct SnapshotTile {
     pub height_weight: f32,
 }
 
-fn default_height_weight() -> f32 { 1.0 }
+fn default_height_weight() -> f32 {
+    1.0
+}
 
 /// One column inside a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,22 +77,19 @@ pub struct Snapshot {
     pub monitors: Vec<SnapshotMonitor>,
 }
 
-fn default_version() -> u32 { 1 }
+fn default_version() -> u32 {
+    1
+}
 
 const SNAPSHOT_VERSION: u32 = 1;
 
 impl Snapshot {
     /// Build a snapshot from a `MonitorSet` (read directly off the engine).
-    pub fn from_monitors(
-        monitors: &super::MonitorSet<OutputId, super::Monitor>,
-    ) -> Self {
+    pub fn from_monitors(monitors: &super::MonitorSet<OutputId, super::Monitor>) -> Self {
         let mut out_monitors = Vec::with_capacity(monitors.len());
         for (oid, m) in monitors.iter() {
-            let mut ws_list: Vec<(i32, &Workspace)> = m
-                .workspaces
-                .iter()
-                .map(|(k, v)| (*k, v))
-                .collect();
+            let mut ws_list: Vec<(i32, &Workspace)> =
+                m.workspaces.iter().map(|(k, v)| (*k, v)).collect();
             ws_list.sort_by_key(|(k, _)| *k);
             let workspaces = ws_list
                 .into_iter()
@@ -243,8 +242,7 @@ pub fn save_to(name: &str, snapshot: &Snapshot) -> std::io::Result<PathBuf> {
 pub fn load_from(name: &str) -> std::io::Result<Snapshot> {
     let path = snapshot_path(name);
     let raw = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&raw)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    serde_json::from_str(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Enumerate every snapshot in `snapshot_dir()`.  Returns just the base
@@ -332,8 +330,8 @@ pub fn rebuild_workspaces(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::{Point, Rect};
     use crate::layout::{Monitor, MonitorSet};
+    use crate::utils::{Point, Rect};
 
     fn temp_snapshot_dir() -> PathBuf {
         // Each test gets a unique temp subdir so concurrent tests don't
@@ -356,7 +354,11 @@ mod tests {
 
         let mut ms: MonitorSet<OutputId, Monitor> = MonitorSet::new();
         let oid = OutputId::from_name("RT-MON-1");
-        let mut m = Monitor::new(oid, Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080));
+        let mut m = Monitor::new(
+            oid,
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+        );
         m.add_window(WindowId::new(0x1001));
         m.add_window(WindowId::new(0x1002));
         if let Some(ws) = m.workspace_mut() {
@@ -401,9 +403,18 @@ mod tests {
                 id: 0,
                 columns: vec![SnapshotColumn {
                     tiles: vec![
-                        SnapshotTile { hwnd: 100, height_weight: 1.0 },
-                        SnapshotTile { hwnd: 200, height_weight: 1.0 },
-                        SnapshotTile { hwnd: 300, height_weight: 1.0 },
+                        SnapshotTile {
+                            hwnd: 100,
+                            height_weight: 1.0,
+                        },
+                        SnapshotTile {
+                            hwnd: 200,
+                            height_weight: 1.0,
+                        },
+                        SnapshotTile {
+                            hwnd: 300,
+                            height_weight: 1.0,
+                        },
                     ],
                     width: Some(500),
                     tabbed_active: None,
@@ -414,8 +425,7 @@ mod tests {
             }],
         };
         // Only HWND 200 still exists.
-        let surviving: std::collections::HashSet<isize> =
-            std::iter::once(200isize).collect();
+        let surviving: std::collections::HashSet<isize> = std::iter::once(200isize).collect();
         let rebuilt = rebuild_workspaces(&snap_mon, &surviving);
         let ws = rebuilt.get(&0).expect("workspace 0 materialised");
         assert_eq!(ws.columns.len(), 1, "column kept because it has survivors");
@@ -438,4 +448,3 @@ mod tests {
         assert!(!cleaned.contains(".."));
     }
 }
-

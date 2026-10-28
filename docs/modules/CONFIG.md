@@ -1,5 +1,12 @@
 # Config Module Documentation
 
+> **What the code does today** (Phase 2A): the config is read by `src/config/kdl.rs` (a small
+> dependency-free KDL reader), mapped onto `Config` by `src/config/decode.rs`, loaded and watched by
+> `src/config/loader.rs`, with the entry points in `src/config/parse.rs`.  The user-facing syntax is
+> described in [DOCUMENTATION.md, section 4](../DOCUMENTATION.md#4-configuration-guide).  Everything
+> below this note is the original design sketch (knuffel, a `validate.rs`, a `types/` directory); wiri
+> does not use knuffel and the file layout differs, so read it as background, not as a reference.
+
 ## Overview
 
 The config module (src/config/) handles loading, parsing, watching, and providing access to wiri's configuration. Configuration is in KDL format (Knuth Document Language), similar to niri.
@@ -8,19 +15,13 @@ The config module (src/config/) handles loading, parsing, watching, and providin
 
 `
 config/
-    mod.rs              # Config struct, ConfigLoader, error types
-    parse.rs            # KDL parsing with knuffel
-    validate.rs         # Configuration validation
-    source.rs           # Config file source locations and watching
-    types/
-        mod.rs          # Re-exports all config types
-        input.rs        # InputConfig, keyboard, mouse, touch settings
-        output.rs       # OutputConfig, monitor configuration
-        layout.rs       # LayoutConfig, gaps, borders, focus ring, shadows
-        workspace.rs    # WorkspaceConfig, named workspaces
-        window_rule.rs  # WindowRule, WindowRuleMatch, WindowRuleProperties
-        binds.rs        # BindsConfig, hotkey -> action mappings
-        animation.rs    # AnimationsConfig
+    mod.rs              # re-exports
+    kdl.rs              # the KDL reader (nodes, arguments, properties, line:column errors)
+    decode.rs           # document -> Config, every error and warning with line:column
+    parse.rs            # parse_kdl_config / validate_kdl_config / validate_config_file
+    loader.rs           # Config::load, ConfigLoader (watcher, trailing-edge debounce), include paths
+    types.rs            # Config, InputConfig, LayoutConfig, WindowRule, HotkeyBinding, ...
+    error.rs            # ConfigError
 `
 
 ---

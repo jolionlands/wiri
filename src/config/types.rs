@@ -5,11 +5,35 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub workspace: Vec<WorkspaceConfig>,
     pub window_rules: Vec<WindowRule>,
+    /// niri `layer-rule` sections.  Windows has no layer shell, so the only layer surface
+    /// wiri has is its own overlays; a layer rule's `namespace` is their name and its
+    /// `block-out-from` decides whether they are excluded from screen capture.
+    pub layer_rules: Vec<WindowRule>,
     pub binds: BindsConfig,
+    pub recent_windows: super::recent_windows_config::RecentWindowsConfig,
     pub animations: AnimationsConfig,
+    pub gestures: super::gestures_config::GesturesConfig,
+    /// niri `hotkey-overlay { skip-at-startup; hide-not-bound }`.
+    pub hotkey_overlay: HotkeyOverlayConfig,
+    /// niri `cursor { hide-when-typing; hide-after-inactive-ms <ms> }`.
+    pub cursor: CursorConfig,
+    pub overview: super::overview_config::OverviewConfig,
+    /// niri screenshot-path: Pictures default, a strftime template, or null (clipboard only).
+    pub screenshot_path: crate::screenshot::path::ScreenshotPath,
     /// Programs to spawn at startup. Each entry is [program, arg1, arg2, …].
     /// Populated from `spawn-at-startup "prog" "arg"` top-level KDL lines.
     pub spawn_at_startup: Vec<Vec<String>>,
+    /// Shell command lines to run at startup (`spawn-sh-at-startup "cmd"`), each through
+    /// `cmd.exe /d /s /c` like the `spawn-sh` bind.
+    pub spawn_sh_at_startup: Vec<String>,
+    /// Child-only set/unset overrides; never modify the compositor environment.
+    pub environment: crate::hooks::environment::Environment,
+    pub switch_events: SwitchEventsConfig,
+    /// Suppress failed-load balloons, not diagnostics or ConfigLoaded events.
+    pub disable_failed_config_notification: bool,
+    /// Screen-reader announcements (niri's Accessibility support).  On by default, as in
+    /// niri; `accessibility false` turns them off (wiri extension).
+    pub accessibility: bool,
 }
 
 impl Default for Config {
@@ -21,11 +45,14 @@ impl Default for Config {
                 position: Position::default(),
                 width: 0,
                 height: 0,
-                scale: 1.0,
+                scale: 0.0,
                 mode: String::new(),
                 vrr: false,
                 primary: false,
-                transform: "normal".to_string(),
+                position_set: false,
+                focus_at_startup: false,
+                hot_corners: None,
+                transform: String::new(),
                 enable: true,
                 layout_override: None,
                 mod_key: None,
@@ -33,22 +60,99 @@ impl Default for Config {
             layout: LayoutConfig::default_config(),
             workspace: Vec::new(),
             window_rules: Vec::new(),
+            layer_rules: Vec::new(),
             binds: BindsConfig::default(),
+            recent_windows: super::recent_windows_config::RecentWindowsConfig::default(),
             animations: AnimationsConfig::default_config(),
+            gestures: super::gestures_config::GesturesConfig::default(),
+            hotkey_overlay: HotkeyOverlayConfig::default(),
+            cursor: CursorConfig::default(),
+            overview: super::overview_config::OverviewConfig::default(),
+            screenshot_path: crate::screenshot::path::ScreenshotPath::default(),
             spawn_at_startup: Vec::new(),
+            spawn_sh_at_startup: Vec::new(),
+            environment: Default::default(),
+            switch_events: Default::default(),
+            disable_failed_config_notification: false,
+            accessibility: true,
         }
     }
 }
 
 impl Config {
+    /// Emergency fallback when no valid file can be loaded. A successfully
+    /// decoded empty file instead uses Default and never invents keybindings.
     pub fn default_config() -> Self {
-        Self::default()
+        let mut config = Self::default();
+        config.binds.extend_defaults = true;
+        config
     }
+}
+
+/// Switch bindings intentionally support only `spawn`, as in pinned niri.
+#[derive(Debug, Clone, Default)]
+pub struct SwitchEventsConfig {
+    pub lid_close: Option<Vec<String>>,
+    pub lid_open: Option<Vec<String>>,
+    pub tablet_mode_on: Option<Vec<String>>,
+    pub tablet_mode_off: Option<Vec<String>>,
+}
+
+impl SwitchEventsConfig {
+    pub fn subscriptions(&self) -> crate::hooks::switch_events::SwitchEventSubscriptions {
+        crate::hooks::switch_events::SwitchEventSubscriptions {
+            lid: self.lid_close.is_some() || self.lid_open.is_some(),
+            tablet_mode: self.tablet_mode_on.is_some() || self.tablet_mode_off.is_some(),
+        }
+    }
+
+    pub fn command(&self, event: crate::hooks::switch_events::SwitchEvent) -> Option<&[String]> {
+        use crate::hooks::switch_events::SwitchEvent;
+        match event {
+            SwitchEvent::LidClose => &self.lid_close,
+            SwitchEvent::LidOpen => &self.lid_open,
+            SwitchEvent::TabletModeOn => &self.tablet_mode_on,
+            SwitchEvent::TabletModeOff => &self.tablet_mode_off,
+        }
+        .as_deref()
+    }
+}
+
+/// niri `hotkey-overlay { ... }`: what the "Important Hotkeys" sheet does when wiri starts and
+/// which entries it lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HotkeyOverlayConfig {
+    /// `skip-at-startup`: do not show the sheet when wiri starts (it can still be opened with
+    /// the `show-hotkey-overlay` action).
+    pub skip_at_startup: bool,
+    /// `hide-not-bound`: leave out the essential actions that have no key bound to them
+    /// (niri lists them as "(not bound)" otherwise).
+    pub hide_not_bound: bool,
+}
+
+/// niri `cursor { ... }`: the cursor options Windows has a lever for.
+///
+/// `xcursor-theme` and `xcursor-size` belong to the Windows pointer scheme
+/// (Settings > Accessibility > Mouse pointer), so they are not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CursorConfig {
+    /// `hide-when-typing`: the per-user "hide pointer while typing" flag
+    /// (`SPI_GETMOUSEVANISH` / `SPI_SETMOUSEVANISH`).  `None` leaves the Windows setting alone;
+    /// a reload that drops the key puts the original value back.
+    pub hide_when_typing: Option<bool>,
+    /// `hide-after-inactive-ms <ms>`: hide the pointer after this many milliseconds without
+    /// pointer movement (`0` hides as soon as the pointer stops).  `None` never hides.
+    pub hide_after_inactive_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct InputConfig {
     pub keyboard_layout: String,
+    /// Native keyboard settings are acquired only when explicitly configured.
+    pub keyboard_layout_configured: bool,
+    pub repeat_delay_configured: bool,
+    pub repeat_rate_configured: bool,
+    pub numlock_configured: bool,
     pub repeat_delay: u32,
     pub repeat_rate: u32,
     pub mouse_speed: f64,
@@ -62,14 +166,21 @@ pub struct InputConfig {
     /// "alt", "super" (Win key), "win-alt", "ctrl-shift". Custom KDL `binds`
     /// override this entirely.
     pub mod_key: String,
+    /// niri's `workspace-auto-back-and-forth`: asking for the workspace you are on
+    /// (`focus-workspace 2` while on the second one) goes back to the previous
+    /// workspace instead.
+    pub workspace_auto_back_and_forth: bool,
 
     // ---- nested-block fields surfaced as flat config fields ----
     /// Delay (ms) before focus-follows-mouse kicks in after the pointer
     /// settles on a new window. 0 = instant.
     pub focus_delay_ms: u32,
-    /// When focus changes programmatically, warp the mouse pointer to the
-    /// centre of the newly focused window.
+    /// Maximum reveal scroll as a percentage of the output working-area width.
+    /// None permits any minimal reveal; Some(0.0) forbids scrolling.
+    pub focus_max_scroll_percent: Option<f64>,
+    /// Warp the pointer when the foreground window changes.
     pub warp_on_focus: bool,
+    pub warp_mode: WarpMode,
     /// Whether to enable NumLock at startup. Mirrors `input.keyboard.numlock`.
     pub numlock: bool,
 
@@ -77,16 +188,62 @@ pub struct InputConfig {
     /// Enable touch input handling. Default false — wiri only reads touch when
     /// this is true.
     pub touch_enabled: bool,
+    /// Opt-in promoted tablet pen gestures (input.tablet without off).
+    pub tablet_enabled: bool,
+    /// Opt-in raw Precision Touchpad contacts: presence of input.touchpad without off.
+    pub touchpad_enabled: bool,
     /// Convert a tap into a left-click event (mirrors trackpad behaviour).
     pub touch_tap_to_click: bool,
     /// Touch scroll speed multiplier (1.0 = native).
     pub touch_scroll_speed: f64,
+
+    // ---- pointing-device options (niri `input { mouse/touchpad/trackpoint/trackball }`) ----
+    // Every `Option` is `None` when the config says nothing about it: wiri then leaves the
+    // Windows setting alone, and a reload that removes the key restores what was there before
+    // (`crate::input::pointer_settings`).
+    /// niri `accel-profile "flat"` / `"adaptive"` (Windows: "Enhance pointer precision").
+    pub accel_profile: Option<AccelProfile>,
+    /// niri `left-handed` (Windows: swap the primary and secondary mouse buttons).
+    pub left_handed: Option<bool>,
+    /// niri `middle-emulation`: parsed and validated, but Windows has no lever for it.
+    pub middle_emulation: Option<bool>,
+    /// niri `scroll-method`: parsed and validated, but Windows has no lever for it.
+    pub scroll_method: Option<ScrollMethod>,
+    /// niri `scroll-button`: the button number `on-button-down` scrolling uses.
+    pub scroll_button: Option<u32>,
+    /// niri `scroll-button-lock`: keep the scroll button scrolling without holding it.
+    pub scroll_button_lock: Option<bool>,
+    /// niri `off` inside `input { mouse }`: parsed, but a Windows mouse belongs to the OS.
+    pub mouse_off: bool,
+    /// niri `off` inside `input { trackpoint }`.
+    pub trackpoint_off: bool,
+    /// niri `off` inside `input { trackball }`.
+    pub trackball_off: bool,
+    /// niri touchpad `dwt` (Windows: the precision-touchpad typing sensitivity).
+    pub touchpad_dwt: Option<bool>,
+    /// niri touchpad `dwtp`: parsed and validated, but Windows has no lever for it.
+    pub touchpad_dwtp: Option<bool>,
+    /// niri touchpad `drag`: parsed and validated, no Windows lever (the OS owns tap-and-drag).
+    pub touchpad_drag: Option<bool>,
+    /// niri touchpad `drag-lock`: parsed and validated, no Windows lever.
+    pub touchpad_drag_lock: Option<bool>,
+    /// niri touchpad `tap-button-map { left N; middle N; right N; }`.
+    pub touchpad_tap_button_map: Option<TapButtonMap>,
+    /// niri touchpad `click-method`: parsed and validated, no Windows lever.
+    pub touchpad_click_method: Option<ClickMethod>,
+    /// niri touchpad `disabled-on-external-mouse` (Windows: "Leave touchpad on when a mouse is
+    /// connected", inverted).
+    pub touchpad_disabled_on_external_mouse: Option<bool>,
 }
 
 impl InputConfig {
     pub fn default_config() -> Self {
         Self {
             keyboard_layout: "us".to_string(),
+            keyboard_layout_configured: false,
+            repeat_delay_configured: false,
+            repeat_rate_configured: false,
+            numlock_configured: false,
             repeat_delay: 250,
             repeat_rate: 25,
             mouse_speed: 1.0,
@@ -96,12 +253,33 @@ impl InputConfig {
             mouse_sensitivity: 1.0,
             focus_follows_mouse: false,
             mod_key: "ctrl-alt".to_string(),
+            workspace_auto_back_and_forth: false,
             focus_delay_ms: 0,
+            focus_max_scroll_percent: None,
             warp_on_focus: false,
+            warp_mode: WarpMode::default(),
             numlock: false,
             touch_enabled: false,
+            tablet_enabled: false,
+            touchpad_enabled: false,
             touch_tap_to_click: true,
             touch_scroll_speed: 1.0,
+            accel_profile: None,
+            left_handed: None,
+            middle_emulation: None,
+            scroll_method: None,
+            scroll_button: None,
+            scroll_button_lock: None,
+            mouse_off: false,
+            trackpoint_off: false,
+            trackball_off: false,
+            touchpad_dwt: None,
+            touchpad_dwtp: None,
+            touchpad_drag: None,
+            touchpad_drag_lock: None,
+            touchpad_tap_button_map: None,
+            touchpad_click_method: None,
+            touchpad_disabled_on_external_mouse: None,
         }
     }
 
@@ -144,7 +322,115 @@ impl InputConfig {
         FocusSubConfig {
             follows_mouse: self.focus_follows_mouse,
             focus_delay_ms: self.focus_delay_ms,
+            max_scroll_percent: self.focus_max_scroll_percent,
             warp_on_focus: self.warp_on_focus,
+            warp_mode: self.warp_mode,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pointing-device option types (niri `input { ... }`)
+// ---------------------------------------------------------------------------
+
+/// niri `accel-profile "flat"` / `"adaptive"`.
+///
+/// Windows has one global acceleration curve ("Enhance pointer precision"), which is what
+/// wiri maps this to: `Flat` turns it off, `Adaptive` turns it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelProfile {
+    Flat,
+    Adaptive,
+}
+
+impl AccelProfile {
+    /// `flat` / `adaptive`, as niri spells them.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "flat" => Some(Self::Flat),
+            "adaptive" => Some(Self::Adaptive),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
+
+/// niri `scroll-method "none" | "edge" | "two-finger" | "on-button-down"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMethod {
+    NoScroll,
+    Edge,
+    TwoFinger,
+    OnButtonDown,
+}
+
+impl ScrollMethod {
+    /// The four niri spellings (also the older `edge-scroll` / `button-scroll` aliases).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "none" | "no-scroll" => Some(Self::NoScroll),
+            "edge" => Some(Self::Edge),
+            "two-finger" | "twofinger" => Some(Self::TwoFinger),
+            "on-button-down" | "button" => Some(Self::OnButtonDown),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoScroll => "none",
+            Self::Edge => "edge",
+            Self::TwoFinger => "two-finger",
+            Self::OnButtonDown => "on-button-down",
+        }
+    }
+}
+
+/// niri touchpad `click-method "button-areas" | "clickfinger"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickMethod {
+    ButtonAreas,
+    Clickfinger,
+}
+
+impl ClickMethod {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "button-areas" => Some(Self::ButtonAreas),
+            "clickfinger" => Some(Self::Clickfinger),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ButtonAreas => "button-areas",
+            Self::Clickfinger => "clickfinger",
+        }
+    }
+}
+
+/// niri touchpad `tap-button-map { left N; middle N; right N; }`: which button a tap with N
+/// fingers means.  niri's defaults are 1 / 2 / 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapButtonMap {
+    pub left: u8,
+    pub middle: u8,
+    pub right: u8,
+}
+
+impl Default for TapButtonMap {
+    fn default() -> Self {
+        Self {
+            left: 1,
+            middle: 2,
+            right: 3,
         }
     }
 }
@@ -183,19 +469,38 @@ pub struct TouchSubConfig {
     pub scroll_speed: f64,
 }
 
+/// Pointer placement when a window gains focus (niri `warp-mouse-to-focus`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WarpMode {
+    /// Center only axes on which the pointer lies outside the window.
+    #[default]
+    CenterOutsideAxes,
+    /// Center both axes, but only when outside the window.
+    CenterXy,
+    /// Center both axes even when already inside the window.
+    CenterXyAlways,
+}
+
 /// Nested focus-policy configuration view derived from `InputConfig` flat fields.
 #[derive(Debug, Clone, Default)]
 pub struct FocusSubConfig {
     pub follows_mouse: bool,
-    /// Focus delay in ms; no flat counterpart yet, defaults 0.
+    /// Delay in ms from entering a new target, not from the last motion.
     pub focus_delay_ms: u32,
-    /// Warp pointer to newly-focused window; no flat counterpart yet, defaults false.
+    pub max_scroll_percent: Option<f64>,
     pub warp_on_focus: bool,
+    pub warp_mode: WarpMode,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputConfig {
     pub name: String,
+    /// Unset position leaves the physical desktop arrangement unchanged.
+    pub position_set: bool,
+    /// Select this output in wiri once at startup, not as the Windows primary display.
+    pub focus_at_startup: bool,
+    /// Omitted inherits global gestures.hot-corners; a block replaces it.
+    pub hot_corners: Option<super::hot_corner_config::HotCorners>,
     pub position: Position,
     pub width: u32,
     pub height: u32,
@@ -249,6 +554,17 @@ pub struct LayoutConfigPartial {
     pub scroll_step: Option<u32>,
     pub column_width: Option<u32>,
     pub column_width_mode: Option<String>,
+    pub default_column_display: Option<String>,
+    pub center_focused_column: Option<String>,
+    pub always_center_single_column: Option<bool>,
+    pub preset_column_widths: Option<Vec<SizeSpec>>,
+    pub default_column_width: Option<Option<SizeSpec>>,
+    /// `preset-window-heights`: the `switch-preset-window-height` list.
+    pub preset_window_heights: Option<Vec<SizeSpec>>,
+    /// `empty-workspace-above-first`: keep an empty workspace above the first one.
+    pub empty_workspace_above_first: Option<bool>,
+    /// `fullscreen-backdrop-color`: the colour behind a fullscreen window.
+    pub fullscreen_backdrop_color: Option<String>,
     pub strip_frame: Option<bool>,
     pub border_color_urgent: Option<String>,
     pub border_radius: Option<u32>,
@@ -258,6 +574,21 @@ pub struct LayoutConfigPartial {
     pub shadow_spread: Option<u32>,
     /// Per-output override for `LayoutConfig::smart_borders`.
     pub smart_borders: Option<bool>,
+    pub max_visible_columns: Option<u32>,
+    pub snap_on_drag: Option<bool>,
+    pub snap_threshold_px: Option<u32>,
+    pub status_bar: Option<bool>,
+    pub hide_method: Option<String>,
+    pub reserve_top: Option<i32>,
+    pub reserve_bottom: Option<i32>,
+    pub reserve_left: Option<i32>,
+    pub reserve_right: Option<i32>,
+    /// The `focus-ring`, `border`, `shadow`, `insert-hint` and `tab-indicator` blocks this
+    /// `layout {}` names; each replaces the block of the layout it is applied to.
+    pub effects: crate::config::effects::EffectsPartial,
+    /// niri `layout { background-color }` (also where the deprecated per-output
+    /// `background-color` maps).
+    pub background_color: Option<String>,
 }
 
 impl LayoutConfigPartial {
@@ -266,10 +597,18 @@ impl LayoutConfigPartial {
     /// base value (i.e. the global `layout { … }` block wins for unset keys).
     pub fn apply_to(&self, base: &LayoutConfig) -> LayoutConfig {
         let mut out = base.clone();
-        if let Some(v) = self.inner_gaps { out.inner_gaps = v; }
-        if let Some(v) = self.outer_gaps { out.outer_gaps = v; }
-        if let Some(v) = self.border_width { out.border_width = v; }
-        if let Some(ref v) = self.border_color { out.border_color = v.clone(); }
+        if let Some(v) = self.inner_gaps {
+            out.inner_gaps = v;
+        }
+        if let Some(v) = self.outer_gaps {
+            out.outer_gaps = v;
+        }
+        if let Some(v) = self.border_width {
+            out.border_width = v;
+        }
+        if let Some(ref v) = self.border_color {
+            out.border_color = v.clone();
+        }
         if let Some(ref v) = self.border_color_focused {
             // Per-output override: an "accent" / "windows-accent" sentinel
             // is intentionally NOT stored as a literal — the engine reads
@@ -280,33 +619,143 @@ impl LayoutConfigPartial {
             // string.  Empty overrides keep the parent value.
             out.border_color_focused = v.clone();
         }
-        if let Some(v) = self.focus_ring_width { out.focus_ring_width = v; }
-        if let Some(v) = self.dim_unfocused { out.dim_unfocused = v; }
-        if let Some(ref v) = self.focus_ring_color { out.focus_ring_color = v.clone(); }
-        if let Some(v) = self.shadow_enable { out.shadow_enable = v; }
-        if let Some(v) = self.shadow_opacity { out.shadow_opacity = v; }
-        if let Some(v) = self.shadow_offset_x { out.shadow_offset_x = v; }
-        if let Some(v) = self.shadow_offset_y { out.shadow_offset_y = v; }
-        if let Some(v) = self.shadow_blur { out.shadow_blur = v; }
-        if let Some(ref v) = self.shadow_color { out.shadow_color = v.clone(); }
-        if let Some(v) = self.split_ratio { out.split_ratio = v; }
-        if let Some(v) = self.auto_balance { out.auto_balance = v; }
-        if let Some(v) = self.scroll_step { out.scroll_step = v; }
-        if let Some(v) = self.column_width { out.column_width = v; }
-        if let Some(ref v) = self.column_width_mode { out.column_width_mode = v.clone(); }
-        if let Some(v) = self.strip_frame { out.strip_frame = v; }
-        if let Some(ref v) = self.border_color_urgent { out.border_color_urgent = v.clone(); }
-        if let Some(v) = self.border_radius { out.border_radius = v; }
-        if let Some(v) = self.border_padding { out.border_padding = v; }
-        if let Some(v) = self.focus_ring_gap { out.focus_ring_gap = v; }
-        if let Some(ref v) = self.focus_ring_inactive_color { out.focus_ring_inactive_color = v.clone(); }
-        if let Some(v) = self.shadow_spread { out.shadow_spread = v; }
-        if let Some(v) = self.smart_borders { out.smart_borders = v; }
+        if let Some(v) = self.focus_ring_width {
+            out.focus_ring_width = v;
+        }
+        if let Some(v) = self.dim_unfocused {
+            out.dim_unfocused = v;
+        }
+        if let Some(ref v) = self.focus_ring_color {
+            out.focus_ring_color = v.clone();
+        }
+        if let Some(v) = self.shadow_enable {
+            out.shadow_enable = v;
+        }
+        if let Some(v) = self.shadow_opacity {
+            out.shadow_opacity = v;
+        }
+        if let Some(v) = self.shadow_offset_x {
+            out.shadow_offset_x = v;
+        }
+        if let Some(v) = self.shadow_offset_y {
+            out.shadow_offset_y = v;
+        }
+        if let Some(v) = self.shadow_blur {
+            out.shadow_blur = v;
+        }
+        if let Some(ref v) = self.shadow_color {
+            out.shadow_color = v.clone();
+        }
+        if let Some(v) = self.split_ratio {
+            out.split_ratio = v;
+        }
+        if let Some(v) = self.auto_balance {
+            out.auto_balance = v;
+        }
+        if let Some(v) = self.scroll_step {
+            out.scroll_step = v;
+        }
+        if let Some(v) = self.column_width {
+            out.column_width = v;
+        }
+        if let Some(ref v) = self.column_width_mode {
+            out.column_width_mode = v.clone();
+        }
+        if let Some(ref v) = self.default_column_display {
+            out.default_column_display = v.clone();
+        }
+        if let Some(ref v) = self.center_focused_column {
+            out.center_focused_column = v.clone();
+        }
+        if let Some(v) = self.always_center_single_column {
+            out.always_center_single_column = v;
+        }
+        if let Some(ref v) = self.preset_column_widths {
+            out.preset_column_widths = v.clone();
+        }
+        if let Some(ref v) = self.preset_window_heights {
+            out.preset_window_heights = v.clone();
+        }
+        if let Some(v) = self.empty_workspace_above_first {
+            out.empty_workspace_above_first = v;
+        }
+        if let Some(ref v) = self.fullscreen_backdrop_color {
+            out.fullscreen_backdrop_color = Some(v.clone());
+        }
+        if let Some(v) = self.default_column_width {
+            out.default_column_width = Some(v);
+        }
+        if let Some(v) = self.strip_frame {
+            out.strip_frame = v;
+        }
+        if let Some(ref v) = self.border_color_urgent {
+            out.border_color_urgent = v.clone();
+        }
+        if let Some(v) = self.border_radius {
+            out.border_radius = v;
+        }
+        if let Some(v) = self.border_padding {
+            out.border_padding = v;
+        }
+        if let Some(v) = self.focus_ring_gap {
+            out.focus_ring_gap = v;
+        }
+        if let Some(ref v) = self.focus_ring_inactive_color {
+            out.focus_ring_inactive_color = v.clone();
+        }
+        if let Some(v) = self.shadow_spread {
+            out.shadow_spread = v;
+        }
+        if let Some(v) = self.smart_borders {
+            out.smart_borders = v;
+        }
+        if let Some(v) = self.max_visible_columns {
+            out.max_visible_columns = v;
+        }
+        if let Some(v) = self.snap_on_drag {
+            out.snap_on_drag = v;
+        }
+        if let Some(v) = self.snap_threshold_px {
+            out.snap_threshold_px = v;
+        }
+        if let Some(v) = self.status_bar {
+            out.status_bar = v;
+        }
+        if let Some(ref v) = self.hide_method {
+            out.hide_method = v.clone();
+        }
+        if let Some(v) = self.reserve_top {
+            out.reserve_top = v;
+        }
+        if let Some(v) = self.reserve_bottom {
+            out.reserve_bottom = v;
+        }
+        if let Some(v) = self.reserve_left {
+            out.reserve_left = v;
+        }
+        if let Some(v) = self.reserve_right {
+            out.reserve_right = v;
+        }
+        if let Some(ref v) = self.background_color {
+            out.background_color = Some(v.clone());
+        }
+        out.effects = self.effects.apply_to(&out.effects);
+        // The older flat spellings of the widths count when no block named them.
+        if self.effects.border.is_none() {
+            if let Some(v) = self.border_width {
+                out.effects.border.width = v;
+                out.effects.border.off = v == 0;
+            }
+        }
+        if self.effects.focus_ring.is_none() {
+            if let Some(v) = self.focus_ring_width {
+                out.effects.focus_ring.width = v;
+                out.effects.focus_ring.off = v == 0;
+            }
+        }
         out
     }
 }
-
-
 
 #[derive(Debug, Clone, Default)]
 pub struct Position {
@@ -341,6 +790,24 @@ pub struct LayoutConfig {
     pub scroll_step: u32,
     pub column_width: u32,
     pub column_width_mode: String,
+    /// niri display for newly opened columns: `normal` or `tabbed`.
+    pub default_column_display: String,
+    pub center_focused_column: String,
+    pub always_center_single_column: bool,
+    pub preset_column_widths: Vec<SizeSpec>,
+    /// `preset-window-heights`: niri's per-window height presets for
+    /// `switch-preset-window-height` (empty = niri's default thirds/half/two-thirds).
+    pub preset_window_heights: Vec<SizeSpec>,
+    /// `empty-workspace-above-first`: the workspace list keeps an empty workspace above the
+    /// first one, so that `focus-workspace-up` from the first workspace has somewhere to go.
+    pub empty_workspace_above_first: bool,
+    /// `fullscreen-backdrop-color`: the colour the overlay layer fills the monitor with
+    /// behind a fullscreen window (`#rrggbb`, `#rrggbbaa`); `None` draws nothing.
+    pub fullscreen_backdrop_color: Option<String>,
+    pub default_column_width: Option<Option<SizeSpec>>,
+    /// Proportional mode: split the screen among at most this many columns
+    /// (default 3); further windows scroll in.  0 = no limit.
+    pub max_visible_columns: u32,
     /// Strip native frame (caption + thick frame) from tiled windows for pixel-perfect tiles.
     /// Default false — some apps render their content area black after style changes
     /// until they receive a paint message. Off by default for compatibility.
@@ -381,20 +848,37 @@ pub struct LayoutConfig {
     /// local time (right).  Opt-in via `status-bar true` inside `layout { }`.
     /// Default `false`.
     pub status_bar: bool,
+    /// How the windows of inactive workspaces are hidden: `"hide"` (`SW_HIDE`, the
+    /// default: they leave the taskbar and Alt+Tab) or `"cloak"` (shell cloaking: they stay
+    /// in the taskbar and Alt+Tab but are not drawn; off by default because it relies on
+    /// undocumented shell interfaces).  Set via `hide-method` inside `layout { }`.
+    pub hide_method: String,
 
     // ---- screen-area reservation for external bars / panels ----
     /// Pixels to subtract from the top of each monitor's tiling work area.
     /// Set via `reserve-top N` inside `layout { }`.  Default 0.
-    pub reserve_top: u32,
+    pub reserve_top: i32,
     /// Pixels to subtract from the bottom of each monitor's tiling work area.
     /// Set via `reserve-bottom N` inside `layout { }`.  Default 0.
-    pub reserve_bottom: u32,
+    pub reserve_bottom: i32,
     /// Pixels to subtract from the left of each monitor's tiling work area.
     /// Set via `reserve-left N` inside `layout { }`.  Default 0.
-    pub reserve_left: u32,
+    pub reserve_left: i32,
     /// Pixels to subtract from the right of each monitor's tiling work area.
     /// Set via `reserve-right N` inside `layout { }`.  Default 0.
-    pub reserve_right: u32,
+    pub reserve_right: i32,
+
+    /// What the overlay layer draws around the windows: niri's `focus-ring`, `border`,
+    /// `shadow`, `insert-hint` and `tab-indicator` blocks, with their colours and gradients.
+    /// The flat `border_*` / `focus_ring_*` / `shadow_*` fields above are the older spelling
+    /// of some of the same keys; the decoder keeps both in step.
+    pub effects: crate::config::effects::Effects,
+
+    /// niri `layout { background-color }`: the colour behind the workspaces.  niri's deprecated
+    /// per-output `background-color` maps here too.  Windows owns the desktop behind tiled
+    /// windows, so wiri paints this behind the overview's workspaces (see
+    /// `OverviewConfig::backdrop_color`, which overrides it there).
+    pub background_color: Option<String>,
 }
 
 impl LayoutConfig {
@@ -418,7 +902,16 @@ impl LayoutConfig {
             auto_balance: false,
             scroll_step: 200,
             column_width: 500,
-            column_width_mode: "proportional".to_string(),
+            column_width_mode: "fixed".to_string(),
+            center_focused_column: "never".to_string(),
+            always_center_single_column: false,
+            preset_column_widths: Vec::new(),
+            preset_window_heights: Vec::new(),
+            empty_workspace_above_first: false,
+            fullscreen_backdrop_color: None,
+            default_column_width: None,
+            default_column_display: "normal".to_string(),
+            max_visible_columns: 3,
             strip_frame: false,
             border_color_urgent: "#cc3344".to_string(),
             border_radius: 0,
@@ -430,10 +923,13 @@ impl LayoutConfig {
             snap_threshold_px: 20,
             smart_borders: false,
             status_bar: false,
+            hide_method: "hide".to_string(),
             reserve_top: 0,
             reserve_bottom: 0,
             reserve_left: 0,
             reserve_right: 0,
+            effects: crate::config::effects::Effects::default(),
+            background_color: None,
         }
     }
 
@@ -441,7 +937,12 @@ impl LayoutConfig {
     /// Uses `inner_gaps` for all four sides; per-side overrides are a future addition.
     pub fn gaps_edges(&self) -> Edges<i32> {
         let g = self.inner_gaps as i32;
-        Edges { left: g, right: g, top: g, bottom: g }
+        Edges {
+            left: g,
+            right: g,
+            top: g,
+            bottom: g,
+        }
     }
 
     /// Return a nested border view built from the flat fields.
@@ -538,7 +1039,17 @@ pub struct WorkspaceConfig {
     pub name: String,
     pub layout: String,
     pub monitor: String,
+    /// Ordered niri output preferences; `monitor` remains the legacy fallback.
+    pub open_on_outputs: Vec<String>,
     pub follow_on_focus: bool,
+    /// Workspace-local layout, applied after the global and output layouts.
+    pub layout_override: Option<LayoutConfigPartial>,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self::default_config()
+    }
 }
 
 impl WorkspaceConfig {
@@ -547,7 +1058,9 @@ impl WorkspaceConfig {
             name: String::new(),
             layout: "tile".to_string(),
             monitor: String::new(),
+            open_on_outputs: Vec::new(),
             follow_on_focus: true,
+            layout_override: None,
         }
     }
 }
@@ -594,6 +1107,85 @@ pub enum Matcher {
     IsUrgent,
     /// Match only during the startup phase.
     AtStartup,
+    /// niri `app-id="regex"`: the regex is searched in the process's file name
+    /// (`firefox.exe`), in that name without `.exe` (`firefox`) and in the window's
+    /// AppUserModelID (packaged apps), anywhere in the string.
+    AppId(RegexPat),
+    /// niri `title="regex"`: the regex is searched anywhere in the window title.
+    TitleSearch(RegexPat),
+    /// niri `class-name="regex"` / wiri extension: searched in the window class.
+    ClassSearch(RegexPat),
+    /// wiri extension `process-name="regex"`: searched in the process's file name.
+    ProcessSearch(RegexPat),
+    /// Match only when the window has the keyboard focus (niri `is-focused`).
+    IsFocused,
+    /// Match only when the window is the active one of its column (niri `is-active-in-column`).
+    IsActiveInColumn,
+    /// The opposite of the matcher inside (`is-active=false`).
+    Not(Box<Matcher>),
+}
+
+/// A regular expression from the config, kept with its source text.
+#[derive(Debug, Clone)]
+pub struct RegexPat {
+    pub source: String,
+    pub regex: regex::Regex,
+}
+
+impl RegexPat {
+    /// Compile `source` (Rust regex syntax, like niri's).
+    pub fn new(source: &str) -> std::result::Result<RegexPat, regex::Error> {
+        let regex = regex::Regex::new(source)?;
+        Ok(RegexPat {
+            source: source.to_string(),
+            regex,
+        })
+    }
+
+    /// True when the regex matches anywhere in `text`.
+    pub fn is_match(&self, text: &str) -> bool {
+        self.regex.is_match(text)
+    }
+}
+
+/// niri's preset size: a proportion of the view or a fixed size in pixels
+/// (`default-column-width { proportion 0.5; }`, `{ fixed 800; }`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SizeSpec {
+    Proportion(f64),
+    Fixed(u32),
+}
+
+/// One `match` or `exclude` line of a niri window rule: every condition has to hold.
+#[derive(Debug, Clone, Default)]
+pub struct MatchGroup {
+    pub conds: Vec<Matcher>,
+}
+
+impl MatchGroup {
+    pub fn matches(&self, ctx: &MatcherContext<'_>) -> bool {
+        self.conds.iter().all(|m| m.matches(ctx))
+    }
+}
+
+/// True when any candidate name of a window matches an `app-id` regex.  Windows has no
+/// app-id: the process's file name, that name without its extension and the
+/// AppUserModelID of a packaged app stand in for it.
+pub fn app_id_matches(pat: &RegexPat, ctx: &MatcherContext<'_>) -> bool {
+    if ctx
+        .process_names()
+        .iter()
+        .flatten()
+        .any(|n| pat.is_match(n))
+    {
+        return true;
+    }
+    if let Some(aumid) = ctx.aumid {
+        if pat.is_match(aumid) {
+            return true;
+        }
+    }
+    false
 }
 
 impl Matcher {
@@ -629,9 +1221,18 @@ impl Matcher {
                     false
                 }
             },
-            Matcher::ProcessName(s) => ctx.process_name.map_or(false, |p| p == s.as_str()),
+            // The process answers to its file name and to that name without `.exe`; Windows
+            // file names do not care about case.
+            Matcher::ProcessName(s) => ctx
+                .process_names()
+                .iter()
+                .flatten()
+                .any(|p| p.eq_ignore_ascii_case(s.as_str())),
             Matcher::ProcessNameRegex(pat) => match regex::Regex::new(pat) {
-                Ok(re) => re.is_match(ctx.process_name.unwrap_or("")),
+                Ok(re) => match ctx.process_names() {
+                    [None, _] => re.is_match(""),
+                    names => names.iter().flatten().any(|p| re.is_match(p)),
+                },
                 Err(e) => {
                     tracing::warn!("ProcessNameRegex: invalid pattern {:?}: {}", pat, e);
                     false
@@ -641,6 +1242,43 @@ impl Matcher {
             Matcher::IsFloating => ctx.is_floating,
             Matcher::IsUrgent => ctx.is_urgent,
             Matcher::AtStartup => ctx.at_startup,
+            Matcher::AppId(pat) => app_id_matches(pat, ctx),
+            Matcher::TitleSearch(pat) => pat.is_match(ctx.title),
+            Matcher::ClassSearch(pat) => pat.is_match(ctx.class_name),
+            Matcher::ProcessSearch(pat) => ctx
+                .process_names()
+                .iter()
+                .flatten()
+                .any(|p| pat.is_match(p)),
+            Matcher::IsFocused => ctx.is_focused,
+            Matcher::IsActiveInColumn => ctx.is_active_in_column,
+            Matcher::Not(inner) => !inner.matches(ctx),
+        }
+    }
+
+    /// True when this condition, or the one it negates, satisfies `test`.
+    pub fn any(&self, test: &dyn Fn(&Matcher) -> bool) -> bool {
+        match self {
+            Matcher::Not(inner) => inner.any(test),
+            other => test(other),
+        }
+    }
+
+    /// True for the conditions that depend on the window's state (focus, floating, urgency)
+    /// rather than on what it is: a rule that has one has to be looked at again when that
+    /// state changes.
+    pub fn is_dynamic(&self) -> bool {
+        match self {
+            Matcher::IsActive
+            | Matcher::IsFloating
+            | Matcher::IsUrgent
+            | Matcher::IsFocused
+            | Matcher::IsActiveInColumn
+            | Matcher::TitleSearch(_)
+            | Matcher::Title(_)
+            | Matcher::TitleRegex(_) => true,
+            Matcher::Not(inner) => inner.is_dynamic(),
+            _ => false,
         }
     }
 }
@@ -666,9 +1304,31 @@ pub struct MatcherContext<'a> {
     pub is_floating: bool,
     pub is_urgent: bool,
     pub at_startup: bool,
+    /// The AppUserModelID of a packaged (UWP / MSIX) app, when the window has one.
+    pub aumid: Option<&'a str>,
+    /// The window has the keyboard focus.
+    pub is_focused: bool,
+    /// The window is the active one of its column.
+    pub is_active_in_column: bool,
 }
 
 impl<'a> MatcherContext<'a> {
+    /// The names the window's process answers to: its file name (`firefox.exe`) and that
+    /// name without the extension (`firefox`), or nothing for a window whose process is not
+    /// known.
+    pub fn process_names(&self) -> [Option<&'a str>; 2] {
+        match self.process_name {
+            None => [None, None],
+            Some(name) => {
+                let stem = match name.rfind('.') {
+                    Some(dot) if dot > 0 => Some(&name[..dot]),
+                    _ => None,
+                };
+                [Some(name), stem]
+            }
+        }
+    }
+
     /// Build a `MatcherContext` from the fields previously threaded through
     /// `resolve_window_rules` (class, title, instance, pid).  All boolean
     /// flags are set to `false` — this constructor is only used by external
@@ -690,6 +1350,9 @@ impl<'a> MatcherContext<'a> {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: false,
+            is_active_in_column: false,
         }
     }
 
@@ -707,6 +1370,9 @@ impl<'a> MatcherContext<'a> {
             is_floating: false,
             is_urgent: false,
             at_startup: false,
+            aumid: None,
+            is_focused: false,
+            is_active_in_column: false,
         }
     }
 }
@@ -770,15 +1436,122 @@ pub struct WindowRule {
     /// Cap the initial physical size of the window to `(width_px, height_px)`.
     /// Either dimension of `0` means "no cap on that axis".
     pub open_max_bounds: Option<(u32, u32)>,
+
+    // ---- niri window-rule matching: `match` lines (any) and `exclude` lines (none) ----
+    /// niri: a window matches the rule when it matches ANY of these (an empty list matches
+    /// every window), each group being the AND of its conditions.
+    pub match_groups: Vec<MatchGroup>,
+    /// niri: a window that matches ANY of these is left out.
+    pub exclude_groups: Vec<MatchGroup>,
+
+    // ---- niri properties (applied when the rule matches) ----
+    /// `default-column-width`: `Some(Some(size))` for `{ proportion 0.5; }` / `{ fixed 800; }`,
+    /// `Some(None)` for an empty block (the window picks its own width), `None` when unset.
+    pub default_column_width: Option<Option<SizeSpec>>,
+    /// `default-window-height`, the same forms.
+    pub default_window_height: Option<Option<SizeSpec>>,
+    /// `open-on-workspace "name"`: the workspace (by name) the window opens on.
+    pub open_on_workspace: Option<String>,
+    /// `open-maximized`: the window's column opens as wide as the view.
+    pub open_maximized: Option<bool>,
+    /// `open-maximized-to-edges`: the window opens maximized to the edges of the work area.
+    pub open_maximized_to_edges: Option<bool>,
+    /// `open-focused`: false keeps the focus where it was when the window opens.
+    pub open_focused: Option<bool>,
+    /// `min-width` / `min-height` / `max-width` / `max-height`: size limits in pixels.
+    pub min_width: Option<u32>,
+    pub min_height: Option<u32>,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+    /// Sparse per-window decoration and geometry overrides.
+    pub effects: crate::window::rule_effects::RuleEffects,
+    pub policy: crate::window::rule_policy::RulePolicy,
+    /// niri `block-out-from "screencast"` / `"screen-capture"`: keep the window out of
+    /// screen capture.  Windows only lets the owning process set that affinity, so wiri
+    /// applies it to its own overlays (see [`crate::window::block_out`]); foreign
+    /// application windows are decoded and kept but cannot be excluded.
+    pub block_out_from: Option<crate::window::block_out::BlockOutFrom>,
 }
 
 impl WindowRule {
-    /// Returns `true` when this rule matches the given `MatcherContext`.
-    ///
-    /// When `self.matchers` is non-empty all matchers are evaluated (AND).
-    /// When `self.matchers` is empty the flat fields are used for backwards
-    /// compatibility with configs that don't use `match { }` blocks.
+    /// Returns `true` when this rule matches the given `MatcherContext`: the old flat /
+    /// `matchers` conditions all hold, and (niri) the window matches any `match` line, if
+    /// there are any, and none of the `exclude` lines.
     pub fn matches(&self, ctx: &MatcherContext<'_>) -> bool {
+        if !self.legacy_matches(ctx) {
+            return false;
+        }
+        if !self.match_groups.is_empty() && !self.match_groups.iter().any(|g| g.matches(ctx)) {
+            return false;
+        }
+        !self.exclude_groups.iter().any(|g| g.matches(ctx))
+    }
+
+    /// True when any condition of the rule depends on state that changes while a window
+    /// lives (focus, floating, urgency, the title), so the rule has to be looked at again.
+    pub fn has_dynamic_conditions(&self) -> bool {
+        self.matchers.iter().any(|m| m.is_dynamic())
+            || self.title.is_some()
+            || self
+                .match_groups
+                .iter()
+                .chain(self.exclude_groups.iter())
+                .any(|g| g.conds.iter().any(|m| m.is_dynamic()))
+    }
+
+    /// True when any condition of the rule (in `matchers`, a `match` line or an `exclude`
+    /// line) satisfies `test`.
+    pub fn any_condition(&self, test: &dyn Fn(&Matcher) -> bool) -> bool {
+        self.matchers
+            .iter()
+            .chain(
+                self.match_groups
+                    .iter()
+                    .chain(self.exclude_groups.iter())
+                    .flat_map(|g| g.conds.iter()),
+            )
+            .any(|m| m.any(test))
+    }
+
+    /// The rule looks at the AppUserModelID of the window (`app-id`).
+    pub fn uses_app_id(&self) -> bool {
+        self.any_condition(&|m| matches!(m, Matcher::AppId(_)))
+    }
+
+    /// The rule's outcome depends on which window has the focus.
+    pub fn depends_on_focus(&self) -> bool {
+        self.any_condition(&|m| {
+            matches!(
+                m,
+                Matcher::IsActive | Matcher::IsFocused | Matcher::IsActiveInColumn
+            )
+        })
+    }
+
+    /// The rule's outcome depends on the title of the window.
+    pub fn depends_on_title(&self) -> bool {
+        self.title.is_some()
+            || self.any_condition(&|m| {
+                matches!(
+                    m,
+                    Matcher::Title(_) | Matcher::TitleRegex(_) | Matcher::TitleSearch(_)
+                )
+            })
+    }
+
+    /// The rule's outcome depends on whether the window floats.
+    pub fn depends_on_floating(&self) -> bool {
+        self.any_condition(&|m| matches!(m, Matcher::IsFloating))
+    }
+
+    /// The rule's outcome depends on whether the window is urgent (flashing).
+    pub fn depends_on_urgency(&self) -> bool {
+        self.any_condition(&|m| matches!(m, Matcher::IsUrgent))
+    }
+
+    /// The conditions of the old rule format: `matchers` when there are any (all of them
+    /// must pass), otherwise the flat `class` / `title` / `instance` / `process_name` fields.
+    fn legacy_matches(&self, ctx: &MatcherContext<'_>) -> bool {
         if !self.matchers.is_empty() {
             // Matcher-based path: every matcher must pass.
             return self.matchers.iter().all(|m| m.matches(ctx));
@@ -823,12 +1596,8 @@ impl WindowRule {
 #[derive(Debug, Clone)]
 pub struct BindsConfig {
     pub hotkeys: Vec<HotkeyBinding>,
-    /// niri-style "extend the built-in default keybindings instead of
-    /// replacing them".  Default `true` — the user's `binds { … }` block
-    /// is folded on top of the shipped defaults so newly-added actions
-    /// stay available without a config edit.  Set to `false` (via
-    /// `binds { extend-defaults false … }`) to get the pre-2026-05-18
-    /// "replace everything" behaviour.
+    /// Wiri extension: explicitly opt into built-in keybindings. Defaults to
+    /// false: niri never fills in missing binds (even an empty binds block).
     pub extend_defaults: bool,
 }
 
@@ -836,7 +1605,7 @@ impl Default for BindsConfig {
     fn default() -> Self {
         Self {
             hotkeys: Vec::new(),
-            extend_defaults: true,
+            extend_defaults: false,
         }
     }
 }
@@ -850,8 +1619,28 @@ pub struct HotkeyBinding {
     /// The action name from config (e.g. "focus-column-left", "close-window")
     pub command: String,
     pub args: Vec<String>,
+    /// Whether each argument was written in double quotes (parallel to `args`;
+    /// missing entries mean "not quoted").  `focus-workspace 2` is an index,
+    /// `focus-workspace "2"` the workspace named "2".
+    pub args_quoted: Vec<bool>,
+    /// niri's `repeat=false` turns this off: holding the key fires the action once.  True
+    /// (the default) lets the key's auto-repeat fire it again.
     pub repeat: bool,
+    /// Wiri extension `on-release=true` (also `release=true`); pinned niri has no
+    /// generic release-bind property. The chord is captured on down, fired on up.
     pub release: bool,
+    /// niri's `cooldown-ms=`: after the action fired, the bind is ignored for this long.
+    pub cooldown_ms: Option<u32>,
+    /// niri's `allow-when-locked=`: accepted; a locked Windows session never delivers hotkeys.
+    pub allow_when_locked: bool,
+    /// niri's `allow-inhibiting=`: false keeps the bind active during shortcut inhibition.
+    pub allow_inhibiting: bool,
+    /// niri's `hotkey-overlay-title=`: `Some(Some(text))` is the title, `Some(None)`
+    /// (`hotkey-overlay-title=null`) hides the bind from the overlay.
+    pub hotkey_overlay_title: Option<Option<String>>,
+    /// Properties written on the action itself (`focus=false` of `move-window-to-workspace`,
+    /// `show-pointer=false` of `screenshot`), as `(name, value)` text.
+    pub action_props: Vec<(String, String)>,
 }
 
 impl HotkeyBinding {
@@ -869,22 +1658,47 @@ impl HotkeyBinding {
             }
             return None;
         }
-        crate::input::parse_action_name(&self.command, &self.args)
-    }
-
-    /// Parse modifier strings to Windows MOD flags
-    pub fn mod_flags(&self) -> u32 {
-        let mut flags = 0u32;
-        for m in &self.modifiers {
-            match m.to_lowercase().as_str() {
-                "ctrl" | "control" => flags |= 0x0002, // MOD_CTRL
-                "alt" => flags |= 0x0001,              // MOD_ALT
-                "shift" => flags |= 0x0004,            // MOD_SHIFT
-                "super" | "win" | "meta" => flags |= 0x0008, // MOD_WIN
-                _ => {}
+        let mut words = self.args.clone();
+        let mut quoted = self.args_quoted.clone();
+        quoted.resize(words.len(), false);
+        // Implemented action properties use the very same argv validator as CLI
+        // and typed IPC, rather than being stored as inert configuration text.
+        let every_prop = matches!(
+            self.command.as_str(),
+            "screenshot" | "screenshot-screen" | "screenshot-window" | "quit"
+        );
+        for (name, value) in &self.action_props {
+            // Layout action properties share the validated CLI/IPC flag grammar.
+            let layout = matches!(name.as_str(), "focus" | "workspace" | "id" | "debounce-ms");
+            if every_prop || layout {
+                words.extend([format!("--{name}"), value.clone()]);
+                quoted.extend([false, every_prop]);
             }
         }
-        flags
+        crate::input::parse_action_flagged(&self.command, &words, &quoted)
+    }
+
+    /// Legacy lenient Windows modifier mask; unknown names, `Mod`, and
+    /// hook-only AltGr are skipped. Never use this for bind matching or
+    /// registration: use [`Self::resolve_modifiers`] so unsupported names cannot
+    /// silently weaken a chord, then `keynames::register_hotkey_modifiers` to
+    /// decide whether Win32 fallback is possible.
+    pub fn mod_flags(&self) -> u32 {
+        crate::input::parse_modifiers(&self.modifiers)
+    }
+
+    /// Strict modifier resolution: `Mod` becomes `mod_key` (what `input {
+    /// mod-key }` stands for), and any modifier that is not understood is an
+    /// error.
+    pub fn resolve_modifiers(&self, mod_key: u32) -> Result<u32, crate::input::ModifierError> {
+        crate::input::resolve_bind_modifiers(&self.modifiers, mod_key)
+    }
+
+    /// The bind as the user wrote it, for log messages (`Mod+Shift+T`).
+    pub fn chord_text(&self) -> String {
+        let mut parts: Vec<&str> = self.modifiers.iter().map(|m| m.as_str()).collect();
+        parts.push(self.key.as_str());
+        parts.join("+")
     }
 
     /// Parse key string to a Windows virtual key code.
@@ -899,7 +1713,10 @@ impl HotkeyBinding {
     /// `backend/message_loop.rs`) consumes this to spawn the argument
     /// through `cmd.exe /C "<command>"`.
     pub fn is_spawn_cmd(&self) -> bool {
-        matches!(self.command.as_str(), "spawn-cmd" | "spawn_cmd" | "spawn-sh")
+        matches!(
+            self.command.as_str(),
+            "spawn-cmd" | "spawn_cmd" | "spawn-sh"
+        )
     }
 
     /// When this binding is `spawn-cmd "<command>"`, return the canonical
@@ -927,40 +1744,21 @@ impl Default for HotkeyBinding {
             modifiers: Vec::new(),
             command: String::new(),
             args: Vec::new(),
-            repeat: false,
+            args_quoted: Vec::new(),
+            repeat: true,
             release: false,
+            cooldown_ms: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+            action_props: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct AnimationsConfig {
-    pub enabled: bool,
-    pub duration: u32,
-    pub easing: String,
-    pub focus_transition: bool,
-    pub workspace_transition: bool,
-    pub window_move: bool,
-    pub window_resize: bool,
-    pub popup: bool,
-    pub shadow: bool,
-}
-
-impl AnimationsConfig {
-    pub fn default_config() -> Self {
-        Self {
-            enabled: false,
-            duration: 200,
-            easing: "cubic-bezier".to_string(),
-            focus_transition: true,
-            workspace_transition: true,
-            window_move: true,
-            window_resize: true,
-            popup: true,
-            shadow: true,
-        }
-    }
-}
+#[path = "animation_config.rs"]
+mod animation_config;
+pub use animation_config::AnimationsConfig;
 
 pub fn parse_color(color: &str) -> Option<[u8; 4]> {
     let color = color.trim();
@@ -1024,6 +1822,31 @@ bitflags::bitflags! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quit_bind_skip_confirmation_property_reaches_the_executor() {
+        for skip in [false, true] {
+            let bind = HotkeyBinding {
+                command: "quit".into(),
+                action_props: vec![("skip-confirmation".into(), skip.to_string())],
+                ..Default::default()
+            };
+            let expected = if skip {
+                crate::input::Action::System(crate::input::system_actions::SystemAction::Quit {
+                    skip_confirmation: true,
+                })
+            } else {
+                crate::input::Action::Quit
+            };
+            assert_eq!(bind.parse_action(), Some(expected));
+        }
+        let invalid = HotkeyBinding {
+            command: "quit".into(),
+            action_props: vec![("skip-confirmation".into(), "yes".into())],
+            ..Default::default()
+        };
+        assert!(invalid.parse_action().is_none());
+    }
 
     #[test]
     fn test_parse_color_hex6() {
@@ -1144,7 +1967,10 @@ mod tests {
     fn test_hotkey_binding_parse_action() {
         let mut b = HotkeyBinding::default();
         b.command = "focus-column-left".to_string();
-        assert_eq!(b.parse_action(), Some(crate::input::Action::FocusColumnLeft));
+        assert_eq!(
+            b.parse_action(),
+            Some(crate::input::Action::FocusColumnLeft)
+        );
     }
 
     #[test]
@@ -1172,7 +1998,11 @@ mod tests {
         assert!(b.is_spawn_cmd());
         assert_eq!(
             b.shell_command_argv(),
-            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "wt.exe".to_string()]),
+            Some(vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                "wt.exe".to_string()
+            ]),
         );
     }
 
@@ -1187,7 +2017,11 @@ mod tests {
         assert!(b.is_spawn_cmd());
         assert_eq!(
             b.shell_command_argv(),
-            Some(vec!["cmd.exe".to_string(), "/C".to_string(), "echo hi".to_string()]),
+            Some(vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                "echo hi".to_string()
+            ]),
         );
     }
 
@@ -1387,7 +2221,12 @@ mod tests {
         let mut rule = WindowRule::default();
         rule.instance = Some("main".to_string());
         rule.process_name = Some("firefox.exe".to_string());
-        let ok = ctx_full("Mozilla", "About:Mozilla", Some("main"), Some("firefox.exe"));
+        let ok = ctx_full(
+            "Mozilla",
+            "About:Mozilla",
+            Some("main"),
+            Some("firefox.exe"),
+        );
         let wrong_proc = ctx_full("Mozilla", "About:Mozilla", Some("main"), Some("chrome.exe"));
         assert!(rule.matches(&ok));
         assert!(!rule.matches(&wrong_proc));
@@ -1410,6 +2249,9 @@ mod tests {
     fn test_output_config_mod_key_field_can_be_set() {
         let mut out = OutputConfig {
             name: "DP-1".to_string(),
+            position_set: false,
+            focus_at_startup: false,
+            hot_corners: None,
             position: Position::default(),
             width: 1920,
             height: 1080,

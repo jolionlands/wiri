@@ -234,7 +234,9 @@ impl GestureRecognizer {
             self.pinch_reference_distance = None;
         }
 
-        let TrackedPointer { start_pos, start_t, .. } = match entry {
+        let TrackedPointer {
+            start_pos, start_t, ..
+        } = match entry {
             Some((_, t)) => t,
             None => return None,
         };
@@ -352,11 +354,9 @@ struct TouchHookState {
     recognizer: GestureRecognizer,
 }
 
-static TOUCH_HOOK: LazyLock<Mutex<Option<SendHook>>> =
-    LazyLock::new(|| Mutex::new(None));
+static TOUCH_HOOK: LazyLock<Mutex<Option<SendHook>>> = LazyLock::new(|| Mutex::new(None));
 
-static TOUCH_STATE: LazyLock<Mutex<Option<TouchHookState>>> =
-    LazyLock::new(|| Mutex::new(None));
+static TOUCH_STATE: LazyLock<Mutex<Option<TouchHookState>>> = LazyLock::new(|| Mutex::new(None));
 
 // ---------------------------------------------------------------------------
 // Three-finger swipe — parallel pointer accumulator
@@ -403,8 +403,7 @@ struct SendSender(tokio::sync::mpsc::UnboundedSender<Action>);
 // Mutex so Sync is fine here.
 unsafe impl Sync for SendSender {}
 
-static ACTION_SENDER: LazyLock<Mutex<Option<SendSender>>> =
-    LazyLock::new(|| Mutex::new(None));
+static ACTION_SENDER: LazyLock<Mutex<Option<SendSender>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Wire a tokio mpsc sender so the hook can dispatch gestures to the main
 /// event loop directly. Optional — if not set, gestures are still queued via
@@ -493,7 +492,9 @@ pub fn start_touch_hook(config: TouchConfig) -> Result<(), String> {
 #[allow(dead_code)]
 pub fn stop_touch_hook() {
     if let Some(h) = TOUCH_HOOK.lock().take() {
-        unsafe { let _ = UnhookWindowsHookEx(h.0); }
+        unsafe {
+            let _ = UnhookWindowsHookEx(h.0);
+        }
         info!("Touch hook removed");
     }
     *TOUCH_STATE.lock() = None;
@@ -548,11 +549,14 @@ unsafe extern "system" fn touch_hook_callback(
                         if active.is_empty() {
                             LIFTED_POINTERS.lock().clear();
                         }
-                        active.insert(pid, ActivePointer {
-                            pointer_id: pid,
-                            start: pt,
-                            start_time: Instant::now(),
-                        });
+                        active.insert(
+                            pid,
+                            ActivePointer {
+                                pointer_id: pid,
+                                start: pt,
+                                start_time: Instant::now(),
+                            },
+                        );
                     }
                     WM_POINTERUP => {
                         let removed = ACTIVE_POINTERS.lock().remove(&pid);
@@ -575,21 +579,13 @@ unsafe extern "system" fn touch_hook_callback(
                                 // must have come down within THREE_FINGER_WINDOW_MS
                                 // of each other (oldest → youngest down time).
                                 let now = Instant::now();
-                                let oldest = lifted
-                                    .iter()
-                                    .map(|(_, _, t)| *t)
-                                    .min()
-                                    .unwrap_or(now);
-                                let window_ok = now
-                                    .duration_since(oldest)
-                                    .as_millis()
+                                let oldest = lifted.iter().map(|(_, _, t)| *t).min().unwrap_or(now);
+                                let window_ok = now.duration_since(oldest).as_millis()
                                     <= THREE_FINGER_WINDOW_MS as u128;
                                 if window_ok {
                                     // Strip the timestamp for evaluate_three_finger_swipe.
-                                    let pairs: Vec<(POINT, POINT)> = lifted
-                                        .iter()
-                                        .map(|(s, e, _)| (*s, *e))
-                                        .collect();
+                                    let pairs: Vec<(POINT, POINT)> =
+                                        lifted.iter().map(|(s, e, _)| (*s, *e)).collect();
                                     if let Some(gesture) = evaluate_three_finger_swipe(&pairs) {
                                         info!("touch: 3-finger gesture detected = {:?}", gesture);
                                         let action = TOUCH_STATE
@@ -597,14 +593,23 @@ unsafe extern "system" fn touch_hook_callback(
                                             .as_ref()
                                             .and_then(|s| s.config.gestures.get(&gesture).cloned());
                                         if let Some(action) = action {
-                                            info!("touch: 3-finger {:?} -> action {:?}", gesture, action);
+                                            info!(
+                                                "touch: 3-finger {:?} -> action {:?}",
+                                                gesture, action
+                                            );
                                             dispatch_action(action);
                                         } else {
-                                            info!("touch: 3-finger {:?} (no action bound)", gesture);
+                                            info!(
+                                                "touch: 3-finger {:?} (no action bound)",
+                                                gesture
+                                            );
                                         }
                                     }
                                 } else {
-                                    debug!("touch: 3-finger gesture discarded (outside {}ms window)", THREE_FINGER_WINDOW_MS);
+                                    debug!(
+                                        "touch: 3-finger gesture discarded (outside {}ms window)",
+                                        THREE_FINGER_WINDOW_MS
+                                    );
                                 }
                             }
                         }
@@ -669,7 +674,11 @@ const THREE_FINGER_WINDOW_MS: u64 = 300;
 /// This function is pure (no global state reads) so it can be exercised in
 /// unit tests without Win32.
 fn evaluate_three_finger_swipe(lifted: &[(POINT, POINT)]) -> Option<TouchGesture> {
-    debug_assert_eq!(lifted.len(), 3, "caller must ensure exactly 3 lifted pointers");
+    debug_assert_eq!(
+        lifted.len(),
+        3,
+        "caller must ensure exactly 3 lifted pointers"
+    );
 
     // Compute average displacement across the three fingers.
     let mut sum_dx: i64 = 0;
@@ -720,8 +729,7 @@ fn evaluate_three_finger_swipe(lifted: &[(POINT, POINT)]) -> Option<TouchGesture
 /// is called once per tick from the message loop. We use a plain `Vec` behind
 /// a `Mutex` (rather than a channel) so we can drop duplicates of the same
 /// gesture in a single tick without re-implementing back-pressure.
-static PENDING_ACTIONS: LazyLock<Mutex<Vec<Action>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static PENDING_ACTIONS: LazyLock<Mutex<Vec<Action>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Append an action to the pending queue. Called from the touch hook callback
 /// when a recognized gesture has a config-mapped action.
@@ -857,7 +865,7 @@ mod tests {
         assert_eq!(r.pointer_update_id(1, make_point(50, 100)), None);
         // Second pointer comes back down — new reference distance applies.
         r.pointer_down_id(2, make_point(60, 100)); // distance now ~10
-        // Tiny update -> still under threshold.
+                                                   // Tiny update -> still under threshold.
         assert_eq!(r.pointer_update_id(2, make_point(63, 100)), None);
         // Big spread -> PinchOut from the new reference.
         assert_eq!(

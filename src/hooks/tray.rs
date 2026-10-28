@@ -1,22 +1,19 @@
 use anyhow::{Context, Result};
-use std::os::windows::ffi::OsStrExt;
-use std::sync::{mpsc, Arc};
 use parking_lot::Mutex;
+use std::sync::{mpsc, Arc};
 use tracing::{info, warn};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, AppendMenuW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GetCursorPos, GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenu, TranslateMessage, CreateWindowExW,
-    CS_HREDRAW, CS_VREDRAW, MF_SEPARATOR, MF_STRING,
-    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RIGHTBUTTON,
-    WM_COMMAND, WM_DESTROY, WM_USER, WNDCLASSW,
-    WINDOW_EX_STYLE, WINDOW_STYLE,
+    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MF_SEPARATOR, MF_STRING,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+    WM_DESTROY, WM_USER, WNDCLASSW,
 };
 // NIF_INFO, NIIF_INFO, NIM_MODIFY etc. come from the Shell glob below
-use windows::Win32::UI::Shell::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::core::PCWSTR;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::*;
 
 const WM_TRAYICON: u32 = WM_USER + 100;
 const ID_TRAY_SHOW_HIDE: usize = 1001;
@@ -27,6 +24,23 @@ const ID_TRAY_ABOUT: usize = 1005;
 const ID_TRAY_FOCUS_PREV: usize = 1006;
 const ID_TRAY_SCREENSHOT: usize = 1007;
 const ID_TRAY_CAPTURE_WINDOW: usize = 1008;
+
+/// Wakes whoever polls [`TrayIcon::try_recv_action`] (the daemon's main loop): a tray click is
+/// the only thing that puts an action in the channel, so the poller sleeps until this fires
+/// instead of looking every few milliseconds.
+static TRAY_ACTION_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The wake-up for tray actions: it fires once for every action the tray menu or the icon sends.
+pub fn tray_action_wake() -> &'static tokio::sync::Notify {
+    &TRAY_ACTION_WAKE
+}
+
+/// Queue `action` for the main loop and wake it.
+fn send_action(tx: &mpsc::Sender<TrayAction>, action: TrayAction) {
+    if tx.send(action).is_ok() {
+        TRAY_ACTION_WAKE.notify_one();
+    }
+}
 
 /// Actions that the tray icon can trigger
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +101,10 @@ impl TrayIcon {
         Ok(())
     }
 
-    fn run_tray_loop(action_tx: mpsc::Sender<TrayAction>, hwnd_raw: Arc<Mutex<Option<isize>>>) -> Result<()> {
+    fn run_tray_loop(
+        action_tx: mpsc::Sender<TrayAction>,
+        hwnd_raw: Arc<Mutex<Option<isize>>>,
+    ) -> Result<()> {
         unsafe {
             let hinstance = GetModuleHandleW(None).context("GetModuleHandleW failed")?;
 
@@ -114,8 +131,14 @@ impl TrayIcon {
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(window_name.as_ptr()),
                 WINDOW_STYLE(0),
-                0, 0, 0, 0,
-                None, None, hinstance, None,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                hinstance,
+                None,
             );
             let hwnd = match hwnd {
                 Ok(w) => w,
@@ -196,7 +219,7 @@ impl TrayIcon {
                     ) as *mut mpsc::Sender<TrayAction>;
                     if !tx_ptr.is_null() {
                         let tx = &*tx_ptr;
-                        let _ = tx.send(TrayAction::FocusPrevious);
+                        send_action(tx, TrayAction::FocusPrevious);
                     }
                 }
                 LRESULT(0)
@@ -211,14 +234,30 @@ impl TrayIcon {
                 if !tx_ptr.is_null() {
                     let tx = &*tx_ptr;
                     match cmd_id {
-                        ID_TRAY_SHOW_HIDE => { let _ = tx.send(TrayAction::ShowHide); }
-                        ID_TRAY_RELOAD_CONFIG => { let _ = tx.send(TrayAction::ReloadConfig); }
-                        ID_TRAY_OPEN_CONFIG_DIR => { let _ = tx.send(TrayAction::OpenConfigDir); }
-                        ID_TRAY_ABOUT => { let _ = tx.send(TrayAction::About); }
-                        ID_TRAY_FOCUS_PREV => { let _ = tx.send(TrayAction::FocusPrevious); }
-                        ID_TRAY_SCREENSHOT => { let _ = tx.send(TrayAction::Screenshot); }
-                        ID_TRAY_CAPTURE_WINDOW => { let _ = tx.send(TrayAction::CaptureWindow); }
-                        ID_TRAY_QUIT => { let _ = tx.send(TrayAction::Quit); }
+                        ID_TRAY_SHOW_HIDE => {
+                            send_action(tx, TrayAction::ShowHide);
+                        }
+                        ID_TRAY_RELOAD_CONFIG => {
+                            send_action(tx, TrayAction::ReloadConfig);
+                        }
+                        ID_TRAY_OPEN_CONFIG_DIR => {
+                            send_action(tx, TrayAction::OpenConfigDir);
+                        }
+                        ID_TRAY_ABOUT => {
+                            send_action(tx, TrayAction::About);
+                        }
+                        ID_TRAY_FOCUS_PREV => {
+                            send_action(tx, TrayAction::FocusPrevious);
+                        }
+                        ID_TRAY_SCREENSHOT => {
+                            send_action(tx, TrayAction::Screenshot);
+                        }
+                        ID_TRAY_CAPTURE_WINDOW => {
+                            send_action(tx, TrayAction::CaptureWindow);
+                        }
+                        ID_TRAY_QUIT => {
+                            send_action(tx, TrayAction::Quit);
+                        }
                         _ => {}
                     }
                 }
@@ -256,16 +295,33 @@ impl TrayIcon {
             let focus_prev: Vec<u16> = "Focus Last Tile\0".encode_utf16().collect();
             let show_hide_text: Vec<u16> = "Show/Hide\0".encode_utf16().collect();
             let screenshot_text: Vec<u16> = "Take screenshot\0".encode_utf16().collect();
-            let capture_window_text: Vec<u16> =
-                "Capture focused window\0".encode_utf16().collect();
+            let capture_window_text: Vec<u16> = "Capture focused window\0".encode_utf16().collect();
             let reload_text: Vec<u16> = "Reload Config\0".encode_utf16().collect();
             let open_dir_text: Vec<u16> = "Open Config Folder…\0".encode_utf16().collect();
             let about_text: Vec<u16> = "About wiri…\0".encode_utf16().collect();
             let quit_text: Vec<u16> = "Quit\0".encode_utf16().collect();
 
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_FOCUS_PREV, PCWSTR(focus_prev.as_ptr())).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_SHOW_HIDE, PCWSTR(show_hide_text.as_ptr())).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_SCREENSHOT, PCWSTR(screenshot_text.as_ptr())).ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_FOCUS_PREV,
+                PCWSTR(focus_prev.as_ptr()),
+            )
+            .ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_SHOW_HIDE,
+                PCWSTR(show_hide_text.as_ptr()),
+            )
+            .ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_SCREENSHOT,
+                PCWSTR(screenshot_text.as_ptr()),
+            )
+            .ok();
             AppendMenuW(
                 hmenu,
                 MF_STRING,
@@ -274,8 +330,20 @@ impl TrayIcon {
             )
             .ok();
             AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_RELOAD_CONFIG, PCWSTR(reload_text.as_ptr())).ok();
-            AppendMenuW(hmenu, MF_STRING, ID_TRAY_OPEN_CONFIG_DIR, PCWSTR(open_dir_text.as_ptr())).ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_RELOAD_CONFIG,
+                PCWSTR(reload_text.as_ptr()),
+            )
+            .ok();
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                ID_TRAY_OPEN_CONFIG_DIR,
+                PCWSTR(open_dir_text.as_ptr()),
+            )
+            .ok();
             AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_ABOUT, PCWSTR(about_text.as_ptr())).ok();
             AppendMenuW(hmenu, MF_STRING, ID_TRAY_QUIT, PCWSTR(quit_text.as_ptr())).ok();
@@ -302,30 +370,15 @@ impl TrayIcon {
     /// Open the wiri config folder in Explorer, creating it if missing.
     /// Used by the tray menu's "Open Config Folder…" item.
     pub fn open_config_folder() -> Result<()> {
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
         let dir = crate::config::default_config_dir()
             .ok_or_else(|| anyhow::anyhow!("APPDATA environment variable not set"))?;
-        // Best-effort: create the folder if missing.
-        let _ = std::fs::create_dir_all(&dir);
-
-        let dir_w: Vec<u16> = dir.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let verb_w: Vec<u16> = "open\0".encode_utf16().collect();
-
-        unsafe {
-            let _ = ShellExecuteW(
-                HWND::default(),
-                PCWSTR::from_raw(verb_w.as_ptr()),
-                PCWSTR::from_raw(dir_w.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
-        }
+        // This legacy helper uses the same child-only environment as all other
+        // launchers. The tray action itself opens the active path in main.
+        std::fs::create_dir_all(&dir)?;
+        crate::hooks::spawner::spawn_argv(&[
+            "explorer.exe".into(),
+            dir.to_string_lossy().into_owned(),
+        ])?;
         Ok(())
     }
 
@@ -335,7 +388,8 @@ impl TrayIcon {
         self.action_rx.as_mut()?.try_recv().ok()
     }
 
-    /// Get a clone of the action sender for dispatching tray actions
+    /// Get a clone of the action sender for dispatching tray actions.  A send through this
+    /// clone does not fire [`tray_action_wake`]; the poller finds the action on its next wake.
     pub fn action_sender(&self) -> mpsc::Sender<TrayAction> {
         self.action_tx.clone()
     }
@@ -347,12 +401,20 @@ impl TrayIcon {
 
     /// Show a balloon notification from the tray icon.
     pub fn show_balloon(&self, title: &str, message: &str) -> Result<()> {
+        let _ = self.try_balloon(title, message);
+        Ok(())
+    }
+
+    /// Show a balloon notification; false when the tray icon is not there (yet) or the shell
+    /// refused it.  The title is cut to 63 and the message to 255 UTF-16 units, each ended by a
+    /// null as the shell requires.
+    pub fn try_balloon(&self, title: &str, message: &str) -> bool {
         let hwnd_raw = *self.hwnd_raw.lock();
         let hwnd_val = match hwnd_raw {
             Some(v) => v,
             None => {
-                warn!("show_balloon: tray window not yet created");
-                return Ok(());
+                tracing::debug!("try_balloon: tray window not yet created");
+                return false;
             }
         };
         let hwnd = HWND(hwnd_val as *mut std::ffi::c_void);
@@ -365,24 +427,28 @@ impl TrayIcon {
             nid.uFlags = NIF_INFO;
             nid.dwInfoFlags = NIIF_INFO;
 
-            // szInfoTitle (max 64 chars including null)
-            let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-            let title_len = title_wide.len().min(nid.szInfoTitle.len());
+            // szInfoTitle (max 64 units including the null)
+            let title_wide: Vec<u16> = title.encode_utf16().collect();
+            let title_len = title_wide.len().min(nid.szInfoTitle.len() - 1);
             nid.szInfoTitle[..title_len].copy_from_slice(&title_wide[..title_len]);
 
-            // szInfo (max 256 chars including null)
-            let msg_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
-            let msg_len = msg_wide.len().min(nid.szInfo.len());
+            // szInfo (max 256 units including the null)
+            let msg_wide: Vec<u16> = message.encode_utf16().collect();
+            let msg_len = msg_wide.len().min(nid.szInfo.len() - 1);
             nid.szInfo[..msg_len].copy_from_slice(&msg_wide[..msg_len]);
 
             if !Shell_NotifyIconW(NIM_MODIFY, &nid as *const _ as *const _).as_bool() {
-                warn!("show_balloon: Shell_NotifyIconW NIM_MODIFY failed");
+                tracing::debug!("try_balloon: Shell_NotifyIconW NIM_MODIFY failed");
+                return false;
             }
         }
-        Ok(())
+        true
     }
 
-    pub fn set_icon(&mut self, _icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Result<()> {
+    pub fn set_icon(
+        &mut self,
+        _icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -423,5 +489,53 @@ impl Drop for TrayIcon {
             // Give the thread a moment to process WM_DESTROY, then join.
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn woken_within(ms: u64) -> bool {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(ms), TRAY_ACTION_WAKE.notified())
+                    .await
+                    .is_ok()
+            })
+    }
+
+    // One test: the wake-up is a process-wide static, so parallel tests would take each
+    // other's permits.
+    #[test]
+    fn a_tray_action_is_queued_and_wakes_the_poller_exactly_when_it_arrives() {
+        let (tx, rx) = mpsc::channel();
+        // Leave no permit from an earlier send behind.
+        woken_within(1);
+        assert!(!woken_within(30), "no wake-up without an action");
+
+        send_action(&tx, TrayAction::ReloadConfig);
+        send_action(&tx, TrayAction::Quit);
+        assert!(
+            woken_within(2000),
+            "the poller must be woken by a tray action"
+        );
+        assert!(
+            !woken_within(30),
+            "a stored permit is one wake-up, not one per send"
+        );
+        assert_eq!(rx.try_recv().unwrap(), TrayAction::ReloadConfig);
+        assert_eq!(rx.try_recv().unwrap(), TrayAction::Quit);
+        assert!(rx.try_recv().is_err());
+
+        // A send nobody can receive wakes nobody.
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        send_action(&tx, TrayAction::About);
+        assert!(!woken_within(30));
     }
 }

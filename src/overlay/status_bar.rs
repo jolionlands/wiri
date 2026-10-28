@@ -15,21 +15,21 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, HFONT, PAINTSTRUCT, DT_END_ELLIPSIS,
-    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, HFONT, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
-    KillTimer, MSG, PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetTimer,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, SM_CXSCREEN,
-    SW_SHOWNOACTIVATE, WNDCLASSEXW, WM_CREATE, WM_DESTROY, WM_PAINT, WM_TIMER, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, KillTimer,
+    PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetTimer, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, MSG, SM_CXSCREEN, SW_SHOWNOACTIVATE,
+    WM_CREATE, WM_DESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::PCWSTR;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -81,10 +81,10 @@ struct BarState {
 /// Handle to the persistent status bar overlay.
 ///
 /// # Usage
-/// ```
+/// ```ignore
 /// let bar = Arc::new(StatusBar::new());
 /// let _ = bar.clone().spawn(); // start Win32 thread; drops JoinHandle intentionally
-/// bar.update(StatusBarContent { ... });
+/// bar.update(StatusBarContent { /* fields */ });
 /// ```
 pub struct StatusBar {
     state: Arc<BarState>,
@@ -133,7 +133,11 @@ impl Default for StatusBar {
 
 fn primary_monitor_scale() -> f64 {
     let dpi = unsafe { GetDpiForSystem() };
-    if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 }
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f64 / 96.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,11 +181,8 @@ fn run_window_loop(state: Arc<BarState>) {
         // WS_EX_NOACTIVATE   → never steals keyboard focus
         // WS_EX_TOOLWINDOW   → excluded from Alt+Tab list
         // WS_EX_TOPMOST      → always on top of normal windows
-        let ex_style = WS_EX_LAYERED
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_TRANSPARENT;
+        let ex_style =
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
 
         // Pass state as lpCreateParams so WM_CREATE can store it in GWLP_USERDATA.
         let state_ptr = Arc::into_raw(state.clone()) as *mut BarState;
@@ -191,10 +192,10 @@ fn run_window_loop(state: Arc<BarState>) {
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("").as_ptr()),
             WS_POPUP,
-            0,           // x: left edge of primary monitor
-            0,           // y: top edge of primary monitor
-            screen_w,    // width: full screen width
-            bar_h,       // height: 32 logical px × scale
+            0,        // x: left edge of primary monitor
+            0,        // y: top edge of primary monitor
+            screen_w, // width: full screen width
+            bar_h,    // height: 32 logical px × scale
             None,
             None,
             hinstance,
@@ -207,6 +208,10 @@ fn run_window_loop(state: Arc<BarState>) {
 
         // Store HWND so update() can post InvalidateRect.
         *state.hwnd.lock() = Some(hwnd.0 as isize);
+        crate::window::block_out::apply_to(
+            crate::window::block_out::Overlay::StatusBar,
+            hwnd.0 as isize,
+        );
 
         // Show immediately (bar is persistent, not transient like workspace_indicator).
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -288,7 +293,12 @@ unsafe extern "system" fn wnd_proc(
             // Background: #1e1e1e (charcoal).  The 90% alpha set via
             // SetLayeredWindowAttributes provides the semi-transparency effect.
             let bg = CreateSolidBrush(COLORREF(0x00_1E_1E_1E));
-            let full_rc = RECT { left: 0, top: 0, right: bar_w, bottom: bar_h };
+            let full_rc = RECT {
+                left: 0,
+                top: 0,
+                right: bar_w,
+                bottom: bar_h,
+            };
             FillRect(hdc, &full_rc, bg);
             let _ = DeleteObject(bg);
 
@@ -297,11 +307,18 @@ unsafe extern "system" fn wnd_proc(
             let font_height = (-11f64 * scale) as i32;
             let hfont: HFONT = CreateFontW(
                 font_height,
-                0, 0, 0,
+                0,
+                0,
+                0,
                 400, // FW_NORMAL
-                0, 0, 0,
-                1,   // DEFAULT_CHARSET
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                1, // DEFAULT_CHARSET
+                0,
+                0,
+                0,
+                0,
                 PCWSTR(wide("Segoe UI").as_ptr()),
             );
             let old_font = SelectObject(hdc, hfont);

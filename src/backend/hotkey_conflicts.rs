@@ -72,13 +72,10 @@ pub fn detect() -> Vec<String> {
 #[cfg(target_arch = "x86_64")]
 fn has_intel_hotkey_service() -> bool {
     use windows::Win32::System::Services::{
-        CloseServiceHandle, OpenSCManagerW, OpenServiceW,
-        SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
     };
 
-    let scm = unsafe {
-        OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT)
-    };
+    let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) };
     let scm = match scm {
         Ok(h) => h,
         Err(_) => return false,
@@ -93,16 +90,19 @@ fn has_intel_hotkey_service() -> bool {
     let mut found = false;
     for name in candidates {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        let res = unsafe {
-            OpenServiceW(scm, PCWSTR::from_raw(wide.as_ptr()), SERVICE_QUERY_STATUS)
-        };
+        let res =
+            unsafe { OpenServiceW(scm, PCWSTR::from_raw(wide.as_ptr()), SERVICE_QUERY_STATUS) };
         if let Ok(svc) = res {
-            unsafe { let _ = CloseServiceHandle(svc); }
+            unsafe {
+                let _ = CloseServiceHandle(svc);
+            }
             found = true;
             break;
         }
     }
-    unsafe { let _ = CloseServiceHandle(scm); }
+    unsafe {
+        let _ = CloseServiceHandle(scm);
+    }
     found
 }
 
@@ -113,14 +113,11 @@ fn has_intel_hotkey_service() -> bool {
 #[cfg(target_arch = "x86_64")]
 fn has_intel_graphics_registry() -> bool {
     use windows::Win32::System::Registry::{
-        HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+        RegCloseKey, RegOpenKeyExW, HKEY_LOCAL_MACHINE, KEY_READ,
     };
 
     // Try a couple of well-known subkeys.
-    let candidates: [&str; 2] = [
-        r"SOFTWARE\Intel\Display\igfxext",
-        r"SOFTWARE\Intel\Display",
-    ];
+    let candidates: [&str; 2] = [r"SOFTWARE\Intel\Display\igfxext", r"SOFTWARE\Intel\Display"];
     for path in candidates {
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         let mut hkey = windows::Win32::System::Registry::HKEY::default();
@@ -134,7 +131,9 @@ fn has_intel_graphics_registry() -> bool {
             )
         };
         if res.is_ok() {
-            unsafe { let _ = RegCloseKey(hkey); }
+            unsafe {
+                let _ = RegCloseKey(hkey);
+            }
             return true;
         }
     }
@@ -145,13 +144,10 @@ fn has_intel_graphics_registry() -> bool {
 #[cfg(target_arch = "x86_64")]
 fn has_amd_radeon_registry() -> bool {
     use windows::Win32::System::Registry::{
-        HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+        RegCloseKey, RegOpenKeyExW, HKEY_LOCAL_MACHINE, KEY_READ,
     };
 
-    let candidates: [&str; 2] = [
-        r"SOFTWARE\AMD\CN",
-        r"SOFTWARE\AMD",
-    ];
+    let candidates: [&str; 2] = [r"SOFTWARE\AMD\CN", r"SOFTWARE\AMD"];
     for path in candidates {
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         let mut hkey = windows::Win32::System::Registry::HKEY::default();
@@ -165,7 +161,9 @@ fn has_amd_radeon_registry() -> bool {
             )
         };
         if res.is_ok() {
-            unsafe { let _ = RegCloseKey(hkey); }
+            unsafe {
+                let _ = RegCloseKey(hkey);
+            }
             return true;
         }
     }
