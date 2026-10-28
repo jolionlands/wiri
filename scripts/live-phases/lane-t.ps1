@@ -15,6 +15,8 @@
         'h59_resize_preview_survives_held_refresh', 'h59_resize_persists_after_drop',
         'h59_move_drops_into_actual_destination_column', 'h59_right_click_during_move_toggles_float',
         'h60_dnd_host_absent_without_gestures', 'h60_dnd_host_configured_only',
+        'h60_dnd_edge_scroll_moves_the_strip', 'h60_dnd_edge_switch_fires_once_after_the_delay',
+        'h60_dnd_no_frame_timer_when_idle',
         'h61_raw_host_absent_without_touchpad', 'h61_raw_inputsink_registered_on_opt_in',
         'h61_raw_removed_on_off_reload', 'h61_raw_removed_on_quit'
     )
@@ -65,7 +67,16 @@
     }
     function TConfig([bool]$raw=$false, [bool]$dnd=$false) {
         $rawBlock = if ($raw) { 'touchpad {}' } else { 'touchpad { off; }' }
-        $dndBlock = if ($dnd) { 'gestures {}' } else { '' }
+        # Explicit zones and dwell, not the defaults: the H60 edge gates quote these numbers, so
+        # a changed default must fail them instead of silently re-timing the fixture.
+        $dndBlock = if ($dnd) {
+            (@(
+                'gestures {',
+                '    dnd-edge-view-scroll { trigger-width 30; delay-ms 100; max-speed 1500; }',
+                '    dnd-edge-workspace-switch { trigger-height 50; delay-ms 100; max-speed 1500; }',
+                '}'
+            ) -join "`n")
+        } else { '' }
         return @"
 input { mod-key "Alt"; $rawBlock }
 animations {}
@@ -314,7 +325,90 @@ public static class LaneTNative {
         }
         try { TClose } catch { $tDetails['error-close'] = [string]$_ }
 
-        # H60-H61: lifecycle evidence only, deliberately no shell settings/HID injection/OLE claims.
+        # H60: real drag-and-drop edge evidence. A held left button pressed on one of our own
+        # forms and moved with SendInput (no Mod, so wiri sees a foreign capture drag like an
+        # application's) drives the configured edges: the strip scrolls the way niri's does, a
+        # dwell at the top/bottom edge steps the workspace once, and the one-shot frame timer
+        # stops the moment the pointer leaves the zone and stays stopped. Direction and
+        # once-only-ness are asserted; frame cadence never is, because the dwell timing is the
+        # flaky part. Still no OLE claim: the capture heuristic is wiri's own.
+        try {
+            TReload (TConfig $false $true)
+            $tDragOn = [LaneTNative]::MessageWindow('WiriDragGestures',$tProcess.Id)
+            $tScreen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $tEdgeX = $tScreen.Right - 4
+            $tEdgeY = $tScreen.Bottom - 4
+            $tMidX = $tScreen.Left + [int]($tScreen.Width/2)
+            $tMidY = $tScreen.Top + [int]($tScreen.Height/2)
+            $tE = TOpen 'edge-a'; $tF = TOpen 'edge-b'; $tG = TOpen 'edge-c'
+            TAction 't-dnd-workspace' @('focus-workspace','2')
+            $tStrip0 = Rc $tG
+            $tFrames0 = (LogLines $tLog 'dnd edge frame').Count
+            $tRight0 = (LogLines $tLog 'dnd edge frame dir=right').Count
+            $tLeft0 = (LogLines $tLog 'dnd edge frame dir=left').Count
+            $tPt = TPoint $tE 0.25 0.5
+            try {
+                [LaneTNative]::Button('L',$false)
+                foreach ($i in 1..10) {
+                    [LaneTNative]::Move(($tPt.X + [int](($tEdgeX-$tPt.X)*$i/10)), $tPt.Y)
+                    Start-Sleep -Milliseconds 25
+                }
+                Start-Sleep -Milliseconds 160
+                # Still inside the zone, but re-arm the one-shot timer a few times with a real
+                # frame delta: a first frame shorter than half a pixel would otherwise latch the
+                # axis off without the strip ever moving (the pointer itself stays in the zone).
+                foreach ($i in 1..3) {
+                    [LaneTNative]::Move($tEdgeX, ($tPt.Y + 2*$i))
+                    Start-Sleep -Milliseconds 120
+                }
+                Start-Sleep -Milliseconds 320
+                $tStripHeld = Rc $tG
+                Shot 'h60-dnd-edge-scroll'
+                $tFramesZone = (LogLines $tLog 'dnd edge frame').Count
+                $tRightZone = (LogLines $tLog 'dnd edge frame dir=right').Count
+                $tLeftZone = (LogLines $tLog 'dnd edge frame dir=left').Count
+                # Same held button, away from every edge zone: the timer must be gone already.
+                [LaneTNative]::Move($tMidX, $tMidY)
+                Start-Sleep -Milliseconds 160
+                $tFramesOut = (LogLines $tLog 'dnd edge frame').Count
+                $tOut1 = Rc $tG; Start-Sleep -Milliseconds 140; $tOut2 = Rc $tG
+            } finally { [LaneTNative]::ReleaseAll() }
+            Start-Sleep -Milliseconds 300
+            $tFramesIdle = (LogLines $tLog 'dnd edge frame').Count
+            $tOut3 = Rc $tG
+            TGate 'h60_dnd_edge_scroll_moves_the_strip' (($tDragOn -ne [IntPtr]::Zero) -and ($tStripHeld.L -lt $tStrip0.L-40) -and ($tRightZone -gt $tRight0) -and ($tLeftZone -eq $tLeft0)) @($tStrip0,$tStripHeld,$tRight0,$tRightZone,$tLeftZone)
+            TGate 'h60_dnd_no_frame_timer_when_idle' (($tFramesZone -gt $tFrames0) -and ($tFramesOut -eq $tFramesZone) -and ($tFramesIdle -eq $tFramesZone) -and (Near $tOut1.L $tOut2.L 2) -and (Near $tOut2.L $tOut3.L 2) -and (Near $tOut2.L $tStripHeld.L 2)) @($tFramesZone,$tFramesOut,$tFramesIdle,$tOut1,$tOut2,$tOut3)
+
+            # A fresh drag straight down to the bottom edge: past delay-ms the workspace steps
+            # once, in the down direction, and a stationary pointer never repeats it.
+            $tWs0 = [string](TCtl 't-dnd-state' @('--json','state') | ConvertFrom-Json).result.active_workspace
+            $tSteps0 = (LogLines $tLog 'dnd workspace step delta=1').Count
+            $tBack0 = (LogLines $tLog 'dnd workspace step delta=-1').Count
+            $tPt = TPoint $tG 0.4 0.5
+            try {
+                [LaneTNative]::Button('L',$false)
+                foreach ($i in 1..10) {
+                    [LaneTNative]::Move($tPt.X, ($tPt.Y + [int](($tEdgeY-$tPt.Y)*$i/10)))
+                    Start-Sleep -Milliseconds 25
+                }
+                Start-Sleep -Milliseconds 1500
+                $tWs1 = [string](TCtl 't-dnd-state-after' @('--json','state') | ConvertFrom-Json).result.active_workspace
+                $tSteps1 = (LogLines $tLog 'dnd workspace step delta=1').Count
+                $tAway = (VisibleCount @($tE,$tF,$tG)) -eq 0
+            } finally { [LaneTNative]::ReleaseAll() }
+            TAction 't-dnd-back' @('focus-workspace','2')
+            $tWsBack = [string](TCtl 't-dnd-state-back' @('--json','state') | ConvertFrom-Json).result.active_workspace
+            $tNext = 'workspace-' + ([int]($tWs0 -replace '^workspace-','') + 1)
+            TGate 'h60_dnd_edge_switch_fires_once_after_the_delay' (($tSteps1-$tSteps0 -eq 1) -and ((LogLines $tLog 'dnd workspace step delta=-1').Count -eq $tBack0) -and ($tWs0 -ne $tWs1) -and ($tWs1 -eq $tNext) -and $tAway -and ($tWsBack -eq $tWs0) -and ((VisibleCount @($tE,$tF,$tG)) -eq 3)) @($tWs0,$tWs1,$tNext,$tSteps0,$tSteps1,$tAway,$tWsBack)
+            Shot 'h60-dnd-back'
+        } catch {
+            $tDetails['error-h60-dnd'] = [string]$_
+            $tDetails['error-h60-dnd-position'] = $_.InvocationInfo.PositionMessage
+        }
+        try { TClose } catch { $tDetails['error-h60-dnd-close'] = [string]$_ }
+
+        # H60 lifecycle / H61: HWND lifecycle only, deliberately no shell settings/HID injection/
+        # OLE claims.
         try {
             TReload (TConfig $true $true)
             $tRaw = [LaneTNative]::MessageWindow('WiriTouchpadRawInput',$tProcess.Id)
