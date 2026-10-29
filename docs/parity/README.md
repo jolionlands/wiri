@@ -91,11 +91,15 @@ The later pointer-origin correction at `5738371` passed **2,041 Rust tests** and
 all 11 source gates; it has no new graphics or native result. The exact immutable
 R4 binaries also passed **7/7 native spacing** and **7/7 native panel** follow-up
 checks at actual 96 DPI. Root verified the PNG hashes and reviewed both panel
-images. Task19's later floating-height source qualification passed
-**19/19 height tests**, all 20 backend-message tests and **2,060 Rust tests**,
-with all 13 source gates and the release build passing. IPC explicit-target focus,
-workspace-transfer index lifecycle and native/DPI height qualification remain open.
-These height results add no graphics or native evidence. Each result retains
+images. Task19's later routing checkpoint `69e0eb7` passed **25/25 height tests**
+(21 engine and four compositional IPC cases), all 20 backend-message tests and
+**2,066 Rust tests**, with all 14 source gates and the release build passing.
+Explicit-ID handler pre-focus and workspace-transfer index lifecycle are corrected;
+the IPC tests combine two positive-ID wire normalization controls and two shared-handler
+negative-model cases, rather than typed end-to-end or native foreground evidence.
+Owned native height and DPI qualification remain pending. The separate graphics
+run passed its real BMP test with no display skip; the 245-file immutable graph
+is recorded in the evidence report. No native height result is claimed. Each result retains
 its own source manifests; these results are not a
 new full desktop cycle. See the
 [R4 evidence and remaining work](2026-10-29-tridaris-r4.md).
@@ -106,8 +110,10 @@ After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
 curated hotkey list move to done. The current totals are
 **303 done / 93 partial / 89 N/A** across 485 rows:
 **303/396 applicable rows (76.5%)**. The floating-height consumer and final logical
-quantization are now source-qualified; both height rows remain partial for the
-IPC/transfer gaps and native/DPI evidence described above.
+quantization, IPC handler routing and transfer lifecycle are now source-qualified;
+both height rows remain partial for native/DPI evidence and the existing tiled
+single-window/tabbed fill-view approximation. Floating native qualification alone
+would not close either whole row.
 Appearance scaling, remaining floating-height behavior, input/config semantics and
 hardware evidence remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
 for the active work; a gate count alone is not full parity.

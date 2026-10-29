@@ -411,8 +411,12 @@ engine consumer and per-window remembered index. Its initial 16-test source GREE
 passed 2,057 full-suite tests; three follow-ups then exposed a 400-versus-401-pixel
 logical quantization failure. The correction passed all 19 height tests, all 20
 backend-message tests, 2,060 full-suite tests, all 13 required gates and the release
-build. IPC pre-focus, workspace-transfer index lifecycle and native/DPI height
-qualification remain open.
+build. The later routing checkpoint `69e0eb7` passed all 25 height tests (21 engine
+and four compositional IPC cases), 2,066 full-suite tests, all 14 source gates and
+the release build. IPC handler pre-focus and workspace-transfer index lifecycle
+are corrected; owned native/DPI height qualification remains pending. The existing
+tiled single-window/tabbed fill-view approximation remains separate; floating native
+qualification alone would not close the whole height rows.
 
 - [x] Add and observe dispatch/state regressions for current and explicit
   floating targets: nonpreset first step, forward/back wrap, remembered index,
@@ -423,12 +427,16 @@ qualification remain open.
 - [x] Observe the three follow-up cases (two controls pass, one semantic failure)
   and qualify final logical-height rounding before the physical request; 19/19
   height tests pass.
-- [ ] Qualify explicit-target IPC without focus mutation; four compositional
-  tests are drafted but unregistered/unexecuted.
-- [ ] Observe and fix remembered-index invalidation on A→B→A transfer across
-  different named-workspace lists; two tests are drafted but unregistered/unexecuted.
+- [x] Observe and fix explicit-target common-handler pre-focus. Four compositional
+  tests pass: two positive-ID typed-wire normalization controls and two negative-model
+  shared-handler cases. This is not typed end-to-end or native foreground evidence.
+- [x] Observe and fix remembered-index invalidation on A→B→A transfer across
+  different named-workspace lists; both transfer tests pass, including unchanged-list
+  retention.
 - [ ] Review and verify owned native height changes and refresh/reload retention;
   keep actual mixed-DPI hardware evidence separate from deterministic tests.
+- [ ] Reconcile the existing tiled single-window/tabbed fill-view approximation
+  against pinned niri; the floating consumer and future native phase do not close it.
 
 ### Following source-backed queue
 
@@ -457,8 +465,14 @@ checks with retained artifact hashes and root-reviewed images. The later
 pointer-origin follow-up passed **2,041 Rust tests** and 11 source gates. Task19's
 initial 16-case implementation passed **2,057 Rust tests**; its logical-height
 correction then passed **19/19 height tests**, all 20 backend-message tests,
-**2,060 Rust tests**, all 13 source gates and the release build. IPC explicit-target
-focus, workspace-transfer index lifecycle and native/DPI height work remain pending.
+**2,060 Rust tests**, all 13 source gates and the release build. The later routing
+checkpoint `69e0eb7` passed **25/25 height tests**, **2,066 Rust tests**, all 14
+source gates and the release build, correcting explicit-ID handler pre-focus and
+workspace-transfer index lifecycle. Its IPC coverage is compositional, not typed
+end-to-end or native foreground proof. Owned native/DPI height work remains pending;
+the unexecuted R1 phase corrects its prelaunch refresh request envelope.
+The separate Task19 graphics run passed its real BMP test with no display skip,
+and froze a new 245-file source/bin graph; this supplies no native height result.
 The matrix remains **303/396 (76.5%), 93 partial**, with no height-row promotion.
 These version-bound results do not replace the failed full R3 desktop cycle or
 provide a new performance result. See the [evidence report](../../parity/2026-10-29-tridaris-r4.md#floating-height-presets-source-qualification).
