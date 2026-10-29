@@ -312,7 +312,7 @@ of different sections of `config/types.rs` or `config/decode.rs`.
 
 ### Performance qualification after the integrated checkpoint
 
-The next observer should acknowledge geometry on the owned sentinel's UI thread.
+The external observer now acknowledges geometry on the owned sentinel's UI thread.
 Attach a perf-only `NativeWindow` listener on that thread, arm a generation and
 baseline outside the timed interval, then capture QPC at the first armed
 `WM_WINDOWPOSCHANGED` whose immediate rectangle read differs. The injector records
@@ -344,8 +344,21 @@ the older poller roadmap in PERF.md is historical.
 
 - [ ] Run the frozen complete desktop harness with root compilation stopped;
   retain its one cold start, 30s idle window, ten spaced keys and resource endpoints.
-- [ ] Improve the external target-acknowledgement observer before enforcing
-  sub-frame latency; report uncertainty and actual rectangles independently.
+- [x] Implement and qualify the external target-acknowledgement observer: 24/24
+  deterministic state tests, five fresh no-input calibration cases and ten valid
+  owned transitions at source `381ce11`. Preserve raw QPC/rectangle uncertainty.
+- [x] Run the bounded source-pinned cold-start/idle/ten-key measurement separately
+  from the complete desktop harness. The run finished 2026-10-29 13:04:39 UTC:
+  target receipt median/max 5.8467/7.5401 ms, rectangle read completion
+  5.8476/7.5408 ms, cold typed-IPC readiness 167.6095 ms and 30.0297263 s idle.
+  Observed daemon CPU delta was below counter resolution. Context: 27 managed
+  windows, two owned ordinary forms with unarmed listeners, daemon-only CPU and
+  no-tray/no-autostart/no-startup-overlay flags. All 14 downloads and 247/253-file
+  graphs were verified; cleanup passed. The first attempt's zero-input readiness
+  failure and 13 artifacts remain preserved. See the
+  [endpoint definitions and proof](../../parity/2026-10-29-tridaris-r4.md#owned-target-acknowledgement-performance).
+- [ ] Qualify frame presentation and any 16 ms budget separately; the new
+  acknowledgement endpoint does not establish a historical speedup.
 - [ ] Measure focus/cursor acknowledgement and engine-lock duration around the
   synchronous activation fallback; preserve generation and completion guarantees.
 - [ ] Measure ordinary animated frame spacing separately: the existing perf

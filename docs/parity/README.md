@@ -155,6 +155,17 @@ with **34 stable native/IPC observations** and **22 referenced artifacts** at
 actual 96 DPI, covering selected sole/stacked/tabbed height and reload behavior.
 See the [native tiled-height evidence](2026-10-29-tridaris-r4.md#owned-native-tiled-height-lifecycle).
 
+The same `381ce11` source then completed a bounded owned target-acknowledgement
+measurement: **10/10 transitions**, with target UI receipt median/max
+**5.8467/7.5401 ms** and raw rectangle read completion **5.8476/7.5408 ms**.
+Five fresh observer calibration cases passed. Cold start to the first PID-verified
+typed reply was **167.6095 ms**; the **30.0297263 s** idle interval showed no
+resolvable daemon CPU increase, with 27 total managed windows and two owned
+ordinary forms/listeners. This is target-message/bounds acknowledgement, with no
+frame, historical speedup or zero-CPU certification. The first readiness failure
+retains its zero-input diagnostics; full R3 remains failed. See the
+[performance endpoints and context](2026-10-29-tridaris-r4.md#owned-target-acknowledgement-performance).
+
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
