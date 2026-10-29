@@ -97,9 +97,17 @@ images. Task19's later routing checkpoint `69e0eb7` passed **25/25 height tests*
 Explicit-ID handler pre-focus and workspace-transfer index lifecycle are corrected;
 the IPC tests combine two positive-ID wire normalization controls and two shared-handler
 negative-model cases, rather than typed end-to-end or native foreground evidence.
-Owned native height and DPI qualification remain pending. The separate graphics
-run passed its real BMP test with no display skip; the 245-file immutable graph
-is recorded in the evidence report. No native height result is claimed. Each result retains
+The later Task19 R3 owned native run passed **14/14 checks**, with **38 native/IPC
+observations** and **12 verified artifacts**, at actual 96 DPI. It covers floating
+height order, wrap, proportion, refresh/reload and transfer lifecycle, plus typed
+inactive-target foreground preservation. Root separately reviewed two saved
+visible-source images. The earlier R2 attempt stopped before height observations
+at an admission-grace focus precondition and cleaned up; R3 settles managed
+admission for three seconds before its one explicit focus request. This does not
+qualify focus during admission grace. Mixed-DPI hardware and tiled single-window/
+tabbed height behavior remain partial. The separate graphics run passed its real
+BMP test with no display skip; the 245-file base graph and composed native graph
+are recorded in the evidence report. Each result retains
 its own source manifests; these results are not a
 new full desktop cycle. See the
 [R4 evidence and remaining work](2026-10-29-tridaris-r4.md).
@@ -111,7 +119,7 @@ curated hotkey list move to done. The current totals are
 **303 done / 93 partial / 89 N/A** across 485 rows:
 **303/396 applicable rows (76.5%)**. The floating-height consumer and final logical
 quantization, IPC handler routing and transfer lifecycle are now source-qualified;
-both height rows remain partial for native/DPI evidence and the existing tiled
+both height rows remain partial for actual mixed-DPI hardware and the existing tiled
 single-window/tabbed fill-view approximation. Floating native qualification alone
 would not close either whole row.
 Appearance scaling, remaining floating-height behavior, input/config semantics and

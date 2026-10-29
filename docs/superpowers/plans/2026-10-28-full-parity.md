@@ -414,9 +414,10 @@ backend-message tests, 2,060 full-suite tests, all 13 required gates and the rel
 build. The later routing checkpoint `69e0eb7` passed all 25 height tests (21 engine
 and four compositional IPC cases), 2,066 full-suite tests, all 14 source gates and
 the release build. IPC handler pre-focus and workspace-transfer index lifecycle
-are corrected; owned native/DPI height qualification remains pending. The existing
-tiled single-window/tabbed fill-view approximation remains separate; floating native
-qualification alone would not close the whole height rows.
+are corrected. The owned Task19 R3 native run passed 14/14 checks, 38 native/IPC
+observations and 12 verified artifacts at actual 96 DPI. Mixed-DPI hardware and
+the existing tiled single-window/tabbed fill-view approximation remain separate;
+floating native qualification alone does not close the whole height rows.
 
 - [x] Add and observe dispatch/state regressions for current and explicit
   floating targets: nonpreset first step, forward/back wrap, remembered index,
@@ -433,10 +434,14 @@ qualification alone would not close the whole height rows.
 - [x] Observe and fix remembered-index invalidation on A→B→A transfer across
   different named-workspace lists; both transfer tests pass, including unchanged-list
   retention.
-- [ ] Review and verify owned native height changes and refresh/reload retention;
-  keep actual mixed-DPI hardware evidence separate from deterministic tests.
+- [x] Verify owned native height changes, order/wrap, proportion, refresh/reload
+  retention, typed inactive-target foreground preservation and transfer lifecycle:
+  Task19 R3 passed 14/14 at actual 96 DPI, with 38 native/IPC observations and
+  12 verified artifacts. Root reviewed the two saved visible-source images;
+  the original phase's pending manual-review field remains unchanged.
+- [ ] Qualify actual mixed-DPI hardware separately from deterministic scale tests.
 - [ ] Reconcile the existing tiled single-window/tabbed fill-view approximation
-  against pinned niri; the floating consumer and future native phase do not close it.
+  against pinned niri; the floating consumer and native evidence do not close it.
 
 ### Following source-backed queue
 
@@ -469,10 +474,17 @@ correction then passed **19/19 height tests**, all 20 backend-message tests,
 checkpoint `69e0eb7` passed **25/25 height tests**, **2,066 Rust tests**, all 14
 source gates and the release build, correcting explicit-ID handler pre-focus and
 workspace-transfer index lifecycle. Its IPC coverage is compositional, not typed
-end-to-end or native foreground proof. Owned native/DPI height work remains pending;
-the unexecuted R1 phase corrects its prelaunch refresh request envelope.
+end-to-end or native foreground proof. The later owned Task19 R3 native run
+passed **14/14 checks**, **38 native/IPC observations** and **12 verified artifacts**
+at actual 96 DPI, including typed inactive-target foreground preservation.
+Root's separate manual review covers two visible-source screenshots. R2 stopped
+before height observations at an admission-grace startup focus precondition and
+cleaned up; R3 waits for three seconds of stable managed admission before its
+one explicit focus request. This fixture correction does not fix the queued
+explicit-focus/admission interaction. Mixed-DPI hardware qualification and the
+tiled-height correction remain open.
 The separate Task19 graphics run passed its real BMP test with no display skip,
-and froze a new 245-file source/bin graph; this supplies no native height result.
+and froze a new 245-file source/bin base graph used by the composed native run.
 The matrix remains **303/396 (76.5%), 93 partial**, with no height-row promotion.
 These version-bound results do not replace the failed full R3 desktop cycle or
 provide a new performance result. See the [evidence report](../../parity/2026-10-29-tridaris-r4.md#floating-height-presets-source-qualification).
