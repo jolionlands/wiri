@@ -112,6 +112,14 @@ its own source manifests; these results are not a
 new full desktop cycle. See the
 [R4 evidence and remaining work](2026-10-29-tridaris-r4.md).
 
+The later floating-width lifecycle checkpoint `351065a` passed **four width
+regressions**, all **25 height controls**, the **2,070-test suite** and all
+**15 source gates**, including the release build. Changed preset lists now
+discard stale floating width indices on reload and workspace transfer; unchanged
+lists retain their indices. This is source qualification; the native-height
+result above remains bound to `69e0eb7`. See the
+[width evidence](2026-10-29-tridaris-r4.md#floating-width-list-lifecycle).
+
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the

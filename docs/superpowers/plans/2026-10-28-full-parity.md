@@ -443,6 +443,20 @@ floating native qualification alone does not close the whole height rows.
 - [ ] Reconcile the existing tiled single-window/tabbed fill-view approximation
   against pinned niri; the floating consumer and native evidence do not close it.
 
+### Floating width list lifecycle
+
+- [x] Observe reload/transfer failures when presets change A→B→A without a cycle
+  on B: two failures at 300 versus 900 px, two unchanged-list controls passing,
+  and all 25 height controls passing.
+- [x] Retain logical width-list identity and invalidate stale indices at existing
+  reload/transfer boundaries; equal lists retain their indices.
+- [x] Qualify and import checkpoint `351065a`: width 4/4, height 25/25, full
+  suite 2,070, all 15 source gates/build passing, all 196 inputs verified and
+  only eight formatted files imported. See the
+  [width evidence](../../parity/2026-10-29-tridaris-r4.md#floating-width-list-lifecycle).
+- [ ] Add native width lifecycle evidence against this checkpoint separately;
+  the earlier height-native result remains bound to `69e0eb7`.
+
 ### Following source-backed queue
 
 - Full configured-title Pango semantics, literal ampersands and consistent styled
