@@ -150,6 +150,11 @@ missing opening defaults. The four-file guarded import verifies all 197 inputs
 and preserves 193 others. This adds source qualification only; see the
 [lifecycle evidence](2026-10-29-tridaris-r4.md#tiled-height-preset-list-and-constraint-lifecycle).
 
+A separate owned run at the same `381ce11` source passed **21/21 native checks**,
+with **34 stable native/IPC observations** and **22 referenced artifacts** at
+actual 96 DPI, covering selected sole/stacked/tabbed height and reload behavior.
+See the [native tiled-height evidence](2026-10-29-tridaris-r4.md#owned-native-tiled-height-lifecycle).
+
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
@@ -157,7 +162,7 @@ curated hotkey list move to done. The current totals are
 **303 done / 93 partial / 89 N/A** across 485 rows:
 **303/396 applicable rows (76.5%)**. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
-remain partial for native tiled-height/mixed-DPI qualification. The lifecycle
+remain partial for physical mixed-DPI and remaining lifecycle routes. The lifecycle
 checkpoint qualifies its listed source cases; earlier floating native evidence
 retains its own source binding.
 Appearance scaling, other height lifecycle routes, input/config semantics and

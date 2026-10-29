@@ -416,8 +416,9 @@ and four compositional IPC cases), 2,066 full-suite tests, all 14 source gates a
 the release build. IPC handler pre-focus and workspace-transfer index lifecycle
 are corrected. The owned Task19 R3 native run passed 14/14 checks, 38 native/IPC
 observations and 12 verified artifacts at actual 96 DPI. The later tiled-height
-source correction is qualified at `1cb2a25` below. Remaining request lifecycle,
-native tiled-height and mixed-DPI qualification keep both height rows partial.
+source correction is qualified at `1cb2a25` below, with selected current-source
+96-DPI native behavior qualified at `381ce11`. Remaining lifecycle routes and
+physical mixed-DPI qualification keep both height rows partial.
 
 - [x] Add and observe dispatch/state regressions for current and explicit
   floating targets: nonpreset first step, forward/back wrap, remembered index,
@@ -492,8 +493,12 @@ native tiled-height and mixed-DPI qualification keep both height rows partial.
   2,104 tests and 21 source gates/build pass. The four-file guarded import verifies
   all 197 inputs and preserves 193 others. See the
   [lifecycle evidence](../../parity/2026-10-29-tridaris-r4.md#tiled-height-preset-list-and-constraint-lifecycle).
-- [ ] Add native tiled-height and mixed-DPI evidence separately; the prior native
-  floating-height result remains bound to `69e0eb7`. No row promotion.
+- [x] Qualify selected current-source tiled heights at 96 DPI: source `381ce11`,
+  native 21/34/22, one owned cleanup. See the
+  [native evidence](../../parity/2026-10-29-tridaris-r4.md#owned-native-tiled-height-lifecycle).
+  Historical floating native 14/14 remains bound to `69e0eb7`; no row promotion.
+- [ ] Obtain physical mixed-DPI and remaining lifecycle/route evidence before
+  whole-row acceptance.
 
 ### Following source-backed queue
 
@@ -541,10 +546,12 @@ closing native minimum-width request loss while leaving generic rule/config call
 at that checkpoint. The later lifecycle checkpoint `381ce11` passes 2,104
 tests and 21 source gates/build: five effective-list cases and four rule/admission
 cases qualify the expanded three-file source fix. All 197 inputs qualify; the
-four-file guarded import preserves 193 others. Native tiled height, mixed-DPI
-hardware and other lifecycle routes remain open.
-The separate Task19 graphics run passed its real BMP test with no display skip,
+four-file guarded import preserves 193 others. A later same-source native run
+passes 21/21 at 96 DPI with 34 observations and 22 artifacts for selected tiled
+shapes/reloads. Physical mixed-DPI and other lifecycle routes remain open.
+The historical Task19 graphics run passed its real BMP test with no display skip,
 and froze a new 245-file source/bin base graph used by the composed native run.
+The later lifecycle native run uses its fresh 247-file base and 249-file composition.
 The matrix remains **303/396 (76.5%), 93 partial**, with no height-row promotion.
 These version-bound results do not replace the failed full R3 desktop cycle or
 provide a new performance result. See the [evidence report](../../parity/2026-10-29-tridaris-r4.md#floating-height-presets-source-qualification).
