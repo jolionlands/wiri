@@ -28,7 +28,21 @@ impl TilingEngine {
 
     /// `layout { preset-window-heights }`, or niri's default thirds/half/two-thirds.
     pub(super) fn window_height_presets(&self, output: OutputId) -> Vec<SizeSpec> {
-        let configured = &self.active_workspace_config(output).preset_window_heights;
+        Self::window_height_presets_from_config(self.active_workspace_config(output))
+    }
+
+    fn window_height_presets_for_workspace(
+        &self,
+        output: OutputId,
+        workspace: i32,
+    ) -> Vec<SizeSpec> {
+        Self::window_height_presets_from_config(
+            self.effective_config_for_workspace(output, workspace),
+        )
+    }
+
+    fn window_height_presets_from_config(cfg: &LayoutConfig) -> Vec<SizeSpec> {
+        let configured = &cfg.preset_window_heights;
         if configured.is_empty() {
             Self::PRESET_WINDOW_PROPORTIONS
                 .iter()
@@ -36,6 +50,99 @@ impl TilingEngine {
                 .collect()
         } else {
             configured.clone()
+        }
+    }
+
+    /// Preset indices survive position changes and reloads of the same list, but
+    /// never refer to a replacement list, even if it is changed back before use.
+    pub(super) fn refresh_float_height_presets(&mut self) {
+        let lists: Vec<_> = self
+            .float_homes
+            .iter()
+            .map(|(window, home)| {
+                (
+                    *window,
+                    self.window_height_presets_for_workspace(home.output, home.workspace),
+                )
+            })
+            .collect();
+        for (window, presets) in lists {
+            if let Some(home) = self.float_homes.get_mut(&window) {
+                if home.height_preset_list != presets {
+                    home.height_preset_idx = None;
+                    home.height_preset_list = presets;
+                }
+            }
+        }
+    }
+
+    /// Floating heights use their own output's work area and logical preset
+    /// list, without the gaps or border band belonging to tiled columns.
+    pub fn float_cycle_height(
+        &mut self,
+        window: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, workspace)) = self.float_location(window) else {
+            return;
+        };
+        let Some((work, scale)) = self.monitors.get(&output).map(|m| {
+            (
+                m.work_area,
+                if m.scale_factor.is_finite() && m.scale_factor > 0.0 {
+                    m.scale_factor
+                } else {
+                    1.0
+                },
+            )
+        }) else {
+            return;
+        };
+        let Some(rect) = self.float_action_rect(window, backend) else {
+            return;
+        };
+        let presets = self.window_height_presets_for_workspace(output, workspace);
+        let resolved: Vec<f64> = presets
+            .iter()
+            .map(|spec| match spec {
+                SizeSpec::Proportion(p) => work.size.h as f64 / scale * p,
+                SizeSpec::Fixed(px) => *px as f64,
+            })
+            .collect();
+        let remembered = self.float_homes.get(&window).and_then(|home| {
+            if home.height_preset_list == presets {
+                home.height_preset_idx
+            } else {
+                None
+            }
+        });
+        let current = rect.size.h as f64 / scale;
+        let len = presets.len();
+        let next = match remembered {
+            Some(index) if forwards => (index + 1) % len,
+            Some(index) => (index + len - 1) % len,
+            None if forwards => resolved
+                .iter()
+                .position(|height| current + 1.0 < *height)
+                .unwrap_or(0),
+            None => resolved
+                .iter()
+                .rposition(|height| *height + 1.0 < current)
+                .unwrap_or(len - 1),
+        };
+        let height = (resolved[next].round().clamp(1.0, 100_000.0) * scale)
+            .round()
+            .max(1.0) as u32;
+        self.place_float_rect(
+            window,
+            Rect::new(rect.loc.x, rect.loc.y, rect.size.w, height),
+            true,
+            backend,
+        );
+        if let Some(home) = self.float_homes.get_mut(&window) {
+            home.height_preset_idx = Some(next);
+            home.height_preset_list = presets;
         }
     }
 

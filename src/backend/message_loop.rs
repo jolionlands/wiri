@@ -22,6 +22,7 @@ use crate::input::keyboard::bind_may_fire;
 use crate::input::keyboard::{self, BindOptions};
 use crate::input::{Action, SizeChange};
 use crate::layout::{FocusLayer, ScrollDirection, TilingEngine};
+use crate::utils::WindowId;
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
 /// Custom message sent to the hotkey thread to trigger re-registration
@@ -1039,6 +1040,21 @@ pub(crate) fn perform_action_on(
         Action::CloseWindow => engine
             .write()
             .resolve_action_target_for(foreground, true, backend),
+        Action::WindowHeightPresetCycle | Action::WindowHeightPresetCycleBack
+            if window.is_some_and(|hwnd| engine.read().is_floating(WindowId::new(hwnd))) =>
+        {
+            // An explicit floating resize must not report a new foreground
+            // window or change either output's active selection.
+            let engine = engine.read();
+            window
+                .map(WindowId::new)
+                .filter(|id| engine.tiled_windows().contains_key(id))
+                .map(|id| crate::layout::ActionTarget {
+                    window: id,
+                    floating: true,
+                    focus_hwnd: id.as_isize(),
+                })
+        }
         _ => engine
             .write()
             .resolve_action_target_for(foreground, false, backend),
@@ -1335,13 +1351,11 @@ pub(crate) fn perform_action_on(
         }
         Action::WindowHeightPresetCycle | Action::WindowHeightPresetCycleBack => {
             let forwards = matches!(action, Action::WindowHeightPresetCycle);
-            if float_of(target).is_some() {
-                // A floating window has no column to share: niri's presets are column shares.
-                info!("switch-preset-window-height: a floating window keeps its height");
-            } else {
-                engine
+            match float_of(target) {
+                Some(window) => engine.write().float_cycle_height(window, forwards, backend),
+                None => engine
                     .write()
-                    .switch_preset_window_height(forwards, backend);
+                    .switch_preset_window_height(forwards, backend),
             }
         }
         // wiri's fractions are niri proportions of the view.

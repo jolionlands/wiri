@@ -30,6 +30,8 @@ mod ipcview;
 mod lane_l;
 pub use lane_l::FocusLayer;
 #[cfg(test)]
+mod floating_height_parity_tests;
+#[cfg(test)]
 mod lane_f_integration_tests;
 mod monitor_actions;
 #[cfg(test)]
@@ -116,6 +118,9 @@ struct FloatHome {
     seq: u64,
     /// Preset order is configured, not necessarily ascending by width.
     width_preset_idx: Option<usize>,
+    height_preset_idx: Option<usize>,
+    /// The effective logical list that the remembered height index refers to.
+    height_preset_list: Vec<crate::config::types::SizeSpec>,
 }
 
 /// A window the user minimized: out of the layout until it comes back, so that the
@@ -4606,6 +4611,8 @@ impl TilingEngine {
                 ),
                 seq,
                 width_preset_idx: None,
+                height_preset_idx: None,
+                height_preset_list: Vec::new(),
             },
         );
     }
@@ -4964,6 +4971,9 @@ impl TilingEngine {
             if home.rect.size.w != rect.size.w {
                 home.width_preset_idx = None;
             }
+            if home.rect.size.h != rect.size.h {
+                home.height_preset_idx = None;
+            }
             home.rect = rect;
             home.position_history.submit(rect);
         }
@@ -5277,6 +5287,8 @@ impl TilingEngine {
                         ),
                         seq,
                         width_preset_idx: None,
+                        height_preset_idx: None,
+                        height_preset_list: Vec::new(),
                     },
                 );
             }
@@ -5750,6 +5762,9 @@ impl TilingEngine {
         if let Some(home) = self.float_homes.get_mut(&window_id) {
             if home.rect.size.w != bounds.size.w {
                 home.width_preset_idx = None;
+            }
+            if home.rect.size.h != bounds.size.h {
+                home.height_preset_idx = None;
             }
             home.rect = bounds;
             home.position_history.authoritative(bounds, Some(bounds));
@@ -7569,9 +7584,10 @@ impl TilingEngine {
             SizeAxis::Height => Rect::new(rect.loc.x, rect.loc.y, rect.size.w, size),
         };
         self.place_float_rect(window_id, resized, true, backend);
-        if axis == SizeAxis::Width {
-            if let Some(home) = self.float_homes.get_mut(&window_id) {
-                home.width_preset_idx = None;
+        if let Some(home) = self.float_homes.get_mut(&window_id) {
+            match axis {
+                SizeAxis::Width => home.width_preset_idx = None,
+                SizeAxis::Height => home.height_preset_idx = None,
             }
         }
     }

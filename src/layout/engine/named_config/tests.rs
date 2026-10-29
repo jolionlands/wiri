@@ -78,6 +78,8 @@ fn seed_contents(engine: &mut TilingEngine, output: OutputId, workspace: i32) ->
             ),
             seq: 7,
             width_preset_idx: Some(1),
+            height_preset_idx: None,
+            height_preset_list: Vec::new(),
         },
     );
 
