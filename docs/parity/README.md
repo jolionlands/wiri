@@ -295,3 +295,13 @@ the live gates hold (no repositioning once settled, every test window tiled with
 overlap, no IPC timeouts, no unknown-key warnings, every window visible after quit and
 after a crash restart).  A live run holds a machine-wide lock, so two runs can never overlap
 and spoil each other.
+
+**2026-10-29 explicit admission-focus checkpoint (`75fd0f3`).** Explicitly
+selecting a recently admitted floating or tiled window now supersedes its
+opening-only focus guard. The expanded baseline had two failing cases and two
+passing controls; all four now pass, along with **24 source checks, 2,108 Rust
+tests and both release builds**. A separate real BMP test passed without a
+display skip from a new frozen copy containing 251 files. Native admission-focus, physical
+mixed-DPI and the full desktop cycle remain pending; the failed full R3 stays
+recorded. All 485 matrix feature/status pairs remain unchanged: **303/396 done
+(76.5%), 93 partial, 89 N/A**. See the [R4 checkpoint](2026-10-29-tridaris-r4.md#explicit-focus-during-recent-admission).
