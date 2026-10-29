@@ -288,7 +288,7 @@ of different sections of `config/types.rs` or `config/decode.rs`.
   resulting physical origin upward and reduce size by the same snap delta.
 - [x] Observe a trailing-fraction regression before implementation: left -4.5,
   right 0.25 and proportion 0.8 retain width 903.75 until yielding width 723.
-- [ ] Qualify final logical window-request rounding separately: at 1x, left
+- [x] Qualify final logical window-request rounding separately: at 1x, left
   -4.5/right 0.5/proportion 0.8 requests 722.8 logical pixels and settles at
   722; at 1.5x, the same logical struts on a 900px physical parent request
   482.8 logical pixels and settle at 482 logical / 723 physical pixels.
@@ -303,11 +303,11 @@ of different sections of `config/types.rs` or `config/decode.rs`.
   window width remains 483. Preserve the standalone physical API and existing
   height policy. This width correction does not qualify appearance scaling,
   height request rounding, camera precision or actual native acknowledgement.
-- [ ] Implement canonical values and pure projection, retaining fractional
+- [x] Implement canonical values and pure projection, retaining fractional
   strut intermediates and avoiding independent side rounding or projection drift.
-- [ ] Verify 1x -> 1.5x -> 1x, inactive-workspace relocation, partial precedence,
+- [x] Verify 1x -> 1.5x -> 1x, inactive-workspace relocation, partial precedence,
   native/IPC rectangle agreement and a 10px runtime reservation at both scales.
-- [ ] Review and add an owned desktop fixture at the observed scale. Keep
+- [x] Review and add an owned desktop fixture at the observed scale. Keep
   synthetic 1.5x evidence separate from actual mixed-DPI hardware qualification.
 
 ### Performance qualification after the integrated checkpoint
@@ -366,7 +366,7 @@ passing controls. Production implementation is now authorized within this lane.
   resolved Ctrl and Mod masks are insufficient to implement pinned eligibility.
 - [x] Carry typed command-head descriptions rather than reverse-parsing Rust
   Debug strings. Preserve custom titles and complete action-wide suppression.
-- [ ] Review and verify the actual panel, including fallback wording. Curation
+- [x] Review and verify the actual panel, including fallback wording. Curation
   completion does not imply Pango markup rendering parity.
 
 ### Task 17: Signed axis scroll factors
@@ -412,7 +412,7 @@ does nothing. Pinned workspace routing reaches `floating.toggle_window_height`,
 which applies the configured fixed/proportional list and retains a preset index.
 The two matrix rows describe one shared implementation gap.
 
-- [ ] Add and observe dispatch/state regressions for current and explicit
+- [x] Add and observe dispatch/state regressions for current and explicit
   floating targets: nonpreset first step, forward/back wrap, remembered index,
   target effective configuration, fixed-size DPI and proportional units.
 - [ ] Implement floating height preset resolution and lifecycle without changing

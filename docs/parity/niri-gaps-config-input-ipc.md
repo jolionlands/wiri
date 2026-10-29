@@ -19,7 +19,7 @@ Sources read (read-only, nothing built or run):
 
 ## Status counts
 
-Current feature-row counts through integrated Phase 2B and Phase 2C B/D/G/H/F2.
+Current feature-row counts include the Tridaris R4 source and native follow-ups.
 The headline findings below describe the original audit unless marked with a later phase.
 Lane F2 naming/action evidence and remaining workspace gaps are separated in the
 [Lane F2 report](phase2c-lane-f-report.md). F2 labels describe implemented paths and
@@ -33,7 +33,7 @@ and the final product/harness fixes have not been rerun live.
 | 3. Pointing devices (touchpad, mouse, trackpoint, trackball, tablet, touch) | 18 | 0 | 12 | 0 | 6 |
 | 4. General input settings (focus-follows-mouse, warp, workspace back-and-forth, mod key) | 7 | 6 | 0 | 0 | 1 |
 | 5. Key bindings (syntax, modifiers, key names, bind properties, mouse / wheel / touchpad / stylus triggers) | 21 | 15 | 5 | 0 | 1 |
-| 6. Hotkey overlay ("Important Hotkeys") | 7 | 4 | 3 | 0 | 0 |
+| 6. Hotkey overlay ("Important Hotkeys") | 7 | 5 | 2 | 0 | 0 |
 | 7. Screenshots | 11 | 10 | 1 | 0 | 0 |
 | 8. IPC transport, protocol and CLI | 11 | 10 | 1 | 0 | 0 |
 | 9. IPC `Request` variants (one row each) | 16 | 10 | 4 | 0 | 2 |
@@ -45,7 +45,7 @@ and the final product/harness fixes have not been rerun live.
 | 15. Layer rules | 5 | 0 | 0 | 0 | 5 |
 | 16. Debug options | 22 | 0 | 0 | 0 | 22 |
 | 17. Accessibility, security model, screencasting, Xwayland | 13 | 5 | 0 | 0 | 8 |
-| **total** | **259** | **139** | **48** | **0** | **72** |
+| **total** | **259** | **140** | **47** | **0** | **72** |
 
 Lane LAST moved three rows from `missing` to `partial` (the two `cursor {}` rows in
 section 13 and the tablet stylus row in section 5); the table above is not recounted for
@@ -196,7 +196,7 @@ Release tagging of the rows: main-only 9, release 238, release? 12. Priorities o
 | niri feature | niri ref (file:line or wiki page) | release or main-only | wiri status (done / partial / missing / N/A on Windows) | wiri evidence (file:line, or "none found") | Windows approach (API or technique; say if it is an approximation) | effort S/M/L | priority (P0 = needed to daily-drive, P1 = expected niri feel, P2 = nice to have) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `show-hotkey-overlay` action | wiki:Configuration:-Key-Bindings; niri:niri-ipc/src/lib.rs:787; niri:src/input/mod.rs:2122 | release | done (Phase 2B, item 6) | niri alias reaches BindingsCheatsheet::toggle from registered binds and IPC action. H21 observes both IPC show-hotkey-overlay and real Mod+F1, with one lazy host and no host before first show. | Add the niri alias and an IPC action | S | P1 |
-| Curated list: fixed set of ~15 core actions (shown as "(not bound)" if unbound), then titled binds, then Mod/Super spawn binds | niri:src/ui/hotkey_overlay.rs:197-290 | release | partial (Phase 2B, item 6) | hotkey_rows.rs selects essential registered actions, configured title overrides and Mod-preferred aliases without duplicate chords/actions. Readable descriptions replace Debug strings. Screen-fitting columns/pages do not discard overflow. Unit-tested curation; H21 observes stable rendered controls. Lane P adds niri's "(not bound)" placeholder rows for the essential actions without a key. Missing: exact niri ordering and full Mod/Super spawn enumeration. | Build a curated list from config titles; scrollable or two-column layout | M | P1 |
+| Curated list: 18 core actions (shown as "(not bound)" if unbound), optional bound screenshot, then titled binds and Mod/Super keyboard spawn binds | niri:src/ui/hotkey_overlay.rs:197-290 | release | done (Tridaris R4 source and native follow-up) | `hotkey_rows.rs::curated_rows` follows the pinned essentials/order and action fallbacks, custom/null-title precedence, first ordinary alias and eligible literal Mod/Super keyboard spawns; typed command metadata supplies program/command heads. All 13 pinned curation regressions passed in R4. Task16 R1 passed 7/7 against the exact R4 snapshot at actual 96 DPI, rendering 8 bound rows or 20 with placeholders; root verified PNG hashes and reviewed order, custom titles, null omission, command heads, ellipsis and bounds. Both clean-run PNGs match the reviewed images byte for byte. See the [R4 evidence report](2026-10-29-tridaris-r4.md#qualified-native-spacing-and-panel-follow-ups). Pango and per-output/mixed-DPI rendering remain partial in the separate rows below. | Curate registered keyboard bindings and render bounded columns/pages | M | P1 |
 | Shown at startup unless `hotkey-overlay { skip-at-startup }` | wiki:Configuration:-Miscellaneous (hotkey-overlay); niri:src/niri.rs:2693-2695 | release | done (Lane P; unit-tested, live gate added and pending the lead cycle) | `main.rs` opens the sheet after the bindings are registered unless `hotkey-overlay { skip-at-startup }`, `--no-startup-overlay` or `--no-autostart` asks for quiet; the startup path and the `show-hotkey-overlay` action share `backend::message_loop::show_hotkey_overlay`, so both list the bindings Windows actually registered. Unit tests `hotkey_overlay_options_are_parsed`; live gates `h75_hotkey_overlay_shown_at_startup`, `h75_hotkey_overlay_skip_at_startup` | Show once at startup; honour the flag | S | P2 |
 | Dismisses on any key press or click | niri:src/input/mod.rs:167-168,211,4828 | release | done (Phase 2B, item 6) | Existing keyboard/mouse hooks dismiss before action dispatch, consume the dismissal key including repeats/up, and keep recent physical-modifier tracking coherent. H21 observes letters, held Shift, Alt, Escape and recreation; click handling is source/unit-covered only. | The WH_KEYBOARD_LL callback sees any key-down while visible: hide, and pass the key through | S | P1 |
 | `hotkey-overlay { hide-not-bound }` | wiki:Configuration:-Miscellaneous (25.08); niri:niri-config/src/misc.rs:67-85 | release (25.08) | done (Lane P; unit-tested, live gate added and pending the lead cycle) | `decode.rs::decode_hotkey_overlay` stores the flag; `overlay/hotkey_rows.rs::curated_rows` adds niri's "(not bound)" placeholder for every essential action without a key and `hide-not-bound` drops them, so the sheet lists only pressable chords. Unit test `unbound_essentials_are_placeholders_unless_hide_not_bound`; live gate `h75_hotkey_overlay_hide_not_bound` compares the row counts of two runs and the log line `(hide-not-bound true/false)` | Filter at list-build time | S | P2 |

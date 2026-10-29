@@ -13,12 +13,13 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 161 | 48 | 0 | 17 |
-| Config, input and IPC (259 rows) | 139 | 48 | 0 | 72 |
+| Layout and behaviour (226 rows) | 163 | 46 | 0 | 17 |
+| Config, input and IPC (259 rows) | 140 | 47 | 0 | 72 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
-retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates; they are not a
-full live sign-off. Official desktop cycles passed W+K (560/560) and F2 (601/602, H34 included);
+retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates and
+the R4 source/native follow-ups; they are not a full live sign-off. Official desktop
+cycles passed W+K (560/560) and F2 (601/602, H34 included);
 C2's H66-H70 gates passed in the 8c6c9b0 cycle and lane T's H58-H61 in the f4d2666 cycle.
 The 2026-10-27 cycle at `cc3920d` passed **761/761 enforced gates, 0 failed** (88 further
 information entries), including every `h78_*` cursor-hiding gate, all five H31
@@ -82,19 +83,27 @@ The single-output machine cannot qualify cross-output relocation or mixed DPI.
 The later canonical layout/output action correction at `0f1c4fc` passed
 **75 unique scoped tests**, including its 12 new regressions. This is a source
 qualification, not a replacement for the failed full native cycle. The combined
-spacing, hotkey-selection and axis-scroll checkpoint now passes **2,037 Rust
-tests**, the separate graphics smoke test and **12/12 H87 native scroll checks**.
-All 17 source qualification gates passed. The 53 targeted spacing/scroll/hotkey
-tests are included in the full-suite count. See the
+spacing, hotkey-selection and axis-scroll checkpoint at `a62d10d` passed
+**2,037 Rust tests**, the separate graphics smoke test and **12/12 H87 native
+scroll checks**. All 17 source qualification gates passed. The 53 targeted
+spacing/scroll/hotkey tests are included in the full-suite count.
+The later pointer-origin correction at `5738371` passed **2,041 Rust tests** and
+all 11 source gates; it has no new graphics or native result. The exact immutable
+R4 binaries also passed **7/7 native spacing** and **7/7 native panel** follow-up
+checks at actual 96 DPI. Root verified the PNG hashes and reviewed both panel
+images. These results identify their tested sources separately; they are not a
+new full desktop cycle. See the
 [R4 evidence and remaining work](2026-10-29-tridaris-r4.md).
 
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
-The current totals are **300 done / 96 partial / 89 N/A** across 485 rows:
-**300/396 applicable rows (75.8%)**. The preset list and tiled actions work;
+After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
+curated hotkey list move to done. The current totals are
+**303 done / 93 partial / 89 N/A** across 485 rows:
+**303/396 applicable rows (76.5%)**. The preset list and tiled actions work;
 the floating actions explicitly do nothing, unlike the pinned implementation.
-Native spacing, appearance scaling, remaining input/config semantics and hardware evidence
-remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
+Appearance scaling, floating height presets, remaining input/config semantics and
+hardware evidence remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
 for the active work; a gate count alone is not full parity.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;

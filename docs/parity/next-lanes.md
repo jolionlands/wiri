@@ -1,8 +1,8 @@
 # Next lanes: surveying the partial parity rows (2026-10-27)
 
 > **Historical survey, superseded for assignment.** This file records the
-> `0821983` snapshot. Following the integrated and PR #2 focused verification,
-> current matrices contain **300 done / 96 partial / 89 N/A** (396 applicable
+> `0821983` snapshot. Following the integrated, PR #2 and qualified R4 follow-ups,
+> current matrices contain **303 done / 93 partial / 89 N/A** (396 applicable
 > rows), including five appearance/DPI and two floating-preset corrections, not the 138
 > partial rows below. The active
 > [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md) checks the
@@ -11,31 +11,34 @@
 > home expansion and h60/h79 coverage already exist. The proposed fullscreen
 > refusal gates below require source-semantic review, not blind implementation.
 
-## Current partial-row audit, 2026-10-28
+## Current partial-row audit, 2026-10-29
 
 The initial 94 partial rows were rechecked against the implementation and pinned
 niri source. The action census exposed two further preset-height rows previously
 marked done and confirmed software defects in both broad action/CLI rows.
-Primary categories now sum to 96; a row can have secondary limits too.
+The qualified R4 source/native follow-ups close the `gaps`, `struts` and curated
+hotkey-list software gaps. Primary categories now sum to 93; a row can have
+secondary limits too. See the [R4 evidence report](2026-10-29-tridaris-r4.md#qualified-native-spacing-and-panel-follow-ups).
 
 | Primary remaining condition | Layout | Config/input/IPC | Total |
 | --- | ---: | ---: | ---: |
-| Missing or incorrect software | 17 | 18 | 35 |
+| Missing or incorrect software | 15 | 17 | 32 |
 | Implemented; evidence needs reconciliation | 10 | 3 | 13 |
 | Hardware evidence unavailable | 7 | 2 | 9 |
 | Windows-specific backend differences | 14 | 25 | 39 |
-| **Total partial rows** | **48** | **48** | **96** |
+| **Total partial rows** | **46** | **47** | **93** |
 
-These are prioritization categories, not completion claims or 35 independent
+These are prioritization categories, not completion claims or 32 independent
 coding tasks. Several metric rows share one implementation. A Windows-specific
 category describes the current adapter's approximation or rejected capability;
 it does not establish that every possible Windows implementation is impossible.
 Evidence-only rows retain partial status until their exact remaining condition
 is reconciled with source and native proof.
 
-The active next batch has tests prepared, with RED still unobserved: fractional
-logical spacing and signed struts, hotkey-overlay selection/title/launch semantics,
-and signed per-axis scroll factors. The following queue covers appearance scaling,
+R4 qualified fractional spacing, signed struts and hotkey curation through pure
+and native checks; those three rows are no longer remaining software work.
+Signed per-axis scroll factors also passed their R4 source/native checks, with
+physical device routing still separate. The following queue covers appearance scaling,
 general viewport anchoring and clipping, application self-resize reconciliation,
 floating fullscreen transitions, admission focus policy, and presentation-aware
 pacing. Native constraint sampling alone does not finish self-resize behavior.
