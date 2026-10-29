@@ -38,6 +38,8 @@ mod lane_f_integration_tests;
 mod monitor_actions;
 #[cfg(test)]
 mod monitor_actions_tests;
+#[cfg(test)]
+mod tiled_height_parity_tests;
 mod workspace_actions;
 #[cfg(test)]
 mod workspace_actions_tests;
@@ -2822,6 +2824,17 @@ impl TilingEngine {
     }
 
     pub fn apply_layout_for_monitor(&mut self, output_id: OutputId, backend: &BackendHandle) {
+        self.apply_layout_for_monitor_with_activation(output_id, backend, true);
+    }
+
+    /// Size-only actions preserve the caller's native foreground. Other layout
+    /// callers retain the normal once-per-target activation behavior.
+    fn apply_layout_for_monitor_with_activation(
+        &mut self,
+        output_id: OutputId,
+        backend: &BackendHandle,
+        activate_focus: bool,
+    ) {
         self.note_focused_workspace();
         self.refresh_strip_widths(output_id);
         // After `restore_all` nothing is laid out any more (see `shut_down`).
@@ -3587,10 +3600,11 @@ impl TilingEngine {
         );
 
         // Bring the focused window to the foreground if it changed since last layout.
+        // A size-only apply leaves both native focus and last_activated untouched.
         // Only the focused monitor's focus drives Win32 activation.  The attempt is
         // made once per focus target (success or not): retrying a refused request on
         // every layout pass is what used to flood the log and fight the foreground lock.
-        if Some(output_id) == self.monitors.focused_id() {
+        if activate_focus && Some(output_id) == self.monitors.focused_id() {
             let current_focus = self.monitors.get(&output_id).and_then(|m| m.focus_window);
             if let Some(wid) = current_focus {
                 if Some(wid) != self.last_activated {
@@ -3773,6 +3787,202 @@ impl TilingEngine {
     /// Calculate window positions for a workspace.
     /// Supports per-column variable widths and overview zoom.
     ///
+    /// Vertical space reserved by the existing tab-indicator placement adapter.
+    fn vertical_tab_indicator_space(
+        &self,
+        column: &crate::layout::Column,
+        cfg: &LayoutConfig,
+        zoom: f64,
+    ) -> i32 {
+        use crate::config::TabPosition;
+        use crate::layout::ColumnDisplay;
+        let style = &cfg.effects.tab_indicator;
+        if !matches!(column.display, ColumnDisplay::Tabbed { .. })
+            || self.column_sizing_mode(column) != DrawMode::Inset
+            || style.off
+            || !style.place_within_column
+            || (style.hide_when_single_tab && column.tiles.len() < 2)
+            || !matches!(style.position, TabPosition::Top | TabPosition::Bottom)
+        {
+            return 0;
+        }
+        ((style.width * zoom).round() + (style.gap * zoom).round()).max(0.0) as i32
+    }
+
+    fn column_height_specs(
+        &self,
+        column: &crate::layout::Column,
+        visible: &[usize],
+        available: f64,
+        gap: i32,
+        cfg: &LayoutConfig,
+        zoom: f64,
+    ) -> Vec<rules::HeightSpec> {
+        use crate::layout::ColumnDisplay;
+        let tabbed = matches!(column.display, ColumnDisplay::Tabbed { .. });
+        let height_scale = if zoom < 1.0 { zoom as f32 } else { 1.0 };
+        let scaled = |px: u32| ((px as f32) * height_scale).round() as i32;
+        let indicator = self.vertical_tab_indicator_space(column, cfg, zoom);
+        let capacity = (available - indicator as f64).max(0.0).floor() as i32;
+        // Allocation excludes inter-tile gaps; proportional requests use the
+        // full inner view. Hidden tabs never consume an inter-tile gap.
+        let proportion_view = available + gap as f64 * visible.len().saturating_sub(1) as f64;
+        let requested = |tile: &crate::layout::Tile| {
+            tile.preferred_height
+                .map(|px| {
+                    let height = scaled(px);
+                    // Fixed requests fit the work area before individual limits.
+                    // Presets retain their own requested extent.
+                    if tile.height_preset_idx.is_none() && (tabbed || column.tiles.len() == 1) {
+                        height.min(capacity)
+                    } else {
+                        height
+                    }
+                })
+                .or_else(|| {
+                    tile.height_proportion.map(|share| {
+                        proportion_px(proportion_view, gap, share)
+                            .saturating_sub(indicator)
+                            .max(1)
+                    })
+                })
+        };
+        let shared = if tabbed {
+            let owner = column.tiles.iter().find_map(&requested);
+            let minimum = column
+                .tiles
+                .iter()
+                .map(|tile| scaled(tile.min_height))
+                .max()
+                .unwrap_or(0)
+                .min(capacity);
+            Some(owner.unwrap_or(capacity).max(minimum))
+        } else {
+            None
+        };
+        visible
+            .iter()
+            .map(|&index| {
+                if let Some(tile) = column.tiles.get(index) {
+                    rules::HeightSpec {
+                        // Allocation includes the indicator; placement removes it once.
+                        fixed: shared
+                            .or_else(|| requested(tile))
+                            .map(|height| height.saturating_add(indicator)),
+                        weight: tile.height_weight.max(0.1),
+                        min: scaled(tile.min_height).saturating_add(indicator),
+                        max: if tile.max_height == 0 {
+                            0
+                        } else {
+                            scaled(tile.max_height).saturating_add(indicator)
+                        },
+                    }
+                } else {
+                    rules::HeightSpec {
+                        fixed: None,
+                        weight: 1.0,
+                        min: 0,
+                        max: 0,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Capture the pure layout before an infrequent height action. Hidden tabs
+    /// can have different final limits, so project each tab in turn.
+    fn tiled_column_rendered_heights(
+        &self,
+        output: OutputId,
+        workspace: i32,
+        column_index: usize,
+    ) -> Option<Vec<i32>> {
+        use crate::layout::ColumnDisplay;
+        let monitor = self.monitors.get(&output)?;
+        let cfg = self.effective_config_for_workspace(output, workspace);
+        let workspace = monitor.workspaces.get(&workspace)?;
+        let column = workspace.columns.get(column_index)?;
+        let area = Self::precise_tiling_area(monitor, cfg);
+        if matches!(column.display, ColumnDisplay::Tabbed { .. }) {
+            let mut projection = workspace.clone();
+            let mut heights = Vec::with_capacity(column.tiles.len());
+            for (index, tile) in column.tiles.iter().enumerate() {
+                projection.columns[column_index].display =
+                    ColumnDisplay::Tabbed { active_tab: index };
+                let positions = self.calculate_positions(&projection, area, cfg);
+                heights.push(
+                    positions
+                        .iter()
+                        .find(|(id, _)| *id == tile.window_id)?
+                        .1
+                        .size
+                        .h as i32,
+                );
+            }
+            Some(heights)
+        } else {
+            let positions = self.calculate_positions(workspace, area, cfg);
+            column
+                .tiles
+                .iter()
+                .map(|tile| {
+                    positions
+                        .iter()
+                        .find(|(id, _)| *id == tile.window_id)
+                        .map(|(_, rect)| rect.size.h as i32)
+                })
+                .collect()
+        }
+    }
+
+    /// An auto target starts a new owner. Preserve apparent ratios and remove
+    /// rule fallbacks along with the derived height metadata.
+    fn prepare_tiled_height_owner(
+        &mut self,
+        output: OutputId,
+        workspace: i32,
+        column_index: usize,
+        window: WindowId,
+        rendered: &[i32],
+    ) -> bool {
+        let Some(column) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|monitor| monitor.workspaces.get_mut(&workspace))
+            .and_then(|workspace| workspace.columns.get_mut(column_index))
+        else {
+            return false;
+        };
+        let Some(index) = column.index_of(window) else {
+            return false;
+        };
+        let tile = &column.tiles[index];
+        if tile.preferred_height.is_some()
+            || tile.height_proportion.is_some()
+            || tile.height_preset_idx.is_some()
+        {
+            return true;
+        }
+        if rendered.len() != column.tiles.len() || rendered.is_empty() {
+            return false;
+        }
+        let mut sorted = rendered.to_vec();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2].max(1) as f32;
+        let mut converted = Vec::with_capacity(column.tiles.len());
+        for (tile, height) in column.tiles.iter_mut().zip(rendered) {
+            tile.height_weight = (*height as f32 / median).max(0.1);
+            tile.preferred_height = None;
+            tile.height_proportion = None;
+            tile.height_preset_idx = None;
+            converted.push(tile.window_id);
+        }
+        for window in converted {
+            self.rule_heights.remove(&window);
+        }
+        true
+    }
+
     /// Backwards-compatible single-workspace path — equivalent to
     /// `calculate_positions_in_section(workspace, work_rect, 0, work_rect.size.h as i32, cfg)`.
     fn calculate_positions(
@@ -4097,29 +4307,14 @@ impl TilingEngine {
             // asks for a height of its own keeps it and the others share the rest
             // (`default-window-height`), and `min-height` / `max-height` hold a tile.
             // In overview the pixel sizes are zoomed like the column.
-            let height_scale = if zoom < 1.0 { zoom as f32 } else { 1.0 };
-            let scaled = |px: u32| -> i32 { ((px as f32) * height_scale).round() as i32 };
-            let specs: Vec<rules::HeightSpec> = visible_indices
-                .iter()
-                .map(|&i| match column.tiles.get(i) {
-                    Some(t) => rules::HeightSpec {
-                        fixed: t.preferred_height.map(&scaled).or_else(|| {
-                            t.height_proportion.map(|share| {
-                                proportion_px(available_height, scaled_gap, share).max(1)
-                            })
-                        }),
-                        weight: t.height_weight.max(0.1),
-                        min: scaled(t.min_height),
-                        max: scaled(t.max_height),
-                    },
-                    None => rules::HeightSpec {
-                        fixed: None,
-                        weight: 1.0,
-                        min: 0,
-                        max: 0,
-                    },
-                })
-                .collect();
+            let specs = self.column_height_specs(
+                column,
+                &visible_indices,
+                available_height,
+                scaled_gap,
+                cfg,
+                zoom,
+            );
             // The rounding the shares leave goes to the last tile, so that the column uses
             // the full available height exactly.
             let tile_heights: Vec<i32> = rules::distribute_heights(available_height, &specs);
@@ -7425,10 +7620,9 @@ impl TilingEngine {
         self.set_column_width_by(SizeChange::SetProportion(milli_percent), backend);
     }
 
-    /// niri `set-window-height`: change the height of the focused window inside its
-    /// column.  Heights are kept as weights, so the window gets the share of the column
-    /// that the new height is and the others keep their proportions.  A column of one
-    /// window (or a tabbed one) always fills the view: nothing happens there.
+    /// niri set-window-height: retain a concrete request for the target.
+    /// The other auto windows share what remains; sole and tabbed columns can
+    /// leave blank space below the requested height.
     pub fn set_window_height_by(&mut self, change: SizeChange, backend: &BackendHandle) {
         let Some(window) = self
             .monitors
@@ -7463,102 +7657,138 @@ impl TilingEngine {
         let Some((output, workspace, col_idx)) = self.locate_window(window) else {
             return;
         };
-        let scale = self
-            .monitors
-            .get(&output)
-            .map_or(1.0, |monitor| monitor.scale_factor);
-        let physical_change = Self::physical_size_change(change, scale);
-        let (view_h, gap, extra) = {
-            let Some(monitor) = self.monitors.get(&output) else {
-                return;
-            };
-            let cfg = self.effective_config_for_workspace(output, workspace);
-            let view_h = Self::precise_tiling_area(monitor, cfg).height;
-            (
-                view_h,
-                cfg.window_gap,
-                2 * self.rule_border_inset(window, cfg),
-            )
+        let Some(rendered) = self.tiled_column_rendered_heights(output, workspace, col_idx) else {
+            return;
         };
-        let changed = {
-            let Some(monitor) = self.monitors.get_mut(&output) else {
-                return;
-            };
-            let Some(column) = monitor
-                .workspaces
-                .get_mut(&workspace)
-                .and_then(|w| w.columns.get_mut(col_idx))
-            else {
-                return;
-            };
-            if column.tiles.len() < 2
-                || matches!(
-                    column.display,
-                    crate::layout::workspace::ColumnDisplay::Tabbed { .. }
-                )
-            {
-                return;
-            }
-            let Some(idx) = column.index_of(window) else {
-                return;
-            };
+        let Some(monitor) = self.monitors.get(&output) else {
+            return;
+        };
+        let cfg = self.effective_config_for_workspace(output, workspace);
+        let view_h = Self::precise_tiling_area(monitor, cfg).height;
+        let gap = cfg.window_gap;
+        let border = 2 * self.rule_border_inset(window, cfg);
+        let Some(column) = monitor
+            .workspaces
+            .get(&workspace)
+            .and_then(|workspace| workspace.columns.get(col_idx))
+        else {
+            return;
+        };
+        let Some(idx) = column.index_of(window) else {
+            return;
+        };
+        let tile = &column.tiles[idx];
+        let indicator = self.vertical_tab_indicator_space(column, cfg, 1.0);
+        let tabbed = matches!(column.display, crate::layout::ColumnDisplay::Tabbed { .. });
+        // Auto/Preset changes start from the rendered tile; Fixed changes
+        // retain the stored request even when the current view clamps it.
+        let current_px = if tile.height_preset_idx.is_none() && tile.height_proportion.is_none() {
+            tile.preferred_height
+                .map(|height| height as i32)
+                .unwrap_or(rendered[idx])
+        } else {
+            rendered[idx]
+        };
+        let taken = if tabbed {
+            0.0
+        } else {
+            column
+                .tiles
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != idx)
+                .map(|(_, tile)| tile.min_height.max(1) as f64 + gap as f64)
+                .sum()
+        };
+        let capacity = (view_h - indicator as f64 - taken).max(1.0).floor() as i32;
+        let physical_change = Self::physical_size_change(change, monitor.scale_factor);
+        let proportional = matches!(
+            &physical_change,
+            SizeChange::SetProportion(_) | SizeChange::AdjustProportion(_)
+        );
+        let mut target_px = physical_change.resolve(current_px, view_h, gap, border);
+        if proportional {
+            target_px = target_px.saturating_sub(indicator);
+        }
+        // Working-area capacity is applied before the window's constraints;
+        // a minimum still wins when it cannot fit the view or the maximum.
+        target_px = target_px.min(capacity);
+        if tile.max_height > 0 {
+            target_px = target_px.min(tile.max_height as i32);
+        }
+        target_px = target_px
+            .max(tile.min_height as i32)
+            .max(border.saturating_add(1));
+        if !self.prepare_tiled_height_owner(output, workspace, col_idx, window, &rendered) {
+            return;
+        }
+        let Some(column) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|monitor| monitor.workspaces.get_mut(&workspace))
+            .and_then(|workspace| workspace.columns.get_mut(col_idx))
+        else {
+            return;
+        };
+        if !tabbed && column.tiles.len() > 1 {
+            // Preserve the legacy weight API as compatibility bookkeeping.
+            // Geometry uses the concrete request; other auto weights retain
+            // their apparent ratios from the conversion above.
             let available =
                 (view_h - (gap * (column.tiles.len() as i32 - 1)) as f64).max(1.0) as f32;
             let weights: Vec<f32> = column
                 .tiles
                 .iter()
-                .map(|t| t.height_weight.max(0.1))
+                .map(|tile| tile.height_weight.max(0.1))
                 .collect();
-            let total: f32 = weights.iter().sum();
-            let mine = weights[idx];
-            let others = total - mine;
-            let current_px = (available * mine / total).round() as i32;
-            let target_px = physical_change.resolve(current_px, view_h, gap, extra);
-            // The share of the column the window gets, and the weight that makes it so.
+            let others = weights.iter().sum::<f32>() - weights[idx];
             let share = (target_px as f32 / available).clamp(0.05, 0.95);
             column.tiles[idx].height_weight = (share / (1.0 - share) * others).clamp(0.1, 10.0);
-            // The height the user chose replaces the one a window rule or a preset asked for.
-            column.tiles[idx].preferred_height = None;
-            column.tiles[idx].height_proportion = None;
-            column.tiles[idx].height_preset_idx = None;
-            Some(window)
-        };
-        if let Some(window) = changed {
-            self.rule_heights.remove(&window);
-            self.apply_layout_for_monitor(output, backend);
         }
+        let tile = &mut column.tiles[idx];
+        tile.preferred_height = Some(target_px as u32);
+        tile.height_proportion = None;
+        tile.height_preset_idx = None;
+        self.rule_heights.remove(&window);
+        self.apply_layout_for_monitor_with_activation(output, backend, false);
     }
 
-    /// niri `reset-window-height`: the focused window gets the default weight again.
+    /// niri reset-window-height: tabbed columns reset all owners; a stacked
+    /// column resets only the requested tile to its default auto weight.
     pub fn reset_window_height(&mut self, backend: &BackendHandle) {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        let reset = self
-            .monitors
-            .get_mut(&output)
-            .and_then(|monitor| {
-                let (col_idx, window) = (monitor.focus_column?, monitor.focus_window?);
-                monitor
-                    .workspace_mut()?
-                    .columns
-                    .get_mut(col_idx)?
-                    .tiles
-                    .iter_mut()
-                    .find(|t| t.window_id == window)
-            })
-            .map(|tile| {
+        let Some(monitor) = self.monitors.get_mut(&output) else {
+            return;
+        };
+        let (Some(col_idx), Some(window)) = (monitor.focus_column, monitor.focus_window) else {
+            return;
+        };
+        let Some(column) = monitor
+            .workspace_mut()
+            .and_then(|workspace| workspace.columns.get_mut(col_idx))
+        else {
+            return;
+        };
+        let tabbed = matches!(column.display, crate::layout::ColumnDisplay::Tabbed { .. });
+        let mut reset = Vec::new();
+        for tile in &mut column.tiles {
+            if tabbed || tile.window_id == window {
                 tile.height_weight = 1.0;
-                // The height a window rule asked for is gone too: "default" is auto.
                 tile.preferred_height = None;
                 tile.height_proportion = None;
                 tile.height_preset_idx = None;
-                tile.window_id
-            });
-        if let Some(window) = reset {
-            self.rule_heights.remove(&window);
-            self.apply_layout_for_monitor(output, backend);
+                reset.push(tile.window_id);
+            }
         }
+        if reset.is_empty() {
+            return;
+        }
+        for window in reset {
+            self.rule_heights.remove(&window);
+        }
+        self.apply_layout_for_monitor_with_activation(output, backend, false);
     }
 
     /// Change the width or the height of a floating window (`set-column-width` /
@@ -8078,6 +8308,30 @@ impl TilingEngine {
             };
             (col, wid)
         };
+
+        let has_requested_height = self
+            .monitors
+            .get(&focused_output)
+            .and_then(|monitor| monitor.workspace())
+            .and_then(|workspace| workspace.columns.get(focus_col_idx))
+            .map_or(false, |column| {
+                column.tiles.len() >= 2
+                    && column.tiles.iter().any(|tile| {
+                        tile.preferred_height.is_some()
+                            || tile.height_proportion.is_some()
+                            || tile.height_preset_idx.is_some()
+                    })
+            });
+        if has_requested_height {
+            // Explicit requests take priority over weights. Reuse the shared
+            // owner/current-size path instead of changing an invisible weight.
+            self.set_tiled_window_height_for(
+                focus_wid,
+                SizeChange::AdjustProportion(delta_percent.saturating_mul(1_000)),
+                backend,
+            );
+            return;
+        }
 
         if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             if let Some(workspace) = monitor.workspace_mut() {
@@ -17213,5 +17467,143 @@ mod tests {
         // edge (5 * 500 + 4 * 16 = 2564) lines up with the view's (1904).
         engine.reveal_focused();
         assert_eq!(scroll(&engine), 2564 - 1904);
+    }
+
+    // Diagnostic followups for the candidate height implementation. These run
+    // entirely inside the refused-activation guard with invalid model HWNDs.
+    fn tiled_followup_fixture(tabbed: bool) -> (TilingEngine, BackendHandle, OutputId) {
+        let mut cfg = LayoutConfig {
+            outer_gaps: (0, 0, 0, 0),
+            column_gap: 0,
+            window_gap: 0,
+            border_width: 0,
+            reserve_top: 0,
+            reserve_bottom: 0,
+            reserve_left: 0,
+            reserve_right: 0,
+            ..LayoutConfig::default()
+        };
+        cfg.effects.border.off = true;
+        cfg.effects.focus_ring.off = true;
+        cfg.effects.tab_indicator.off = true;
+        let mut engine = TilingEngine::new(cfg);
+        let output = OutputId::from_name("tiled-height-followup-model");
+        engine.register_monitor(
+            output,
+            Rect::new(0, 0, 1200, 900),
+            Rect::new(0, 0, 1200, 900),
+        );
+        let mut column = crate::layout::Column::new();
+        for id in [-9501, -9502] {
+            column.add_tile(crate::layout::Tile::new(WindowId::new(id)));
+        }
+        if tabbed {
+            column.switch_to_tabbed();
+        }
+        let monitor = engine.monitors.get_mut(&output).unwrap();
+        monitor.workspace_mut().unwrap().columns.push(column);
+        monitor.focus_column = Some(0);
+        monitor.focus_window = Some(WindowId::new(-9501));
+        (engine, BackendHandle::default_for_test(), output)
+    }
+
+    fn tiled_followup_positions(engine: &TilingEngine, output: OutputId) -> Vec<(WindowId, Rect)> {
+        let monitor = engine.monitors.get(&output).unwrap();
+        let cfg = engine.active_workspace_config(output);
+        engine.calculate_positions(
+            monitor.workspace().unwrap(),
+            TilingEngine::precise_tiling_area(monitor, cfg),
+            cfg,
+        )
+    }
+
+    fn tiled_followup_resize_after_fixed(delta: i32) {
+        let ((), attempts) =
+            crate::backend::activation_attempt_test_support::with_refused_activation_attempts(
+                || {
+                    let (mut engine, backend, output) = tiled_followup_fixture(false);
+                    engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+                    let before = tiled_followup_positions(&engine, output);
+                    assert_eq!(
+                        before
+                            .iter()
+                            .map(|(_, rect)| rect.size.h)
+                            .collect::<Vec<_>>(),
+                        vec![300, 600]
+                    );
+                    let monitor = engine.monitors.get(&output).unwrap();
+                    let focus = (
+                        engine.monitors.focused_id(),
+                        monitor.focus_column,
+                        monitor.focus_window,
+                    );
+                    engine.resize_focused_tile_height_by_percent(delta, &backend);
+                    let after = tiled_followup_positions(&engine, output);
+                    assert_eq!(after.len(), 2);
+                    if delta > 0 {
+                        assert!(after[0].1.size.h > before[0].1.size.h,
+                        "Grow after a direct Fixed request must visibly increase height: {before:?} -> {after:?}");
+                    } else {
+                        assert!(after[0].1.size.h < before[0].1.size.h,
+                        "Shrink after a direct Fixed request must visibly decrease height: {before:?} -> {after:?}");
+                    }
+                    assert_eq!(after.iter().map(|(_, rect)| rect.size.h).sum::<u32>(), 900);
+                    assert_eq!(after[0].1.loc.y, 0);
+                    assert_eq!(after[1].1.loc.y, after[0].1.size.h as i32);
+                    let monitor = engine.monitors.get(&output).unwrap();
+                    assert_eq!(
+                        (
+                            engine.monitors.focused_id(),
+                            monitor.focus_column,
+                            monitor.focus_window
+                        ),
+                        focus,
+                    );
+                },
+            );
+        assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+    }
+
+    #[test]
+    fn parity_tiled_followup_grow_after_direct_fixed_changes_geometry() {
+        tiled_followup_resize_after_fixed(5);
+    }
+
+    #[test]
+    fn parity_tiled_followup_shrink_after_direct_fixed_changes_geometry() {
+        tiled_followup_resize_after_fixed(-5);
+    }
+
+    #[test]
+    fn parity_tiled_followup_direct_proportion_preserves_outer_gap_indicator_basis() {
+        let ((), attempts) =
+            crate::backend::activation_attempt_test_support::with_refused_activation_attempts(
+                || {
+                    let (mut engine, backend, output) = tiled_followup_fixture(true);
+                    let mut cfg = engine.active_workspace_config(output).clone();
+                    cfg.outer_gaps = (12, 12, 12, 12);
+                    cfg.column_gap = 12;
+                    cfg.window_gap = 12;
+                    cfg.effects.tab_indicator.off = false;
+                    cfg.effects.tab_indicator.place_within_column = true;
+                    cfg.effects.tab_indicator.hide_when_single_tab = false;
+                    cfg.effects.tab_indicator.position = crate::config::TabPosition::Top;
+                    cfg.effects.tab_indicator.width = 8.0;
+                    cfg.effects.tab_indicator.gap = 6.0;
+                    engine.update_config(cfg);
+                    engine.set_window_height_by(SizeChange::SetProportion(50_000), &backend);
+                    for tab in 0..2 {
+                        let monitor = engine.monitors.get_mut(&output).unwrap();
+                        monitor.workspace_mut().unwrap().columns[0].display =
+                            crate::layout::ColumnDisplay::Tabbed { active_tab: tab };
+                        monitor.focus_window = Some(WindowId::new(-9501 - tab as isize));
+                        let positions = tiled_followup_positions(&engine, output);
+                        assert_eq!(positions.len(), 1);
+                        assert_eq!(positions[0].1.loc.y, 26);
+                        assert_eq!(positions[0].1.size.h, 418);
+                    }
+                },
+            );
+        assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
     }
 }

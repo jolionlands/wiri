@@ -158,102 +158,79 @@ impl TilingEngine {
         self.switch_preset_column_width(forwards, backend);
     }
 
-    /// niri `switch-preset-window-height` (`forwards`) and `-back`: the focused window takes
-    /// the next of `preset-window-heights` (a third, a half and two thirds of its column by
-    /// default).  The other windows of the column share what is left by their weights.  A
-    /// column of one window (and a tabbed column) always fills the view, so nothing visible
-    /// changes there; the choice is remembered all the same (niri leaves the blank space).
+    /// Cycle the focused tile's configured height. Sole and tabbed columns
+    /// retain the request and may leave blank space below it.
     pub fn switch_preset_window_height(&mut self, forwards: bool, backend: &BackendHandle) {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        let cfg = self.active_workspace_config(output).clone();
-        let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
-        // The column's room: the view height less the outer gaps, borders and the gaps
-        // between the tiles — the same numbers the layout pass uses.
-        let metrics = {
-            let Some(monitor) = self.monitors.get(&output) else {
-                return;
-            };
-            let view_h = Self::precise_tiling_area(monitor, &cfg).height;
-            let gap = cfg.window_gap;
-            let Some(column) = monitor
-                .workspace()
-                .and_then(|w| monitor.focus_column.and_then(|i| w.columns.get(i)))
-            else {
-                return;
-            };
-            let Some(window) = monitor.focus_window else {
-                return;
-            };
-            let Some(index) = column.index_of(window) else {
-                return;
-            };
-            let available = (view_h - (gap * (column.tiles.len() as i32 - 1)) as f64).max(1.0);
-            let tile = &column.tiles[index];
-            let current = match (tile.preferred_height, tile.height_proportion) {
-                (Some(px), _) => px as i32,
-                (None, Some(proportion)) => proportion_px(available, gap, proportion),
-                (None, None) => {
-                    let weights: f32 = column.tiles.iter().map(|t| t.height_weight.max(0.1)).sum();
-                    let mine = column.tiles[index].height_weight.max(0.1);
-                    (available as f32 * mine / weights.max(0.1)).round() as i32
-                }
-            };
-            (
-                monitor.focus_column.unwrap_or(0),
-                index,
-                current,
-                available,
-                gap,
-                tile.height_preset_idx,
-                window,
-            )
+        let Some(monitor) = self.monitors.get(&output) else {
+            return;
         };
-        let (column_index, tile_index, current, available, gap, remembered, window) = metrics;
+        let (Some(column_index), Some(window)) = (monitor.focus_column, monitor.focus_window)
+        else {
+            return;
+        };
+        let workspace = monitor.active_workspace;
+        let Some(column) = monitor
+            .workspace()
+            .and_then(|workspace| workspace.columns.get(column_index))
+        else {
+            return;
+        };
+        let Some(tile_index) = column.index_of(window) else {
+            return;
+        };
+        let remembered = column.tiles[tile_index].height_preset_idx;
+        let cfg = self.effective_config_for_workspace(output, workspace);
+        let view_h = Self::precise_tiling_area(monitor, cfg).height;
+        let gap = cfg.window_gap;
+        let scale = monitor.scale_factor;
+        let border = 2 * self.rule_border_inset(window, cfg);
+        let indicator = self.vertical_tab_indicator_space(column, cfg, 1.0);
+        let Some(rendered) = self.tiled_column_rendered_heights(output, workspace, column_index)
+        else {
+            return;
+        };
+        let current = rendered[tile_index];
         let presets = self.window_height_presets(output);
-        // A fixed height in `preset-window-heights` is the height of the *window*, as niri
-        // counts it, and `HeightSpec::fixed` is in pixels of the whole tile: the border wiri
-        // paints around the window sits on top of it, exactly as `set-window-height "300"`
-        // (`SizeChange::SetFixed` adds the border) and a `default-window-height` rule
-        // (`rules::spec_px`) resolve the same number.  Without the border band a `fixed 300`
-        // preset came out 2 * border px shorter than the same height asked for any other way.
-        let border = 2 * cfg.border_inset();
+        // Proportions use the full inner view, including the gap basis; fixed
+        // entries are client sizes with the target's physical border added.
         let resolved: Vec<i32> = presets
             .iter()
             .map(|spec| match spec {
-                SizeSpec::Proportion(p) => proportion_px(available, gap, *p),
-                SizeSpec::Fixed(px) => (*px as f64 * scale).round() as i32 + border,
+                SizeSpec::Proportion(share) => proportion_px(view_h, gap, *share)
+                    .saturating_sub(indicator)
+                    .max(1),
+                SizeSpec::Fixed(px) => ((*px as f64 * scale).round() as i32 + border).max(1),
             })
             .collect();
         let preset = Self::next_preset_index(remembered, current, &resolved, forwards);
-        let changed = self
-            .monitors
-            .get_mut(&output)
-            .and_then(|monitor| monitor.workspace_mut())
-            .and_then(|workspace| workspace.columns.get_mut(column_index))
-            .and_then(|column| column.tiles.get_mut(tile_index))
-            .map(|tile| {
-                match presets[preset] {
-                    SizeSpec::Proportion(share) => {
-                        tile.height_proportion = Some(share);
-                        tile.preferred_height = None;
-                    }
-                    SizeSpec::Fixed(px) => {
-                        tile.height_proportion = None;
-                        tile.preferred_height =
-                            Some((((px as f64 * scale).round() as i32 + border).max(1)) as u32);
-                    }
-                }
-                tile.height_preset_idx = Some(preset);
-            })
-            .is_some();
-        if !changed {
+        if !self.prepare_tiled_height_owner(output, workspace, column_index, window, &rendered) {
             return;
         }
-        // The height the user chose replaces the one a window rule asked for.
+        let Some(tile) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|monitor| monitor.workspaces.get_mut(&workspace))
+            .and_then(|workspace| workspace.columns.get_mut(column_index))
+            .and_then(|column| column.tiles.get_mut(tile_index))
+        else {
+            return;
+        };
+        match presets[preset] {
+            SizeSpec::Proportion(share) => {
+                tile.height_proportion = Some(share);
+                tile.preferred_height = None;
+            }
+            SizeSpec::Fixed(_) => {
+                tile.height_proportion = None;
+                tile.preferred_height = Some(resolved[preset] as u32);
+            }
+        }
+        tile.height_preset_idx = Some(preset);
         self.rule_heights.remove(&window);
-        self.apply_layout_for_monitor(output, backend);
+        self.apply_layout_for_monitor_with_activation(output, backend, false);
     }
 }
 
@@ -452,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_window_column_remembers_the_preset_but_fills_the_view() {
+    fn a_single_window_column_remembers_the_preset_and_leaves_blank_space() {
         let (mut engine, be, output) = height_fixture(vec![SizeSpec::Proportion(0.5)]);
         {
             let monitor = engine.monitors.get_mut(&output).unwrap();
@@ -467,9 +444,9 @@ mod tests {
         assert_eq!(
             tile.height_proportion,
             Some(0.5),
-            "the choice is remembered for a column of several windows"
+            "the choice is remembered even for a column of one window"
         );
-        // The layout keeps the historic rule: a lone window fills the column.
+        // A lone preset tile keeps its requested extent rather than filling the view.
         assert_eq!(
             super::super::rules::distribute_heights(
                 600,
@@ -480,7 +457,7 @@ mod tests {
                     max: 0,
                 }]
             ),
-            vec![600]
+            vec![294]
         );
     }
 }

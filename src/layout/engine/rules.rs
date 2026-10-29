@@ -172,7 +172,7 @@ pub(super) struct HeightSpec {
 ///   of the others, they are cut back in proportion.
 /// * Without limits and fixed heights the tiles get their share of `available` (rounded
 ///   down); the last one takes what the rounding leaves, so that the column is filled.
-/// * A column of one tile fills the view, within its limits.
+/// * One auto tile fills the view; a fixed tile retains its request, within its limits.
 /// * The limits can leave part of the column empty (every tile at its maximum) or ask for
 ///   more than there is (the minimums add up to more): the heights say so.
 pub(super) fn distribute_heights(available: impl Into<f64>, tiles: &[HeightSpec]) -> Vec<i32> {
@@ -189,7 +189,8 @@ pub(super) fn distribute_heights(available: impl Into<f64>, tiles: &[HeightSpec]
         height.max(tile.min.max(0))
     };
     if n == 1 {
-        return vec![limit(available.floor() as i32, &tiles[0])];
+        let height = tiles[0].fixed.unwrap_or(available.floor() as i32).max(0);
+        return vec![limit(height, &tiles[0])];
     }
 
     let mut height: Vec<Option<i32>> = tiles
@@ -1173,11 +1174,11 @@ mod tests {
     }
 
     #[test]
-    fn a_column_of_one_fills_the_view_within_its_limits() {
+    fn a_column_of_one_honors_fixed_height_or_fills_the_view_within_limits() {
         assert_eq!(distribute_heights(900, &[auto()]), vec![900]);
         assert_eq!(
             distribute_heights(900, &[spec(Some(300), 1.0, 0, 0)]),
-            vec![900]
+            vec![300]
         );
         assert_eq!(
             distribute_heights(900, &[spec(None, 1.0, 0, 500)]),
