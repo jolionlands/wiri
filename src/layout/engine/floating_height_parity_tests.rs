@@ -594,3 +594,115 @@ fn parity_floating_height_followup_proportion_rounds_logical_height_before_physi
     let _ = run_height_action(&engine, &backend, true, Some(id));
     assert_eq!(float_rect(&engine, id), Rect::new(30, 40, 450, 401));
 }
+// TEMP ONLY: append after the frozen height child for a separately observed RED.
+// Uses its existing height_fixture/run_height_action/float_rect and imports.
+// No registration or production changes. All model HWNDs remain negative.
+//
+// Pin e19df12: workspace.rs636-657 transfers a floating tile into the destination
+// floating layout; floating.rs425-426 calls tile.update_config on destination
+// insertion; tile.rs229-235 invalidates the height index when that list differs.
+// No cycle occurs on B: lazy validation only at the next cycle cannot observe it.
+
+fn assert_height_transfer_roundtrip(destination_presets: Vec<SizeSpec>, expected: u32) {
+    // Cover setup and both real transfer calls as well as the shared dispatcher.
+    let _ = with_refused_activation_attempts(|| {
+        let presets = vec![
+            SizeSpec::Fixed(600),
+            SizeSpec::Fixed(200),
+            SizeSpec::Fixed(400),
+        ];
+        let (engine, backend, output, id) = height_fixture(presets.clone(), 300, 1.0);
+        let source_name = "height active";
+        let destination_name = "height-transfer-other";
+        let workspace_config = |name: &str, list: Vec<SizeSpec>| {
+            let mut workspace = WorkspaceConfig::default_config();
+            workspace.name = name.into();
+            workspace.monitor = "floating-height-model".into();
+            workspace.layout_override = Some(LayoutConfigPartial {
+                preset_window_heights: Some(list),
+                ..Default::default()
+            });
+            workspace
+        };
+        let mut config = Config::default();
+        config.layout.preset_window_heights = presets.clone();
+        config.workspace = vec![
+            workspace_config(source_name, presets),
+            workspace_config(destination_name, destination_presets),
+        ];
+        engine.write().set_full_config(config);
+        let source_ref = crate::input::WorkspaceRef::Name(source_name.into());
+        let destination_ref = crate::input::WorkspaceRef::Name(destination_name.into());
+        let source = engine
+            .read()
+            .resolve_workspace_reference(output, &source_ref)
+            .unwrap();
+        let destination = engine
+            .read()
+            .resolve_workspace_reference(output, &destination_ref)
+            .unwrap();
+        assert_eq!(source.0, output);
+        assert_eq!(
+            destination.0, output,
+            "the round trip must stay on one output"
+        );
+        assert_ne!(source.1, destination.1);
+        assert_eq!(engine.read().float_location(id), Some(source));
+        assert_eq!(float_rect(&engine, id), Rect::new(30, 40, 450, 300));
+
+        // Configured order is deliberately unsorted: the index is now 1, while
+        // a fresh nonmember search from 200 would choose list entry 0 (600).
+        for height in [600, 200] {
+            let _ = run_height_action(&engine, &backend, true, Some(id));
+            assert_eq!(float_rect(&engine, id).size.h, height);
+        }
+        let before_transfer = float_rect(&engine, id);
+        engine
+            .write()
+            .move_window_to_workspace_ref(Some(id), destination_ref, false, &backend);
+        assert_eq!(engine.read().float_location(id), Some(destination));
+        assert_eq!(float_rect(&engine, id), before_transfer);
+        // Deliberately no preset action, reload, refresh or config change on B.
+        engine
+            .write()
+            .move_window_to_workspace_ref(Some(id), source_ref, false, &backend);
+        assert_eq!(engine.read().float_location(id), Some(source));
+        assert_eq!(float_rect(&engine, id), before_transfer);
+
+        let _ = run_height_action(&engine, &backend, true, Some(id));
+        assert_eq!(
+            float_rect(&engine, id),
+            Rect::new(
+                before_transfer.loc.x,
+                before_transfer.loc.y,
+                before_transfer.size.w,
+                expected
+            ),
+            "each destination list must be applied at transfer time, even without cycling there"
+        );
+    });
+}
+
+#[test]
+fn parity_floating_height_transfer_changed_list_roundtrip_discards_index() {
+    assert_height_transfer_roundtrip(
+        vec![
+            SizeSpec::Fixed(700),
+            SizeSpec::Fixed(300),
+            SizeSpec::Fixed(500),
+        ],
+        600,
+    );
+}
+
+#[test]
+fn parity_floating_height_transfer_same_list_roundtrip_preserves_index() {
+    assert_height_transfer_roundtrip(
+        vec![
+            SizeSpec::Fixed(600),
+            SizeSpec::Fixed(200),
+            SizeSpec::Fixed(400),
+        ],
+        400,
+    );
+}

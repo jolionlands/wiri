@@ -1091,7 +1091,15 @@ impl IpcServer {
                             }
                             _ => {}
                         }
-                        if !focus_window_by_hwnd(engine, backend, hwnd) {
+                        let preserve_float_height_focus =
+                            matches!(
+                                &action,
+                                crate::input::Action::WindowHeightPresetCycle
+                                    | crate::input::Action::WindowHeightPresetCycleBack
+                            ) && engine.read().is_floating(WindowId::new(hwnd));
+                        if !preserve_float_height_focus
+                            && !focus_window_by_hwnd(engine, backend, hwnd)
+                        {
                             return serde_json::json!({
                                 "success": false,
                                 "error": format!("no window with id {} to focus", hwnd)
@@ -2352,6 +2360,9 @@ fn split_window_target(
     }
     Ok((rest, rest_quoted, target))
 }
+
+#[cfg(test)]
+mod floating_height_parity_tests;
 
 #[cfg(test)]
 mod window_target_tests {
