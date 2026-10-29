@@ -718,6 +718,74 @@ mod tests {
     }
 
     #[test]
+    fn parity_canonical_action_switch_layout_next_uses_pinned_layout_field() {
+        use crate::input::system_actions::{LayoutSwitchTarget, SystemAction};
+        assert_eq!(
+            parsed_typed_action(json!({"SwitchLayout":{"layout":"Next"}})),
+            crate::input::Action::System(SystemAction::SwitchLayout(LayoutSwitchTarget::Next))
+        );
+    }
+
+    #[test]
+    fn parity_canonical_action_switch_layout_prev_uses_pinned_layout_field() {
+        use crate::input::system_actions::{LayoutSwitchTarget, SystemAction};
+        assert_eq!(
+            parsed_typed_action(json!({"SwitchLayout":{"layout":"Prev"}})),
+            crate::input::Action::System(SystemAction::SwitchLayout(LayoutSwitchTarget::Prev))
+        );
+    }
+
+    #[test]
+    fn parity_canonical_action_switch_layout_index_preserves_u8_target() {
+        use crate::input::system_actions::{LayoutSwitchTarget, SystemAction};
+        for index in [0, 2, 255] {
+            assert_eq!(
+                parsed_typed_action(json!({"SwitchLayout":{"layout":{"Index":index}}})),
+                crate::input::Action::System(SystemAction::SwitchLayout(
+                    LayoutSwitchTarget::Index(index)
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_switch_layout_legacy_target_extension_still_works() {
+        use crate::input::system_actions::{LayoutSwitchTarget, SystemAction};
+        for (target, expected) in [
+            (json!("Next"), LayoutSwitchTarget::Next),
+            (json!("Prev"), LayoutSwitchTarget::Prev),
+            (json!({"Index":2}), LayoutSwitchTarget::Index(2)),
+            (json!(2), LayoutSwitchTarget::Index(2)),
+        ] {
+            assert_eq!(
+                parsed_typed_action(json!({"SwitchLayout":{"target":target}})),
+                crate::input::Action::System(SystemAction::SwitchLayout(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_switch_layout_rejects_missing_or_malformed_layout() {
+        assert!(decode(json!({"Action":{"SwitchLayout":{}}})).is_err());
+        for layout in [
+            json!(null),
+            json!(false),
+            json!(1),
+            json!("Unknown"),
+            json!([]),
+            json!({}),
+            json!({"Index":-1}),
+            json!({"Index":256}),
+            json!({"Index":"2"}),
+            json!({"Index":1.5}),
+            json!({"Index":2,"Next":null}),
+        ] {
+            let request = json!({"Action":{"SwitchLayout":{"layout":layout}}});
+            assert!(decode(request.clone()).is_err(), "{request}");
+        }
+    }
+
+    #[test]
     fn parity_typed_size_changes_preserve_percent_units_and_set_adjust_kinds() {
         use crate::input::{Action, SizeChange};
 

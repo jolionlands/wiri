@@ -816,6 +816,10 @@ fn output_action(words: &[String]) -> Result<serde_json::Value> {
         ["scale", scale] => json!({"Scale": {"scale": scalar(scale)}}),
         ["transform", transform] => json!({"Transform": {"transform": transform}}),
         ["position", "auto"] => json!({"Position": {"position": "Auto"}}),
+        ["position", "set", x, y] => {
+            json!({"Position": {"position": {"x": scalar(x), "y": scalar(y)}}})
+        }
+        ["position", "set", ..] => anyhow::bail!("expected position set X Y"),
         ["position", x, y] => {
             json!({"Position": {"position": {"x": scalar(x), "y": scalar(y)}}})
         }
@@ -830,7 +834,7 @@ fn output_action(words: &[String]) -> Result<serde_json::Value> {
         ["max-bpc", max_bpc] => json!({"MaxBpc": {"max_bpc": scalar(max_bpc)}}),
         _ => anyhow::bail!(
             "expected external output-action JSON, or on/off, mode MODE, scale SCALE, \
-             transform TRANSFORM, position X Y/auto, vrr on/off, max-bpc BITS"
+             transform TRANSFORM, position set X Y, position X Y/auto, vrr on/off, max-bpc BITS"
         ),
     })
 }
@@ -2347,6 +2351,71 @@ mod tests {
                 panic!("output request")
             };
             assert_eq!(action, expected);
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_cli_output_position_set_keeps_signed_coordinates() {
+        // Pinned PositionToSet is a clap subcommand: position set X Y.
+        for prefix in [vec!["wiri-ctl"], vec!["wiri-ctl", "msg"]] {
+            let args: Vec<&str> = prefix
+                .into_iter()
+                .chain(["output", "DISPLAY1", "position", "set", "-100", "25"])
+                .collect();
+            let IpcMessage::Output { output, action } = request_of(&args) else {
+                panic!("output request")
+            };
+            assert_eq!(output, "DISPLAY1");
+            assert_eq!(
+                action,
+                serde_json::json!({"Position":{"position":{"x":-100,"y":25}}})
+            );
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_cli_output_position_retains_friendly_controls() {
+        for (words, expected) in [
+            (
+                vec!["position", "-100", "25"],
+                serde_json::json!({"Position":{"position":{"x":-100,"y":25}}}),
+            ),
+            (
+                vec!["position", "auto"],
+                serde_json::json!({"Position":{"position":"Auto"}}),
+            ),
+        ] {
+            let args: Vec<&str> = ["wiri-ctl", "msg", "output", "DISPLAY1"]
+                .into_iter()
+                .chain(words)
+                .collect();
+            let IpcMessage::Output { action, .. } = request_of(&args) else {
+                panic!("output request")
+            };
+            assert_eq!(action, expected);
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_cli_output_position_set_rejects_bad_arity() {
+        // The daemon owns semantic value validation; the CLI must reject a
+        // truncated/overlong canonical command before constructing a request.
+        for words in [
+            vec!["position", "set"],
+            vec!["position", "set", "-100"],
+            vec!["position", "set", "-100", "25", "extra"],
+        ] {
+            let args: Vec<&str> = ["wiri-ctl", "msg", "output", "DISPLAY1"]
+                .into_iter()
+                .chain(words)
+                .collect();
+            let result = Cli::try_parse_from(args)
+                .map_err(anyhow::Error::from)
+                .and_then(|cli| request_for(cli.command.into_command()));
+            assert!(
+                result.is_err(),
+                "incomplete or extra position-set arguments"
+            );
         }
     }
 

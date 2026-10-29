@@ -101,7 +101,7 @@ pub fn wire_args(
     fields: &Map<String, Value>,
 ) -> Option<Result<Vec<String>, String>> {
     let (name, allowed): (&str, &[&str]) = match variant {
-        "SwitchLayout" => ("switch-layout", &["target"]),
+        "SwitchLayout" => ("switch-layout", &["layout", "target"]),
         "ToggleWindowUrgent" => ("toggle-window-urgent", &["id"]),
         "SetWindowUrgent" => ("set-window-urgent", &["id"]),
         "UnsetWindowUrgent" => ("unset-window-urgent", &["id"]),
@@ -120,10 +120,21 @@ pub fn wire_args(
         let mut args = Vec::new();
         match name {
             "switch-layout" => {
-                let target = fields.get("target").ok_or("SwitchLayout requires target")?;
+                // `layout` is the pinned niri field. Keep `target` as a legacy
+                // extension only when the canonical field is absent.
+                let (target, legacy) = if let Some(layout) = fields.get("layout") {
+                    (layout, false)
+                } else {
+                    (
+                        fields.get("target").ok_or("SwitchLayout requires layout")?,
+                        true,
+                    )
+                };
                 let word = match target {
-                    Value::String(s) => s.to_ascii_lowercase(),
-                    Value::Number(n) => n
+                    Value::String(s) if legacy || matches!(s.as_str(), "Next" | "Prev") => {
+                        s.to_ascii_lowercase()
+                    }
+                    Value::Number(n) if legacy => n
                         .as_u64()
                         .filter(|n| *n <= 255)
                         .ok_or("layout index must be 0..255")?
