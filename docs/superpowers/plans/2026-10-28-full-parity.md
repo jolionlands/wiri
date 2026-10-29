@@ -406,17 +406,27 @@ compatibility controls while accepting canonical niri shapes.
 
 ### Task 19: Floating window height presets
 
-Both the general preset-height config row and action/back row remain partial:
-parsing, storage and tiled behavior work, but the floating dispatch explicitly
-does nothing. Pinned workspace routing reaches `floating.toggle_window_height`,
-which applies the configured fixed/proportional list and retains a preset index.
-The two matrix rows describe one shared implementation gap.
+Both preset-height rows remain partial. Task19 implemented the shared floating
+engine consumer and per-window remembered index. Its initial 16-test source GREEN
+passed 2,057 full-suite tests; three follow-ups then exposed a 400-versus-401-pixel
+logical quantization failure. The correction passed all 19 height tests, all 20
+backend-message tests, 2,060 full-suite tests, all 13 required gates and the release
+build. IPC pre-focus, workspace-transfer index lifecycle and native/DPI height
+qualification remain open.
 
 - [x] Add and observe dispatch/state regressions for current and explicit
   floating targets: nonpreset first step, forward/back wrap, remembered index,
   target effective configuration, fixed-size DPI and proportional units.
-- [ ] Implement floating height preset resolution and lifecycle without changing
-  tiled column behavior. Preserve inactive explicit-target focus where required.
+- [x] Implement and source-qualify floating preset resolution/lifecycle, current
+  and explicit shared dispatch, target configuration and synthetic DPI through
+  the unchanged initial 16 tests.
+- [x] Observe the three follow-up cases (two controls pass, one semantic failure)
+  and qualify final logical-height rounding before the physical request; 19/19
+  height tests pass.
+- [ ] Qualify explicit-target IPC without focus mutation; four compositional
+  tests are drafted but unregistered/unexecuted.
+- [ ] Observe and fix remembered-index invalidation on A→B→A transfer across
+  different named-workspace lists; two tests are drafted but unregistered/unexecuted.
 - [ ] Review and verify owned native height changes and refresh/reload retention;
   keep actual mixed-DPI hardware evidence separate from deterministic tests.
 
@@ -441,7 +451,14 @@ passed 12/12 against the new frozen binaries, versus 5/12 on R3. Numeric height
 oracles were retained while repairing an integer-allocation regression. See
 [the evidence report](../../parity/2026-10-29-tridaris-r4.md).
 
-Task15 native geometry and Task16 rendered panel checks remain pending. Next
-observe the prepared four-case mouse-origin binding baseline, then the separate
-floating-height preset baseline. No matrix promotion or new performance claim
-is made; the old full R3 desktop cycle remains failed.
+The exact immutable R4 binaries passed H87 native scroll **12/12**, Task15 native
+spacing **7/7** and Task16 native panel **7/7**; the latter two were actual 96-DPI
+checks with retained artifact hashes and root-reviewed images. The later
+pointer-origin follow-up passed **2,041 Rust tests** and 11 source gates. Task19's
+initial 16-case implementation passed **2,057 Rust tests**; its logical-height
+correction then passed **19/19 height tests**, all 20 backend-message tests,
+**2,060 Rust tests**, all 13 source gates and the release build. IPC explicit-target
+focus, workspace-transfer index lifecycle and native/DPI height work remain pending.
+The matrix remains **303/396 (76.5%), 93 partial**, with no height-row promotion.
+These version-bound results do not replace the failed full R3 desktop cycle or
+provide a new performance result. See the [evidence report](../../parity/2026-10-29-tridaris-r4.md#floating-height-presets-source-qualification).
