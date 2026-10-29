@@ -65,6 +65,7 @@ fn seed_contents(engine: &mut TilingEngine, output: OutputId, workspace: i32) ->
     let column = strip.add_window_to_new_column(tiled);
     strip.columns[column].width = Some(641);
 
+    let width_preset_list = engine.column_presets_for_workspace(output, workspace);
     engine.floating_windows.insert(floating);
     engine.float_homes.insert(
         floating,
@@ -78,6 +79,7 @@ fn seed_contents(engine: &mut TilingEngine, output: OutputId, workspace: i32) ->
             ),
             seq: 7,
             width_preset_idx: Some(1),
+            width_preset_list,
             height_preset_idx: None,
             height_preset_list: Vec::new(),
         },

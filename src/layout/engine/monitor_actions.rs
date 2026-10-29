@@ -312,7 +312,7 @@ impl TilingEngine {
                 unplugged.moved.retain(|(from, _)| *from != key);
             }
         }
-        self.refresh_float_height_presets();
+        self.refresh_float_presets();
         self.maintain_empty_workspace(source);
         self.maintain_empty_workspace(destination);
         if was_active {

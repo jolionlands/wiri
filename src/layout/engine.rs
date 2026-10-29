@@ -32,6 +32,8 @@ pub use lane_l::FocusLayer;
 #[cfg(test)]
 mod floating_height_parity_tests;
 #[cfg(test)]
+mod floating_width_list_parity_tests;
+#[cfg(test)]
 mod lane_f_integration_tests;
 mod monitor_actions;
 #[cfg(test)]
@@ -118,6 +120,8 @@ struct FloatHome {
     seq: u64,
     /// Preset order is configured, not necessarily ascending by width.
     width_preset_idx: Option<usize>,
+    /// The effective logical list that the remembered width index refers to.
+    width_preset_list: Vec<crate::config::types::SizeSpec>,
     height_preset_idx: Option<usize>,
     /// The effective logical list that the remembered height index refers to.
     height_preset_list: Vec<crate::config::types::SizeSpec>,
@@ -4611,6 +4615,7 @@ impl TilingEngine {
                 ),
                 seq,
                 width_preset_idx: None,
+                width_preset_list: Vec::new(),
                 height_preset_idx: None,
                 height_preset_list: Vec::new(),
             },
@@ -5195,8 +5200,8 @@ impl TilingEngine {
             return;
         };
         let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
-        let widths: Vec<i32> = self
-            .column_presets_for_workspace(output, workspace)
+        let presets = self.column_presets_for_workspace(output, workspace);
+        let widths: Vec<i32> = presets
             .iter()
             .map(|spec| match spec {
                 crate::config::types::SizeSpec::Proportion(p) => {
@@ -5205,10 +5210,13 @@ impl TilingEngine {
                 crate::config::types::SizeSpec::Fixed(px) => (*px as f64 * scale).round() as i32,
             })
             .collect();
-        let remembered = self
-            .float_homes
-            .get(&window_id)
-            .and_then(|home| home.width_preset_idx);
+        let remembered = self.float_homes.get(&window_id).and_then(|home| {
+            if home.width_preset_list == presets {
+                home.width_preset_idx
+            } else {
+                None
+            }
+        });
         let next = Self::next_preset_index(remembered, rect.size.w as i32, &widths, forwards);
         self.place_float_rect(
             window_id,
@@ -5223,6 +5231,7 @@ impl TilingEngine {
         );
         if let Some(home) = self.float_homes.get_mut(&window_id) {
             home.width_preset_idx = Some(next);
+            home.width_preset_list = presets;
         }
     }
 
@@ -5287,13 +5296,14 @@ impl TilingEngine {
                         ),
                         seq,
                         width_preset_idx: None,
+                        width_preset_list: Vec::new(),
                         height_preset_idx: None,
                         height_preset_list: Vec::new(),
                     },
                 );
             }
         }
-        self.refresh_float_height_presets();
+        self.refresh_float_presets();
         self.maintain_empty_workspace(output);
         self.apply_layout_for_monitor(output, backend);
     }

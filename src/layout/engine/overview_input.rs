@@ -165,7 +165,7 @@ impl TilingEngine {
             m.set_focus(window);
         }
         self.sync_min_widths();
-        self.refresh_float_height_presets();
+        self.refresh_float_presets();
         self.maintain_empty_workspace(output);
         self.apply_layout_for_monitor(output, backend);
     }

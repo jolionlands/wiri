@@ -551,7 +551,7 @@ impl TilingEngine {
         focus: Option<WindowId>,
         backend: &BackendHandle,
     ) {
-        self.refresh_float_height_presets();
+        self.refresh_float_presets();
         self.maintain_empty_workspace(source);
         if source != destination.0 {
             self.maintain_empty_workspace(destination.0);

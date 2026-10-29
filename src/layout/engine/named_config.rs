@@ -112,7 +112,7 @@ impl TilingEngine {
             views.insert(workspace.name.clone(), per_output);
         }
         self.config_per_workspace = views;
-        self.refresh_float_height_presets();
+        self.refresh_float_presets();
     }
 
     /// The ordered output preferences of one `workspace` declaration: its repeated

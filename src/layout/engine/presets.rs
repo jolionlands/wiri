@@ -55,22 +55,27 @@ impl TilingEngine {
 
     /// Preset indices survive position changes and reloads of the same list, but
     /// never refer to a replacement list, even if it is changed back before use.
-    pub(super) fn refresh_float_height_presets(&mut self) {
+    pub(super) fn refresh_float_presets(&mut self) {
         let lists: Vec<_> = self
             .float_homes
             .iter()
             .map(|(window, home)| {
                 (
                     *window,
+                    self.column_presets_for_workspace(home.output, home.workspace),
                     self.window_height_presets_for_workspace(home.output, home.workspace),
                 )
             })
             .collect();
-        for (window, presets) in lists {
+        for (window, width_presets, height_presets) in lists {
             if let Some(home) = self.float_homes.get_mut(&window) {
-                if home.height_preset_list != presets {
+                if home.width_preset_list != width_presets {
+                    home.width_preset_idx = None;
+                    home.width_preset_list = width_presets;
+                }
+                if home.height_preset_list != height_presets {
                     home.height_preset_idx = None;
-                    home.height_preset_list = presets;
+                    home.height_preset_list = height_presets;
                 }
             }
         }
