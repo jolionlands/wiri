@@ -9,7 +9,7 @@ Built in Rust, runs natively on Win32 (x86_64 and ARM64).
 ## Status
 
 - Compiles clean on `aarch64-pc-windows-msvc` and `x86_64-pc-windows-msvc`
-- 2,095 Rust tests passed at source checkpoint `3d7c8f6` — see the [qualification evidence](docs/parity/2026-10-29-tridaris-r4.md#tiled-height-request-durability)
+- 2,104 Rust tests passed at source checkpoint `381ce11` — see the [qualification evidence](docs/parity/2026-10-29-tridaris-r4.md#tiled-height-preset-list-and-constraint-lifecycle)
 - Released as a working prototype — see `docs/PROGRESS.md` for the current feature matrix
 
 ## Build

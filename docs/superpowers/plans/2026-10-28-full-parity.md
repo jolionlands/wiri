@@ -479,14 +479,19 @@ native tiled-height and mixed-DPI qualification keep both height rows partial.
   gates/build pass. The two-file guarded import verifies all 197 inputs and
   preserves 195 others. See the
   [durability evidence](../../parity/2026-10-29-tridaris-r4.md#tiled-height-request-durability).
-- [ ] Qualify broader rule/limit request lifecycle through distinct acceptance
-  cases; a same-config reload failure is not established.
-- [ ] Observe tiled effective preset-list changes, including A-to-B-to-A and
-  unchanged-list controls. Pinned niri `scrolling.rs:4094` resets tiled heights
-  to Auto when the list changes; the current list-identity refresh covers floats.
-- [ ] Observe direct Fixed retention across dynamic rule-limit updates and new
-  window admission. Their generic `sync_min_widths` callers remain unchanged;
-  possible request loss is a source-backed candidate, without an executed RED.
+- [x] Observe combined lifecycle RED: list5 yields one pass/four semantic failures;
+  reconcile4 yields one pass/three semantic failures. All 54 existing controls,
+  warnings-denied all-target checking and integrity pass.
+- [x] Capture old effective tiled lists and rendered heights before config/view
+  publication; changed lists convert all heights to Auto with old apparent ratios,
+  clearing preset metadata and opening fallbacks. Unchanged effective output lists
+  retain indices. This follows pinned niri `scrolling.rs:4094`.
+- [x] Preserve existing direct requests during generic constraint refresh, including
+  dynamic rule-limit changes and window admission; continue filling missing opening
+  defaults. Qualify `381ce11`: list5, reconcile4, all prior controls,
+  2,104 tests and 21 source gates/build pass. The four-file guarded import verifies
+  all 197 inputs and preserves 193 others. See the
+  [lifecycle evidence](../../parity/2026-10-29-tridaris-r4.md#tiled-height-preset-list-and-constraint-lifecycle).
 - [ ] Add native tiled-height and mixed-DPI evidence separately; the prior native
   floating-height result remains bound to `69e0eb7`. No row promotion.
 
@@ -532,8 +537,12 @@ explicit-focus/admission interaction. Later width checkpoint `351065a` passed
 2,070 tests; tiled-height checkpoint `1cb2a25` passed 2,091 and all 18 source gates,
 including the release build. The later durability checkpoint `3d7c8f6`
 passes 2,095 tests and 19 source gates/build,
-closing native minimum-width request loss while leaving generic rule/config callers unchanged.
-Broader rule/limit lifecycle, native tiled height and mixed-DPI hardware remain open.
+closing native minimum-width request loss while leaving generic rule/config callers unchanged
+at that checkpoint. The later lifecycle checkpoint `381ce11` passes 2,104
+tests and 21 source gates/build: five effective-list cases and four rule/admission
+cases qualify the expanded three-file source fix. All 197 inputs qualify; the
+four-file guarded import preserves 193 others. Native tiled height, mixed-DPI
+hardware and other lifecycle routes remain open.
 The separate Task19 graphics run passed its real BMP test with no display skip,
 and froze a new 245-file source/bin base graph used by the composed native run.
 The matrix remains **303/396 (76.5%), 93 partial**, with no height-row promotion.

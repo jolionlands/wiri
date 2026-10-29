@@ -134,10 +134,21 @@ The later durability checkpoint `3d7c8f6` passed **four retention
 cases**, all prior controls and **2,095 Rust tests**, with
 **19 source gates** and the release build passing.
 Three same-config reload controls already passed in RED; native minimum-width
-refresh caused the actual 300-to-900 px request loss. Only that caller now
-preserves the height request; generic rule/config synchronization is unchanged.
+refresh caused the actual 300-to-900 px request loss. At that checkpoint, only the native minimum-width caller
+preserved the height request; generic rule/config synchronization was unchanged.
 The two-file guarded import verifies all 197 inputs. See the
 [durability evidence](2026-10-29-tridaris-r4.md#tiled-height-request-durability).
+
+The later lifecycle checkpoint `381ce11` passed **five effective-list
+cases**, **four rule/admission cases**, all prior controls and **2,104 Rust
+tests**, with **21 source gates** and the release build passing. Its actual
+nine-case RED had seven semantic failures and two passing controls; all 54
+existing controls passed. Changed effective tiled height lists now convert the
+old rendered heights to Auto, while unchanged output overrides retain the preset
+index. Constraint refresh preserves existing direct requests and still fills
+missing opening defaults. The four-file guarded import verifies all 197 inputs
+and preserves 193 others. This adds source qualification only; see the
+[lifecycle evidence](2026-10-29-tridaris-r4.md#tiled-height-preset-list-and-constraint-lifecycle).
 
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
@@ -146,10 +157,10 @@ curated hotkey list move to done. The current totals are
 **303 done / 93 partial / 89 N/A** across 485 rows:
 **303/396 applicable rows (76.5%)**. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
-remain partial for native tiled-height/mixed-DPI qualification; broader rule/limit
-lifecycle changes need their own acceptance cases. Earlier floating native evidence
+remain partial for native tiled-height/mixed-DPI qualification. The lifecycle
+checkpoint qualifies its listed source cases; earlier floating native evidence
 retains its own source binding.
-Appearance scaling, remaining height lifecycle, input/config semantics and
+Appearance scaling, other height lifecycle routes, input/config semantics and
 hardware evidence remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
 for the active work; a gate count alone is not full parity.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
