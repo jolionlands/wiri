@@ -415,9 +415,9 @@ build. The later routing checkpoint `69e0eb7` passed all 25 height tests (21 eng
 and four compositional IPC cases), 2,066 full-suite tests, all 14 source gates and
 the release build. IPC handler pre-focus and workspace-transfer index lifecycle
 are corrected. The owned Task19 R3 native run passed 14/14 checks, 38 native/IPC
-observations and 12 verified artifacts at actual 96 DPI. Mixed-DPI hardware and
-the existing tiled single-window/tabbed fill-view approximation remain separate;
-floating native qualification alone does not close the whole height rows.
+observations and 12 verified artifacts at actual 96 DPI. The later tiled-height
+source correction is qualified at `1cb2a25` below. Remaining request lifecycle,
+native tiled-height and mixed-DPI qualification keep both height rows partial.
 
 - [x] Add and observe dispatch/state regressions for current and explicit
   floating targets: nonpreset first step, forward/back wrap, remembered index,
@@ -440,8 +440,8 @@ floating native qualification alone does not close the whole height rows.
   12 verified artifacts. Root reviewed the two saved visible-source images;
   the original phase's pending manual-review field remains unchanged.
 - [ ] Qualify actual mixed-DPI hardware separately from deterministic scale tests.
-- [ ] Reconcile the existing tiled single-window/tabbed fill-view approximation
-  against pinned niri; the floating consumer and native evidence do not close it.
+- [x] Reconcile tiled sole/tabbed requested heights against pinned niri; checkpoint
+  `1cb2a25` source-qualifies direct/preset ownership and resize as recorded below.
 
 ### Floating width list lifecycle
 
@@ -456,6 +456,26 @@ floating native qualification alone does not close the whole height rows.
   [width evidence](../../parity/2026-10-29-tridaris-r4.md#floating-width-list-lifecycle).
 - [ ] Add native width lifecycle evidence against this checkpoint separately;
   the earlier height-native result remains bound to `69e0eb7`.
+
+### Tiled height ownership and resize
+
+- [x] Observe original 18-case RED (16 semantic failures, two Auto controls) and
+  preserve width 4/4 and height 25/25 controls. Observe candidate geometry success
+  with activation-guard failures and unchanged legacy Grow/Shrink requests.
+- [x] Honor sole/tabbed direct/preset requests, rendered-height owner replacement,
+  reset/rule-fallback lifecycle, hidden-tab minima and border/indicator constraints.
+  Preserve the Auto-only path; correct legacy requested-height Grow/Shrink and use
+  nonactivating layout for height set/reset/preset.
+- [x] Qualify and import `1cb2a25`: tiled 18/18, followups 3/3, rules 50/50,
+  all prior focused controls, full suite 2,091 and all 18 source gates/build passing.
+  All 197 inputs qualify; only four formatted files were imported and 193 other
+  inputs were preserved. See the
+  [tiled-height evidence](../../parity/2026-10-29-tridaris-r4.md#tiled-height-ownership-and-resize).
+- [ ] Qualify direct-request retention when limits/rules change. Four TEMP tests
+  (three reload controls and a public native-minimum-width discriminator) remain
+  unregistered/unexecuted; a same-config reload failure is not established.
+- [ ] Add native tiled-height and mixed-DPI evidence separately; the prior native
+  floating-height result remains bound to `69e0eb7`. No row promotion.
 
 ### Following source-backed queue
 
@@ -495,8 +515,10 @@ Root's separate manual review covers two visible-source screenshots. R2 stopped
 before height observations at an admission-grace startup focus precondition and
 cleaned up; R3 waits for three seconds of stable managed admission before its
 one explicit focus request. This fixture correction does not fix the queued
-explicit-focus/admission interaction. Mixed-DPI hardware qualification and the
-tiled-height correction remain open.
+explicit-focus/admission interaction. Later width checkpoint `351065a` passed
+2,070 tests; tiled-height checkpoint `1cb2a25` passed 2,091 and all 18 source gates,
+including the release build. Tiled ownership/resize is source-qualified; request
+lifecycle under limits/rules, native tiled height and mixed-DPI hardware remain open.
 The separate Task19 graphics run passed its real BMP test with no display skip,
 and froze a new 245-file source/bin base graph used by the composed native run.
 The matrix remains **303/396 (76.5%), 93 partial**, with no height-row promotion.

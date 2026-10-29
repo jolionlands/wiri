@@ -104,8 +104,8 @@ inactive-target foreground preservation. Root separately reviewed two saved
 visible-source images. The earlier R2 attempt stopped before height observations
 at an admission-grace focus precondition and cleaned up; R3 settles managed
 admission for three seconds before its one explicit focus request. This does not
-qualify focus during admission grace. Mixed-DPI hardware and tiled single-window/
-tabbed height behavior remain partial. The separate graphics run passed its real
+qualify focus during admission grace. This native result does not cover tiled
+height or mixed-DPI hardware. The separate graphics run passed its real
 BMP test with no display skip; the 245-file base graph and composed native graph
 are recorded in the evidence report. Each result retains
 its own source manifests; these results are not a
@@ -120,17 +120,27 @@ lists retain their indices. This is source qualification; the native-height
 result above remains bound to `69e0eb7`. See the
 [width evidence](2026-10-29-tridaris-r4.md#floating-width-list-lifecycle).
 
+The tiled-height checkpoint `1cb2a25` passed **18 tiled-height cases**, **three
+follow-up cases**, all **50 height-rule controls**, the **2,091-test suite** and
+all **18 source gates**, including the release build. Direct/preset sole and
+tabbed heights now preserve their requests rather than filling the view; owner
+replacement/reset, border/indicator constraints, legacy Grow/Shrink and
+nonactivating height layout are source-qualified. All 197 pinned inputs were
+verified; the guarded import changed only four formatted files. This adds no
+native or performance result. See the
+[tiled-height evidence](2026-10-29-tridaris-r4.md#tiled-height-ownership-and-resize).
+
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
 curated hotkey list move to done. The current totals are
 **303 done / 93 partial / 89 N/A** across 485 rows:
-**303/396 applicable rows (76.5%)**. The floating-height consumer and final logical
-quantization, IPC handler routing and transfer lifecycle are now source-qualified;
-both height rows remain partial for actual mixed-DPI hardware and the existing tiled
-single-window/tabbed fill-view approximation. Floating native qualification alone
-would not close either whole row.
-Appearance scaling, remaining floating-height behavior, input/config semantics and
+**303/396 applicable rows (76.5%)**. Floating-height resolution/routing and the
+sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
+remain partial: direct-request retention under limits/rule changes and native
+tiled-height/mixed-DPI qualification remain open. Earlier floating native evidence
+retains its own source binding.
+Appearance scaling, remaining height lifecycle, input/config semantics and
 hardware evidence remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
 for the active work; a gate count alone is not full parity.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
