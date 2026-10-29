@@ -445,3 +445,131 @@ fn parity_tiled_height_rule_origin_tabbed_reset_stays_auto_after_limit_sync() {
     });
     assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
 }
+// TEMP append-only fragment for the existing tiled_height_parity_tests child.
+// Reuses its guarded invalid-HWND fixture, height, select_tab and pure-position
+// helpers. It is neither registered nor executed.
+// Pin e19df12 scrolling.rs4072-4131: identical preset/config lists preserve the
+// existing WindowHeight::Fixed request; TileData::update3952-3968 updates observed
+// geometry without replacing height. Width constraints do not reset that request.
+// Reload calls are the engine publication sequence from main.rs apply_loaded_config;
+// output/native input enumeration is excluded from this synthetic engine fixture.
+
+fn tiled_durability_config() -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.output.clear();
+    config.workspace.clear();
+    config.window_rules.clear();
+    config.layout.inner_gaps = 0.0;
+    config.layout.outer_gaps = 0.0;
+    config.layout.preset_window_heights.clear();
+    config.layout.effects.border.off = true;
+    config.layout.effects.focus_ring.off = true;
+    config.layout.effects.tab_indicator.off = true;
+    config
+}
+
+fn tiled_durability_reload(
+    engine: &mut TilingEngine,
+    backend: &BackendHandle,
+    output: OutputId,
+    config: &crate::config::Config,
+) {
+    engine.update_config(LayoutConfig::from_config(config));
+    // Same observed output context, equivalent to the model-side sync in the
+    // real reload path; this performs no native enumeration or DPI change.
+    engine.sync_monitor_with_scale(
+        output,
+        Rect::new(0, 0, 1200, 900),
+        Rect::new(0, 0, 1200, 900),
+        1.0,
+    );
+    engine.set_full_config(config.clone());
+    engine.apply_reloaded_layout(backend);
+}
+
+fn tiled_durability_fixture(
+    count: usize,
+    tabbed: bool,
+) -> (TilingEngine, BackendHandle, OutputId, crate::config::Config) {
+    let (mut engine, backend, output) = tiled_fixture(count, tabbed, vec![]);
+    // The model already received an OS-foreground report. This is an engine
+    // observation, not an activation request or a synthetic input bypass.
+    assert_eq!(
+        engine.sync_os_foreground(WindowId::new(-9401), &backend),
+        Some((0, 0)),
+    );
+    let config = tiled_durability_config();
+    tiled_durability_reload(&mut engine, &backend, output, &config);
+    (engine, backend, output, config)
+}
+
+#[test]
+fn parity_tiled_durability_sole_fixed_survives_same_config_reload() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, config) = tiled_durability_fixture(1, false);
+        engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+        assert_eq!(height(&engine, output), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        tiled_durability_reload(&mut engine, &backend, output, &config);
+        assert_eq!(height(&engine, output), 300);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_durability_tabbed_fixed_survives_same_config_reload() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, config) = tiled_durability_fixture(2, true);
+        engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+        assert_eq!(height(&engine, output), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        tiled_durability_reload(&mut engine, &backend, output, &config);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+        for tab in 0..2 {
+            select_tab(&mut engine, output, tab);
+            assert_eq!(height(&engine, output), 300);
+        }
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_durability_stacked_fixed_survives_same_config_reload() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, config) = tiled_durability_fixture(2, false);
+        engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+        let before: Vec<_> = tiled_extra_positions(&engine, output)
+            .iter()
+            .map(|(_, rect)| rect.size.h)
+            .collect();
+        assert_eq!(before, vec![300, 600]);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        tiled_durability_reload(&mut engine, &backend, output, &config);
+        let after: Vec<_> = tiled_extra_positions(&engine, output)
+            .iter()
+            .map(|(_, rect)| rect.size.h)
+            .collect();
+        assert_eq!(after, vec![300, 600]);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_durability_fixed_survives_native_width_minimum_refresh() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, config) = tiled_durability_fixture(1, false);
+        engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+        assert_eq!(height(&engine, output), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        assert!(engine.note_window_min_width(WindowId::new(-9401), 123));
+        // Isolate the actual width-only reconciliation trigger before reload.
+        assert_eq!(height(&engine, output), 300);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+        tiled_durability_reload(&mut engine, &backend, output, &config);
+        assert_eq!(height(&engine, output), 300);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}

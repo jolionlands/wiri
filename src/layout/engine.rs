@@ -2104,7 +2104,8 @@ impl TilingEngine {
         } else {
             self.window_min_widths.insert(window_id, width);
         }
-        self.sync_min_widths();
+        // A native width limit changes constraints, not the user's height request.
+        self.sync_tile_limits(false);
         true
     }
 
