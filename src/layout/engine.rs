@@ -39,6 +39,8 @@ mod monitor_actions;
 #[cfg(test)]
 mod monitor_actions_tests;
 #[cfg(test)]
+mod recent_admission_focus_parity_tests;
+#[cfg(test)]
 mod tiled_height_parity_tests;
 mod workspace_actions;
 #[cfg(test)]
