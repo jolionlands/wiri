@@ -1,6 +1,17 @@
 use super::*;
 use crate::config::types::SizeSpec;
 
+/// Old effective options and apparent geometry, retained only while publishing
+/// an infrequent configuration change. The window IDs guard column identity.
+pub(super) struct TiledHeightSnapshot {
+    output: OutputId,
+    workspace: i32,
+    column: usize,
+    windows: Vec<WindowId>,
+    presets: Vec<SizeSpec>,
+    rendered: Vec<i32>,
+}
+
 impl TilingEngine {
     pub(super) fn column_presets(&self, output: OutputId) -> Vec<SizeSpec> {
         Self::column_presets_from_config(self.active_workspace_config(output))
@@ -50,6 +61,79 @@ impl TilingEngine {
                 .collect()
         } else {
             configured.clone()
+        }
+    }
+
+    /// Read the old views before publishing either the global layout or caches.
+    /// Hidden tabs are projected independently by the pure geometry helper.
+    pub(super) fn capture_tiled_height_presets(&self) -> Vec<TiledHeightSnapshot> {
+        let mut snapshots = Vec::new();
+        for (output, monitor) in self.monitors.iter() {
+            for (workspace, strip) in &monitor.workspaces {
+                let presets = self.window_height_presets_for_workspace(*output, *workspace);
+                for (column, tiles) in strip.columns.iter().enumerate() {
+                    if tiles.tiles.is_empty() {
+                        continue;
+                    }
+                    let Some(rendered) =
+                        self.tiled_column_rendered_heights(*output, *workspace, column)
+                    else {
+                        continue;
+                    };
+                    snapshots.push(TiledHeightSnapshot {
+                        output: *output,
+                        workspace: *workspace,
+                        column,
+                        windows: tiles.tiles.iter().map(|tile| tile.window_id).collect(),
+                        presets: presets.clone(),
+                        rendered,
+                    });
+                }
+            }
+        }
+        snapshots
+    }
+
+    /// niri Column::update_config converts every height to Auto when its
+    /// effective list changes, including Fixed requests unrelated to presets.
+    pub(super) fn refresh_tiled_height_presets(&mut self, snapshots: Vec<TiledHeightSnapshot>) {
+        for snapshot in snapshots {
+            if snapshot.presets
+                == self.window_height_presets_for_workspace(snapshot.output, snapshot.workspace)
+            {
+                continue;
+            }
+            let Some(column) = self
+                .monitors
+                .get_mut(&snapshot.output)
+                .and_then(|monitor| monitor.workspaces.get_mut(&snapshot.workspace))
+                .and_then(|workspace| workspace.columns.get_mut(snapshot.column))
+            else {
+                continue;
+            };
+            if column.tiles.len() != snapshot.rendered.len()
+                || !column
+                    .tiles
+                    .iter()
+                    .map(|tile| tile.window_id)
+                    .eq(snapshot.windows.iter().copied())
+            {
+                continue;
+            }
+            let mut sorted = snapshot.rendered.clone();
+            sorted.sort_unstable();
+            let median = sorted[sorted.len() / 2].max(1) as f32;
+            for (tile, height) in column.tiles.iter_mut().zip(snapshot.rendered) {
+                tile.height_weight = height.max(1) as f32 / median;
+                tile.preferred_height = None;
+                tile.height_proportion = None;
+                tile.height_preset_idx = None;
+            }
+            // Clear the source as well as derived metadata: a later limit sync
+            // must not restore an opening default after the Auto conversion.
+            for window in snapshot.windows {
+                self.rule_heights.remove(&window);
+            }
         }
     }
 

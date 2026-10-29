@@ -573,3 +573,431 @@ fn parity_tiled_durability_fixed_survives_native_width_minimum_refresh() {
     });
     assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
 }
+
+// TEMP append-only fragment for engine/tiled_height_parity_tests.rs.
+// Pin e19df12 scrolling.rs4094-4097,5212-5233: an effective preset-height-list
+// change converts every tiled request to Auto, preserving apparent ratios.
+// Reuses the frozen child's invalid-HWND fixture and actual reload sequence.
+
+fn tiled_list_output_override(config: &mut crate::config::Config, presets: Vec<SizeSpec>) {
+    let mut output = crate::config::Config::default().output.remove(0);
+    output.name = "tiled-height-model".to_string();
+    output.layout_override = Some(crate::config::LayoutConfigPartial {
+        preset_window_heights: Some(presets),
+        ..Default::default()
+    });
+    config.output = vec![output];
+}
+
+fn tiled_list_assert_auto(engine: &TilingEngine, output: OutputId) {
+    for tile in &engine
+        .monitors
+        .get(&output)
+        .unwrap()
+        .workspace()
+        .unwrap()
+        .columns[0]
+        .tiles
+    {
+        assert_eq!(tile.preferred_height, None);
+        assert_eq!(tile.height_proportion, None);
+        assert_eq!(tile.height_preset_idx, None);
+    }
+}
+
+#[test]
+fn parity_tiled_list_sole_fixed_changed_back_reload_starts_fresh() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, mut a) = tiled_durability_fixture(1, false);
+        a.layout.preset_window_heights = vec![SizeSpec::Fixed(300), SizeSpec::Fixed(600)];
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        engine.switch_preset_window_height(true, &backend);
+        assert_eq!(height(&engine, output), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        let mut b = a.clone();
+        b.layout.preset_window_heights = vec![SizeSpec::Fixed(200), SizeSpec::Fixed(700)];
+        tiled_durability_reload(&mut engine, &backend, output, &b);
+        assert_eq!(height(&engine, output), 900);
+        tiled_list_assert_auto(&engine, output);
+        // No cycle on B: returning to A must not revive its old index/request.
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        assert_eq!(height(&engine, output), 900);
+        tiled_list_assert_auto(&engine, output);
+        engine.switch_preset_window_height(true, &backend);
+        assert_eq!(height(&engine, output), 300);
+        engine.switch_preset_window_height(false, &backend);
+        assert_eq!(height(&engine, output), 600);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_list_tabbed_output_proportion_changed_back_resets_all_tabs() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, mut a) = tiled_durability_fixture(2, true);
+        a.layout.preset_window_heights = vec![SizeSpec::Fixed(111)];
+        tiled_list_output_override(
+            &mut a,
+            vec![SizeSpec::Proportion(0.25), SizeSpec::Proportion(0.5)],
+        );
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        engine.switch_preset_window_height(true, &backend);
+        assert_eq!(height(&engine, output), 225);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        let mut b = a.clone();
+        tiled_list_output_override(
+            &mut b,
+            vec![SizeSpec::Proportion(0.4), SizeSpec::Proportion(0.8)],
+        );
+        tiled_durability_reload(&mut engine, &backend, output, &b);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+        tiled_list_assert_auto(&engine, output);
+        for tab in 0..2 {
+            select_tab(&mut engine, output, tab);
+            assert_eq!(height(&engine, output), 900);
+        }
+        select_tab(&mut engine, output, 0);
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        tiled_list_assert_auto(&engine, output);
+        for tab in 0..2 {
+            select_tab(&mut engine, output, tab);
+            assert_eq!(height(&engine, output), 900);
+        }
+        select_tab(&mut engine, output, 0);
+        engine.switch_preset_window_height(false, &backend);
+        assert_eq!(height(&engine, output), 450);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_list_stacked_direct_fixed_converts_to_apparent_auto_ratios() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, mut a) = tiled_durability_fixture(3, false);
+        a.layout.preset_window_heights = vec![SizeSpec::Fixed(300), SizeSpec::Fixed(600)];
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        engine.set_window_height_by(SizeChange::SetFixed(450), &backend);
+        let before: Vec<_> = tiled_extra_positions(&engine, output)
+            .iter()
+            .map(|(_, r)| r.size.h)
+            .collect();
+        assert_eq!(before, vec![450, 225, 225]);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        let mut b = a.clone();
+        b.layout.preset_window_heights = vec![SizeSpec::Fixed(250), SizeSpec::Fixed(750)];
+        tiled_durability_reload(&mut engine, &backend, output, &b);
+        tiled_list_assert_auto(&engine, output);
+        let weights: Vec<_> = engine
+            .monitors
+            .get(&output)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles
+            .iter()
+            .map(|tile| tile.height_weight)
+            .collect();
+        assert_eq!(weights, vec![2.0, 1.0, 1.0]);
+        let after: Vec<_> = tiled_extra_positions(&engine, output)
+            .iter()
+            .map(|(_, r)| r.size.h)
+            .collect();
+        assert_eq!(after, vec![450, 225, 225]);
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        tiled_list_assert_auto(&engine, output);
+        engine.sync_monitor_with_scale(
+            output,
+            Rect::new(0, 0, 1200, 1200),
+            Rect::new(0, 0, 1200, 1200),
+            1.0,
+        );
+        let resized: Vec<_> = tiled_extra_positions(&engine, output)
+            .iter()
+            .map(|(_, r)| r.size.h)
+            .collect();
+        assert_eq!(resized, vec![600, 300, 300]);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_list_unchanged_output_override_retains_index_across_global_reload() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, mut a) = tiled_durability_fixture(2, true);
+        a.layout.preset_window_heights = vec![SizeSpec::Fixed(111), SizeSpec::Fixed(222)];
+        tiled_list_output_override(
+            &mut a,
+            vec![SizeSpec::Proportion(0.25), SizeSpec::Proportion(0.5)],
+        );
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        engine.switch_preset_window_height(true, &backend);
+        assert_eq!(height(&engine, output), 225);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        let mut b = a.clone();
+        b.layout.preset_window_heights = vec![SizeSpec::Fixed(777)];
+        tiled_durability_reload(&mut engine, &backend, output, &b);
+        assert_eq!(height(&engine, output), 225);
+        let tile = &engine
+            .monitors
+            .get(&output)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .columns[0]
+            .tiles[0];
+        assert_eq!(tile.height_proportion, Some(0.25));
+        assert_eq!(tile.height_preset_idx, Some(0));
+        engine.switch_preset_window_height(true, &backend);
+        assert_eq!(height(&engine, output), 450);
+        tiled_durability_reload(&mut engine, &backend, output, &b);
+        assert_eq!(height(&engine, output), 450);
+        engine.switch_preset_window_height(false, &backend);
+        assert_eq!(height(&engine, output), 225);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_list_opening_fixed_fallback_does_not_resurrect_after_change() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output, mut a) = tiled_durability_fixture(1, false);
+        a.layout.preset_window_heights = vec![SizeSpec::Fixed(300), SizeSpec::Fixed(600)];
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        let target = WindowId::new(-9401);
+        // Existing engine representation of an applied opening-height request;
+        // rule matching/admission is independently covered by the sibling lane.
+        engine.rule_heights.insert(target, 300);
+        engine.sync_tile_limits(false);
+        assert_eq!(height(&engine, output), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        let mut b = a.clone();
+        b.layout.preset_window_heights = vec![SizeSpec::Fixed(200), SizeSpec::Fixed(700)];
+        tiled_durability_reload(&mut engine, &backend, output, &b);
+        engine.sync_tile_limits(false);
+        assert_eq!(height(&engine, output), 900);
+        tiled_list_assert_auto(&engine, output);
+        assert!(!engine.rule_heights.contains_key(&target));
+        tiled_durability_reload(&mut engine, &backend, output, &a);
+        engine.sync_tile_limits(false);
+        assert_eq!(height(&engine, output), 900);
+        tiled_list_assert_auto(&engine, output);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+// Append-only follow-up to the qualified tiled-height child.
+// Default heights initialize only the admitted window. Dynamic constraints
+// clamp the stored Fixed request without replacing its source intention.
+
+fn tiled_reconcile_title_rule(
+    pattern: &str,
+    rule: crate::config::WindowRule,
+) -> crate::config::WindowRule {
+    crate::config::WindowRule {
+        match_groups: vec![crate::config::types::MatchGroup {
+            conds: vec![crate::config::types::Matcher::TitleSearch(
+                crate::config::types::RegexPat::new(pattern).unwrap(),
+            )],
+        }],
+        ..rule
+    }
+}
+
+fn tiled_reconcile_open(
+    engine: &mut TilingEngine,
+    backend: &BackendHandle,
+    output: OutputId,
+    hwnd: isize,
+    title: &str,
+) {
+    engine.add_window_with_target(
+        WindowInfo {
+            hwnd,
+            title: title.to_string(),
+            class_name: "TiledHeightReconcileFixture".to_string(),
+            process_id: 1000,
+            bounds: Rect::new(100, 100, 700, 500),
+            state: crate::backend::WindowState::Normal,
+            is_visible: true,
+        },
+        AddWindowTarget::Output(output),
+        backend,
+        false,
+    );
+    assert!(engine.locate_window(WindowId::new(hwnd)).is_some());
+    assert!(!engine.floating_windows.contains(&WindowId::new(hwnd)));
+}
+
+fn tiled_reconcile_fixture(
+    extra_rules: Vec<crate::config::WindowRule>,
+) -> (TilingEngine, BackendHandle, OutputId) {
+    let config = tiled_durability_config();
+    let mut engine = TilingEngine::new(LayoutConfig::from_config(&config));
+    let backend = BackendHandle::default_for_test();
+    let output = OutputId::from_name("tiled-height-reconcile-model");
+    engine.register_monitor(
+        output,
+        Rect::new(0, 0, 1200, 900),
+        Rect::new(0, 0, 1200, 900),
+    );
+    let mut rules = vec![crate::config::WindowRule {
+        open_floating: Some(false),
+        open_focused: Some(false),
+        ..crate::config::WindowRule::default()
+    }];
+    rules.extend(extra_rules);
+    engine.set_window_rules(rules);
+    tiled_reconcile_open(&mut engine, &backend, output, -9601, "source");
+    // Observe the already-managed source foreground through the public event
+    // path. No activation request, fake expiry, or synthetic input is involved.
+    assert!(engine
+        .sync_os_foreground(WindowId::new(-9601), &backend)
+        .is_some());
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().focus_window,
+        Some(WindowId::new(-9601)),
+    );
+    (engine, backend, output)
+}
+
+fn tiled_reconcile_height(engine: &TilingEngine, output: OutputId, hwnd: isize) -> u32 {
+    tiled_extra_positions(engine, output)
+        .into_iter()
+        .find(|(window, _)| *window == WindowId::new(hwnd))
+        .expect("managed fixture must have pure layout geometry")
+        .1
+        .size
+        .h
+}
+
+fn tiled_reconcile_min_width(engine: &TilingEngine, output: OutputId, hwnd: isize) -> u32 {
+    engine
+        .monitors
+        .get(&output)
+        .unwrap()
+        .workspace()
+        .unwrap()
+        .columns
+        .iter()
+        .flat_map(|column| column.tiles.iter())
+        .find(|tile| tile.window_id == WindowId::new(hwnd))
+        .unwrap()
+        .min_width
+}
+
+fn tiled_reconcile_opening_defaults() -> Vec<crate::config::WindowRule> {
+    vec![
+        tiled_reconcile_title_rule(
+            "^source",
+            crate::config::WindowRule {
+                default_window_height: Some(Some(SizeSpec::Fixed(450))),
+                ..crate::config::WindowRule::default()
+            },
+        ),
+        tiled_reconcile_title_rule(
+            "^newcomer$",
+            crate::config::WindowRule {
+                default_window_height: Some(Some(SizeSpec::Fixed(200))),
+                ..crate::config::WindowRule::default()
+            },
+        ),
+    ]
+}
+
+#[test]
+fn parity_tiled_reconcile_direct_fixed_survives_dynamic_width_rule_replace_remove() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let mut rules = tiled_reconcile_opening_defaults();
+        rules.push(tiled_reconcile_title_rule(
+            "^source-limited$",
+            crate::config::WindowRule {
+                min_width: Some(123),
+                ..crate::config::WindowRule::default()
+            },
+        ));
+        rules.push(tiled_reconcile_title_rule(
+            "^source-wide$",
+            crate::config::WindowRule {
+                min_width: Some(234),
+                ..crate::config::WindowRule::default()
+            },
+        ));
+        let (mut engine, backend, output) = tiled_reconcile_fixture(rules);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 450);
+        engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        for (title, minimum) in [("source-limited", 123), ("source-wide", 234), ("source", 0)] {
+            engine.window_title_changed(WindowId::new(-9601), title, &backend);
+            assert_eq!(tiled_reconcile_min_width(&engine, output, -9601), minimum);
+            assert_eq!(tiled_reconcile_height(&engine, output, -9601), 300);
+            assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+        }
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_reconcile_direct_fixed_returns_after_dynamic_height_cap_removed() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output) =
+            tiled_reconcile_fixture(vec![tiled_reconcile_title_rule(
+                "^source-capped$",
+                crate::config::WindowRule {
+                    max_height: Some(250),
+                    ..crate::config::WindowRule::default()
+                },
+            )]);
+        engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        engine.window_title_changed(WindowId::new(-9601), "source-capped", &backend);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 250);
+        engine.window_title_changed(WindowId::new(-9601), "source", &backend);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 300);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_reconcile_new_admission_preserves_existing_direct_fixed() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output) =
+            tiled_reconcile_fixture(tiled_reconcile_opening_defaults());
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 450);
+        engine.set_window_height_by(SizeChange::SetFixed(300), &backend);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 300);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        tiled_reconcile_open(&mut engine, &backend, output, -9602, "newcomer");
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 300);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9602), 200);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}
+
+#[test]
+fn parity_tiled_reconcile_admission_and_default_only_rematch_keep_opening_heights() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output) =
+            tiled_reconcile_fixture(tiled_reconcile_opening_defaults());
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 450);
+        let focus = engine.monitors.get(&output).unwrap().focus_window;
+        tiled_reconcile_open(&mut engine, &backend, output, -9602, "newcomer");
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 450);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9602), 200);
+        // The default rule stops matching, but defaults are opening-only.
+        engine.window_title_changed(WindowId::new(-9602), "no-default-match", &backend);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9601), 450);
+        assert_eq!(tiled_reconcile_height(&engine, output, -9602), 200);
+        assert_eq!(engine.monitors.get(&output).unwrap().focus_window, focus);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}

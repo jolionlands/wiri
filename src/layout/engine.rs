@@ -2124,16 +2124,17 @@ impl TilingEngine {
     }
 
     /// Copy what is known of each window onto its tile: the minimum width the window
-    /// answered, the size limits and the height its window rule asks for (a tile is made
-    /// anew when a window moves to another workspace or stops floating).  The minimum width
+    /// answered, the size limits and any missing opening-rule height (a tile is made
+    /// anew when a window moves to another workspace or stops floating). Existing height
+    /// requests survive constraint, appearance and structural refreshes. The minimum width
     /// of a tile is the larger of what the window says and what its rule says; the limits
     /// of a rule are for the window, so the border around it comes on top.
     fn sync_min_widths(&mut self) {
-        self.sync_tile_limits(true);
+        self.sync_tile_limits(false);
     }
 
-    /// Structural transfers refresh output-relative limits without erasing native/user
-    /// preferred heights. Rule/config updates retain their existing reset semantics.
+    /// Refresh output-relative limits, filling missing rule heights without replacing
+    /// existing requests unless the caller explicitly resets them.
     fn sync_tile_limits(&mut self, reset_heights: bool) {
         let known = &self.window_min_widths;
         let native = &self.native_bounds_cache;
@@ -6018,9 +6019,10 @@ impl TilingEngine {
 
     /// Update the layout configuration (e.g., on config reload)
     pub fn update_config(&mut self, config: LayoutConfig) {
+        let tiled_heights = self.capture_tiled_height_presets();
         self.config = config;
         // Runtime ReserveArea changes reach cached output/workspace views too.
-        self.refresh_layout_views();
+        self.refresh_layout_views_with_tiled_heights(tiled_heights);
     }
 
     /// A physical IPC reservation overlays the canonical global layer, including zero.

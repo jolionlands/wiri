@@ -26,9 +26,20 @@ impl TilingEngine {
     /// Rebuild the cached global -> output -> workspace layout views only. A config
     /// reload (or a runtime reservation change) uses this: it never moves a workspace.
     pub(super) fn refresh_layout_views(&mut self) {
+        let tiled_heights = self.capture_tiled_height_presets();
+        self.refresh_layout_views_with_tiled_heights(tiled_heights);
+    }
+
+    /// update_config captures before replacing the global layer; other callers
+    /// capture through refresh_layout_views before discarding the old caches.
+    pub(super) fn refresh_layout_views_with_tiled_heights(
+        &mut self,
+        tiled_heights: Vec<presets::TiledHeightSnapshot>,
+    ) {
         self.config_per_monitor.clear();
         self.config_per_workspace.clear();
         let Some(mut config) = self.full_config.clone() else {
+            self.refresh_tiled_height_presets(tiled_heights);
             return;
         };
         // Runtime requests retain their units independently of every projected view.
@@ -112,6 +123,7 @@ impl TilingEngine {
             views.insert(workspace.name.clone(), per_output);
         }
         self.config_per_workspace = views;
+        self.refresh_tiled_height_presets(tiled_heights);
         self.refresh_float_presets();
     }
 
