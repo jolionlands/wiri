@@ -471,9 +471,22 @@ native tiled-height and mixed-DPI qualification keep both height rows partial.
   All 197 inputs qualify; only four formatted files were imported and 193 other
   inputs were preserved. See the
   [tiled-height evidence](../../parity/2026-10-29-tridaris-r4.md#tiled-height-ownership-and-resize).
-- [ ] Qualify direct-request retention when limits/rules change. Four TEMP tests
-  (three reload controls and a public native-minimum-width discriminator) remain
-  unregistered/unexecuted; a same-config reload failure is not established.
+- [x] Observe durability RED: three same-config reload controls pass; the native
+  minimum-width callback clears Fixed300 to 900. All 50 prior controls pass.
+- [x] Qualify `3d7c8f6`: only that caller uses nonresetting limit
+  synchronization; generic rule/config callers remain unchanged. Four cases,
+  prior controls, 2,095 tests and 19 source
+  gates/build pass. The two-file guarded import verifies all 197 inputs and
+  preserves 195 others. See the
+  [durability evidence](../../parity/2026-10-29-tridaris-r4.md#tiled-height-request-durability).
+- [ ] Qualify broader rule/limit request lifecycle through distinct acceptance
+  cases; a same-config reload failure is not established.
+- [ ] Observe tiled effective preset-list changes, including A-to-B-to-A and
+  unchanged-list controls. Pinned niri `scrolling.rs:4094` resets tiled heights
+  to Auto when the list changes; the current list-identity refresh covers floats.
+- [ ] Observe direct Fixed retention across dynamic rule-limit updates and new
+  window admission. Their generic `sync_min_widths` callers remain unchanged;
+  possible request loss is a source-backed candidate, without an executed RED.
 - [ ] Add native tiled-height and mixed-DPI evidence separately; the prior native
   floating-height result remains bound to `69e0eb7`. No row promotion.
 
@@ -517,8 +530,10 @@ cleaned up; R3 waits for three seconds of stable managed admission before its
 one explicit focus request. This fixture correction does not fix the queued
 explicit-focus/admission interaction. Later width checkpoint `351065a` passed
 2,070 tests; tiled-height checkpoint `1cb2a25` passed 2,091 and all 18 source gates,
-including the release build. Tiled ownership/resize is source-qualified; request
-lifecycle under limits/rules, native tiled height and mixed-DPI hardware remain open.
+including the release build. The later durability checkpoint `3d7c8f6`
+passes 2,095 tests and 19 source gates/build,
+closing native minimum-width request loss while leaving generic rule/config callers unchanged.
+Broader rule/limit lifecycle, native tiled height and mixed-DPI hardware remain open.
 The separate Task19 graphics run passed its real BMP test with no display skip,
 and froze a new 245-file source/bin base graph used by the composed native run.
 The matrix remains **303/396 (76.5%), 93 partial**, with no height-row promotion.

@@ -130,6 +130,15 @@ verified; the guarded import changed only four formatted files. This adds no
 native or performance result. See the
 [tiled-height evidence](2026-10-29-tridaris-r4.md#tiled-height-ownership-and-resize).
 
+The later durability checkpoint `3d7c8f6` passed **four retention
+cases**, all prior controls and **2,095 Rust tests**, with
+**19 source gates** and the release build passing.
+Three same-config reload controls already passed in RED; native minimum-width
+refresh caused the actual 300-to-900 px request loss. Only that caller now
+preserves the height request; generic rule/config synchronization is unchanged.
+The two-file guarded import verifies all 197 inputs. See the
+[durability evidence](2026-10-29-tridaris-r4.md#tiled-height-request-durability).
+
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
@@ -137,8 +146,8 @@ curated hotkey list move to done. The current totals are
 **303 done / 93 partial / 89 N/A** across 485 rows:
 **303/396 applicable rows (76.5%)**. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
-remain partial: direct-request retention under limits/rule changes and native
-tiled-height/mixed-DPI qualification remain open. Earlier floating native evidence
+remain partial for native tiled-height/mixed-DPI qualification; broader rule/limit
+lifecycle changes need their own acceptance cases. Earlier floating native evidence
 retains its own source binding.
 Appearance scaling, remaining height lifecycle, input/config semantics and
 hardware evidence remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
