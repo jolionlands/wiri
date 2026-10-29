@@ -390,7 +390,7 @@ impl TilingEngine {
             &explicit,
             &minimums,
             &maximums,
-            Self::tiling_work_rect(monitor, cfg).size.w as i32,
+            Self::precise_tiling_area(monitor, cfg).width,
             cfg.column_gap,
             cfg,
         );

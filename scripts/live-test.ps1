@@ -2626,8 +2626,8 @@ $h15TypedTold = @(EvOf $new 'workspace_activated' | Where-Object { [int64]$_.dat
 $h15TypedAccepted = ($typedReply -match '"success":\s*true') -and ($h15TypedTold.Count -eq 1)
 $null = Ctl 'h15-ws1-again' @('action', 'focus-workspace', '1'); Start-Sleep -Milliseconds 2000
 
-# (j) --id names the window to act on: fullscreen-window --id <a window that is not focused>.  The window is focused first
-# (niri leaves the focus; wiri's documented approximation), then it is fullscreen
+# (j) --id names the window to act on: fullscreen-window --id <a window that is not focused>.
+# niri makes that window fullscreen while leaving native, managed and stream focus alone.
 FocusForm $k1
 # Native focus alone is not the event-stream precondition. Otherwise a setup
 # observation still in flight can leave the stream on k3 and dedup its return.
@@ -2657,16 +2657,35 @@ $h15IdMark = @(EvList $evAll).Count
 $new = @(H15Step { $null = Ctl 'h15-fullscreen-id' @('action', 'fullscreen-window', '--id', [string][int64]$k3) } 2400)
 $h15IdFs = @(EvWindow $new 'window_opened_or_changed' $k3)
 $h15IdFocus = @(EvOf $new 'window_focus_changed' | Where-Object { [int64]$_.data.id -eq [int64]$k3 })
+$h15IdAfterQuery = PipeRequest '{"type":"focused_window"}' | ConvertFrom-Json
+$h15IdManagedFocus = $h15IdAfterQuery.result.focused_window.id
+$h15IdStreamFocus = $null
+foreach ($event in @(EvList $evAll)) {
+    if ($event.type -eq 'windows_changed') {
+        $focused = @($event.data.windows | Where-Object { $_.is_focused })
+        $h15IdStreamFocus = if ($focused.Count -eq 1) { $focused[0].id } else { $null }
+    } elseif ($event.type -eq 'window_focus_changed') {
+        $h15IdStreamFocus = $event.data.id
+    }
+}
 $h15IdForeground = [int64][LT]::GetForegroundWindow()
-$h15IdActs = $h15IdSetup -and ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 1) -and ($h15IdForeground -eq [int64]$k3)
-[pscustomobject]@{ setup_pass=$h15IdSetup; setup_expected=[int64]$k1; setup_samples=$h15IdSetupSamples.ToArray(); event_mark=$h15IdMark; expected=[int64]$k3; fullscreen_change_count=$h15IdFs.Count; focus_change_count=$h15IdFocus.Count; foreground_after=$h15IdForeground; pass=$h15IdActs; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-fullscreen-id.evidence.json')
+$h15IdActs = $h15IdSetup -and ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 0) -and
+    ($h15IdForeground -eq [int64]$k1) -and $h15IdAfterQuery.success -and ($null -ne $h15IdManagedFocus) -and ([int64]$h15IdManagedFocus -eq [int64]$k1) -and
+    ($null -ne $h15IdStreamFocus) -and ([int64]$h15IdStreamFocus -eq [int64]$k1)
+[pscustomobject]@{ setup_pass=$h15IdSetup; setup_expected=[int64]$k1; setup_samples=$h15IdSetupSamples.ToArray(); event_mark=$h15IdMark; expected=[int64]$k3; focus_expected=[int64]$k1; fullscreen_change_count=$h15IdFs.Count; focus_change_count=$h15IdFocus.Count; foreground_after=$h15IdForeground; managed_after=$h15IdManagedFocus; stream_after=$h15IdStreamFocus; pass=$h15IdActs; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-fullscreen-id.evidence.json')
 $null = Ctl 'h15-fullscreen-id-off' @('action', 'fullscreen-window', '--id', [string][int64]$k3); Start-Sleep -Milliseconds 2200
-# close-window --id closes that window and leaves the focus where it is
+# Arrange a different foreground window before closing k1 by id: fullscreen above deliberately kept k1 focused.
+FocusForm $k3
+$h15CloseSetup = WaitForeground $k3 300 8000
 $h15FgBeforeClose = [int64][LT]::GetForegroundWindow()
-$new = @(H15Step { $null = Ctl 'h15-close-id' @('action', 'close-window', '--id', [string][int64]$k1) } 2400)
+$h15CloseSetup = $h15CloseSetup -and ($h15FgBeforeClose -eq [int64]$k3) -and [LT]::IsWindow($k1)
+$new = @()
+if ($h15CloseSetup) { $new = @(H15Step { $null = Ctl 'h15-close-id' @('action', 'close-window', '--id', [string][int64]$k1) } 2400) }
 $h15Closed = @(EvOf $new 'window_closed' | Where-Object { [int64]$_.data.id -eq [int64]$k1 })
-$h15CloseById = ($h15Closed.Count -eq 1) -and ([int64]$h15Closed[0].data.window_hwnd -eq [int64]$k1) -and (-not [LT]::IsWindow($k1)) -and
-    ([int64][LT]::GetForegroundWindow() -eq $h15FgBeforeClose) -and ($h15FgBeforeClose -eq [int64]$k3)
+$h15FgAfterClose = [int64][LT]::GetForegroundWindow()
+$h15CloseById = $h15CloseSetup -and ($h15Closed.Count -eq 1) -and ([int64]$h15Closed[0].data.window_hwnd -eq [int64]$k1) -and (-not [LT]::IsWindow($k1)) -and
+    ($h15FgAfterClose -eq $h15FgBeforeClose) -and ($h15FgBeforeClose -eq [int64]$k3)
+[pscustomobject]@{ setup_pass=$h15CloseSetup; target=[int64]$k1; focus_expected=[int64]$k3; foreground_before=$h15FgBeforeClose; foreground_after=$h15FgAfterClose; closed_count=$h15Closed.Count; pass=$h15CloseById; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-close-id.evidence.json')
 
 # (k) what is wrong is said: an action that does not exist, a window that does not exist
 $bad1 = CtlRaw @('action', 'no-such-action')

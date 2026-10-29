@@ -819,12 +819,9 @@ fn reveal_scroll(engine: &TilingEngine, target: FocusTarget, percent: Option<f64
     if workspace.layout_mode != WorkspaceLayout::Scrolling {
         return Some(before);
     }
-    let config = engine.effective_config(target.output);
-    let view_width = monitor.work_area.size.w as i32
-        - config.outer_gaps.1
-        - config.outer_gaps.3
-        - config.reserve_left as i32
-        - config.reserve_right as i32;
+    let config = engine.effective_config_for_workspace(target.output, target.workspace);
+    let precise_width = TilingEngine::precise_tiling_area(monitor, config).width;
+    let view_width = precise_width.floor() as i32;
     if view_width <= 0 {
         return None;
     }
@@ -853,7 +850,7 @@ fn reveal_scroll(engine: &TilingEngine, target: FocusTarget, percent: Option<f64
         &explicit,
         &mins,
         &maxs,
-        view_width,
+        precise_width,
         config.column_gap,
         config,
     );

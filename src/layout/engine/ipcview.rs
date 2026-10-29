@@ -62,7 +62,11 @@ impl TilingEngine {
                 let work = Self::tiling_work_rect(monitor, cfg);
                 use crate::layout::workspace::WorkspaceLayout;
                 let positions = match workspace.layout_mode {
-                    WorkspaceLayout::Scrolling => self.calculate_positions(workspace, work, cfg),
+                    WorkspaceLayout::Scrolling => self.calculate_positions(
+                        workspace,
+                        Self::precise_tiling_area(monitor, cfg),
+                        cfg,
+                    ),
                     WorkspaceLayout::BStack => {
                         self.calculate_positions_bstack(workspace, work, cfg)
                     }
@@ -78,14 +82,22 @@ impl TilingEngine {
                     monitor.bounds,
                 );
                 for (window, rect) in positions {
-                    let inset = if modes.get(&window).copied().unwrap_or(DrawMode::Inset)
-                        == DrawMode::Inset
-                    {
+                    let normal =
+                        modes.get(&window).copied().unwrap_or(DrawMode::Inset) == DrawMode::Inset;
+                    let inset = if normal {
                         self.rule_border_inset(window, cfg)
                     } else {
                         0
                     };
-                    layouts.insert(window, layout_geometry(rect, monitor.bounds, scale, inset));
+                    let resolved = self.resolved_window_geometry(window, rect, cfg, inset, normal);
+                    let mut geometry = layout_geometry(resolved.tile, monitor.bounds, scale, inset);
+                    if let Some(width) = resolved.logical_window_size.0 {
+                        geometry.window_size.0 = width;
+                    }
+                    if let Some(height) = resolved.logical_window_size.1 {
+                        geometry.window_size.1 = height;
+                    }
+                    layouts.insert(window, geometry);
                 }
             }
         }
@@ -861,7 +873,7 @@ mod tests {
         let mut ring = crate::config::effects::RingStyle::focus_ring_default();
         ring.width = 11;
         override_layout.effects.focus_ring = Some(ring);
-        override_layout.outer_gaps = Some(23);
+        override_layout.outer_gaps = Some(23.0);
         let (engine, output, active, inactive) = geometry_fixture(config, Some(override_layout));
         assert_ne!(active, inactive);
         assert_eq!(

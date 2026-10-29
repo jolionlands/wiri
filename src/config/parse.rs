@@ -112,7 +112,7 @@ mod tests {
     fn test_layout_partial_apply_to_overlays_only_set_fields() {
         let mut base = LayoutConfig::default_config();
         base.column_width = 500;
-        base.inner_gaps = 16;
+        base.inner_gaps = 16.0;
         base.border_color = "#111111".to_string();
         let partial = LayoutConfigPartial {
             column_width: Some(900),
@@ -122,7 +122,10 @@ mod tests {
         let effective = partial.apply_to(&base);
         assert_eq!(effective.column_width, 900, "Some(900) wins");
         assert_eq!(effective.border_color, "#222222", "Some color wins");
-        assert_eq!(effective.inner_gaps, 16, "None field falls through to base");
+        assert_eq!(
+            effective.inner_gaps, 16.0,
+            "None field falls through to base"
+        );
     }
 
     /// Every bind of a shipped config must resolve to a real key and a real action, and the
@@ -193,8 +196,8 @@ mod tests {
         assert_eq!(cfg.layout.border_color_focused, "#3381d9");
         assert_eq!(cfg.layout.focus_ring_width, 3);
         assert_eq!(cfg.layout.focus_ring_color, "#3381d9");
-        assert_eq!(cfg.layout.inner_gaps, 16);
-        assert_eq!(cfg.layout.outer_gaps, 8);
+        assert_eq!(cfg.layout.inner_gaps, 16.0);
+        assert_eq!(cfg.layout.outer_gaps, 8.0);
         assert!(!cfg.layout.shadow_enable);
     }
 

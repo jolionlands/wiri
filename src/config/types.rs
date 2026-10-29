@@ -156,6 +156,10 @@ pub struct InputConfig {
     pub repeat_delay: u32,
     pub repeat_rate: u32,
     pub mouse_speed: f64,
+    /// niri mouse-wheel factors. None keeps the legacy scalar scroll-speed.
+    pub mouse_scroll_factor: Option<ScrollFactor>,
+    /// Preserved independently; WH_MOUSE_LL has no finger/device source tag.
+    pub touchpad_scroll_factor: Option<ScrollFactor>,
     pub mouse_acceleration: f64,
     pub natural_scroll: bool,
     pub tap_to_click: bool,
@@ -252,6 +256,8 @@ impl InputConfig {
             repeat_delay: 250,
             repeat_rate: 25,
             mouse_speed: 1.0,
+            mouse_scroll_factor: None,
+            touchpad_scroll_factor: None,
             mouse_acceleration: 0.0,
             natural_scroll: false,
             tap_to_click: false,
@@ -342,6 +348,25 @@ pub struct MouseScrollConfig {
     pub button: Option<u32>,
     pub lock: Option<bool>,
     pub natural: bool,
+}
+
+/// niri's optional base and axis overrides. The base is nonnegative; a signed
+/// axis override can reverse just that axis. Window rules remain nonnegative.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScrollFactor {
+    pub base: Option<f64>,
+    pub horizontal: Option<f64>,
+    pub vertical: Option<f64>,
+}
+
+impl ScrollFactor {
+    pub fn h_v_factors(self) -> (f64, f64) {
+        let base = self.base.unwrap_or(1.0);
+        (
+            self.horizontal.unwrap_or(base),
+            self.vertical.unwrap_or(base),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,8 +575,8 @@ pub struct OutputConfig {
 /// value".  `Some(x)` means "use this value on this output specifically".
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayoutConfigPartial {
-    pub inner_gaps: Option<u32>,
-    pub outer_gaps: Option<u32>,
+    pub inner_gaps: Option<f64>,
+    pub outer_gaps: Option<f64>,
     pub border_width: Option<u32>,
     pub border_color: Option<String>,
     pub border_color_focused: Option<String>,
@@ -594,10 +619,8 @@ pub struct LayoutConfigPartial {
     pub snap_threshold_px: Option<u32>,
     pub status_bar: Option<bool>,
     pub hide_method: Option<String>,
-    pub reserve_top: Option<i32>,
-    pub reserve_bottom: Option<i32>,
-    pub reserve_left: Option<i32>,
-    pub reserve_right: Option<i32>,
+    /// Unset edges inherit independently; explicit physical zero remains an override.
+    pub struts: Edges<Option<InsetValue>>,
     /// The `focus-ring`, `border`, `shadow`, `insert-hint` and `tab-indicator` blocks this
     /// `layout {}` names; each replaces the block of the layout it is applied to.
     pub effects: crate::config::effects::EffectsPartial,
@@ -739,17 +762,17 @@ impl LayoutConfigPartial {
         if let Some(ref v) = self.hide_method {
             out.hide_method = v.clone();
         }
-        if let Some(v) = self.reserve_top {
-            out.reserve_top = v;
+        if let Some(v) = self.struts.top {
+            out.struts.top = v;
         }
-        if let Some(v) = self.reserve_bottom {
-            out.reserve_bottom = v;
+        if let Some(v) = self.struts.bottom {
+            out.struts.bottom = v;
         }
-        if let Some(v) = self.reserve_left {
-            out.reserve_left = v;
+        if let Some(v) = self.struts.left {
+            out.struts.left = v;
         }
-        if let Some(v) = self.reserve_right {
-            out.reserve_right = v;
+        if let Some(v) = self.struts.right {
+            out.struts.right = v;
         }
         if let Some(ref v) = self.background_color {
             out.background_color = Some(v.clone());
@@ -786,8 +809,9 @@ impl Position {
 
 #[derive(Debug, Clone, Default)]
 pub struct LayoutConfig {
-    pub inner_gaps: u32,
-    pub outer_gaps: u32,
+    /// Logical gap lengths, retained exactly until projection onto an output.
+    pub inner_gaps: f64,
+    pub outer_gaps: f64,
     pub border_width: u32,
     pub border_color: String,
     pub border_color_focused: String,
@@ -869,19 +893,9 @@ pub struct LayoutConfig {
     /// undocumented shell interfaces).  Set via `hide-method` inside `layout { }`.
     pub hide_method: String,
 
-    // ---- screen-area reservation for external bars / panels ----
-    /// Pixels to subtract from the top of each monitor's tiling work area.
-    /// Set via `reserve-top N` inside `layout { }`.  Default 0.
-    pub reserve_top: i32,
-    /// Pixels to subtract from the bottom of each monitor's tiling work area.
-    /// Set via `reserve-bottom N` inside `layout { }`.  Default 0.
-    pub reserve_bottom: i32,
-    /// Pixels to subtract from the left of each monitor's tiling work area.
-    /// Set via `reserve-left N` inside `layout { }`.  Default 0.
-    pub reserve_left: i32,
-    /// Pixels to subtract from the right of each monitor's tiling work area.
-    /// Set via `reserve-right N` inside `layout { }`.  Default 0.
-    pub reserve_right: i32,
+    /// Signed per-edge insets. niri `struts` are logical; legacy `reserve-*`
+    /// spellings are physical pixels. Each edge has one authoritative value.
+    pub struts: Edges<InsetValue>,
 
     /// What the overlay layer draws around the windows: niri's `focus-ring`, `border`,
     /// `shadow`, `insert-hint` and `tab-indicator` blocks, with their colours and gradients.
@@ -899,8 +913,8 @@ pub struct LayoutConfig {
 impl LayoutConfig {
     pub fn default_config() -> Self {
         Self {
-            inner_gaps: 16,
-            outer_gaps: 8,
+            inner_gaps: 16.0,
+            outer_gaps: 8.0,
             border_width: 4,
             border_color: "#333333".to_string(),
             border_color_focused: "#0066cc".to_string(),
@@ -939,19 +953,16 @@ impl LayoutConfig {
             smart_borders: false,
             status_bar: false,
             hide_method: "hide".to_string(),
-            reserve_top: 0,
-            reserve_bottom: 0,
-            reserve_left: 0,
-            reserve_right: 0,
+            struts: Edges::default(),
             effects: crate::config::effects::Effects::default(),
             background_color: None,
         }
     }
 
-    /// Return gap sizes as an `Edges<i32>` view.
+    /// Return logical gap sizes without quantizing them.
     /// Uses `inner_gaps` for all four sides; per-side overrides are a future addition.
-    pub fn gaps_edges(&self) -> Edges<i32> {
-        let g = self.inner_gaps as i32;
+    pub fn gaps_edges(&self) -> Edges<f64> {
+        let g = self.inner_gaps;
         Edges {
             left: g,
             right: g,
@@ -1000,6 +1011,19 @@ impl LayoutConfig {
 // ---------------------------------------------------------------------------
 // LayoutConfig sub-structs and Edges generic
 // ---------------------------------------------------------------------------
+
+/// A configured inset with an explicit unit, projected once for each output.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InsetValue {
+    Logical(f64),
+    Physical(i32),
+}
+
+impl Default for InsetValue {
+    fn default() -> Self {
+        Self::Logical(0.0)
+    }
+}
 
 /// A four-sided value (e.g. gaps or padding) generic over any `Copy + Default` type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2162,12 +2186,12 @@ mod tests {
     #[test]
     fn test_layout_config_gaps_edges() {
         let mut layout = LayoutConfig::default_config();
-        layout.inner_gaps = 16;
+        layout.inner_gaps = 16.0;
         let e = layout.gaps_edges();
-        assert_eq!(e.left, 16);
-        assert_eq!(e.right, 16);
-        assert_eq!(e.top, 16);
-        assert_eq!(e.bottom, 16);
+        assert_eq!(e.left, 16.0);
+        assert_eq!(e.right, 16.0);
+        assert_eq!(e.top, 16.0);
+        assert_eq!(e.bottom, 16.0);
     }
 
     #[test]

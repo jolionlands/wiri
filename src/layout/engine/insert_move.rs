@@ -338,7 +338,8 @@ impl TilingEngine {
         if workspace.layout_mode != crate::layout::workspace::WorkspaceLayout::Scrolling {
             return None;
         }
-        let fallback = self.calculate_positions(&workspace, view, cfg);
+        let fallback =
+            self.calculate_positions(&workspace, Self::precise_tiling_area(monitor, cfg), cfg);
         let columns = column_geometry(&workspace, &fallback)?;
         let destination = insertion_destination(
             &columns,

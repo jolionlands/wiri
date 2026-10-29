@@ -145,7 +145,7 @@ pub(super) struct FocusBefore {
 /// A size from a rule as pixels of a whole tile: a proportion of `view_px` (with `gap_px`
 /// between neighbours, as niri counts it), or a fixed size of the window plus the border
 /// around it.
-pub(super) fn spec_px(spec: SizeSpec, view_px: i32, gap_px: i32, border_px: i32) -> i32 {
+pub(super) fn spec_px(spec: SizeSpec, view_px: impl Into<f64>, gap_px: i32, border_px: i32) -> i32 {
     match spec {
         SizeSpec::Proportion(p) => proportion_px(view_px, gap_px, p),
         SizeSpec::Fixed(px) => (px as i32).saturating_add(border_px),
@@ -175,12 +175,12 @@ pub(super) struct HeightSpec {
 /// * A column of one tile fills the view, within its limits.
 /// * The limits can leave part of the column empty (every tile at its maximum) or ask for
 ///   more than there is (the minimums add up to more): the heights say so.
-pub(super) fn distribute_heights(available: i32, tiles: &[HeightSpec]) -> Vec<i32> {
+pub(super) fn distribute_heights(available: impl Into<f64>, tiles: &[HeightSpec]) -> Vec<i32> {
     let n = tiles.len();
     if n == 0 {
         return Vec::new();
     }
-    let available = available.max(0);
+    let available = available.into().max(0.0);
     let limit = |height: i32, tile: &HeightSpec| -> i32 {
         let mut height = height;
         if tile.max > 0 {
@@ -189,7 +189,7 @@ pub(super) fn distribute_heights(available: i32, tiles: &[HeightSpec]) -> Vec<i3
         height.max(tile.min.max(0))
     };
     if n == 1 {
-        return vec![limit(available, &tiles[0])];
+        return vec![limit(available.floor() as i32, &tiles[0])];
     }
 
     let mut height: Vec<Option<i32>> = tiles
@@ -203,32 +203,48 @@ pub(super) fn distribute_heights(available: i32, tiles: &[HeightSpec]) -> Vec<i3
     }
     let takers = height.iter().filter(|h| h.is_none()).count() as i32;
     let asked: i32 = height.iter().flatten().sum();
-    let budget = (available - takers * LEAST_AUTO_TILE_PX).max(0);
-    if asked > budget && asked > 0 {
-        let scale = budget as f64 / asked as f64;
+    let budget = (available - (takers * LEAST_AUTO_TILE_PX) as f64).max(0.0);
+    if asked as f64 > budget && asked > 0 {
+        let scale = budget / asked as f64;
         for (i, h) in height.iter_mut().enumerate() {
             if let Some(h) = h {
                 *h = limit((*h as f64 * scale).floor() as i32, &tiles[i]);
             }
         }
     }
-    let mut rest = available - height.iter().flatten().sum::<i32>();
+    let mut rest = available - height.iter().flatten().sum::<i32>() as f64;
 
     // The others share `rest` by weight.  One that would end up outside its limits is held to
     // the limit and the rest is shared again among those that are left.
     let mut open: Vec<usize> = (0..n).filter(|&i| height[i].is_none()).collect();
     while !open.is_empty() {
-        let weights: Vec<f32> = open.iter().map(|&i| tiles[i].weight.max(0.1)).collect();
-        let total: f32 = weights.iter().sum();
-        let shares: Vec<i32> = weights
-            .iter()
-            .map(|w| ((rest as f32) * (w / total)).floor() as i32)
-            .collect();
+        let shares: Vec<i32> = if available.fract() == 0.0 {
+            // Resize actions store f32 weights. Preserve their established
+            // allocation at integral extents: promoting an approximate weight
+            // before flooring can steal a pixel from an explicit height request.
+            let weights: Vec<f32> = open.iter().map(|&i| tiles[i].weight.max(0.1)).collect();
+            let total: f32 = weights.iter().sum();
+            weights
+                .iter()
+                .map(|w| ((rest as f32) * (w / total)).floor() as i32)
+                .collect()
+        } else {
+            // Keep a fractional working-area extent through the final share.
+            let weights: Vec<f64> = open
+                .iter()
+                .map(|&i| tiles[i].weight.max(0.1) as f64)
+                .collect();
+            let total: f64 = weights.iter().sum();
+            weights
+                .iter()
+                .map(|w| (rest * (w / total)).floor() as i32)
+                .collect()
+        };
         let held: Vec<usize> = (0..open.len())
             .filter(|&k| limit(shares[k], &tiles[open[k]]) != shares[k])
             .collect();
         if held.is_empty() {
-            let leftover = rest - shares.iter().sum::<i32>();
+            let leftover = rest.floor() as i32 - shares.iter().sum::<i32>();
             for (k, &i) in open.iter().enumerate() {
                 let mut h = shares[k];
                 if k + 1 == open.len() && limit(h + leftover, &tiles[i]) == h + leftover {
@@ -242,7 +258,7 @@ pub(super) fn distribute_heights(available: i32, tiles: &[HeightSpec]) -> Vec<i3
             let i = open[k];
             let h = limit(shares[k], &tiles[i]);
             height[i] = Some(h);
-            rest -= h;
+            rest -= h as f64;
         }
         open = open
             .iter()
@@ -433,17 +449,13 @@ impl TilingEngine {
 
     /// The height of the destination workspace's view: what a proportion of a window height is of.
     /// `None` uses the active workspace of `output`.
-    fn view_height_for(&self, output: OutputId, workspace: Option<i32>) -> i32 {
+    fn view_height_for(&self, output: OutputId, workspace: Option<i32>) -> f64 {
         let Some(monitor) = self.monitors.get(&output) else {
-            return 0;
+            return 0.0;
         };
         let cfg = self
             .effective_config_for_workspace(output, workspace.unwrap_or(monitor.active_workspace));
-        monitor.work_area.size.h as i32
-            - cfg.outer_gaps.0
-            - cfg.outer_gaps.2
-            - cfg.reserve_top as i32
-            - cfg.reserve_bottom as i32
+        Self::precise_tiling_area(monitor, cfg).height
     }
 
     /// The monitor a new window opens on, and the workspace there when the rules name one:
@@ -502,7 +514,7 @@ impl TilingEngine {
         let monitor = self.monitors.get(&output)?;
         let cfg = self
             .effective_config_for_workspace(output, workspace.unwrap_or(monitor.active_workspace));
-        let view = Self::view_width_for_monitor(monitor, cfg);
+        let view = Self::precise_tiling_area(monitor, cfg).width;
         let border = 2 * rules
             .effects
             .border
@@ -510,7 +522,7 @@ impl TilingEngine {
         let px = match rules.default_column_width {
             Some(Some(spec)) => spec_px(spec, view, cfg.column_gap, border),
             // The empty block: the window picks its own width, that is the one it opened with.
-            Some(None) => (window.bounds.size.w as i32 + border).min(view),
+            Some(None) => (window.bounds.size.w as i32 + border).min(view.floor() as i32),
             None => return rules.default_width_px,
         };
         Some(px.clamp(Self::MIN_COLUMN_PX, Self::MAX_COLUMN_PX) as u32)

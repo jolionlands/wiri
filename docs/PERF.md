@@ -5,7 +5,60 @@ All `p_*` properties in `summary.json` are numeric **information**, never pass/f
 `-1` means unavailable, not zero cost or a passing sample. Existing live gates are untouched.
 The proposed budgets below are future acceptance criteria, not enforced by this collector.
 
-## Tridaris full-baseline checkpoint, 2026-10-28 (`f217e15`)
+## Tridaris R3 observation, 2026-10-29 UTC (`E8C1274F` source archive)
+
+The frozen full run `C:\wiri-dev\evidence\parity-full-r3-20261028-234058`
+finished with 735 passing and 111 failing desktop gates, 94 information entries
+and one cursor-restoration phase error. Builds remained stopped throughout this
+run. All 64 new H81-H86 checks passed, but the whole run is not qualified.
+
+| Observation, 28 managed windows / two sentinels | Result |
+| --- | ---: |
+| First complete IPC reply / first observed layout | 102.69 / 87.01 ms, one cold start |
+| Idle CPU / interval | Below counter resolution / 30.006 s |
+| Idle input-tick changes / positioning lines | 0 / 0 |
+| Idle context switches, endpoint lower bound | 14.73 per second |
+| Private memory, startup / after sampled actions | 13.77 / 13.61 MiB |
+| Working set, startup / after sampled actions | 35.51 / 36.82 MiB |
+| Threads, startup / after sampled actions | 14 / 15 |
+| Hotkey samples, valid / timeout / invalid preflight | 0 / 0 / 1 |
+| Hotkey latency | Unavailable |
+
+The collector requested focus of its exact owned sentinel, HWND 62067746, but
+Windows refused native activation; foreground remained HWND 86250240. The
+preflight correctly stopped before sending the hotkey batch. That foreground HWND was
+later identified as a visible elevated Windows Terminal window that predated
+this run. The evidence establishes activation refusal, not why Windows refused.
+It does not establish that all desktop failures have the same cause.
+
+A subsequent owned-window diagnostic on the same frozen binary completed four
+comparisons with clean cleanup. All 16 observations through 1,500 ms showed the
+requested owned window in the foreground. The initial foreground already belonged
+to the collector, so this did not reproduce the earlier Terminal-to-sentinel
+refusal or qualify hotkey latency. Collector, daemon and Terminal had the same
+integrity level in that diagnostic; this does not establish their earlier state.
+The original failed performance observation remains retained.
+
+A separate diagnostic retained the original daemon-first fixture startup order.
+Its first owned focus request succeeded from a medium-integrity PowerShell
+foreground window to the initially hidden, elevated owned target. That target
+remained foreground through 1,500 ms. This does not reproduce the original
+elevated-Terminal refusal. The passive state snapshots also add observation
+overhead; this diagnostic supplies no hotkey latency measurement.
+
+The idle counters and resource endpoints describe this workload. The action
+sequence omitted all ten hotkeys, so its final memory snapshot is not a matched
+comparison with f217. Two endpoints prove neither a leak nor a plateau. The
+single cold sample also has clock-mapping uncertainty (observer offsets were
+negative); its difference from the earlier run cannot establish a regression.
+
+Next qualify owned-target native foreground acknowledgement, then repeat the
+perf-only phase on the frozen binary. Retain the pre-injection refusal and record
+target/foreground ownership, focus reply and activation log. A later target-side
+geometry acknowledgement observer can separate collector wake delay; displayed
+frame timing requires separate evidence.
+
+## Historical Tridaris full-baseline checkpoint, 2026-10-28 (`f217e15`)
 
 The frozen full run at `C:\wiri-dev\evidence\parity-full-f217e15-20261028`
 recorded the following with 26 managed windows and two existing sentinels:
@@ -26,7 +79,7 @@ The run's verdict records concurrent compilation. It is not a quiet performance
 qualification, and the observer gap cannot resolve a 16 ms movement target.
 Two memory endpoints establish neither a leak nor a stable long-term plateau.
 These measurements precede the current startup, native sizing and activation fixes;
-their performance effects have not been measured. Command round-trip timings from
+they are not a matched comparison with current source. Command round-trip timings from
 focused gates are a separate measurement from hotkey-to-rectangle latency.
 
 Next: repeat the normal-desktop collector on the final frozen binary after builds

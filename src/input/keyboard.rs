@@ -15,6 +15,8 @@ pub struct BindOptions {
     pub allow_inhibiting: bool,
     pub cooldown: Option<Duration>,
     pub title: Option<Option<String>>,
+    /// The config chord contained literal `Mod`, before resolving its Win32 mask.
+    pub overlay_uses_compositor_mod: bool,
 }
 impl Default for BindOptions {
     fn default() -> Self {
@@ -24,6 +26,7 @@ impl Default for BindOptions {
             allow_inhibiting: true,
             cooldown: None,
             title: None,
+            overlay_uses_compositor_mod: false,
         }
     }
 }

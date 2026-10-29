@@ -163,7 +163,9 @@ with the floating-position worker before editing.
 - [x] Add one fixed 60-second phase, reload-stable deadline, one-shot dynamic
   reevaluation and owned-overlay refresh; keep initial-scan admission separate.
 - [x] Pass 13 deterministic regressions on Tridaris.
-- [ ] Review and run the real deadline/reload/admission desktop phase H85.
+- [x] Review and run the real deadline/reload/admission desktop phase H85:
+  ten checks passed in the frozen 861 checkpoint. The final R3 source has
+  twenty passing startup regressions after the expiry placement fixes.
 
 ### Task 9: Stable workspace IDs
 
@@ -172,7 +174,9 @@ with the floating-position worker before editing.
   across outputs, reorder/rename/relocation and reused local keys.
 - [x] Pass wire, engine and server regressions on Tridaris, including unknown-ID
   no-op behavior and malformed-reference rejection.
-- [ ] Review, document and run desktop phase H86; retain hardware limits explicitly.
+- [x] Review, document and run desktop phase H86: ten checks passed in the
+  frozen 861 checkpoint. Cross-output monitor relocation remains unverified
+  because that run had only one physical output.
 
 ### Task 10: Frozen full-baseline failures
 
@@ -189,9 +193,9 @@ with the floating-position worker before editing.
 
 - [x] Reaudit the pinned percentage contract: JSON `SetProportion(10)` is 10%,
   and typed negative Set values must retain their Set kind through dispatch.
-- [ ] Observe consumer regressions before replacing lossy argv translation with
+- [x] Observe consumer regressions before replacing lossy argv translation with
   a bounded structured size-action transport.
-- [ ] Preserve fixed/proportion units and Set/Adjust kinds; validate malformed
+- [x] Preserve fixed/proportion units and Set/Adjust kinds; validate malformed
   variants and numeric domains, including explicit window targets.
 - [ ] Review and verify actual dimensions and foreground preservation.
 
@@ -199,8 +203,8 @@ with the floating-position worker before editing.
 
 - [x] Trace logical fixed size in pinned niri and Wiri's width conversion;
   confirm tiled height resolves directly against physical view dimensions.
-- [ ] Observe 1.5-scale fixed/adjusted height regressions, with width control.
-- [ ] Scale fixed changes using the target output, retaining proportion units,
+- [x] Observe 1.5-scale fixed/adjusted height regressions, with width control.
+- [x] Scale fixed changes using the target output, retaining proportion units,
   per-workspace layout and focus behavior; review floating consistency.
 - [ ] Pass unit and native checks without treating 96-DPI evidence as mixed-DPI proof.
 
@@ -209,18 +213,20 @@ with the floating-position worker before editing.
 Confirmed remaining candidates require their own source-backed specs and tests:
 curated hotkey essential ordering/fallbacks, Mod/Super spawn eligibility and
 command descriptions, title markup, scroll-factor axis semantics/bounds, and
-middle-button emulation. Remaining matrix rows have not all been re-audited;
-retain their current status until implementation and evidence justify a change.
+middle-button emulation. The initial 94 partial rows have been audited by source;
+the action census added two missing floating-preset consumers, making 96 partial.
+Retain their status until implementation and matching evidence justify a change.
 
 ### Task 13: Explicit width targets and IPC geometry
 
 - [x] Add server-boundary typed/legacy width regressions for inactive tiled and
   floating targets, 150% DPI, unrelated columns, focus and invalid IDs.
-- [ ] Observe width-target failures, add a direct engine width operation and
+- [x] Observe width-target failures, add a direct engine width operation and
   preserve legacy `set-column-width` extension behavior separately.
 - [x] Observe fractional-DPI IPC geometry failures for disabled borders and
   inactive workspace overrides; retain enabled-border controls.
-- [ ] Verify IPC reports the same per-window border inset used for native layout.
+- [x] Verify IPC reports the same per-window border inset used for native layout
+  in deterministic engine/server tests. This does not qualify mixed-DPI hardware.
 - [ ] Review and include native foreground/dimension evidence.
 
 ### Task 14: Native margin context provenance
@@ -228,9 +234,10 @@ retain their current status until implementation and evidence justify a change.
 - [x] Observe failed-refresh cache loss and verify the same-context retention fix.
 - [x] Add the between-query transition regression: margins from context A must
   not survive failed measurement in stable context B.
-- [ ] Observe RED, preserve margin context provenance or invalidate at the
+- [x] Observe RED, preserve margin context provenance or invalidate at the
   transition boundary, and retain same-context timeout behavior.
-- [ ] Review the complete native query/cache path after covering GREEN.
+- [x] Review the complete native query/cache path after covering GREEN;
+  native-bounds round three is clean and all 28 current regressions pass.
 
 ### Task 15: Canonical fractional spacing and signed struts
 
@@ -248,11 +255,54 @@ module. Engine integration owns effective views, strip calculation, reload/scale
 invalidation, IPC geometry and runtime reservation plumbing. Freeze the shared API
 before editing these files in parallel. Appearance consumers begin after spacing.
 
-- [ ] Observe compiling decode regressions: gap 2.5 and strut -4.5 must survive
+Reuse `config::Edges<T>` for canonical `struts: Edges<InsetValue>` and partial
+`Edges<Option<InsetValue>>`, where `InsetValue` distinguishes logical `f64` from
+legacy physical `i32`. Gaps become canonical `f64`. A pure `project_spacing`
+produces integer physical gaps and fractional physical strut intermediates;
+`spacing_work_rect` returns `PhysicalWorkArea { loc: Point, width: f64, height: f64 }`,
+with the shared origin ceiling and corresponding size adjustment. Preserve its
+fractional extent through proportional sizing until final placement conversion;
+early flooring changes `floor(903.75 * 0.8) = 723` to `floor(903 * 0.8) = 722`.
+There is no implicit integer-rectangle conversion. Validate/fallback output scale
+at this boundary. Engine caches are
+derived from canonical values; no inverse projection may recreate configuration.
+
+Config/projection owns `config/types.rs`, `config/decode.rs`, the metrics module
+and config fixtures. Engine integration owns `engine.rs`, `named_config.rs`,
+`strip_model.rs`, height consumers in `rules.rs`/`presets.rs`, `ipcview.rs`,
+`input/focus.rs`, runtime-reservation IPC and startup/reload call sites. Replace
+runtime cache mutation with optional physical reservation requests, preserving
+explicit zero and existing global/output/workspace precedence. Project every
+connected output, including outputs without a layout override. Give input focus
+the same workspace work rectangle used by placement and height sizing.
+
+Sequence the shared config-file edits: Task15 config/projection freeze, then
+Task17 input-factor config edits. Task15 engine consumers can proceed alongside
+Task17 input consumers after that handoff; do not assign simultaneous ownership
+of different sections of `config/types.rs` or `config/decode.rs`.
+
+- [x] Observe compiling decode regressions: gap 2.5 and strut -4.5 must survive
   global/output/workspace parsing and reload without early integer rounding.
-- [ ] Observe engine geometry regressions through existing APIs: gap 2.5 becomes
+- [x] Observe engine geometry regressions through existing APIs: gap 2.5 becomes
   3 physical pixels at 1x and 4 at 1.5x; zero stays zero. Signed struts snap the
   resulting physical origin upward and reduce size by the same snap delta.
+- [x] Observe a trailing-fraction regression before implementation: left -4.5,
+  right 0.25 and proportion 0.8 retain width 903.75 until yielding width 723.
+- [ ] Qualify final logical window-request rounding separately: at 1x, left
+  -4.5/right 0.5/proportion 0.8 requests 722.8 logical pixels and settles at
+  722; at 1.5x, the same logical struts on a 900px physical parent request
+  482.8 logical pixels and settle at 482 logical / 723 physical pixels.
+  Preserve fractional work extents until this request boundary. Camera/reveal
+  precision remains a separate qualification from settled tile geometry.
+  Both final-request cases now have observed compiling assertion failures.
+  Resolve canonical proportional requests in logical units, subtract the
+  effective physical border in logical units, floor the client width, then
+  rasterize it to physical pixels. Share resolved native/tile rectangles and
+  the explicit logical client width with IPC. At 1.5x, an accepted logical
+  width of 483 becomes 725 physical pixels: IPC tile width is 483.333..., while
+  window width remains 483. Preserve the standalone physical API and existing
+  height policy. This width correction does not qualify appearance scaling,
+  height request rounding, camera precision or actual native acknowledgement.
 - [ ] Implement canonical values and pure projection, retaining fractional
   strut intermediates and avoiding independent side rounding or projection drift.
 - [ ] Verify 1x -> 1.5x -> 1x, inactive-workspace relocation, partial precedence,
@@ -261,6 +311,31 @@ before editing these files in parallel. Appearance consumers begin after spacing
   synthetic 1.5x evidence separate from actual mixed-DPI hardware qualification.
 
 ### Performance qualification after the integrated checkpoint
+
+The next observer should acknowledge geometry on the owned sentinel's UI thread.
+Attach a perf-only `NativeWindow` listener on that thread, arm a generation and
+baseline outside the timed interval, then capture QPC at the first armed
+`WM_WINDOWPOSCHANGED` whose immediate rectangle read differs. The injector records
+QPC before the complete SendInput batch, its accepted count and return timestamp,
+then waits once on an event. Store collector wake time separately from the target
+timestamp. Keep the previous polling metric as historical evidence, with a new
+observer/schema version for acknowledgement results.
+
+This endpoint includes target-thread message delivery; it is an upper bound on
+the rectangle change, not its exact native commit or a displayed frame. An
+out-of-context WinEvent callback includes its own queued delivery delay, and
+`DwmFlush` covers changes queued by the caller rather than a session-wide frame.
+See Microsoft's [NativeWindow documentation](https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.nativewindow?view=netframework-4.8.1),
+[WM_WINDOWPOSCHANGED](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-windowposchanged)
+and [DwmFlush](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmflush).
+
+Before collecting new latency samples, cover generation/arm/cancel/late-callback
+state, first-result retention and unchanged rectangles. Calibrate with an owned
+resize and deliberately delayed collector retrieval: target timestamps must stay
+independent of collector wake delay. Verify UI-thread attachment/release and
+destruction/timeout cleanup; preserve foreground/key preflight, partial-injection
+releases and settled-transition confirmation. Do not change global timer
+resolution, spin an observer, or claim a product speedup from changing endpoints.
 
 The f217e15 full baseline included concurrent compilation and a 33.47ms observer
 gap. Its timings cannot enforce the 16ms movement target. Current source already
@@ -275,3 +350,98 @@ the older poller roadmap in PERF.md is historical.
   synchronous activation fallback; preserve generation and completion guarantees.
 - [ ] Measure ordinary animated frame spacing separately: the existing perf
   collector disables animations. Attribute runtime costs before optimization.
+
+### Task 16: Hotkey-overlay selection and descriptions
+
+Twelve tests in `overlay/hotkey_rows.rs` use existing production APIs. Their
+baseline compiled and produced ten meaningful assertion failures and two
+passing controls. Production implementation is now authorized within this lane.
+
+- [x] Observe RED for the pinned 18 essentials/order, action-wide custom/null
+  title precedence, first-binding selection, Mod/Super spawn eligibility and
+  command-specific launch labels; retain two positive controls.
+- [x] Implement exact action selection and dynamic quit/workspace-transfer
+  fallbacks, preserving the selected bound focus variant and its description.
+- [x] Preserve literal modifier provenance through bind registration. Equivalent
+  resolved Ctrl and Mod masks are insufficient to implement pinned eligibility.
+- [x] Carry typed command-head descriptions rather than reverse-parsing Rust
+  Debug strings. Preserve custom titles and complete action-wide suppression.
+- [ ] Review and verify the actual panel, including fallback wording. Curation
+  completion does not imply Pango markup rendering parity.
+
+### Task 17: Signed axis scroll factors
+
+Eight tests in decoder and accumulator modules compiled and produced eight
+meaningful failures. Valid-syntax tests prove acceptance, not retained axis
+values; storage and consumers require their own assertions after the API exists.
+
+- [x] Observe RED for mouse/touchpad axis syntax, invalid shapes, negative axis
+  reversal and residual preservation while alternating unequal axis factors.
+- [x] Store optional typed factors: base 0..100, axes -100..100, with each axis
+  resolving override -> base -> 1. Preserve explicit legacy alias behavior.
+- [x] Apply mouse device factors after physical binding dispatch and compose
+  with the nonnegative window-rule factor. Button scrolling remains window-only.
+- [x] Retain zero suppression, self-injection bypass and independent residuals;
+  add actual stored/resolved-value and consumer regressions after the API exists.
+- [x] Review and verify native wheel effects. Touchpad syntax/storage must not
+  imply independent device routing through the device-agnostic WH_MOUSE_LL path.
+
+### Task 18: Canonical typed action and output command forms
+
+The pinned census matches all 136 bindable names; it does not establish argument
+fields or effects. Twelve tests are authored in the existing wire, output-query
+and CLI test modules. The narrow canonical correction at 0f1c4fc passes 75
+unique scoped tests, including all 12 new cases. Preserve friendly extensions as explicit
+compatibility controls while accepting canonical niri shapes.
+
+- [x] Observe RED for `SwitchLayout { layout: Next/Prev/Index }`, output
+  Mode/Scale `Automatic`, and `output NAME position set X Y`.
+- [x] Accept the pinned fields/enums/grammar and reject malformed or truncated
+  canonical requests. Keep legacy accepted aliases separate from the contract.
+- [x] Review and verify typed decoding and CLI request output. Native keyboard
+  layout acceptance and physical output changes require their own evidence.
+- [ ] Follow with the source-confirmed explicit-ID focus and typed requiredness,
+  numeric-range/default gaps; do not repeat the already fixed workspace IDs,
+  false-focus transfers, size units or floating-position defaults.
+
+### Task 19: Floating window height presets
+
+Both the general preset-height config row and action/back row remain partial:
+parsing, storage and tiled behavior work, but the floating dispatch explicitly
+does nothing. Pinned workspace routing reaches `floating.toggle_window_height`,
+which applies the configured fixed/proportional list and retains a preset index.
+The two matrix rows describe one shared implementation gap.
+
+- [ ] Add and observe dispatch/state regressions for current and explicit
+  floating targets: nonpreset first step, forward/back wrap, remembered index,
+  target effective configuration, fixed-size DPI and proportional units.
+- [ ] Implement floating height preset resolution and lifecycle without changing
+  tiled column behavior. Preserve inactive explicit-target focus where required.
+- [ ] Review and verify owned native height changes and refresh/reload retention;
+  keep actual mixed-DPI hardware evidence separate from deterministic tests.
+
+### Following source-backed queue
+
+- Full configured-title Pango semantics, literal ampersands and consistent styled
+  measurement/painting; invalid markup falls back to the whole original string.
+  A declared small subset must retain partial status.
+- General non-transfer viewport anchoring and partial-window clipping, separate
+  from the now-reviewed workspace-transfer anchor helper.
+- Ordinary application self-resize reconciliation, beyond four-axis bounds queries.
+- Floating-to-fullscreen strip semantics and correct restoration.
+- Admission-focus heuristics, continuous four-finger/touch-overview behavior,
+  and an exhaustive pinned action/CLI contract census.
+
+
+### R4 execution checkpoint, 2026-10-29 UTC
+
+All 17 combined source gates passed: 2,037 full-suite Rust tests, the separate
+graphics test, seven focused groups and both pure CI fixtures. H87 native scroll
+passed 12/12 against the new frozen binaries, versus 5/12 on R3. Numeric height
+oracles were retained while repairing an integer-allocation regression. See
+[the evidence report](../../parity/2026-10-29-tridaris-r4.md).
+
+Task15 native geometry and Task16 rendered panel checks remain pending. Next
+observe the prepared four-case mouse-origin binding baseline, then the separate
+floating-height preset baseline. No matrix promotion or new performance claim
+is made; the old full R3 desktop cycle remains failed.

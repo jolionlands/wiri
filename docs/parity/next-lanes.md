@@ -2,14 +2,57 @@
 
 > **Historical survey, superseded for assignment.** This file records the
 > `0821983` snapshot. Following the integrated and PR #2 focused verification,
-> current matrices contain **302 done / 94 partial / 89 N/A** (396 applicable
-> rows), including five corrected appearance/DPI classifications, not the 138
+> current matrices contain **300 done / 96 partial / 89 N/A** (396 applicable
+> rows), including five appearance/DPI and two floating-preset corrections, not the 138
 > partial rows below. The active
 > [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md) checks the
 > pinned source and current implementation before assigning work. In particular,
 > center-column, floating Mod grabs, gesture spring velocity/rubber-band, spawn
 > home expansion and h60/h79 coverage already exist. The proposed fullscreen
 > refusal gates below require source-semantic review, not blind implementation.
+
+## Current partial-row audit, 2026-10-28
+
+The initial 94 partial rows were rechecked against the implementation and pinned
+niri source. The action census exposed two further preset-height rows previously
+marked done and confirmed software defects in both broad action/CLI rows.
+Primary categories now sum to 96; a row can have secondary limits too.
+
+| Primary remaining condition | Layout | Config/input/IPC | Total |
+| --- | ---: | ---: | ---: |
+| Missing or incorrect software | 17 | 18 | 35 |
+| Implemented; evidence needs reconciliation | 10 | 3 | 13 |
+| Hardware evidence unavailable | 7 | 2 | 9 |
+| Windows-specific backend differences | 14 | 25 | 39 |
+| **Total partial rows** | **48** | **48** | **96** |
+
+These are prioritization categories, not completion claims or 35 independent
+coding tasks. Several metric rows share one implementation. A Windows-specific
+category describes the current adapter's approximation or rejected capability;
+it does not establish that every possible Windows implementation is impossible.
+Evidence-only rows retain partial status until their exact remaining condition
+is reconciled with source and native proof.
+
+The active next batch has tests prepared, with RED still unobserved: fractional
+logical spacing and signed struts, hotkey-overlay selection/title/launch semantics,
+and signed per-axis scroll factors. The following queue covers appearance scaling,
+general viewport anchoring and clipping, application self-resize reconciliation,
+floating fullscreen transitions, admission focus policy, and presentation-aware
+pacing. Native constraint sampling alone does not finish self-resize behavior.
+Canonical typed action fields, automatic output values, output-position CLI
+grammar and floating preset heights also have source-confirmed software gaps;
+matching action names alone does not establish their field or effect contracts.
+
+Several earlier gap descriptions below are stale: center-column, floating Mod
+grabs and positioning, typed workspace IDs and sizes, cubic Bezier, startup-rule
+timing, scalar wheel scaling, and environment-aware spawn now have implementations.
+Returning-output order and a literal `original-output` option are not pinned gaps:
+niri appends returning outputs and uses repeated `open-on-output` preferences.
+Per-device routing, global input ownership, multi-output acceptance and full Pango
+markup remain distinct questions. A small markup subset cannot close that row.
+
+Use the [active implementation plan](../superpowers/plans/2026-10-28-full-parity.md)
+for assignments. The survey below remains historical evidence.
 
 Read-only survey of every row still marked `partial` in both parity matrices, written at
 `0821983` on branch `wiri/shine-20261024`. Nothing was built, run, edited or reconfigured:

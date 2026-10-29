@@ -432,6 +432,11 @@ pub struct LayoutConfig {
     pub reserve_left: i32,
     /// Pixels reserved at the right of every monitor's tiling work area.
     pub reserve_right: i32,
+    /// Derived physical struts. Canonical logical/physical units live in `full_config`.
+    /// `None` preserves the standalone engine's legacy physical reservation API.
+    pub projected_struts: Option<crate::config::Edges<f64>>,
+    /// Scale of a canonical projection; standalone engine configs use physical sizes.
+    pub projection_scale: Option<f64>,
     /// What the overlay layer draws around the windows (niri's `focus-ring`, `border`,
     /// `shadow`, `insert-hint` and `tab-indicator`).
     pub effects: crate::config::Effects,
@@ -475,6 +480,8 @@ impl Default for LayoutConfig {
             reserve_bottom: 0,
             reserve_left: 0,
             reserve_right: 0,
+            projected_struts: None,
+            projection_scale: None,
             effects: crate::config::Effects::default(),
             background_color: None,
         }
@@ -489,14 +496,25 @@ impl LayoutConfig {
     }
 
     pub fn from_config(config: &crate::config::Config) -> Self {
+        Self::from_config_at_scale(config, 1.0)
+    }
+
+    pub fn from_config_at_scale(config: &crate::config::Config, scale: f64) -> Self {
         let mut lc = Self::default();
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        lc.projection_scale = Some(scale);
+        let spacing = crate::layout::metrics::project_spacing(&config.layout, scale);
         // inner_gaps controls spacing between columns and between stacked tiles
         // Always apply (even if 0, user explicitly set it)
-        lc.column_gap = config.layout.inner_gaps as i32;
-        lc.window_gap = config.layout.inner_gaps as i32;
+        lc.column_gap = spacing.inner_gap_px;
+        lc.window_gap = spacing.inner_gap_px;
         // outer_gaps controls padding around the edge of the monitor
         // Always apply from config
-        let og = config.layout.outer_gaps as i32;
+        let og = spacing.outer_gap_px;
         lc.outer_gaps = (og, og, og, og);
         // The border block says how much room every window leaves around itself: its width,
         // none when the border is off.
@@ -564,10 +582,12 @@ impl LayoutConfig {
         // `backdrop` is engine-only and has no counterpart in the flat KDL
         // LayoutConfig; callers set it directly on the LayoutConfig after
         // calling from_config() if they need a non-default value.
-        lc.reserve_top = config.layout.reserve_top;
-        lc.reserve_bottom = config.layout.reserve_bottom;
-        lc.reserve_left = config.layout.reserve_left;
-        lc.reserve_right = config.layout.reserve_right;
+        lc.projected_struts = Some(spacing.struts_px);
+        // Compatibility views only; no canonical value is reconstructed from these.
+        lc.reserve_top = spacing.struts_px.top.round() as i32;
+        lc.reserve_bottom = spacing.struts_px.bottom.round() as i32;
+        lc.reserve_left = spacing.struts_px.left.round() as i32;
+        lc.reserve_right = spacing.struts_px.right.round() as i32;
         lc.background_color = config
             .layout
             .background_color
@@ -717,6 +737,8 @@ pub struct TilingEngine {
     /// When each fullscreen window went fullscreen.
     fullscreen_since: HashMap<WindowId, std::time::Instant>,
     full_config: Option<crate::config::Config>,
+    /// Runtime IPC requests are physical, including explicit zero, and survive reloads.
+    runtime_reservations: crate::config::Edges<Option<i32>>,
     recent: recent::RecentState,
     animation: crate::layout::AnimationManager,
     /// Overview mode: None = normal, Some(state) = zoomed out (all workspaces stacked).
@@ -878,6 +900,7 @@ impl TilingEngine {
             unzoom_pending: HashMap::new(),
             fullscreen_since: HashMap::new(),
             full_config: None,
+            runtime_reservations: crate::config::Edges::default(),
             recent: recent::RecentState::default(),
             animation: crate::layout::AnimationManager::disabled(),
             overview: None,
@@ -1145,6 +1168,7 @@ impl TilingEngine {
                 monitor.bounds = bounds;
                 monitor.work_area = work_area;
                 monitor.scale_factor = scale_factor;
+                self.refresh_layout_views();
             }
         } else {
             self.register_monitor_with_scale(output_id, bounds, work_area, scale_factor);
@@ -2597,9 +2621,10 @@ impl TilingEngine {
 
     pub fn effective_column_width(
         num_columns: usize,
-        view_width: i32,
+        view_width: impl Into<f64>,
         config: &LayoutConfig,
     ) -> i32 {
+        let view_width = view_width.into();
         match config.column_width_mode {
             ColumnWidthMode::Fixed => config.column_width as i32,
             ColumnWidthMode::Proportional => {
@@ -2623,13 +2648,13 @@ impl TilingEngine {
     /// set (the default config uses 3) the floor is also the width at which that
     /// many columns exactly fill the view, so a fourth window scrolls into view
     /// instead of squeezing every column down to a sliver.
-    fn min_proportional_width(view_width: i32, gap: i32, cfg: &LayoutConfig) -> i32 {
+    fn min_proportional_width(view_width: impl Into<f64>, gap: i32, cfg: &LayoutConfig) -> i32 {
         let historic = cfg.column_width as i32 / 2;
         if cfg.max_visible_columns == 0 {
             return historic;
         }
         let k = cfg.max_visible_columns as i32;
-        let share = (view_width - gap * (k - 1)) / k;
+        let share = ((view_width.into() - (gap * (k - 1)) as f64) / k as f64).floor() as i32;
         historic.max(share)
     }
 
@@ -2640,10 +2665,11 @@ impl TilingEngine {
     /// over, but never get narrower than [`Self::min_proportional_width`].
     fn auto_column_width(
         explicit: &[Option<u32>],
-        view_width: i32,
+        view_width: impl Into<f64>,
         gap: i32,
         cfg: &LayoutConfig,
     ) -> i32 {
+        let view_width = view_width.into();
         match cfg.column_width_mode {
             ColumnWidthMode::Fixed => cfg.column_width as i32,
             ColumnWidthMode::Proportional => {
@@ -2653,8 +2679,9 @@ impl TilingEngine {
                 }
                 let explicit_total: i32 = explicit.iter().flatten().map(|w| *w as i32).sum();
                 let total_gaps = gap * (explicit.len() as i32 - 1).max(0);
-                let available = view_width - total_gaps - explicit_total;
-                (available / n_auto).max(Self::min_proportional_width(view_width, gap, cfg))
+                let available = view_width - total_gaps as f64 - explicit_total as f64;
+                ((available / n_auto as f64).floor() as i32)
+                    .max(Self::min_proportional_width(view_width, gap, cfg))
             }
         }
     }
@@ -2664,7 +2691,7 @@ impl TilingEngine {
     /// keeps it in both layout modes; the rest get [`Self::auto_column_width`].
     pub fn column_widths(
         explicit: &[Option<u32>],
-        view_width: i32,
+        view_width: impl Into<f64>,
         gap: i32,
         cfg: &LayoutConfig,
     ) -> Vec<i32> {
@@ -2677,7 +2704,7 @@ impl TilingEngine {
     pub fn column_widths_with_minimums(
         explicit: &[Option<u32>],
         mins: &[u32],
-        view_width: i32,
+        view_width: impl Into<f64>,
         gap: i32,
         cfg: &LayoutConfig,
     ) -> (Vec<i32>, i32) {
@@ -2700,10 +2727,11 @@ impl TilingEngine {
         explicit: &[Option<u32>],
         mins: &[u32],
         maxs: &[u32],
-        view_width: i32,
+        view_width: impl Into<f64>,
         gap: i32,
         cfg: &LayoutConfig,
     ) -> (Vec<i32>, i32) {
+        let view_width = view_width.into();
         let min_of = |i: usize| mins.get(i).copied().unwrap_or(0);
         let max_of = |i: usize| maxs.get(i).copied().unwrap_or(0);
         // `width` held to the limits of column `i`.
@@ -2763,9 +2791,10 @@ impl TilingEngine {
     /// The width a column without explicit width gets on `workspace`.
     fn workspace_default_width(
         workspace: &crate::layout::workspace::Workspace,
-        view_width: i32,
+        view_width: impl Into<f64>,
         cfg: &LayoutConfig,
     ) -> i32 {
+        let view_width = view_width.into();
         let (explicit, mins, maxs) = Self::column_inputs(workspace);
         if explicit.is_empty() {
             return Self::effective_column_width(0, view_width, cfg);
@@ -2957,7 +2986,7 @@ impl TilingEngine {
                     continue; // skip empty workspaces, no Y consumption
                 }
                 let cfg = self.effective_config_for_workspace(output_id, ws_id);
-                let mut ws_work_rect = Self::tiling_work_rect(monitor, cfg);
+                let mut ws_work_rect = Self::precise_tiling_area(monitor, cfg);
                 // The helper scales the section height, not its origin. Scale
                 // the top inset too so it stays inside this workspace's section.
                 ws_work_rect.loc.y = monitor.work_area.loc.y
@@ -2966,7 +2995,7 @@ impl TilingEngine {
                     ws,
                     ws_work_rect,
                     section_y,
-                    ws_work_rect.size.h as i32,
+                    ws_work_rect.height,
                     cfg,
                 );
                 out.append(&mut ws_positions);
@@ -2981,9 +3010,11 @@ impl TilingEngine {
                     self.calculate_positions_bstack(workspace, work_rect, &eff_cfg)
                 }
                 WorkspaceLayout::Spiral => self.calculate_positions_spiral(workspace, work_rect),
-                WorkspaceLayout::Scrolling => {
-                    self.calculate_positions(workspace, work_rect, &eff_cfg)
-                }
+                WorkspaceLayout::Scrolling => self.calculate_positions(
+                    workspace,
+                    Self::precise_tiling_area(monitor, &eff_cfg),
+                    &eff_cfg,
+                ),
             }
         };
 
@@ -3186,12 +3217,14 @@ impl TilingEngine {
             } else {
                 0
             };
-            let inset_rect = Rect::new(
-                rect.loc.x + inset,
-                rect.loc.y + inset,
-                rect.size.w.saturating_sub(inset as u32 * 2),
-                rect.size.h.saturating_sub(inset as u32 * 2),
+            let geometry = self.resolved_window_geometry(
+                window_id,
+                rect,
+                &eff_cfg,
+                inset,
+                !overview_active && draw_mode == DrawMode::Inset,
             );
+            let inset_rect = geometry.window;
 
             // The corner radius the config asks for, as the preference DWM understands (windows
             // keep what they have when it asks for none, and on Windows 10 there is nothing to ask).
@@ -3736,10 +3769,11 @@ impl TilingEngine {
     fn calculate_positions(
         &self,
         workspace: &crate::layout::workspace::Workspace,
-        work_rect: Rect,
+        work_rect: impl Into<crate::layout::metrics::PhysicalWorkArea>,
         cfg: &LayoutConfig,
     ) -> Vec<(WindowId, Rect)> {
-        let section_height = work_rect.size.h as i32;
+        let work_rect = work_rect.into();
+        let section_height = work_rect.height;
         self.calculate_positions_in_section(workspace, work_rect, 0, section_height, cfg)
     }
 
@@ -3914,9 +3948,9 @@ impl TilingEngine {
     fn calculate_positions_in_section(
         &self,
         workspace: &crate::layout::workspace::Workspace,
-        work_rect: Rect,
+        work_rect: impl Into<crate::layout::metrics::PhysicalWorkArea>,
         section_y_offset: i32,
-        section_height: i32,
+        section_height: impl Into<f64>,
         cfg: &LayoutConfig,
     ) -> Vec<(WindowId, Rect)> {
         self.calculate_positions_at_zoom(
@@ -3932,12 +3966,14 @@ impl TilingEngine {
     fn calculate_positions_at_zoom(
         &self,
         workspace: &crate::layout::workspace::Workspace,
-        work_rect: Rect,
+        work_rect: impl Into<crate::layout::metrics::PhysicalWorkArea>,
         section_y_offset: i32,
-        section_height: i32,
+        section_height: impl Into<f64>,
         cfg: &LayoutConfig,
         zoom: f64,
     ) -> Vec<(WindowId, Rect)> {
+        let work_rect = work_rect.into();
+        let section_height = section_height.into();
         let mut positions = Vec::new();
         let column_gap = cfg.column_gap;
         let window_gap = cfg.window_gap;
@@ -3949,12 +3985,26 @@ impl TilingEngine {
         // Item 4: use effective_zoom so auto_tile_zoom is consulted when no manual
         // overview is active.  Falls back to overview_zoom() when overview is on.
 
-        let (explicit_widths, min_widths, max_widths) = Self::column_inputs(workspace);
+        let (explicit_widths, mut min_widths, mut max_widths) = Self::column_inputs(workspace);
+        if cfg.projection_scale.is_some() {
+            for (index, column) in workspace.columns.iter().enumerate() {
+                if column.width_proportion.is_some()
+                    && !column.maximized
+                    && self.column_sizing_mode(column) == DrawMode::Inset
+                {
+                    // The cache already contains the constrained, rasterized
+                    // logical request. Reapplying physical limits could invent
+                    // an unrepresentable width between adjacent logical sizes.
+                    min_widths[index] = 0;
+                    max_widths[index] = 0;
+                }
+            }
+        }
         let (col_widths, _) = Self::column_widths_with_limits(
             &explicit_widths,
             &min_widths,
             &max_widths,
-            work_rect.size.w as i32,
+            work_rect.width,
             column_gap,
             cfg,
         );
@@ -3973,7 +4023,7 @@ impl TilingEngine {
 
         let center_offset = if zoom < 1.0 && total_content_width > 0 {
             let scaled_total = (total_content_width as f64 * zoom) as i32;
-            ((work_rect.size.w as i32 - scaled_total) / 2).max(0)
+            ((work_rect.width - scaled_total as f64) / 2.0).max(0.0) as i32
         } else {
             0
         };
@@ -3982,7 +4032,7 @@ impl TilingEngine {
         // positioning; in normal mode `section_y_offset == 0` and
         // `section_height == work_rect.size.h`, so nothing changes.
         let scaled_section_height = if zoom < 1.0 {
-            (section_height as f64 * zoom) as i32
+            section_height * zoom
         } else {
             section_height
         };
@@ -4019,8 +4069,8 @@ impl TilingEngine {
             // height (so each workspace's section is rendered at the same
             // size, with a small inter-workspace gap drawn elsewhere).
             let work_height = if zoom < 1.0 {
-                let padding = (scaled_section_height as f64 * 0.05) as i32;
-                (scaled_section_height - padding * 2).max(40)
+                let padding = (scaled_section_height * 0.05).floor();
+                (scaled_section_height - padding * 2.0).max(40.0)
             } else {
                 section_height
             };
@@ -4031,7 +4081,7 @@ impl TilingEngine {
                 window_gap
             };
             let total_gap_height = scaled_gap * (visible_count as i32 - 1).max(0);
-            let available_height = (work_height - total_gap_height).max(0);
+            let available_height = (work_height - total_gap_height as f64).max(0.0);
             // Per-tile heights honor `Tile.height_weight` so the keyboard
             // resize actions (`Action::GrowTileHeight` / `ShrinkTileHeight`)
             // can re-bias a column's vertical distribution; a tile whose window rule
@@ -4068,7 +4118,7 @@ impl TilingEngine {
             let y_centre_offset = if zoom < 1.0 {
                 let total_used: i32 = tile_heights.iter().sum::<i32>()
                     + scaled_gap * (visible_count as i32 - 1).max(0);
-                ((scaled_section_height - total_used) / 2).max(0)
+                ((scaled_section_height - total_used as f64) / 2.0).max(0.0) as i32
             } else {
                 0
             };
@@ -4088,6 +4138,19 @@ impl TilingEngine {
                         zoom,
                         self.column_sizing_mode(column),
                     );
+                    let rect = if zoom == 1.0 && self.column_sizing_mode(column) == DrawMode::Inset
+                    {
+                        self.resolved_window_geometry(
+                            tile.window_id,
+                            rect,
+                            cfg,
+                            self.rule_border_inset(tile.window_id, cfg),
+                            true,
+                        )
+                        .tile
+                    } else {
+                        rect
+                    };
                     positions.push((tile.window_id, rect));
                     accumulated_y += window_height + effective_gap;
                 }
@@ -5738,6 +5801,31 @@ impl TilingEngine {
         self.refresh_layout_views();
     }
 
+    /// A physical IPC reservation overlays the canonical global layer, including zero.
+    pub fn set_runtime_reservation(&mut self, side: &str, pixels: i32) -> bool {
+        let edge = match side {
+            "top" => &mut self.runtime_reservations.top,
+            "right" => &mut self.runtime_reservations.right,
+            "bottom" => &mut self.runtime_reservations.bottom,
+            "left" => &mut self.runtime_reservations.left,
+            _ => return false,
+        };
+        *edge = Some(pixels);
+        if self.full_config.is_some() {
+            self.refresh_layout_views();
+        } else {
+            match side {
+                "top" => self.config.reserve_top = pixels,
+                "right" => self.config.reserve_right = pixels,
+                "bottom" => self.config.reserve_bottom = pixels,
+                "left" => self.config.reserve_left = pixels,
+                _ => unreachable!(),
+            }
+            self.config.projected_struts = None;
+        }
+        true
+    }
+
     /// Update animation settings from config
     pub fn update_animation_settings(
         &mut self,
@@ -6313,11 +6401,9 @@ impl TilingEngine {
 
     /// Set the full configuration (for keybind access and future use).
     ///
-    /// Also rebuilds the per-monitor `LayoutConfig` cache from every
-    /// `output { layout { … } }` block by folding the partial fields onto
-    /// `config.layout` and converting the result through
-    /// `LayoutConfig::from_config`.  Subsequent layout passes consult
-    /// `effective_config(oid)` to pick the right config per monitor.
+    /// Also rebuilds each connected output's projected `LayoutConfig` by
+    /// folding its partial overrides onto `config.layout` before applying its
+    /// scale. Subsequent layout passes consult `effective_config(oid)`.
     pub fn set_full_config(&mut self, config: crate::config::Config) {
         self.recent_reset();
         self.configure_motion(&config.animations);
@@ -6611,36 +6697,17 @@ impl TilingEngine {
         // Half-gap slop so the cursor doesn't have to land pixel-perfectly.
         let half_gap = (gap / 2).max(1);
 
-        // Left edge of the usable work area (after outer gaps).
-        let work_x = wa.loc.x + eff_cfg.outer_gaps.3;
-
-        // Compute each column's pixel width, mirroring the layout pass.
-        let num_columns = ws.columns.len();
-        let view_width = wa.size.w as i32
-            - eff_cfg.outer_gaps.1  // right outer gap
-            - eff_cfg.outer_gaps.3; // left outer gap
-        let col_widths: Vec<i32> = ws
-            .columns
-            .iter()
-            .map(|col| {
-                col.width
-                    .map(|w| w as i32)
-                    .unwrap_or_else(|| match eff_cfg.column_width_mode {
-                        ColumnWidthMode::Proportional => {
-                            let total_gaps = gap * (num_columns as i32 - 1).max(0);
-                            let available = view_width - total_gaps;
-                            (available / num_columns as i32).max(eff_cfg.column_width as i32 / 2)
-                        }
-                        ColumnWidthMode::Fixed => eff_cfg.column_width as i32,
-                    })
-            })
-            .collect();
+        let work = Self::precise_tiling_area(monitor, eff_cfg);
+        let work_x = work.loc.x;
+        let (explicit, mins, maxs) = Self::column_inputs(ws);
+        let (col_widths, _) =
+            Self::column_widths_with_limits(&explicit, &mins, &maxs, work.width, gap, eff_cfg);
 
         // Walk the column layout and check if (x) lands in any gap zone.
         let scroll_x = ws.scroll_offset.x;
         let mut cursor = 0i32; // content-space x (before scroll and work_x offset)
         for (i, &cw) in col_widths.iter().enumerate() {
-            if i + 1 < num_columns {
+            if i + 1 < col_widths.len() {
                 // The gap in screen-space starts right after this column.
                 let gap_screen_start = work_x + cursor + cw - scroll_x;
                 let gap_screen_end = gap_screen_start + gap;
@@ -6655,10 +6722,10 @@ impl TilingEngine {
         false
     }
 
-    /// Return the layout configuration that applies to `output_id`.  If a
-    /// per-monitor override exists (set via `output { layout { … } }`) the
-    /// reference points into `config_per_monitor`; otherwise the global
-    /// `self.config` is returned.  Engine state-mutating methods that take an
+    /// Return the layout configuration that applies to `output_id`. Canonical
+    /// configs produce a projected view for every connected output, including
+    /// those inheriting all global values. Without a cached view, the legacy
+    /// global `self.config` is returned. Engine state-mutating methods that take an
     /// `OutputId` should prefer this accessor over reading `self.config`
     /// directly so per-monitor layout settings (column-width, gaps, etc.)
     /// are honoured on multi-monitor setups.
@@ -6854,6 +6921,7 @@ impl TilingEngine {
         };
         info!("Cycling backdrop: {:?} → {:?}", self.config.backdrop, next);
         self.config.backdrop = next.to_string();
+        self.refresh_layout_views();
 
         // Invalidate the backdrop cache for every tiled window so the next
         // layout pass re-applies the new value via `apply_backdrop_for_window`.
@@ -7101,11 +7169,11 @@ impl TilingEngine {
     /// The focused column of `output` and what a size change needs to know about it:
     /// its index and width, the width of the view, the gap between columns and the room
     /// the borders take around a window.
-    fn focused_column_metrics(&self, output: OutputId) -> Option<(usize, i32, i32, i32, i32)> {
+    fn focused_column_metrics(&self, output: OutputId) -> Option<(usize, i32, f64, i32, i32)> {
         let monitor = self.monitors.get(&output)?;
         let cfg = self.active_workspace_config(output);
         let col_idx = monitor.focus_column?;
-        let view = Self::view_width_for_monitor(monitor, cfg);
+        let view = Self::precise_tiling_area(monitor, cfg).width;
         let workspace = monitor.workspace()?;
         let column = workspace.columns.get(col_idx)?;
         let current = column.resolved_width(Self::workspace_default_width(workspace, view, cfg));
@@ -7179,7 +7247,7 @@ impl TilingEngine {
                 let ws = monitor.workspaces.get(&workspace)?;
                 let column = ws.columns.get(col_idx)?;
                 let window = window.or_else(|| column.active_window());
-                let view = Self::view_width_for_monitor(monitor, cfg);
+                let view = Self::precise_tiling_area(monitor, cfg).width;
                 Some((
                     column.resolved_width(Self::workspace_default_width(ws, view, cfg)),
                     view,
@@ -7211,7 +7279,7 @@ impl TilingEngine {
                 SizeChange::AdjustProportion(milli) => {
                     let current = column
                         .width_proportion
-                        .unwrap_or_else(|| (current + gap) as f64 / (view + gap).max(1) as f64);
+                        .unwrap_or_else(|| (current + gap) as f64 / (view + gap as f64).max(1.0));
                     column.set_proportion((current + milli as f64 / 100_000.0).max(0.0), view, gap);
                 }
                 SizeChange::SetFixed(px) => {
@@ -7287,7 +7355,7 @@ impl TilingEngine {
         };
         // A maximized column counts as a column as wide as the view.
         let idx = if maximized {
-            Self::next_preset_index(None, view, &resolved, forwards)
+            Self::next_preset_index(None, view.floor() as i32, &resolved, forwards)
         } else {
             Self::next_preset_index(remembered, current, &resolved, forwards)
         };
@@ -7379,11 +7447,7 @@ impl TilingEngine {
                 return;
             };
             let cfg = self.effective_config_for_workspace(output, workspace);
-            let view_h = monitor.work_area.size.h as i32
-                - cfg.outer_gaps.0
-                - cfg.outer_gaps.2
-                - cfg.reserve_top as i32
-                - cfg.reserve_bottom as i32;
+            let view_h = Self::precise_tiling_area(monitor, cfg).height;
             (
                 view_h,
                 cfg.window_gap,
@@ -7412,7 +7476,8 @@ impl TilingEngine {
             let Some(idx) = column.index_of(window) else {
                 return;
             };
-            let available = (view_h - gap * (column.tiles.len() as i32 - 1)).max(1) as f32;
+            let available =
+                (view_h - (gap * (column.tiles.len() as i32 - 1)) as f64).max(1.0) as f32;
             let weights: Vec<f32> = column
                 .tiles
                 .iter()
@@ -14474,16 +14539,18 @@ mod tests {
         assert_eq!(engine.effective_config(oid).column_width, 700);
         engine.set_full_config(mk_cfg(1100));
         assert_eq!(engine.effective_config(oid).column_width, 1100);
-        // Reload with no override at all → fall-through.
+        // Reload with no override inherits global values in the output's view.
         let mut bare = crate::config::Config::default();
         bare.output.clear();
         engine.set_full_config(bare);
-        let p_eff = engine.effective_config(oid) as *const LayoutConfig;
-        let p_default = &engine.config as *const LayoutConfig;
-        assert_eq!(
-            p_eff, p_default,
-            "reload without override falls back to global"
-        );
+        let effective = engine.effective_config(oid);
+        assert_eq!(effective.column_width, engine.config.column_width);
+        assert_eq!(effective.column_width_mode, engine.config.column_width_mode);
+        assert_eq!(effective.column_gap, engine.config.column_gap);
+        assert_eq!(effective.window_gap, engine.config.window_gap);
+        assert_eq!(effective.outer_gaps, engine.config.outer_gaps);
+        assert_eq!(effective.projected_struts, engine.config.projected_struts);
+        assert_eq!(effective.projection_scale, Some(1.0));
     }
 
     // -------------------------------------------------------------------------
@@ -17077,8 +17144,8 @@ mod tests {
             }
         }
 
-        config.layout.inner_gaps = 34;
-        config.layout.outer_gaps = 34;
+        config.layout.inner_gaps = 34.0;
+        config.layout.outer_gaps = 34.0;
         engine.update_config(LayoutConfig::from_config(&config));
         engine.set_full_config(config);
         engine.apply_reloaded_layout(&backend);

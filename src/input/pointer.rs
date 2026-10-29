@@ -92,6 +92,7 @@ impl PointerEngine {
                         allow_inhibiting: b.allow_inhibiting,
                         cooldown: b.cooldown_ms.map(|ms| Duration::from_millis(ms as u64)),
                         title: b.hotkey_overlay_title.clone(),
+                        overlay_uses_compositor_mod: false,
                     },
                     last: None,
                 },

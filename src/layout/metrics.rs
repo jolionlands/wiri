@@ -1,0 +1,178 @@
+//! Projection of canonical logical spacing onto one output's physical pixels.
+//!
+//! niri e19df12 rounds nonzero gaps to at least one physical pixel, then keeps
+//! fractional strut extents through working-area and proportional-size resolution.
+
+use crate::config::{Edges, InsetValue, LayoutConfig};
+use crate::utils::{Point, Rect};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PhysicalSpacing {
+    pub inner_gap_px: i32,
+    pub outer_gap_px: i32,
+    pub struts_px: Edges<f64>,
+}
+
+/// A working area with a pixel-aligned origin and unquantized physical extents.
+///
+/// Size consumers must resolve proportions before rounding the final window size.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PhysicalWorkArea {
+    pub loc: Point,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl From<Rect> for PhysicalWorkArea {
+    fn from(rect: Rect) -> Self {
+        Self {
+            loc: rect.loc,
+            width: f64::from(rect.size.w),
+            height: f64::from(rect.size.h),
+        }
+    }
+}
+
+/// Resolve units exactly once after global, output and workspace overrides merge.
+pub fn project_spacing(config: &LayoutConfig, scale: f64) -> PhysicalSpacing {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let gap = |value: f64| {
+        if value == 0.0 {
+            0
+        } else {
+            (value * scale).max(1.0).round() as i32
+        }
+    };
+    let inset = |value: InsetValue| match value {
+        InsetValue::Logical(value) => value * scale,
+        InsetValue::Physical(value) => f64::from(value),
+    };
+    PhysicalSpacing {
+        inner_gap_px: gap(config.inner_gaps),
+        outer_gap_px: gap(config.outer_gaps),
+        struts_px: Edges {
+            left: inset(config.struts.left),
+            right: inset(config.struts.right),
+            top: inset(config.struts.top),
+            bottom: inset(config.struts.bottom),
+        },
+    }
+}
+
+/// Apply signed struts and the outer gap, snapping only the absolute origin.
+///
+/// As in niri's `compute_working_area`, any positive origin snap is subtracted
+/// from the extent without allowing a negative size. Fractional trailing edges
+/// remain available to the eventual window-size consumer.
+pub fn spacing_work_rect(work_px: Rect, spacing: &PhysicalSpacing) -> PhysicalWorkArea {
+    let outer = f64::from(spacing.outer_gap_px);
+    let x = f64::from(work_px.loc.x) + spacing.struts_px.left + outer;
+    let y = f64::from(work_px.loc.y) + spacing.struts_px.top + outer;
+    let width = (f64::from(work_px.size.w)
+        - spacing.struts_px.left
+        - spacing.struts_px.right
+        - 2.0 * outer)
+        .max(0.0);
+    let height = (f64::from(work_px.size.h)
+        - spacing.struts_px.top
+        - spacing.struts_px.bottom
+        - 2.0 * outer)
+        .max(0.0);
+    let snapped_x = x.ceil();
+    let snapped_y = y.ceil();
+    PhysicalWorkArea {
+        loc: Point::new(snapped_x as i32, snapped_y as i32),
+        width: width - (snapped_x - x).min(width),
+        height: height - (snapped_y - y).min(height),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parity_fractional_spacing_projection_preserves_units_and_minimum_gap() {
+        let mut config = LayoutConfig::default_config();
+        config.inner_gaps = 2.5;
+        config.outer_gaps = 0.1;
+        config.struts = Edges {
+            left: InsetValue::Logical(-4.5),
+            right: InsetValue::Logical(0.25),
+            top: InsetValue::Physical(10),
+            bottom: InsetValue::Physical(0),
+        };
+        let projected = project_spacing(&config, 1.5);
+        assert_eq!((projected.inner_gap_px, projected.outer_gap_px), (4, 1));
+        assert_eq!(
+            projected.struts_px,
+            Edges {
+                left: -6.75,
+                right: 0.375,
+                top: 10.0,
+                bottom: 0.0,
+            }
+        );
+        config.inner_gaps = 0.0;
+        config.outer_gaps = 0.0;
+        let projected = project_spacing(&config, 1.5);
+        assert_eq!((projected.inner_gap_px, projected.outer_gap_px), (0, 0));
+    }
+
+    #[test]
+    fn parity_fractional_spacing_invalid_scale_uses_one() {
+        let mut config = LayoutConfig::default_config();
+        config.inner_gaps = 2.5;
+        config.struts.left = InsetValue::Logical(-4.5);
+        let expected = project_spacing(&config, 1.0);
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(project_spacing(&config, scale), expected);
+        }
+    }
+
+    #[test]
+    fn parity_fractional_spacing_work_area_retains_right_and_bottom_fractions() {
+        let mut config = LayoutConfig::default_config();
+        config.inner_gaps = 0.0;
+        config.outer_gaps = 0.0;
+        config.struts = Edges {
+            left: InsetValue::Logical(-4.5),
+            right: InsetValue::Logical(0.25),
+            top: InsetValue::Logical(-2.5),
+            bottom: InsetValue::Logical(0.75),
+        };
+        let work = spacing_work_rect(
+            Rect::new(-300, -100, 900, 600),
+            &project_spacing(&config, 1.0),
+        );
+        assert_eq!(work.loc, Point::new(-304, -102));
+        assert_eq!((work.width, work.height), (903.75, 601.25));
+        assert_eq!((work.width * 0.8).floor(), 723.0);
+        let work = spacing_work_rect(
+            Rect::new(-300, -100, 900, 600),
+            &project_spacing(&config, 1.5),
+        );
+        assert_eq!(work.loc, Point::new(-306, -103));
+        assert_eq!((work.width, work.height), (905.625, 601.875));
+    }
+
+    #[test]
+    fn parity_fractional_spacing_exhausted_area_stays_nonnegative() {
+        let spacing = PhysicalSpacing {
+            struts_px: Edges {
+                left: 0.5,
+                right: 5.0,
+                top: 0.75,
+                bottom: 5.0,
+            },
+            ..PhysicalSpacing::default()
+        };
+        let work = spacing_work_rect(Rect::new(-3, -4, 2, 2), &spacing);
+        assert_eq!(work.loc, Point::new(-2, -3));
+        assert_eq!((work.width, work.height), (0.0, 0.0));
+    }
+}

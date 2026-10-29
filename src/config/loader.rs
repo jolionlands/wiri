@@ -505,7 +505,7 @@ mod include_tests {
         write_temp(&dir, "extra.kdl", "layout {\n    gaps 9\n}\n");
         let cfg = Config::load(&main).expect("fixed");
         assert_eq!(cfg.input.repeat_delay, 111);
-        assert_eq!(cfg.layout.inner_gaps, 9);
+        assert_eq!(cfg.layout.inner_gaps, 9.0);
     }
 
     #[test]

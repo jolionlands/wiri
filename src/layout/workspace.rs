@@ -167,7 +167,7 @@ impl Column {
         self.width = width;
     }
 
-    pub fn set_proportion(&mut self, proportion: f64, view: i32, gap: i32) {
+    pub fn set_proportion(&mut self, proportion: f64, view: impl Into<f64>, gap: i32) {
         self.set_width(Some(
             crate::input::proportion_px(view, gap, proportion).clamp(50, 100_000) as u32,
         ));

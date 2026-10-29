@@ -13,7 +13,7 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 163 | 46 | 0 | 17 |
+| Layout and behaviour (226 rows) | 161 | 48 | 0 | 17 |
 | Config, input and IPC (259 rows) | 139 | 48 | 0 | 72 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
@@ -69,15 +69,31 @@ The affected keyboard/focus/reload checks passed
 **65/65**; a separate session run passed **8/8** after repairing a missing helper
 in the temporary focused runner. These are focused results, not a new full-cycle
 sign-off. Startup and transfer review follow-ups passed their integrated source
-tests and scoped reviews; the complete desktop run is now in progress against
-frozen source `E8C1274F` and copied release binaries.
+tests and scoped reviews. The complete desktop run against frozen source
+`E8C1274F` and copied release binaries finished with **735 pass / 111 fail /
+94 information entries**, plus one cursor-restoration phase error. All 64 new
+H81-H86 checks passed again. Several older groups stopped at native foreground
+preconditions; two H15 oracles expected obsolete explicit-target focus stealing.
+Their corrected source passed a subsequent focused native run: both original
+explicit-ID assertions and owned setup/cleanup passed (**4/4**). The frozen full
+run remains recorded unchanged; this focused result is not a full-cycle sign-off.
 The single-output machine cannot qualify cross-output relocation or mixed DPI.
 
-The source audit also found missing DPI projection on five appearance rows that
-had been marked done. Their correction makes the current totals **302 done /
-94 partial / 89 N/A** across 485 rows: **302/396 applicable rows (76.3%)**.
-This corrects the checklist; it does not describe a runtime regression. Fractional
-spacing, appearance scaling, remaining input/config semantics and hardware evidence
+The later canonical layout/output action correction at `0f1c4fc` passed
+**75 unique scoped tests**, including its 12 new regressions. This is a source
+qualification, not a replacement for the failed full native cycle. The combined
+spacing, hotkey-selection and axis-scroll checkpoint now passes **2,037 Rust
+tests**, the separate graphics smoke test and **12/12 H87 native scroll checks**.
+All 17 source qualification gates passed. The 53 targeted spacing/scroll/hotkey
+tests are included in the full-suite count. See the
+[R4 evidence and remaining work](2026-10-29-tridaris-r4.md).
+
+The source audit found missing DPI projection on five appearance rows and a
+missing floating-height preset consumer affecting two rows previously marked done.
+The current totals are **300 done / 96 partial / 89 N/A** across 485 rows:
+**300/396 applicable rows (75.8%)**. The preset list and tiled actions work;
+the floating actions explicitly do nothing, unlike the pinned implementation.
+Native spacing, appearance scaling, remaining input/config semantics and hardware evidence
 remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
 for the active work; a gate count alone is not full parity.
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was

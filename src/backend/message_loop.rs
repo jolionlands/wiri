@@ -289,7 +289,19 @@ fn build_hotkey_list(
             "Hotkeys: {} from defaults, 0 from config (0 overridden)",
             default_count
         );
-        return (defaults, HashMap::new());
+        let options = defaults
+            .iter()
+            .map(|(mods, vk, _)| {
+                (
+                    (*mods, *vk),
+                    BindOptions {
+                        overlay_uses_compositor_mod: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        return (defaults, options);
     }
 
     // Parse every config bind once.
@@ -301,25 +313,24 @@ fn build_hotkey_list(
         }
         match bind_to_hotkey(bind, prefix) {
             Ok(row) => {
-                if !bind.repeat
-                    || bind.release
-                    || !bind.allow_inhibiting
-                    || bind.cooldown_ms.is_some()
-                    || bind.hotkey_overlay_title.is_some()
-                {
-                    options.insert(
-                        (row.0, row.1),
-                        BindOptions {
-                            no_repeat: !bind.repeat,
-                            release: bind.release,
-                            allow_inhibiting: bind.allow_inhibiting,
-                            cooldown: bind
-                                .cooldown_ms
-                                .map(|ms| std::time::Duration::from_millis(ms as u64)),
-                            title: bind.hotkey_overlay_title.clone(),
-                        },
-                    );
-                }
+                // Keep an entry even for ordinary explicit Ctrl binds: their
+                // resolved mask cannot tell them apart from literal Mod.
+                options.insert(
+                    (row.0, row.1),
+                    BindOptions {
+                        no_repeat: !bind.repeat,
+                        release: bind.release,
+                        allow_inhibiting: bind.allow_inhibiting,
+                        cooldown: bind
+                            .cooldown_ms
+                            .map(|ms| std::time::Duration::from_millis(ms as u64)),
+                        title: bind.hotkey_overlay_title.clone(),
+                        overlay_uses_compositor_mod: bind
+                            .modifiers
+                            .iter()
+                            .any(|modifier| modifier.eq_ignore_ascii_case("mod")),
+                    },
+                );
                 parsed_config.push(row)
             }
             Err(why) => warn!("Config bind: {}, skipping", why),
@@ -328,6 +339,14 @@ fn build_hotkey_list(
 
     let config_count = parsed_config.len();
     let (merged, overridden) = merge_hotkeys(defaults, parsed_config, extend_defaults);
+    // Remaining rows originate in the opt-in default keymap's Mod chords.
+    // Config rows, including explicit non-Mod replacements, already have entries.
+    for (mods, vk, _) in &merged {
+        options.entry((*mods, *vk)).or_insert_with(|| BindOptions {
+            overlay_uses_compositor_mod: true,
+            ..Default::default()
+        });
+    }
     if extend_defaults {
         info!(
             "Hotkeys: {} from defaults, {} from config ({} overridden)",
@@ -516,6 +535,10 @@ pub struct RegisteredBinding {
     /// Action this binding fires.  Held as a debug-formatted string so the
     /// IPC layer (which doesn't depend on `Action`'s serde impl) can ship it.
     pub action: String,
+    /// Typed action for overlay selection/descriptions; runtime snapshots always
+    /// populate this. The debug string above remains the existing IPC contract.
+    pub overlay_action: Option<Action>,
+    pub overlay_uses_compositor_mod: bool,
     /// niri's `hotkey-overlay-title=`: `Some(Some(text))` is shown in the key-bindings overlay
     /// instead of the action name, `Some(None)` hides the bind from it.
     pub title: Option<Option<String>>,
@@ -541,6 +564,10 @@ fn update_current_bindings_snapshot(
             modifiers: *mods,
             vk_code: *vk,
             action: format!("{:?}", action),
+            overlay_action: Some(action.clone()),
+            overlay_uses_compositor_mod: options
+                .get(&(*mods, *vk))
+                .is_some_and(|o| o.overlay_uses_compositor_mod),
             title: options.get(&(*mods, *vk)).and_then(|o| o.title.clone()),
         });
     }
@@ -2120,6 +2147,44 @@ mod tests {
     }
 
     #[test]
+    fn pinned_hotkey_runtime_snapshot_preserves_literal_mod_spawn_eligibility() {
+        // Ctrl and Mod resolve to the same Win32 mask here. Only the literal
+        // Mod bind qualifies for automatic spawn curation in pinned niri.
+        let source = r#"
+            input { mod-key "ctrl"; }
+            binds {
+                Ctrl+T { spawn "explicit-ctrl.exe"; }
+                Mod+Y { spawn "literal-mod.exe"; }
+                Super+U { spawn-sh "super-shell.exe --flag"; }
+            }
+        "#;
+        let config = crate::config::parse_kdl_config(source).unwrap();
+        let mut engine = TilingEngine::new(crate::layout::LayoutConfig::from_config(&config));
+        engine.set_full_config(config);
+        let (hotkeys, options) = build_hotkey_list(&Arc::new(parking_lot::RwLock::new(engine)));
+        assert_eq!(hotkeys.len(), 3);
+        assert_eq!(hotkeys[0].0, MOD_CTRL);
+        assert_eq!(hotkeys[1].0, MOD_CTRL);
+        assert_eq!(hotkeys[2].0, MOD_WIN);
+
+        // Model successful registration without registering a native hotkey.
+        let registered_ids: Vec<_> = (0..hotkeys.len()).map(|i| 32768 + i as i32).collect();
+        let saved = current_bindings();
+        update_current_bindings_snapshot(&hotkeys, &registered_ids, &options);
+        let snapshot = current_bindings();
+        *REGISTERED_BINDINGS.lock() = saved;
+        assert_eq!(snapshot.len(), 3);
+        let rows = crate::overlay::hotkey_rows::curated_rows(&snapshot, MOD_CTRL, true);
+        assert_eq!(
+            rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>(),
+            vec![
+                crate::ipc::server::format_chord(MOD_CTRL, 0x59),
+                crate::ipc::server::format_chord(MOD_WIN, 0x55),
+            ]
+        );
+    }
+
+    #[test]
     fn empty_replacement_never_restores_defaults() {
         let defaults = vec![d(MOD_CTRL | MOD_ALT, 0x51, "close")];
         let (merged, overridden) = merge_hotkeys(defaults, vec![], false);
@@ -2325,6 +2390,8 @@ mod tests {
             modifiers: MOD_CTRL | MOD_ALT,
             vk_code: vk,
             action: action.to_string(),
+            overlay_action: None,
+            overlay_uses_compositor_mod: false,
             title: title.map(|t| t.map(|s| s.to_string())),
         };
         let rows = overlay_rows(&[

@@ -32,6 +32,8 @@ mod overview_decode;
 mod recent_windows_decode;
 mod rule_effects_decode;
 mod rule_policy;
+#[cfg(test)]
+mod spacing_parity_tests;
 
 /// How many levels of `include` are followed.
 pub const MAX_INCLUDE_DEPTH: u8 = 8;
@@ -708,6 +710,7 @@ impl InputScope {
                 "click-method",
                 "disabled-on-external-mouse",
                 "natural-scroll",
+                "scroll-factor",
                 "accel-profile",
                 "scroll-method",
                 "scroll-button",
@@ -1666,14 +1669,13 @@ impl Decoder {
                     cfg.input.tap_to_click = v;
                 }
             }
-            "scroll-factor" if scope == InputScope::Mouse => {
-                // niri: one number, or horizontal= / vertical= properties.
-                if let Some(a) = child.args.first() {
-                    if let Some(v) = self.value_number(child, a, 0.0, 1000.0) {
-                        cfg.input.mouse_speed = v;
+            "scroll-factor" if matches!(scope, InputScope::Mouse | InputScope::Touchpad) => {
+                if let Some(factor) = self.decode_scroll_factor(child) {
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll_factor = Some(factor);
+                    } else {
+                        cfg.input.touchpad_scroll_factor = Some(factor);
                     }
-                } else {
-                    self.unsupported(child, "per-axis scroll factors");
                 }
             }
             "accel-speed" if scope.is_pointer() => {
@@ -1726,6 +1728,80 @@ impl Decoder {
             }
             _ => self.unknown(child, scope.label(), scope.known()),
         }
+    }
+
+    fn decode_scroll_factor(&mut self, node: &Node) -> Option<ScrollFactor> {
+        let before = self.issues.len();
+        if node.ty.is_some() {
+            self.error(node.pos, "scroll-factor does not accept a type annotation");
+        }
+        if node.args.len() > 1 {
+            self.error(
+                node.args[1].pos,
+                "scroll-factor takes at most one base value",
+            );
+        }
+        if node.children.is_some() {
+            self.error(node.pos, "scroll-factor takes no child block");
+        }
+        let mut factor = ScrollFactor::default();
+        if let Some(value) = node.args.first() {
+            factor.base = self.scroll_factor_number(node, value, 0.0, 100.0);
+        }
+        let mut horizontal_seen = false;
+        let mut vertical_seen = false;
+        for prop in &node.props {
+            let (seen, axis) = match prop.key.as_str() {
+                "horizontal" => (&mut horizontal_seen, &mut factor.horizontal),
+                "vertical" => (&mut vertical_seen, &mut factor.vertical),
+                _ => {
+                    self.error(
+                        prop.key_pos,
+                        format!("unknown scroll-factor property '{}'", prop.key),
+                    );
+                    continue;
+                }
+            };
+            if std::mem::replace(seen, true) {
+                self.error(
+                    prop.key_pos,
+                    format!("duplicate scroll-factor property '{}'", prop.key),
+                );
+            }
+            *axis = self.scroll_factor_number(node, &prop.value, -100.0, 100.0);
+        }
+        (self.issues.len() == before).then_some(factor)
+    }
+
+    fn scroll_factor_number(
+        &mut self,
+        node: &Node,
+        value: &Value,
+        min: f64,
+        max: f64,
+    ) -> Option<f64> {
+        if value.ty.is_some() {
+            self.error(
+                value.pos,
+                "scroll-factor values do not accept type annotations",
+            );
+            return None;
+        }
+        let Some(number) = value.as_f64() else {
+            self.error(
+                value.pos,
+                format!("'{}' requires a numeric value", node.name),
+            );
+            return None;
+        };
+        if !number.is_finite() || number < min || number > max {
+            self.error(
+                value.pos,
+                format!("'{}' must be between {min} and {max}", node.name),
+            );
+            return None;
+        }
+        Some(number)
     }
 
     /// One niri pointing-device option, shared by `mouse`, `touchpad`, `trackpoint` and
@@ -2115,30 +2191,29 @@ impl Decoder {
                         self.section(child);
                         for c in child.kids() {
                             match norm(&c.name).as_str() {
-                                "inner" => self.set_u32(c, 65535, &mut p.inner_gaps),
-                                "outer" => self.set_u32(c, 65535, &mut p.outer_gaps),
+                                "inner" => self.set_f64(c, 0.0, 65535.0, &mut p.inner_gaps),
+                                "outer" => self.set_f64(c, 0.0, 65535.0, &mut p.outer_gaps),
                                 _ => self.unknown(c, "'gaps'", &["inner", "outer"]),
                             }
                         }
                     } else if let Some(v) = self.arg_number(child, 0.0, 65535.0) {
-                        let g = v.round() as u32;
-                        p.inner_gaps = Some(g);
-                        p.outer_gaps = Some(g);
+                        p.inner_gaps = Some(v);
+                        p.outer_gaps = Some(v);
                     }
                 }
-                "inner-gaps" | "inner" => self.set_u32(child, 65535, &mut p.inner_gaps),
-                "outer-gaps" | "outer" => self.set_u32(child, 65535, &mut p.outer_gaps),
+                "inner-gaps" | "inner" => self.set_f64(child, 0.0, 65535.0, &mut p.inner_gaps),
+                "outer-gaps" | "outer" => self.set_f64(child, 0.0, 65535.0, &mut p.outer_gaps),
                 "struts" => {
                     self.section(child);
                     for c in child.kids() {
                         let side = norm(&c.name);
                         let strut = self.arg_number(c, -65535.0, 65535.0);
-                        let value = strut.map(|v| v.round() as i32);
+                        let value = strut.map(InsetValue::Logical);
                         match side.as_str() {
-                            "left" => p.reserve_left = value.or(p.reserve_left),
-                            "right" => p.reserve_right = value.or(p.reserve_right),
-                            "top" => p.reserve_top = value.or(p.reserve_top),
-                            "bottom" => p.reserve_bottom = value.or(p.reserve_bottom),
+                            "left" => p.struts.left = value.or(p.struts.left),
+                            "right" => p.struts.right = value.or(p.struts.right),
+                            "top" => p.struts.top = value.or(p.struts.top),
+                            "bottom" => p.struts.bottom = value.or(p.struts.bottom),
                             _ => self.unknown(c, "'struts'", &["left", "right", "top", "bottom"]),
                         }
                     }
@@ -2297,10 +2372,22 @@ impl Decoder {
                 }
                 "status-bar" => self.set_flag(child, &mut p.status_bar),
                 "hide-method" => self.set_text(child, &mut p.hide_method),
-                "reserve-top" => self.set_i32(child, &mut p.reserve_top),
-                "reserve-bottom" => self.set_i32(child, &mut p.reserve_bottom),
-                "reserve-left" => self.set_i32(child, &mut p.reserve_left),
-                "reserve-right" => self.set_i32(child, &mut p.reserve_right),
+                "reserve-top" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.top = value.or(p.struts.top);
+                }
+                "reserve-bottom" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.bottom = value.or(p.struts.bottom);
+                }
+                "reserve-left" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.left = value.or(p.struts.left);
+                }
+                "reserve-right" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.right = value.or(p.struts.right);
+                }
                 "center-focused-column" => {
                     if let Some(mode) = self.arg_text(child) {
                         if matches!(mode.as_str(), "never" | "always" | "on-overflow") {
@@ -3776,6 +3863,154 @@ mod tests {
     }
 
     #[test]
+    fn parity_axis_scroll_factor_accepts_property_only_mouse_axes() {
+        let decoded = load("input { mouse { scroll-factor horizontal=2 vertical=-1 } }");
+        assert!(
+            decoded.issues.is_empty(),
+            "valid niri axis factors must load without diagnostics: {:?}",
+            decoded.issues
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_accepts_touchpad_axes() {
+        let decoded = load("input { touchpad { scroll-factor horizontal=-1.5 vertical=0.5 } }");
+        assert!(
+            decoded.issues.is_empty(),
+            "valid niri touchpad factors must load without diagnostics: {:?}",
+            decoded.issues
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_stores_and_resolves_defaults_base_and_overrides() {
+        for (syntax, base, horizontal, vertical, expected) in [
+            ("scroll-factor", None, None, None, (1.0, 1.0)),
+            ("scroll-factor 2", Some(2.0), None, None, (2.0, 2.0)),
+            (
+                "scroll-factor horizontal=2",
+                None,
+                Some(2.0),
+                None,
+                (2.0, 1.0),
+            ),
+            (
+                "scroll-factor vertical=-1.5",
+                None,
+                None,
+                Some(-1.5),
+                (1.0, -1.5),
+            ),
+            (
+                "scroll-factor 2 vertical=-1",
+                Some(2.0),
+                None,
+                Some(-1.0),
+                (2.0, -1.0),
+            ),
+            (
+                "scroll-factor 0 horizontal=100 vertical=-100",
+                Some(0.0),
+                Some(100.0),
+                Some(-100.0),
+                (100.0, -100.0),
+            ),
+        ] {
+            for scope in ["mouse", "touchpad"] {
+                let config = clean(&format!("input {{ {scope} {{ {syntax} }} }}"));
+                let stored = if scope == "mouse" {
+                    config.input.mouse_scroll_factor
+                } else {
+                    config.input.touchpad_scroll_factor
+                };
+                let factor = stored.expect("explicit identity still preserves presence");
+                assert_eq!(
+                    (factor.base, factor.horizontal, factor.vertical),
+                    (base, horizontal, vertical)
+                );
+                assert_eq!(factor.h_v_factors(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_keeps_mouse_and_touchpad_settings_independent() {
+        let mouse = "mouse { scroll-factor 2 vertical=-1 }";
+        let touchpad = "touchpad { scroll-factor 4 horizontal=-3 }";
+        for text in [
+            format!("input {{ {mouse}; {touchpad} }}"),
+            format!("input {{ {touchpad}; {mouse} }}"),
+        ] {
+            let config = clean(&text);
+            assert_eq!(
+                config.input.mouse_scroll_factor.unwrap().h_v_factors(),
+                (2.0, -1.0)
+            );
+            assert_eq!(
+                config.input.touchpad_scroll_factor.unwrap().h_v_factors(),
+                (-3.0, 4.0)
+            );
+        }
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_extra_base_arguments() {
+        let decoded = load("input { mouse { scroll-factor 2 3 } }");
+        assert!(
+            decoded.has_errors(),
+            "scroll-factor permits at most one base argument"
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_numeric_strings() {
+        let decoded = load("input { mouse { scroll-factor \"2\" } }");
+        assert!(
+            decoded.has_errors(),
+            "niri scroll factors require numbers, not numeric strings"
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_unknown_properties() {
+        let decoded = load("input { mouse { scroll-factor 2 sideways=3 } }");
+        assert!(
+            decoded.has_errors(),
+            "unknown scroll-factor properties must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_children() {
+        let decoded = load("input { mouse { scroll-factor 2 { ignored; } } }");
+        assert!(decoded.has_errors(), "scroll-factor has no child nodes");
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_bad_types_ranges_and_duplicate_properties() {
+        for scope in ["mouse", "touchpad"] {
+            for syntax in [
+                "scroll-factor -0.01",
+                "scroll-factor 100.01",
+                "scroll-factor horizontal=-100.01",
+                "scroll-factor vertical=100.01",
+                "scroll-factor horizontal=\"2\"",
+                "scroll-factor vertical=true",
+                "scroll-factor null",
+                "scroll-factor horizontal=1 horizontal=2",
+                "scroll-factor (f64)2",
+                "scroll-factor {}",
+            ] {
+                let decoded = load(&format!("input {{ {scope} {{ {syntax} }} }}"));
+                assert!(
+                    decoded.has_errors(),
+                    "invalid factor loaded: {scope} {syntax}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parity_button_scroll_accepts_canonical_evdev_middle() {
         let cfg = clean(
             "input { mouse { scroll-method \"on-button-down\"; scroll-button 274; scroll-button-lock } }",
@@ -3976,16 +4211,21 @@ overview { backdrop-color \"#000000\" }",
         let cfg = clean(
             "layout {\n    gaps 12\n    struts { left 4; right 5; top 6; bottom 7; }\n    border { width 3; active-color \"#ffc87f\"; inactive-color \"#505050\"; urgent-color \"#9b0000\"; }\n    focus-ring { width 5; active-color \"#7fc8ff\"; inactive-color \"#404040\"; }\n    shadow { on; softness 20; spread 4; offset x=2 y=6; color \"#0007\"; }\n}\n",
         );
-        assert_eq!(cfg.layout.inner_gaps, 12);
-        assert_eq!(cfg.layout.outer_gaps, 12);
+        assert_eq!(cfg.layout.inner_gaps, 12.0);
+        assert_eq!(cfg.layout.outer_gaps, 12.0);
         assert_eq!(
             (
-                cfg.layout.reserve_left,
-                cfg.layout.reserve_right,
-                cfg.layout.reserve_top,
-                cfg.layout.reserve_bottom
+                cfg.layout.struts.left,
+                cfg.layout.struts.right,
+                cfg.layout.struts.top,
+                cfg.layout.struts.bottom
             ),
-            (4, 5, 6, 7)
+            (
+                InsetValue::Logical(4.0),
+                InsetValue::Logical(5.0),
+                InsetValue::Logical(6.0),
+                InsetValue::Logical(7.0)
+            )
         );
         assert_eq!(cfg.layout.border_width, 3);
         assert_eq!(cfg.layout.border_color_focused, "#ffc87f");
@@ -4023,14 +4263,19 @@ overview { backdrop-color \"#000000\" }",
         );
         assert_eq!(
             (
-                cfg.layout.reserve_left,
-                cfg.layout.reserve_right,
-                cfg.layout.reserve_top,
-                cfg.layout.reserve_bottom
+                cfg.layout.struts.left,
+                cfg.layout.struts.right,
+                cfg.layout.struts.top,
+                cfg.layout.struts.bottom
             ),
-            (-20, 30, 10, -5)
+            (
+                InsetValue::Logical(-20.0),
+                InsetValue::Logical(30.0),
+                InsetValue::Logical(10.0),
+                InsetValue::Logical(-5.0)
+            )
         );
-        assert_eq!(cfg.layout.inner_gaps, 12);
+        assert_eq!(cfg.layout.inner_gaps, 12.0);
     }
 
     #[test]
@@ -4098,7 +4343,7 @@ overview { backdrop-color \"#000000\" }",
         let cfg = clean(
             "layout {\n    gaps { inner 10; outer 6 }\n    borders { width 4; color \"#4d4d4d\"; color-focused \"#3381d9\"; color-urgent \"#cc3344\"; radius 8 }\n    focus-ring { width 3; color \"#3381d9\"; gap 6; inactive-color \"#404040\" }\n    shadows { enable true; opacity 0.75; offset-x 5; offset-y 5; blur 15; spread 5 }\n    column-width-mode \"proportional\"\n    max-visible-columns 4\n    column-width 700\n    scroll-step 300\n    hide-method hide\n    dim-unfocused 0.92\n    snap-on-drag false\n    snap-threshold-px 32\n    smart-borders true\n    reserve-top 30\n}\n",
         );
-        assert_eq!((cfg.layout.inner_gaps, cfg.layout.outer_gaps), (10, 6));
+        assert_eq!((cfg.layout.inner_gaps, cfg.layout.outer_gaps), (10.0, 6.0));
         assert_eq!(cfg.layout.border_width, 4);
         assert_eq!(cfg.layout.border_color, "#4d4d4d");
         assert_eq!(cfg.layout.border_color_focused, "#3381d9");
@@ -4125,10 +4370,10 @@ overview { backdrop-color \"#000000\" }",
         assert!(!cfg.layout.snap_on_drag);
         assert_eq!(cfg.layout.snap_threshold_px, 32);
         assert!(cfg.layout.smart_borders);
-        assert_eq!(cfg.layout.reserve_top, 30);
+        assert_eq!(cfg.layout.struts.top, InsetValue::Physical(30));
         // The older flat spellings.
         let cfg = clean("layout {\n    inner_gaps 12\n    border-width 3\n    border-color \"#333333\"\n    focus-ring-width 4\n    shadow-enable true\n    hide-method \"cloak\"\n}\n");
-        assert_eq!(cfg.layout.inner_gaps, 12);
+        assert_eq!(cfg.layout.inner_gaps, 12.0);
         assert_eq!(cfg.layout.border_width, 3);
         assert_eq!(cfg.layout.focus_ring_width, 4);
         assert!(cfg.layout.shadow_enable);
@@ -4147,7 +4392,7 @@ overview { backdrop-color \"#000000\" }",
         assert_eq!(a.mod_key.as_deref(), Some("super"));
         let lo = a.layout_override.as_ref().expect("layout override");
         assert_eq!(lo.column_width, Some(800));
-        assert_eq!(lo.inner_gaps, Some(20));
+        assert_eq!(lo.inner_gaps, Some(20.0));
         assert!(lo.scroll_step.is_none());
         let b = &cfg.output[1];
         assert_eq!(b.mode, "1920x1080@60");
@@ -4764,7 +5009,7 @@ overview { backdrop-color \"#000000\" }",
             .as_ref()
             .unwrap()
             .apply_to(&d.config.layout);
-        assert_eq!(layout.inner_gaps, 16);
+        assert_eq!(layout.inner_gaps, 16.0);
         assert!(!layout.always_center_single_column);
         for option in ["empty-workspace-above-first", "insert-hint {}"] {
             let d = load(&format!("workspace \"a\" {{ layout {{ {option}; }} }}"));
@@ -4797,7 +5042,7 @@ overview { backdrop-color \"#000000\" }",
             warnings(&d)
         );
         assert_eq!(d.config.input.repeat_delay, 123);
-        assert_eq!(d.config.layout.inner_gaps, 3);
+        assert_eq!(d.config.layout.inner_gaps, 3.0);
         // A later bind on the same chord replaces the earlier one.
         let t: Vec<&HotkeyBinding> = d
             .config
@@ -4895,7 +5140,7 @@ overview { backdrop-color \"#000000\" }",
             Some(Path::new("C:\\nowhere")),
         );
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(d.config.layout.inner_gaps, 5);
+        assert_eq!(d.config.layout.inner_gaps, 5.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

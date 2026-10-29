@@ -63,11 +63,7 @@ impl TilingEngine {
             let Some(monitor) = self.monitors.get(&output) else {
                 return;
             };
-            let view_h = monitor.work_area.size.h as i32
-                - cfg.outer_gaps.0
-                - cfg.outer_gaps.2
-                - cfg.reserve_top as i32
-                - cfg.reserve_bottom as i32;
+            let view_h = Self::precise_tiling_area(monitor, &cfg).height;
             let gap = cfg.window_gap;
             let Some(column) = monitor
                 .workspace()
@@ -81,7 +77,7 @@ impl TilingEngine {
             let Some(index) = column.index_of(window) else {
                 return;
             };
-            let available = (view_h - gap * (column.tiles.len() as i32 - 1)).max(1);
+            let available = (view_h - (gap * (column.tiles.len() as i32 - 1)) as f64).max(1.0);
             let tile = &column.tiles[index];
             let current = match (tile.preferred_height, tile.height_proportion) {
                 (Some(px), _) => px as i32,

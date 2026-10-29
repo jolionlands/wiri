@@ -361,8 +361,8 @@ impl std::str::FromStr for SizeChange {
 /// separates it from its neighbours: two halves and the gap between them fill the view
 /// exactly, three thirds and two gaps too (niri: `(view - gap) * p - gap`, with the
 /// outer gaps counted in the view).
-pub fn proportion_px(view_px: i32, gap_px: i32, proportion: f64) -> i32 {
-    (proportion * (view_px + gap_px) as f64 - gap_px as f64).round() as i32
+pub fn proportion_px(view_px: impl Into<f64>, gap_px: i32, proportion: f64) -> i32 {
+    (proportion * (view_px.into() + gap_px as f64) - gap_px as f64).round() as i32
 }
 
 impl SizeChange {
@@ -370,8 +370,15 @@ impl SizeChange {
     /// long with `gap_px` between its neighbours.  `extra_px` is how much larger it is
     /// than the window it holds (the borders around the window), which a fixed size
     /// does not include.
-    pub fn resolve(self, current_px: i32, view_px: i32, gap_px: i32, extra_px: i32) -> i32 {
-        let whole = (view_px + gap_px).max(1) as f64;
+    pub fn resolve(
+        self,
+        current_px: i32,
+        view_px: impl Into<f64>,
+        gap_px: i32,
+        extra_px: i32,
+    ) -> i32 {
+        let view_px = view_px.into();
+        let whole = (view_px + gap_px as f64).max(1.0);
         match self {
             SizeChange::SetFixed(px) => px.saturating_add(extra_px),
             SizeChange::AdjustFixed(delta) => current_px.saturating_add(delta),
@@ -915,7 +922,7 @@ pub fn apply_mouse_config(config: &InputConfig) {
         config.natural_scroll,
         config.tap_to_click,
     );
-    rule_scroll::configure(config.mouse_speed);
+    rule_scroll::configure(config);
     set_mouse_runtime_config(MouseRuntimeConfig {
         natural_scroll: config.natural_scroll,
         scroll_speed: config.mouse_speed as f32,

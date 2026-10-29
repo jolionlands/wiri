@@ -2062,20 +2062,15 @@ impl IpcServer {
                 // TODO(audit): per-monitor reservations (monitor_id ignored for v1)
                 info!("IPC: ReserveArea side={} pixels={}", side, pixels);
                 if let Some(engine) = &self.engine {
-                    let mut new_config = engine.read().config().clone();
-                    match side.as_str() {
-                        "top" => new_config.reserve_top = pixels.min(i32::MAX as u32) as i32,
-                        "bottom" => new_config.reserve_bottom = pixels.min(i32::MAX as u32) as i32,
-                        "left" => new_config.reserve_left = pixels.min(i32::MAX as u32) as i32,
-                        "right" => new_config.reserve_right = pixels.min(i32::MAX as u32) as i32,
-                        _ => {
-                            return serde_json::json!({
-                                "success": false,
-                                "error": format!("invalid side {:?}: expected top | bottom | left | right", side),
-                            })
-                        }
+                    if !engine
+                        .write()
+                        .set_runtime_reservation(&side, pixels.min(i32::MAX as u32) as i32)
+                    {
+                        return serde_json::json!({
+                            "success": false,
+                            "error": format!("invalid side {:?}: expected top | bottom | left | right", side),
+                        });
                     }
-                    engine.write().update_config(new_config);
                     if let Some(backend) = &self.backend {
                         engine.write().apply_all(backend);
                     }

@@ -3,7 +3,114 @@
 use super::*;
 use crate::config::types::SizeSpec;
 
+/// A client request and its settled, rasterized physical width are distinct.
+pub(super) struct ResolvedWidth {
+    pub tile_px: u32,
+    pub window_px: u32,
+    pub window_logical: Option<i32>,
+}
+
+/// Shared geometry for native placement and IPC. A missing logical dimension
+/// retains the existing physical policy for that dimension (including heights).
+pub(super) struct ResolvedWindowGeometry {
+    pub tile: Rect,
+    pub window: Rect,
+    pub logical_window_size: (Option<i32>, Option<i32>),
+}
+
 impl TilingEngine {
+    pub(super) fn proportional_width(
+        view: f64,
+        cfg: &LayoutConfig,
+        proportion: f64,
+        inset: i32,
+        min: u32,
+        max: u32,
+    ) -> ResolvedWidth {
+        let border = inset.max(0).saturating_mul(2) as u32;
+        if let Some(scale) = cfg.projection_scale {
+            let desired = (proportion * (view + cfg.column_gap as f64) - cfg.column_gap as f64)
+                .clamp(Self::MIN_COLUMN_PX as f64, Self::MAX_COLUMN_PX as f64)
+                .max(min as f64);
+            let max = if max == 0 { u32::MAX } else { max.max(min) };
+            let desired = desired.min(max as f64);
+            // niri tile.rs:942-963 subtracts borders, then floors the LOGICAL
+            // client request. Its settled visual size is physically rounded
+            // (845-851); the unrounded request is never a retained tile frame.
+            // Native/rule limits are physical in this engine. Bound the logical
+            // request so its final rounded physical client honors those limits;
+            // the minimum wins if this scale cannot represent both limits.
+            let min_client = min.saturating_sub(border).max(1) as f64;
+            let max_client = max.saturating_sub(border).max(1) as f64;
+            let logical_min = ((min_client - 0.5) / scale).ceil().max(1.0) as i32;
+            let logical_max =
+                (((max_client + 0.5) / scale).ceil() - 1.0).max(logical_min as f64) as i32;
+            let logical = (((desired - border as f64) / scale).floor() as i32)
+                .clamp(logical_min, logical_max);
+            let window_px = (logical as f64 * scale).round().max(1.0) as u32;
+            ResolvedWidth {
+                tile_px: window_px.saturating_add(border),
+                window_px,
+                window_logical: Some(logical),
+            }
+        } else {
+            let tile_px = proportion_px(view, cfg.column_gap, proportion)
+                .clamp(Self::MIN_COLUMN_PX, Self::MAX_COLUMN_PX) as u32;
+            ResolvedWidth {
+                tile_px,
+                window_px: tile_px.saturating_sub(border),
+                window_logical: None,
+            }
+        }
+    }
+
+    pub(super) fn resolved_window_geometry(
+        &self,
+        window: WindowId,
+        mut tile: Rect,
+        cfg: &LayoutConfig,
+        inset: i32,
+        resolve_proportion: bool,
+    ) -> ResolvedWindowGeometry {
+        let mut native = Rect::new(
+            tile.loc.x + inset,
+            tile.loc.y + inset,
+            tile.size.w.saturating_sub(inset.max(0) as u32 * 2),
+            tile.size.h.saturating_sub(inset.max(0) as u32 * 2),
+        );
+        let mut logical_window_size = (None, None);
+        if resolve_proportion && cfg.projection_scale.is_some() {
+            if let Some((output, workspace, column)) = self.locate_window(window) {
+                if let Some(monitor) = self.monitors.get(&output) {
+                    if let Some(ws) = monitor.workspaces.get(&workspace) {
+                        if ws.layout_mode == crate::layout::workspace::WorkspaceLayout::Scrolling {
+                            if let Some(column) = ws.columns.get(column).filter(|c| !c.maximized) {
+                                if let Some(p) = column.width_proportion {
+                                    let width = Self::proportional_width(
+                                        Self::precise_tiling_area(monitor, cfg).width,
+                                        cfg,
+                                        p,
+                                        inset,
+                                        column.min_width(),
+                                        column.max_width(),
+                                    );
+                                    tile.size.w = width.tile_px;
+                                    native.size.w = width.window_px;
+                                    logical_window_size.0 = width.window_logical;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ResolvedWindowGeometry {
+            tile,
+            window: native,
+            logical_window_size,
+        }
+    }
+
     /// Compose signed struts and outer gaps without casting negative insets to u32.
     pub(super) fn tiling_work_rect(monitor: &crate::layout::Monitor, cfg: &LayoutConfig) -> Rect {
         Self::tiling_rect_in(monitor.work_area, cfg)
@@ -11,17 +118,47 @@ impl TilingEngine {
 
     /// [`Self::tiling_work_rect`] for a bare work area (no monitor borrowed).
     pub(super) fn tiling_rect_in(work_area: Rect, cfg: &LayoutConfig) -> Rect {
-        let left = cfg.reserve_left as i64 + cfg.outer_gaps.3 as i64;
-        let right = cfg.reserve_right as i64 + cfg.outer_gaps.1 as i64;
-        let top = cfg.reserve_top as i64 + cfg.outer_gaps.0 as i64;
-        let bottom = cfg.reserve_bottom as i64 + cfg.outer_gaps.2 as i64;
-        let coord = |value: i64| value.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-        let size = |value: i64| value.clamp(0, i32::MAX as i64) as u32;
+        let area = Self::precise_tiling_area_in(work_area, cfg);
+        // Explicit integer viewport adapter. Sizing consumes the precise area below.
         Rect::new(
-            coord(work_area.loc.x as i64 + left),
-            coord(work_area.loc.y as i64 + top),
-            size(work_area.size.w as i64 - left - right),
-            size(work_area.size.h as i64 - top - bottom),
+            area.loc.x,
+            area.loc.y,
+            area.width.floor().clamp(0.0, i32::MAX as f64) as u32,
+            area.height.floor().clamp(0.0, i32::MAX as f64) as u32,
+        )
+    }
+
+    pub(crate) fn precise_tiling_area(
+        monitor: &crate::layout::Monitor,
+        cfg: &LayoutConfig,
+    ) -> crate::layout::metrics::PhysicalWorkArea {
+        Self::precise_tiling_area_in(monitor.work_area, cfg)
+    }
+
+    fn precise_tiling_area_in(
+        work_area: Rect,
+        cfg: &LayoutConfig,
+    ) -> crate::layout::metrics::PhysicalWorkArea {
+        use crate::layout::metrics::{spacing_work_rect, PhysicalSpacing};
+        let struts = cfg.projected_struts.unwrap_or(crate::config::Edges {
+            top: cfg.reserve_top as f64,
+            right: cfg.reserve_right as f64,
+            bottom: cfg.reserve_bottom as f64,
+            left: cfg.reserve_left as f64,
+        });
+        // Keep the standalone engine's asymmetric physical outer-gap API.
+        spacing_work_rect(
+            work_area,
+            &PhysicalSpacing {
+                inner_gap_px: cfg.column_gap,
+                outer_gap_px: 0,
+                struts_px: crate::config::Edges {
+                    top: struts.top + cfg.outer_gaps.0 as f64,
+                    right: struts.right + cfg.outer_gaps.1 as f64,
+                    bottom: struts.bottom + cfg.outer_gaps.2 as f64,
+                    left: struts.left + cfg.outer_gaps.3 as f64,
+                },
+            },
         )
     }
 
@@ -35,7 +172,7 @@ impl TilingEngine {
         let scale = monitor.scale_factor;
         for ws in monitor.workspaces.values_mut() {
             let cfg = Self::workspace_layout_in(per_workspace, output, ws).unwrap_or(base);
-            let view = Self::view_width_for_work_area(work_area, cfg);
+            let view = Self::precise_tiling_area_in(work_area, cfg).width;
             for column in &mut ws.columns {
                 // Fullscreen/maximize temporarily override the cached width.
                 if column.maximized
@@ -48,10 +185,30 @@ impl TilingEngine {
                     continue;
                 }
                 if let Some(p) = column.width_proportion {
+                    let min = column.min_width();
+                    let max = column.max_width();
                     column.width = Some(
-                        proportion_px(view, cfg.column_gap, p)
-                            .clamp(Self::MIN_COLUMN_PX, Self::MAX_COLUMN_PX)
-                            as u32,
+                        column
+                            .tiles
+                            .iter()
+                            .map(|tile| {
+                                let inset = self.rule_state.get(&tile.window_id).map_or(
+                                    cfg.border_inset(),
+                                    |state| {
+                                        state
+                                            .resolved
+                                            .effects
+                                            .border
+                                            .inset(&cfg.effects.border, cfg.border_inset())
+                                    },
+                                );
+                                Self::proportional_width(view, cfg, p, inset, min, max).tile_px
+                            })
+                            .max()
+                            .unwrap_or_else(|| {
+                                Self::proportional_width(view, cfg, p, cfg.border_inset(), min, max)
+                                    .tile_px
+                            }),
                     );
                 } else if let Some(logical) = column.width_fixed_logical {
                     // A target that left the column must not supply an unrelated
@@ -98,10 +255,11 @@ impl TilingEngine {
         };
         let cfg = self.effective_config_for_workspace(output, ws).clone();
         let spec = rule.or(cfg.default_column_width);
+        let inset = self.rule_border_inset(id, &cfg);
         let Some(monitor) = self.monitors.get_mut(&output) else {
             return;
         };
-        let view = Self::view_width_for_monitor(monitor, &cfg);
+        let view = Self::precise_tiling_area(monitor, &cfg).width;
         let scale = monitor.scale_factor;
         let Some(column) = monitor
             .workspaces
@@ -122,7 +280,20 @@ impl TilingEngine {
             return;
         }
         match spec {
-            Some(Some(SizeSpec::Proportion(p))) => column.set_proportion(p, view, cfg.column_gap),
+            Some(Some(SizeSpec::Proportion(p))) => {
+                column.set_proportion(p, view, cfg.column_gap);
+                column.width = Some(
+                    Self::proportional_width(
+                        view,
+                        &cfg,
+                        p,
+                        inset,
+                        column.min_width(),
+                        column.max_width(),
+                    )
+                    .tile_px,
+                );
+            }
             Some(Some(SizeSpec::Fixed(px))) => {
                 column.set_fixed_logical(px as f64, scale, 2 * cfg.border_width.max(1))
             }
@@ -130,7 +301,7 @@ impl TilingEngine {
                 if let Some(window) = self.tiled_windows.get(&id) {
                     column.set_width(Some(
                         (window.bounds.size.w as i32 + 2 * cfg.border_width.max(1))
-                            .min(view)
+                            .min(view.floor() as i32)
                             .max(50) as u32,
                     ));
                 }

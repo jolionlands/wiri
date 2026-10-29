@@ -238,12 +238,12 @@ impl TilingEngine {
             // Each workspace lays out inside its own configured insets (C2), then the
             // camera transform places that inside the shared stack entry.
             let cfg = self.effective_config_for_workspace(output, id);
-            let workspace_view = Self::tiling_work_rect(monitor, cfg);
+            let workspace_view = Self::precise_tiling_area(monitor, cfg);
             let normal = self.calculate_positions_at_zoom(
                 ws,
                 workspace_view,
                 0,
-                workspace_view.size.h as i32,
+                workspace_view.height,
                 cfg,
                 1.0,
             );
