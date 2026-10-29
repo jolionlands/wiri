@@ -66,7 +66,7 @@ impl PointerEngine {
     pub fn configure(&mut self, config: &Config) {
         self.mod_key =
             super::mod_key_flags(&config.input.mod_key).unwrap_or(super::DEFAULT_MOD_KEY);
-        self.natural = config.input.natural_scroll;
+        self.natural = config.input.mouse_scroll.natural;
         self.binds.clear();
         self.residual = [0; 2];
         self.residual_mods = None;
@@ -206,6 +206,9 @@ impl PointerEngine {
 }
 pub static ENGINE: LazyLock<Mutex<PointerEngine>> =
     LazyLock::new(|| Mutex::new(PointerEngine::default()));
+
+#[cfg(test)]
+mod natural_origin_parity_tests;
 
 #[cfg(test)]
 mod tests {
