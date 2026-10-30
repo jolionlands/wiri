@@ -957,8 +957,10 @@ impl IpcServer {
                         }
                     };
                 }
-                // niri's `--id <n>`: the window to act on.
-                let (args, quoted, target) = match split_window_target(&args, &quoted) {
+                // niri's `--id <n>`: the window to act on.  Not for `spawn`: every word after
+                // its name is the command line of the program to start, `--id 5` included
+                // (`niri msg action spawn -- tool --id 5`, niri:niri-ipc/src/lib.rs:207-212).
+                let (args, quoted, target) = match split_action_target(&name, &args, &quoted) {
                     Ok(split) => split,
                     Err(error) => return serde_json::json!({"success": false, "error": error}),
                 };
@@ -2308,10 +2310,29 @@ fn is_query(message: &IpcMessage) -> bool {
     )
 }
 
+/// The actions whose words are an argv or a command line, never options: a `--id` among them
+/// belongs to the program that is started.
+pub(crate) fn is_spawn_action(name: &str) -> bool {
+    matches!(name, "spawn" | "exec" | "spawn-sh" | "spawn-cmd" | "spawn_cmd")
+}
+
+/// [`split_window_target`] for the action `name`: the words of a `spawn` are left alone.
+pub(crate) fn split_action_target(
+    name: &str,
+    args: &[String],
+    quoted: &[bool],
+) -> Result<(Vec<String>, Vec<bool>, Option<isize>), String> {
+    if is_spawn_action(name) {
+        Ok((args.to_vec(), quoted.to_vec(), None))
+    } else {
+        split_window_target(args, quoted)
+    }
+}
+
 /// niri's `--id <n>` (also `--id=<n>`, and `--window-id` where niri's action calls it so) in
 /// the arguments of an action: the window to act on instead of the focused one.  Returns the
 /// arguments without it, the `quoted` flags that go with them, and the window.
-fn split_window_target(
+pub(crate) fn split_window_target(
     args: &[String],
     quoted: &[bool],
 ) -> Result<(Vec<String>, Vec<bool>, Option<isize>), String> {

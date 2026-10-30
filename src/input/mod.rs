@@ -172,8 +172,10 @@ pub enum Action {
     MoveColumnToFirst,
     /// niri `move-column-to-last`.
     MoveColumnToLast,
-    /// niri `move-column-to-index N`: the focused column goes to the 0-based index `N`
-    /// of its workspace (an index past the end puts it last).
+    /// niri `move-column-to-index N`: the focused column goes to the 1-based index `N` of
+    /// its workspace; `0` is the first place as well and an index past the end puts it last
+    /// (niri:src/layout/scrolling.rs:1702-1707, `index.saturating_sub(1).min(len - 1)`).
+    /// The variant keeps niri's argument; the engine subtracts the one.
     MoveColumnToIndex(u32),
     /// niri `swap-window-left`: the focused window changes places with the window of
     /// the column on its left (the moved window keeps the focus).
@@ -415,14 +417,70 @@ impl WorkspaceRef {
             return None;
         }
         if !quoted {
-            if let Ok(index) = word.parse::<u32>() {
+            // niri:niri-ipc/src/lib.rs:1791-1805 (`WorkspaceReferenceArg::from_str`, the CLI)
+            // and niri:niri-config/src/binds.rs:754-758 (an integer literal in a bind): an
+            // integer is an index that must fit a `u8`.  A larger or negative one is an
+            // error, not a workspace that happens to be called "-1".  Only text that is not
+            // an `i32` at all is a name.
+            if let Ok(number) = word.parse::<i32>() {
                 // niri counts from 1; 0 is the first workspace as well.
-                return Some(WorkspaceRef::Index(index.max(1)));
+                return u8::try_from(number)
+                    .ok()
+                    .map(|index| WorkspaceRef::Index(u32::from(index).max(1)));
             }
         }
         Some(WorkspaceRef::Name(word.to_string()))
     }
 }
+
+/// A niri `usize` argument (`focus-column`, `move-column-to-index`,
+/// `move-workspace-to-index`; niri:niri-config/src/binds.rs:175,198,248).  Any non-negative
+/// integer is valid; the engine's finite stacks make every value past `u32::MAX` the last
+/// place, exactly as the typed IPC conversion already clamps it.
+pub(crate) fn parse_usize_index(word: &str) -> Option<u32> {
+    word.parse::<usize>()
+        .ok()
+        .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
+}
+
+/// niri's unit actions: the names whose KDL grammar takes no argument and no property
+/// (a unit variant of niri:niri-config/src/binds.rs `Action`; knuffel rejects a surplus
+/// argument).  Their legacy aliases keep the old lenient arms.
+const UNIT_NIRI_ACTIONS: &[&str] = &[
+    "toggle-keyboard-shortcuts-inhibit",
+    "move-column-to-first",
+    "move-column-to-last",
+    "move-window-up",
+    "move-window-down",
+    "consume-or-expel-window-left",
+    "consume-or-expel-window-right",
+    "move-column-left",
+    "move-column-right",
+    "close-window",
+    "fullscreen-window",
+    "toggle-window-floating",
+    "move-window-to-floating",
+    "move-window-to-tiling",
+    "center-window",
+    "toggle-overview",
+    "open-overview",
+    "close-overview",
+    "toggle-column-tabbed-display",
+    "center-column",
+    "reset-window-height",
+    "switch-preset-column-width",
+    "switch-preset-column-width-back",
+    "switch-preset-window-width",
+    "switch-preset-window-width-back",
+    "switch-preset-window-height",
+    "switch-preset-window-height-back",
+    "consume-window-into-column",
+    "expel-window-from-column",
+    "expand-column-to-available-width",
+    "maximize-column",
+    "maximize-window-to-edges",
+    "show-hotkey-overlay",
+];
 
 /// Parse an action name string (from config/IPC) into an Action.
 /// Returns None for unknown action names.
@@ -507,6 +565,11 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
             }
         });
     }
+    // A unit action of niri's grammar takes nothing: `close-window "x"` is a config error
+    // there, not a `close-window` that ignores the word.
+    if UNIT_NIRI_ACTIONS.contains(&name) && !args.is_empty() {
+        return None;
+    }
     match name {
         "toggle-keyboard-shortcuts-inhibit" => Some(Action::ToggleKeyboardShortcutsInhibit),
         "focus-column-left" | "focus-left" => Some(Action::FocusColumnLeft),
@@ -518,7 +581,7 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         "move-column-to-first" => Some(Action::MoveColumnToFirst),
         "move-column-to-last" => Some(Action::MoveColumnToLast),
         "move-column-to-index" if args.len() == 1 => {
-            args[0].parse::<u32>().ok().map(Action::MoveColumnToIndex)
+            parse_usize_index(&args[0]).map(Action::MoveColumnToIndex)
         }
         "swap-window-left" if args.is_empty() => Some(Action::SwapWindowLeft),
         "swap-window-right" if args.is_empty() => Some(Action::SwapWindowRight),

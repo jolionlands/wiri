@@ -1,4 +1,6 @@
 mod action_audit;
+#[cfg(test)]
+mod action_census;
 mod action_options;
 pub mod client;
 pub mod codec;

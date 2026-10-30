@@ -60,7 +60,8 @@ pub fn parse(name: &str, args: &[String]) -> Option<Option<SystemAction>> {
             [] => Some(Quit {
                 skip_confirmation: false,
             }),
-            [flag] if flag == "--skip-confirmation" => Some(Quit {
+            // niri:niri-ipc/src/lib.rs:196-201: `#[arg(short, long)] skip_confirmation`.
+            [flag] if flag == "--skip-confirmation" || flag == "-s" => Some(Quit {
                 skip_confirmation: true,
             }),
             [flag, value] if flag == "--skip-confirmation" => match value.as_str() {

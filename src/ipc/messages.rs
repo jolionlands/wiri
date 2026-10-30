@@ -184,6 +184,18 @@ impl std::str::FromStr for PositionChange {
     }
 }
 
+/// niri's CLI spellings that differ from the words of a `binds {}` line.  `niri msg action
+/// unset-workspace-name [REFERENCE]` takes the workspace as a positional argument
+/// (niri:niri-ipc/src/lib.rs:611-618); a bind (and wiri's parser) names it with
+/// `--workspace`, so a single positional word becomes that option and keeps its quotes.
+pub fn niri_cli_words(name: &str, mut words: Vec<String>) -> Vec<String> {
+    if name == "unset-workspace-name" && words.len() == 1 && !words[0].starts_with("--") {
+        let reference = words.remove(0);
+        words = vec!["--workspace".to_string(), reference];
+    }
+    words
+}
+
 /// Parse the IPC-only action independently of the KDL bind vocabulary.
 pub fn parse_move_floating_window(args: &[String]) -> Result<IpcMessage, String> {
     let (mut id, mut x, mut y) = (None, None, None);

@@ -364,7 +364,7 @@ impl<'a> Words<'a> {
                             _ => return None,
                         })
                     }
-                    "--workspace" if words.workspace.is_none() => {
+                    "--workspace" | "--reference" if words.workspace.is_none() => {
                         words.workspace = Some(WorkspaceRef::from_word(value, value_quoted)?)
                     }
                     "--id" if words.window.is_none() => {
@@ -415,15 +415,18 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
         | "move-column-down"
         | "move-column-to-workspace-above"
         | "move-column-to-workspace-below" => &["--focus"],
-        "move-workspace-to-index"
-        | "set-workspace-name"
-        | "rename-workspace"
-        | "rename-ws"
-        | "unset-workspace-name" => &["--workspace"],
+        // niri's CLI names the target of `move-workspace-to-index` and
+        // `move-workspace-to-monitor` `--reference` (niri:niri-ipc/src/lib.rs:579-586,
+        // 805-812) and that of `set-workspace-name` `--workspace` (lib.rs:595-602); wiri's
+        // older `--workspace` spelling keeps working for all of them.
+        "move-workspace-to-index" => &["--workspace", "--reference"],
+        "set-workspace-name" | "rename-workspace" | "rename-ws" | "unset-workspace-name" => {
+            &["--workspace"]
+        }
         "focus-window-previous" | "focus-previous" | "alt-tab" | "focus-history-back" => {
             &["--debounce-ms"]
         }
-        n if n.starts_with("move-workspace-to-monitor") => &["--workspace"],
+        n if n.starts_with("move-workspace-to-monitor") => &["--workspace", "--reference"],
         n if n.starts_with("move-window-to-monitor")
             || n == "move-to-monitor-left"
             || n == "move-to-monitor-right" =>
@@ -445,11 +448,13 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
     match name {
         "focus-column-right-or-first" => focus(F::ColumnRightOrFirst),
         "focus-column-left-or-last" => focus(F::ColumnLeftOrLast),
+        // `focus-column` takes a `usize` and `focus-window-in-column` a `u8`
+        // (niri:niri-config/src/binds.rs:163,175): 300 is no window index.
         "focus-column" => Some(Action::LayoutFocus(F::Column(
-            w.one()?.parse::<u32>().ok()?.max(1),
+            super::parse_usize_index(w.one()?)?.max(1),
         ))),
         "focus-window-in-column" => Some(Action::LayoutFocus(F::WindowInColumn(
-            w.one()?.parse::<u32>().ok()?.max(1),
+            u32::from(w.one()?.parse::<u8>().ok()?).max(1),
         ))),
         "focus-window-down-or-column-left" => focus(F::DownOrColumnLeft),
         "focus-window-down-or-column-right" => focus(F::DownOrColumnRight),
@@ -530,7 +535,7 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
         "move-workspace-down" | "swap-workspace-down" => simple(Action::MoveWorkspaceDown),
         "move-workspace-up" | "swap-workspace-up" => simple(Action::MoveWorkspaceUp),
         "move-workspace-to-index" => Some(Action::WorkspaceAction(W::MoveToIndex {
-            index: w.one()?.parse::<u32>().ok()?.max(1),
+            index: super::parse_usize_index(w.one()?)?.max(1),
             workspace: w.workspace.clone(),
         })),
         "set-workspace-name" | "rename-workspace" | "rename-ws" => {
