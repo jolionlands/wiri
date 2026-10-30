@@ -10,11 +10,13 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 - [Config, input and IPC](niri-gaps-config-input-ipc.md): config system and KDL, keyboard
   and pointer input, key bindings, hotkey overlay, screenshots, IPC requests and events,
   outputs, non-layout actions, misc and security.
+- [Action and CLI contract census](action-census.md): every pinned niri action (143) and the
+  `niri msg` subcommands against wiri's KDL, `wiri-ctl` and typed-IPC entry points.
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
 | Layout and behaviour (226 rows) | 163 | 46 | 0 | 17 |
-| Config, input and IPC (259 rows) | 140 | 47 | 0 | 72 |
+| Config, input and IPC (259 rows) | 141 | 46 | 0 | 72 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
 retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates and
@@ -169,9 +171,10 @@ retains its zero-input diagnostics; full R3 remains failed. See the
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
-curated hotkey list move to done. The current totals are
-**303 done / 93 partial / 89 N/A** across 485 rows:
-**303/396 applicable rows (76.5%)**. Floating-height resolution/routing and the
+curated hotkey list move to done, and the 2026-10-30 action census moves
+`binds` action names to done. The current totals are
+**304 done / 92 partial / 89 N/A** across 485 rows:
+**304/396 applicable rows (76.8%)**. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
 remain partial for physical mixed-DPI and remaining lifecycle routes. The lifecycle
 checkpoint qualifies its listed source cases; earlier floating native evidence
@@ -305,3 +308,11 @@ display skip from a new frozen copy containing 251 files. Native admission-focus
 mixed-DPI and the full desktop cycle remain pending; the failed full R3 stays
 recorded. All 485 matrix feature/status pairs remain unchanged: **303/396 done
 (76.5%), 93 partial, 89 N/A**. See the [R4 checkpoint](2026-10-29-tridaris-r4.md#explicit-focus-during-recent-admission).
+
+**2026-10-30 action and CLI contract census.** [action-census.md](action-census.md) runs niri's own
+KDL node, CLI words and typed JSON for all 143 pinned actions through wiri's parsers, with the
+measured gate `ipc::action_census` (119 full, 15 partial, 9 N/A, 0 missing). It fixed a wrong
+claim (`move-column-to-index` is 1-based) and nine further contract mismatches, and moves matrix B
+row 178 to done: **304/396 applicable rows (76.8%), 92 partial, 89 N/A**. Rows 232 and 257 stay
+partial: nine `*ById` forms still activate the named window first, and `--print-request` prints
+wiri's dialect.
