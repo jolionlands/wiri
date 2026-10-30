@@ -159,8 +159,8 @@ struct Cli {
     #[arg(short, long, default_value = "5", global = true)]
     timeout: u64,
 
-    /// Emit the raw JSON response instead of a formatted summary.
-    #[arg(long, global = true)]
+    /// Emit the raw JSON response instead of a formatted summary (niri's `msg -j`).
+    #[arg(short = 'j', long, global = true)]
     json: bool,
 
     /// Print the request JSON and exit without connecting to the daemon.
@@ -248,6 +248,14 @@ enum Commands {
 
     /// Whether the overview is open.
     OverviewState,
+
+    /// List open layer-shell surfaces (niri `msg layers`).  Windows has no layer-shell:
+    /// the daemon answers niri's own "not available on Windows" error, exit status 1.
+    Layers,
+
+    /// List screencasts (niri `msg casts`).  Windows has no portal casting: the daemon
+    /// answers "not available on Windows", exit status 1.
+    Casts,
 
     /// The version of the running wiri daemon (the daemon's, not this CLI's:
     /// `wiri-ctl --version` is the CLI's).
@@ -596,6 +604,26 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
+    // `niri msg layers` / `niri msg casts` have no Windows counterpart.  They still travel as
+    // niri's own request names, so the daemon (not clap) says why and the exit status is 1.
+    if let Some(request) = niri_only_request(&command) {
+        let text = serde_json::to_string(request)?;
+        if cli.print_request {
+            println!("{}", text);
+            return Ok(());
+        }
+        let reply = block_on(async {
+            let mut client = connect_ipc(cli.timeout).await?;
+            Ok(client.request_raw(&text).await?)
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&reply)?;
+        if let Some(error) = value.get("Err").and_then(serde_json::Value::as_str) {
+            anyhow::bail!("{}", error);
+        }
+        println!("{}", reply);
+        return Ok(());
+    }
+
     let event_output = match &command {
         Commands::EventStream { stream, .. } => Some(*stream || cli.json),
         _ => None,
@@ -644,6 +672,7 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
         Commands::RequestError => IpcMessage::ReturnError,
         Commands::RawRequest { .. } => unreachable!("raw requests handled before IPC dial"),
         Commands::OverviewState => IpcMessage::OverviewState,
+        Commands::Layers | Commands::Casts => unreachable!("niri-only requests handled above"),
         Commands::Version => IpcMessage::Version,
         Commands::SwitchWorkspace { id } => IpcMessage::SwitchWorkspace { id },
         Commands::FocusWindow { hwnd } => IpcMessage::FocusWindow { window_hwnd: hwnd },
@@ -698,6 +727,7 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
         Commands::MoveFloatingWindow { id, x, y } => IpcMessage::MoveFloatingWindow { id, x, y },
         Commands::Spawn { command, args } => IpcMessage::SpawnCommand { command, args },
         Commands::Action { name, args } => {
+            let args = wiri::ipc::niri_cli_words(&name, args);
             let (args, quoted) = split_quoted_words(args);
             if name == "move-floating-window" {
                 wiri::ipc::parse_move_floating_window(&args).map_err(anyhow::Error::msg)?
@@ -765,6 +795,15 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
             monitor_id,
         },
     })
+}
+
+/// The niri requests wiri-ctl forwards only to be told that Windows has no such thing.
+fn niri_only_request(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Layers => Some("Layers"),
+        Commands::Casts => Some("Casts"),
+        _ => None,
+    }
 }
 
 fn event_types(types: &str) -> Vec<String> {
@@ -2114,6 +2153,111 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["wiri-ctl", "workspaces"]).expect("parses");
         assert!(!cli.json, "the readable output is the default");
+    }
+
+    #[test]
+    fn niri_msg_short_json_flag_and_every_msg_subcommand_exist() {
+        // niri:src/cli.rs:44-45: `#[arg(short, long)] json`, so `niri msg -j windows`.
+        for args in [
+            ["wiri-ctl", "-j", "windows"],
+            ["wiri-ctl", "msg", "-j", "windows"],
+            ["wiri-ctl", "msg", "windows", "-j"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("the command line parses");
+            assert!(cli.json, "{:?}", args);
+        }
+        // niri:src/cli.rs:67-117: all seventeen `niri msg` subcommands parse, `layers` and
+        // `casts` included (Windows has neither; the daemon answers with an error).
+        for name in [
+            "outputs",
+            "workspaces",
+            "windows",
+            "layers",
+            "keyboard-layouts",
+            "focused-output",
+            "focused-window",
+            "pick-window",
+            "pick-color",
+            "event-stream",
+            "version",
+            "request-error",
+            "overview-state",
+            "casts",
+        ] {
+            assert!(
+                Cli::try_parse_from(["wiri-ctl", "msg", name]).is_ok(),
+                "msg {name}"
+            );
+        }
+        for args in [
+            vec!["wiri-ctl", "msg", "action", "focus-column-left"],
+            vec!["wiri-ctl", "msg", "output", "DP-1", "off"],
+            vec!["wiri-ctl", "msg", "raw-request", "\"Version\""],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{:?}", args);
+        }
+    }
+
+    #[test]
+    fn layers_and_casts_travel_as_niris_own_request_names() {
+        // They have no IpcMessage: the daemon's wire layer says "not available on Windows".
+        for (name, request) in [("layers", "Layers"), ("casts", "Casts")] {
+            let cli = Cli::try_parse_from(["wiri-ctl", "msg", name]).unwrap();
+            let command = cli.command.into_command();
+            assert_eq!(super::niri_only_request(&command), Some(request));
+            let reply = wiri::ipc::wire::decode(serde_json::json!(request));
+            assert!(
+                reply.is_err_and(|error| error.contains("not available on Windows")),
+                "{request}"
+            );
+        }
+        let cli = Cli::try_parse_from(["wiri-ctl", "windows"]).unwrap();
+        assert_eq!(super::niri_only_request(&cli.command.into_command()), None);
+    }
+
+    #[test]
+    fn spawn_takes_niris_double_dash_and_keeps_every_word() {
+        // niri:niri-ipc/src/lib.rs:207-218: `niri msg action spawn -- alacritty -e htop` and
+        // `spawn-sh -- "echo hi"` (`#[arg(last = true)]`).  A `--id` after the command belongs
+        // to the program.
+        let request = request_of(&["wiri-ctl", "action", "spawn", "--", "tool", "--id", "5"]);
+        match request {
+            IpcMessage::RunAction { name, args, .. } => {
+                assert_eq!(name, "spawn");
+                assert_eq!(args, ["tool", "--id", "5"], "the separator is not a word");
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+        let request = request_of(&["wiri-ctl", "msg", "action", "spawn-sh", "--", "echo hi"]);
+        match request {
+            IpcMessage::RunAction { name, args, .. } => {
+                assert_eq!(name, "spawn-sh");
+                assert_eq!(args, ["echo hi"]);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unset_workspace_name_takes_its_reference_positionally() {
+        // niri:niri-ipc/src/lib.rs:611-618: `unset-workspace-name [REFERENCE]`.
+        let request = request_of(&["wiri-ctl", "action", "unset-workspace-name", "web"]);
+        match request {
+            IpcMessage::RunAction { name, args, quoted } => {
+                assert_eq!(name, "unset-workspace-name");
+                assert_eq!(args, ["--workspace", "web"]);
+                assert!(quoted.is_empty(), "an unquoted word keeps meaning an index or a name");
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+        let request = request_of(&["wiri-ctl", "action", "unset-workspace-name", "\"2\""]);
+        match request {
+            IpcMessage::RunAction { args, quoted, .. } => {
+                assert_eq!(args, ["--workspace", "2"]);
+                assert_eq!(quoted, [false, true], "quotes still make a name");
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
     }
 
     #[test]
