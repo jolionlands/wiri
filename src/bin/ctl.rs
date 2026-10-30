@@ -2159,11 +2159,11 @@ mod tests {
     fn niri_msg_short_json_flag_and_every_msg_subcommand_exist() {
         // niri:src/cli.rs:44-45: `#[arg(short, long)] json`, so `niri msg -j windows`.
         for args in [
-            ["wiri-ctl", "-j", "windows"],
-            ["wiri-ctl", "msg", "-j", "windows"],
-            ["wiri-ctl", "msg", "windows", "-j"],
+            vec!["wiri-ctl", "-j", "windows"],
+            vec!["wiri-ctl", "msg", "-j", "windows"],
+            vec!["wiri-ctl", "msg", "windows", "-j"],
         ] {
-            let cli = Cli::try_parse_from(args).expect("the command line parses");
+            let cli = Cli::try_parse_from(args.clone()).expect("the command line parses");
             assert!(cli.json, "{:?}", args);
         }
         // niri:src/cli.rs:67-117: all seventeen `niri msg` subcommands parse, `layers` and
