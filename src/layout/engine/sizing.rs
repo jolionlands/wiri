@@ -734,13 +734,73 @@ impl TilingEngine {
         self.apply_layout_for_monitor(output, backend);
     }
 
+    /// A floating window cannot be fullscreen or maximized (niri `Workspace::set_fullscreen` and
+    /// `set_maximized`, workspace.rs:1290-1293 and 1355-1358): it moves into the strip first,
+    /// as a column of its own right of its workspace's active column, and is remembered as a
+    /// tile that floats again when the state ends (`restore_to_floating`, workspace.rs:1339-1341
+    /// and 1398-1400). Whether the new tile takes the focus follows niri's `target_is_active`
+    /// (workspace.rs:1420): only the active window does, so an explicit id of another float
+    /// leaves the focus where it is. The geometry it floated at stays in `float_memory`.
+    ///
+    /// Nothing is laid out here: the caller changes the sizing state next and lays out once.
+    /// `false` when the window cannot move (it is minimized, or it has no home).
+    fn float_into_strip_for_sizing(&mut self, window_id: WindowId, backend: &BackendHandle) -> bool {
+        if self.minimized.contains_key(&window_id) {
+            return false;
+        }
+        let Some((output, _)) = self.float_location(window_id) else {
+            return false;
+        };
+        let Some(work) = self.monitors.get(&output).map(|m| m.work_area) else {
+            return false;
+        };
+        let activate = self
+            .state_target()
+            .is_some_and(|target| target.window == window_id);
+        self.unfloat_window_with(window_id, activate, false, backend);
+        if self.floating_windows.contains(&window_id) {
+            return false;
+        }
+        self.restore_to_floating.insert(window_id, work);
+        true
+    }
+
+    /// A tile that is not fullscreen or maximized any more is a plain tile: it no longer
+    /// remembers a float to return to (niri overwrites the flag at every change from normal,
+    /// workspace.rs:1339-1341).
+    fn settle_restore_to_floating(&mut self, window_id: WindowId) {
+        if !self.effective_fullscreen(window_id) && !self.is_maximized_to_edges(window_id) {
+            self.restore_to_floating.remove(&window_id);
+        }
+    }
+
+    /// Leaving fullscreen floats the window again when it came from the floating layer and is
+    /// not also maximized (niri workspace.rs:1299-1321: "when going from fullscreen to
+    /// maximized, don't consider restore_to_floating yet").
+    fn floats_when_leaving_fullscreen(&self, window_id: WindowId) -> bool {
+        self.restore_to_floating.contains_key(&window_id)
+            && self.effective_fullscreen(window_id)
+            && !self.is_maximized_to_edges(window_id)
+    }
+
+    /// Leaving maximized floats the window again when it came from the floating layer. A
+    /// window that is fullscreen as well cannot leave maximized into floating: niri's check is
+    /// on the pending sizing mode, which is fullscreen then (workspace.rs:1373-1375).
+    fn floats_when_leaving_maximized(&self, window_id: WindowId) -> bool {
+        self.restore_to_floating.contains_key(&window_id)
+            && self.is_maximized_to_edges(window_id)
+            && !self.effective_fullscreen(window_id)
+    }
+
     /// Make a window fullscreen (`on`) or take it out of fullscreen.  `by_app` says that the
     /// window did it on its own (a video player, F11): its frame is not touched then, and wiri
     /// follows it out of fullscreen when the application leaves.
     ///
     /// A tile keeps its column (and its place in it) and is drawn over the monitor by the layout
-    /// pass; a floating window covers the monitor and gets its rectangle back afterwards.  The
-    /// shell is told, so that the taskbar goes away (and comes back).
+    /// pass.  A floating window cannot be fullscreen (niri workspace.rs:1288-1298): it moves
+    /// into the strip and is fullscreen there, and floats again, where it floated, when it
+    /// leaves fullscreen; asking a floating window to leave fullscreen does nothing.  The shell
+    /// is told, so that the taskbar goes away (and comes back).
     pub fn set_fullscreen(
         &mut self,
         window_id: WindowId,
@@ -751,20 +811,28 @@ impl TilingEngine {
         let Some(hwnd) = self.tiled_windows.get(&window_id).map(|w| w.hwnd) else {
             return;
         };
+        if self.floating_windows.contains(&window_id) {
+            if !on || !self.float_into_strip_for_sizing(window_id, backend) {
+                return;
+            }
+        } else if !on && self.floats_when_leaving_fullscreen(window_id) {
+            self.float_window(window_id, backend);
+            return;
+        }
         if self.sizing_tabbed_column(window_id).is_some() {
             self.set_tabbed_fullscreen(window_id, on, by_app, backend);
+            self.settle_restore_to_floating(window_id);
             return;
         }
         if self.fullscreen_windows.contains(&window_id) == on {
+            self.settle_restore_to_floating(window_id);
             return;
         }
-        let is_float = self.floating_windows.contains(&window_id);
-        let output = if is_float {
-            self.float_location(window_id).map(|(o, _)| o)
-        } else {
-            self.locate_window(window_id).map(|(o, _, _)| o)
-        };
-        let Some(output) = output.or_else(|| self.monitors.focused_id()) else {
+        let Some(output) = self
+            .locate_window(window_id)
+            .map(|(o, _, _)| o)
+            .or_else(|| self.monitors.focused_id())
+        else {
             return;
         };
         let Some(monitor_bounds) = self.monitors.get(&output).map(|m| m.bounds) else {
@@ -772,20 +840,13 @@ impl TilingEngine {
         };
 
         if on {
-            if is_float {
-                if let Some(rect) = self.float_rect_of(window_id) {
-                    self.float_memory.insert(window_id, rect);
-                }
-            }
             self.fullscreen_windows.insert(window_id);
             self.fullscreen_since.insert(window_id, Instant::now());
             self.window_sizing.insert(window_id, SizingMode::Fullscreen);
             if by_app {
                 self.app_fullscreen.insert(window_id);
             }
-            if !is_float {
-                self.hold_slot(window_id);
-            }
+            self.hold_slot(window_id);
             if !by_app && !self.tab_sizing_styles.contains_key(&window_id) {
                 // A former tab keeps its deferred native style until layout selects it.
                 // Ordinary independent fullscreen retains the existing native path.
@@ -817,16 +878,11 @@ impl TilingEngine {
                     None => self.restore_window_style(hwnd),
                 }
             }
-            if is_float {
-                if let Some(rect) = self.float_memory.get(&window_id).copied() {
-                    self.place_float(window_id, rect, backend);
-                }
-            } else {
-                self.release_slot(window_id);
-            }
+            self.release_slot(window_id);
             crate::backend::taskbar::mark_fullscreen(hwnd, false);
             info!("Window {} left fullscreen", hwnd);
         }
+        self.settle_restore_to_floating(window_id);
 
         // The fullscreen rect is applied behind the applied-state cache's back.  Forget
         // what the cache knows about this window, or leaving fullscreen finds its old
@@ -838,16 +894,25 @@ impl TilingEngine {
 
     /// niri `maximize-window-to-edges`: the window fills the work area of its monitor, with no
     /// gap and no border, and keeps its place in its column.  Toggling it again gives the
-    /// window its tile back.  A floating window cannot be maximized.
+    /// window its tile back.  A floating window cannot be maximized (niri
+    /// workspace.rs:1353-1363): it moves into the strip and is maximized there, and floats
+    /// again, where it floated, when it is unmaximized; asking a floating window to unmaximize
+    /// does nothing.
     pub fn set_maximized_to_edges(
         &mut self,
         window_id: WindowId,
         on: bool,
         backend: &BackendHandle,
     ) {
-        if !self.tiled_windows.contains_key(&window_id)
-            || self.floating_windows.contains(&window_id)
-        {
+        if !self.tiled_windows.contains_key(&window_id) {
+            return;
+        }
+        if self.floating_windows.contains(&window_id) {
+            if !on || !self.float_into_strip_for_sizing(window_id, backend) {
+                return;
+            }
+        } else if !on && self.floats_when_leaving_maximized(window_id) {
+            self.float_window(window_id, backend);
             return;
         }
         let members = self.sizing_members(window_id);
@@ -855,9 +920,11 @@ impl TilingEngine {
             .iter()
             .all(|member| self.maximized_edges.contains(member) == on)
         {
+            self.settle_restore_to_floating(window_id);
             return;
         }
         let Some((output, _, _)) = self.locate_window(window_id) else {
+            self.settle_restore_to_floating(window_id);
             return;
         };
         let transition = SizingTransition::begin();
@@ -886,6 +953,7 @@ impl TilingEngine {
             window_id.as_isize(),
             if on { "now" } else { "no longer" }
         );
+        self.settle_restore_to_floating(window_id);
         self.reveal_focused_column(output);
         self.apply_layout_for_monitor(output, backend);
     }
@@ -919,6 +987,10 @@ impl TilingEngine {
         let by_app = self.app_fullscreen.remove(&window_id);
         if !keep_maximized {
             self.maximized_edges.remove(&window_id);
+            // The window leaves the strip for good (it floats, or is dropped elsewhere): no
+            // float to return to any more. A minimized window keeps its state, and with it
+            // where it comes back to.
+            self.restore_to_floating.remove(&window_id);
         }
         self.unzoom_pending.remove(&window_id);
         self.invalidate_sizing_geometry(window_id);
@@ -951,6 +1023,7 @@ impl TilingEngine {
         self.release_slot_for(window_id, true);
         self.fullscreen_windows.remove(&window_id);
         self.maximized_edges.remove(&window_id);
+        self.restore_to_floating.remove(&window_id);
         self.app_fullscreen.remove(&window_id);
         self.tab_sizing_styles.remove(&window_id);
         self.unzoom_pending.remove(&window_id);
@@ -1895,8 +1968,15 @@ mod tests {
         let mut engine = with_three_windows();
         let two = WindowId::new(2);
         engine.toggle_floating_for(two, &be());
+        // niri workspace.rs:1355-1358: maximizing a float moves it into the strip, where it
+        // is maximized; it is never both floating and maximized.
         engine.toggle_maximize_window_to_edges_for(two, &be());
-        assert!(!engine.is_maximized_to_edges(two), "a float stays a float");
+        assert!(!engine.is_floating(two), "it moved into the strip");
+        assert!(engine.is_maximized_to_edges(two));
+        // niri workspace.rs:1375-1379: unmaximizing it floats it again.
+        engine.toggle_maximize_window_to_edges_for(two, &be());
+        assert!(engine.is_floating(two));
+        assert!(!engine.is_maximized_to_edges(two));
         engine.toggle_floating_for(two, &be());
         // Tiles: fullscreen and maximized end when the window floats.
         let one = WindowId::new(1);

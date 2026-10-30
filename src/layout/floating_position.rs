@@ -190,10 +190,61 @@ pub fn clamp_visible(rect: Rect, work: Rect, scale: f64) -> Rect {
     )
 }
 
+/// The same fraction of another work area. niri stores a float's position as a fraction
+/// of the working area (`logical_to_size_frac_in_working_area`, floating.rs:126-135, with
+/// the extent floored at 1) and scales it by the work area it is added to
+/// (`scale_by_working_area`, floating.rs:115-124). The size is kept as it is: niri's
+/// remembered `floating_window_size` is not scaled either (floating.rs:538-541).
+pub fn rescale_position(rect: Rect, from: Rect, to: Rect) -> Rect {
+    if from == to {
+        return rect;
+    }
+    let fraction = |pos: i32, origin: i32, extent: u32| {
+        (f64::from(pos) - f64::from(origin)) / f64::from(extent).max(1.0)
+    };
+    let place = |fraction: f64, origin: i32, extent: u32| {
+        (f64::from(origin) + fraction * f64::from(extent)).round() as i32
+    };
+    Rect::new(
+        place(
+            fraction(rect.loc.x, from.loc.x, from.size.w),
+            to.loc.x,
+            to.size.w,
+        ),
+        place(
+            fraction(rect.loc.y, from.loc.y, from.size.h),
+            to.loc.y,
+            to.size.h,
+        ),
+        rect.size.w,
+        rect.size.h,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use PositionChange::*;
+
+    #[test]
+    fn parity_rescale_position_keeps_the_work_area_fraction_and_the_size() {
+        // niri floating.rs:115-135: position / working area size, then back by the new area.
+        let from = Rect::new(0, 0, 1920, 1040);
+        let to = Rect::new(1920, 40, 960, 520);
+        let rect = Rect::new(480, 260, 700, 400);
+        assert_eq!(
+            rescale_position(rect, from, to),
+            Rect::new(1920 + 240, 40 + 130, 700, 400)
+        );
+        // The same area is the identity, even for a position outside it.
+        assert_eq!(rescale_position(Rect::new(-90, 5, 10, 10), from, from), Rect::new(-90, 5, 10, 10));
+        // A degenerate source extent is floored at one pixel (floating.rs:133-134).
+        let flat = Rect::new(0, 0, 0, 0);
+        assert_eq!(
+            rescale_position(Rect::new(0, 0, 5, 5), flat, to),
+            Rect::new(1920, 40, 5, 5)
+        );
+    }
 
     #[test]
     fn parity_float_repeated_final_ack_allows_external_return_to_intermediate() {

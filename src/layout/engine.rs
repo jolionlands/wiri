@@ -30,6 +30,8 @@ mod ipcview;
 mod lane_l;
 pub use lane_l::FocusLayer;
 #[cfg(test)]
+mod float_sizing_parity_tests;
+#[cfg(test)]
 mod floating_height_parity_tests;
 #[cfg(test)]
 mod floating_width_list_parity_tests;
@@ -747,6 +749,11 @@ pub struct TilingEngine {
     /// A window that maximized itself was asked to give up the native state; the value is
     /// whether it is to be maximized to the edges once it has.
     unzoom_pending: HashMap<WindowId, bool>,
+    /// Tiles that are in the strip only because a floating window was made fullscreen or
+    /// maximized to the edges (niri `Tile::restore_to_floating`, tile.rs:62-63). Leaving the
+    /// state floats the window again. The value is the work area its remembered float
+    /// position is relative to (niri stores that position as a fraction of it).
+    restore_to_floating: HashMap<WindowId, Rect>,
     /// When each fullscreen window went fullscreen.
     fullscreen_since: HashMap<WindowId, std::time::Instant>,
     full_config: Option<crate::config::Config>,
@@ -911,6 +918,7 @@ impl TilingEngine {
             tab_sizing_styles: HashMap::new(),
             slot_forced: HashSet::new(),
             unzoom_pending: HashMap::new(),
+            restore_to_floating: HashMap::new(),
             fullscreen_since: HashMap::new(),
             full_config: None,
             runtime_reservations: crate::config::Edges::default(),
@@ -4969,12 +4977,24 @@ impl TilingEngine {
         };
         // A fullscreen or maximized tile that floats is neither any more (niri: they cannot be
         // floating), and its column gets its width back.
+        let restored_from = self.restore_to_floating.get(&window_id).copied();
         self.leave_sizing_states(window_id, false);
         let work = self
             .monitors
             .get(&output)
             .map(|m| (m.work_area, m.scale_factor));
-        let rect = match (self.float_memory.get(&window_id).copied(), work) {
+        // niri keeps a float's position as a fraction of its workspace's working area
+        // (floating.rs:543, scale_by_working_area at floating.rs:115-124): a window that left
+        // the floating layer on another output or work area comes back at the same fraction.
+        let remembered = self.float_memory.get(&window_id).copied().map(|remembered| {
+            match (restored_from, work) {
+                (Some(from), Some((to, _))) => {
+                    super::floating_position::rescale_position(remembered, from, to)
+                }
+                _ => remembered,
+            }
+        });
+        let rect = match (remembered, work) {
             (Some(remembered), Some((work, scale))) => {
                 super::floating_position::clamp_visible(remembered, work, scale)
             }
@@ -5014,6 +5034,8 @@ impl TilingEngine {
         if self.os_foreground == Some(window_id) {
             // Conversion preserves native focus without another foreground event.
             // Remember the new layer now, including for floating-only workspaces.
+            // niri: the floating space becomes the active one (workspace.rs:1465-1467).
+            self.focus_layer = Some(FocusLayer::Floating);
             self.remember_action_focus(window_id);
             self.last_activated = self.monitors.get(&output).and_then(|m| m.focus_window);
         }
@@ -5048,6 +5070,20 @@ impl TilingEngine {
     /// Put a floating window back into the strip of the workspace it belongs to,
     /// and remember where it floated.
     fn unfloat_window(&mut self, window_id: WindowId, backend: &BackendHandle) {
+        self.unfloat_window_with(window_id, true, true, backend);
+    }
+
+    /// [`Self::unfloat_window`] with niri's activation choice (workspace.rs:1420,1433-1443:
+    /// the tile becomes the active one only when the target was the active window) and,
+    /// for callers that go on to change the window's sizing state at once, without the
+    /// layout pass in between (it would place the tile once before its real rectangle).
+    pub(super) fn unfloat_window_with(
+        &mut self,
+        window_id: WindowId,
+        activate: bool,
+        layout: bool,
+        backend: &BackendHandle,
+    ) {
         let Some((output, workspace)) = self.float_location(window_id) else {
             return;
         };
@@ -5092,23 +5128,47 @@ impl TilingEngine {
         } else {
             monitor.active_workspace
         };
-        let column = monitor
+        let strip = monitor
             .workspaces
             .entry(workspace)
-            .or_insert_with(crate::layout::Workspace::new)
-            .insert_window_after_active(window_id, width_hint);
-        if monitor.active_workspace == workspace {
+            .or_insert_with(crate::layout::Workspace::new);
+        let previous_active = strip
+            .active_window
+            .filter(|window| strip.find_window_column(*window).is_some());
+        let column = strip.insert_window_after_active(window_id, width_hint);
+        if !activate {
+            // The new column sits right of the active one but does not take the focus
+            // (niri workspace.rs:1433-1440 passes `target_is_active` as `activate`).
+            if let Some(previous) = previous_active {
+                strip.active_window = Some(previous);
+            }
+        }
+        let on_active_workspace = monitor.active_workspace == workspace;
+        if activate && on_active_workspace {
             monitor.focus_column = Some(column);
             monitor.focus_window = Some(window_id);
             monitor.focus_ring.push(window_id);
+        } else if let (true, Some(focused)) = (on_active_workspace, monitor.focus_window) {
+            // The columns right of the new one moved: keep the index in step.
+            monitor.focus_column = monitor
+                .workspaces
+                .get(&workspace)
+                .and_then(|strip| strip.find_window_column(focused))
+                .or(monitor.focus_column);
+        }
+        if activate && on_active_workspace {
+            // niri workspace.rs:1441-1443: the scrolling space is the active one now.
+            self.focus_layer = Some(FocusLayer::Tiling);
         }
         info!("Un-floating window {:?}", window_id);
         self.rules_after_float_change(window_id, backend);
         self.apply_new_column_policy(window_id);
         self.sync_min_widths();
         self.maintain_empty_workspace(output);
-        self.reveal_focused_column(output);
-        self.apply_layout_for_monitor(output, backend);
+        if layout {
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
+        }
     }
 
     /// Float `window_id` if it is tiled, tile it if it floats.
@@ -11119,11 +11179,14 @@ mod tests {
         engine.float_move_by(float, 40, 20, &be);
         let before = engine.float_homes.get(&float).unwrap().rect;
 
+        // niri workspace.rs:1290-1293: a float that goes fullscreen moves into the strip.
         engine.toggle_fullscreen_for(float, &be);
         assert!(engine.is_fullscreen(float));
-        assert!(engine.is_floating(float), "still a floating window");
+        assert!(!engine.is_floating(float), "it is a tile while fullscreen");
+        // niri workspace.rs:1309-1320: leaving fullscreen floats it again where it was.
         engine.toggle_fullscreen_for(float, &be);
         assert!(!engine.is_fullscreen(float));
+        assert!(engine.is_floating(float));
         assert_eq!(engine.float_homes.get(&float).unwrap().rect, before);
     }
 

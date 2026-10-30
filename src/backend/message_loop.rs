@@ -1235,19 +1235,19 @@ pub(crate) fn perform_action_on(
             // wiri's older `maximize`: the window fills the work area.  It is the engine's
             // maximized-to-edges state now (the window keeps its place in its column), not
             // the native one that the layout pass used to fight.
+            // A floating window moves into the strip and is maximized there (niri: they
+            // cannot be floating and maximized).
             match target {
-                Some(t) if !t.floating => engine
+                Some(t) => engine
                     .write()
                     .set_maximized_to_edges(t.window, true, backend),
-                Some(_) => info!("Maximize: a floating window stays a floating window"),
                 None => warn!("Maximize: no window to maximize"),
             }
         }
         Action::MaximizeWindowToEdges => match target {
-            Some(t) if !t.floating => engine
+            Some(t) => engine
                 .write()
                 .toggle_maximize_window_to_edges_for(t.window, backend),
-            Some(_) => info!("maximize-window-to-edges: a floating window stays a floating window"),
             None => info!("maximize-window-to-edges: no window to maximize"),
         },
         Action::Minimize => {

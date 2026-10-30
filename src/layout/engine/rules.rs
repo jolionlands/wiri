@@ -700,7 +700,10 @@ impl TilingEngine {
         if rules.open_maximized == Some(true) && !floating {
             self.open_maximized_column(window_id);
         }
-        if rules.open_maximized_to_edges == Some(true) && !floating {
+        // A window that opens floating and maximized or fullscreen opens in the strip and
+        // floats again when it leaves the state (niri workspace.rs:654-657, 647): the sizing
+        // actions move a float into the strip themselves.
+        if rules.open_maximized_to_edges == Some(true) {
             self.set_maximized_to_edges(window_id, true, backend);
         }
         if rules.open_focused == Some(false) && !at_startup {
