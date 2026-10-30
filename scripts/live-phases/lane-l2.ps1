@@ -215,13 +215,15 @@ public static class LaneL2Native {
         $back = L2Rect $l2B
         L2Gate 'h76_swap_window_left' (L2Near $back.L $rectB.L) @{ before = $after.L; after = $back.L; expected = $rectB.L }
 
-        # move-column-to-index 0: the focused (last) column goes to the front.
+        # move-column-to-index 1: the focused (last) column goes to the front.  niri's index is
+        # 1-based (niri:src/layout/scrolling.rs:1707, index.saturating_sub(1)); the window-list
+        # `column` is 0-based, so "back" is that column plus one.
         L2Focus $l2C
         # The strip is not just A, B and C (the daemon tiles every window of the session), so
         # "back" is the column the window really had, not a number.
         $columnBefore = (L2Entry 'move-column-to-index-before' $l2C).column
-        $restoreIndex = $(if ($null -ne $columnBefore) { [string]$columnBefore } else { '2' })
-        $null = L2Action 'move-column-to-index-forward' @('move-column-to-index', '0')
+        $restoreIndex = $(if ($null -ne $columnBefore) { [string]([int]$columnBefore + 1) } else { '3' })
+        $null = L2Action 'move-column-to-index-forward' @('move-column-to-index', '1')
         $movedRect = L2Rect $l2C
         $entry = L2Entry 'move-column-to-index-check' $l2C
         L2Gate 'h76_move_column_to_index' ($movedRect.L -lt $rectB.L) @{ before = $rectC.L; after = $movedRect.L; column = $entry.column; column_before = $columnBefore }
