@@ -744,7 +744,11 @@ impl TilingEngine {
     ///
     /// Nothing is laid out here: the caller changes the sizing state next and lays out once.
     /// `false` when the window cannot move (it is minimized, or it has no home).
-    fn float_into_strip_for_sizing(&mut self, window_id: WindowId, backend: &BackendHandle) -> bool {
+    fn float_into_strip_for_sizing(
+        &mut self,
+        window_id: WindowId,
+        backend: &BackendHandle,
+    ) -> bool {
         if self.minimized.contains_key(&window_id) {
             return false;
         }

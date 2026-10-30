@@ -237,7 +237,10 @@ mod tests {
             Rect::new(1920 + 240, 40 + 130, 700, 400)
         );
         // The same area is the identity, even for a position outside it.
-        assert_eq!(rescale_position(Rect::new(-90, 5, 10, 10), from, from), Rect::new(-90, 5, 10, 10));
+        assert_eq!(
+            rescale_position(Rect::new(-90, 5, 10, 10), from, from),
+            Rect::new(-90, 5, 10, 10)
+        );
         // A degenerate source extent is floored at one pixel (floating.rs:133-134).
         let flat = Rect::new(0, 0, 0, 0);
         assert_eq!(

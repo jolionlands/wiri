@@ -74,14 +74,14 @@ fn fixture() -> (TilingEngine, BackendHandle, OutputId) {
 fn with_float(engine: &mut TilingEngine, backend: &BackendHandle, output: OutputId) -> Rect {
     engine.toggle_floating_for(id(F), backend);
     engine.place_float(id(F), geometry(), backend);
-    engine
-        .monitors
-        .get_mut(&output)
-        .unwrap()
-        .set_focus(id(T1));
+    engine.monitors.get_mut(&output).unwrap().set_focus(id(T1));
     engine.record_ipc_foreground(id(F));
     let rect = engine.float_homes[&id(F)].rect;
-    assert_eq!(rect, geometry(), "the model monitor holds the fixture float");
+    assert_eq!(
+        rect,
+        geometry(),
+        "the model monitor holds the fixture float"
+    );
     rect
 }
 
@@ -89,7 +89,13 @@ fn strip(engine: &TilingEngine, output: OutputId, workspace: i32) -> Vec<Vec<isi
     engine.monitors.get(&output).unwrap().workspaces[&workspace]
         .columns
         .iter()
-        .map(|column| column.tiles.iter().map(|t| t.window_id.as_isize()).collect())
+        .map(|column| {
+            column
+                .tiles
+                .iter()
+                .map(|t| t.window_id.as_isize())
+                .collect()
+        })
         .collect()
 }
 
@@ -302,11 +308,7 @@ fn parity_an_explicit_inactive_float_target_does_not_take_the_focus() {
     guarded(|| {
         let (mut engine, backend, output) = fixture();
         let rect = with_float(&mut engine, &backend, output);
-        engine
-            .monitors
-            .get_mut(&output)
-            .unwrap()
-            .set_focus(id(T2));
+        engine.monitors.get_mut(&output).unwrap().set_focus(id(T2));
         engine.record_ipc_foreground(id(T2));
 
         // workspace.rs:1420,1433-1440: `target_is_active` is false for a window that is not the
@@ -342,8 +344,15 @@ fn parity_a_float_on_an_inactive_workspace_enters_that_workspaces_strip() {
         engine.toggle_fullscreen_for(id(F), &backend);
         assert_eq!(engine.locate_window(id(F)), Some((output, other, 0)));
         assert!(engine.is_fullscreen(id(F)));
-        assert_eq!(strip(&engine, output, 0), [[T1], [T2]], "the active strip is left alone");
-        assert_eq!(engine.monitors.get(&output).unwrap().active_workspace, active_before);
+        assert_eq!(
+            strip(&engine, output, 0),
+            [[T1], [T2]],
+            "the active strip is left alone"
+        );
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().active_workspace,
+            active_before
+        );
         assert_ne!(focus_of(&engine, output), Some(id(F)));
 
         engine.toggle_fullscreen_for(id(F), &backend);
@@ -413,7 +422,11 @@ fn parity_float_fullscreen_on_the_second_monitor_stays_on_that_monitor() {
         // the fullscreen rectangle is that monitor's, not the focused one's.
         engine.toggle_fullscreen_for(id(F), &backend);
         assert_eq!(engine.locate_window(id(F)).map(|place| place.0), Some(b));
-        assert_eq!(strip(&engine, a, 0), a_before, "the other monitor is untouched");
+        assert_eq!(
+            strip(&engine, a, 0),
+            a_before,
+            "the other monitor is untouched"
+        );
         assert_eq!(strip(&engine, b, 0), [vec![T2], vec![F]]);
         let ids: HashSet<WindowId> = [id(F)].into_iter().collect();
         assert_eq!(engine.sizing_draw_modes(&ids)[&id(F)], DrawMode::Exact);
@@ -440,7 +453,12 @@ fn parity_a_float_that_goes_fullscreen_returns_at_the_same_fraction_of_another_w
     guarded(|| {
         let (mut engine, backend, a, b) = two_monitor_fixture();
         // A float on monitor A at a quarter of its work area in both axes.
-        engine.add_window_with_target(info(-9504, "g"), AddWindowTarget::Output(a), &backend, false);
+        engine.add_window_with_target(
+            info(-9504, "g"),
+            AddWindowTarget::Output(a),
+            &backend,
+            false,
+        );
         let moved = id(-9504);
         engine.toggle_floating_for(moved, &backend);
         engine.place_float(moved, Rect::new(480, 260, 400, 300), &backend);

@@ -4986,14 +4986,16 @@ impl TilingEngine {
         // niri keeps a float's position as a fraction of its workspace's working area
         // (floating.rs:543, scale_by_working_area at floating.rs:115-124): a window that left
         // the floating layer on another output or work area comes back at the same fraction.
-        let remembered = self.float_memory.get(&window_id).copied().map(|remembered| {
-            match (restored_from, work) {
+        let remembered = self
+            .float_memory
+            .get(&window_id)
+            .copied()
+            .map(|remembered| match (restored_from, work) {
                 (Some(from), Some((to, _))) => {
                     super::floating_position::rescale_position(remembered, from, to)
                 }
                 _ => remembered,
-            }
-        });
+            });
         let rect = match (remembered, work) {
             (Some(remembered), Some((work, scale))) => {
                 super::floating_position::clamp_visible(remembered, work, scale)
