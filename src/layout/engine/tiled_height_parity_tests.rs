@@ -1001,3 +1001,70 @@ fn parity_tiled_reconcile_admission_and_default_only_rematch_keep_opening_height
     });
     assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
 }
+
+// Live gate h76_column_height_proportion_and_fixed (lane-l2.ps1) numbers. Pin e19df12
+// scrolling.rs:5703-5715 resolve_preset_size: a proportional preset height is the TILE
+// `(view - gaps) * proportion - gaps - extra`, where `view` is the whole working-area
+// height whatever else the column holds (other tiles only clamp it afterwards,
+// scrolling.rs:4642-4661), and the client is that tile less the borders
+// (`window_height_for_tile_height`, rounded at scrolling.rs:4693).
+// Work area 728, outer gaps 10, gap 10, border 4, two stacked tiles. 0.6 gives
+// (728 - 10) * 0.6 - 10 = 420.8 -> tile 421 -> client 413. The old expectation 407 treated the
+// 698 px left after the neighbour's gap as the view: (698 + 10) * 0.6 - 10 = 414.8 -> 415 - 8.
+#[test]
+fn parity_tiled_height_stacked_proportion_preset_resolves_against_the_whole_view() {
+    let ((), attempts) = with_refused_activation_attempts(|| {
+        let (mut engine, backend, output) = tiled_fixture(
+            2,
+            false,
+            vec![
+                SizeSpec::Proportion(0.25),
+                SizeSpec::Fixed(300),
+                SizeSpec::Proportion(0.6),
+            ],
+        );
+        let mut cfg = engine.active_workspace_config(output).clone();
+        cfg.outer_gaps = (10, 10, 10, 10);
+        cfg.column_gap = 10;
+        cfg.window_gap = 10;
+        cfg.border_width = 4;
+        cfg.effects.border.off = false;
+        cfg.effects.border.width = 4;
+        engine.update_config(cfg);
+        engine.sync_monitor_with_scale(
+            output,
+            Rect::new(0, 0, 1200, 728),
+            Rect::new(0, 0, 1200, 728),
+            1.0,
+        );
+        let tiles = |engine: &TilingEngine| -> Vec<u32> {
+            tiled_extra_positions(engine, output)
+                .iter()
+                .map(|(_, rect)| rect.size.h)
+                .collect()
+        };
+        let first = |engine: &TilingEngine| tiles(engine)[0];
+
+        // Independent oracle straight from the pinned formula (f64, then rounded once).
+        let niri_tile = |proportion: f64| ((728.0 - 10.0) * proportion - 10.0).round() as u32;
+        assert_eq!(niri_tile(0.6), 421);
+        assert_eq!(niri_tile(0.6) - 2 * 4, 413);
+
+        // From the auto split (349 px tiles) the first preset taller than the tile is 0.6.
+        assert_eq!(first(&engine), 349);
+        engine.switch_preset_window_height(true, &backend);
+        assert_eq!(first(&engine), niri_tile(0.6));
+        assert_eq!(first(&engine) - 2 * 4, 413, "client height of the live gate");
+        // `-back` steps to the fixed 300 preset: 300 client + the two 4 px borders.
+        engine.switch_preset_window_height(false, &backend);
+        assert_eq!(first(&engine), 308);
+        assert_eq!(first(&engine) - 2 * 4, 300);
+        // Forward returns to 0.6 at the same size: no neighbour-gap dependence.
+        engine.switch_preset_window_height(true, &backend);
+        assert_eq!(first(&engine) - 2 * 4, 413);
+        // The neighbour is the auto tile that takes what is left of the column
+        // (708 view - 10 gap - 421 tile = 277).
+        assert_eq!(tiles(&engine), vec![421, 277]);
+    });
+    assert!(attempts.is_empty(), "unexpected activation: {attempts:?}");
+}

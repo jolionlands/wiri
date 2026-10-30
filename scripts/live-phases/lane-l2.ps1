@@ -314,19 +314,26 @@ public static class LaneL2Native {
             $sorted = @($tiles | Sort-Object -Property T)
             return [pscustomobject]@{ workspace = $mine.workspace; column = $mine.column; count = $sorted.Count; tiles = $sorted }
         }
-        # A `proportion` share of a column that has `$available` px of room, as the engine
-        # resolves it (proportion_px in src/input/mod.rs: the share of the view plus the gap,
-        # less the gap again), rounded half away from zero like Rust's f64::round.
-        function L2ProportionPx([int]$available, [int]$gap, [double]$share) {
-            return [int][Math]::Round($share * ($available + $gap) - $gap, [MidpointRounding]::AwayFromZero)
+        # A `proportion` share of the WHOLE view (the work area less the outer gaps, NOT the
+        # room left after the neighbours' gaps), as the engine resolves it (proportion_px in
+        # src/input/mod.rs: the share of the view plus the gap, less the gap again), rounded
+        # half away from zero like Rust's f64::round.  niri resolve_preset_size
+        # (scrolling.rs:5703-5715, pinned e19df12) is `(view - gaps) * proportion - gaps - extra`
+        # for a preset height and `set-window-height N%` (scrolling.rs:5099), whatever else the
+        # column holds; other tiles only clamp it afterwards (scrolling.rs:4642-4661).
+        function L2ProportionPx([int]$view, [int]$gap, [double]$share) {
+            return [int][Math]::Round($share * ($view + $gap) - $gap, [MidpointRounding]::AwayFromZero)
         }
         $l2Gap = 10
         $l2Border = 4
         $l2ViewH = [int]$swa.Height - 2 * $l2Gap
         # h76_column_height_proportion_and_fixed: the fixed 300 preset is 300 px of window and
-        # the proportion 0.6 preset is its share of the column, each within 1 px.  The previous
-        # gate left the window on the 0.6 preset (index 2 of the cycle): `-back` steps to the
-        # fixed one (index 1), forward returns to 0.6.
+        # the proportion 0.6 preset is its share of the whole view (never of the room left by
+        # the neighbours' gaps: niri scrolling.rs:5703-5715 resolves a proportional preset
+        # against the working area alone, so a two-tile column resolves it exactly like a
+        # one-tile one), each within 1 px.  The previous gate left the window on the 0.6
+        # preset (index 2 of the cycle): `-back` steps to the fixed one (index 1), forward
+        # returns to 0.6.
         try {
             L2Focus $below
             $column = L2ColumnTiles 'column-height-fixed-list' $below
@@ -335,10 +342,10 @@ public static class LaneL2Native {
             $fixedH = (L2Rect $below).H
             $null = L2Action 'column-height-proportion' @('switch-preset-window-height')
             $propH = (L2Rect $below).H
-            $expectedProp = (L2ProportionPx $available $l2Gap 0.6) - 2 * $l2Border
+            $expectedProp = (L2ProportionPx $l2ViewH $l2Gap 0.6) - 2 * $l2Border
             L2Gate 'h76_column_height_proportion_and_fixed' ((L2Near $fixedH 300 1) -and (L2Near $propH $expectedProp 1)) @{
                 fixed = $fixedH; fixed_expected = 300; proportion = $propH; proportion_expected = $expectedProp
-                tiles = $column.count; available = $available; border = $l2Border; gap = $l2Gap
+                tiles = $column.count; available = $available; view = $l2ViewH; border = $l2Border; gap = $l2Gap
                 presets = 'proportion 0.25, fixed 300, proportion 0.6'
             }
         } catch {
