@@ -529,8 +529,16 @@ physical mixed-DPI qualification keep both height rows partial.
   run in a cycle. Not done: hiding floats under a fullscreen tile (`is_floating_visible`,
   row 131), the physical-size rescale across output scales, and a float's returning column
   width (`floating.rs:545`).
-- Admission-focus heuristics, continuous four-finger/touch-overview behavior,
-  and an exhaustive pinned action/CLI contract census.
+- Admission-focus heuristics and continuous four-finger/touch-overview behavior.
+- [x] Exhaustive pinned action/CLI contract census, 2026-10-30:
+  [action-census.md](../../parity/action-census.md). All 143 pinned actions (142 typed
+  variants plus KDL-only `suspend`) run through niri's own KDL, CLI and typed-IPC grammar with
+  a measured gate (`ipc::action_census`): 119 full, 15 partial, 9 N/A, 0 missing. Fixed:
+  `move-column-to-index` is 1-based, `u8` workspace indices, `--reference`, positional
+  `unset-workspace-name`, `quit -s`, `spawn ... --id`, surplus words on unit actions,
+  `msg -j`/`layers`/`casts`, focus-neutral `--id` for `maximize-window-to-edges` and
+  `toggle-window-rule-opacity`. Matrix B row 178 is done; rows 232 and 257 stay partial
+  (nine focus-first by-id forms, `--print-request` dialect).
 
 
 ### R4 execution checkpoint, 2026-10-29 UTC
