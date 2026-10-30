@@ -171,10 +171,12 @@ retains its zero-input diagnostics; full R3 remains failed. See the
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
-curated hotkey list move to done, and the 2026-10-30 action census moves
-`binds` action names to done. The current totals are
-**304 done / 92 partial / 89 N/A** across 485 rows:
-**304/396 applicable rows (76.8%)**. Floating-height resolution/routing and the
+curated hotkey list move to done, the 2026-10-30 action census moves
+`binds` action names to done, and Lane FS moves "Fullscreen and maximized windows
+cannot be floating" to done on 22 source-pinned engine cases (its `h88_*` live gates
+are pending their first cycle; the row returns to partial if they fail). The current
+totals are **305 done / 91 partial / 89 N/A** across 485 rows:
+**305/396 applicable rows (77.0%)**. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
 remain partial for physical mixed-DPI and remaining lifecycle routes. The lifecycle
 checkpoint qualifies its listed source cases; earlier floating native evidence

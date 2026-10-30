@@ -2,7 +2,7 @@
 
 > **Historical survey, superseded for assignment.** This file records the
 > `0821983` snapshot. Following the integrated, PR #2 and qualified R4 follow-ups,
-> current matrices contain **303 done / 93 partial / 89 N/A** (396 applicable
+> current matrices contain **305 done / 91 partial / 89 N/A** (396 applicable
 > rows), including five appearance/DPI and two floating-preset corrections, not the 138
 > partial rows below. The active
 > [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md) checks the
