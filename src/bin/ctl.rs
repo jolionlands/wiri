@@ -2246,7 +2246,10 @@ mod tests {
             IpcMessage::RunAction { name, args, quoted } => {
                 assert_eq!(name, "unset-workspace-name");
                 assert_eq!(args, ["--workspace", "web"]);
-                assert!(quoted.is_empty(), "an unquoted word keeps meaning an index or a name");
+                assert!(
+                    quoted.is_empty(),
+                    "an unquoted word keeps meaning an index or a name"
+                );
             }
             other => panic!("unexpected request {other:?}"),
         }

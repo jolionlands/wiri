@@ -2330,7 +2330,10 @@ fn is_query(message: &IpcMessage) -> bool {
 /// The actions whose words are an argv or a command line, never options: a `--id` among them
 /// belongs to the program that is started.
 pub(crate) fn is_spawn_action(name: &str) -> bool {
-    matches!(name, "spawn" | "exec" | "spawn-sh" | "spawn-cmd" | "spawn_cmd")
+    matches!(
+        name,
+        "spawn" | "exec" | "spawn-sh" | "spawn-cmd" | "spawn_cmd"
+    )
 }
 
 /// [`split_window_target`] for the action `name`: the words of a `spawn` are left alone.

@@ -24,104 +24,288 @@ use crate::input::parse_action_flagged;
 /// The 136 names of niri's `Action` enum that a KDL bind accepts (binds.rs, every variant that
 /// is not `#[knuffel(skip)]`), in declaration order.
 const NIRI_KDL_ACTIONS: &[&str] = &[
-    "quit", "suspend", "power-off-monitors", "power-on-monitors", "toggle-debug-tint",
-    "debug-toggle-opaque-regions", "debug-toggle-damage", "toggle-touchpad", "spawn",
-    "spawn-sh", "do-screen-transition", "screenshot", "screenshot-screen", "screenshot-window",
-    "toggle-keyboard-shortcuts-inhibit", "close-window", "fullscreen-window",
-    "toggle-windowed-fullscreen", "focus-window-in-column", "focus-window-previous",
-    "focus-column-left", "focus-column-right", "focus-column-first", "focus-column-last",
-    "focus-column-right-or-first", "focus-column-left-or-last", "focus-column",
-    "focus-window-or-monitor-up", "focus-window-or-monitor-down",
-    "focus-column-or-monitor-left", "focus-column-or-monitor-right", "focus-window-down",
-    "focus-window-up", "focus-window-down-or-column-left", "focus-window-down-or-column-right",
-    "focus-window-up-or-column-left", "focus-window-up-or-column-right",
-    "focus-window-or-workspace-down", "focus-window-or-workspace-up", "focus-window-top",
-    "focus-window-bottom", "focus-window-down-or-top", "focus-window-up-or-bottom",
-    "move-column-left", "move-column-right", "move-column-to-first", "move-column-to-last",
-    "move-column-left-or-to-monitor-left", "move-column-right-or-to-monitor-right",
-    "move-column-to-index", "move-window-down", "move-window-up",
-    "move-window-down-or-to-workspace-down", "move-window-up-or-to-workspace-up",
-    "consume-or-expel-window-left", "consume-or-expel-window-right",
-    "consume-window-into-column", "expel-window-from-column", "swap-window-left",
-    "swap-window-right", "toggle-column-tabbed-display", "set-column-display", "center-column",
-    "center-window", "center-visible-columns", "focus-workspace-down", "focus-workspace-up",
-    "focus-workspace", "focus-workspace-previous", "move-window-to-workspace-down",
-    "move-window-to-workspace-up", "move-window-to-workspace", "move-column-to-workspace-down",
-    "move-column-to-workspace-up", "move-column-to-workspace", "move-workspace-down",
-    "move-workspace-up", "move-workspace-to-index", "move-workspace-to-monitor",
-    "set-workspace-name", "unset-workspace-name", "focus-monitor-left", "focus-monitor-right",
-    "focus-monitor-down", "focus-monitor-up", "focus-monitor-previous", "focus-monitor-next",
-    "focus-monitor", "move-window-to-monitor-left", "move-window-to-monitor-right",
-    "move-window-to-monitor-down", "move-window-to-monitor-up",
-    "move-window-to-monitor-previous", "move-window-to-monitor-next", "move-window-to-monitor",
-    "move-column-to-monitor-left", "move-column-to-monitor-right",
-    "move-column-to-monitor-down", "move-column-to-monitor-up",
-    "move-column-to-monitor-previous", "move-column-to-monitor-next", "move-column-to-monitor",
-    "set-window-width", "set-window-height", "reset-window-height",
-    "switch-preset-column-width", "switch-preset-column-width-back",
-    "switch-preset-window-width", "switch-preset-window-width-back",
-    "switch-preset-window-height", "switch-preset-window-height-back", "maximize-column",
-    "maximize-window-to-edges", "set-column-width", "expand-column-to-available-width",
-    "switch-layout", "show-hotkey-overlay", "move-workspace-to-monitor-left",
-    "move-workspace-to-monitor-right", "move-workspace-to-monitor-down",
-    "move-workspace-to-monitor-up", "move-workspace-to-monitor-previous",
-    "move-workspace-to-monitor-next", "toggle-window-floating", "move-window-to-floating",
-    "move-window-to-tiling", "focus-floating", "focus-tiling",
-    "switch-focus-between-floating-and-tiling", "toggle-window-rule-opacity",
-    "set-dynamic-cast-window", "set-dynamic-cast-monitor", "clear-dynamic-cast-target",
-    "toggle-overview", "open-overview", "close-overview",
+    "quit",
+    "suspend",
+    "power-off-monitors",
+    "power-on-monitors",
+    "toggle-debug-tint",
+    "debug-toggle-opaque-regions",
+    "debug-toggle-damage",
+    "toggle-touchpad",
+    "spawn",
+    "spawn-sh",
+    "do-screen-transition",
+    "screenshot",
+    "screenshot-screen",
+    "screenshot-window",
+    "toggle-keyboard-shortcuts-inhibit",
+    "close-window",
+    "fullscreen-window",
+    "toggle-windowed-fullscreen",
+    "focus-window-in-column",
+    "focus-window-previous",
+    "focus-column-left",
+    "focus-column-right",
+    "focus-column-first",
+    "focus-column-last",
+    "focus-column-right-or-first",
+    "focus-column-left-or-last",
+    "focus-column",
+    "focus-window-or-monitor-up",
+    "focus-window-or-monitor-down",
+    "focus-column-or-monitor-left",
+    "focus-column-or-monitor-right",
+    "focus-window-down",
+    "focus-window-up",
+    "focus-window-down-or-column-left",
+    "focus-window-down-or-column-right",
+    "focus-window-up-or-column-left",
+    "focus-window-up-or-column-right",
+    "focus-window-or-workspace-down",
+    "focus-window-or-workspace-up",
+    "focus-window-top",
+    "focus-window-bottom",
+    "focus-window-down-or-top",
+    "focus-window-up-or-bottom",
+    "move-column-left",
+    "move-column-right",
+    "move-column-to-first",
+    "move-column-to-last",
+    "move-column-left-or-to-monitor-left",
+    "move-column-right-or-to-monitor-right",
+    "move-column-to-index",
+    "move-window-down",
+    "move-window-up",
+    "move-window-down-or-to-workspace-down",
+    "move-window-up-or-to-workspace-up",
+    "consume-or-expel-window-left",
+    "consume-or-expel-window-right",
+    "consume-window-into-column",
+    "expel-window-from-column",
+    "swap-window-left",
+    "swap-window-right",
+    "toggle-column-tabbed-display",
+    "set-column-display",
+    "center-column",
+    "center-window",
+    "center-visible-columns",
+    "focus-workspace-down",
+    "focus-workspace-up",
+    "focus-workspace",
+    "focus-workspace-previous",
+    "move-window-to-workspace-down",
+    "move-window-to-workspace-up",
+    "move-window-to-workspace",
+    "move-column-to-workspace-down",
+    "move-column-to-workspace-up",
+    "move-column-to-workspace",
+    "move-workspace-down",
+    "move-workspace-up",
+    "move-workspace-to-index",
+    "move-workspace-to-monitor",
+    "set-workspace-name",
+    "unset-workspace-name",
+    "focus-monitor-left",
+    "focus-monitor-right",
+    "focus-monitor-down",
+    "focus-monitor-up",
+    "focus-monitor-previous",
+    "focus-monitor-next",
+    "focus-monitor",
+    "move-window-to-monitor-left",
+    "move-window-to-monitor-right",
+    "move-window-to-monitor-down",
+    "move-window-to-monitor-up",
+    "move-window-to-monitor-previous",
+    "move-window-to-monitor-next",
+    "move-window-to-monitor",
+    "move-column-to-monitor-left",
+    "move-column-to-monitor-right",
+    "move-column-to-monitor-down",
+    "move-column-to-monitor-up",
+    "move-column-to-monitor-previous",
+    "move-column-to-monitor-next",
+    "move-column-to-monitor",
+    "set-window-width",
+    "set-window-height",
+    "reset-window-height",
+    "switch-preset-column-width",
+    "switch-preset-column-width-back",
+    "switch-preset-window-width",
+    "switch-preset-window-width-back",
+    "switch-preset-window-height",
+    "switch-preset-window-height-back",
+    "maximize-column",
+    "maximize-window-to-edges",
+    "set-column-width",
+    "expand-column-to-available-width",
+    "switch-layout",
+    "show-hotkey-overlay",
+    "move-workspace-to-monitor-left",
+    "move-workspace-to-monitor-right",
+    "move-workspace-to-monitor-down",
+    "move-workspace-to-monitor-up",
+    "move-workspace-to-monitor-previous",
+    "move-workspace-to-monitor-next",
+    "toggle-window-floating",
+    "move-window-to-floating",
+    "move-window-to-tiling",
+    "focus-floating",
+    "focus-tiling",
+    "switch-focus-between-floating-and-tiling",
+    "toggle-window-rule-opacity",
+    "set-dynamic-cast-window",
+    "set-dynamic-cast-monitor",
+    "clear-dynamic-cast-target",
+    "toggle-overview",
+    "open-overview",
+    "close-overview",
 ];
 
 /// The 142 variants of `niri_ipc::Action` (lib.rs:194-962), in declaration order, as kebab-case.
 const NIRI_IPC_ACTIONS: &[&str] = &[
-    "quit", "power-off-monitors", "power-on-monitors", "spawn", "spawn-sh",
-    "do-screen-transition", "screenshot", "screenshot-screen", "screenshot-window",
-    "toggle-keyboard-shortcuts-inhibit", "close-window", "fullscreen-window",
-    "toggle-windowed-fullscreen", "focus-window", "focus-window-in-column",
-    "focus-window-previous", "focus-column-left", "focus-column-right", "focus-column-first",
-    "focus-column-last", "focus-column-right-or-first", "focus-column-left-or-last",
-    "focus-column", "focus-window-or-monitor-up", "focus-window-or-monitor-down",
-    "focus-column-or-monitor-left", "focus-column-or-monitor-right", "focus-window-down",
-    "focus-window-up", "focus-window-down-or-column-left", "focus-window-down-or-column-right",
-    "focus-window-up-or-column-left", "focus-window-up-or-column-right",
-    "focus-window-or-workspace-down", "focus-window-or-workspace-up", "focus-window-top",
-    "focus-window-bottom", "focus-window-down-or-top", "focus-window-up-or-bottom",
-    "move-column-left", "move-column-right", "move-column-to-first", "move-column-to-last",
-    "move-column-left-or-to-monitor-left", "move-column-right-or-to-monitor-right",
-    "move-column-to-index", "move-window-down", "move-window-up",
-    "move-window-down-or-to-workspace-down", "move-window-up-or-to-workspace-up",
-    "consume-or-expel-window-left", "consume-or-expel-window-right",
-    "consume-window-into-column", "expel-window-from-column", "swap-window-right",
-    "swap-window-left", "toggle-column-tabbed-display", "set-column-display", "center-column",
-    "center-window", "center-visible-columns", "focus-workspace-down", "focus-workspace-up",
-    "focus-workspace", "focus-workspace-previous", "move-window-to-workspace-down",
-    "move-window-to-workspace-up", "move-window-to-workspace", "move-column-to-workspace-down",
-    "move-column-to-workspace-up", "move-column-to-workspace", "move-workspace-down",
-    "move-workspace-up", "move-workspace-to-index", "set-workspace-name",
-    "unset-workspace-name", "focus-monitor-left", "focus-monitor-right", "focus-monitor-down",
-    "focus-monitor-up", "focus-monitor-previous", "focus-monitor-next", "focus-monitor",
-    "move-window-to-monitor-left", "move-window-to-monitor-right",
-    "move-window-to-monitor-down", "move-window-to-monitor-up",
-    "move-window-to-monitor-previous", "move-window-to-monitor-next", "move-window-to-monitor",
-    "move-column-to-monitor-left", "move-column-to-monitor-right",
-    "move-column-to-monitor-down", "move-column-to-monitor-up",
-    "move-column-to-monitor-previous", "move-column-to-monitor-next", "move-column-to-monitor",
-    "set-window-width", "set-window-height", "reset-window-height",
-    "switch-preset-column-width", "switch-preset-column-width-back",
-    "switch-preset-window-width", "switch-preset-window-width-back",
-    "switch-preset-window-height", "switch-preset-window-height-back", "maximize-column",
-    "maximize-window-to-edges", "set-column-width", "expand-column-to-available-width",
-    "switch-layout", "show-hotkey-overlay", "move-workspace-to-monitor-left",
-    "move-workspace-to-monitor-right", "move-workspace-to-monitor-down",
-    "move-workspace-to-monitor-up", "move-workspace-to-monitor-previous",
-    "move-workspace-to-monitor-next", "move-workspace-to-monitor", "toggle-debug-tint",
-    "debug-toggle-opaque-regions", "debug-toggle-damage", "toggle-touchpad",
-    "toggle-window-floating", "move-window-to-floating", "move-window-to-tiling",
-    "focus-floating", "focus-tiling", "switch-focus-between-floating-and-tiling",
-    "move-floating-window", "toggle-window-rule-opacity", "set-dynamic-cast-window",
-    "set-dynamic-cast-monitor", "clear-dynamic-cast-target", "stop-cast", "toggle-overview",
-    "open-overview", "close-overview", "toggle-window-urgent", "set-window-urgent",
-    "unset-window-urgent", "load-config-file",
+    "quit",
+    "power-off-monitors",
+    "power-on-monitors",
+    "spawn",
+    "spawn-sh",
+    "do-screen-transition",
+    "screenshot",
+    "screenshot-screen",
+    "screenshot-window",
+    "toggle-keyboard-shortcuts-inhibit",
+    "close-window",
+    "fullscreen-window",
+    "toggle-windowed-fullscreen",
+    "focus-window",
+    "focus-window-in-column",
+    "focus-window-previous",
+    "focus-column-left",
+    "focus-column-right",
+    "focus-column-first",
+    "focus-column-last",
+    "focus-column-right-or-first",
+    "focus-column-left-or-last",
+    "focus-column",
+    "focus-window-or-monitor-up",
+    "focus-window-or-monitor-down",
+    "focus-column-or-monitor-left",
+    "focus-column-or-monitor-right",
+    "focus-window-down",
+    "focus-window-up",
+    "focus-window-down-or-column-left",
+    "focus-window-down-or-column-right",
+    "focus-window-up-or-column-left",
+    "focus-window-up-or-column-right",
+    "focus-window-or-workspace-down",
+    "focus-window-or-workspace-up",
+    "focus-window-top",
+    "focus-window-bottom",
+    "focus-window-down-or-top",
+    "focus-window-up-or-bottom",
+    "move-column-left",
+    "move-column-right",
+    "move-column-to-first",
+    "move-column-to-last",
+    "move-column-left-or-to-monitor-left",
+    "move-column-right-or-to-monitor-right",
+    "move-column-to-index",
+    "move-window-down",
+    "move-window-up",
+    "move-window-down-or-to-workspace-down",
+    "move-window-up-or-to-workspace-up",
+    "consume-or-expel-window-left",
+    "consume-or-expel-window-right",
+    "consume-window-into-column",
+    "expel-window-from-column",
+    "swap-window-right",
+    "swap-window-left",
+    "toggle-column-tabbed-display",
+    "set-column-display",
+    "center-column",
+    "center-window",
+    "center-visible-columns",
+    "focus-workspace-down",
+    "focus-workspace-up",
+    "focus-workspace",
+    "focus-workspace-previous",
+    "move-window-to-workspace-down",
+    "move-window-to-workspace-up",
+    "move-window-to-workspace",
+    "move-column-to-workspace-down",
+    "move-column-to-workspace-up",
+    "move-column-to-workspace",
+    "move-workspace-down",
+    "move-workspace-up",
+    "move-workspace-to-index",
+    "set-workspace-name",
+    "unset-workspace-name",
+    "focus-monitor-left",
+    "focus-monitor-right",
+    "focus-monitor-down",
+    "focus-monitor-up",
+    "focus-monitor-previous",
+    "focus-monitor-next",
+    "focus-monitor",
+    "move-window-to-monitor-left",
+    "move-window-to-monitor-right",
+    "move-window-to-monitor-down",
+    "move-window-to-monitor-up",
+    "move-window-to-monitor-previous",
+    "move-window-to-monitor-next",
+    "move-window-to-monitor",
+    "move-column-to-monitor-left",
+    "move-column-to-monitor-right",
+    "move-column-to-monitor-down",
+    "move-column-to-monitor-up",
+    "move-column-to-monitor-previous",
+    "move-column-to-monitor-next",
+    "move-column-to-monitor",
+    "set-window-width",
+    "set-window-height",
+    "reset-window-height",
+    "switch-preset-column-width",
+    "switch-preset-column-width-back",
+    "switch-preset-window-width",
+    "switch-preset-window-width-back",
+    "switch-preset-window-height",
+    "switch-preset-window-height-back",
+    "maximize-column",
+    "maximize-window-to-edges",
+    "set-column-width",
+    "expand-column-to-available-width",
+    "switch-layout",
+    "show-hotkey-overlay",
+    "move-workspace-to-monitor-left",
+    "move-workspace-to-monitor-right",
+    "move-workspace-to-monitor-down",
+    "move-workspace-to-monitor-up",
+    "move-workspace-to-monitor-previous",
+    "move-workspace-to-monitor-next",
+    "move-workspace-to-monitor",
+    "toggle-debug-tint",
+    "debug-toggle-opaque-regions",
+    "debug-toggle-damage",
+    "toggle-touchpad",
+    "toggle-window-floating",
+    "move-window-to-floating",
+    "move-window-to-tiling",
+    "focus-floating",
+    "focus-tiling",
+    "switch-focus-between-floating-and-tiling",
+    "move-floating-window",
+    "toggle-window-rule-opacity",
+    "set-dynamic-cast-window",
+    "set-dynamic-cast-monitor",
+    "clear-dynamic-cast-target",
+    "stop-cast",
+    "toggle-overview",
+    "open-overview",
+    "close-overview",
+    "toggle-window-urgent",
+    "set-window-urgent",
+    "unset-window-urgent",
+    "load-config-file",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -490,15 +674,24 @@ fn rows() -> Vec<Row> {
                 r#"{"UnsetWorkspaceName":{"reference":{"Name":"web"}}}"#,
             ]),
     ]);
-    rows.extend(monitor_directions("focus-monitor", "MonitorAction(Focus) -> engine.monitor_layout_action"));
+    rows.extend(monitor_directions(
+        "focus-monitor",
+        "MonitorAction(Focus) -> engine.monitor_layout_action",
+    ));
     rows.push(
-        a("focus-monitor", "MonitorAction(Focus(Name)) -> engine.monitor_layout_action")
-            .fields("output: String")
-            .kdl(&[r#"focus-monitor "DP-1""#])
-            .cli(&[&["DP-1"]])
-            .ipc(&[r#"{"FocusMonitor":{"output":"DP-1"}}"#]),
+        a(
+            "focus-monitor",
+            "MonitorAction(Focus(Name)) -> engine.monitor_layout_action",
+        )
+        .fields("output: String")
+        .kdl(&[r#"focus-monitor "DP-1""#])
+        .cli(&[&["DP-1"]])
+        .ipc(&[r#"{"FocusMonitor":{"output":"DP-1"}}"#]),
     );
-    rows.extend(monitor_directions("move-window-to-monitor", "MonitorAction(MoveWindow) -> engine.monitor_layout_action"));
+    rows.extend(monitor_directions(
+        "move-window-to-monitor",
+        "MonitorAction(MoveWindow) -> engine.monitor_layout_action",
+    ));
     rows.push(
         a("move-window-to-monitor", "MonitorAction(MoveWindow(Name)) -> engine.monitor_layout_action (explicit id: no focus change)")
             .fields("id: Option<u64> = None, output: String")
@@ -509,13 +702,19 @@ fn rows() -> Vec<Row> {
                 r#"{"MoveWindowToMonitor":{"id":5,"output":"DP-1"}}"#,
             ]),
     );
-    rows.extend(monitor_directions("move-column-to-monitor", "MonitorAction(MoveColumn) -> engine.monitor_layout_action"));
+    rows.extend(monitor_directions(
+        "move-column-to-monitor",
+        "MonitorAction(MoveColumn) -> engine.monitor_layout_action",
+    ));
     rows.push(
-        a("move-column-to-monitor", "MonitorAction(MoveColumn(Name)) -> engine.monitor_layout_action")
-            .fields("output: String")
-            .kdl(&[r#"move-column-to-monitor "DP-1""#])
-            .cli(&[&["DP-1"]])
-            .ipc(&[r#"{"MoveColumnToMonitor":{"output":"DP-1"}}"#]),
+        a(
+            "move-column-to-monitor",
+            "MonitorAction(MoveColumn(Name)) -> engine.monitor_layout_action",
+        )
+        .fields("output: String")
+        .kdl(&[r#"move-column-to-monitor "DP-1""#])
+        .cli(&[&["DP-1"]])
+        .ipc(&[r#"{"MoveColumnToMonitor":{"output":"DP-1"}}"#]),
     );
     for (name, executor) in [
         ("set-window-width", "SizeAction / SetColumnWidth -> change_size(Width) (explicit id: set_window_width_for)"),
@@ -576,7 +775,10 @@ fn rows() -> Vec<Row> {
             ]),
         unit("show-hotkey-overlay", "ShowKeyBindings -> message_loop::show_hotkey_overlay"),
     ]);
-    rows.extend(monitor_directions("move-workspace-to-monitor", "MonitorAction(MoveWorkspace) -> engine.monitor_layout_action"));
+    rows.extend(monitor_directions(
+        "move-workspace-to-monitor",
+        "MonitorAction(MoveWorkspace) -> engine.monitor_layout_action",
+    ));
     rows.extend([
         a("move-workspace-to-monitor", "MonitorAction(MoveWorkspace(Name)) -> engine.monitor_layout_action")
             .fields("output: String, reference: Option<WorkspaceReferenceArg> = None (CLI --reference)")
@@ -659,16 +861,19 @@ fn rows() -> Vec<Row> {
         );
     }
     rows.push(
-        a("load-config-file", "System(LoadConfigFile) -> system_actions::request_reload")
-            .fields("path: Option<String> = None (CLI --path)")
-            .kdl(&["load-config-file"])
-            .cli(&[&[], &["--path", "C:/x.kdl"]])
-            .ipc(&[
-                r#"{"LoadConfigFile":{}}"#,
-                r#"{"LoadConfigFile":{"path":"C:/x.kdl"}}"#,
-            ])
-            .not_bindable()
-            .note("extension: wiri also accepts it as a bind"),
+        a(
+            "load-config-file",
+            "System(LoadConfigFile) -> system_actions::request_reload",
+        )
+        .fields("path: Option<String> = None (CLI --path)")
+        .kdl(&["load-config-file"])
+        .cli(&[&[], &["--path", "C:/x.kdl"]])
+        .ipc(&[
+            r#"{"LoadConfigFile":{}}"#,
+            r#"{"LoadConfigFile":{"path":"C:/x.kdl"}}"#,
+        ])
+        .not_bindable()
+        .note("extension: wiri also accepts it as a bind"),
     );
     rows
 }
@@ -710,7 +915,8 @@ fn run_action_words(name: &str, args: &[String], quoted: &[bool]) -> Outcome {
         return match parsed {
             None => Outcome::Rejected("invalid system action arguments".into()),
             Some(system) => {
-                if target.is_some() && !matches!(system, system_actions::SystemAction::WindowUrgent(_))
+                if target.is_some()
+                    && !matches!(system, system_actions::SystemAction::WindowUrgent(_))
                 {
                     Outcome::Rejected("this action does not accept --id".into())
                 } else {
@@ -763,11 +969,8 @@ fn typed(text: &str) -> Outcome {
 }
 
 fn kdl(action: &str) -> Outcome {
-    let decoded = crate::config::decode::decode_text(
-        &format!("binds {{ Mod+T {{ {action}; }} }}"),
-        "",
-        None,
-    );
+    let decoded =
+        crate::config::decode::decode_text(&format!("binds {{ Mod+T {{ {action}; }} }}"), "", None);
     if let Some(issue) = decoded.first_error() {
         return Outcome::Rejected(issue.to_string());
     }
@@ -860,7 +1063,11 @@ fn the_census_covers_exactly_the_pinned_niri_vocabulary() {
     }
     expected.sort_unstable();
     assert_eq!(names, expected, "the census must list every pinned action");
-    assert_eq!(rows.len(), 143, "142 IPC variants plus the KDL-only suspend");
+    assert_eq!(
+        rows.len(),
+        143,
+        "142 IPC variants plus the KDL-only suspend"
+    );
     assert_eq!(NIRI_KDL_ACTIONS.len(), 136);
     assert_eq!(NIRI_IPC_ACTIONS.len(), 142);
     // The decoder's own vocabulary list is niri's bindable set, in niri's order.
@@ -960,7 +1167,10 @@ fn omitted_typed_fields_take_niris_serde_defaults() {
         assert_eq!(a, b, "{omitted} must equal {explicit}");
     };
     same(r#"{"Quit":{}}"#, r#"{"Quit":{"skip_confirmation":false}}"#);
-    same(r#"{"Screenshot":{}}"#, r#"{"Screenshot":{"show_pointer":true}}"#);
+    same(
+        r#"{"Screenshot":{}}"#,
+        r#"{"Screenshot":{"show_pointer":true}}"#,
+    );
     same(
         r#"{"ScreenshotScreen":{}}"#,
         r#"{"ScreenshotScreen":{"write_to_disk":true,"show_pointer":true}}"#,
@@ -1021,7 +1231,11 @@ fn required_typed_fields_are_required() {
         r#"{"SpawnSh":{}}"#,
         r#"{"FocusWindow":{}}"#,
     ] {
-        assert!(!typed(text).ok(), "{text} must be refused: {:?}", typed(text));
+        assert!(
+            !typed(text).ok(),
+            "{text} must be refused: {:?}",
+            typed(text)
+        );
     }
 }
 
@@ -1041,7 +1255,8 @@ fn spawn_words_are_never_taken_for_a_window_target() {
         "{accepted:?}"
     );
     // Every other action still reads niri's `--id` and `--window-id`.
-    let (rest, _, target) = split_action_target("close-window", &words(&["--id", "5"]), &[]).unwrap();
+    let (rest, _, target) =
+        split_action_target("close-window", &words(&["--id", "5"]), &[]).unwrap();
     assert!(rest.is_empty());
     assert_eq!(target, Some(5));
 }
@@ -1053,7 +1268,10 @@ fn niri_cli_spellings_of_workspace_references_are_accepted() {
     for (name, args) in [
         ("move-workspace-to-index", vec!["2", "--reference", "web"]),
         ("move-workspace-to-index", vec!["2", "--workspace", "web"]),
-        ("move-workspace-to-monitor", vec!["DP-1", "--reference", "2"]),
+        (
+            "move-workspace-to-monitor",
+            vec!["DP-1", "--reference", "2"],
+        ),
         ("move-workspace-to-monitor-left", vec!["--reference", "2"]),
         ("set-workspace-name", vec!["web", "--workspace", "2"]),
         ("unset-workspace-name", vec!["web"]),
@@ -1115,7 +1333,10 @@ fn unit_actions_refuse_surplus_words_like_niris_kdl() {
         "show-hotkey-overlay",
     ] {
         assert!(!cli(name, &words(&["surplus"])).ok(), "{name} surplus");
-        assert!(!kdl(&format!(r#"{name} "surplus""#)).ok(), "{name} in a bind");
+        assert!(
+            !kdl(&format!(r#"{name} "surplus""#)).ok(),
+            "{name} in a bind"
+        );
         assert!(kdl(name).ok(), "{name} alone");
     }
 }
@@ -1126,8 +1347,14 @@ fn index_arguments_have_niris_integer_types() {
     // a workspace index is a `u8`; 300 and -1 are errors, not a workspace called "300".
     for args in [vec!["300"], vec!["-1"], vec!["256"]] {
         assert!(!cli("focus-workspace", &words(&args)).ok(), "{args:?}");
-        assert!(!cli("move-window-to-workspace", &words(&args)).ok(), "{args:?}");
-        assert!(!cli("move-column-to-workspace", &words(&args)).ok(), "{args:?}");
+        assert!(
+            !cli("move-window-to-workspace", &words(&args)).ok(),
+            "{args:?}"
+        );
+        assert!(
+            !cli("move-column-to-workspace", &words(&args)).ok(),
+            "{args:?}"
+        );
     }
     assert!(cli("focus-workspace", &words(&["255"])).ok());
     assert!(cli("focus-workspace", &words(&["0"])).ok());
@@ -1136,7 +1363,11 @@ fn index_arguments_have_niris_integer_types() {
     // `focus-window-in-column` is a `u8`, the others are `usize` and never overflow.
     assert!(!cli("focus-window-in-column", &words(&["256"])).ok());
     assert!(cli("focus-window-in-column", &words(&["255"])).ok());
-    for name in ["focus-column", "move-column-to-index", "move-workspace-to-index"] {
+    for name in [
+        "focus-column",
+        "move-column-to-index",
+        "move-workspace-to-index",
+    ] {
         assert!(cli(name, &words(&["99999999999"])).ok(), "{name} clamps");
         assert!(!cli(name, &words(&["-1"])).ok(), "{name} negative");
     }
