@@ -5288,7 +5288,13 @@ impl TilingEngine {
         let rect = if let Some(home) = floating {
             home.1
         } else if let Some(remembered) = self.float_memory.get(&window).copied() {
-            remembered
+            // The stored position is a fraction of the working area it is used in (niri
+            // floating.rs:115-124, workspace.rs:1541): a fullscreen or maximized tile that
+            // came from the floating layer on another work area is adjusted from there.
+            match self.restore_to_floating.get(&window) {
+                Some(from) => super::floating_position::rescale_position(remembered, *from, work),
+                None => remembered,
+            }
         } else {
             let initial = self.initial_float_rect(window, output);
             if self
@@ -5310,6 +5316,10 @@ impl TilingEngine {
             self.place_float_rect(window, rect, true, backend);
         } else {
             self.float_memory.insert(window, rect);
+            // The new position is relative to this work area.
+            if let Some(from) = self.restore_to_floating.get_mut(&window) {
+                *from = work;
+            }
         }
         Ok(())
     }

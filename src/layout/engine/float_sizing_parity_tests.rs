@@ -10,8 +10,9 @@
 //! strip (a column of its own right of the active column, active only when the target was the
 //! active window), remembers that it came from the floating layer, and leaving the state
 //! floats it again at the geometry it floated at. `toggle-window-floating` on such a tile
-//! floats it with both states gone. Windowed fullscreen (workspace.rs:1722-1728 and mod.rs:3586)
-//! has no Windows counterpart (row 120).
+//! floats it with both states gone. Windowed fullscreen (mod.rs:3586-3604, window/mapped.rs:1321-1351)
+//! has no Windows counterpart (matrix row 120). Not covered here: niri hides the floating layer
+//! under a fullscreen scrolling window (workspace.rs:1722-1728), which wiri does not do.
 //!
 //! Engine-level only. Model HWNDs are negative and invalid: no native window, pump, hook or
 //! input fixture is created, and every activation attempt is refused.
@@ -635,5 +636,41 @@ fn parity_the_actions_move_a_float_into_the_strip_through_the_shared_dispatcher(
         run("fullscreen-window");
         assert!(engine.read().is_floating(id(F)));
         assert_eq!(engine.read().float_homes[&id(F)].rect, rect);
+    });
+}
+
+#[test]
+fn parity_move_floating_window_on_a_sizing_tile_adjusts_from_the_fraction_in_its_work_area() {
+    guarded(|| {
+        let (mut engine, backend, a, b) = two_monitor_fixture();
+        engine.add_window_with_target(
+            info(-9504, "g"),
+            AddWindowTarget::Output(a),
+            &backend,
+            false,
+        );
+        let moved = id(-9504);
+        engine.toggle_floating_for(moved, &backend);
+        engine.place_float(moved, Rect::new(480, 260, 400, 300), &backend);
+        engine.record_ipc_foreground(moved);
+        engine.toggle_fullscreen_for(moved, &backend);
+        engine.move_window_to_monitor_action(Some(moved), &MonitorTarget::Right, &backend);
+        assert_eq!(engine.locate_window(moved).map(|place| place.0), Some(b));
+
+        // workspace.rs:1541-1595: a tile's stored floating position is scaled by the working
+        // area it is used in, then adjusted and stored again as a fraction of that area.
+        use crate::ipc::PositionChange::AdjustFixed;
+        engine
+            .move_floating_window(Some(moved), AdjustFixed(10.0), AdjustFixed(0.0), None, &backend)
+            .unwrap();
+        assert_eq!(
+            engine.restore_to_floating.get(&moved),
+            Some(&engine.monitors.get(&b).unwrap().work_area)
+        );
+        engine.toggle_fullscreen_for(moved, &backend);
+        assert_eq!(
+            engine.float_homes[&moved].rect,
+            Rect::new(1920 + 320 + 10, 170, 400, 300)
+        );
     });
 }

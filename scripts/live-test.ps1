@@ -3227,6 +3227,9 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-startup-rules.ps1') } catch {
 # H86: stable workspace identities and owned native focus; monitor relocation
 # remains explicit hardware qualification information on a single-output host.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-workspace-ids.ps1') } catch { LanePhaseError 'lane_workspace_ids' $_ }
+# H88: a floating window cannot be fullscreen or maximized: the action moves it into the strip and
+# leaving the state floats it again where it was (niri workspace.rs:1288-1476).
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-float-sizing.ps1') } catch { LanePhaseError 'lane_float_sizing' $_ }
 # Lane P: pointer-device settings, the hotkey overlay's startup options and the
 # dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
 # so nothing here changes this machine's real pointer or touchpad settings.

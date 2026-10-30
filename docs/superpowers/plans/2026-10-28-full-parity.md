@@ -521,7 +521,14 @@ physical mixed-DPI qualification keep both height rows partial.
 - General non-transfer viewport anchoring and partial-window clipping, separate
   from the now-reviewed workspace-transfer anchor helper.
 - Ordinary application self-resize reconciliation, beyond four-axis bounds queries.
-- Floating-to-fullscreen strip semantics and correct restoration.
+- Floating-to-fullscreen strip semantics and correct restoration. **Source-qualified
+  (Lane FS):** fullscreen and maximize move a float into the strip and leaving the state
+  floats it again at its remembered geometry; 22 engine cases plus the work-area fraction
+  helper pin niri `workspace.rs:1288-1476`, `floating.rs:425-552`, `scrolling.rs:999-1014`
+  (see matrix row 123). Live gates `h88_*` (`lane-float-sizing.ps1`) are added and have not
+  run in a cycle. Not done: hiding floats under a fullscreen tile (`is_floating_visible`,
+  row 131), the physical-size rescale across output scales, and a float's returning column
+  width (`floating.rs:545`).
 - Admission-focus heuristics, continuous four-finger/touch-overview behavior,
   and an exhaustive pinned action/CLI contract census.
 
