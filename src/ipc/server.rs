@@ -1091,6 +1091,23 @@ impl IpcServer {
                                 );
                                 return serde_json::json!({"success": true});
                             }
+                            // niri:src/input/mod.rs:1753-1761 and the other `*ById` variants:
+                            // the named window changes, the focus does not.
+                            crate::input::Action::MaximizeWindowToEdges => {
+                                let window = WindowId::new(hwnd);
+                                let mut engine = engine.write();
+                                // A floating window stays floating (as for the focused one).
+                                if !engine.is_floating(window) {
+                                    engine.toggle_maximize_window_to_edges_for(window, backend);
+                                }
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::ToggleWindowRuleOpacity => {
+                                engine
+                                    .write()
+                                    .toggle_window_rule_opacity(WindowId::new(hwnd), backend);
+                                return serde_json::json!({"success": true});
+                            }
                             _ => {}
                         }
                         let preserve_float_height_focus =
@@ -3095,6 +3112,45 @@ mod tests {
                 workspace
             );
         }
+    }
+
+    #[test]
+    fn maximize_and_rule_opacity_with_id_leave_the_focus_alone() {
+        // niri's MaximizeWindowToEdgesById / ToggleWindowRuleOpacityById name the window and
+        // never activate it (niri:src/input/mod.rs:1753-1761); these used to focus it first.
+        let (mut server, engine) = server_with_windows(&[100, 101]);
+        let backend = BackendHandle::default_for_test();
+        server.set_backend(backend.clone());
+        engine
+            .write()
+            .sync_os_foreground(WindowId::new(101), &backend);
+        assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+        let output = engine.read().monitors().focused_id();
+        let workspace = engine.read().monitors().focused().unwrap().active_workspace;
+
+        let reply = server.process_message(action("maximize-window-to-edges", &["--id", "100"]));
+        assert_eq!(reply["success"], true, "{reply}");
+        assert!(engine.read().is_maximized_to_edges(WindowId::new(100)));
+        assert!(!engine.read().is_maximized_to_edges(WindowId::new(101)));
+        assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+        assert_eq!(engine.read().monitors().focused_id(), output);
+        assert_eq!(
+            engine.read().monitors().focused().unwrap().active_workspace,
+            workspace
+        );
+
+        let reply = server.process_message(action("maximize-window-to-edges", &["--id=100"]));
+        assert_eq!(reply["success"], true, "{reply}");
+        assert!(
+            !engine.read().is_maximized_to_edges(WindowId::new(100)),
+            "a second call toggles it back"
+        );
+        assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+
+        let reply = server.process_message(action("toggle-window-rule-opacity", &["--id", "100"]));
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(engine.read().ipc_snapshot().focused_window(), Some(101));
+        assert_eq!(engine.read().monitors().focused_id(), output);
     }
 
     #[test]
