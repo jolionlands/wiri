@@ -1054,7 +1054,11 @@ fn parity_tiled_height_stacked_proportion_preset_resolves_against_the_whole_view
         assert_eq!(first(&engine), 349);
         engine.switch_preset_window_height(true, &backend);
         assert_eq!(first(&engine), niri_tile(0.6));
-        assert_eq!(first(&engine) - 2 * 4, 413, "client height of the live gate");
+        assert_eq!(
+            first(&engine) - 2 * 4,
+            413,
+            "client height of the live gate"
+        );
         // `-back` steps to the fixed 300 preset: 300 client + the two 4 px borders.
         engine.switch_preset_window_height(false, &backend);
         assert_eq!(first(&engine), 308);
