@@ -520,31 +520,41 @@ input {
         $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
         $null = [Windows.Media.Ocr.OcrResult, Windows.Foundation, ContentType = WindowsRuntime]
         $null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
-        # One chord for every ESSENTIAL plus the launcher. No defaults, aliases,
-        # placeholders or title overrides: these are curated_rows' core descriptions.
+        # niri's curated Important Hotkeys list (ui/hotkey_overlay.rs collect_actions, pinned
+        # e19df12, :197-304) and the titles action_name gives them (:458-494), in niri's order:
+        # exactly these 18 actions are always candidates; with `hide-not-bound` the ones with no
+        # bind drop out.  No defaults, aliases, placeholders or title overrides.  The earlier
+        # gate also bound Spawn, focus-window-up/down and fullscreen-window and expected 18 rows
+        # with the pre-niri titles ("Launch application", "Focus window above", "Fullscreen
+        # window"...); none of those is in niri's list (a spawn is listed only for a Mod/Super
+        # chord, :281-296, and these chords are Ctrl+Alt+Shift), so 14 rows is correct for that
+        # config.  The wiri-specific wording is only the program name: "Exit wiri" for "Exit niri".
         $pCore = @(
-            @('spawn "notepad.exe"', 'Launch application'),
-            @('close-window', 'Close window'),
-            @('focus-column-left', 'Focus column left'),
-            @('focus-column-right', 'Focus column right'),
-            @('focus-window-up', 'Focus window above'),
-            @('focus-window-down', 'Focus window below'),
-            @('move-column-left', 'Move column left'),
-            @('move-column-right', 'Move column right'),
-            @('consume-or-expel-window-left', 'Consume or expel window left'),
-            @('consume-or-expel-window-right', 'Consume or expel window right'),
-            @('maximize-column', 'Maximize column'),
-            @('fullscreen-window', 'Fullscreen window'),
-            @('toggle-window-floating', 'Toggle floating'),
-            @('toggle-overview', 'Overview'),
-            @('focus-workspace-up', 'Previous workspace'),
-            @('focus-workspace-down', 'Next workspace'),
-            @('show-hotkey-overlay', 'Important Hotkeys'),
-            @('quit', 'Exit wiri')
+            @('show-hotkey-overlay', 'Show Important Hotkeys'),
+            @('quit', 'Exit wiri'),
+            @('close-window', 'Close Focused Window'),
+            @('focus-column-left', 'Focus Column to the Left'),
+            @('focus-column-right', 'Focus Column to the Right'),
+            @('move-column-left', 'Move Column Left'),
+            @('move-column-right', 'Move Column Right'),
+            @('focus-workspace-down', 'Switch Workspace Down'),
+            @('focus-workspace-up', 'Switch Workspace Up'),
+            @('move-column-to-workspace-down', 'Move Column to Workspace Down'),
+            @('move-column-to-workspace-up', 'Move Column to Workspace Up'),
+            @('switch-preset-column-width', 'Switch Preset Column Widths'),
+            @('maximize-column', 'Maximize Column'),
+            @('consume-or-expel-window-left', 'Consume or Expel Window Left'),
+            @('consume-or-expel-window-right', 'Consume or Expel Window Right'),
+            @('toggle-window-floating', 'Move Window Between Floating and Tiling'),
+            @('switch-focus-between-floating-and-tiling', 'Switch Focus Between Floating and Tiling'),
+            @('toggle-overview', 'Open the Overview')
         )
+        # Registered, but not in niri's list: they must not get a row (so rows stay 18).
+        $pNotCurated = @('spawn "notepad.exe"', 'focus-window-up', 'focus-window-down', 'fullscreen-window')
+        $pBound = @($pCore | ForEach-Object { $_[0] }) + $pNotCurated
         $pCoreConfig = "hotkey-overlay { skip-at-startup; hide-not-bound; }`nbinds {`n    extend-defaults false`n"
-        for ($i = 0; $i -lt $pCore.Count; $i++) {
-            $pCoreConfig += '    Ctrl+Alt+Shift+' + [char](65 + $i) + ' { ' + $pCore[$i][0] + "; }`n"
+        for ($i = 0; $i -lt $pBound.Count; $i++) {
+            $pCoreConfig += '    Ctrl+Alt+Shift+' + [char](65 + $i) + ' { ' + $pBound[$i] + "; }`n"
         }
         $pCoreConfig += "}`n"
         $pCoreTitles = @($pCore | ForEach-Object { $_[1] })
@@ -553,9 +563,12 @@ input {
         # Check registration as well, so placeholders cannot stand in for binds.
         $pCurated['hotkeys_title_occurrences'] = [regex]::Matches($pCurated.rendered_text, 'Important Hotkeys').Count
         $pCurated['registered_count'] = @($pCurated.bindings).Count
+        # The painted sheet carries none of the non-curated actions' pre-niri wording either.
+        $pCurated['non_curated_text'] = @([regex]::Matches($pCurated.rendered_text, 'Spawn|notepad|FIXME|Fullscreen|Launch application|Focus window (above|below)') | ForEach-Object { $_.Value })
         PGate 'h80_curated_hotkeys_render' ($pCurated.pass -and
             $pCurated.hotkeys_title_occurrences -eq 2 -and
-            $pCurated.registered_count -eq $pCore.Count) $pCurated
+            $pCurated.registered_count -eq $pBound.Count -and
+            $pCurated.non_curated_text.Count -eq 0) $pCurated
 
         PCheckpoint 'checking-per-bind-overlay-titles'
         # The Windows GDI sheet renders markup literally, not as Pango formatting.

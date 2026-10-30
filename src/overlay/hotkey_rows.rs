@@ -698,4 +698,129 @@ mod tests {
         assert_eq!(titled.len(), 1);
         assert_eq!(titled[0].1, "My special action");
     }
+
+    // The live h80_curated_hotkeys_render gate (lane-p.ps1) binds each KDL action on a
+    // Ctrl+Alt+Shift chord with `hotkey-overlay { hide-not-bound }`. These are the same
+    // binds, parsed by the real action parser, and the sheet it painted.
+    fn live_chord_bind(id: i32, key: u32, command: &str, args: &[&str]) -> RegisteredBinding {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let action = crate::input::parse_action_flagged(command, &args, &[])
+            .unwrap_or_else(|| panic!("live gate action must parse: {command} {args:?}"));
+        // Ctrl+Alt+Shift is 7, and not a literal Mod/Super chord.
+        action_bind(id, 7, key, action, None)
+    }
+
+    fn live_gate_rows(commands: &[(&str, &[&str])]) -> Vec<(String, String)> {
+        let bindings: Vec<_> = commands
+            .iter()
+            .enumerate()
+            .map(|(index, (command, args))| {
+                live_chord_bind(index as i32, 0x41 + index as u32, command, args)
+            })
+            .collect();
+        curated_rows(&bindings, 3, true)
+    }
+
+    // Pinned niri e19df12 ui/hotkey_overlay.rs:197-304 collect_actions (the 18 candidates, in
+    // this order) and :458-494 action_name (their titles; only "niri" reads "wiri" here).
+    #[test]
+    fn pinned_hotkey_live_gate_binding_all_eighteen_curated_actions_lists_all_eighteen() {
+        let curated: [(&str, &str); 18] = [
+            ("show-hotkey-overlay", "Show Important Hotkeys"),
+            ("quit", "Exit wiri"),
+            ("close-window", "Close Focused Window"),
+            ("focus-column-left", "Focus Column to the Left"),
+            ("focus-column-right", "Focus Column to the Right"),
+            ("move-column-left", "Move Column Left"),
+            ("move-column-right", "Move Column Right"),
+            ("focus-workspace-down", "Switch Workspace Down"),
+            ("focus-workspace-up", "Switch Workspace Up"),
+            (
+                "move-column-to-workspace-down",
+                "Move Column to Workspace Down",
+            ),
+            ("move-column-to-workspace-up", "Move Column to Workspace Up"),
+            ("switch-preset-column-width", "Switch Preset Column Widths"),
+            ("maximize-column", "Maximize Column"),
+            (
+                "consume-or-expel-window-left",
+                "Consume or Expel Window Left",
+            ),
+            (
+                "consume-or-expel-window-right",
+                "Consume or Expel Window Right",
+            ),
+            (
+                "toggle-window-floating",
+                "Move Window Between Floating and Tiling",
+            ),
+            (
+                "switch-focus-between-floating-and-tiling",
+                "Switch Focus Between Floating and Tiling",
+            ),
+            ("toggle-overview", "Open the Overview"),
+        ];
+        // Registered as well, but not in niri's list: no row. A spawn would need a
+        // Mod/Super chord (:281-296); focus-window-up/down and fullscreen-window never.
+        let not_curated: [(&str, &[&str]); 4] = [
+            ("spawn", &["notepad.exe"]),
+            ("focus-window-up", &[]),
+            ("focus-window-down", &[]),
+            ("fullscreen-window", &[]),
+        ];
+        let mut commands: Vec<(&str, &[&str])> = Vec::new();
+        for (command, _) in curated {
+            commands.push((command, &[]));
+        }
+        commands.extend(not_curated);
+        assert_eq!(commands.len(), 22);
+        let rows = live_gate_rows(&commands);
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+            curated.iter().map(|(_, title)| *title).collect::<Vec<_>>()
+        );
+        // Each row names the chord of its own bind (A..R, in the order bound).
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.0,
+                crate::ipc::server::format_chord(7, 0x41 + index as u32),
+                "{}",
+                row.1
+            );
+        }
+    }
+
+    // The sheet the aa6c884 live run measured: 18 binds of the pre-niri list ("Launch
+    // application", focus-window-up/down, fullscreen-window and 14 curated ones). niri lists
+    // only the 14 that are in its curated list, so 14 rows is the correct answer.
+    #[test]
+    fn pinned_hotkey_live_gate_old_pre_niri_bind_set_gives_fourteen_rows() {
+        let binds: [(&str, &[&str]); 18] = [
+            ("spawn", &["notepad.exe"]),
+            ("close-window", &[]),
+            ("focus-column-left", &[]),
+            ("focus-column-right", &[]),
+            ("focus-window-up", &[]),
+            ("focus-window-down", &[]),
+            ("move-column-left", &[]),
+            ("move-column-right", &[]),
+            ("consume-or-expel-window-left", &[]),
+            ("consume-or-expel-window-right", &[]),
+            ("maximize-column", &[]),
+            ("fullscreen-window", &[]),
+            ("toggle-window-floating", &[]),
+            ("toggle-overview", &[]),
+            ("focus-workspace-up", &[]),
+            ("focus-workspace-down", &[]),
+            ("show-hotkey-overlay", &[]),
+            ("quit", &[]),
+        ];
+        let rows = live_gate_rows(&binds);
+        assert_eq!(rows.len(), 14);
+        for absent in ["Launch application", "Fullscreen window"] {
+            assert!(!rows.iter().any(|row| row.1 == absent), "{absent}");
+        }
+        assert!(!rows.iter().any(|row| row.1.starts_with("Spawn")));
+        assert!(!rows.iter().any(|row| row.1.contains("Focus window")));
+    }
 }
