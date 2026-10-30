@@ -504,6 +504,32 @@ function OnScreen($h) {
 function OnScreenCount($hwnds) { @($hwnds | Where-Object { [LT]::IsWindow($_) -and [LT]::IsWindowVisible($_) -and -not [LT]::IsIconic($_) -and (OnScreen $_) }).Count }
 function NewTopLevel($before) { @([LT]::TopLevel() | Where-Object { $before -notcontains $_ }) }
 
+# Terminal windows (Windows Terminal or a classic console) that appeared since $snapshot: ask each to
+# close, stop the given shells by PID if they still run, then retry the close until the window is gone
+# (a killed shell leaves its Windows Terminal window open on an "[process exited]" tab, and a close that
+# arrives while the tab is still tearing down is ignored). Returns how many windows it found.
+$terminalShellsStopped = 0
+$terminalWindowsLeftOpen = 0
+function CloseNewTerminalWindows($snapshot, [int[]]$shellIds) {
+    $wins = @(NewTopLevel $snapshot | Where-Object { [LT]::IsWindow($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') })
+    foreach ($h in $wins) { [LT]::Close($h) }
+    if ($wins.Count) { Start-Sleep -Milliseconds 500 }
+    foreach ($id in @($shellIds)) {
+        if (Get-Process -Id $id -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+            $script:terminalShellsStopped++
+        }
+    }
+    foreach ($h in $wins) {
+        for ($i = 0; $i -lt 15 -and [LT]::IsWindow($h); $i++) {
+            Start-Sleep -Milliseconds 200
+            [LT]::Close($h)
+        }
+        if ([LT]::IsWindow($h)) { $script:terminalWindowsLeftOpen++ }
+    }
+    return $wins.Count
+}
+
 # Wait at least $minMs, and until $h is the foreground window or $maxMs have passed; true when it is.
 function WaitForeground($h, [int]$minMs, [int]$maxMs) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -575,6 +601,7 @@ $ctlBytes = [IO.File]::ReadAllBytes($ctl)
 $ctlSubsystem = [BitConverter]::ToUInt16($ctlBytes, [BitConverter]::ToInt32($ctlBytes, 0x3C) + 24 + 68)
 
 $topBefore = [LT]::TopLevel()
+$topAtStart = $topBefore   # the end-of-run terminal sweep closes only windows this run created
 $w = Start-Wiri $log1 (Join-Path $D 'wiri.stdout.log')
 Start-Sleep -Seconds 4
 $steps.Add([pscustomobject]@{ step = 'start'; args = "pid $($w.Id)"; rc = $(if ($w.HasExited) { $w.ExitCode } else { 'running' }); bytes = 0 })
@@ -629,7 +656,9 @@ $termWindows = @(NewTopLevel $topB | Where-Object { [LT]::IsWindowVisible($_) -a
 $termInfo = FormInfo $termWindows
 $termInfo | ConvertTo-Json | Set-Content (Join-Path $D '02b-terminals.json')
 Shot '02b-terminals'
-foreach ($c in $cons) { if (-not $c.HasExited) { Stop-Process -Id $c.Id -Force } }
+# Close the consoles' Windows Terminal windows first: a killed cmd.exe leaves its window open on an
+# "[process exited with code 4294967295]" tab for the rest of the run.
+$null = CloseNewTerminalWindows $topB @($cons | ForEach-Object { $_.Id })
 Start-Sleep -Seconds 2
 # The terminals are gone: the three windows must be back on screen (the strip re-fits itself).
 $formsOnScreenAfterTerminals = OnScreenCount $forms
@@ -885,25 +914,16 @@ function TerminalShells {
         Where-Object { ($hosts -contains [int]$_.ParentProcessId) -and ($_.Name -in 'powershell.exe', 'pwsh.exe', 'cmd.exe') } |
         ForEach-Object { [int]$_.ProcessId })
 }
-$terminalShellsStopped = 0
-$terminalWindowsLeftOpen = 0
-function CloseSpawnedTerminal($window, $shellsBefore) {
+# Windows Terminal hosts every window in one process, so the window a spawn check found first is not
+# always the one that got the new shell: close every terminal window that appeared since the check's
+# snapshot, not just that one.
+function CloseSpawnedTerminal($topSnapshot, $shellsBefore) {
     $new = @()
     for ($i = 0; $i -lt 12 -and -not $new.Count; $i++) {
         $new = @(TerminalShells | Where-Object { $shellsBefore -notcontains $_ })
         if (-not $new.Count) { Start-Sleep -Milliseconds 250 }
     }
-    foreach ($id in $new) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
-    # A killed shell leaves its Windows Terminal window open on an "[process exited]" tab, and a
-    # close that arrives while the tab is still tearing down is ignored: retry until it is gone.
-    if ($window) {
-        for ($i = 0; $i -lt 15 -and [LT]::IsWindow($window); $i++) {
-            Start-Sleep -Milliseconds 200
-            [LT]::Close($window)
-        }
-        if ([LT]::IsWindow($window)) { $script:terminalWindowsLeftOpen++ }
-    }
-    $script:terminalShellsStopped += $new.Count
+    $null = CloseNewTerminalWindows $topSnapshot $new
 }
 
 # The built-in Mod+Enter (no spawn bind in this config) starts Windows Terminal: press it for real.
@@ -917,7 +937,7 @@ for ($i = 0; $i -lt 40 -and -not $defaultTerm; $i++) {
 }
 $spawnDefaultTerminal = [bool]$defaultTerm
 Shot '13-default-terminal'
-CloseSpawnedTerminal $defaultTerm $shellsBefore
+CloseSpawnedTerminal $topBefore $shellsBefore
 Start-Sleep -Seconds 2
 
 $h2Config = @"
@@ -963,7 +983,7 @@ if ($env:WIRI_LIVE_CI -ne '1' -or (Get-Command wt.exe -ErrorAction SilentlyConti
     }
     $spawnWtWindow = [bool]$wtWin
     Shot '13-spawn-wt'
-    CloseSpawnedTerminal $wtWin $shellsBefore
+    CloseSpawnedTerminal $topBefore $shellsBefore
     Start-Sleep -Seconds 2
 }
 $w = $w4
@@ -3250,6 +3270,10 @@ if ($env:WIRI_LIVE_CI -eq '1') {
     })
 }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') } catch { LanePhaseError 'lane_e_perf' $_ } # p_* numeric information only; never pass/fail
+# Terminal windows this run created and any phase left behind: close them so the next run starts on a
+# clean desktop. Information only (a count), never a gate.
+$summary['terminal_windows_swept_at_end'] = CloseNewTerminalWindows $topAtStart @()
+$summary['terminal_windows_left_open'] = $terminalWindowsLeftOpen
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }
