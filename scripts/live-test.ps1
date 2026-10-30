@@ -2651,8 +2651,18 @@ $null = Ctl 'h15-ws1-again' @('action', 'focus-workspace', '1'); Start-Sleep -Mi
 FocusForm $k1
 # Native focus alone is not the event-stream precondition. Otherwise a setup
 # observation still in flight can leave the stream on k3 and dedup its return.
+# The OS now and then raises no EVENT_SYSTEM_FOREGROUND for a successful SetForegroundWindow
+# (aa6c884: the single activation of k1 got no notification, so managed and stream focus stayed
+# on k3 for 8 s while the OS foreground was k1, and no later event for k1 ever came; the wiri
+# logs of the r3 run show one more activation without any foreground notice, at another place).
+# Repeating focus-window on the window that already is foreground sends no new notification, so
+# when managed focus has not followed after 1.5 s the precondition is re-created with real
+# transitions (focus k3, then k1 again), at most twice.  Every attempt is recorded in the
+# evidence; a precondition that never settles still fails the gate.
 $h15IdSetupClock = [Diagnostics.Stopwatch]::StartNew()
 $h15IdSetup = $false
+$h15IdSetupAttempts = 1
+$h15IdAttemptStartMs = 0
 $h15IdSetupSamples = New-Object System.Collections.Generic.List[object]
 do {
     $streamFocus = $null
@@ -2671,8 +2681,14 @@ do {
     [void]$h15IdSetupSamples.Add([pscustomobject]@{ ms=$h15IdSetupClock.ElapsedMilliseconds; native=$nativeFocus; managed=$managedFocus; stream=$streamFocus; events=$setupEvents.Count })
     $h15IdSetup = ($query.success -and $nativeFocus -eq [int64]$k1 -and $null -ne $managedFocus -and [int64]$managedFocus -eq [int64]$k1 -and $null -ne $streamFocus -and [int64]$streamFocus -eq [int64]$k1)
     if ($h15IdSetup) { break }
+    if ($h15IdSetupAttempts -lt 3 -and ($h15IdSetupClock.ElapsedMilliseconds - $h15IdAttemptStartMs) -ge 1500) {
+        $h15IdSetupAttempts++
+        FocusForm $k3
+        FocusForm $k1
+        $h15IdAttemptStartMs = $h15IdSetupClock.ElapsedMilliseconds
+    }
     Start-Sleep -Milliseconds 40
-} while ($h15IdSetupClock.ElapsedMilliseconds -lt 8000)
+} while ($h15IdSetupClock.ElapsedMilliseconds -lt 12000)
 $h15IdMark = @(EvList $evAll).Count
 $new = @(H15Step { $null = Ctl 'h15-fullscreen-id' @('action', 'fullscreen-window', '--id', [string][int64]$k3) } 2400)
 $h15IdFs = @(EvWindow $new 'window_opened_or_changed' $k3)
@@ -2692,7 +2708,7 @@ $h15IdForeground = [int64][LT]::GetForegroundWindow()
 $h15IdActs = $h15IdSetup -and ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 0) -and
     ($h15IdForeground -eq [int64]$k1) -and $h15IdAfterQuery.success -and ($null -ne $h15IdManagedFocus) -and ([int64]$h15IdManagedFocus -eq [int64]$k1) -and
     ($null -ne $h15IdStreamFocus) -and ([int64]$h15IdStreamFocus -eq [int64]$k1)
-[pscustomobject]@{ setup_pass=$h15IdSetup; setup_expected=[int64]$k1; setup_samples=$h15IdSetupSamples.ToArray(); event_mark=$h15IdMark; expected=[int64]$k3; focus_expected=[int64]$k1; fullscreen_change_count=$h15IdFs.Count; focus_change_count=$h15IdFocus.Count; foreground_after=$h15IdForeground; managed_after=$h15IdManagedFocus; stream_after=$h15IdStreamFocus; pass=$h15IdActs; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-fullscreen-id.evidence.json')
+[pscustomobject]@{ setup_pass=$h15IdSetup; setup_attempts=$h15IdSetupAttempts; setup_expected=[int64]$k1; setup_samples=$h15IdSetupSamples.ToArray(); event_mark=$h15IdMark; expected=[int64]$k3; focus_expected=[int64]$k1; fullscreen_change_count=$h15IdFs.Count; focus_change_count=$h15IdFocus.Count; foreground_after=$h15IdForeground; managed_after=$h15IdManagedFocus; stream_after=$h15IdStreamFocus; pass=$h15IdActs; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-fullscreen-id.evidence.json')
 $null = Ctl 'h15-fullscreen-id-off' @('action', 'fullscreen-window', '--id', [string][int64]$k3); Start-Sleep -Milliseconds 2200
 # Arrange a different foreground window before closing k1 by id: fullscreen above deliberately kept k1 focused.
 FocusForm $k3
