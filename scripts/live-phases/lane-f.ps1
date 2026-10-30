@@ -602,23 +602,39 @@ window-rule {
         $fComplete = $false
         try {
             foreach ($fTransport in @('cli','raw')) {
+                # niri's `focus true` (the default of move-window-to-workspace --window-id) is
+                # ActivateWindow::Smart (input/mod.rs:1420-1470), and Monitor::move_to_workspace
+                # resolves Smart as "the moved window is the monitor's active window"
+                # (layout/monitor.rs:843-845, pinned e19df12): a window that is NOT focused is
+                # moved without taking the focus, whatever the flag says, and only the focused
+                # one is followed.  So with --id naming an unfocused B, A stays focused and the
+                # source workspace stays active for the default AND for --focus false; the
+                # default follows only when --id names the window that already has the focus.
                 foreach ($fByIndex in @($false,$true)) {
                     foreach ($fFollow in @($true,$false)) {
                         $fState = FFixture
                         $fReference = if ($fByIndex) { [int](FWorkspace $fState $fTarget).idx } else { $fTarget }
-                        # The explicit HWND must not be focused before dispatch. A
-                        # remains foreground for --focus false; default focus follows B.
+                        # The explicit HWND is not focused before dispatch: A stays focused.
                         FFocus $fA
                         $fArgs = @($fReference,'--id',[int64]$fB)
                         if (-not $fFollow) { $fArgs += @('--focus',$false) }
-                        $fExpected = if ($fFollow) { $fB } else { $fA }
-                        $fRecord = FRun "h32-window-$fByIndex-$fFollow-$fTransport" $fTransport 'move-window-to-workspace' $fArgs ([int64]$fExpected)
+                        $fRecord = FRun "h32-window-$fByIndex-$fFollow-$fTransport" $fTransport 'move-window-to-workspace' $fArgs ([int64]$fA)
                         $fValid = FTransferCheck $fRecord $fTarget @($fB) @(@{hwnd=$fB;column=0;tile=0})
                         $fGate = if ($fFollow) { 'h32_window_transfer_names_indices_default_focus' } else { 'h32_window_transfer_focus_false_preserves_source' }
                         $fSourceWs = FWorkspace $fRecord.after $fSource
                         $fTargetWs = FWorkspace $fRecord.after $fTarget
-                        FCheck $fGate ($fValid -and $(if ($fFollow) { $fTargetWs.is_active } else { $fSourceWs.is_active })) $fRecord
+                        FCheck $fGate ($fValid -and $fSourceWs.is_active -and -not $fTargetWs.is_active) $fRecord
                     }
+                    # --id names the window that already has the focus: the default follows it
+                    # to the target workspace (Smart is true), by name and by index.
+                    $fState = FFixture
+                    $fReference = if ($fByIndex) { [int](FWorkspace $fState $fTarget).idx } else { $fTarget }
+                    FFocus $fA; FFocus $fB
+                    $fRecord = FRun "h32-window-focused-$fByIndex-$fTransport" $fTransport 'move-window-to-workspace' @($fReference,'--id',[int64]$fB) ([int64]$fB)
+                    $fValid = FTransferCheck $fRecord $fTarget @($fB) @(@{hwnd=$fB;column=0;tile=0})
+                    $fSourceWs = FWorkspace $fRecord.after $fSource
+                    $fTargetWs = FWorkspace $fRecord.after $fTarget
+                    FCheck 'h32_window_transfer_names_indices_default_focus' ($fValid -and $fTargetWs.is_active -and -not $fSourceWs.is_active) $fRecord
                 }
                 # No --id: the focused window is the target. Exercise inline flags,
                 # explicit true, and the legacy non-following numeric action too.

@@ -2892,3 +2892,89 @@ fn configured_output_preferences_and_reload_top_insertion_preserve_prior_workspa
         engine.set_full_config(config.clone());
     }
 }
+
+// The live h32 fixture: A/B and C/D stacked columns on the source workspace, an empty named
+// target workspace on the same (only) output. niri `MoveWindowToWorkspaceById` maps `focus`
+// to ActivateWindow::Smart/No (input/mod.rs:1420-1470) and Monitor::move_to_workspace
+// resolves Smart as "the moved window is the monitor's active window" (monitor.rs:843-845,
+// pinned e19df12), so only the window that already has the focus is followed.
+fn live_h32_fixture() -> (TilingEngine, BackendHandle, OutputId) {
+    let mut engine = TilingEngine::new(LayoutConfig::default());
+    let output = install_monitor(
+        &mut engine,
+        "lane-f-live-h32",
+        0,
+        vec![
+            (40, workspace("source", &[&[100, 101], &[102, 103]])),
+            (7, workspace("target", &[])),
+        ],
+        40,
+        100,
+    );
+    (engine, BackendHandle::default_for_test(), output)
+}
+
+#[test]
+fn explicit_unfocused_window_move_never_takes_the_focus_for_default_or_false() {
+    for focus in [true, false] {
+        for index in [false, true] {
+            let (mut engine, backend, output) = live_h32_fixture();
+            engine.record_ipc_foreground(WindowId::new(100));
+            let before = cursor(&engine, output);
+            let reference = if index {
+                WorkspaceRef::Index(2)
+            } else {
+                WorkspaceRef::Name("target".to_string())
+            };
+            // `--id` names B while A is focused: B goes to the target, A keeps the focus.
+            engine.move_window_to_workspace_ref(
+                Some(WindowId::new(101)),
+                reference,
+                focus,
+                &backend,
+            );
+            let case = format!("focus={focus}, index={index}");
+            assert_tile_at(&engine, 101, output, 7);
+            assert_eq!(
+                columns_on(&engine, output, 40),
+                vec![vec![100], vec![102, 103]],
+                "{case}"
+            );
+            assert_eq!(columns_on(&engine, output, 7), vec![vec![101]], "{case}");
+            assert_eq!(cursor(&engine, output), before, "{case}");
+            assert_eq!(engine.ipc_snapshot().focused_window(), Some(100), "{case}");
+        }
+    }
+}
+
+#[test]
+fn explicit_focused_window_move_follows_only_with_the_default_focus_flag() {
+    for index in [false, true] {
+        let reference = || {
+            if index {
+                WorkspaceRef::Index(2)
+            } else {
+                WorkspaceRef::Name("target".to_string())
+            }
+        };
+        // Default focus: B was already focused, so Smart activation follows it.
+        let (mut engine, backend, output) = live_h32_fixture();
+        assert!(engine.focus_action_window(WindowId::new(101), &backend));
+        engine.record_ipc_foreground(WindowId::new(101));
+        engine.move_window_to_workspace_ref(Some(WindowId::new(101)), reference(), true, &backend);
+        assert_tile_at(&engine, 101, output, 7);
+        let (active, _, focus_window) = cursor(&engine, output);
+        assert_eq!(active, 7, "index={index}");
+        assert_eq!(focus_window, Some(WindowId::new(101)), "index={index}");
+
+        // `--focus false`: B moves, the source workspace stays active.
+        let (mut engine, backend, output) = live_h32_fixture();
+        assert!(engine.focus_action_window(WindowId::new(101), &backend));
+        engine.record_ipc_foreground(WindowId::new(101));
+        engine.move_window_to_workspace_ref(Some(WindowId::new(101)), reference(), false, &backend);
+        assert_tile_at(&engine, 101, output, 7);
+        let (active, _, focus_window) = cursor(&engine, output);
+        assert_eq!(active, 40, "index={index}");
+        assert_eq!(focus_window, Some(WindowId::new(100)), "index={index}");
+    }
+}
