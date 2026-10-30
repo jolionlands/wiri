@@ -661,7 +661,13 @@ fn parity_move_floating_window_on_a_sizing_tile_adjusts_from_the_fraction_in_its
         // area it is used in, then adjusted and stored again as a fraction of that area.
         use crate::ipc::PositionChange::AdjustFixed;
         engine
-            .move_floating_window(Some(moved), AdjustFixed(10.0), AdjustFixed(0.0), None, &backend)
+            .move_floating_window(
+                Some(moved),
+                AdjustFixed(10.0),
+                AdjustFixed(0.0),
+                None,
+                &backend,
+            )
             .unwrap();
         assert_eq!(
             engine.restore_to_floating.get(&moved),
