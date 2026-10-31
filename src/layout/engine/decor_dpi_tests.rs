@@ -435,14 +435,15 @@ fn tab_indicator_config() -> Config {
 
 #[test]
 fn parity_the_tab_indicator_is_projected_through_the_output_scale() {
-    // niri layout/tab_indicator.rs:100-105,164: the width, the gap and the gaps between the
-    // tabs are rounded to physical pixels, and the corner radius (logical there, in a shader
+    // niri layout/tab_indicator.rs:100-105,164: the width is rounded to physical pixels, the
+    // gap and the gaps between the tabs are physical values whose one-pixel minimum is
+    // applied when the tabs are laid out, and the corner radius (logical there, in a shader
     // that applies the scale) is physical here.
     let table = [
         // scale, width, gap, gaps between, corner radius
         (1.0, 4, 5.0, 10.0, 6.0),
-        (1.25, 5, 6.0, 12.5, 7.5),
-        (1.5, 6, 8.0, 15.0, 9.0),
+        (1.25, 5, 6.25, 12.5, 7.5),
+        (1.5, 6, 7.5, 15.0, 9.0),
         (2.0, 8, 10.0, 20.0, 12.0),
     ];
     for (scale, width, gap, gaps_between, corner_radius) in table {

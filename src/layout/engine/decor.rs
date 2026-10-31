@@ -193,13 +193,13 @@ fn tab_specs(
     // The tab indicator's width, gap, gaps-between and corner radius are logical config
     // values, like the ring and the shadow: the spec holds the physical pixels of this
     // output (niri layout/tab_indicator.rs:100-105,164 and 323-335 pass them through the
-    // output scale). `length` stays a proportion, which has no units to project.
+    // output scale). `length` stays a proportion, which has no units to project. The width
+    // is rounded through the scale here and the other three keep their fraction: niri's
+    // one-pixel minimums for them are the ones `TabsSpec::tab_rects` already applies to a
+    // physical value, so 100% output stays bit-identical.
     let scale = cfg.output_scale();
     let tab_width = crate::layout::metrics::ring_width_px(style.width, scale);
-    let tab_gap = crate::layout::metrics::signed_gap_px(style.gap, scale);
-    // niri's `round_logical_in_physical_max1` minimum for gaps-between is applied inside
-    // `TabsSpec::tab_rects`, so only the scale is projected here: at 100% the tab geometry
-    // is bit-identical to what it was.
+    let tab_gap = style.gap * scale;
     let tab_gaps_between = style.gaps_between_tabs * scale;
     let tab_corner_radius = (style.corner_radius * scale) as f32;
     workspace
