@@ -12,11 +12,15 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
   outputs, non-layout actions, misc and security.
 - [Action and CLI contract census](action-census.md): every pinned niri action (143) and the
   `niri msg` subcommands against wiri's KDL, `wiri-ctl` and typed-IPC entry points.
+- [Partial rows, classified](partial-rows-2026-10-30.md): every `partial` row in both matrices
+  with one primary condition (missing software, evidence not reconciled, hardware, Windows
+  backend difference) and the exact remaining condition, plus the `h95_*` live gates added for
+  the evidence rows.
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 163 | 46 | 0 | 17 |
-| Config, input and IPC (259 rows) | 141 | 46 | 0 | 72 |
+| Layout and behaviour (226 rows) | 164 | 45 | 0 | 17 |
+| Config, input and IPC (259 rows) | 141 | 47 | 0 | 71 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
 retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates and
@@ -202,6 +206,20 @@ retains its own source binding.
 Appearance scaling, other height lifecycle routes, input/config semantics and
 hardware evidence remain open. See the [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md)
 for the active work; a gate count alone is not full parity.
+
+**2026-10-30 partial-row reconcile (Lane EVIDENCE).** [partial-rows-2026-10-30.md](partial-rows-2026-10-30.md)
+classifies all 92 partial rows by one primary condition: **5 missing or incorrect software, 15
+implemented but evidence not reconciled, 37 hardware evidence unavailable, 35 Windows backend
+differences**. The matrix totals are unchanged — **164 done / 45 partial / 17 N/A** (layout) and
+**141 done / 47 partial / 71 N/A** (config, input and IPC), 305 / 92 / 88 of 485 — because no row
+was promoted: promotion needs a named gate to have passed in a complete official run, and this
+pass could not read `C:\wiri-dev\evidence\<run>\`, so the 15 evidence rows instead name the gate
+they need. Eight `h95_*` gates are now written in `scripts/live-phases/lane-evidence.ps1`
+(dot-sourced next to the other lanes and parse-checked, not yet run in a cycle) and settle five
+of those rows plus the overview half of one backend row; the remaining rows point at gates that
+already exist in `lane-a-camera-motion.ps1`, `lane-startup-rules.ps1`, `lane-pango.ps1`,
+`lane-pace.ps1`, `lane-cfg.ps1` or `lane-focus.ps1`, or name the one check still to write.
+
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;
 11 / 87 / 91 / 70. Unqualified line numbers in both files refer to commit `1532635`;
