@@ -41,10 +41,21 @@
 #          window to act on; bad actions say what is wrong; a late subscriber and a filtered one are told the right state.
 # Phase D  close one window, `wiri-ctl quit`, check every window is visible again.
 #
+# The lane phase files under live-phases/ add the per-area desktop checks (H19-H99); each is
+# dot-sourced into this scope and records its own summary.json gates.  Lane MULTIMON (H99) needs a
+# second display and skips itself without one.
+#
+# Two displays: this harness drives DISPLAY1 (the primary, 100%) and reads the whole desktop in
+# physical pixels (a per-monitor-v2 thread context, see ParkCursorAtPrimary).  Fixtures are kept on
+# the primary by parking the pointer there and returning wiri's focus to the primary before they
+# open, so a second display cannot move them out from under an existing gate.
+#
 # Outputs (all in -Out, default C:\wiri-dev\live): summary.json, per-step *.txt / *.json, *.png
 # screenshots, wiri.stderr.log (+ wiri.stderr2.log for the restarted instance).  Parallel workers pass
 # their own -Out inside their worktree (.live\ is git-ignored) and -LockWaitMinutes to queue for the
 # desktop instead of failing while another run holds it.
+# WIRI_LIVE_ONLY=lane_a,lane_grid,... runs only those lanes (the phrases above always run); unset
+# keeps the full cycle unchanged.
 param(
     [string]$Bin = 'C:\wiri-dev\wiri\target\release',
     [string]$Out = 'C:\wiri-dev\live',
@@ -156,6 +167,9 @@ public static class LT {
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  // The thread's DPI awareness: the harness reads every rectangle and screenshot pixel in physical
+  // pixels, which is what a per-monitor-v2 context reports on a mixed-DPI desktop.
+  [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
   // The top-level window that is on top at a screen point (what the user sees there).
   public static IntPtr TopWindowAt(int x, int y) {
     POINT p; p.X = x; p.Y = y;
@@ -477,6 +491,35 @@ function Shot([string]$name) {
     $g.Dispose(); $bmp.Dispose()
 }
 
+# ---- two displays ------------------------------------------------------------------------------
+# The harness observes everything in physical pixels: a per-monitor-v2 thread context makes
+# EnumDisplayMonitors/Screen/get_cursor_pos and CopyFromScreen report the real mixed-DPI desktop
+# (a DPI-unaware process is told that a 1920x1080/125% output is 1536x864 and its screenshots of it
+# are wrong).  On a single 100% display nothing changes.  The context is process-wide only for this
+# thread, and nothing here changes a display setting.
+$dpiContextBefore = [LT]::SetThreadDpiAwarenessContext([IntPtr](-4))   # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+$primaryScreen = [System.Windows.Forms.Screen]::PrimaryScreen
+# Windows places a new CW_USEDEFAULT window on the display the pointer is on, and wiri tiles a window
+# on the display whose rectangle contains it: a fixture opened while the pointer rests on a second
+# display lands there and every gate that compares it with the primary's work area fails.  Park the
+# pointer on the primary and give wiri's focus back to the primary before fixtures are opened.  Both
+# calls are read-only with respect to the display configuration; the pointer is not a system setting.
+function ParkCursorAtPrimary {
+    $b = $primaryScreen.Bounds
+    try { [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point ([int]($b.Left + $b.Width / 2)), ([int]($b.Top + $b.Height / 2)) } catch { }
+}
+# A live run keeps one daemon per phase; naming the primary output in wiri's own focus makes
+# `focus-workspace` and the workspace-stack gates act on the primary, as they did on one display.
+function FocusPrimaryOutput([string]$tag) {
+    $out = $primaryScreen.DeviceName
+    if ([string]::IsNullOrEmpty($out)) { return }
+    $null = Ctl ("$tag-primary-$PID") @('action', 'focus-monitor', $out)
+}
+function PrepareFixtureDesktop([string]$tag) {
+    ParkCursorAtPrimary
+    FocusPrimaryOutput $tag
+}
+
 # Every wiri-ctl call gets 5 s; a hung IPC call is recorded as rc=timeout instead of blocking the run.
 function Ctl([string]$name, [string[]]$ctlArgs) {
     $outFile = Join-Path $D "$name.txt"
@@ -630,6 +673,9 @@ function Start-Wiri([string]$stderrLog, [string]$stdoutLog) {
         try { if ([IO.Directory]::GetFiles('\\.\pipe\') -contains $pipe) { break } } catch { break }
         Start-Sleep -Milliseconds 50
     }
+    # Every daemon this run starts is meant for fixtures opened right after it: keep them on the
+    # primary display of a two-display desktop (see ParkCursorAtPrimary).
+    PrepareFixtureDesktop 'start'
     return $p
 }
 
@@ -665,6 +711,9 @@ Ctl '01-state' @('state') | Out-Null
 Ctl '01-bindings' @('test-bindings') | Out-Null
 
 # ---- Phase A: three plain windows -------------------------------------------------------------
+# The pointer is parked on the primary and wiri's focus is on the primary, so the fixtures open on
+# the display every gate below measures (see ParkCursorAtPrimary).
+PrepareFixtureDesktop 'phase-a'
 $forms = @()
 foreach ($i in 1..3) {
     $forms += [TestForms]::Open("wiri-test-$i", 40, (60 + 50 * $i), 120)
@@ -695,6 +744,8 @@ $minWidth = ($vr | ForEach-Object { $_.R - $_.L } | Measure-Object -Minimum).Min
 
 # ---- Phase B: real terminal windows (the loop trigger) ----------------------------------------
 $topB = [LT]::TopLevel()
+# Terminal windows are placed by Windows at CW_USEDEFAULT, like the forms: keep them on the primary.
+PrepareFixtureDesktop 'phase-b'
 $cons = @()
 foreach ($i in 1..2) {
     $cons += Start-Process -FilePath cmd.exe -ArgumentList '/k', "title wiri-con-$i" -PassThru
@@ -1656,7 +1707,25 @@ $w = $w8
 $h8BindWarnings = (LogLines $log8 'Config bind:').Count
 function WsList([string]$tag) {
     $raw = Ctl $tag @('--json', 'get-workspace-list')
-    try { return @(($raw | ConvertFrom-Json).result.workspaces) } catch { return @() }
+    $all = @()
+    try { $all = @(($raw | ConvertFrom-Json).result.workspaces) } catch { return @() }
+    # Two displays: this legacy list covers every monitor (each entry names its monitor_id), while
+    # these gates count the primary monitor's workspaces.  On one display the filter keeps every entry.
+    $primary = PrimaryMonitorId
+    if ($null -eq $primary) { return $all }
+    return @($all | Where-Object { [int64]$_.monitor_id -eq $primary })
+}
+# The engine's monitor id of the Windows primary display, from wiri's own monitor list.  Cached: the
+# answer cannot change without a display change, which is itself a new run of the phase.
+$primaryMonitorIdCache = $null
+function PrimaryMonitorId {
+    if ($null -ne $primaryMonitorIdCache) { return $primaryMonitorIdCache }
+    $raw = Ctl 'primary-monitor-list' @('--json', 'list-monitors')
+    try {
+        $entry = @(($raw | ConvertFrom-Json).result | Where-Object { $_.name -ieq $primaryScreen.DeviceName }) | Select-Object -First 1
+        if ($null -ne $entry) { $script:primaryMonitorIdCache = [int64]$entry.output_id }
+    } catch { }
+    return $primaryMonitorIdCache
 }
 $wl = WsList 'h8-workspaces-at-start'
 $h8Names = @($wl | ForEach-Object { $_.name })
@@ -1719,7 +1788,10 @@ Remove-Item $cfg -Force -ErrorAction SilentlyContinue
 $w9 = Start-Wiri $log9 ($log9 + '.out')
 Start-Sleep -Seconds 4
 $w = $w9
-$sb = [System.Windows.Forms.SystemInformation]::VirtualScreen
+# The monitor the fixtures are on (the primary).  This used to be the virtual screen, which on a
+# two-display desktop is the union of every monitor: a fullscreen window covers ITS monitor, and a
+# window parked out of view sits below it, so the primary's rectangle is what these gates mean.
+$sb = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 # Every default chord registers: Ctrl+Alt+Tab is Windows' own task switcher and was refused at every start.
 $h9FailedHotkeys = (LogLines $log9 'FAIL hotkey').Count
 $h9RegisteredHotkeys = (LogLines $log9 'OK hotkey').Count
@@ -2618,7 +2690,7 @@ $h15OneFocused = ($h15FocusedWindows.Count -eq 1) -and ([int64]$h15FocusedWindow
 $h15FocusedWs = @($h15Workspaces | Where-Object { $_.is_focused -eq $true })
 $h15WsFields = ($h15Workspaces.Count -ge 2) -and ($h15FocusedWs.Count -eq 1) -and ($h15FocusedWs[0].name -eq 'chat') -and ($h15FocusedWs[0].idx -eq 1) -and
     ($h15FocusedWs[0].is_active -eq $true) -and (-not [string]::IsNullOrEmpty($h15FocusedWs[0].output)) -and
-    ([int64]$h15FocusedWs[0].active_window_id -eq $h15Fg) -and (@($h15Workspaces | ForEach-Object { $_.id } | Select-Object -Unique).Count -eq $h15Workspaces.Count)
+    ([int64]$h15FocusedWs[0].active_window_id -eq $h15Fg) -and (@($h15Workspaces | ForEach-Object { "$($_.output)|$($_.id)" } | Select-Object -Unique).Count -eq $h15Workspaces.Count)
 $h15WsOfWindows = ([int64]$h15FocusedWindows[0].workspace_id -eq [int64]$h15FocusedWs[0].id)
 $h15ConfigReplayed = (@(EvOf $h15Replay 'config_loaded').Count -ge 1) -and ((EvOf $h15Replay 'config_loaded')[0].data.failed -eq $false)
 Shot 'h15-01-three-windows'
@@ -3309,84 +3381,98 @@ $summary = [ordered]@{
 }
 # One lane's unexpected error must not end the run: its gates stay false and the error is recorded.
 function LanePhaseError([string]$lane, $err) { $summary["phase_error_$lane"] = ($err | Out-String).Trim() }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-a.ps1') } catch { LanePhaseError 'lane_a' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1') } catch { LanePhaseError 'lane_b' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1') } catch { LanePhaseError 'lane_d' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-h.ps1') } catch { LanePhaseError 'lane_h' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-g.ps1') } catch { LanePhaseError 'lane_g' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-z.ps1') } catch { LanePhaseError 'lane_z' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-s.ps1') } catch { LanePhaseError 'lane_s' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-w.ps1') } catch { LanePhaseError 'lane_w' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-k.ps1') } catch { LanePhaseError 'lane_k' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-f.ps1') } catch { LanePhaseError 'lane_f' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-t.ps1') } catch { LanePhaseError 'lane_t' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2.ps1') } catch { LanePhaseError 'lane_c2' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-binds.ps1') } catch { LanePhaseError 'lane_c2_binds' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-keyboard.ps1') } catch { LanePhaseError 'lane_c2_keyboard' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-session.ps1') } catch { LanePhaseError 'lane_c2_session' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-workspaces.ps1') } catch { LanePhaseError 'lane_c2_workspaces' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-v.ps1') } catch { LanePhaseError 'lane_v' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-hot-corner.ps1') } catch { LanePhaseError 'lane_v_hot_corner' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-tabs.ps1') } catch { LanePhaseError 'lane_v_tabs' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-l2.ps1') } catch { LanePhaseError 'lane_l2' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-floating-position.ps1') } catch { LanePhaseError 'lane_floating_position' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-button-scroll.ps1') } catch { LanePhaseError 'lane_button_scroll' $_ }
+# Opt-in subset for a targeted desktop run: WIRI_LIVE_ONLY=lane_d,lane_grid,lane_multimon dot-sources
+# only the named lanes (the phrase keys above still run in full).  Unset, empty or absent means every
+# lane runs, so the default full cycle is unchanged; the record-live cycle sets nothing.
+$liveOnly = @($env:WIRI_LIVE_ONLY -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+function LaneWanted([string]$lane) { return ($liveOnly.Count -eq 0) -or ($liveOnly -contains $lane) }
+if ($liveOnly.Count) { $summary['live_only'] = $liveOnly }
+if (LaneWanted 'lane_a') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-a.ps1') } catch { LanePhaseError 'lane_a' $_ } }
+if (LaneWanted 'lane_b') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-b.ps1') } catch { LanePhaseError 'lane_b' $_ } }
+if (LaneWanted 'lane_d') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-d.ps1') } catch { LanePhaseError 'lane_d' $_ } }
+if (LaneWanted 'lane_h') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-h.ps1') } catch { LanePhaseError 'lane_h' $_ } }
+if (LaneWanted 'lane_g') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-g.ps1') } catch { LanePhaseError 'lane_g' $_ } }
+if (LaneWanted 'lane_z') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-z.ps1') } catch { LanePhaseError 'lane_z' $_ } }
+if (LaneWanted 'lane_s') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-s.ps1') } catch { LanePhaseError 'lane_s' $_ } }
+if (LaneWanted 'lane_w') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-w.ps1') } catch { LanePhaseError 'lane_w' $_ } }
+if (LaneWanted 'lane_k') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-k.ps1') } catch { LanePhaseError 'lane_k' $_ } }
+if (LaneWanted 'lane_f') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-f.ps1') } catch { LanePhaseError 'lane_f' $_ } }
+if (LaneWanted 'lane_t') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-t.ps1') } catch { LanePhaseError 'lane_t' $_ } }
+if (LaneWanted 'lane_c2') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2.ps1') } catch { LanePhaseError 'lane_c2' $_ } }
+if (LaneWanted 'lane_c2_binds') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-binds.ps1') } catch { LanePhaseError 'lane_c2_binds' $_ } }
+if (LaneWanted 'lane_c2_keyboard') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-keyboard.ps1') } catch { LanePhaseError 'lane_c2_keyboard' $_ } }
+if (LaneWanted 'lane_c2_session') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-session.ps1') } catch { LanePhaseError 'lane_c2_session' $_ } }
+if (LaneWanted 'lane_c2_workspaces') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-c2-workspaces.ps1') } catch { LanePhaseError 'lane_c2_workspaces' $_ } }
+if (LaneWanted 'lane_v') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-v.ps1') } catch { LanePhaseError 'lane_v' $_ } }
+if (LaneWanted 'lane_v_hot_corner') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-hot-corner.ps1') } catch { LanePhaseError 'lane_v_hot_corner' $_ } }
+if (LaneWanted 'lane_v_tabs') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-tabs.ps1') } catch { LanePhaseError 'lane_v_tabs' $_ } }
+if (LaneWanted 'lane_l2') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-l2.ps1') } catch { LanePhaseError 'lane_l2' $_ } }
+if (LaneWanted 'lane_floating_position') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-floating-position.ps1') } catch { LanePhaseError 'lane_floating_position' $_ } }
+if (LaneWanted 'lane_button_scroll') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-button-scroll.ps1') } catch { LanePhaseError 'lane_button_scroll' $_ } }
 # H84: owned native bounds, allocation, classification and refresh evidence.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-native-bounds.ps1') } catch { LanePhaseError 'lane_native_bounds' $_ }
+if (LaneWanted 'lane_native_bounds') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-native-bounds.ps1') } catch { LanePhaseError 'lane_native_bounds' $_ } }
 # H85: observe the real global 60-second startup-rule deadline, including a
 # pre-expiry reload that must preserve the deadline and dynamic expiry updates.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-startup-rules.ps1') } catch { LanePhaseError 'lane_startup_rules' $_ }
+if (LaneWanted 'lane_startup_rules') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-startup-rules.ps1') } catch { LanePhaseError 'lane_startup_rules' $_ } }
 # H86: stable workspace identities and owned native focus; monitor relocation
 # remains explicit hardware qualification information on a single-output host.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-workspace-ids.ps1') } catch { LanePhaseError 'lane_workspace_ids' $_ }
+if (LaneWanted 'lane_workspace_ids') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-workspace-ids.ps1') } catch { LanePhaseError 'lane_workspace_ids' $_ } }
 # H88: a floating window cannot be fullscreen or maximized: the action moves it into the strip and
 # leaving the state floats it again where it was (niri workspace.rs:1288-1476).
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-float-sizing.ps1') } catch { LanePhaseError 'lane_float_sizing' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-cfg.ps1') } catch { LanePhaseError 'lane_cfg' $_ }
+if (LaneWanted 'lane_float_sizing') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-float-sizing.ps1') } catch { LanePhaseError 'lane_float_sizing' $_ } }
+if (LaneWanted 'lane_cfg') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-cfg.ps1') } catch { LanePhaseError 'lane_cfg' $_ } }
 # H89: a bind's `hotkey-overlay-title` is Pango markup, as niri paints it with set_markup:
 # bold, a colour span and `&amp;` paint styled, an invalid title paints the whole original
 # string, and that invalid title is warned about once at config load.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-pango.ps1') } catch { LanePhaseError 'lane_pango' $_ }
+if (LaneWanted 'lane_pango') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-pango.ps1') } catch { LanePhaseError 'lane_pango' $_ } }
 # Lane P: pointer-device settings, the hotkey overlay's startup options and the
 # dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
 # so nothing here changes this machine's real pointer or touchpad settings.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-p.ps1') } catch { LanePhaseError 'lane_p' $_ }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1') } catch { LanePhaseError 'lane_a11y' $_ }
+if (LaneWanted 'lane_p') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-p.ps1') } catch { LanePhaseError 'lane_p' $_ } }
+if (LaneWanted 'lane_a11y') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1') } catch { LanePhaseError 'lane_a11y' $_ } }
 # Lane LAST: niri's `cursor { hide-when-typing; hide-after-inactive-ms }` and the tablet
 # stylus binds.  hide-when-typing is checked only in lane P's dry-run mode; the inactivity
 # test starts one private daemon whose own explicit hide/restore is the only cursor change,
 # and its `finally` reloads the user's cursor scheme unconditionally.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1') } catch { LanePhaseError 'lane_last' $_ }
+if (LaneWanted 'lane_last') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1') } catch { LanePhaseError 'lane_last' $_ } }
 # Lane PACE: the animation frame clock waits for the desktop's presentation clock while
 # timelines run and arms nothing at rest.  h90_* read the burst line the daemon logs (it
 # always runs with -v) and the CPU time of a settled daemon; no display setting is touched.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-pace.ps1') } catch { LanePhaseError 'lane_pace' $_ }
+if (LaneWanted 'lane_pace') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-pace.ps1') } catch { LanePhaseError 'lane_pace' $_ } }
 # H92: the focus core. One focus-window request settles managed focus on the native foreground (no retry);
 # niri's *ById actions change the named window and never move native or managed focus.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-focus.ps1') } catch { LanePhaseError 'lane_focus' $_ }
+if (LaneWanted 'lane_focus') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-focus.ps1') } catch { LanePhaseError 'lane_focus' $_ } }
 # H97: the overview is niri's fixed-zoom camera over the 2D grid (overview { zoom }, one stack entry per
 # workspace, gaps of 10% of the view height, each workspace through its own horizontal camera), not a
 # fit-everything zoom. It owns one daemon and 30 ordinary owned forms, and only reads published geometry.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-overview.ps1') } catch { LanePhaseError 'lane_overview' $_ }
+if (LaneWanted 'lane_overview') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-overview.ps1') } catch { LanePhaseError 'lane_overview' $_ } }
 # H96: niri hides the floating layer while the workspace's active window is a fullscreen tile and the floating
 # layer is not active (workspace.rs:1722-1728); focusing a float or leaving fullscreen brings it back in place.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-dpi-floats.ps1') } catch { LanePhaseError 'lane_dpi_floats' $_ }
+if (LaneWanted 'lane_dpi_floats') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-dpi-floats.ps1') } catch { LanePhaseError 'lane_dpi_floats' $_ } }
 # H98: wiri's `layout { unified-grid }` extension.  One shared horizontal camera per monitor, x-matched
 # vertical moves, the eight diagonal actions, the two-arrow chord and the mode-off identity.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-grid.ps1') } catch { LanePhaseError 'lane_grid' $_ }
+if (LaneWanted 'lane_grid') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-grid.ps1') } catch { LanePhaseError 'lane_grid' $_ } }
+# H99 MULTIMON: two displays of different size and scale (here DISPLAY1 1366x768 at 100% primary and
+# DISPLAY2 1920x1080 at 125%).  The `Outputs` IPC list, per-output `layout {}` overrides, `center-column`,
+# the border/focus-ring/shadow/window-rule projection, the per-output backdrop, the hotkey overlay, the
+# overview's keyboard binds, per-output hot corners, `msg output scale/mode/position/transform`, and a
+# workspace surviving `output off` and coming back with the output.  It changes DISPLAY2 only, only
+# through wiri's own `msg output`, restores it in a finally block, and skips every gate when fewer than
+# two displays are present.
+if (LaneWanted 'lane_multimon') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-multimon.ps1') } catch { LanePhaseError 'lane_multimon' $_ } }
 # Lane EVIDENCE: the precise desktop checks that were missing for rows whose behaviour exists
 # and is unit-tested but was never observed exactly: the overview workspace shadow, the
 # deprecated per-output background colour, center-column on variable-width edge columns, the
 # tab indicator's urgent colour, Mod+button grabs on a floating window, and the keyboard-
 # shortcuts inhibitor.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-evidence.ps1') } catch { LanePhaseError 'lane_evidence' $_ }
+if (LaneWanted 'lane_evidence') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-evidence.ps1') } catch { LanePhaseError 'lane_evidence' $_ } }
 # H94: windows keep the final say over their size. Harness-owned WinForms fixtures resize themselves
 # from their own UI thread; the layout must keep that size, move the neighbours and never write the
 # window's geometry again (niri scrolling.rs:4860-4875, :1287-1305, :1293-1300).
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-resize.ps1') } catch { LanePhaseError 'lane_resize' $_ }
+if (LaneWanted 'lane_resize') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-resize.ps1') } catch { LanePhaseError 'lane_resize' $_ } }
 # H93: touch, pen and drag-and-drop driven by input Windows itself synthesizes (a real
 # synthetic pointer device and a real OLE drag); no digitizer hardware is involved.
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-synth.ps1') } catch { LanePhaseError 'lane_synth' $_ }
+if (LaneWanted 'lane_synth') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-synth.ps1') } catch { LanePhaseError 'lane_synth' $_ } }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
@@ -3396,7 +3482,7 @@ if ($env:WIRI_LIVE_CI -eq '1') {
         }
     })
 }
-try { . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') } catch { LanePhaseError 'lane_e_perf' $_ } # p_* numeric information only; never pass/fail
+if (LaneWanted 'lane_e_perf') { try { . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') } catch { LanePhaseError 'lane_e_perf' $_ } } # p_* numeric information only; never pass/fail
 # End of run: retry closing only terminal windows a check of this run created (the shared desktop may
 # also hold someone's own terminal, which must never be closed). Any other terminal window that appeared
 # during the run is only reported, so a phase that leaks one shows up here. Information only.
@@ -3418,6 +3504,30 @@ $fgEvents | Set-Content -Encoding UTF8 (Join-Path $D 'foreground-log.tsv')
 $summary['foreground_events'] = $fgEvents.Count
 $summary['foreground_elevated_titles'] = @($fgEvents | ForEach-Object { ($_ -split "`t", 4)[3] } |
     Where-Object { $_ -like 'Administrator:*' } | Sort-Object -Unique)
+# A subset run (WIRI_LIVE_ONLY) never dot-sources the other lanes, whose gates therefore keep the
+# placeholders this script declares above and would read as failures.  Drop the ones the skipped lane
+# files name, and count them, so nobody mistakes a subset for the full cycle.
+if ($liveOnly.Count -gt 0) {
+    $liveOnlyRemoved = 0
+    foreach ($laneFile in @(Get-ChildItem (Join-Path $PSScriptRoot 'live-phases') -Filter 'lane-*.ps1' |
+            Where-Object { -not (LaneWanted ($_.BaseName -replace '-', '_')) })) {
+        $names = @([regex]::Matches((Get-Content $laneFile.FullName -Raw), '(?<![A-Za-z0-9_])(h\d+_[a-z0-9_]*)') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        # A name the file builds at run time (`$summary["h81_${case}_settled"]`) is captured as the
+        # literal prefix of it; a prefix that ends in `_` stands for every gate the lane composes.
+        $exactNames = @($names | Where-Object { -not $_.EndsWith('_') })
+        $prefixNames = @($names | Where-Object { $_.EndsWith('_') })
+        $candidates = @($summary.Keys | Where-Object {
+                $key = [string]$_
+                ($exactNames -contains $key) -or (@($prefixNames | Where-Object { $key.StartsWith($_) }).Count -gt 0)
+            })
+        foreach ($gateName in $candidates) {
+            # Only a gate that is still false: a number 0 is not a failed gate.
+            if (($summary[$gateName] -is [bool]) -and ($summary[$gateName] -eq $false)) { $summary.Remove($gateName); $liveOnlyRemoved++ }
+        }
+    }
+    $summary['live_only_gates_removed'] = $liveOnlyRemoved
+}
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }

@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     TRANSPARENT,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub type BindingRow = (String, String);
@@ -206,6 +206,18 @@ pub fn dismiss_on_key(vk: u32, down: bool) -> bool {
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
+/// The DPI the sheet is sized with: the scale of the OUTPUT it is placed on, not the foreground
+/// window's own.  A DPI-unaware application reports 96 DPI for itself even when it sits on a 125%
+/// output (`GetDpiForWindow`), while niri sizes the sheet with the output's scale; so the monitor's
+/// effective DPI wins whenever Windows reports it.  Never below 96 DPI.
+fn sheet_dpi(monitor_dpi: u32, window_dpi: u32) -> u32 {
+    let reported = if monitor_dpi >= 96 {
+        monitor_dpi
+    } else {
+        window_dpi
+    };
+    reported.max(96)
+}
 fn focused_work_area() -> (Rect, f64) {
     unsafe {
         let fg = GetForegroundWindow();
@@ -216,7 +228,14 @@ fn focused_work_area() -> (Rect, f64) {
         };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let r = info.rcWork;
-            let dpi = GetDpiForWindow(fg).max(96);
+            let mut monitor_dpi: u32 = 0;
+            let mut monitor_dpi_y: u32 = 0;
+            if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut monitor_dpi, &mut monitor_dpi_y)
+                .is_err()
+            {
+                monitor_dpi = 0;
+            }
+            let dpi = sheet_dpi(monitor_dpi, GetDpiForWindow(fg));
             (
                 Rect::new(
                     r.left,
@@ -224,7 +243,7 @@ fn focused_work_area() -> (Rect, f64) {
                     (r.right - r.left).max(1) as u32,
                     (r.bottom - r.top).max(1) as u32,
                 ),
-                dpi as f64 / 96.0,
+                f64::from(dpi) / 96.0,
             )
         } else {
             (Rect::new(0, 0, 1366, 728), 1.0)
@@ -474,5 +493,25 @@ mod tests {
         cs.dismiss();
         cs.dismiss();
         assert!(cs.session.lock().is_none());
+    }
+    #[test]
+    fn the_sheet_is_sized_by_the_output_scale_not_the_foreground_window() {
+        // A DPI-unaware application on a 125% output reports 96 DPI for itself; the sheet must
+        // still be sized for the output (niri: the output's scale).
+        assert_eq!(sheet_dpi(120, 96), 120);
+        assert_eq!(sheet_dpi(144, 96), 144);
+        // An output whose DPI Windows does not report falls back to the window's own value.
+        assert_eq!(sheet_dpi(0, 144), 144);
+        // Never below 96 DPI, and a plain 96 DPI pair stays 1.0.
+        assert_eq!(sheet_dpi(0, 0), 96);
+        assert_eq!(sheet_dpi(96, 96), 96);
+        // ... and the sheet it produces on a 100% and a 125% output really differs.
+        let work = Rect::new(1366, 0, 1920, 1030);
+        let plain = SheetLayout::fit(work, f64::from(sheet_dpi(96, 96)) / 96.0, 20);
+        let scaled = SheetLayout::fit(work, f64::from(sheet_dpi(120, 96)) / 96.0, 20);
+        assert_eq!(plain.bounds.size.w, 720);
+        assert_eq!(scaled.bounds.size.w, 900);
+        assert!(scaled.bounds.size.h > plain.bounds.size.h);
+        assert_eq!(scaled.bounds.loc.x, 1366 + (1920 - 900) / 2);
     }
 }
