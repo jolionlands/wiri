@@ -3283,6 +3283,16 @@ $summary = [ordered]@{
     h86_inactive_height_id_preserves_native_focus = $false
     h86_owned_cleanup = $false
     h88_toggle_window_floating_on_a_fullscreen_float_tile = $false
+    # H95: live checks for rows whose behaviour was only unit-tested; `lane-evidence.ps1`
+    # replaces these defaults only after its own observations succeed.
+    h95_overview_workspace_shadow_paints_and_off_removes_it = $false
+    h95_deprecated_output_background_colour_is_the_overview_backdrop = $false
+    h95_center_column_centres_variable_width_edge_columns = $false
+    h95_tab_indicator_urgent_colour_overrides_the_selection = $false
+    h95_mod_drag_moves_a_floating_window = $false
+    h95_mod_drag_resizes_a_floating_window = $false
+    h95_mod_drag_escape_cancels_to_the_pre_drag_rect = $false
+    h95_shortcuts_inhibit_blocks_inhibitable_binds_only = $false
     # H89: a configured hotkey-overlay-title is Pango markup; its live gates are added by
     # `lane-pango.ps1` and replace these defaults only after observing the painted sheet.
     h89_markup_title_text_and_entity_render = $false
@@ -3356,6 +3366,12 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-dpi-floats.ps1') } catch { La
 # H98: wiri's `layout { unified-grid }` extension.  One shared horizontal camera per monitor, x-matched
 # vertical moves, the eight diagonal actions, the two-arrow chord and the mode-off identity.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-grid.ps1') } catch { LanePhaseError 'lane_grid' $_ }
+# Lane EVIDENCE: the precise desktop checks that were missing for rows whose behaviour exists
+# and is unit-tested but was never observed exactly: the overview workspace shadow, the
+# deprecated per-output background colour, center-column on variable-width edge columns, the
+# tab indicator's urgent colour, Mod+button grabs on a floating window, and the keyboard-
+# shortcuts inhibitor.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-evidence.ps1') } catch { LanePhaseError 'lane_evidence' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
