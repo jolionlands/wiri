@@ -3872,7 +3872,8 @@ impl TilingEngine {
         {
             return 0;
         }
-        ((style.width * zoom).round() + (style.gap * zoom).round()).max(0.0) as i32
+        // The same projection `tabs::reserve_indicator` reserves with on the other sides.
+        tabs::indicator_space(style, zoom, cfg.output_scale()) as i32
     }
 
     fn column_height_specs(
@@ -4406,6 +4407,7 @@ impl TilingEngine {
                         column,
                         &cfg.effects.tab_indicator,
                         zoom,
+                        cfg.output_scale(),
                         self.column_sizing_mode(column),
                     );
                     let rect = if zoom == 1.0 && self.column_sizing_mode(column) == DrawMode::Inset

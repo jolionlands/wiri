@@ -20,7 +20,7 @@ use super::rules::RuleState;
 use super::*;
 use crate::config::Config;
 use crate::layout::metrics::{project_shadow, ring_width_px};
-use crate::overlay::decor::{DecorContent, FrameSpec, RecordingSink};
+use crate::overlay::decor::{DecorContent, FrameSpec, RecordingSink, TabsSpec};
 use crate::window::ResolvedWindowRules;
 
 const SCALES: [f64; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
@@ -388,4 +388,130 @@ window-rule {
         ring_width_px(rule.effects.focus_ring.width.unwrap(), 1.5),
         1
     );
+}
+
+/// A tabbed column of three tiles on `output`, with the first tab focused.
+fn add_tabbed_column(engine: &mut TilingEngine, output: OutputId, first: isize) {
+    let mut column = crate::layout::Column::new();
+    for n in first..first + 3 {
+        column.add_tile(crate::layout::Tile::new(wid(n)));
+    }
+    column.switch_to_tabbed();
+    let monitor = engine.monitors.get_mut(&output).unwrap();
+    monitor.workspace_mut().unwrap().columns.push(column);
+    monitor.set_focus(wid(first));
+    engine.monitors.set_focused(output);
+}
+
+/// The tab indicator the overlay layer is asked to draw for `output` after a layout pass.
+fn indicator_of(engine: &mut TilingEngine, output: OutputId, first: isize) -> TabsSpec {
+    let sink = RecordingSink::new();
+    engine.install_decor_sink(sink.clone());
+    let work = engine.monitors.get(&output).unwrap().work_area;
+    let tile = Rect::new(work.loc.x + 100, work.loc.y + 100, 600, 400);
+    let positions: HashMap<WindowId, Rect> =
+        (first..first + 3).map(|n| (wid(n), tile)).collect();
+    let modes: HashMap<WindowId, DrawMode> = HashMap::new();
+    engine.refresh_decorations(output, &positions, &modes, work, false);
+    sink.of_output(output.as_u64())
+        .iter()
+        .find_map(|spec| match &spec.content {
+            DecorContent::Tabs(tabs) => Some(tabs.clone()),
+            _ => None,
+        })
+        .expect("the tabbed column has an indicator")
+}
+
+/// A layout whose tab indicator is 4 px wide, 5 px from the window, 10 px between its tabs
+/// and has 6 px corners, all logical pixels.
+fn tab_indicator_config() -> Config {
+    let mut config = fractional_config();
+    let tabs = &mut config.layout.effects.tab_indicator;
+    tabs.width = 4.0;
+    tabs.gap = 5.0;
+    tabs.gaps_between_tabs = 10.0;
+    tabs.corner_radius = 6.0;
+    config
+}
+
+#[test]
+fn parity_the_tab_indicator_is_projected_through_the_output_scale() {
+    // niri layout/tab_indicator.rs:100-105,164: the width, the gap and the gaps between the
+    // tabs are rounded to physical pixels, and the corner radius (logical there, in a shader
+    // that applies the scale) is physical here.
+    let table = [
+        // scale, width, gap, gaps between, corner radius
+        (1.0, 4, 5.0, 10.0, 6.0),
+        (1.25, 5, 6.0, 12.5, 7.5),
+        (1.5, 6, 8.0, 15.0, 9.0),
+        (2.0, 8, 10.0, 20.0, 12.0),
+    ];
+    for (scale, width, gap, gaps_between, corner_radius) in table {
+        let (mut engine, outputs) = engine_with(tab_indicator_config(), &[("tabs", scale)]);
+        let output = outputs[0];
+        add_tabbed_column(&mut engine, output, 201);
+        let spec = indicator_of(&mut engine, output, 201);
+        assert_eq!(spec.width, width, "width at scale {scale}");
+        assert_eq!(spec.gap, gap, "gap at scale {scale}");
+        assert_eq!(spec.gaps_between, gaps_between, "gaps between at scale {scale}");
+        assert_eq!(spec.corner_radius, corner_radius, "corner radius at scale {scale}");
+    }
+}
+
+#[test]
+fn parity_the_tab_reservation_is_projected_through_the_output_scale() {
+    // niri tab_indicator.rs:323-335 (`extra_size`): the width and the gap are rounded
+    // through the output scale, each on its own, and the reserved space is their sum.
+    for (scale, space) in [(1.0, 10), (1.5, 16), (2.0, 20)] {
+        let mut config = tab_indicator_config();
+        let style = &mut config.layout.effects.tab_indicator;
+        style.place_within_column = true;
+        style.position = crate::config::TabPosition::Top;
+        style.width = 7.0;
+        style.gap = 3.0;
+        let (mut engine, outputs) = engine_with(config, &[("tabs-room", scale)]);
+        let output = outputs[0];
+        add_tabbed_column(&mut engine, output, 211);
+        let cfg = engine.effective_config(output).clone();
+        let reserved = {
+            let workspace = engine.monitors.get(&output).unwrap().workspace().unwrap();
+            engine.vertical_tab_indicator_space(&workspace.columns[0], &cfg, 1.0)
+        };
+        assert_eq!(reserved, space, "the reserved pixels at scale {scale}");
+    }
+}
+
+#[test]
+fn parity_the_side_tab_reservation_moves_the_tile_by_the_projected_pixels() {
+    // The left/right reservation runs inside the layout pass, so check the pixels it takes
+    // out of the tile: the same layout with and without `place-within-column` differs by
+    // exactly the projected width and gap.
+    let loc_x = |scale: f64, place: bool| {
+        let mut config = tab_indicator_config();
+        let style = &mut config.layout.effects.tab_indicator;
+        style.place_within_column = place;
+        style.width = 7.0;
+        style.gap = 3.0;
+        let (mut engine, outputs) = engine_with(config, &[("tabs-side", scale)]);
+        let output = outputs[0];
+        add_tabbed_column(&mut engine, output, 221);
+        let cfg = engine.effective_config(output).clone();
+        let work = engine.monitors.get(&output).unwrap().work_area;
+        let workspace = engine.monitors.get(&output).unwrap().workspace().unwrap();
+        engine
+            .calculate_positions_in_section(workspace, work, 0, f64::from(work.size.h), &cfg)
+            .iter()
+            .find(|(window, _)| *window == wid(221))
+            .expect("the tab is laid out")
+            .1
+            .loc
+            .x
+    };
+    for (scale, space) in [(1.0, 10), (1.5, 16), (2.0, 20)] {
+        assert_eq!(
+            loc_x(scale, true) - loc_x(scale, false),
+            space,
+            "the reserved pixels at scale {scale}"
+        );
+    }
 }

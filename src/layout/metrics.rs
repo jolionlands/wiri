@@ -64,6 +64,22 @@ pub fn ring_width_px(logical: f64, scale: f64) -> i32 {
     (logical * valid_scale(scale)).max(1.0).round() as i32
 }
 
+/// A signed logical gap (the tab indicator's `gap`) in whole physical pixels.
+///
+/// niri projects it as `round_logical_in_physical_max1(scale, gap.abs()).copysign(gap)`
+/// (layout/tab_indicator.rs:104-105): zero keeps its sign, any other value is at least one
+/// physical pixel and rounded to the nearest, halves away from zero. A non-finite value is
+/// handed on unchanged, so the tab geometry still refuses to lay it out.
+pub fn signed_gap_px(logical: f64, scale: f64) -> f64 {
+    if logical == 0.0 || !logical.is_finite() {
+        return logical;
+    }
+    (logical.abs() * valid_scale(scale))
+        .max(1.0)
+        .round()
+        .copysign(logical)
+}
+
 /// The shadow geometry of one tile in physical pixels, as niri's `Shadow` derives it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PhysicalShadow {
@@ -166,6 +182,38 @@ pub fn spacing_work_rect(work_px: Rect, spacing: &PhysicalSpacing) -> PhysicalWo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// niri projects a tab indicator's `gap` with the sign kept and a one-pixel minimum
+    /// (layout/tab_indicator.rs:104-105).
+    #[test]
+    fn parity_signed_gap_projection_keeps_its_sign_and_one_pixel_minimum() {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for logical in [0.0, -0.0, 0.2, -0.2, 0.5, 1.0, 1.5, 2.5, -2.5, 5.0, 12.25] {
+                let px = signed_gap_px(logical, scale);
+                let reference = if logical == 0.0 {
+                    logical
+                } else {
+                    (logical.abs() * scale).max(1.0).round().copysign(logical)
+                };
+                assert_eq!(px, reference, "gap {logical} at scale {scale}");
+                assert_eq!(
+                    px.is_sign_negative(),
+                    logical.is_sign_negative(),
+                    "the sign survives: {logical} at scale {scale}"
+                );
+            }
+        }
+        // Hand-checked pins: halves go away from zero, a non-zero gap is a pixel at least.
+        assert_eq!(signed_gap_px(5.0, 2.0), 10.0);
+        assert_eq!(signed_gap_px(-0.2, 1.0), -1.0);
+        assert_eq!(signed_gap_px(-2.5, 1.5), -4.0);
+        assert_eq!(signed_gap_px(0.0, 2.0), 0.0);
+        assert!(signed_gap_px(-0.0, 2.0).is_sign_negative());
+        // A broken scale is 96 DPI; a non-finite gap is handed on so no geometry uses it.
+        assert_eq!(signed_gap_px(5.0, 0.0), 5.0);
+        assert!(signed_gap_px(f64::NAN, 2.0).is_nan());
+        assert_eq!(signed_gap_px(f64::INFINITY, 2.0), f64::INFINITY);
+    }
 
     #[test]
     fn parity_fractional_spacing_projection_preserves_units_and_minimum_gap() {

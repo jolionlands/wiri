@@ -190,6 +190,18 @@ fn tab_specs(
     if style.off {
         return Vec::new();
     }
+    // The tab indicator's width, gap, gaps-between and corner radius are logical config
+    // values, like the ring and the shadow: the spec holds the physical pixels of this
+    // output (niri layout/tab_indicator.rs:100-105,164 and 323-335 pass them through the
+    // output scale). `length` stays a proportion, which has no units to project.
+    let scale = cfg.output_scale();
+    let tab_width = crate::layout::metrics::ring_width_px(style.width, scale);
+    let tab_gap = crate::layout::metrics::signed_gap_px(style.gap, scale);
+    // niri's `round_logical_in_physical_max1` minimum for gaps-between is applied inside
+    // `TabsSpec::tab_rects`, so only the scale is projected here: at 100% the tab geometry
+    // is bit-identical to what it was.
+    let tab_gaps_between = style.gaps_between_tabs * scale;
+    let tab_corner_radius = (style.corner_radius * scale) as f32;
     workspace
         .columns
         .iter()
@@ -259,11 +271,11 @@ fn tab_specs(
                 TabsSpec {
                     area,
                     position: style.position,
-                    width: style.width.round() as i32,
-                    gap: style.gap,
-                    gaps_between: style.gaps_between_tabs,
+                    width: tab_width,
+                    gap: tab_gap,
+                    gaps_between: tab_gaps_between,
                     length: style.length,
-                    corner_radius: style.corner_radius as f32,
+                    corner_radius: tab_corner_radius,
                     tabs: paints,
                     windows: col.tiles.iter().map(|tile| tile.window_id).collect(),
                     view,
@@ -1039,6 +1051,7 @@ mod tests {
                 area,
                 &workspace.columns[0],
                 &cfg.effects.tab_indicator,
+                1.0,
                 1.0,
                 DrawMode::Inset,
             ),
