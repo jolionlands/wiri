@@ -233,7 +233,7 @@ fn rule_border_sizing_fixture(
     ws.columns.insert(0, sibling);
     let mut resolved = crate::window::ResolvedWindowRules::default();
     resolved.effects.border.off = off;
-    resolved.effects.border.width = width;
+    resolved.effects.border.width = width.map(f64::from);
     engine.rule_state.insert(
         WindowId::new(201),
         rules::RuleState {

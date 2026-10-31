@@ -211,7 +211,7 @@ window-rule {
         let result = crate::window::resolve_window_rules(&cfg.window_rules, &ctx);
         let fx = result.effects.apply_to(&cfg.layout.effects);
         assert!(!fx.border.off);
-        assert_eq!(fx.border.width, 11);
+        assert_eq!(fx.border.width, 11.0);
         assert_eq!(
             fx.border.inactive,
             crate::config::PaintStyle::color("#0000ff")

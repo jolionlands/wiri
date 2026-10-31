@@ -347,7 +347,7 @@ fn parity_tiled_height_fixed_preset_scales_client_before_physical_border() {
         let mut cfg = engine.active_workspace_config(output).clone();
         cfg.border_width = 4;
         cfg.effects.border.off = false;
-        cfg.effects.border.width = 4;
+        cfg.effects.border.width = 4.0;
         engine.update_config(cfg);
         engine.sync_monitor_with_scale(
             output,
@@ -1029,7 +1029,7 @@ fn parity_tiled_height_stacked_proportion_preset_resolves_against_the_whole_view
         cfg.window_gap = 10;
         cfg.border_width = 4;
         cfg.effects.border.off = false;
-        cfg.effects.border.width = 4;
+        cfg.effects.border.width = 4.0;
         engine.update_config(cfg);
         engine.sync_monitor_with_scale(
             output,

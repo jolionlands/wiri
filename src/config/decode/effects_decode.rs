@@ -244,10 +244,12 @@ impl Decoder {
             }
             "width" => {
                 // niri: `width: Option<FloatOrInt<0, 65535>>`
-                // (niri-config/src/appearance.rs:617-620).  Wiri paints whole pixels, so the
-                // value is stored rounded; the range is niri's.
+                // (niri-config/src/appearance.rs:617-620).  The value is a LOGICAL width and
+                // stays fractional here; niri rounds it to physical pixels per output
+                // (`round_logical_in_physical_max1`, layout/tile.rs:244,257), which wiri does
+                // in `layout::metrics::ring_width_px`.
                 if let Some(w) = self.arg_number(c, 0.0, 65535.0) {
-                    style.width = w.round() as u32;
+                    style.width = w;
                 }
             }
             "active-color" | "active-gradient" => {

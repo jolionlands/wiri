@@ -266,13 +266,13 @@ fn workspace_layout_folds_global_then_output_then_workspace() {
     config.layout.struts.left = crate::config::InsetValue::Physical(17);
     config.layout.strip_frame = true;
     config.layout.always_center_single_column = true;
-    config.layout.effects.focus_ring.width = 41;
+    config.layout.effects.focus_ring.width = 41.0;
     config.layout.effects.focus_ring.active = PaintStyle::color("#112233");
     let global_shadow = config.layout.effects.shadow.clone();
 
     let mut output_ring = RingStyle::focus_ring_default();
     output_ring.off = true;
-    output_ring.width = 19;
+    output_ring.width = 19.0;
     output_ring.active = PaintStyle::color("#445566");
     let mut output_layout = LayoutConfigPartial {
         column_width: Some(480),
@@ -286,7 +286,7 @@ fn workspace_layout_folds_global_then_output_then_workspace() {
 
     // A named nested block replaces the whole output block, not just its width.
     let mut workspace_ring = RingStyle::focus_ring_default();
-    workspace_ring.width = 7;
+    workspace_ring.width = 7.0;
     let mut workspace_layout = LayoutConfigPartial {
         column_width: Some(720),
         always_center_single_column: Some(false),
@@ -1449,7 +1449,7 @@ fn parity_fractional_spacing_stacked_border_insets_carry_each_window_request() {
     let (mut engine, output, workspace) = fractional_constrained_window_fixture(&[plain, bordered]);
     let mut resolved = crate::window::ResolvedWindowRules::default();
     resolved.effects.border.off = Some(false);
-    resolved.effects.border.width = Some(2);
+    resolved.effects.border.width = Some(2.0);
     engine.rule_state.insert(
         bordered,
         rules::RuleState {

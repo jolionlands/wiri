@@ -794,13 +794,13 @@ impl LayoutConfigPartial {
         // The older flat spellings of the widths count when no block named them.
         if self.effects.border.is_none() {
             if let Some(v) = self.border_width {
-                out.effects.border.width = v;
+                out.effects.border.width = f64::from(v);
                 out.effects.border.off = v == 0;
             }
         }
         if self.effects.focus_ring.is_none() {
             if let Some(v) = self.focus_ring_width {
-                out.effects.focus_ring.width = v;
+                out.effects.focus_ring.width = f64::from(v);
                 out.effects.focus_ring.off = v == 0;
             }
         }

@@ -240,6 +240,17 @@ fn norm(name: &str) -> String {
     name.replace('_', "-").to_ascii_lowercase()
 }
 
+/// The older flat `border-width` / `focus-ring-width` integers mirror a block's LOGICAL width:
+/// a non-zero width is at least one pixel, as in niri's `round_logical_in_physical_max1`
+/// (utils/mod.rs:185-191) at scale 1.  The block's own width stays fractional.
+fn legacy_width_px(width: f64) -> u32 {
+    if width > 0.0 {
+        width.round().max(1.0) as u32
+    } else {
+        0
+    }
+}
+
 /// The `border` block being built by a `layout {}` (started from its defaults when nothing
 /// named it yet).
 fn border_style(p: &mut LayoutConfigPartial) -> &mut RingStyle {
@@ -2288,7 +2299,7 @@ impl Decoder {
                     self.set_u32(child, 4096, &mut p.border_width);
                     if let Some(w) = p.border_width {
                         let b = border_style(p);
-                        b.width = w;
+                        b.width = f64::from(w);
                         b.off = w == 0;
                     }
                 }
@@ -2321,7 +2332,7 @@ impl Decoder {
                     self.set_u32(child, 4096, &mut p.focus_ring_width);
                     if let Some(w) = p.focus_ring_width {
                         let r = focus_ring_style(p);
-                        r.width = w;
+                        r.width = f64::from(w);
                         r.off = w == 0;
                     }
                 }
@@ -2527,7 +2538,7 @@ impl Decoder {
                 // The older flat fields follow the block (the engine's DWM border colours and
                 // the per-output overrides read them).
                 match norm(&c.name).as_str() {
-                    "width" => p.border_width = Some(style.width),
+                    "width" => p.border_width = Some(legacy_width_px(style.width)),
                     "off" | "on" => {
                         if style.off {
                             p.border_width = Some(0);
@@ -2592,7 +2603,7 @@ impl Decoder {
         for c in node.kids() {
             if self.ring_key(c, &mut style, false) {
                 match norm(&c.name).as_str() {
-                    "width" => p.focus_ring_width = Some(style.width),
+                    "width" => p.focus_ring_width = Some(legacy_width_px(style.width)),
                     "off" | "on" => {
                         if style.off {
                             p.focus_ring_width = Some(0);
