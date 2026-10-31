@@ -744,15 +744,17 @@ What the table does and does not say:
    `System tray icon added on the session UI thread`.
 2. **The ≤8 settled budget is not met.** Of the 12 threads at rest, seven are wiri's own (main,
    two `wiri-rt` workers, `wiri-ui`, `wiri-winevent-hook`, `wiri-mouse-hook`,
-   `wiri-config-reload`). The other five are created outside wiri's source — the `notify` crate's
-   directory-change backend and whatever the Win32/WinRT layers start — and this host could not
-   attribute them per thread: `GetThreadDescription` returned `0x10000000` for every thread,
-   including the ones wiri names (`scripts/perf/thread-name-check.ps1` shows the two calls on a
-   thread the same process just named). The next step that would fit the budget is the one the
-   budget table already names, **shared watcher delivery**: replace `notify` with one
-   `ReadDirectoryChangesW` wait on the existing `wiri-config-reload` thread (no new thread, no
-   poll), which removes the crate's backend thread(s) and makes the reload thread's own
-   `WM`-equivalent wait explicit.
+   `wiri-config-reload`). The other five could not be attributed per thread on this host:
+   `GetThreadDescription` returned `0x10000000` for every thread, including the ones wiri names
+   (`scripts/perf/thread-name-check.ps1` shows both calls failing on a thread the same process
+   just named). The candidates are the `notify` crate's directory-change backend, the lazily
+   started workspace-indicator overlay and threads the Win32/WinRT layers start; this record does
+   not claim which. The next step that would fit the budget is the one the budget table already
+   names, **shared watcher delivery**: replace `notify` with one `ReadDirectoryChangesW` wait on
+   the existing `wiri-config-reload` thread (no new thread, no poll), which removes the crate's
+   backend thread(s) and makes the reload thread's wait explicit. That change was not made here:
+   config reload is covered by the `h91_*` live gates and a half-tested native watcher is worse
+   than a measured gap.
 3. **Memory did not regress and did not improve measurably.** At rest the medians are 7.52 vs
    7.90 MiB private and 23.18 vs 23.33 MiB working set — inside each other's spread on a machine
    with other tenants. The after-actions endpoints differ in both directions between runs
