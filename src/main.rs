@@ -1538,17 +1538,8 @@ fn handle_backend_event(
             let (live, location) =
                 eng.observe_native_foreground(hwnd, owner, stamp, is_current, handle);
             if live {
-                ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
-                if let Some((col_idx, ws_id)) = location {
-                    let number = match managed.and_then(|w| eng.locate_window(w)) {
-                        Some((oid, _, _)) => eng.workspace_number_on(oid, ws_id),
-                        None => wiri::layout::workspace_number(ws_id),
-                    };
-                    ipc_server.broadcast_event(IpcEvent::ColumnFocused {
-                        window_hwnd: hwnd,
-                        column_index: col_idx,
-                        workspace_id: number,
-                    });
+                for event in eng.live_focus_events(hwnd, managed, location) {
+                    ipc_server.broadcast_event(event);
                 }
             }
         }

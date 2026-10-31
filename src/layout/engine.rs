@@ -775,6 +775,14 @@ pub struct TilingEngine {
     /// or floating).  Floating windows are not in the focus ring, so this is how
     /// `toggle_floating` finds the floating window the user is looking at.
     os_foreground: Option<WindowId>,
+    /// The live-focus broadcast `converge_live_focus` queued for the IPC server (one slot:
+    /// a newer convergence replaces an undelivered older one; the stream's state diff
+    /// already tells subscribers the latest focus).
+    live_focus_notice: parking_lot::Mutex<Option<foreground_runtime::LiveFocusNotice>>,
+    /// The window whose live-focus broadcast `converge_live_focus` made, so the native
+    /// notice that may still follow for the same window is not broadcast a second time.
+    /// Cleared by any other live focus change.
+    converged_broadcast: Option<WindowId>,
     /// IPC focus history uses a monotonic daemon-local clock, never wall time.
     focus_timestamps: HashMap<WindowId, std::time::Duration>,
     focus_epoch: std::time::Instant,
@@ -929,6 +937,8 @@ impl TilingEngine {
             failed_position: HashMap::new(),
             last_activated: None,
             os_foreground: None,
+            live_focus_notice: parking_lot::Mutex::new(None),
+            converged_broadcast: None,
             focus_timestamps: HashMap::new(),
             focus_epoch: std::time::Instant::now(),
             last_focus_stamp: std::time::Duration::ZERO,
@@ -3634,12 +3644,16 @@ impl TilingEngine {
     fn activate_now(&mut self, wid: WindowId, backend: &BackendHandle) {
         self.remember_action_focus(wid);
         self.last_activated = Some(wid);
-        if let Err(e) = backend.activate_window(wid.as_isize()) {
-            tracing::warn!(
+        match backend.activate_window(wid.as_isize()) {
+            // Windows does not always raise EVENT_SYSTEM_FOREGROUND for a request it
+            // accepted (or that was already satisfied): the live focus follows the
+            // native query instead of waiting for a notice that may never come.
+            Ok(()) => self.converge_live_focus(wid, backend),
+            Err(e) => tracing::warn!(
                 "Could not bring {} to the foreground: {} (not retrying until focus moves)",
                 wid,
                 e
-            );
+            ),
         }
     }
 

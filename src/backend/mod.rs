@@ -57,6 +57,83 @@ pub(crate) mod activation_attempt_test_support {
 
     thread_local! {
         static ATTEMPTS: RefCell<Option<Vec<isize>>> = const { RefCell::new(None) };
+        static NATIVE: RefCell<Option<NativeSim>> = const { RefCell::new(None) };
+    }
+
+    /// What a simulated native foreground does with an activation request that is not
+    /// already satisfied (a request for the window that already is foreground never
+    /// reaches this: the real `activate_window_native` returns at its first check).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Activation {
+        /// Windows refuses (the foreground lock): the foreground does not change.
+        Refuse,
+        /// Windows accepts and the foreground changes, but never raises
+        /// EVENT_SYSTEM_FOREGROUND (the aa6c884 h15 evidence).
+        SwitchWithoutNotice,
+        /// Windows accepts the request but the foreground has not changed yet.
+        AcceptDeferred,
+    }
+
+    struct NativeSim {
+        foreground: isize,
+        activation: Activation,
+        attempts: Vec<isize>,
+    }
+
+    /// Run `run` against a simulated native foreground window. Returns the activation
+    /// attempts the backend made (never one for the window that already was foreground).
+    pub(crate) fn with_native_foreground<T>(
+        foreground: isize,
+        activation: Activation,
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<isize>) {
+        struct Restore(Option<NativeSim>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                NATIVE.with(|sim| *sim.borrow_mut() = self.0.take());
+            }
+        }
+
+        let _restore = Restore(NATIVE.with(|sim| {
+            sim.replace(Some(NativeSim {
+                foreground,
+                activation,
+                attempts: Vec::new(),
+            }))
+        }));
+        let result = run();
+        let attempts = NATIVE.with(|sim| {
+            sim.borrow_mut()
+                .as_mut()
+                .map(|sim| std::mem::take(&mut sim.attempts))
+                .unwrap_or_default()
+        });
+        (result, attempts)
+    }
+
+    /// The simulated foreground window, when a simulation is installed.
+    pub(super) fn native_foreground() -> Option<isize> {
+        NATIVE.with(|sim| sim.borrow().as_ref().map(|sim| sim.foreground))
+    }
+
+    /// The simulation's answer to an activation request, or None without a simulation.
+    pub(super) fn native_activation(hwnd: isize) -> Option<bool> {
+        NATIVE.with(|sim| {
+            let mut sim = sim.borrow_mut();
+            let sim = sim.as_mut()?;
+            if sim.foreground == hwnd {
+                return Some(true);
+            }
+            sim.attempts.push(hwnd);
+            match sim.activation {
+                Activation::Refuse => Some(false),
+                Activation::SwitchWithoutNotice => {
+                    sim.foreground = hwnd;
+                    Some(true)
+                }
+                Activation::AcceptDeferred => Some(true),
+            }
+        })
     }
 
     /// Observe real backend activation dispatch without activating fabricated HWNDs.
@@ -1049,7 +1126,31 @@ impl BackendHandle {
         activation_with_completion(hwnd, || self.activate_window_native(hwnd))
     }
 
+    /// The native foreground window right now (0 for none): a fresh `GetForegroundWindow`
+    /// query, never a remembered notice. Tests see the simulated foreground, or none.
+    #[cfg(not(test))]
+    pub fn foreground_window(&self) -> isize {
+        // SAFETY: GetForegroundWindow takes no arguments; the handle is only compared.
+        unsafe { GetForegroundWindow().0 as isize }
+    }
+
+    #[cfg(test)]
+    pub fn foreground_window(&self) -> isize {
+        activation_attempt_test_support::native_foreground().unwrap_or(0)
+    }
+
     fn activate_window_native(&self, hwnd: isize) -> Result<()> {
+        #[cfg(test)]
+        if let Some(accepted) = activation_attempt_test_support::native_activation(hwnd) {
+            return if accepted {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "injected foreground refusal for hwnd={}",
+                    hwnd
+                ))
+            };
+        }
         #[cfg(test)]
         if activation_attempt_test_support::record_refusal(hwnd) {
             return Err(anyhow::anyhow!(

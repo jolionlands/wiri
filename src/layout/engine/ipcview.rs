@@ -38,6 +38,11 @@ impl TilingEngine {
     /// Duplicate foreground reports do not reorder MRU history. Unmanaged windows
     /// still break a focus interval, but never acquire managed-window history.
     pub(super) fn record_ipc_foreground(&mut self, window: WindowId) {
+        if self.os_foreground != Some(window) {
+            // Any other live focus change ends the converged window's claim that its
+            // broadcast was already made.
+            self.converged_broadcast = None;
+        }
         if self.os_foreground != Some(window) && self.tiled_windows.contains_key(&window) {
             let stamp = self.focus_epoch.elapsed().max(
                 self.last_focus_stamp
