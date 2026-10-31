@@ -31,6 +31,13 @@ namespace LaneE {
         public long Switches;
         public double CpuMs;
     }
+    // Information only: one row per OS thread description at rest, e.g. "wiri-ui" x1.
+    public sealed class ThreadGroup {
+        public string Name;
+        public int Count;
+        public List<long> Ids = new List<long>();
+        public override string ToString() { return Name + " x" + Count; }
+    }
     public sealed class IdleResult {
         public double Seconds, CpuMs, OneCorePercent, SwitchesPerSecond;
         public int NewThreads, ExitedThreads;
@@ -174,6 +181,43 @@ namespace LaneE {
                     throw new InvalidOperationException("Target process is absent from system snapshot");
                 } finally { Marshal.FreeHGlobal(data); }
             }
+        }
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern int GetThreadDescription(IntPtr thread, out IntPtr description);
+        [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+        const uint THREAD_QUERY_LIMITED_INFORMATION = 0x0800;
+        // The description SetThreadDescription stores; unnamed threads answer "".
+        public static string DescribeThread(long tid) {
+            IntPtr thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, (uint)tid);
+            if (thread == IntPtr.Zero) return "";
+            try {
+                IntPtr text;
+                if (GetThreadDescription(thread, out text) != 0 || text == IntPtr.Zero) return "";
+                try { return Marshal.PtrToStringUni(text) ?? ""; }
+                finally { LocalFree(text); }
+            } finally { CloseHandle(thread); }
+        }
+        // Thread count by description, one entry per distinct description, largest first.
+        public static List<ThreadGroup> ThreadDescriptions(int pid) {
+            var groups = new List<ThreadGroup>();
+            var byName = new Dictionary<string, ThreadGroup>();
+            foreach (ThreadCount t in ReadThreads(pid).Threads) {
+                string name = DescribeThread(t.Id);
+                ThreadGroup group;
+                if (!byName.TryGetValue(name, out group)) {
+                    group = new ThreadGroup { Name = name };
+                    byName.Add(name, group);
+                    groups.Add(group);
+                }
+                group.Count++;
+                group.Ids.Add(t.Id);
+            }
+            groups.Sort(delegate(ThreadGroup a, ThreadGroup b) {
+                int byCount = b.Count.CompareTo(a.Count);
+                return byCount != 0 ? byCount : String.CompareOrdinal(a.Name, b.Name);
+            });
+            return groups;
         }
         static uint InputTick() {
             var li = new LastInput { Size = (uint)Marshal.SizeOf(typeof(LastInput)) };

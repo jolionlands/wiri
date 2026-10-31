@@ -613,3 +613,69 @@ correctness, validating budgets with less noisy repeated normal runs, a finer ex
 latency observer, checking normal non-verbose mode, and measuring ARM64. Separately,
 investigate the H9 terminal visible-frame overlap without weakening its recorded result.
 No stress/soak testing is proposed.
+
+## Thread and memory budget work, 2026-10-31 (Lane PERF)
+
+This section is the source-backed inventory the "Proposed Phase 4 budgets" table asked for, the
+changes that shrink it, and the before/after measurement of exactly those changes. Every thread
+below is named with `SetThreadDescription` when it starts (Rust's `std::thread::Builder::name`
+and Tokio's `thread_name` both do that), so a collector can attribute each one by description
+instead of by guesswork. Only the `notify` crate's own watcher thread is out of our naming reach.
+
+### Inventory: every thread wiri creates
+
+| Wall-clock point | Description | Owner (source) | Count | Lifetime |
+| --- | --- | --- | ---: | --- |
+| process start | `wiri.exe` (the unnamed main thread) | `main.rs::main` | 1 | process |
+| process start | `wiri-rt` | Tokio workers, `runtime.rs::build` (`WORKER_THREADS = 2`) | 2 | process |
+| on demand | `wiri-rt` | Tokio blocking pool, `MAX_BLOCKING_THREADS = 4`; created per `spawn_blocking` task, exits after `BLOCKING_KEEP_ALIVE` idle | 0..4 | transient |
+| process start | `wiri-ui` | `backend/message_loop.rs::run_message_loop`: hotkey window (`WiriHotkeyWnd`), `WH_KEYBOARD_LL`, the compositor and decoration windows and the tray icon pump here | 1 | process |
+| process start | `wiri-winevent-hook` | `backend/hooks.rs::WinEventHook` — `SetWinEventHook(WINEVENT_OUTOFCONTEXT)` needs its own pumping thread | 1 | process |
+| process start | `wiri-mouse-hook` | `input/low_level_hook.rs::start_mouse_hook` — `WH_MOUSE_LL` plus the one-shot cursor-hide timer | 1 | process |
+| process start | `wiri-config-reload` | `config/loader.rs::spawn_reload_handler` | 1 | process |
+| process start | *(unnamed, third party)* | the `notify` crate's `ReadDirectoryChangesW` watcher thread | 1 | process |
+| process start (default config) | — | nothing else: the four overlays below are all lazy | 0 | — |
+| first announcement | `wiri-a11y` | `a11y.rs::Provider::start` — the UIA provider window; created by the first `announce` | 0..1 | process |
+| first `overview-toggle` | `wiri-overview-banner` | `overlay/overview_banner.rs::ensure_thread` (was eager at startup) | 0..1 | process |
+| first workspace change | `wiri-ws-indicator` | `overlay/workspace_indicator.rs::ensure_thread` | 0..1 | process |
+| `show-key-bindings` / `hotkey-overlay` | `wiri-hotkeys` | `overlay/bindings_cheatsheet.rs` | 0..1 | sheet |
+| `status-bar true` | `wiri-status-bar` | `overlay/status_bar.rs::spawn` | 0..1 | process |
+| first snap-guide show | `wiri-snap-guide` | `input/snap_guide.rs::spawn` | 0..1 | process |
+| first `overview-select`/thumbnail use | `wiri-overview-host` | `overlay/thumbnail_overview.rs` | 0..1 | overview |
+| first window close fade | `wiri-recent-preview`, `wiri-recent-debounce` | `overlay/recent_windows*.rs` | 0..2 | fade |
+| first screenshot | `wiri-screenshot-ui` | `overlay/screenshot_ui.rs` | 0..1 | capture |
+| `quit skip-confirmation=false` | `wiri-quit-confirmation` | `input/system_actions.rs` | 0..1 | dialog |
+| a power action | `wiri-power-action` | `input/system_actions.rs` | 0..1 | request |
+| any animation burst | *(the Tokio blocking threads above)* | `animation/clock.rs` occupies one with `DCompositionWaitForCompositorClock`; it is released when the last timeline ends | 0..1 | transient |
+
+The hooks (`WH_MOUSE_LL`, `WH_KEYBOARD_LL`, the WinEvent hooks) are on threads that pump
+messages, as Win32 requires, and none of them is shared with a thread that can block on a
+modal operation: the tray context menu is the only modal call in the process and it now runs on
+`wiri-ui`, so an open menu delays hotkey delivery, exactly as it would in any other Win32
+application that shows a menu on its own UI thread.
+
+### What changed
+
+1. **One session UI thread.** `wiri-ui` now hosts the tray icon as well as the hotkey window,
+   the keyboard hook and the overlay windows. `hooks/tray.rs::create_icon` is called on that
+   pump (posted to it with `WM_TRAY_HOST`, answered through a `SyncSender`, 5 s bound) instead
+   of starting a second Win32 message loop; when the pump is not running yet the old dedicated
+   `wiri-tray` thread is used, so the icon can never be lost. This is the thread the task called
+   "one UI thread for overlays/tray/hotkeys". One thread fewer at rest.
+2. **Lazy overview banner.** The overview banner used to create its window and pump thread at
+   startup although only `overview-toggle` ever shows it. `OverviewBanner::ensure_thread` starts
+   it on the first `show`/`hide` (posting one `WM_BANNER_UPDATE` at creation so a `show` that
+   raced the thread is not lost). No timer, no poll. One thread fewer at rest.
+3. **Shorter blocking-pool keep-alive.** `runtime::BLOCKING_KEEP_ALIVE` fell from 2 s to 250 ms,
+   so an IPC burst (one blocking task per request) no longer leaves pool threads behind for
+   seconds after the last reply. A request that finds no idle thread starts one, which costs a
+   fraction of a millisecond.
+4. **Every remaining thread is named**, including the previously unnamed hotkey pump and the
+   status bar / snap guide / overview banner pumps, so `p_rest_threads_by_*` can attribute them.
+
+Not changed, deliberately: the WinEvent hook, the low-level mouse hook and the hotkey pump stay
+on three separate threads. Merging any two of them would put a blocking native call (a hook
+callback that can wait on a hung window, or a modal tray menu) in front of the input path that
+the "Hotkey movement" budget measures; the budget itself says "preserve independent LL hook
+responsiveness".
+

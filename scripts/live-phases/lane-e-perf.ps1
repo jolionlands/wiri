@@ -9,6 +9,7 @@ function Invoke-LaneEPerf {
         'cold_start_call_ms', 'cold_observer_start_max_ms', 'existing_sentinel_windows', 'managed_windows',
         'idle_seconds', 'idle_cpu_ms', 'idle_one_core_percent', 'idle_context_switches_per_s',
         'idle_input_changed', 'idle_new_threads', 'idle_exited_threads', 'idle_positioning_lines',
+        'rest_threads_total', 'rest_threads_named', 'rest_threads_unnamed',
         'hotkey_samples', 'hotkey_timeouts', 'hotkey_invalid_samples', 'hotkey_move_median_ms',
         'hotkey_move_max_ms', 'hotkey_observer_gap_max_ms',
         'maximize_setwindowpos_lines_median', 'maximize_setwindowpos_lines_max',
@@ -151,6 +152,22 @@ function Invoke-LaneEPerf {
         if ($cold.LayoutError) { $errors.Add($cold.LayoutError) }
         Start-Sleep -Seconds 5 # allow startup indicator / initial location events to settle
         $evidence.startup_resources = PResources 'startup'
+        # Information only: which threads the daemon owns once startup has settled, grouped by
+        # the description SetThreadDescription gives them. One numeric key per description plus
+        # the totals; the rows themselves stay text in measurement.json.
+        $restGroups = @([LaneE.Native]::ThreadDescriptions($owned.Id))
+        $evidence.rest_threads = @($restGroups | ForEach-Object {
+            [pscustomobject]@{ description = $_.Name; count = $_.Count; tids = @($_.Ids) }
+        })
+        PValue 'rest_threads_total' ([int](($restGroups | Measure-Object Count -Sum).Sum))
+        PValue 'rest_threads_named' ([int](($restGroups | Where-Object { $_.Name -ne '' } | Measure-Object Count -Sum).Sum))
+        PValue 'rest_threads_unnamed' ([int](($restGroups | Where-Object { $_.Name -eq '' } | Measure-Object Count -Sum).Sum))
+        foreach ($group in $restGroups) {
+            $key = 'rest_threads_by_' + (($group.Name.ToLowerInvariant() -replace '[^a-z0-9]+', '_').Trim('_'))
+            if ($key -eq 'rest_threads_by_') { $key = 'rest_threads_by_unnamed' }
+            if ($key.Length -gt 60) { $key = $key.Substring(0, 60) }
+            PValue $key ([int]$group.Count)
+        }
         $state = PRequest '{"type":"get_state"}'
         $state | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $perfDir 'startup-state.json')
         $windowReply = PRequest '{"type":"window_list"}'
