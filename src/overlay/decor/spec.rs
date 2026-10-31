@@ -167,17 +167,21 @@ pub struct TabsSpec {
     /// The column's tile area: the indicator sits beside it.
     pub area: Rect,
     pub position: TabPosition,
-    /// Thickness of the indicator.
+    /// Thickness of the indicator, in physical pixels: the logical width through the output
+    /// scale (niri layout/tab_indicator.rs:100,323).
     pub width: i32,
-    /// Raw gap to the area; its sign (including negative zero) survives the one-pixel minimum.
-    /// Negative gaps put the indicator over the window.
+    /// The gap to the area in physical pixels (niri tab_indicator.rs:104-105); its sign
+    /// (including negative zero) survives the one-pixel minimum applied here. Negative gaps
+    /// put the indicator over the window.
     pub gap: f64,
-    /// Raw configured gap: even a positive value that rounds to zero keeps independent caps.
+    /// The gap between tabs in physical pixels: even a positive value that rounds to zero
+    /// keeps independent caps.
     pub gaps_between: f64,
     /// Requested total proportion, clamped to 0..=2 before pixel rounding. Keep the config's
     /// f64 precision; a cast before clamping can overflow or change a half-pixel decision.
     /// Each tab and the indicator's thickness are at least one pixel, even at zero length/width.
     pub length: f64,
+    /// The corner radius in physical pixels: niri's logical radius through the output scale.
     pub corner_radius: f32,
     /// One paint per tab, already dimmed for the tabs that are not active.
     pub tabs: Vec<Paint>,
@@ -200,10 +204,11 @@ impl TabHitRegion {
 }
 
 impl TabsSpec {
-    /// Where each tab is, in screen pixels (niri's scale=1, progress=1 layout). Equal tab
-    /// lengths are computed with at least a one-pixel gap, then the final gaps are rounded
-    /// without that minimum. Rounding left over goes to the first tabs, and the resulting
-    /// whole indicator is centred along the side of the area.
+    /// Where each tab is, in screen pixels (niri's progress=1 layout; the indicator fields
+    /// are already the physical pixels of the output). Equal tab lengths are computed with at
+    /// least a one-pixel gap, then the final gaps are rounded without that minimum. Rounding
+    /// left over goes to the first tabs, and the resulting whole indicator is centred along
+    /// the side of the area.
     pub fn tab_rects(&self) -> Vec<Rect> {
         let n = self.tabs.len();
         if n == 0

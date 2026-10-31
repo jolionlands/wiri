@@ -95,6 +95,10 @@ New-Item -ItemType Directory -Force $testRoaming, $testLocal | Out-Null
 $wiri = Join-Path $Bin 'wiri.exe'
 $ctl = Join-Path $Bin 'wiri-ctl.exe'
 $steps = New-Object System.Collections.Generic.List[object]
+# Lane files are dot-sourced into this scope: a lane that reused the name `$steps` for its own samples
+# replaced this list with a fixed-size array, and every later Ctl call threw. Read-only keeps .Add()
+# working but turns such a reassignment into an error inside that lane's own try/catch.
+Set-Variable -Name steps -Option ReadOnly
 $log1 = Join-Path $D 'wiri.stderr.log'
 $log2 = Join-Path $D 'wiri.stderr2.log'
 
@@ -416,6 +420,52 @@ public static class TestForms {
     }
   }
 }
+
+// Run-wide foreground log: every EVENT_SYSTEM_FOREGROUND with time, window, process id and title, so a
+// failed focus gate can be told apart from another program taking the foreground during the run.
+public static class FgLog {
+  delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+  [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr h; public uint m; public IntPtr w; public IntPtr l; public uint t; public int x; public int y; }
+  [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc proc, uint pid, uint tid, uint flags);
+  [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr h);
+  [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr h, uint min, uint max);
+  [DllImport("user32.dll")] static extern bool PostThreadMessage(uint tid, uint msg, IntPtr w, IntPtr l);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  static readonly List<string> events = new List<string>();
+  static WinEventProc keep;
+  static System.Threading.Thread thread;
+  static uint threadId;
+  public static void Start() {
+    if (thread != null) return;
+    var ready = new System.Threading.ManualResetEvent(false);
+    thread = new System.Threading.Thread(() => {
+      threadId = GetCurrentThreadId();
+      keep = (hook, ev, hwnd, idObject, idChild, tid, time) => {
+        uint pid; GetWindowThreadProcessId(hwnd, out pid);
+        var title = new StringBuilder(160); GetWindowText(hwnd, title, 160);
+        lock (events) { events.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "\t" + hwnd.ToInt64() + "\t" + pid + "\t" + title.ToString()); }
+      };
+      IntPtr hk = SetWinEventHook(3, 3, IntPtr.Zero, keep, 0, 0, 0);   // EVENT_SYSTEM_FOREGROUND, out of context
+      ready.Set();
+      MSG m;
+      while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
+      if (hk != IntPtr.Zero) UnhookWinEvent(hk);
+    });
+    thread.IsBackground = true;
+    thread.Start();
+    ready.WaitOne(2000);
+  }
+  public static string[] Stop() {
+    if (thread != null) {
+      PostThreadMessage(threadId, 0x0012, IntPtr.Zero, IntPtr.Zero);   // WM_QUIT
+      thread.Join(2000);
+      thread = null;
+    }
+    lock (events) { return events.ToArray(); }
+  }
+}
 '@
 
 function Shot([string]$name) {
@@ -504,6 +554,34 @@ function OnScreen($h) {
 function OnScreenCount($hwnds) { @($hwnds | Where-Object { [LT]::IsWindow($_) -and [LT]::IsWindowVisible($_) -and -not [LT]::IsIconic($_) -and (OnScreen $_) }).Count }
 function NewTopLevel($before) { @([LT]::TopLevel() | Where-Object { $before -notcontains $_ }) }
 
+# Terminal windows (Windows Terminal or a classic console) that appeared since $snapshot: ask each to
+# close, stop the given shells by PID if they still run, then retry the close until the window is gone
+# (a killed shell leaves its Windows Terminal window open on an "[process exited]" tab, and a close that
+# arrives while the tab is still tearing down is ignored). Returns how many windows it found.
+$terminalShellsStopped = 0
+$terminalWindowsLeftOpen = 0
+# Every terminal window a check of this run created and closed; the end of the run retries only these.
+$runTerminalWindows = New-Object System.Collections.Generic.List[long]
+function CloseNewTerminalWindows($snapshot, [int[]]$shellIds) {
+    $wins = @(NewTopLevel $snapshot | Where-Object { [LT]::IsWindow($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') })
+    foreach ($h in $wins) { [void]$script:runTerminalWindows.Add([long]$h); [LT]::Close($h) }
+    if ($wins.Count) { Start-Sleep -Milliseconds 500 }
+    foreach ($id in @($shellIds)) {
+        if (Get-Process -Id $id -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+            $script:terminalShellsStopped++
+        }
+    }
+    foreach ($h in $wins) {
+        for ($i = 0; $i -lt 15 -and [LT]::IsWindow($h); $i++) {
+            Start-Sleep -Milliseconds 200
+            [LT]::Close($h)
+        }
+        if ([LT]::IsWindow($h)) { $script:terminalWindowsLeftOpen++ }
+    }
+    return $wins.Count
+}
+
 # Wait at least $minMs, and until $h is the foreground window or $maxMs have passed; true when it is.
 function WaitForeground($h, [int]$minMs, [int]$maxMs) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -575,6 +653,8 @@ $ctlBytes = [IO.File]::ReadAllBytes($ctl)
 $ctlSubsystem = [BitConverter]::ToUInt16($ctlBytes, [BitConverter]::ToInt32($ctlBytes, 0x3C) + 24 + 68)
 
 $topBefore = [LT]::TopLevel()
+$topAtStart = $topBefore   # the end of the run reports terminal windows that appeared after this snapshot
+[FgLog]::Start()
 $w = Start-Wiri $log1 (Join-Path $D 'wiri.stdout.log')
 Start-Sleep -Seconds 4
 $steps.Add([pscustomobject]@{ step = 'start'; args = "pid $($w.Id)"; rc = $(if ($w.HasExited) { $w.ExitCode } else { 'running' }); bytes = 0 })
@@ -629,7 +709,9 @@ $termWindows = @(NewTopLevel $topB | Where-Object { [LT]::IsWindowVisible($_) -a
 $termInfo = FormInfo $termWindows
 $termInfo | ConvertTo-Json | Set-Content (Join-Path $D '02b-terminals.json')
 Shot '02b-terminals'
-foreach ($c in $cons) { if (-not $c.HasExited) { Stop-Process -Id $c.Id -Force } }
+# Close the consoles' Windows Terminal windows first: a killed cmd.exe leaves its window open on an
+# "[process exited with code 4294967295]" tab for the rest of the run.
+$null = CloseNewTerminalWindows $topB @($cons | ForEach-Object { $_.Id })
 Start-Sleep -Seconds 2
 # The terminals are gone: the three windows must be back on screen (the strip re-fits itself).
 $formsOnScreenAfterTerminals = OnScreenCount $forms
@@ -885,25 +967,16 @@ function TerminalShells {
         Where-Object { ($hosts -contains [int]$_.ParentProcessId) -and ($_.Name -in 'powershell.exe', 'pwsh.exe', 'cmd.exe') } |
         ForEach-Object { [int]$_.ProcessId })
 }
-$terminalShellsStopped = 0
-$terminalWindowsLeftOpen = 0
-function CloseSpawnedTerminal($window, $shellsBefore) {
+# Windows Terminal hosts every window in one process, so the window a spawn check found first is not
+# always the one that got the new shell: close every terminal window that appeared since the check's
+# snapshot, not just that one.
+function CloseSpawnedTerminal($topSnapshot, $shellsBefore) {
     $new = @()
     for ($i = 0; $i -lt 12 -and -not $new.Count; $i++) {
         $new = @(TerminalShells | Where-Object { $shellsBefore -notcontains $_ })
         if (-not $new.Count) { Start-Sleep -Milliseconds 250 }
     }
-    foreach ($id in $new) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
-    # A killed shell leaves its Windows Terminal window open on an "[process exited]" tab, and a
-    # close that arrives while the tab is still tearing down is ignored: retry until it is gone.
-    if ($window) {
-        for ($i = 0; $i -lt 15 -and [LT]::IsWindow($window); $i++) {
-            Start-Sleep -Milliseconds 200
-            [LT]::Close($window)
-        }
-        if ([LT]::IsWindow($window)) { $script:terminalWindowsLeftOpen++ }
-    }
-    $script:terminalShellsStopped += $new.Count
+    $null = CloseNewTerminalWindows $topSnapshot $new
 }
 
 # The built-in Mod+Enter (no spawn bind in this config) starts Windows Terminal: press it for real.
@@ -917,7 +990,7 @@ for ($i = 0; $i -lt 40 -and -not $defaultTerm; $i++) {
 }
 $spawnDefaultTerminal = [bool]$defaultTerm
 Shot '13-default-terminal'
-CloseSpawnedTerminal $defaultTerm $shellsBefore
+CloseSpawnedTerminal $topBefore $shellsBefore
 Start-Sleep -Seconds 2
 
 $h2Config = @"
@@ -963,7 +1036,7 @@ if ($env:WIRI_LIVE_CI -ne '1' -or (Get-Command wt.exe -ErrorAction SilentlyConti
     }
     $spawnWtWindow = [bool]$wtWin
     Shot '13-spawn-wt'
-    CloseSpawnedTerminal $wtWin $shellsBefore
+    CloseSpawnedTerminal $topBefore $shellsBefore
     Start-Sleep -Seconds 2
 }
 $w = $w4
@@ -1039,6 +1112,8 @@ Chord 'ctrl+alt+f'; Start-Sleep -Milliseconds 1800
 $r4 = Rc $fa
 Shot 'h3-04-float-fullscreen-left'
 $h3FullscreenRestores = (Near $r4.L $r2.L 4) -and (Near $r4.T $r2.T 4) -and (Near $r4.W $r2.W 4) -and (Near $r4.H $r2.H 4)
+# Information: the float before fullscreen and after leaving it (L,T WxH), so a miss shows by how much.
+$h3FloatRects = "before=$($r2.L),$($r2.T) $($r2.W)x$($r2.H) after=$($r4.L),$($r4.T) $($r4.W)x$($r4.H)"
 
 # IPC focus-window raises a floating window (it used to answer "ok" and do nothing), tiles still get it too.
 $null = Ctl 'h3-ipc-focus-tile' @('focus-window', [string][int64]$forms[0])
@@ -1238,6 +1313,7 @@ $floatGateSnapshot = [ordered]@{
     h3_fullscreen_covers_monitor = $h3FullscreenCovers
     h3_fullscreen_only_the_float = ($h3FullscreenOthers -eq 0)
     h3_fullscreen_exit_restores_float = $h3FullscreenRestores
+    h3_float_rects_around_fullscreen = $h3FloatRects
     h3_ipc_focus_window_tile = $h3IpcFocusTile
     h3_ipc_focus_window_float = $h3IpcFocusFloat
     h3_ipc_action_centers_float = $h3IpcCenters
@@ -2626,13 +2702,23 @@ $h15TypedTold = @(EvOf $new 'workspace_activated' | Where-Object { [int64]$_.dat
 $h15TypedAccepted = ($typedReply -match '"success":\s*true') -and ($h15TypedTold.Count -eq 1)
 $null = Ctl 'h15-ws1-again' @('action', 'focus-workspace', '1'); Start-Sleep -Milliseconds 2000
 
-# (j) --id names the window to act on: fullscreen-window --id <a window that is not focused>.  The window is focused first
-# (niri leaves the focus; wiri's documented approximation), then it is fullscreen
+# (j) --id names the window to act on: fullscreen-window --id <a window that is not focused>.
+# niri makes that window fullscreen while leaving native, managed and stream focus alone.
 FocusForm $k1
 # Native focus alone is not the event-stream precondition. Otherwise a setup
 # observation still in flight can leave the stream on k3 and dedup its return.
+# The OS now and then raises no EVENT_SYSTEM_FOREGROUND for a successful SetForegroundWindow
+# (aa6c884: the single activation of k1 got no notification, so managed and stream focus stayed
+# on k3 for 8 s while the OS foreground was k1, and no later event for k1 ever came; the wiri
+# logs of the r3 run show one more activation without any foreground notice, at another place).
+# Repeating focus-window on the window that already is foreground sends no new notification, so
+# when managed focus has not followed after 1.5 s the precondition is re-created with real
+# transitions (focus k3, then k1 again), at most twice.  Every attempt is recorded in the
+# evidence; a precondition that never settles still fails the gate.
 $h15IdSetupClock = [Diagnostics.Stopwatch]::StartNew()
 $h15IdSetup = $false
+$h15IdSetupAttempts = 1
+$h15IdAttemptStartMs = 0
 $h15IdSetupSamples = New-Object System.Collections.Generic.List[object]
 do {
     $streamFocus = $null
@@ -2651,22 +2737,47 @@ do {
     [void]$h15IdSetupSamples.Add([pscustomobject]@{ ms=$h15IdSetupClock.ElapsedMilliseconds; native=$nativeFocus; managed=$managedFocus; stream=$streamFocus; events=$setupEvents.Count })
     $h15IdSetup = ($query.success -and $nativeFocus -eq [int64]$k1 -and $null -ne $managedFocus -and [int64]$managedFocus -eq [int64]$k1 -and $null -ne $streamFocus -and [int64]$streamFocus -eq [int64]$k1)
     if ($h15IdSetup) { break }
+    if ($h15IdSetupAttempts -lt 3 -and ($h15IdSetupClock.ElapsedMilliseconds - $h15IdAttemptStartMs) -ge 1500) {
+        $h15IdSetupAttempts++
+        FocusForm $k3
+        FocusForm $k1
+        $h15IdAttemptStartMs = $h15IdSetupClock.ElapsedMilliseconds
+    }
     Start-Sleep -Milliseconds 40
-} while ($h15IdSetupClock.ElapsedMilliseconds -lt 8000)
+} while ($h15IdSetupClock.ElapsedMilliseconds -lt 12000)
 $h15IdMark = @(EvList $evAll).Count
 $new = @(H15Step { $null = Ctl 'h15-fullscreen-id' @('action', 'fullscreen-window', '--id', [string][int64]$k3) } 2400)
 $h15IdFs = @(EvWindow $new 'window_opened_or_changed' $k3)
 $h15IdFocus = @(EvOf $new 'window_focus_changed' | Where-Object { [int64]$_.data.id -eq [int64]$k3 })
+$h15IdAfterQuery = PipeRequest '{"type":"focused_window"}' | ConvertFrom-Json
+$h15IdManagedFocus = $h15IdAfterQuery.result.focused_window.id
+$h15IdStreamFocus = $null
+foreach ($event in @(EvList $evAll)) {
+    if ($event.type -eq 'windows_changed') {
+        $focused = @($event.data.windows | Where-Object { $_.is_focused })
+        $h15IdStreamFocus = if ($focused.Count -eq 1) { $focused[0].id } else { $null }
+    } elseif ($event.type -eq 'window_focus_changed') {
+        $h15IdStreamFocus = $event.data.id
+    }
+}
 $h15IdForeground = [int64][LT]::GetForegroundWindow()
-$h15IdActs = $h15IdSetup -and ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 1) -and ($h15IdForeground -eq [int64]$k3)
-[pscustomobject]@{ setup_pass=$h15IdSetup; setup_expected=[int64]$k1; setup_samples=$h15IdSetupSamples.ToArray(); event_mark=$h15IdMark; expected=[int64]$k3; fullscreen_change_count=$h15IdFs.Count; focus_change_count=$h15IdFocus.Count; foreground_after=$h15IdForeground; pass=$h15IdActs; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-fullscreen-id.evidence.json')
+$h15IdActs = $h15IdSetup -and ($h15IdFs.Count -eq 1) -and ($h15IdFs[0].data.window.is_fullscreen -eq $true) -and ($h15IdFocus.Count -eq 0) -and
+    ($h15IdForeground -eq [int64]$k1) -and $h15IdAfterQuery.success -and ($null -ne $h15IdManagedFocus) -and ([int64]$h15IdManagedFocus -eq [int64]$k1) -and
+    ($null -ne $h15IdStreamFocus) -and ([int64]$h15IdStreamFocus -eq [int64]$k1)
+[pscustomobject]@{ setup_pass=$h15IdSetup; setup_attempts=$h15IdSetupAttempts; setup_expected=[int64]$k1; setup_samples=$h15IdSetupSamples.ToArray(); event_mark=$h15IdMark; expected=[int64]$k3; focus_expected=[int64]$k1; fullscreen_change_count=$h15IdFs.Count; focus_change_count=$h15IdFocus.Count; foreground_after=$h15IdForeground; managed_after=$h15IdManagedFocus; stream_after=$h15IdStreamFocus; pass=$h15IdActs; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-fullscreen-id.evidence.json')
 $null = Ctl 'h15-fullscreen-id-off' @('action', 'fullscreen-window', '--id', [string][int64]$k3); Start-Sleep -Milliseconds 2200
-# close-window --id closes that window and leaves the focus where it is
+# Arrange a different foreground window before closing k1 by id: fullscreen above deliberately kept k1 focused.
+FocusForm $k3
+$h15CloseSetup = WaitForeground $k3 300 8000
 $h15FgBeforeClose = [int64][LT]::GetForegroundWindow()
-$new = @(H15Step { $null = Ctl 'h15-close-id' @('action', 'close-window', '--id', [string][int64]$k1) } 2400)
+$h15CloseSetup = $h15CloseSetup -and ($h15FgBeforeClose -eq [int64]$k3) -and [LT]::IsWindow($k1)
+$new = @()
+if ($h15CloseSetup) { $new = @(H15Step { $null = Ctl 'h15-close-id' @('action', 'close-window', '--id', [string][int64]$k1) } 2400) }
 $h15Closed = @(EvOf $new 'window_closed' | Where-Object { [int64]$_.data.id -eq [int64]$k1 })
-$h15CloseById = ($h15Closed.Count -eq 1) -and ([int64]$h15Closed[0].data.window_hwnd -eq [int64]$k1) -and (-not [LT]::IsWindow($k1)) -and
-    ([int64][LT]::GetForegroundWindow() -eq $h15FgBeforeClose) -and ($h15FgBeforeClose -eq [int64]$k3)
+$h15FgAfterClose = [int64][LT]::GetForegroundWindow()
+$h15CloseById = $h15CloseSetup -and ($h15Closed.Count -eq 1) -and ([int64]$h15Closed[0].data.window_hwnd -eq [int64]$k1) -and (-not [LT]::IsWindow($k1)) -and
+    ($h15FgAfterClose -eq $h15FgBeforeClose) -and ($h15FgBeforeClose -eq [int64]$k3)
+[pscustomobject]@{ setup_pass=$h15CloseSetup; target=[int64]$k1; focus_expected=[int64]$k3; foreground_before=$h15FgBeforeClose; foreground_after=$h15FgAfterClose; closed_count=$h15Closed.Count; pass=$h15CloseById; events=$new } | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $D 'h15-close-id.evidence.json')
 
 # (k) what is wrong is said: an action that does not exist, a window that does not exist
 $bad1 = CtlRaw @('action', 'no-such-action')
@@ -2856,6 +2967,7 @@ $summary = [ordered]@{
     h3_fullscreen_covers_monitor = $h3FullscreenCovers
     h3_fullscreen_only_the_float = ($h3FullscreenOthers -eq 0)
     h3_fullscreen_exit_restores_float = $h3FullscreenRestores
+    h3_float_rects_around_fullscreen = $h3FloatRects
     h3_ipc_focus_window_tile = $h3IpcFocusTile
     h3_ipc_focus_window_float = $h3IpcFocusFloat
     h3_ipc_action_centers_float = $h3IpcCenters
@@ -3108,6 +3220,91 @@ $summary = [ordered]@{
     h15_a_window_that_closes_is_told_by_id_and_handle = $h15CloseTold
     h15_a_late_subscriber_is_told_the_state_as_it_is = $h15LateOk
     h15_the_filter_applies_to_the_state_and_the_changes = $h15FilterOk
+    # Literal defaults keep the integrated parity gates in the CI schema;
+    # each phase replaces them only after observing its owned desktop fixture.
+    h81_linear_common_intermediate_motion = $false
+    h81_linear_target_visible = $false
+    h81_linear_settled = $false
+    h81_bezier_common_intermediate_motion = $false
+    h81_bezier_target_visible = $false
+    h81_bezier_settled = $false
+    h81_off_has_no_intermediate_motion = $false
+    h81_off_target_visible = $false
+    h81_cleanup = $false
+    h82_typed_fixed_position_and_origin = $false
+    h82_typed_full_area_proportions = $false
+    h82_explicit_inactive_id_preserves_foreground_and_unrelated_geometry = $false
+    h82_cli_signed_axis_preserves_omitted_axis = $false
+    h82_partial_visibility_bounds = $false
+    h82_partial_position_survives_resize = $false
+    h82_partial_position_survives_refresh = $false
+    h82_tiled_position_is_stored_until_float = $false
+    h82_stored_float_position_restores = $false
+    h83_unconfigured_middle_click_pair_passes = $false
+    h83_hold_consumes_both_button_edges = $false
+    h83_hold_motion_delivers_both_wheel_axes = $false
+    h83_hold_freezes_cursor_anchor = $false
+    h83_release_stops_scrolling = $false
+    h83_unconfigured_click_after_release_passes = $false
+    h83_short_tap_latches_scroll_lock = $false
+    h83_second_tap_unlocks_scroll_lock = $false
+    h83_reload_cancels_latched_scroll = $false
+    h83_reload_keeps_consumed_release_paired = $false
+    h83_explicit_middle_button_bind_wins = $false
+    h83_physical_wheel_bind_positive_control = $false
+    h83_emulated_wheel_bypasses_physical_bind_and_global_factor = $false
+    h83_touchpad_only_config_does_not_enable_mouse_scroll = $false
+    h83_cleanup = $false
+    h84_native_max_width_allocation = $false
+    h84_native_min_height_allocation = $false
+    h84_native_max_height_allocation = $false
+    h84_native_neighbors_do_not_overlap = $false
+    h84_fixed_height_defaults_floating = $false
+    h84_explicit_tiled_overrides_fixed_height = $false
+    h84_fixed_width_stays_tiled = $false
+    h84_zero_bounds_stay_tiled = $false
+    h84_native_bounds_refresh = $false
+    h84_successful_zero_clears_bounds = $false
+    h84_cleanup = $false
+    h85_initial_scan_startup_rules = $false
+    h85_new_admission_startup_rules = $false
+    h85_title_change_keeps_startup_rules = $false
+    h85_reload_keeps_startup_rules = $false
+    h85_real_deadline_expires_without_reload_reset = $false
+    h85_expiry_updates_existing_limits_and_opacity = $false
+    h85_expiry_does_not_replay_open_properties = $false
+    h85_expiry_remains_consumed = $false
+    h85_post_expiry_admission_uses_runtime_rules = $false
+    h85_cleanup = $false
+    h86_typed_window_id_transfer_preserves_native_focus = $false
+    h86_typed_column_id_transfer = $false
+    h86_typed_workspace_id_focus = $false
+    h86_workspace_id_survives_rename_and_reorder = $false
+    h86_workspace_id_survives_unname = $false
+    h86_unknown_id_is_handled_without_mutation_or_focus = $false
+    h86_malformed_id_is_rejected_without_mutation_or_focus = $false
+    h86_inactive_fullscreen_id_preserves_native_focus = $false
+    h86_inactive_height_id_preserves_native_focus = $false
+    h86_owned_cleanup = $false
+    h88_toggle_window_floating_on_a_fullscreen_float_tile = $false
+    # H95: live checks for rows whose behaviour was only unit-tested; `lane-evidence.ps1`
+    # replaces these defaults only after its own observations succeed.
+    h95_overview_workspace_shadow_paints_and_off_removes_it = $false
+    h95_deprecated_output_background_colour_is_the_overview_backdrop = $false
+    h95_center_column_centres_variable_width_edge_columns = $false
+    h95_tab_indicator_urgent_colour_overrides_the_selection = $false
+    h95_mod_drag_moves_a_floating_window = $false
+    h95_mod_drag_resizes_a_floating_window = $false
+    h95_mod_drag_escape_cancels_to_the_pre_drag_rect = $false
+    h95_shortcuts_inhibit_blocks_inhibitable_binds_only = $false
+    # H89: a configured hotkey-overlay-title is Pango markup; its live gates are added by
+    # `lane-pango.ps1` and replace these defaults only after observing the painted sheet.
+    h89_markup_title_text_and_entity_render = $false
+    h89_markup_colour_span_is_painted = $false
+    h89_markup_bold_run_has_more_ink = $false
+    h89_invalid_markup_falls_back_to_the_whole_string = $false
+    h89_invalid_markup_logs_one_warning_at_load = $false
+    h89_markup_cleanup = $false
     steps = $steps
 }
 # One lane's unexpected error must not end the run: its gates stay false and the error is recorded.
@@ -3132,6 +3329,24 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-v.ps1') } catch { LanePhaseEr
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-hot-corner.ps1') } catch { LanePhaseError 'lane_v_hot_corner' $_ }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-v-tabs.ps1') } catch { LanePhaseError 'lane_v_tabs' $_ }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-l2.ps1') } catch { LanePhaseError 'lane_l2' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-floating-position.ps1') } catch { LanePhaseError 'lane_floating_position' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-button-scroll.ps1') } catch { LanePhaseError 'lane_button_scroll' $_ }
+# H84: owned native bounds, allocation, classification and refresh evidence.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-native-bounds.ps1') } catch { LanePhaseError 'lane_native_bounds' $_ }
+# H85: observe the real global 60-second startup-rule deadline, including a
+# pre-expiry reload that must preserve the deadline and dynamic expiry updates.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-startup-rules.ps1') } catch { LanePhaseError 'lane_startup_rules' $_ }
+# H86: stable workspace identities and owned native focus; monitor relocation
+# remains explicit hardware qualification information on a single-output host.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-workspace-ids.ps1') } catch { LanePhaseError 'lane_workspace_ids' $_ }
+# H88: a floating window cannot be fullscreen or maximized: the action moves it into the strip and
+# leaving the state floats it again where it was (niri workspace.rs:1288-1476).
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-float-sizing.ps1') } catch { LanePhaseError 'lane_float_sizing' $_ }
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-cfg.ps1') } catch { LanePhaseError 'lane_cfg' $_ }
+# H89: a bind's `hotkey-overlay-title` is Pango markup, as niri paints it with set_markup:
+# bold, a colour span and `&amp;` paint styled, an invalid title paints the whole original
+# string, and that invalid title is warned about once at config load.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-pango.ps1') } catch { LanePhaseError 'lane_pango' $_ }
 # Lane P: pointer-device settings, the hotkey overlay's startup options and the
 # dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
 # so nothing here changes this machine's real pointer or touchpad settings.
@@ -3142,6 +3357,36 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1') } catch { LanePhas
 # test starts one private daemon whose own explicit hide/restore is the only cursor change,
 # and its `finally` reloads the user's cursor scheme unconditionally.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1') } catch { LanePhaseError 'lane_last' $_ }
+# Lane PACE: the animation frame clock waits for the desktop's presentation clock while
+# timelines run and arms nothing at rest.  h90_* read the burst line the daemon logs (it
+# always runs with -v) and the CPU time of a settled daemon; no display setting is touched.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-pace.ps1') } catch { LanePhaseError 'lane_pace' $_ }
+# H92: the focus core. One focus-window request settles managed focus on the native foreground (no retry);
+# niri's *ById actions change the named window and never move native or managed focus.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-focus.ps1') } catch { LanePhaseError 'lane_focus' $_ }
+# H97: the overview is niri's fixed-zoom camera over the 2D grid (overview { zoom }, one stack entry per
+# workspace, gaps of 10% of the view height, each workspace through its own horizontal camera), not a
+# fit-everything zoom. It owns one daemon and 30 ordinary owned forms, and only reads published geometry.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-overview.ps1') } catch { LanePhaseError 'lane_overview' $_ }
+# H96: niri hides the floating layer while the workspace's active window is a fullscreen tile and the floating
+# layer is not active (workspace.rs:1722-1728); focusing a float or leaving fullscreen brings it back in place.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-dpi-floats.ps1') } catch { LanePhaseError 'lane_dpi_floats' $_ }
+# H98: wiri's `layout { unified-grid }` extension.  One shared horizontal camera per monitor, x-matched
+# vertical moves, the eight diagonal actions, the two-arrow chord and the mode-off identity.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-grid.ps1') } catch { LanePhaseError 'lane_grid' $_ }
+# Lane EVIDENCE: the precise desktop checks that were missing for rows whose behaviour exists
+# and is unit-tested but was never observed exactly: the overview workspace shadow, the
+# deprecated per-output background colour, center-column on variable-width edge columns, the
+# tab indicator's urgent colour, Mod+button grabs on a floating window, and the keyboard-
+# shortcuts inhibitor.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-evidence.ps1') } catch { LanePhaseError 'lane_evidence' $_ }
+# H94: windows keep the final say over their size. Harness-owned WinForms fixtures resize themselves
+# from their own UI thread; the layout must keep that size, move the neighbours and never write the
+# window's geometry again (niri scrolling.rs:4860-4875, :1287-1305, :1293-1300).
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-resize.ps1') } catch { LanePhaseError 'lane_resize' $_ }
+# H93: touch, pen and drag-and-drop driven by input Windows itself synthesizes (a real
+# synthetic pointer device and a real OLE drag); no digitizer hardware is involved.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-synth.ps1') } catch { LanePhaseError 'lane_synth' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
@@ -3152,6 +3397,27 @@ if ($env:WIRI_LIVE_CI -eq '1') {
     })
 }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') } catch { LanePhaseError 'lane_e_perf' $_ } # p_* numeric information only; never pass/fail
+# End of run: retry closing only terminal windows a check of this run created (the shared desktop may
+# also hold someone's own terminal, which must never be closed). Any other terminal window that appeared
+# during the run is only reported, so a phase that leaks one shows up here. Information only.
+$swept = 0
+foreach ($h in @($runTerminalWindows | Where-Object { [LT]::IsWindow([IntPtr]$_) })) {
+    for ($i = 0; $i -lt 15 -and [LT]::IsWindow([IntPtr]$h); $i++) { [LT]::Close([IntPtr]$h); Start-Sleep -Milliseconds 200 }
+    if ([LT]::IsWindow([IntPtr]$h)) { $terminalWindowsLeftOpen++ } else { $swept++ }
+}
+$untracked = @(NewTopLevel $topAtStart | Where-Object {
+    [LT]::IsWindow($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') -and ($runTerminalWindows -notcontains [long]$_) })
+$summary['terminal_windows_swept_at_end'] = $swept
+$summary['terminal_windows_untracked_at_end'] = $untracked.Count
+$summary['terminal_windows_untracked_titles'] = @($untracked | ForEach-Object { [LT]::Title($_) })
+$summary['terminal_windows_left_open'] = $terminalWindowsLeftOpen
+# Foreground changes over the whole run. The harness never runs elevated, so an "Administrator:" window
+# taking the foreground is another program interfering with the run. Information only, never a gate.
+$fgEvents = @([FgLog]::Stop())
+$fgEvents | Set-Content -Encoding UTF8 (Join-Path $D 'foreground-log.tsv')
+$summary['foreground_events'] = $fgEvents.Count
+$summary['foreground_elevated_titles'] = @($fgEvents | ForEach-Object { ($_ -split "`t", 4)[3] } |
+    Where-Object { $_ -like 'Administrator:*' } | Sort-Object -Unique)
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }

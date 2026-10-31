@@ -54,7 +54,13 @@ impl TilingEngine {
         let Some(output) = self.monitors.focused_id() else {
             return true;
         };
-        if let Some(m) = self.monitors.get_mut(&output) {
+        if self.unified_grid_for(output) {
+            // wiri `unified-grid`: a row change inside the zoomed-out view is the same
+            // vertical move as in the normal view, so it carries the monitor's one camera
+            // across and lands on the column under it (rule 3). Without the carry the
+            // whole overview would jump in x to the row's own remembered offset.
+            self.unified_switch_workspace(output, workspace);
+        } else if let Some(m) = self.monitors.get_mut(&output) {
             m.switch_workspace(workspace);
         }
         // Do not hide sources or slide real application HWNDs under the camera.
@@ -165,6 +171,7 @@ impl TilingEngine {
             m.set_focus(window);
         }
         self.sync_min_widths();
+        self.refresh_float_presets();
         self.maintain_empty_workspace(output);
         self.apply_layout_for_monitor(output, backend);
     }

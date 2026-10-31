@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="300" viewBox="0 0 1000 300" role="img" aria-labelledby="wiri-title wiri-desc">
+  <title id="wiri-title">wiri</title>
+  <desc id="wiri-desc">wiri, a scrollable-tiling window manager for Windows: windows sit in columns on an endless strip.</desc>
+  <rect x="0.5" y="0.5" width="999" height="299" rx="18" fill="#161b22" stroke="#30363d"/>
+  <g font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif">
+    <text x="60" y="162" font-size="112" font-weight="700" letter-spacing="-3" fill="#e6edf3">wiri</text>
+    <text x="64" y="206" font-size="27" fill="#8b949e">Scrollable tiling for Windows</text>
+  </g>
+  <rect x="520" y="248" width="480" height="4" rx="2" fill="#3d444d"/>
+  <rect x="548" y="66" width="104" height="170" rx="10" fill="#3d444d"/>
+  <rect x="668" y="66" width="124" height="170" rx="10" fill="#3d444d"/>
+  <rect x="808" y="66" width="128" height="170" rx="10" fill="#2f81f7"/>
+  <rect x="952" y="66" width="120" height="170" rx="10" fill="#3d444d"/>
+</svg>

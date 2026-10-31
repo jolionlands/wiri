@@ -107,7 +107,8 @@ foreach ($key in $names.Keys) {
     if ($found.Count -eq 1) { $value = [string]$environment[$found[0]] }
     $values[$key] = [ordered]@{ present=($found.Count -eq 1); matches=$found.Count; value=$value }
 }
-$record = [ordered]@{ label=@@LABEL@@; pid=$PID; cwd=[IO.Directory]::GetCurrentDirectory(); env=$values }
+$parent = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId=' + $PID) -ErrorAction Stop
+$record = [ordered]@{ label=@@LABEL@@; pid=$PID; parent_pid=[int]$parent.ParentProcessId; cwd=[IO.Directory]::GetCurrentDirectory(); env=$values }
 $dir = @@DIR@@
 $path = [IO.Path]::Combine($dir, ([Guid]::NewGuid().ToString('N') + '.json'))
 # ReadJsonArray uses Get-Content on Windows PowerShell 5.1; a UTF-8 BOM
@@ -153,11 +154,22 @@ $path = [IO.Path]::Combine($dir, ([Guid]::NewGuid().ToString('N') + '.json'))
         } else {
             $reply = C2SessionRequest @{type='spawn_command'; data=@{command=$c2PowerShell; args=$probe.args}}
         }
-        if ($reply.success -ne $true) { throw "H69 spawn failed: $($reply | ConvertTo-Json -Compress)" }
+        # The server's response budget can expire after CreateProcess starts.
+        # That reply explicitly leaves the request queued: observe this unique
+        # invocation within the existing probe budget, without resending it.
+        $queued = ($reply.success -eq $false -and
+            [string]$reply.error -ceq 'wiri is busy (the window layout is being updated); the request is queued and will be handled shortly')
+        if ($reply.success -ne $true -and -not $queued) { throw "H69 spawn failed: $($reply | ConvertTo-Json -Compress)" }
         $observed = C2ReadProbe $probe
-        if (-not $shell -and ([int]$reply.pid -le 0 -or [int]$reply.pid -ne [int]$observed.snapshot.pid)) { throw 'H69 argv probe PID differs from spawn reply' }
+        if ($observed.count -ne 1 -or [int]$observed.snapshot.pid -le 0 -or
+            [string]$observed.snapshot.label -cne $probe.label) { throw 'H69 expected exactly one matching owned probe' }
+        if (-not $shell) {
+            if ($queued) {
+                if ([int]$observed.snapshot.parent_pid -ne $c2State.owned.Id) { throw 'H69 queued argv probe is not a child of its owned daemon' }
+            } elseif ([int]$reply.pid -le 0 -or [int]$reply.pid -ne [int]$observed.snapshot.pid) { throw 'H69 argv probe PID differs from spawn reply' }
+        }
         $c2Isolation.Add($observed.snapshot)
-        return [pscustomobject]@{ reply=$reply; observed=$observed }
+        return [pscustomobject]@{ reply=$reply; queued=$queued; observed=$observed }
     }
     function C2ProbeMatches($launch, $expected) {
         return ($launch.observed.count -eq 1 -and (C2EnvironmentMatches $launch.observed.snapshot $expected))

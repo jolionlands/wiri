@@ -1,4 +1,5 @@
 pub mod a11y;
+pub mod animation;
 pub mod backend;
 pub mod config;
 pub mod hooks;

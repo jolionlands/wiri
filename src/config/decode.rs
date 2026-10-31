@@ -32,6 +32,8 @@ mod overview_decode;
 mod recent_windows_decode;
 mod rule_effects_decode;
 mod rule_policy;
+#[cfg(test)]
+mod spacing_parity_tests;
 
 /// How many levels of `include` are followed.
 pub const MAX_INCLUDE_DEPTH: u8 = 8;
@@ -238,6 +240,17 @@ fn norm(name: &str) -> String {
     name.replace('_', "-").to_ascii_lowercase()
 }
 
+/// The older flat `border-width` / `focus-ring-width` integers mirror a block's LOGICAL width:
+/// a non-zero width is at least one pixel, as in niri's `round_logical_in_physical_max1`
+/// (utils/mod.rs:185-191) at scale 1.  The block's own width stays fractional.
+fn legacy_width_px(width: f64) -> u32 {
+    if width > 0.0 {
+        width.round().max(1.0) as u32
+    } else {
+        0
+    }
+}
+
 /// The `border` block being built by a `layout {}` (started from its defaults when nothing
 /// named it yet).
 fn border_style(p: &mut LayoutConfigPartial) -> &mut RingStyle {
@@ -317,7 +330,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
-        "debug" => Some("these are compositor debug options"),
         _ => None,
     }
 }
@@ -708,6 +720,7 @@ impl InputScope {
                 "click-method",
                 "disabled-on-external-mouse",
                 "natural-scroll",
+                "scroll-factor",
                 "accel-profile",
                 "scroll-method",
                 "scroll-button",
@@ -934,9 +947,36 @@ impl Decoder {
         Some(n as u32)
     }
 
+    /// An integer-only value, with a range that may be wider than `u32` (niri's `FloatOrInt`
+    /// bounds are i32-typed).  A decimal is a type error, matching knuffel's integer scalars.
+    fn arg_integer(&mut self, node: &Node, min: f64, max: f64) -> Option<f64> {
+        let v = self.one_arg(node)?;
+        let n = self.value_number(node, v, min, max)?;
+        if n.fract() != 0.0 {
+            self.error(v.pos, format!("'{}' expects an integer", node.name));
+            return None;
+        }
+        Some(n)
+    }
+
+    /// A niri `i32` value.  Pinned niri decodes `output { position }` x/y as plain `i32`
+    /// properties (niri-config/src/output.rs:139-152), so a fractional value is a type error
+    /// rather than something to round, and the whole i32 range is accepted.
+    fn value_i32(&mut self, node: &Node, v: &Value) -> Option<i32> {
+        let n = self.value_number(node, v, i32::MIN as f64, i32::MAX as f64)?;
+        if n.fract() != 0.0 {
+            self.error(
+                v.pos,
+                format!("'{}' expects an integer, found {}", node.name, n),
+            );
+            return None;
+        }
+        Some(n as i32)
+    }
+
     fn arg_i32(&mut self, node: &Node) -> Option<i32> {
-        let n = self.arg_number(node, -1_000_000.0, 1_000_000.0)?;
-        Some(n.round() as i32)
+        let v = self.one_arg(node)?;
+        self.value_i32(node, v)
     }
 
     fn arg_text(&mut self, node: &Node) -> Option<String> {
@@ -1097,6 +1137,7 @@ impl Decoder {
                 }
                 "overview" => self.decode_overview(node, &mut cfg.overview),
                 "accessibility" => self.decode_accessibility(node, cfg),
+                "debug" => self.decode_debug(node, cfg),
                 "include" => self.decode_include(node, cfg),
                 other => match top_level_unsupported(other) {
                     Some(why) => self.unsupported(node, why),
@@ -1172,7 +1213,14 @@ impl Decoder {
                         cfg.cursor.hide_after_inactive_ms = Some(ms);
                     }
                 }
-                "xcursor-theme" | "xcursor-size" => {
+                "xcursor-size" => {
+                    // Windows has no Xcursor, but niri still type-checks the value
+                    // (`xcursor_size: Option<u8>`, niri-config/src/misc.rs:36-40).
+                    if self.arg_u32(child, 255).is_some() {
+                        self.unsupported(child, "the cursor theme belongs to Windows");
+                    }
+                }
+                "xcursor-theme" => {
                     self.unsupported(child, "the cursor theme belongs to Windows");
                 }
                 _ => self.unknown(
@@ -1635,6 +1683,9 @@ impl Decoder {
             "natural-scroll" if scope == InputScope::Input || scope.is_pointer() => {
                 if let Some(v) = self.flag(child) {
                     cfg.input.natural_scroll = v;
+                    if matches!(scope, InputScope::Mouse | InputScope::Input) {
+                        cfg.input.mouse_scroll.natural = v;
+                    }
                 }
             }
             "scroll-speed" | "mouse-speed"
@@ -1663,18 +1714,25 @@ impl Decoder {
                     cfg.input.tap_to_click = v;
                 }
             }
-            "scroll-factor" if scope == InputScope::Mouse => {
-                // niri: one number, or horizontal= / vertical= properties.
-                if let Some(a) = child.args.first() {
-                    if let Some(v) = self.value_number(child, a, 0.0, 1000.0) {
-                        cfg.input.mouse_speed = v;
+            "scroll-factor" if matches!(scope, InputScope::Mouse | InputScope::Touchpad) => {
+                if let Some(factor) = self.decode_scroll_factor(child) {
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll_factor = Some(factor);
+                    } else {
+                        cfg.input.touchpad_scroll_factor = Some(factor);
                     }
-                } else {
-                    self.unsupported(child, "per-axis scroll factors");
                 }
             }
             "accel-speed" if scope.is_pointer() => {
                 self.unsupported(child, "Windows has one pointer speed for all devices")
+            }
+            "pinch-sensitivity" if scope == InputScope::Touchpad => {
+                // niri: `pinch_sensitivity: Option<FloatOrInt<0, 100>>`
+                // (niri-config/src/input.rs:228-230).  Windows has no pinch gesture on a
+                // precision touchpad, but the value is still niri's.
+                if self.arg_number(child, 0.0, 100.0).is_some() {
+                    self.unsupported(child, "Windows handles precision-touchpad pinch itself");
+                }
             }
             // pointing-device options shared by mouse, touchpad, trackpoint and trackball
             "off"
@@ -1725,6 +1783,80 @@ impl Decoder {
         }
     }
 
+    fn decode_scroll_factor(&mut self, node: &Node) -> Option<ScrollFactor> {
+        let before = self.issues.len();
+        if node.ty.is_some() {
+            self.error(node.pos, "scroll-factor does not accept a type annotation");
+        }
+        if node.args.len() > 1 {
+            self.error(
+                node.args[1].pos,
+                "scroll-factor takes at most one base value",
+            );
+        }
+        if node.children.is_some() {
+            self.error(node.pos, "scroll-factor takes no child block");
+        }
+        let mut factor = ScrollFactor::default();
+        if let Some(value) = node.args.first() {
+            factor.base = self.scroll_factor_number(node, value, 0.0, 100.0);
+        }
+        let mut horizontal_seen = false;
+        let mut vertical_seen = false;
+        for prop in &node.props {
+            let (seen, axis) = match prop.key.as_str() {
+                "horizontal" => (&mut horizontal_seen, &mut factor.horizontal),
+                "vertical" => (&mut vertical_seen, &mut factor.vertical),
+                _ => {
+                    self.error(
+                        prop.key_pos,
+                        format!("unknown scroll-factor property '{}'", prop.key),
+                    );
+                    continue;
+                }
+            };
+            if std::mem::replace(seen, true) {
+                self.error(
+                    prop.key_pos,
+                    format!("duplicate scroll-factor property '{}'", prop.key),
+                );
+            }
+            *axis = self.scroll_factor_number(node, &prop.value, -100.0, 100.0);
+        }
+        (self.issues.len() == before).then_some(factor)
+    }
+
+    fn scroll_factor_number(
+        &mut self,
+        node: &Node,
+        value: &Value,
+        min: f64,
+        max: f64,
+    ) -> Option<f64> {
+        if value.ty.is_some() {
+            self.error(
+                value.pos,
+                "scroll-factor values do not accept type annotations",
+            );
+            return None;
+        }
+        let Some(number) = value.as_f64() else {
+            self.error(
+                value.pos,
+                format!("'{}' requires a numeric value", node.name),
+            );
+            return None;
+        };
+        if !number.is_finite() || number < min || number > max {
+            self.error(
+                value.pos,
+                format!("'{}' must be between {min} and {max}", node.name),
+            );
+            return None;
+        }
+        Some(number)
+    }
+
     /// One niri pointing-device option, shared by `mouse`, `touchpad`, `trackpoint` and
     /// `trackball`.  Windows configures all pointing devices with one system-wide setup, so the
     /// stored fields are shared too; `crate::input::pointer_settings` decides what reaches the
@@ -1766,16 +1898,36 @@ impl Decoder {
                     "\"none\", \"edge\", \"two-finger\" or \"on-button-down\"",
                 ) {
                     cfg.input.scroll_method = Some(v);
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll.method = Some(v);
+                    } else {
+                        cfg.input.non_mouse_scroll_configured = true;
+                    }
                 }
             }
             "scroll-button" => {
-                if let Some(v) = self.arg_number(child, 1.0, 32.0) {
-                    cfg.input.scroll_button = Some(v.round() as u32);
+                if let Some(v) = self.arg_u32(child, u32::MAX) {
+                    cfg.input.scroll_button = Some(v);
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll.button = Some(v);
+                    } else {
+                        cfg.input.non_mouse_scroll_configured = true;
+                    }
+                    if (1..=5).contains(&v) {
+                        self.warn(child.pos, "legacy scroll-button 1..5 maps to left/right/middle/X1/X2; prefer evdev 272..276");
+                    } else if v != 0 && !(272..=276).contains(&v) {
+                        self.warn(child.pos, "scroll-button is valid evdev syntax but unsupported by the Windows mouse hook; left unapplied");
+                    }
                 }
             }
             "scroll-button-lock" => {
                 if let Some(v) = self.flag(child) {
                     cfg.input.scroll_button_lock = Some(v);
+                    if scope == InputScope::Mouse {
+                        cfg.input.mouse_scroll.lock = Some(v);
+                    } else {
+                        cfg.input.non_mouse_scroll_configured = true;
+                    }
                 }
             }
             "left-handed" => {
@@ -1921,8 +2073,8 @@ impl Decoder {
                     let mut y = None;
                     for p in &child.props {
                         match p.key.as_str() {
-                            "x" => x = self.value_number(child, &p.value, -1e6, 1e6),
-                            "y" => y = self.value_number(child, &p.value, -1e6, 1e6),
+                            "x" => x = self.value_i32(child, &p.value),
+                            "y" => y = self.value_i32(child, &p.value),
                             other => {
                                 let msg = format!("unexpected property '{}' on 'position'", other);
                                 self.error(p.key_pos, msg);
@@ -1930,17 +2082,17 @@ impl Decoder {
                         }
                     }
                     if child.args.len() == 2 {
-                        x = self.value_number(child, &child.args[0], -1e6, 1e6);
-                        y = self.value_number(child, &child.args[1], -1e6, 1e6);
+                        x = self.value_i32(child, &child.args[0]);
+                        y = self.value_i32(child, &child.args[1]);
                     } else if !child.args.is_empty() {
                         self.error(child.args[0].pos, "'position' takes x and y");
                     }
                     if let Some(v) = x {
-                        out.position.x = v.round() as i32;
+                        out.position.x = v;
                         out.position_set = true;
                     }
                     if let Some(v) = y {
-                        out.position.y = v.round() as i32;
+                        out.position.y = v;
                         out.position_set = true;
                     }
                 }
@@ -2092,30 +2244,29 @@ impl Decoder {
                         self.section(child);
                         for c in child.kids() {
                             match norm(&c.name).as_str() {
-                                "inner" => self.set_u32(c, 65535, &mut p.inner_gaps),
-                                "outer" => self.set_u32(c, 65535, &mut p.outer_gaps),
+                                "inner" => self.set_f64(c, 0.0, 65535.0, &mut p.inner_gaps),
+                                "outer" => self.set_f64(c, 0.0, 65535.0, &mut p.outer_gaps),
                                 _ => self.unknown(c, "'gaps'", &["inner", "outer"]),
                             }
                         }
                     } else if let Some(v) = self.arg_number(child, 0.0, 65535.0) {
-                        let g = v.round() as u32;
-                        p.inner_gaps = Some(g);
-                        p.outer_gaps = Some(g);
+                        p.inner_gaps = Some(v);
+                        p.outer_gaps = Some(v);
                     }
                 }
-                "inner-gaps" | "inner" => self.set_u32(child, 65535, &mut p.inner_gaps),
-                "outer-gaps" | "outer" => self.set_u32(child, 65535, &mut p.outer_gaps),
+                "inner-gaps" | "inner" => self.set_f64(child, 0.0, 65535.0, &mut p.inner_gaps),
+                "outer-gaps" | "outer" => self.set_f64(child, 0.0, 65535.0, &mut p.outer_gaps),
                 "struts" => {
                     self.section(child);
                     for c in child.kids() {
                         let side = norm(&c.name);
                         let strut = self.arg_number(c, -65535.0, 65535.0);
-                        let value = strut.map(|v| v.round() as i32);
+                        let value = strut.map(InsetValue::Logical);
                         match side.as_str() {
-                            "left" => p.reserve_left = value.or(p.reserve_left),
-                            "right" => p.reserve_right = value.or(p.reserve_right),
-                            "top" => p.reserve_top = value.or(p.reserve_top),
-                            "bottom" => p.reserve_bottom = value.or(p.reserve_bottom),
+                            "left" => p.struts.left = value.or(p.struts.left),
+                            "right" => p.struts.right = value.or(p.struts.right),
+                            "top" => p.struts.top = value.or(p.struts.top),
+                            "bottom" => p.struts.bottom = value.or(p.struts.bottom),
                             _ => self.unknown(c, "'struts'", &["left", "right", "top", "bottom"]),
                         }
                     }
@@ -2148,7 +2299,7 @@ impl Decoder {
                     self.set_u32(child, 4096, &mut p.border_width);
                     if let Some(w) = p.border_width {
                         let b = border_style(p);
-                        b.width = w;
+                        b.width = f64::from(w);
                         b.off = w == 0;
                     }
                 }
@@ -2181,7 +2332,7 @@ impl Decoder {
                     self.set_u32(child, 4096, &mut p.focus_ring_width);
                     if let Some(w) = p.focus_ring_width {
                         let r = focus_ring_style(p);
-                        r.width = w;
+                        r.width = f64::from(w);
                         r.off = w == 0;
                     }
                 }
@@ -2272,12 +2423,28 @@ impl Decoder {
                 "smart-borders" | "border-smart" | "smart" => {
                     self.set_flag(child, &mut p.smart_borders)
                 }
+                // wiri extension: one shared horizontal camera per monitor, so the
+                // desktop is a single XY grid. Off by default (niri parity).
+                "unified-grid" | "unified-xy-grid" => self.set_flag(child, &mut p.unified_grid),
+                "unified-grid-chord-ms" => self.set_u32(child, 1000, &mut p.unified_grid_chord_ms),
                 "status-bar" => self.set_flag(child, &mut p.status_bar),
                 "hide-method" => self.set_text(child, &mut p.hide_method),
-                "reserve-top" => self.set_i32(child, &mut p.reserve_top),
-                "reserve-bottom" => self.set_i32(child, &mut p.reserve_bottom),
-                "reserve-left" => self.set_i32(child, &mut p.reserve_left),
-                "reserve-right" => self.set_i32(child, &mut p.reserve_right),
+                "reserve-top" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.top = value.or(p.struts.top);
+                }
+                "reserve-bottom" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.bottom = value.or(p.struts.bottom);
+                }
+                "reserve-left" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.left = value.or(p.struts.left);
+                }
+                "reserve-right" => {
+                    let value = self.arg_i32(child).map(InsetValue::Physical);
+                    p.struts.right = value.or(p.struts.right);
+                }
                 "center-focused-column" => {
                     if let Some(mode) = self.arg_text(child) {
                         if matches!(mode.as_str(), "never" | "always" | "on-overflow") {
@@ -2357,6 +2524,8 @@ impl Decoder {
                         "preset-column-widths",
                         "default-column-width",
                         "background-color",
+                        "unified-grid",
+                        "unified-grid-chord-ms",
                     ],
                 ),
             }
@@ -2375,7 +2544,7 @@ impl Decoder {
                 // The older flat fields follow the block (the engine's DWM border colours and
                 // the per-output overrides read them).
                 match norm(&c.name).as_str() {
-                    "width" => p.border_width = Some(style.width),
+                    "width" => p.border_width = Some(legacy_width_px(style.width)),
                     "off" | "on" => {
                         if style.off {
                             p.border_width = Some(0);
@@ -2440,7 +2609,7 @@ impl Decoder {
         for c in node.kids() {
             if self.ring_key(c, &mut style, false) {
                 match norm(&c.name).as_str() {
-                    "width" => p.focus_ring_width = Some(style.width),
+                    "width" => p.focus_ring_width = Some(legacy_width_px(style.width)),
                     "off" | "on" => {
                         if style.off {
                             p.focus_ring_width = Some(0);
@@ -2583,6 +2752,26 @@ impl Decoder {
     /// `accessibility` — screen-reader announcements (wiri extension: niri's Accessibility
     /// support has no config key and is always on).  A bare node means on, `false` turns it
     /// off, and the section form accepts the same two spellings.
+    /// niri `debug { … }`. `strict-new-window-focus-policy` is honoured (see
+    /// `layout::engine::rules::new_window_activation`); every other option configures compositor
+    /// internals (DRM, PipeWire, frame queueing, ...) and is reported, not an error.
+    fn decode_debug(&mut self, node: &Node, cfg: &mut Config) {
+        self.section(node);
+        for child in node.kids() {
+            match norm(&child.name).as_str() {
+                "strict-new-window-focus-policy" => {
+                    if let Some(value) = self.flag(child) {
+                        cfg.debug.strict_new_window_focus_policy = value;
+                    }
+                }
+                _ => self.unsupported(
+                    child,
+                    "a compositor debug option with no Windows counterpart",
+                ),
+            }
+        }
+    }
+
     fn decode_accessibility(&mut self, node: &Node, cfg: &mut Config) {
         let kids = node.kids();
         if kids.is_empty() {
@@ -2763,7 +2952,10 @@ impl Decoder {
                     }
                 }
                 "opacity" => {
-                    if let Some(v) = self.arg_number(child, 0.0, 1.0) {
+                    // niri: `opacity: Option<f32>` with no parse-time bound
+                    // (niri-config/src/window_rule.rs:61-62); the clamp to 0..=1 happens when
+                    // the rule is resolved (src/layout/rules.rs).
+                    if let Some(v) = self.arg_number(child, f32::MIN as f64, f32::MAX as f64) {
                         rule.opacity = Some(v);
                     }
                 }
@@ -2805,10 +2997,12 @@ impl Decoder {
                     self.set_flag(child, &mut rule.open_maximized_to_edges)
                 }
                 "open-focused" => self.set_flag(child, &mut rule.open_focused),
-                "min-width" => self.set_u32(child, 100_000, &mut rule.min_width),
-                "min-height" => self.set_u32(child, 100_000, &mut rule.min_height),
-                "max-width" => self.set_u32(child, 100_000, &mut rule.max_width),
-                "max-height" => self.set_u32(child, 100_000, &mut rule.max_height),
+                // niri: `min_width .. max_height: Option<u16>`
+                // (niri-config/src/window_rule.rs:43-49).
+                "min-width" => self.set_u32(child, 65535, &mut rule.min_width),
+                "min-height" => self.set_u32(child, 65535, &mut rule.min_height),
+                "max-width" => self.set_u32(child, 65535, &mut rule.max_width),
+                "max-height" => self.set_u32(child, 65535, &mut rule.max_height),
                 "default-column-width" => {
                     if let Some(v) = self.decode_size_block(child) {
                         rule.default_column_width = Some(v);
@@ -2880,13 +3074,18 @@ impl Decoder {
         for child in node.kids() {
             match norm(&child.name).as_str() {
                 "proportion" => {
-                    if let Some(v) = self.arg_number(child, 0.0, 100.0) {
+                    // niri: `Proportion(f64)` with no parse-time range
+                    // (niri-config/src/layout.rs:127-152).
+                    if let Some(v) = self.arg_number(child, f64::MIN, f64::MAX) {
                         sizes.push(SizeSpec::Proportion(v));
                     }
                 }
                 "fixed" => {
-                    if let Some(v) = self.arg_number(child, 1.0, 100_000.0) {
-                        sizes.push(SizeSpec::Fixed(v.round() as u32));
+                    // niri: `Fixed(i32)` (niri-config/src/layout.rs:127-152), so a decimal is
+                    // a type error.  Wiri stores a `u32`, so a negative fixed size is reported
+                    // rather than wrapped.
+                    if let Some(v) = self.arg_integer(child, 0.0, u32::MAX as f64) {
+                        sizes.push(SizeSpec::Fixed(v as u32));
                     }
                 }
                 _ => {
@@ -2918,12 +3117,12 @@ impl Decoder {
         let first = &kids[0];
         match norm(&first.name).as_str() {
             "proportion" => {
-                let v = self.arg_number(first, 0.0001, 10.0)?;
+                let v = self.arg_number(first, f64::MIN, f64::MAX)?;
                 Some(Some(SizeSpec::Proportion(v)))
             }
             "fixed" => {
-                let v = self.arg_u32(first, 100_000)?;
-                Some(Some(SizeSpec::Fixed(v)))
+                let v = self.arg_integer(first, 0.0, u32::MAX as f64)?;
+                Some(Some(SizeSpec::Fixed(v as u32)))
             }
             _ => {
                 self.unknown(first, node.name.as_str(), &["proportion", "fixed"]);
@@ -3289,7 +3488,9 @@ impl Decoder {
                     self.decode_bind_release(node, &p.value, &mut bind);
                 }
                 "cooldown-ms" => {
-                    if let Some(v) = self.value_number(node, &p.value, 0.0, 3_600_000.0) {
+                    // niri: `cooldown = Duration::from_millis(u64)`
+                    // (niri-config/src/binds.rs:848-852): any whole millisecond count.
+                    if let Some(v) = self.value_number(node, &p.value, 0.0, u32::MAX as f64) {
                         if v.fract() == 0.0 {
                             bind.cooldown_ms = Some(v as u32);
                         } else {
@@ -3310,6 +3511,24 @@ impl Decoder {
                 "hotkey-overlay-title" => match &p.value.scalar {
                     Scalar::Null => bind.hotkey_overlay_title = Some(None),
                     Scalar::Str { text, .. } => {
+                        // niri paints the title with Pango's set_markup (wiki
+                        // Configuration:-Key-Bindings, "Custom Hotkey Overlay Titles"), so
+                        // an invalid title is not partially styled: it is shown as the
+                        // whole original string.  Say so once, here at load, instead of on
+                        // every paint; the title itself is kept verbatim so the overlay can
+                        // fall back and a later reload can succeed.
+                        if let Err(error) = crate::overlay::pango_markup::parse(
+                            text,
+                            &crate::overlay::pango_markup::Style::overlay_body(),
+                        ) {
+                            self.warn(
+                                p.value.pos,
+                                format!(
+                                    "hotkey-overlay-title \"{}\" is not valid Pango markup ({}) so it is shown literally; escape '&' as '&amp;' and '<' as '&lt;'",
+                                    text, error
+                                ),
+                            );
+                        }
                         bind.hotkey_overlay_title = Some(Some(text.clone()))
                     }
                     _ => {
@@ -3541,6 +3760,36 @@ mod tests {
     }
 
     #[test]
+    fn debug_strict_new_window_focus_policy_is_a_flag_and_other_debug_options_are_reported() {
+        // niri:niri-config/src/debug.rs, wiki:Configuration:-Debug-Options (25.01).
+        assert!(!clean("").debug.strict_new_window_focus_policy);
+        assert!(
+            clean("debug { strict-new-window-focus-policy; }")
+                .debug
+                .strict_new_window_focus_policy
+        );
+        assert!(
+            clean("debug { strict-new-window-focus-policy true; }")
+                .debug
+                .strict_new_window_focus_policy
+        );
+        assert!(
+            !clean("debug { strict-new-window-focus-policy false; }")
+                .debug
+                .strict_new_window_focus_policy
+        );
+        // Every other niri debug option configures compositor internals: a warning, the
+        // strict flag next to it still applies, and the config still loads.
+        let d = load("debug {\n    disable-direct-scanout\n    strict-new-window-focus-policy\n}");
+        assert!(!d.has_errors(), "{:?}", d.issues);
+        assert!(d.config.debug.strict_new_window_focus_policy);
+        assert_eq!(warnings(&d).len(), 1, "{:?}", d.issues);
+        assert!(warnings(&d)[0].contains("disable-direct-scanout"));
+        // A value that is not a boolean is an error, not a silent default.
+        assert!(load("debug { strict-new-window-focus-policy \"maybe\"; }").has_errors());
+    }
+
+    #[test]
     fn accessibility_is_on_by_default_and_can_be_turned_off() {
         assert!(clean("").accessibility);
         assert!(!clean("accessibility false").accessibility);
@@ -3713,13 +3962,13 @@ mod tests {
     #[test]
     fn pointing_device_options_are_stored_per_niri_spelling() {
         let cfg = clean(
-            "input {\n    mouse {\n        accel-profile \"flat\"\n        left-handed\n        middle-emulation false\n        scroll-method \"on-button-down\"\n        scroll-button 8\n        scroll-button-lock\n    }\n    touchpad {\n        dwt\n        dwtp false\n        drag true\n        drag-lock\n        click-method \"clickfinger\"\n        disabled-on-external-mouse\n        tap-button-map {\n            left 1\n            middle 3\n            right 2\n        }\n    }\n    trackpoint { off }\n    trackball { off false }\n}\n",
+            "input {\n    mouse {\n        accel-profile \"flat\"\n        left-handed\n        middle-emulation false\n        scroll-method \"on-button-down\"\n        scroll-button 274\n        scroll-button-lock\n    }\n    touchpad {\n        dwt\n        dwtp false\n        drag true\n        drag-lock\n        click-method \"clickfinger\"\n        disabled-on-external-mouse\n        tap-button-map {\n            left 1\n            middle 3\n            right 2\n        }\n    }\n    trackpoint { off }\n    trackball { off false }\n}\n",
         );
         assert_eq!(cfg.input.accel_profile, Some(AccelProfile::Flat));
         assert_eq!(cfg.input.left_handed, Some(true));
         assert_eq!(cfg.input.middle_emulation, Some(false));
         assert_eq!(cfg.input.scroll_method, Some(ScrollMethod::OnButtonDown));
-        assert_eq!(cfg.input.scroll_button, Some(8));
+        assert_eq!(cfg.input.scroll_button, Some(274));
         assert_eq!(cfg.input.scroll_button_lock, Some(true));
         assert!(
             cfg.input.touchpad_enabled,
@@ -3753,12 +4002,242 @@ mod tests {
     }
 
     #[test]
+    fn parity_axis_scroll_factor_accepts_property_only_mouse_axes() {
+        let decoded = load("input { mouse { scroll-factor horizontal=2 vertical=-1 } }");
+        assert!(
+            decoded.issues.is_empty(),
+            "valid niri axis factors must load without diagnostics: {:?}",
+            decoded.issues
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_accepts_touchpad_axes() {
+        let decoded = load("input { touchpad { scroll-factor horizontal=-1.5 vertical=0.5 } }");
+        assert!(
+            decoded.issues.is_empty(),
+            "valid niri touchpad factors must load without diagnostics: {:?}",
+            decoded.issues
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_stores_and_resolves_defaults_base_and_overrides() {
+        for (syntax, base, horizontal, vertical, expected) in [
+            ("scroll-factor", None, None, None, (1.0, 1.0)),
+            ("scroll-factor 2", Some(2.0), None, None, (2.0, 2.0)),
+            (
+                "scroll-factor horizontal=2",
+                None,
+                Some(2.0),
+                None,
+                (2.0, 1.0),
+            ),
+            (
+                "scroll-factor vertical=-1.5",
+                None,
+                None,
+                Some(-1.5),
+                (1.0, -1.5),
+            ),
+            (
+                "scroll-factor 2 vertical=-1",
+                Some(2.0),
+                None,
+                Some(-1.0),
+                (2.0, -1.0),
+            ),
+            (
+                "scroll-factor 0 horizontal=100 vertical=-100",
+                Some(0.0),
+                Some(100.0),
+                Some(-100.0),
+                (100.0, -100.0),
+            ),
+        ] {
+            for scope in ["mouse", "touchpad"] {
+                let config = clean(&format!("input {{ {scope} {{ {syntax} }} }}"));
+                let stored = if scope == "mouse" {
+                    config.input.mouse_scroll_factor
+                } else {
+                    config.input.touchpad_scroll_factor
+                };
+                let factor = stored.expect("explicit identity still preserves presence");
+                assert_eq!(
+                    (factor.base, factor.horizontal, factor.vertical),
+                    (base, horizontal, vertical)
+                );
+                assert_eq!(factor.h_v_factors(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_keeps_mouse_and_touchpad_settings_independent() {
+        let mouse = "mouse { scroll-factor 2 vertical=-1 }";
+        let touchpad = "touchpad { scroll-factor 4 horizontal=-3 }";
+        for text in [
+            format!("input {{ {mouse}; {touchpad} }}"),
+            format!("input {{ {touchpad}; {mouse} }}"),
+        ] {
+            let config = clean(&text);
+            assert_eq!(
+                config.input.mouse_scroll_factor.unwrap().h_v_factors(),
+                (2.0, -1.0)
+            );
+            assert_eq!(
+                config.input.touchpad_scroll_factor.unwrap().h_v_factors(),
+                (-3.0, 4.0)
+            );
+        }
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_extra_base_arguments() {
+        let decoded = load("input { mouse { scroll-factor 2 3 } }");
+        assert!(
+            decoded.has_errors(),
+            "scroll-factor permits at most one base argument"
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_numeric_strings() {
+        let decoded = load("input { mouse { scroll-factor \"2\" } }");
+        assert!(
+            decoded.has_errors(),
+            "niri scroll factors require numbers, not numeric strings"
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_unknown_properties() {
+        let decoded = load("input { mouse { scroll-factor 2 sideways=3 } }");
+        assert!(
+            decoded.has_errors(),
+            "unknown scroll-factor properties must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_children() {
+        let decoded = load("input { mouse { scroll-factor 2 { ignored; } } }");
+        assert!(decoded.has_errors(), "scroll-factor has no child nodes");
+    }
+
+    #[test]
+    fn parity_axis_scroll_factor_rejects_bad_types_ranges_and_duplicate_properties() {
+        for scope in ["mouse", "touchpad"] {
+            for syntax in [
+                "scroll-factor -0.01",
+                "scroll-factor 100.01",
+                "scroll-factor horizontal=-100.01",
+                "scroll-factor vertical=100.01",
+                "scroll-factor horizontal=\"2\"",
+                "scroll-factor vertical=true",
+                "scroll-factor null",
+                "scroll-factor horizontal=1 horizontal=2",
+                "scroll-factor (f64)2",
+                "scroll-factor {}",
+            ] {
+                let decoded = load(&format!("input {{ {scope} {{ {syntax} }} }}"));
+                assert!(
+                    decoded.has_errors(),
+                    "invalid factor loaded: {scope} {syntax}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parity_button_scroll_accepts_canonical_evdev_middle() {
+        let cfg = clean(
+            "input { mouse { scroll-method \"on-button-down\"; scroll-button 274; scroll-button-lock } }",
+        );
+        assert_eq!(cfg.input.scroll_method, Some(ScrollMethod::OnButtonDown));
+        assert_eq!(cfg.input.scroll_button, Some(274));
+        assert_eq!(cfg.input.scroll_button_lock, Some(true));
+    }
+
+    #[test]
+    fn parity_button_scroll_accepts_zero_to_disable() {
+        let cfg = clean("input { mouse { scroll-method \"on-button-down\"; scroll-button 0 } }");
+        assert_eq!(cfg.input.scroll_button, Some(0));
+    }
+
+    #[test]
+    fn parity_button_scroll_mouse_scope_survives_both_device_block_orders() {
+        let mouse = "mouse { scroll-method \"on-button-down\"; scroll-button 274; scroll-button-lock; natural-scroll }";
+        let touchpad = "touchpad { scroll-method \"two-finger\"; scroll-button 276; scroll-button-lock false; natural-scroll false }";
+        for text in [
+            format!("input {{ {mouse}; {touchpad} }}"),
+            format!("input {{ {touchpad}; {mouse} }}"),
+        ] {
+            let cfg = clean(&text);
+            assert_eq!(
+                cfg.input.mouse_scroll.method,
+                Some(ScrollMethod::OnButtonDown)
+            );
+            assert_eq!(cfg.input.mouse_scroll.button, Some(274));
+            assert_eq!(cfg.input.mouse_scroll.lock, Some(true));
+            assert!(cfg.input.mouse_scroll.natural);
+            assert!(cfg.input.non_mouse_scroll_configured);
+        }
+    }
+
+    #[test]
+    fn parity_button_scroll_never_completes_partial_mouse_settings_from_touchpad() {
+        for (mouse, want_method, want_button, want_lock) in [
+            (
+                "scroll-method \"on-button-down\"",
+                Some(ScrollMethod::OnButtonDown),
+                None,
+                None,
+            ),
+            ("scroll-button 274", None, Some(274), None),
+            ("scroll-button-lock", None, None, Some(true)),
+        ] {
+            let other = "touchpad { scroll-method \"on-button-down\"; scroll-button 276; scroll-button-lock }";
+            for text in [
+                format!("input {{ mouse {{ {mouse} }}; {other} }}"),
+                format!("input {{ {other}; mouse {{ {mouse} }} }}"),
+            ] {
+                let cfg = clean(&text);
+                assert_eq!(cfg.input.mouse_scroll.method, want_method);
+                assert_eq!(cfg.input.mouse_scroll.button, want_button);
+                assert_eq!(cfg.input.mouse_scroll.lock, want_lock);
+            }
+        }
+        let cfg =
+            clean("input { touchpad { scroll-method \"on-button-down\"; scroll-button 274 } }");
+        assert_eq!(cfg.input.mouse_scroll, MouseScrollConfig::default());
+    }
+
+    #[test]
+    fn parity_button_scroll_accepts_all_u32_codes_and_reports_unsupported_or_legacy() {
+        for code in [8, 99, 277, u32::MAX] {
+            let decoded = load(&format!("input {{ mouse {{ scroll-button {code} }} }}"));
+            assert!(errors(&decoded).is_empty());
+            assert_eq!(decoded.config.input.mouse_scroll.button, Some(code));
+            assert_eq!(warnings(&decoded).len(), 1);
+            assert!(warnings(&decoded)[0].contains("unsupported"));
+        }
+        for code in 1..=5 {
+            let decoded = load(&format!("input {{ mouse {{ scroll-button {code} }} }}"));
+            assert!(errors(&decoded).is_empty());
+            assert_eq!(warnings(&decoded).len(), 1);
+            assert!(warnings(&decoded)[0].contains("legacy"));
+        }
+    }
+
+    #[test]
     fn pointing_device_options_reject_bad_values() {
         let cases = [
             "input { mouse { accel-profile \"bogus\" } }",
             "input { mouse { scroll-method \"bogus\" } }",
-            "input { mouse { scroll-button 99 } }",
-            "input { mouse { scroll-button 0 } }",
+            "input { mouse { scroll-button -1 } }",
+            "input { mouse { scroll-button 1.5 } }",
+            "input { mouse { scroll-button 4294967296 } }",
             "input { touchpad { click-method \"bogus\" } }",
             "input { touchpad { tap-button-map { left 0 } } }",
             "input { touchpad { tap-button-map { thumb 1 } } }",
@@ -3871,16 +4350,21 @@ overview { backdrop-color \"#000000\" }",
         let cfg = clean(
             "layout {\n    gaps 12\n    struts { left 4; right 5; top 6; bottom 7; }\n    border { width 3; active-color \"#ffc87f\"; inactive-color \"#505050\"; urgent-color \"#9b0000\"; }\n    focus-ring { width 5; active-color \"#7fc8ff\"; inactive-color \"#404040\"; }\n    shadow { on; softness 20; spread 4; offset x=2 y=6; color \"#0007\"; }\n}\n",
         );
-        assert_eq!(cfg.layout.inner_gaps, 12);
-        assert_eq!(cfg.layout.outer_gaps, 12);
+        assert_eq!(cfg.layout.inner_gaps, 12.0);
+        assert_eq!(cfg.layout.outer_gaps, 12.0);
         assert_eq!(
             (
-                cfg.layout.reserve_left,
-                cfg.layout.reserve_right,
-                cfg.layout.reserve_top,
-                cfg.layout.reserve_bottom
+                cfg.layout.struts.left,
+                cfg.layout.struts.right,
+                cfg.layout.struts.top,
+                cfg.layout.struts.bottom
             ),
-            (4, 5, 6, 7)
+            (
+                InsetValue::Logical(4.0),
+                InsetValue::Logical(5.0),
+                InsetValue::Logical(6.0),
+                InsetValue::Logical(7.0)
+            )
         );
         assert_eq!(cfg.layout.border_width, 3);
         assert_eq!(cfg.layout.border_color_focused, "#ffc87f");
@@ -3918,14 +4402,19 @@ overview { backdrop-color \"#000000\" }",
         );
         assert_eq!(
             (
-                cfg.layout.reserve_left,
-                cfg.layout.reserve_right,
-                cfg.layout.reserve_top,
-                cfg.layout.reserve_bottom
+                cfg.layout.struts.left,
+                cfg.layout.struts.right,
+                cfg.layout.struts.top,
+                cfg.layout.struts.bottom
             ),
-            (-20, 30, 10, -5)
+            (
+                InsetValue::Logical(-20.0),
+                InsetValue::Logical(30.0),
+                InsetValue::Logical(10.0),
+                InsetValue::Logical(-5.0)
+            )
         );
-        assert_eq!(cfg.layout.inner_gaps, 12);
+        assert_eq!(cfg.layout.inner_gaps, 12.0);
     }
 
     #[test]
@@ -3977,8 +4466,13 @@ overview { backdrop-color \"#000000\" }",
 
     #[test]
     fn a_bad_preset_window_height_is_an_error_not_a_silent_drop() {
-        let d = load("layout { preset-window-heights { fixed 0 } }\n");
+        // niri keeps `proportion` unbounded and `fixed` an integer `i32`
+        // (niri-config/src/layout.rs:157-162): a decimal fixed size is a type error, not a
+        // value to round.
+        let d = load("layout { preset-window-heights { fixed 0.5 } }\n");
         assert_eq!(errors(&d).len(), 1);
+        let zero = load("layout { preset-window-heights { fixed 0 } }\n");
+        assert_eq!(errors(&zero).len(), 0, "niri accepts a zero fixed size");
     }
 
     #[test]
@@ -3993,7 +4487,7 @@ overview { backdrop-color \"#000000\" }",
         let cfg = clean(
             "layout {\n    gaps { inner 10; outer 6 }\n    borders { width 4; color \"#4d4d4d\"; color-focused \"#3381d9\"; color-urgent \"#cc3344\"; radius 8 }\n    focus-ring { width 3; color \"#3381d9\"; gap 6; inactive-color \"#404040\" }\n    shadows { enable true; opacity 0.75; offset-x 5; offset-y 5; blur 15; spread 5 }\n    column-width-mode \"proportional\"\n    max-visible-columns 4\n    column-width 700\n    scroll-step 300\n    hide-method hide\n    dim-unfocused 0.92\n    snap-on-drag false\n    snap-threshold-px 32\n    smart-borders true\n    reserve-top 30\n}\n",
         );
-        assert_eq!((cfg.layout.inner_gaps, cfg.layout.outer_gaps), (10, 6));
+        assert_eq!((cfg.layout.inner_gaps, cfg.layout.outer_gaps), (10.0, 6.0));
         assert_eq!(cfg.layout.border_width, 4);
         assert_eq!(cfg.layout.border_color, "#4d4d4d");
         assert_eq!(cfg.layout.border_color_focused, "#3381d9");
@@ -4020,10 +4514,10 @@ overview { backdrop-color \"#000000\" }",
         assert!(!cfg.layout.snap_on_drag);
         assert_eq!(cfg.layout.snap_threshold_px, 32);
         assert!(cfg.layout.smart_borders);
-        assert_eq!(cfg.layout.reserve_top, 30);
+        assert_eq!(cfg.layout.struts.top, InsetValue::Physical(30));
         // The older flat spellings.
         let cfg = clean("layout {\n    inner_gaps 12\n    border-width 3\n    border-color \"#333333\"\n    focus-ring-width 4\n    shadow-enable true\n    hide-method \"cloak\"\n}\n");
-        assert_eq!(cfg.layout.inner_gaps, 12);
+        assert_eq!(cfg.layout.inner_gaps, 12.0);
         assert_eq!(cfg.layout.border_width, 3);
         assert_eq!(cfg.layout.focus_ring_width, 4);
         assert!(cfg.layout.shadow_enable);
@@ -4042,7 +4536,7 @@ overview { backdrop-color \"#000000\" }",
         assert_eq!(a.mod_key.as_deref(), Some("super"));
         let lo = a.layout_override.as_ref().expect("layout override");
         assert_eq!(lo.column_width, Some(800));
-        assert_eq!(lo.inner_gaps, Some(20));
+        assert_eq!(lo.inner_gaps, Some(20.0));
         assert!(lo.scroll_step.is_none());
         let b = &cfg.output[1];
         assert_eq!(b.mode, "1920x1080@60");
@@ -4294,6 +4788,35 @@ overview { backdrop-color \"#000000\" }",
         }
     }
 
+    // Pinned niri applies a title with Pango set_markup (wiki
+    // Configuration:-Key-Bindings, "Custom Hotkey Overlay Titles";
+    // niri-config/src/binds.rs:873-875 keeps the string verbatim).  A bad title is a
+    // *warning* at load and stays in the config as written, because the overlay paints the
+    // whole original string when the markup is invalid.
+    #[test]
+    fn invalid_hotkey_overlay_markup_warns_once_and_keeps_the_title() {
+        let d = load(
+            "binds {\n    Mod+F9 hotkey-overlay-title=\"<b>R&D</b>\" { spawn \"notepad.exe\"; }\n}\n",
+        );
+        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+        assert_eq!(warnings(&d).len(), 1, "{:?}", warnings(&d));
+        assert!(
+            warnings(&d)[0].contains("is not valid Pango markup"),
+            "{:?}",
+            warnings(&d)
+        );
+        assert!(warnings(&d)[0].contains("R&D"), "{:?}", warnings(&d));
+        assert_eq!(
+            d.config.binds.hotkeys[0].hotkey_overlay_title,
+            Some(Some("<b>R&D</b>".to_string()))
+        );
+        // Valid markup, entities and a plain title say nothing.
+        let d = load(
+            "binds {\n    Mod+F8 hotkey-overlay-title=\"<b>R&amp;D</b>\" { spawn \"notepad.exe\"; }\n    Mod+F7 hotkey-overlay-title=\"Plain\" { spawn \"notepad.exe\"; }\n}\n",
+        );
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
+    }
+
     #[test]
     fn wiri_line_binds_still_load() {
         let cfg = clean("binds {\n    Ctrl+Alt+Left focus-column-left\n    Ctrl+Alt+1 switch-workspace 1\n    Ctrl+Alt+Return spawn-cmd \"start wt.exe || start powershell.exe\"\n    Ctrl+Alt+Y exec cmd.exe\n    Escape overview-toggle\n    extend-defaults false\n}\n");
@@ -4523,8 +5046,13 @@ overview { backdrop-color \"#000000\" }",
             is_active_in_column: false,
         };
         assert!(r.matches(&ctx));
-        // An out-of-range value must not silently alter the requested rule.
-        let d = load("window-rule { class-name \"Bright\"\n opacity 2.5 }\n");
+        // niri parses `opacity` as an unbounded f32 (niri-config/src/window_rule.rs:69) and the
+        // clamp to 0..=1 happens when the rule is resolved (src/layout/rules.rs), so 2.5 is
+        // stored as it was written.
+        let clamped = clean("window-rule { class-name \"Bright\"\n opacity 2.5 }\n");
+        assert_eq!(clamped.window_rules[0].opacity, Some(2.5));
+        // A value that is not a number is still an error and must not alter the rule.
+        let d = load("window-rule { class-name \"Bright\"\n opacity \"x\" }\n");
         assert_eq!(errors(&d).len(), 1);
         assert_eq!(d.config.window_rules[0].opacity, None);
         assert!(warnings(&d).is_empty());
@@ -4659,7 +5187,7 @@ overview { backdrop-color \"#000000\" }",
             .as_ref()
             .unwrap()
             .apply_to(&d.config.layout);
-        assert_eq!(layout.inner_gaps, 16);
+        assert_eq!(layout.inner_gaps, 16.0);
         assert!(!layout.always_center_single_column);
         for option in ["empty-workspace-above-first", "insert-hint {}"] {
             let d = load(&format!("workspace \"a\" {{ layout {{ {option}; }} }}"));
@@ -4692,7 +5220,7 @@ overview { backdrop-color \"#000000\" }",
             warnings(&d)
         );
         assert_eq!(d.config.input.repeat_delay, 123);
-        assert_eq!(d.config.layout.inner_gaps, 3);
+        assert_eq!(d.config.layout.inner_gaps, 3.0);
         // A later bind on the same chord replaces the earlier one.
         let t: Vec<&HotkeyBinding> = d
             .config
@@ -4790,7 +5318,7 @@ overview { backdrop-color \"#000000\" }",
             Some(Path::new("C:\\nowhere")),
         );
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
-        assert_eq!(d.config.layout.inner_gaps, 5);
+        assert_eq!(d.config.layout.inner_gaps, 5.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

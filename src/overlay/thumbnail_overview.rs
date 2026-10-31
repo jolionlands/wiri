@@ -11,6 +11,7 @@
 //! handler must route them through the engine, not activate source HWNDs directly.
 
 use crate::config::overview_config::OverviewConfig;
+use crate::layout::overview_geometry::intersect;
 use crate::utils::{Rect, WindowId};
 #[path = "overview_appearance.rs"]
 mod appearance;
@@ -68,6 +69,8 @@ pub enum OverviewCommand {
         window: WindowId,
         target: crate::overlay::overview_pointer::DropTarget,
     },
+    /// A horizontal scroll of the camera, in screen pixels (a right-drag or the
+    /// horizontal axis of a two-finger scroll).
     ScrollView(i32),
     Close,
 }
@@ -79,6 +82,13 @@ pub trait ThumbnailOverviewSink: Send + Sync {
     fn register(&self, window_id: WindowId, source_hwnd: isize);
     /// Destination in screen coordinates, not host-client coordinates.
     fn update_thumbnail(&self, window_id: WindowId, dst_rect: Rect);
+    /// Same, with the workspace rectangle the tile must be cropped to: niri draws
+    /// each workspace's tiles inside that workspace's own rect, so a column that
+    /// runs past the edge is cut there rather than painted into the backdrop.
+    /// The default keeps existing/test sinks source-compatible.
+    fn update_thumbnail_clipped(&self, window_id: WindowId, dst_rect: Rect, _clip: Option<Rect>) {
+        self.update_thumbnail(window_id, dst_rect);
+    }
     /// Default keeps existing/test sinks source-compatible.
     fn set_context(&self, _context: OverviewContext) {}
     fn set_appearance(&self, _style: OverviewConfig, _zoom: f64) {}
@@ -100,6 +110,7 @@ struct MockState {
     enter_calls: u32,
     exit_calls: u32,
     last_dst_rect: HashMap<WindowId, Rect>,
+    last_clip: HashMap<WindowId, Rect>,
     registered: HashMap<WindowId, isize>,
     context: Option<OverviewContext>,
 }
@@ -123,6 +134,10 @@ impl MockThumbnailOverview {
     pub fn last_dst_rect(&self, id: WindowId) -> Option<Rect> {
         self.inner.lock().last_dst_rect.get(&id).copied()
     }
+    /// The workspace crop the engine published for this tile, if it published one.
+    pub fn last_clip(&self, id: WindowId) -> Option<Rect> {
+        self.inner.lock().last_clip.get(&id).copied()
+    }
     pub fn last_context(&self) -> Option<OverviewContext> {
         self.inner.lock().context.clone()
     }
@@ -138,6 +153,7 @@ impl ThumbnailOverviewSink for MockThumbnailOverview {
         s.unregister_calls += s.registered.len() as u32;
         s.registered.clear();
         s.last_dst_rect.clear();
+        s.last_clip.clear();
         s.context = None;
     }
     fn register(&self, id: WindowId, source: isize) {
@@ -150,6 +166,21 @@ impl ThumbnailOverviewSink for MockThumbnailOverview {
         let mut s = self.inner.lock();
         if s.registered.contains_key(&id) {
             s.last_dst_rect.insert(id, rect);
+            s.last_clip.remove(&id);
+        }
+    }
+    fn update_thumbnail_clipped(&self, id: WindowId, rect: Rect, clip: Option<Rect>) {
+        let mut s = self.inner.lock();
+        if s.registered.contains_key(&id) {
+            s.last_dst_rect.insert(id, rect);
+            match clip {
+                Some(clip) => {
+                    s.last_clip.insert(id, clip);
+                }
+                None => {
+                    s.last_clip.remove(&id);
+                }
+            }
         }
     }
     fn set_context(&self, context: OverviewContext) {
@@ -161,6 +192,7 @@ impl ThumbnailOverviewSink for MockThumbnailOverview {
         s.unregister_calls += s.registered.len() as u32;
         s.registered.clear();
         s.last_dst_rect.clear();
+        s.last_clip.clear();
         s.context = None;
     }
     fn retain_windows(&self, windows: &[WindowId]) {
@@ -169,6 +201,7 @@ impl ThumbnailOverviewSink for MockThumbnailOverview {
         s.registered.retain(|id, _| windows.contains(id));
         s.unregister_calls += (before - s.registered.len()) as u32;
         s.last_dst_rect.retain(|id, _| windows.contains(id));
+        s.last_clip.retain(|id, _| windows.contains(id));
     }
     fn registered_count(&self) -> usize {
         self.inner.lock().registered.len()
@@ -218,17 +251,31 @@ fn hit_test(
 
 /// Clip to the monitor and convert screen -> host coordinates, cropping the
 /// source proportionally. Merely clipping rcDestination would squash previews.
+///
+/// `clip` is an additional screen-space crop (the tile's workspace rectangle):
+/// niri renders each workspace's windows inside that workspace's own rectangle,
+/// so a column running past the edge is cut there and the crop still shows the
+/// right part of the window.
 #[cfg(any(target_os = "windows", test))]
-fn thumbnail_geometry(dst: Rect, bounds: Rect, source: (i32, i32)) -> Option<(Rect, Rect)> {
+fn thumbnail_geometry(
+    dst: Rect,
+    bounds: Rect,
+    source: (i32, i32),
+    clip: Option<Rect>,
+) -> Option<(Rect, Rect)> {
     if dst.size.w == 0 || dst.size.h == 0 || source.0 <= 0 || source.1 <= 0 {
         return None;
     }
-    let x = i64::from(dst.loc.x).max(i64::from(bounds.loc.x));
-    let y = i64::from(dst.loc.y).max(i64::from(bounds.loc.y));
+    let clip_bounds = match clip {
+        Some(clip) => intersect(bounds, clip)?,
+        None => bounds,
+    };
+    let x = i64::from(dst.loc.x).max(i64::from(clip_bounds.loc.x));
+    let y = i64::from(dst.loc.y).max(i64::from(clip_bounds.loc.y));
     let right = (i64::from(dst.loc.x) + i64::from(dst.size.w))
-        .min(i64::from(bounds.loc.x) + i64::from(bounds.size.w));
+        .min(i64::from(clip_bounds.loc.x) + i64::from(clip_bounds.size.w));
     let bottom = (i64::from(dst.loc.y) + i64::from(dst.size.h))
-        .min(i64::from(bounds.loc.y) + i64::from(bounds.size.h));
+        .min(i64::from(clip_bounds.loc.y) + i64::from(clip_bounds.size.h));
     if right <= x || bottom <= y {
         return None;
     }
@@ -289,6 +336,9 @@ mod win {
     struct Tile {
         source: isize,
         rect: Option<Rect>,
+        /// The workspace rectangle this tile is cropped to (niri draws each
+        /// workspace's windows inside that workspace's own rect).
+        clip: Option<Rect>,
     }
     #[derive(Clone, Default)]
     struct Scene {
@@ -380,13 +430,21 @@ mod win {
                 s.tiles
                     .entry(id)
                     .and_modify(|t| t.source = source)
-                    .or_insert(Tile { source, rect: None });
+                    .or_insert(Tile {
+                        source,
+                        rect: None,
+                        clip: None,
+                    });
             });
         }
         fn update_thumbnail(&self, id: WindowId, rect: Rect) {
+            self.update_thumbnail_clipped(id, rect, None);
+        }
+        fn update_thumbnail_clipped(&self, id: WindowId, rect: Rect, clip: Option<Rect>) {
             self.publish(|s| {
                 if let Some(tile) = s.tiles.get_mut(&id) {
                     tile.rect = Some(rect);
+                    tile.clip = clip;
                 }
             });
         }
@@ -454,7 +512,13 @@ mod win {
                 if !self.thumbnails.contains_key(id) {
                     return None;
                 }
-                t.rect.map(|r| (*id, r))
+                let rect = t.rect?;
+                // Only the part inside the tile's workspace is clickable.
+                let visible = match t.clip {
+                    Some(clip) => intersect(rect, clip)?,
+                    None => rect,
+                };
+                Some((*id, visible))
             })
         }
         unsafe fn update(&mut self, hwnd: HWND) {
@@ -466,7 +530,13 @@ mod win {
             self.scene = scene;
             for (&id, tile) in &mut self.scene.tiles {
                 if let Some(rect) = tile.rect {
-                    tile.rect = Some(self.pointer.dragged_rect(id, rect));
+                    let dragged = self.pointer.dragged_rect(id, rect);
+                    if dragged != rect {
+                        // A window dragged in the overview follows the pointer across
+                        // workspaces, so its workspace crop no longer applies.
+                        tile.clip = None;
+                        tile.rect = Some(dragged);
+                    }
                 }
             }
             if let Some(context) = &self.scene.context {
@@ -494,7 +564,7 @@ mod win {
                 };
                 let geometry = tile.rect.and_then(|rect| {
                     let size: SIZE = DwmQueryThumbnailSourceSize(thumbnail.handle).ok()?;
-                    thumbnail_geometry(rect, self.bounds, (size.cx, size.cy))
+                    thumbnail_geometry(rect, self.bounds, (size.cx, size.cy), tile.clip)
                 });
                 let mut props = DWM_THUMBNAIL_PROPERTIES {
                     dwFlags: DWM_TNP_VISIBLE,
@@ -572,6 +642,25 @@ mod win {
             property(hwnd, "WiriOverviewFocusY", rect.loc.y as isize);
             property(hwnd, "WiriOverviewFocusW", rect.size.w as isize);
             property(hwnd, "WiriOverviewFocusH", rect.size.h as isize);
+            // Per-tile destination geometry in draw order (top to bottom, then left to
+            // right), so the live harness can read where each column of each workspace row
+            // actually sits instead of trusting a screenshot. Session-local like the rest.
+            let mut tiles: Vec<(WindowId, Rect)> = self
+                .scene
+                .tiles
+                .iter()
+                .filter_map(|(id, tile)| tile.rect.map(|rect| (*id, rect)))
+                .collect();
+            tiles.sort_by_key(|(id, rect)| (rect.loc.y, rect.loc.x, id.as_isize()));
+            property(hwnd, "WiriOverviewTileCount", tiles.len() as isize);
+            for (index, (id, rect)) in tiles.iter().enumerate() {
+                let prefix = format!("WiriOverviewTile{index}");
+                property(hwnd, &format!("{prefix}Window"), id.as_isize());
+                property(hwnd, &format!("{prefix}X"), rect.loc.x as isize);
+                property(hwnd, &format!("{prefix}Y"), rect.loc.y as isize);
+                property(hwnd, &format!("{prefix}W"), rect.size.w as isize);
+                property(hwnd, &format!("{prefix}H"), rect.size.h as isize);
+            }
             if background_changed {
                 self.background = appearance::background(
                     self.bounds,
@@ -1024,19 +1113,19 @@ mod tests {
     fn negative_monitor_origin_is_translated_and_source_is_cropped() {
         let bounds = context().bounds;
         let (dst, src) =
-            thumbnail_geometry(Rect::new(-2020, -50, 400, 200), bounds, (800, 400)).unwrap();
+            thumbnail_geometry(Rect::new(-2020, -50, 400, 200), bounds, (800, 400), None).unwrap();
         assert_eq!(dst, Rect::new(0, 0, 300, 150));
         assert_eq!(src, Rect::new(200, 100, 600, 300));
         assert_eq!(
-            thumbnail_geometry(Rect::new(1, 0, 400, 200), bounds, (800, 400)),
+            thumbnail_geometry(Rect::new(1, 0, 400, 200), bounds, (800, 400), None),
             None
         );
         assert_eq!(
-            thumbnail_geometry(Rect::new(-1800, 0, 0, 200), bounds, (800, 400)),
+            thumbnail_geometry(Rect::new(-1800, 0, 0, 200), bounds, (800, 400), None),
             None
         );
         assert_eq!(
-            thumbnail_geometry(Rect::new(-1800, 0, 100, 200), bounds, (0, 400)),
+            thumbnail_geometry(Rect::new(-1800, 0, 100, 200), bounds, (0, 400), None),
             None
         );
     }
@@ -1046,9 +1135,30 @@ mod tests {
             thumbnail_geometry(
                 Rect::new(-1800, 100, 400, 200),
                 context().bounds,
-                (800, 400)
+                (800, 400),
+                None
             ),
             Some((Rect::new(120, 100, 400, 200), Rect::new(0, 0, 800, 400)))
+        );
+    }
+    /// niri keeps every workspace's windows inside that workspace's own rectangle,
+    /// so a column that runs past the edge is cropped there - and the DWM source
+    /// rectangle must be cropped proportionally, not squashed.
+    #[test]
+    fn thumbnail_cropped_at_a_workspace_edge_keeps_a_proportional_source() {
+        let bounds = Rect::new(0, 0, 1366, 768);
+        // A 400 px wide thumbnail whose last 125 px stay inside the workspace.
+        let ws = Rect::new(342, 192, 683, 384);
+        let (dst, src) =
+            thumbnail_geometry(Rect::new(900, 192, 400, 384), bounds, (800, 768), Some(ws))
+                .expect("the overlapping part is visible");
+        assert_eq!(dst, Rect::new(900, 192, 125, 384));
+        // 125/400 of the source width is kept, from its left edge.
+        assert_eq!(src, Rect::new(0, 0, 250, 768));
+        // Nothing left inside the workspace: no thumbnail at all.
+        assert_eq!(
+            thumbnail_geometry(Rect::new(1100, 192, 100, 100), bounds, (800, 768), Some(ws)),
+            None
         );
     }
     #[test]

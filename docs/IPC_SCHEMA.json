@@ -320,15 +320,162 @@
       "description": "Direction to an adjacent monitor."
     },
 
+    "PositionChange": {
+      "description": "Logical-pixel or percentage-point position change. SetFixed is relative to the working-area origin; proportions use the full working-area dimension (50 means 50%). Signed CLI values adjust. Proportional results clamp to 0..10000 before visibility clamping.",
+      "type": "object", "minProperties": 1, "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "SetFixed": { "type": "number" },
+        "SetProportion": { "type": "number" },
+        "AdjustFixed": { "type": "number" },
+        "AdjustProportion": { "type": "number" }
+      }
+    },
+    "MoveFloatingWindow": {
+      "description": "IPC/CLI-only positioning. Omitted axes mean AdjustFixed(0). Floating targets retain 10..75 logical pixels of partial visibility; tiled targets update stored floating position and require both axes absolute unless stored/default position exists. Does not focus or switch workspace. An active move blocks implicit or matching targets, permitting other explicit IDs.",
+      "type": "object",
+      "properties": {
+        "id": { "type": ["integer", "null"], "minimum": 0, "description": "Managed window HWND; null or omitted selects the focused window." },
+        "x": { "$ref": "#/$defs/PositionChange", "default": { "AdjustFixed": 0.0 } },
+        "y": { "$ref": "#/$defs/PositionChange", "default": { "AdjustFixed": 0.0 } }
+      }
+    },
+    "WorkspaceReferenceArg": {
+      "description": "Typed JSON workspace reference. Id is lossless u64 and resolves current WorkspaceIpc.id globally, following the workspace object through rename, reorder and monitor relocation. Valid absent IDs are handled no-ops without fallback, mutation or focus; invalid typed IDs return Err. Index is an output-local visible position; Name is a global string name, including numeric strings. CLI/KDL retain index/name syntax and expose no Id spelling.",
+      "type": "object", "minProperties": 1, "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "Id": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615, "description": "Unsigned 64-bit JSON integer; clients must preserve exact integer precision. Strings, negative, fractional and overflowing values are errors. Runtime serde also rejects float encodings such as 42.0; JSON Schema's mathematical integer semantics cannot enforce that lexical restriction." },
+        "Index": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "Name": { "type": "string" }
+      }
+    },
+    "NullableWorkspaceReferenceArg": {
+      "description": "Omitted or null selects the focused workspace; otherwise the explicit typed reference selects the workspace.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/WorkspaceReferenceArg" }]
+    },
+    "FocusWorkspace": {
+      "type": "object", "required": ["reference"],
+      "properties": { "reference": { "$ref": "#/$defs/WorkspaceReferenceArg" } }
+    },
+    "MoveWindowToWorkspace": {
+      "type": "object", "required": ["reference"],
+      "description": "Move a window to a typed workspace reference. Index is local to the window's output; Id and Name are global. focus=false does not follow the transferred window to its destination. Unknown valid workspace IDs are handled without mutation or focus.",
+      "properties": {
+        "reference": { "$ref": "#/$defs/WorkspaceReferenceArg" },
+        "window_id": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615, "description": "Managed window HWND; omitted/null selects the focused window. Explicit handles must fit the native handle range." },
+        "id": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615, "description": "Alias for window_id; send only one spelling." },
+        "focus": { "type": "boolean", "default": true }
+      },
+      "not": { "required": ["window_id", "id"] }
+    },
+    "MoveColumnToWorkspace": {
+      "type": "object", "required": ["reference"],
+      "properties": {
+        "reference": { "$ref": "#/$defs/WorkspaceReferenceArg" },
+        "focus": { "type": "boolean", "default": true }
+      }
+    },
+    "MoveWorkspaceToIndex": {
+      "type": "object", "required": ["index"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0, "description": "Destination visible position; clamps to the finite workspace stack and must fit the daemon's usize." },
+        "reference": { "$ref": "#/$defs/NullableWorkspaceReferenceArg" }
+      }
+    },
+    "SetWorkspaceName": {
+      "type": "object", "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "workspace": { "$ref": "#/$defs/NullableWorkspaceReferenceArg" }
+      }
+    },
+    "UnsetWorkspaceName": {
+      "type": "object",
+      "properties": { "reference": { "$ref": "#/$defs/NullableWorkspaceReferenceArg" } }
+    },
+    "MoveWorkspaceToMonitor": {
+      "type": "object", "required": ["output"],
+      "properties": {
+        "output": { "type": "string" },
+        "reference": { "$ref": "#/$defs/NullableWorkspaceReferenceArg" }
+      }
+    },
+    "WorkspaceIpcAction": {
+      "description": "Lossless transport for the seven typed workspace actions. Payloads tolerate unknown future fields; required and optional known fields retain their declared JSON types.",
+      "type": "object", "minProperties": 1, "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "FocusWorkspace": { "$ref": "#/$defs/FocusWorkspace" },
+        "MoveWindowToWorkspace": { "$ref": "#/$defs/MoveWindowToWorkspace" },
+        "MoveColumnToWorkspace": { "$ref": "#/$defs/MoveColumnToWorkspace" },
+        "MoveWorkspaceToIndex": { "$ref": "#/$defs/MoveWorkspaceToIndex" },
+        "SetWorkspaceName": { "$ref": "#/$defs/SetWorkspaceName" },
+        "UnsetWorkspaceName": { "$ref": "#/$defs/UnsetWorkspaceName" },
+        "MoveWorkspaceToMonitor": { "$ref": "#/$defs/MoveWorkspaceToMonitor" }
+      }
+    },
+    "IpcSizeChange": {
+      "description": "Typed size change for SetColumnWidth, SetWindowWidth and SetWindowHeight. Fixed values are signed i32 logical pixels; proportions are finite percentage points (50 means 50%, 0.1 means 0.1%). The engine rounds proportions to 0.001 percentage points and saturates the resulting thousandths to signed i32 before layout constraints apply. Negative and zero values retain their Set/Adjust kind; layout constraints may clamp the resulting allocation. Runtime serde rejects float-encoded Fixed values such as 160.0; JSON Schema's mathematical integer semantics cannot enforce that lexical restriction.",
+      "type": "object", "minProperties": 1, "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "SetFixed": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "AdjustFixed": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "SetProportion": { "type": "number" },
+        "AdjustProportion": { "type": "number" }
+      }
+    },
+    "TypedSizeActionFields": {
+      "description": "Required typed change; optional id/window_id selects a managed window, omitted/null means focused window. SetWindowWidth and SetWindowHeight target directly without focusing; Wiri's optional ID extension on SetColumnWidth retains legacy focus-before-action behavior. Unknown future fields are tolerated. focus=false is unsupported.",
+      "type": "object", "required": ["change"],
+      "properties": {
+        "change": { "$ref": "#/$defs/IpcSizeChange" },
+        "id": { "type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615, "description": "Positive managed HWND fitting the daemon's native handle range." },
+        "window_id": { "type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615, "description": "Alias for id; send only one spelling." }
+      },
+      "not": { "required": ["id", "window_id"] }
+    },
+    "SizeIpcAction": {
+      "type": "object", "minProperties": 1, "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "SetColumnWidth": { "$ref": "#/$defs/TypedSizeActionFields" },
+        "SetWindowWidth": { "$ref": "#/$defs/TypedSizeActionFields" },
+        "SetWindowHeight": { "$ref": "#/$defs/TypedSizeActionFields" }
+      }
+    },
+    "NiriAction": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object", "minProperties": 1, "maxProperties": 1,
+          "properties": {
+            "MoveFloatingWindow": { "$ref": "#/$defs/MoveFloatingWindow" },
+            "SetColumnWidth": { "$ref": "#/$defs/TypedSizeActionFields" },
+            "SetWindowWidth": { "$ref": "#/$defs/TypedSizeActionFields" },
+            "SetWindowHeight": { "$ref": "#/$defs/TypedSizeActionFields" },
+            "FocusWorkspace": { "$ref": "#/$defs/FocusWorkspace" },
+            "MoveWindowToWorkspace": { "$ref": "#/$defs/MoveWindowToWorkspace" },
+            "MoveColumnToWorkspace": { "$ref": "#/$defs/MoveColumnToWorkspace" },
+            "MoveWorkspaceToIndex": { "$ref": "#/$defs/MoveWorkspaceToIndex" },
+            "SetWorkspaceName": { "$ref": "#/$defs/SetWorkspaceName" },
+            "UnsetWorkspaceName": { "$ref": "#/$defs/UnsetWorkspaceName" },
+            "MoveWorkspaceToMonitor": { "$ref": "#/$defs/MoveWorkspaceToMonitor" }
+          }
+        }
+      ]
+    },
     "NiriRequest": {
       "description": "Externally tagged requests; supported typed Action and Output variants use PascalCase. Unknown requests receive Err without disconnecting.",
       "oneOf": [
         { "type": "string", "enum": ["Version", "Outputs", "Workspaces", "Windows", "KeyboardLayouts", "FocusedOutput", "FocusedWindow", "PickWindow", "PickColor", "EventStream", "ReturnError", "OverviewState"] },
-        { "type": "object", "minProperties": 1, "maxProperties": 1, "properties": { "Action": {"type": ["object", "string"]}, "Output": {"type": "object"} }, "additionalProperties": false }
+        { "type": "object", "minProperties": 1, "maxProperties": 1, "properties": { "Action": { "$ref": "#/$defs/NiriAction" }, "Output": {"type": "object"} }, "additionalProperties": false }
       ],
       "examples": [
         "Outputs", "FocusedOutput", "KeyboardLayouts", "PickWindow", "PickColor", "ReturnError", "EventStream",
         { "Action": { "SetColumnWidth": { "change": { "AdjustProportion": 0.1 }, "id": 42 } } },
+        { "Action": { "MoveFloatingWindow": { "id": 42, "x": { "SetProportion": 50.0 } } } },
         { "Output": { "output": "DISPLAY1", "action": { "Scale": { "scale": 1.25 } } } }
       ]
     },
@@ -384,6 +531,33 @@
     "IpcMessage": {
       "description": "Any request sent from a client to the wiri daemon.",
       "oneOf": [
+        {
+          "type": "object", "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "size_action" },
+            "data": {
+              "type": "object", "required": ["action"],
+              "properties": { "action": { "$ref": "#/$defs/SizeIpcAction" } }
+            }
+          }
+        },
+        {
+          "type": "object", "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "workspace_action" },
+            "data": {
+              "type": "object", "required": ["action"],
+              "properties": { "action": { "$ref": "#/$defs/WorkspaceIpcAction" } }
+            }
+          }
+        },
+        {
+          "type": "object", "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "move_floating_window" },
+            "data": { "$ref": "#/$defs/MoveFloatingWindow" }
+          }
+        },
         {"type":"object","required":["type"],"properties":{"type":{"const":"outputs"}}},
         {"type":"object","required":["type"],"properties":{"type":{"const":"focused_output"}}},
         {"type":"object","required":["type"],"properties":{"type":{"const":"keyboard_layouts"}}},

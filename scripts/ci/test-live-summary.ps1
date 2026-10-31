@@ -118,4 +118,89 @@ foreach ($phase in Get-ChildItem -Path (Join-Path $PSScriptRoot '..\live-phases'
     }
 }
 Write-Host 'Live phases do not shadow the harness directory $D.'
+# These fields are added by live phases, outside the static summary hashtable.
+# Their presence is conditional; actual false Boolean results and phase errors
+# must fail CI without treating descriptive values as additional Boolean gates.
+$dynamicBooleanNames = @('h69_environment_spawn_argv', 'h86_monitor_relocation_preserves_id')
+foreach ($name in $dynamicBooleanNames) {
+    if ($keys -contains $name) { throw "Dynamic fixture is now a static gate: $name; select a phase-added gate" }
+}
+$dynamicCases = @(
+    @{ Name = 'dynamic H69 false is rejected'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'h69_environment_spawn_argv' -NotePropertyValue $false
+        Assert-Invalid $s 'h69_environment_spawn_argv'
+    } },
+    @{ Name = 'dynamic H86 false is rejected'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'h86_monitor_relocation_preserves_id' -NotePropertyValue $false
+        Assert-Invalid $s 'h86_monitor_relocation_preserves_id'
+    } },
+    @{ Name = 'dynamic H69 true is accepted'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'h69_environment_spawn_argv' -NotePropertyValue $true
+        Assert-Valid $s
+    } },
+    @{ Name = 'dynamic H86 true is accepted'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'h86_monitor_relocation_preserves_id' -NotePropertyValue $true
+        Assert-Valid $s
+    } },
+    @{ Name = 'dynamic hardware information with a nested false is accepted'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'h86_monitor_relocation_info' -NotePropertyValue ([pscustomobject]@{
+            status = 'unverified: requires a second connected physical output'
+            observed_output_count = 1
+            typed_action = 'MoveWorkspaceToMonitor'
+            counted_as_pass = $false
+        })
+        Assert-Valid $s
+    } },
+    @{ Name = 'dynamic descriptive numeric values are accepted'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'h86_observed_output_count' -NotePropertyValue 1
+        $s | Add-Member -NotePropertyName 'h69_probe_duration_ms' -NotePropertyValue 0.25
+        Assert-Valid $s
+    } },
+    @{ Name = 'dynamic session phase error is rejected'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'phase_error_lane_c2_session' -NotePropertyValue 'Fixture: session phase threw before recording its gates'
+        Assert-Invalid $s 'phase_error_lane_c2_session'
+    } },
+    @{ Name = 'dynamic workspace phase error is rejected'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'phase_error_lane_workspace_ids' -NotePropertyValue 'Fixture: output query failed'
+        Assert-Invalid $s 'phase_error_lane_workspace_ids'
+    } },
+    @{ Name = 'empty dynamic phase error is accepted'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'phase_error_lane_c2_session' -NotePropertyValue ''
+        Assert-Valid $s
+    } },
+    @{ Name = 'null dynamic phase error is accepted'; Check = {
+        $s = New-Summary
+        $s | Add-Member -NotePropertyName 'phase_error_lane_workspace_ids' -NotePropertyValue $null
+        Assert-Valid $s
+    } },
+    @{ Name = 'explicit WT skip does not hide a dynamic false gate'; Check = {
+        $s = New-Summary
+        $s.h2_wt_exe_found_on_path = $null
+        $s.ci_skips = @([pscustomobject]@{ gate = 'h2_wt_exe_found_on_path'; reason = 'wt.exe missing' })
+        $s | Add-Member -NotePropertyName 'h69_environment_spawn_argv' -NotePropertyValue $false
+        Assert-Invalid $s 'h69_environment_spawn_argv'
+    } }
+)
+$dynamicFailures = New-Object 'System.Collections.Generic.List[string]'
+foreach ($case in $dynamicCases) {
+    try {
+        & ($case.Check)
+        Write-Host "PASS: $($case.Name)"
+    } catch {
+        $message = "$($case.Name): $($_.Exception.Message)"
+        $dynamicFailures.Add($message)
+        Write-Host "FAIL: $message"
+    }
+}
+Write-Host ("Dynamic summary fixtures: {0} passed, {1} failed." -f ($dynamicCases.Count - $dynamicFailures.Count), $dynamicFailures.Count)
+if ($dynamicFailures.Count) { throw "Dynamic summary fixtures failed: $($dynamicFailures -join '; ')" }
 Write-Host 'Live-summary fixture tests passed (no desktop automation).'

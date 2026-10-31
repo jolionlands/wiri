@@ -159,8 +159,8 @@ struct Cli {
     #[arg(short, long, default_value = "5", global = true)]
     timeout: u64,
 
-    /// Emit the raw JSON response instead of a formatted summary.
-    #[arg(long, global = true)]
+    /// Emit the raw JSON response instead of a formatted summary (niri's `msg -j`).
+    #[arg(short = 'j', long, global = true)]
     json: bool,
 
     /// Print the request JSON and exit without connecting to the daemon.
@@ -248,6 +248,14 @@ enum Commands {
 
     /// Whether the overview is open.
     OverviewState,
+
+    /// List open layer-shell surfaces (niri `msg layers`).  Windows has no layer-shell:
+    /// the daemon answers niri's own "not available on Windows" error, exit status 1.
+    Layers,
+
+    /// List screencasts (niri `msg casts`).  Windows has no portal casting: the daemon
+    /// answers "not available on Windows", exit status 1.
+    Casts,
 
     /// The version of the running wiri daemon (the daemon's, not this CLI's:
     /// `wiri-ctl --version` is the CLI's).
@@ -352,6 +360,16 @@ enum Commands {
 
     /// Focus the workspace above (no wrapping)
     FocusWorkspacePrevious,
+
+    /// Move a float, or set a tile's remembered floating position (logical pixels or %).
+    MoveFloatingWindow {
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(short, long, default_value = "+0", allow_hyphen_values = true)]
+        x: wiri::ipc::PositionChange,
+        #[arg(short, long, default_value = "+0", allow_hyphen_values = true)]
+        y: wiri::ipc::PositionChange,
+    },
 
     /// Run any action by its niri name, as if its key were pressed:
     /// `wiri-ctl action focus-column-left`, `wiri-ctl action set-column-width +10%`,
@@ -586,6 +604,26 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
+    // `niri msg layers` / `niri msg casts` have no Windows counterpart.  They still travel as
+    // niri's own request names, so the daemon (not clap) says why and the exit status is 1.
+    if let Some(request) = niri_only_request(&command) {
+        let text = serde_json::to_string(request)?;
+        if cli.print_request {
+            println!("{}", text);
+            return Ok(());
+        }
+        let reply = block_on(async {
+            let mut client = connect_ipc(cli.timeout).await?;
+            Ok(client.request_raw(&text).await?)
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&reply)?;
+        if let Some(error) = value.get("Err").and_then(serde_json::Value::as_str) {
+            anyhow::bail!("{}", error);
+        }
+        println!("{}", reply);
+        return Ok(());
+    }
+
     let event_output = match &command {
         Commands::EventStream { stream, .. } => Some(*stream || cli.json),
         _ => None,
@@ -634,6 +672,7 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
         Commands::RequestError => IpcMessage::ReturnError,
         Commands::RawRequest { .. } => unreachable!("raw requests handled before IPC dial"),
         Commands::OverviewState => IpcMessage::OverviewState,
+        Commands::Layers | Commands::Casts => unreachable!("niri-only requests handled above"),
         Commands::Version => IpcMessage::Version,
         Commands::SwitchWorkspace { id } => IpcMessage::SwitchWorkspace { id },
         Commands::FocusWindow { hwnd } => IpcMessage::FocusWindow { window_hwnd: hwnd },
@@ -685,10 +724,16 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
         Commands::ResizeColumn { delta_px } => IpcMessage::ResizeColumn { delta_px },
         Commands::FocusWorkspaceNext => IpcMessage::FocusWorkspaceNext,
         Commands::FocusWorkspacePrevious => IpcMessage::FocusWorkspacePrevious,
+        Commands::MoveFloatingWindow { id, x, y } => IpcMessage::MoveFloatingWindow { id, x, y },
         Commands::Spawn { command, args } => IpcMessage::SpawnCommand { command, args },
         Commands::Action { name, args } => {
+            let args = wiri::ipc::niri_cli_words(&name, args);
             let (args, quoted) = split_quoted_words(args);
-            IpcMessage::RunAction { name, args, quoted }
+            if name == "move-floating-window" {
+                wiri::ipc::parse_move_floating_window(&args).map_err(anyhow::Error::msg)?
+            } else {
+                IpcMessage::RunAction { name, args, quoted }
+            }
         }
         Commands::FocusPrevious => IpcMessage::FocusPrevious,
         Commands::ToggleAlwaysOnTop => IpcMessage::ToggleAlwaysOnTop,
@@ -752,6 +797,15 @@ fn request_for(command: Commands) -> Result<IpcMessage> {
     })
 }
 
+/// The niri requests wiri-ctl forwards only to be told that Windows has no such thing.
+fn niri_only_request(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Layers => Some("Layers"),
+        Commands::Casts => Some("Casts"),
+        _ => None,
+    }
+}
+
 fn event_types(types: &str) -> Vec<String> {
     if types.trim().is_empty() || types.trim() == "*" {
         Vec::new()
@@ -801,6 +855,10 @@ fn output_action(words: &[String]) -> Result<serde_json::Value> {
         ["scale", scale] => json!({"Scale": {"scale": scalar(scale)}}),
         ["transform", transform] => json!({"Transform": {"transform": transform}}),
         ["position", "auto"] => json!({"Position": {"position": "Auto"}}),
+        ["position", "set", x, y] => {
+            json!({"Position": {"position": {"x": scalar(x), "y": scalar(y)}}})
+        }
+        ["position", "set", ..] => anyhow::bail!("expected position set X Y"),
         ["position", x, y] => {
             json!({"Position": {"position": {"x": scalar(x), "y": scalar(y)}}})
         }
@@ -815,7 +873,7 @@ fn output_action(words: &[String]) -> Result<serde_json::Value> {
         ["max-bpc", max_bpc] => json!({"MaxBpc": {"max_bpc": scalar(max_bpc)}}),
         _ => anyhow::bail!(
             "expected external output-action JSON, or on/off, mode MODE, scale SCALE, \
-             transform TRANSFORM, position X Y/auto, vrr on/off, max-bpc BITS"
+             transform TRANSFORM, position set X Y, position X Y/auto, vrr on/off, max-bpc BITS"
         ),
     })
 }
@@ -1566,6 +1624,17 @@ fn print_monitor_list(resp: &serde_json::Value) {
         result.len(),
         if result.len() == 1 { "" } else { "s" }
     );
+    // wiri extension: which outputs run the unified XY grid (`layout { unified-grid }`).
+    let unified: Vec<&str> = result
+        .iter()
+        .filter(|m| m.get("unified_grid").and_then(|v| v.as_bool()) == Some(true))
+        .map(|m| m.get("name").and_then(|v| v.as_str()).unwrap_or("?"))
+        .collect();
+    if unified.is_empty() {
+        outln!("  unified-grid: off (niri: one horizontal camera per workspace row)");
+    } else {
+        outln!("  unified-grid: on for {}", unified.join(", "));
+    }
 }
 
 /// Format the response to `ListBindings` (sent by `test-bindings`) as a
@@ -1976,6 +2045,60 @@ mod tests {
     }
 
     #[test]
+    fn parity_move_floating_window_cli_keeps_signed_axes_and_target() {
+        let request = request_of(&[
+            "wiri-ctl",
+            "msg",
+            "action",
+            "move-floating-window",
+            "--id",
+            "42",
+            "--x",
+            "-10%",
+            "--y",
+            "120",
+        ]);
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "type":"move_floating_window",
+                "data":{"id":42,"x":{"AdjustProportion":-10.0},"y":{"SetFixed":120.0}}
+            })
+        );
+    }
+
+    #[test]
+    fn parity_move_floating_window_direct_cli_defaults_and_validates_axes() {
+        for args in [
+            vec!["wiri-ctl", "move-floating-window", "--x=50%"],
+            vec!["wiri-ctl", "msg", "move-floating-window", "-x", "50%"],
+            vec!["wiri-ctl", "action", "move-floating-window", "--x", "50%"],
+        ] {
+            assert_eq!(
+                serde_json::to_value(request_of(&args)).unwrap(),
+                serde_json::json!({
+                    "type":"move_floating_window","data":{"id":null,
+                    "x":{"SetProportion":50.0},"y":{"AdjustFixed":0.0}}
+                })
+            );
+        }
+        for args in [
+            vec!["wiri-ctl", "move-floating-window", "--x", "NaN"],
+            vec!["wiri-ctl", "move-floating-window", "--y", "10%extra"],
+            vec!["wiri-ctl", "move-floating-window", "--id", "-1"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for args in [vec!["--x"], vec!["--id", "abc"], vec!["--x", "NaN"]] {
+            let cli = Cli::try_parse_from(
+                [vec!["wiri-ctl", "action", "move-floating-window"], args].concat(),
+            )
+            .unwrap();
+            assert!(request_for(cli.command.into_command()).is_err());
+        }
+    }
+
+    #[test]
     fn the_niri_subcommands_ask_for_the_niri_requests() {
         assert!(matches!(
             request_of(&["wiri-ctl", "workspaces"]),
@@ -2041,6 +2164,114 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["wiri-ctl", "workspaces"]).expect("parses");
         assert!(!cli.json, "the readable output is the default");
+    }
+
+    #[test]
+    fn niri_msg_short_json_flag_and_every_msg_subcommand_exist() {
+        // niri:src/cli.rs:44-45: `#[arg(short, long)] json`, so `niri msg -j windows`.
+        for args in [
+            vec!["wiri-ctl", "-j", "windows"],
+            vec!["wiri-ctl", "msg", "-j", "windows"],
+            vec!["wiri-ctl", "msg", "windows", "-j"],
+        ] {
+            let cli = Cli::try_parse_from(args.clone()).expect("the command line parses");
+            assert!(cli.json, "{:?}", args);
+        }
+        // niri:src/cli.rs:67-117: all seventeen `niri msg` subcommands parse, `layers` and
+        // `casts` included (Windows has neither; the daemon answers with an error).
+        for name in [
+            "outputs",
+            "workspaces",
+            "windows",
+            "layers",
+            "keyboard-layouts",
+            "focused-output",
+            "focused-window",
+            "pick-window",
+            "pick-color",
+            "event-stream",
+            "version",
+            "request-error",
+            "overview-state",
+            "casts",
+        ] {
+            assert!(
+                Cli::try_parse_from(["wiri-ctl", "msg", name]).is_ok(),
+                "msg {name}"
+            );
+        }
+        for args in [
+            vec!["wiri-ctl", "msg", "action", "focus-column-left"],
+            vec!["wiri-ctl", "msg", "output", "DP-1", "off"],
+            vec!["wiri-ctl", "msg", "raw-request", "\"Version\""],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{:?}", args);
+        }
+    }
+
+    #[test]
+    fn layers_and_casts_travel_as_niris_own_request_names() {
+        // They have no IpcMessage: the daemon's wire layer says "not available on Windows".
+        for (name, request) in [("layers", "Layers"), ("casts", "Casts")] {
+            let cli = Cli::try_parse_from(["wiri-ctl", "msg", name]).unwrap();
+            let command = cli.command.into_command();
+            assert_eq!(super::niri_only_request(&command), Some(request));
+            let reply = wiri::ipc::wire::decode(serde_json::json!(request));
+            assert!(
+                reply.is_err_and(|error| error.contains("not available on Windows")),
+                "{request}"
+            );
+        }
+        let cli = Cli::try_parse_from(["wiri-ctl", "windows"]).unwrap();
+        assert_eq!(super::niri_only_request(&cli.command.into_command()), None);
+    }
+
+    #[test]
+    fn spawn_takes_niris_double_dash_and_keeps_every_word() {
+        // niri:niri-ipc/src/lib.rs:207-218: `niri msg action spawn -- alacritty -e htop` and
+        // `spawn-sh -- "echo hi"` (`#[arg(last = true)]`).  A `--id` after the command belongs
+        // to the program.
+        let request = request_of(&["wiri-ctl", "action", "spawn", "--", "tool", "--id", "5"]);
+        match request {
+            IpcMessage::RunAction { name, args, .. } => {
+                assert_eq!(name, "spawn");
+                assert_eq!(args, ["tool", "--id", "5"], "the separator is not a word");
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+        let request = request_of(&["wiri-ctl", "msg", "action", "spawn-sh", "--", "echo hi"]);
+        match request {
+            IpcMessage::RunAction { name, args, .. } => {
+                assert_eq!(name, "spawn-sh");
+                assert_eq!(args, ["echo hi"]);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unset_workspace_name_takes_its_reference_positionally() {
+        // niri:niri-ipc/src/lib.rs:611-618: `unset-workspace-name [REFERENCE]`.
+        let request = request_of(&["wiri-ctl", "action", "unset-workspace-name", "web"]);
+        match request {
+            IpcMessage::RunAction { name, args, quoted } => {
+                assert_eq!(name, "unset-workspace-name");
+                assert_eq!(args, ["--workspace", "web"]);
+                assert!(
+                    quoted.is_empty(),
+                    "an unquoted word keeps meaning an index or a name"
+                );
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+        let request = request_of(&["wiri-ctl", "action", "unset-workspace-name", "\"2\""]);
+        match request {
+            IpcMessage::RunAction { args, quoted, .. } => {
+                assert_eq!(args, ["--workspace", "2"]);
+                assert_eq!(quoted, [false, true], "quotes still make a name");
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
     }
 
     #[test]
@@ -2278,6 +2509,71 @@ mod tests {
                 panic!("output request")
             };
             assert_eq!(action, expected);
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_cli_output_position_set_keeps_signed_coordinates() {
+        // Pinned PositionToSet is a clap subcommand: position set X Y.
+        for prefix in [vec!["wiri-ctl"], vec!["wiri-ctl", "msg"]] {
+            let args: Vec<&str> = prefix
+                .into_iter()
+                .chain(["output", "DISPLAY1", "position", "set", "-100", "25"])
+                .collect();
+            let IpcMessage::Output { output, action } = request_of(&args) else {
+                panic!("output request")
+            };
+            assert_eq!(output, "DISPLAY1");
+            assert_eq!(
+                action,
+                serde_json::json!({"Position":{"position":{"x":-100,"y":25}}})
+            );
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_cli_output_position_retains_friendly_controls() {
+        for (words, expected) in [
+            (
+                vec!["position", "-100", "25"],
+                serde_json::json!({"Position":{"position":{"x":-100,"y":25}}}),
+            ),
+            (
+                vec!["position", "auto"],
+                serde_json::json!({"Position":{"position":"Auto"}}),
+            ),
+        ] {
+            let args: Vec<&str> = ["wiri-ctl", "msg", "output", "DISPLAY1"]
+                .into_iter()
+                .chain(words)
+                .collect();
+            let IpcMessage::Output { action, .. } = request_of(&args) else {
+                panic!("output request")
+            };
+            assert_eq!(action, expected);
+        }
+    }
+
+    #[test]
+    fn parity_canonical_action_cli_output_position_set_rejects_bad_arity() {
+        // The daemon owns semantic value validation; the CLI must reject a
+        // truncated/overlong canonical command before constructing a request.
+        for words in [
+            vec!["position", "set"],
+            vec!["position", "set", "-100"],
+            vec!["position", "set", "-100", "25", "extra"],
+        ] {
+            let args: Vec<&str> = ["wiri-ctl", "msg", "output", "DISPLAY1"]
+                .into_iter()
+                .chain(words)
+                .collect();
+            let result = Cli::try_parse_from(args)
+                .map_err(anyhow::Error::from)
+                .and_then(|cli| request_for(cli.command.into_command()));
+            assert!(
+                result.is_err(),
+                "incomplete or extra position-set arguments"
+            );
         }
     }
 

@@ -373,8 +373,10 @@ impl PaintStyle {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RingStyle {
     pub off: bool,
-    /// Thickness in pixels.
-    pub width: u32,
+    /// Thickness in LOGICAL pixels, as niri's `FloatOrInt<0, 65535>` (appearance.rs:617-620).
+    /// It is projected through the output's scale where it is used
+    /// (`layout::metrics::ring_width_px`), never rounded here.
+    pub width: f64,
     pub active: PaintStyle,
     pub inactive: PaintStyle,
     pub urgent: PaintStyle,
@@ -385,7 +387,7 @@ impl RingStyle {
     pub fn focus_ring_default() -> Self {
         Self {
             off: false,
-            width: 3,
+            width: 3.0,
             active: PaintStyle::color("#3381d9"),
             inactive: PaintStyle::color("#505050"),
             urgent: PaintStyle::color("#cc3344"),
@@ -396,7 +398,7 @@ impl RingStyle {
     pub fn border_default() -> Self {
         Self {
             off: false,
-            width: 4,
+            width: 4.0,
             active: PaintStyle::color("#3381d9"),
             inactive: PaintStyle::color("#4d4d4d"),
             urgent: PaintStyle::color("#cc3344"),
@@ -659,13 +661,13 @@ mod tests {
     fn a_partial_replaces_only_the_blocks_it_names() {
         let base = Effects::default();
         let mut ring = RingStyle::focus_ring_default();
-        ring.width = 9;
+        ring.width = 9.0;
         let partial = EffectsPartial {
             focus_ring: Some(ring),
             ..Default::default()
         };
         let out = partial.apply_to(&base);
-        assert_eq!(out.focus_ring.width, 9);
+        assert_eq!(out.focus_ring.width, 9.0);
         assert_eq!(out.border, base.border);
         assert_eq!(out.shadow, base.shadow);
     }
@@ -673,8 +675,8 @@ mod tests {
     #[test]
     fn the_defaults_are_the_ones_the_layout_always_had() {
         let e = Effects::default();
-        assert!(!e.border.off && e.border.width == 4);
-        assert!(!e.focus_ring.off && e.focus_ring.width == 3);
+        assert!(!e.border.off && e.border.width == 4.0);
+        assert!(!e.focus_ring.off && e.focus_ring.width == 3.0);
         assert!(!e.shadow.on);
         assert_eq!(e.tab_indicator.position, TabPosition::Left);
         assert_eq!(e.tab_indicator.length, 0.5);

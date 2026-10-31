@@ -28,8 +28,9 @@ impl TilingEngine {
         }
     }
 
-    /// niri `move-column-to-index N`: the focused column goes to the 0-based index `N` of its
-    /// workspace (niri counts column indexes from zero), the columns in between shift by one.
+    /// niri `move-column-to-index N`: the focused column goes to the 1-based index `N` of its
+    /// workspace (`0` is the first place too, as `index.saturating_sub(1)` makes it:
+    /// niri:src/layout/scrolling.rs:1702-1707), the columns in between shift by one.
     /// An index past the end puts it last; the column stays in view.
     pub fn move_column_to_index(&mut self, index: u32, backend: &BackendHandle) {
         let Some(output) = self.monitors.focused_id() else {
@@ -48,7 +49,7 @@ impl TilingEngine {
             let Some(last) = workspace.columns.len().checked_sub(1) else {
                 return;
             };
-            let target = (index as usize).min(last);
+            let target = (index.saturating_sub(1) as usize).min(last);
             workspace.move_column_to(column, target)
         };
         if let Some(new_column) = moved {
@@ -460,11 +461,14 @@ mod tests {
     }
 
     #[test]
-    fn move_column_to_index_uses_zero_based_indexes_and_clamps() {
+    fn move_column_to_index_is_one_based_like_niri_and_clamps() {
+        // niri:src/layout/scrolling.rs:1702-1707: `index.saturating_sub(1).min(len - 1)`, so
+        // `move-column-to-index 1` is the FIRST place (it was read as 0-based before) and
+        // `0` is the first place as well.
         let (mut engine, backend, output) = fixture();
         strip(&mut engine, output, &[&[1], &[2], &[3]]);
         focus(&mut engine, output, 3);
-        run(&mut engine, &backend, "move-column-to-index", &["0"]);
+        run(&mut engine, &backend, "move-column-to-index", &["1"]);
         assert_eq!(order(&engine, output), vec![vec![3], vec![1], vec![2]]);
         assert_eq!(
             engine.monitors.get(&output).unwrap().focus_column,
@@ -477,9 +481,19 @@ mod tests {
             vec![vec![1], vec![2], vec![3]],
             "an index past the end goes last"
         );
-        // An index that is already the place of the column changes nothing.
+        // The second place is index 2; the third (where the column now is) changes nothing.
         run(&mut engine, &backend, "move-column-to-index", &["2"]);
-        assert_eq!(order(&engine, output), vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(order(&engine, output), vec![vec![1], vec![3], vec![2]]);
+        run(&mut engine, &backend, "move-column-to-index", &["2"]);
+        assert_eq!(
+            order(&engine, output),
+            vec![vec![1], vec![3], vec![2]],
+            "the column is already second"
+        );
+        // 0 saturates to the first place, exactly as 1 does.
+        focus(&mut engine, output, 2);
+        run(&mut engine, &backend, "move-column-to-index", &["0"]);
+        assert_eq!(order(&engine, output), vec![vec![2], vec![1], vec![3]]);
     }
 
     #[test]

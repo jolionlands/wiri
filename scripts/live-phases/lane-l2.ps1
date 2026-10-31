@@ -41,7 +41,8 @@
     $l2Config = @'
 input { mod-key "ctrl-alt"; }
 animations {
-    recent-windows-close { duration-ms 120; curve linear; }
+    // Long enough for an outside observer to watch the overlay's alpha go down.
+    recent-windows-close { duration-ms 400; curve linear; }
 }
 layout {
     gaps 10
@@ -104,6 +105,35 @@ window-rule {
     # [LT]::Visible rectangle only has L/T/R/B: reading `.W` or `.H` from it gave $null, so every
     # width or height gate of this lane compared nothing with nothing.
     function L2Rect([IntPtr]$h) { return (Rc $h) }
+    # The recent-windows overlay host of THIS daemon (wiri's own switcher class).
+    function L2RecentHosts {
+        if ($null -eq $l2Process) { return @() }
+        foreach ($h in [LT]::TopLevel()) {
+            if ([LT]::Class($h) -eq 'WiriRecentWindowsHost' -and [LT]::Pid($h) -eq $l2Process.Id) { $h }
+        }
+    }
+    function L2RecentHost {
+        $hosts = @(L2RecentHosts)
+        if ($hosts.Count -eq 1) { return $hosts[0] }
+        return [IntPtr]::Zero
+    }
+    function L2WaitRecentHost([int]$timeoutMs = 2500) {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $recentHost = L2RecentHost
+            if ($recentHost -ne [IntPtr]::Zero) { return $recentHost }
+            Start-Sleep -Milliseconds 25
+        } while ($clock.ElapsedMilliseconds -lt $timeoutMs)
+        return [IntPtr]::Zero
+    }
+    function L2WaitNoRecentHost([int]$timeoutMs = 2500) {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            if (@(L2RecentHosts).Count -eq 0) { return $true }
+            Start-Sleep -Milliseconds 25
+        } while ($clock.ElapsedMilliseconds -lt $timeoutMs)
+        return (@(L2RecentHosts).Count -eq 0)
+    }
     function L2Near([int]$a, [int]$b, [int]$tol = 8) { return [Math]::Abs($a - $b) -le $tol }
     # The workspace number window-list reports for one window of an already fetched list.
     function L2WorkspaceOf($list, [IntPtr]$h) {
@@ -185,13 +215,15 @@ public static class LaneL2Native {
         $back = L2Rect $l2B
         L2Gate 'h76_swap_window_left' (L2Near $back.L $rectB.L) @{ before = $after.L; after = $back.L; expected = $rectB.L }
 
-        # move-column-to-index 0: the focused (last) column goes to the front.
+        # move-column-to-index 1: the focused (last) column goes to the front.  niri's index is
+        # 1-based (niri:src/layout/scrolling.rs:1707, index.saturating_sub(1)); the window-list
+        # `column` is 0-based, so "back" is that column plus one.
         L2Focus $l2C
         # The strip is not just A, B and C (the daemon tiles every window of the session), so
         # "back" is the column the window really had, not a number.
         $columnBefore = (L2Entry 'move-column-to-index-before' $l2C).column
-        $restoreIndex = $(if ($null -ne $columnBefore) { [string]$columnBefore } else { '2' })
-        $null = L2Action 'move-column-to-index-forward' @('move-column-to-index', '0')
+        $restoreIndex = $(if ($null -ne $columnBefore) { [string]([int]$columnBefore + 1) } else { '3' })
+        $null = L2Action 'move-column-to-index-forward' @('move-column-to-index', '1')
         $movedRect = L2Rect $l2C
         $entry = L2Entry 'move-column-to-index-check' $l2C
         L2Gate 'h76_move_column_to_index' ($movedRect.L -lt $rectB.L) @{ before = $rectC.L; after = $movedRect.L; column = $entry.column; column_before = $columnBefore }
@@ -282,19 +314,26 @@ public static class LaneL2Native {
             $sorted = @($tiles | Sort-Object -Property T)
             return [pscustomobject]@{ workspace = $mine.workspace; column = $mine.column; count = $sorted.Count; tiles = $sorted }
         }
-        # A `proportion` share of a column that has `$available` px of room, as the engine
-        # resolves it (proportion_px in src/input/mod.rs: the share of the view plus the gap,
-        # less the gap again), rounded half away from zero like Rust's f64::round.
-        function L2ProportionPx([int]$available, [int]$gap, [double]$share) {
-            return [int][Math]::Round($share * ($available + $gap) - $gap, [MidpointRounding]::AwayFromZero)
+        # A `proportion` share of the WHOLE view (the work area less the outer gaps, NOT the
+        # room left after the neighbours' gaps), as the engine resolves it (proportion_px in
+        # src/input/mod.rs: the share of the view plus the gap, less the gap again), rounded
+        # half away from zero like Rust's f64::round.  niri resolve_preset_size
+        # (scrolling.rs:5703-5715, pinned e19df12) is `(view - gaps) * proportion - gaps - extra`
+        # for a preset height and `set-window-height N%` (scrolling.rs:5099), whatever else the
+        # column holds; other tiles only clamp it afterwards (scrolling.rs:4642-4661).
+        function L2ProportionPx([int]$view, [int]$gap, [double]$share) {
+            return [int][Math]::Round($share * ($view + $gap) - $gap, [MidpointRounding]::AwayFromZero)
         }
         $l2Gap = 10
         $l2Border = 4
         $l2ViewH = [int]$swa.Height - 2 * $l2Gap
         # h76_column_height_proportion_and_fixed: the fixed 300 preset is 300 px of window and
-        # the proportion 0.6 preset is its share of the column, each within 1 px.  The previous
-        # gate left the window on the 0.6 preset (index 2 of the cycle): `-back` steps to the
-        # fixed one (index 1), forward returns to 0.6.
+        # the proportion 0.6 preset is its share of the whole view (never of the room left by
+        # the neighbours' gaps: niri scrolling.rs:5703-5715 resolves a proportional preset
+        # against the working area alone, so a two-tile column resolves it exactly like a
+        # one-tile one), each within 1 px.  The previous gate left the window on the 0.6
+        # preset (index 2 of the cycle): `-back` steps to the fixed one (index 1), forward
+        # returns to 0.6.
         try {
             L2Focus $below
             $column = L2ColumnTiles 'column-height-fixed-list' $below
@@ -303,10 +342,10 @@ public static class LaneL2Native {
             $fixedH = (L2Rect $below).H
             $null = L2Action 'column-height-proportion' @('switch-preset-window-height')
             $propH = (L2Rect $below).H
-            $expectedProp = (L2ProportionPx $available $l2Gap 0.6) - 2 * $l2Border
+            $expectedProp = (L2ProportionPx $l2ViewH $l2Gap 0.6) - 2 * $l2Border
             L2Gate 'h76_column_height_proportion_and_fixed' ((L2Near $fixedH 300 1) -and (L2Near $propH $expectedProp 1)) @{
                 fixed = $fixedH; fixed_expected = 300; proportion = $propH; proportion_expected = $expectedProp
-                tiles = $column.count; available = $available; border = $l2Border; gap = $l2Gap
+                tiles = $column.count; available = $available; view = $l2ViewH; border = $l2Border; gap = $l2Gap
                 presets = 'proportion 0.25, fixed 300, proportion 0.6'
             }
         } catch {
@@ -469,13 +508,74 @@ public static class LaneL2Native {
         $null = L2Action 'fullscreen-off' @('toggle-fullscreen')
         if ([LT]::IsWindow($full)) { L2Close $full }
 
-        # ---- recent-windows-close -----------------------------------------------------
-        # The option is decoded (not an unsupported-option warning) and a recent-windows
-        # session still opens and closes with the fade configured.
+        # ---- recent-windows-close: the overlay really fades out ------------------------
+        # The fade IS the host window's layered alpha: the host is created WS_EX_LAYERED
+        # and the fade timer lowers that alpha in 16 ms steps until it reaches zero, so
+        # the gate can watch it from outside.  A close that only destroys the window (no
+        # fade at all) cannot pass: the alpha never goes down, and it never takes the
+        # configured time to do so.
         $fadeWarnings = @(LogLines $l2Log 'recent-windows-close').Count
         $panics = @(LogLines $l2Log 'panicked').Count
         $stillUp = -not $l2Process.HasExited
-        L2Gate 'h76_recent_windows_close_fade' ($fadeWarnings -eq 0 -and $panics -eq 0 -and $stillUp) @{ warnings = $fadeWarnings; panics = $panics; alive = $stillUp }
+        $fadeDurationMs = 400
+        $fadeSamples = @()
+        $fadeOpened = $false
+        $fadeHostsGone = $false
+        if ([LT]::IsWindow($l2C)) {
+            L2Focus $l2C
+            # Alt+Tab is the default recent-windows chord: this config has no
+            # recent-windows section, so the defaults (enabled) are in force.
+            [LT]::Key(0x12, $false)
+            Start-Sleep -Milliseconds 40
+            [LT]::Key(0x09, $false); Start-Sleep -Milliseconds 60; [LT]::Key(0x09, $true)
+            $fadeHost = L2WaitRecentHost 2500
+            $fadeOpened = ($fadeHost -ne [IntPtr]::Zero)
+            if ($fadeOpened) {
+                # Escape cancels the session: the overlay closes, and that close is the
+                # fade the gate watches.  Alt is released afterwards, so the session
+                # cannot be kept alive by the modifier.
+                [LT]::Key(0x1B, $false); Start-Sleep -Milliseconds 40; [LT]::Key(0x1B, $true)
+                [LT]::Key(0x12, $true)
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                do {
+                    $recentHost = L2RecentHost
+                    $alpha = -1
+                    if ($recentHost -ne [IntPtr]::Zero) { $alpha = [LaneL2Native]::Alpha($recentHost) }
+                    $fadeSamples += [pscustomobject]@{ at_ms = $clock.ElapsedMilliseconds; alpha = $alpha }
+                    Start-Sleep -Milliseconds 8
+                } while ($clock.ElapsedMilliseconds -lt 2500)
+            } else {
+                [LT]::Key(0x12, $true)
+            }
+            $fadeHostsGone = L2WaitNoRecentHost 2500
+        }
+        # Only the samples with a readable alpha count: before the fade the host has no
+        # layered attributes yet, and after it the window is gone.
+        $valid = @($fadeSamples | Where-Object { $_.alpha -ge 0 })
+        $alphas = @($valid | ForEach-Object { [int]$_.alpha })
+        $maxAlpha = -1; $minAlpha = -1; $maxIndex = -1
+        for ($i = 0; $i -lt $alphas.Count; $i++) {
+            if ($maxAlpha -lt 0 -or $alphas[$i] -gt $maxAlpha) { $maxAlpha = $alphas[$i]; $maxIndex = $i }
+        }
+        if ($alphas.Count -gt 0) { $minAlpha = [int](($alphas | Measure-Object -Minimum).Minimum) }
+        # From the brightest sample on, the alpha may only go down: that is the fade.
+        $tail = @()
+        if ($maxIndex -ge 0) { $tail = @($alphas[$maxIndex..($alphas.Count - 1)]) }
+        $decreasing = $true
+        for ($i = 1; $i -lt $tail.Count; $i++) { if ($tail[$i] -gt $tail[$i-1]) { $decreasing = $false } }
+        $distinct = @($tail | Select-Object -Unique).Count
+        $tailSpan = -1
+        if ($valid.Count -ge ($maxIndex + 2)) { $tailSpan = $valid[-1].at_ms - $valid[$maxIndex].at_ms }
+        $fadeOk = $fadeOpened -and $valid.Count -ge 4 -and $maxAlpha -ge 200 -and $minAlpha -le 48 -and
+            $tail.Count -ge 3 -and $distinct -ge 3 -and $decreasing -and
+            ($tailSpan -ge [int]($fadeDurationMs * 0.4)) -and $fadeHostsGone
+        L2Gate 'h76_recent_windows_close_fade' ($fadeOk -and $fadeWarnings -eq 0 -and $panics -eq 0 -and $stillUp) @{
+            opened = $fadeOpened; samples = $fadeSamples.Count; valid_samples = $valid.Count
+            max_alpha = $maxAlpha; min_alpha = $minAlpha; distinct_tail = $distinct
+            decreasing = $decreasing; tail_span_ms = $tailSpan; configured_duration_ms = $fadeDurationMs
+            hosts_gone = $fadeHostsGone; warnings = $fadeWarnings; panics = $panics; alive = $stillUp
+            alpha_trace = @($fadeSamples | Select-Object -First 80)
+        }
 
         # ---- a bad argument list is refused by the same parser ------------------------
         # An expected refusal goes through CtlRaw: Ctl records every call as a step that must exit 0.
@@ -487,6 +587,7 @@ public static class LaneL2Native {
         # A failed probe ends this lane only: its remaining gates stay false and the error is kept.
         $l2Details['error'] = ($_ | Out-String).Trim()
     } finally {
+        foreach ($key in 0x1B, 0x09, 0x12) { [LT]::Key($key, $true) }
         foreach ($h in $l2Forms) { if ([LT]::IsWindow($h)) { [TestForms]::CloseForm($h) } }
         L2Stop 'lane-l2-quit'
         if ($null -ne $l2Process -and -not $l2Process.HasExited) { Stop-Process -Id $l2Process.Id -Force }

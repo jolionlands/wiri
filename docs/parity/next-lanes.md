@@ -1,5 +1,62 @@
 # Next lanes: surveying the partial parity rows (2026-10-27)
 
+> **Historical survey, superseded for assignment.** This file records the
+> `0821983` snapshot. Following the integrated, PR #2 and qualified R4 follow-ups,
+> current matrices contain **309 done / 88 partial / 88 N/A** (397 applicable
+> rows), including five appearance/DPI and two floating-preset corrections, not the 138
+> partial rows below. The active
+> [full-parity plan](../superpowers/plans/2026-10-28-full-parity.md) checks the
+> pinned source and current implementation before assigning work. In particular,
+> center-column, floating Mod grabs, gesture spring velocity/rubber-band, spawn
+> home expansion and h60/h79 coverage already exist. The proposed fullscreen
+> refusal gates below require source-semantic review, not blind implementation.
+
+## Current partial-row audit, 2026-10-29
+
+The initial 94 partial rows were rechecked against the implementation and pinned
+niri source. The action census exposed two further preset-height rows previously
+marked done and confirmed software defects in both broad action/CLI rows.
+The qualified R4 source/native follow-ups close the `gaps`, `struts` and curated
+hotkey-list software gaps. Primary categories now sum to 93; a row can have
+secondary limits too. See the [R4 evidence report](2026-10-29-tridaris-r4.md#qualified-native-spacing-and-panel-follow-ups).
+
+| Primary remaining condition | Layout | Config/input/IPC | Total |
+| --- | ---: | ---: | ---: |
+| Missing or incorrect software | 15 | 17 | 32 |
+| Implemented; evidence needs reconciliation | 10 | 3 | 13 |
+| Hardware evidence unavailable | 7 | 2 | 9 |
+| Windows-specific backend differences | 14 | 25 | 39 |
+| **Total partial rows** | **46** | **47** | **93** |
+
+These are prioritization categories, not completion claims or 32 independent
+coding tasks. Several metric rows share one implementation. A Windows-specific
+category describes the current adapter's approximation or rejected capability;
+it does not establish that every possible Windows implementation is impossible.
+Evidence-only rows retain partial status until their exact remaining condition
+is reconciled with source and native proof.
+
+R4 qualified fractional spacing, signed struts and hotkey curation through pure
+and native checks; those three rows are no longer remaining software work.
+Signed per-axis scroll factors also passed their R4 source/native checks, with
+physical device routing still separate. The following queue covers appearance scaling,
+general viewport anchoring and clipping, application self-resize reconciliation,
+floating fullscreen transitions, admission focus policy, and presentation-aware
+pacing. Native constraint sampling alone does not finish self-resize behavior.
+Canonical typed action fields, automatic output values, output-position CLI
+grammar and floating preset heights also have source-confirmed software gaps;
+matching action names alone does not establish their field or effect contracts.
+
+Several earlier gap descriptions below are stale: center-column, floating Mod
+grabs and positioning, typed workspace IDs and sizes, cubic Bezier, startup-rule
+timing, scalar wheel scaling, and environment-aware spawn now have implementations.
+Returning-output order and a literal `original-output` option are not pinned gaps:
+niri appends returning outputs and uses repeated `open-on-output` preferences.
+Per-device routing, global input ownership, multi-output acceptance and full Pango
+markup remain distinct questions. A small markup subset cannot close that row.
+
+Use the [active implementation plan](../superpowers/plans/2026-10-28-full-parity.md)
+for assignments. The survey below remains historical evidence.
+
 Read-only survey of every row still marked `partial` in both parity matrices, written at
 `0821983` on branch `wiri/shine-20261024`. Nothing was built, run, edited or reconfigured:
 no live cycle, no wiri instance, no system setting. The classifications below rest on (a) the
@@ -13,7 +70,7 @@ gates passed, 0 failed**, 88 information entries (recorded in [PERF.md](../PERF.
 [README.md](README.md)). Gate counts below assume that population; a gate that exists and ran
 there is called "gated" even when its row text still says otherwise.
 
-The README's headline recount is per matrix: **layout 141 done / 68 partial / 17 N/A** and
+At this survey's snapshot, the README recount was **layout 141 done / 68 partial / 17 N/A** and
 **config-input-IPC 117 done / 70 partial / 72 N/A**, 0 missing in both. The "68 partial rows"
 of the task is the layout matrix; this survey covers **all 138 partial rows** (68 + 70).
 Row numbers below are this document's own ordinal over each matrix's partial rows in file
@@ -118,7 +175,7 @@ found the implementation but the row's remaining delta should be re-read before 
 | C2 | What a reload re-applies (binds, outputs, rules, layout) | event-driven reload; `h12_*`, `h13_*` cover binds and rules | layout/output half of the reload scope is ungated |
 | C24 | niri action names accepted in binds | action vocabulary in `config/decode.rs` + `input/mod.rs` | no completeness gate — a new action can ship with no name test |
 | C27 | Curated Important Hotkeys list (~15 core actions) | `overlay/hotkey_rows.rs::curated_rows` with unit tests; `h75_*` covers startup/skip/hide-not-bound | curated content not asserted live |
-| C28 | `hotkey-overlay-title` per bind, markup, `null` hides | `hotkey_rows.rs`; null path gated by `h75_hotkey_overlay_hide_not_bound` | titles and markup not asserted |
+| C28 | `hotkey-overlay-title` per bind, markup, `null` hides | `hotkey_rows.rs`; null path gated by `h75_hotkey_overlay_hide_not_bound` | Lane PANGO parsed, measured and painted the markup (`pango_markup.rs`, `markup_text.rs`) with `h89_*` gates added but not yet run; row text/status pending the lead cycle |
 | C51 | `spawn` home expansion | executable-only `~` expansion plus `ShellExecuteExW` fallback | no gate (low value; the row may belong in class (c) instead) |
 
 ## 4. Class (b): needs real hardware — 29 rows
@@ -174,7 +231,7 @@ Listed so they are not mistaken for gate work:
 | `move-floating-window` (x/y set/adjust/proportion) | no `move-floating-window` entry in the action vocabulary at all |
 | Mouse move/resize of floats via the Mod key | the LL-hook grab is not extended to the float layer |
 | `at-startup` (first 60 s after launch) | only startup-enumerated windows get `at_startup`; no 60 s clock |
-| New-window focus policy (heuristic auto-focus) | no heuristic; only `open-focused` rules |
+| New-window focus policy (heuristic auto-focus) | done in the focus-core lane (heuristic, `debug { strict-new-window-focus-policy }`, h92_new_window_* gates); remaining gaps are listed in the layout-behaviour matrix row |
 | Easing curve set (linear, ease-out-*, Bezier grammar) | no Bezier solver |
 | Spring animations: typed kinds and gesture velocity | kinds exist in config; the velocity wiring to the driver does not |
 | Gesture kinetics (spring decay, rubber band) | needs the above |

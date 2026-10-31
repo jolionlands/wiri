@@ -523,12 +523,11 @@ async fn run() -> Result<()> {
         for window in windows {
             // How narrow can the window be made?  Asked before the engine lock is taken: the
             // window answers on its own thread.
-            let window_id = WindowId::new(window.hwnd);
-            let min_width = backend_handle.min_track_width(window.hwnd);
-            // Initial enumeration: at_startup=true so window rules with `at-startup` matchers fire.
+            let native_bounds = backend_handle.native_bounds(window.hwnd);
+            // Initial enumeration preserves existing geometry/focus and skips open animations.
+            // The rule matcher's startup phase is shared with subsequent CREATE/SHOW events.
             let mut eng = engine.write();
-            eng.add_window_at_startup(window, &backend_handle);
-            eng.note_min_width_answer(window_id, min_width);
+            eng.add_window_with_native_bounds(window, &backend_handle, true, native_bounds);
         }
         drop(record);
         {
@@ -690,10 +689,9 @@ async fn run() -> Result<()> {
     // Overview-mode banner — shown while the user is in overview ("Space or
     // Esc to exit").  Engine reaches it via the
     // `overlay::overview_banner::global_*` helpers; we install the singleton
-    // here once so those calls actually do something.  Dropping the
-    // JoinHandle is intentional — the thread lives until process exit.
+    // here once so those calls actually do something.  Its message-pump thread
+    // and window are created by the first `show`, not here.
     let overview_banner = Arc::new(OverviewBanner::new());
-    let _ = overview_banner.clone().spawn();
     wiri::overlay::overview_banner::install_global(overview_banner.clone());
 
     // Key-bindings cheatsheet overlay — toggled by the ShowKeyBindings action
@@ -785,13 +783,18 @@ async fn run() -> Result<()> {
 
     print_help();
 
-    // Animations have their own frame worker; idle animations need no polling.
+    // Animations have their own frame worker; idle animations need no polling. While
+    // timelines run it waits for the presentation clock instead of a fixed 16 ms timer:
+    // DCompositionWaitForCompositorClock, then DwmFlush, then a sleep derived from the
+    // output refresh rate (see `wiri::animation`). A frame's delta is the measured
+    // presentation interval, so springs and easings advance by presented frames, and the
+    // wait is disarmed the moment the last timeline finishes.
     let animation_worker = {
         let weak_engine = Arc::downgrade(&engine);
         let wake = Arc::clone(&animation_wake);
         let animation_handle = handle.clone();
         tokio::spawn(async move {
-            let mut last_tick = std::time::Instant::now();
+            let mut clock = wiri::animation::FrameClock::new();
             loop {
                 // Register before probing so an animation starting during the
                 // transition to idle cannot leave the worker asleep.
@@ -806,24 +809,19 @@ async fn run() -> Result<()> {
                     active
                 };
                 if !active {
+                    // Nothing is armed from here on: no timer, no blocking wait, no thread.
+                    clock.disarm();
                     notified.await;
-                    last_tick = std::time::Instant::now();
                     continue;
                 }
 
-                tokio::time::sleep(Duration::from_millis(16)).await;
-                let now = std::time::Instant::now();
-                let delta_ms = now
-                    .duration_since(last_tick)
-                    .as_millis()
-                    .min(u32::MAX as u128) as u32;
-                last_tick = now;
+                let frame = clock.next_frame().await;
                 let Some(engine) = weak_engine.upgrade() else {
                     break;
                 };
                 let _ = engine
                     .write()
-                    .tick_animations_with_backend(delta_ms, &animation_handle);
+                    .tick_animations_with_backend(frame.delta_ms, &animation_handle);
             }
         })
     };
@@ -846,10 +844,16 @@ async fn run() -> Result<()> {
     tokio::pin!(ctrl_c);
     let tray_wake = wiri::hooks::tray::tray_action_wake();
     let workspace_watch = wiri::ipc::workspace_watch();
+    // Fixed at engine creation: enumeration/reloads cannot extend the startup phase.
+    let startup_rules_timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(
+        engine.read().startup_rules_deadline(),
+    ));
+    tokio::pin!(startup_rules_timeout);
+    let mut startup_rules_pending = true;
 
     // Main loop: event driven.  It sleeps until a tray click, a workspace change, a config
     // reload, a quit request or Ctrl+C needs it; with none of those pending there is no
-    // timer at all (a startup balloon waiting for the tray icon is the one bounded exception).
+    // repeating timer (the startup rule expiry and a pending tray balloon are bounded).
     'main: loop {
         // Workspace-indicator: detect workspace switches and show the overlay.
         // The compare is cheap — active_workspace is a plain i32 field; no Win32 calls — and
@@ -923,12 +927,25 @@ async fn run() -> Result<()> {
         }
 
         // Sleep until something needs this loop.  Each source below wakes it by itself; the
-        // only timer is the 50 ms retry of a startup balloon that waits for the tray icon.
+        // deadlines are the one startup expiry and a pending tray balloon retry.
         tokio::select! {
             // A tray click and a possible workspace change only wake the loop: the tray
             // actions are drained below, the workspace compare runs at the top.
             _ = tray_wake.notified() => {}
             _ = workspace_watch.notified() => {}
+
+            _ = &mut startup_rules_timeout, if startup_rules_pending => {
+                startup_rules_pending = false;
+                let expired = engine.write().finish_startup_rules(
+                    std::time::Instant::now(),
+                    &handle,
+                );
+                if expired {
+                    // Own-overlay refresh queries Windows; release the engine lock first.
+                    wiri::window::block_out::finish_startup();
+                    wiri::ipc::notify_state_changed();
+                }
+            }
 
             // Handle file-watcher config reloads
             outcome = config_reload_rx.recv(), if config_reload_open => match outcome {
@@ -993,7 +1010,7 @@ async fn run() -> Result<()> {
             }
 
             // The config error that was found at startup is retried until the tray icon is
-            // there (see below); nothing else in this loop has a deadline.
+            // there (see below); this retry is independent of startup rule expiry.
             _ = tokio::time::sleep(Duration::from_millis(50)), if pending_balloon.is_some() => {}
         }
 
@@ -1241,41 +1258,96 @@ fn apply_loaded_config(
     mouse_tracker: &Arc<RwLock<MouseTracker>>,
     keyboard_session: &Mutex<KeyboardConfigSession>,
 ) {
-    configure_session(&new_config, keyboard_session);
-    wiri::screenshot::configure(&new_config);
+    use wiri::config::reload::{plan as plan_reload, ReloadStep};
+    // niri's `reload_config` re-applies only what changed, in a fixed order
+    // (niri e19df12 src/niri.rs:1683-1967).  The plan compares the config the engine holds
+    // with the one just decoded; an unchanged section is not applied again, so a bind-only
+    // reload does not rewrite pointer settings or re-place every window.
+    let old_config = engine.read().full_config().cloned();
+    let plan = plan_reload(old_config.as_ref(), &new_config);
+    // One line per reload: what the plan decided, and the two sections most often involved,
+    // so a gate that sees no effect can tell "not planned" from "planned but not applied".
+    debug!(
+        steps = ?plan.steps(),
+        gaps = ?old_config.as_ref().map(|c| (c.layout.inner_gaps, c.layout.outer_gaps)),
+        new_gaps = ?(new_config.layout.inner_gaps, new_config.layout.outer_gaps),
+        animations = ?(new_config.animations.enabled, new_config.animations.slowdown),
+        rules = new_config.window_rules.len(),
+        "config reload plan"
+    );
+    if plan.contains(ReloadStep::Environment) {
+        if let Err(error) = wiri::hooks::environment::configure(&new_config.environment) {
+            warn!(%error, "Child environment unchanged");
+        }
+    }
+    if plan.contains(ReloadStep::SwitchEvents) {
+        if let Err(error) =
+            wiri::hooks::switch_events::configure(new_config.switch_events.subscriptions())
+        {
+            warn!(%error, "Switch-event subscriptions could not be updated");
+        }
+    }
+    if plan.contains(ReloadStep::Screenshot) {
+        wiri::screenshot::configure(&new_config);
+    }
     // Lane D: reload physical differences outside the engine lock, then refresh geometry/DPI.
-    wiri::backend::outputs::apply(&new_config);
-    wiri::backend::output_runtime::refresh(handle);
-    let new_layout_config = LayoutConfig::from_config(&new_config);
-    let mouse_config = MouseFocusConfig {
-        focus_follows_mouse: new_config.input.focus_follows_mouse,
-        warp_on_focus: new_config.input.warp_on_focus,
-        focus_delay_ms: new_config.input.focus_delay_ms,
-        raise_on_click: true,
-    };
-
-    apply_mouse_config(&new_config.input);
-    // Lane P: pointing-device options follow a reload; the ones the new config no longer names
-    // go back to what the OS had before wiri changed them.
-    wiri::input::pointer_settings::apply_config(&new_config.input, &new_config.cursor);
-    // Lane LAST: a reload that drops `hide-after-inactive-ms` shows the pointer again (and the
-    // one timer goes away); one that adds it waits for the next pointer movement.
-    wiri::input::cursor_hide::configure(&new_config.cursor);
-    mouse_tracker.write().set_config(mouse_config);
+    if plan.contains(ReloadStep::Outputs) {
+        wiri::backend::outputs::apply(&new_config);
+        wiri::backend::output_runtime::refresh(handle);
+    }
+    if plan.contains(ReloadStep::Input) {
+        // niri: keyboard repeat and xkb first (`src/niri.rs:1750-1764`, 1888-1891), then the
+        // libinput settings on the current devices (`1893-1902`); the cursor theme and the
+        // cursor timeout follow the same section.
+        keyboard_session.lock().apply(&new_config.input);
+        let mouse_config = MouseFocusConfig {
+            focus_follows_mouse: new_config.input.focus_follows_mouse,
+            warp_on_focus: new_config.input.warp_on_focus,
+            focus_delay_ms: new_config.input.focus_delay_ms,
+            raise_on_click: true,
+        };
+        apply_mouse_config(&new_config.input);
+        // Lane P: pointing-device options follow a reload; the ones the new config no longer
+        // names go back to what the OS had before wiri changed them.
+        wiri::input::pointer_settings::apply_config(&new_config.input, &new_config.cursor);
+        // Lane LAST: a reload that drops `hide-after-inactive-ms` shows the pointer again (and
+        // the one timer goes away); one that adds it waits for the next pointer movement.
+        wiri::input::cursor_hide::configure(&new_config.cursor);
+        mouse_tracker.write().set_config(mouse_config);
+    }
+    let layout_changed = plan.contains(ReloadStep::Layout);
+    let new_layout_config = layout_changed.then(|| LayoutConfig::from_config(&new_config));
     let hide_method = hide_method_of(&new_config);
     wiri::backend::cloak::set_hide_method(hide_method);
     {
         let mut engine = engine.write();
-        engine.update_config(new_layout_config);
-        wiri::backend::output_runtime::sync(&new_config, handle, &mut engine);
+        if let Some(new_layout_config) = new_layout_config {
+            engine.update_config(new_layout_config);
+        }
+        if layout_changed || plan.contains(ReloadStep::Outputs) {
+            wiri::backend::output_runtime::sync(&new_config, handle, &mut engine);
+        }
+        // Publishing the config is not optional: the engine reads `binds`, the effects, the
+        // recent-window options and the workspace declarations from it, and `reload_hotkeys`
+        // runs after this block.
         engine.set_full_config(new_config);
         engine.set_hide_method(hide_method);
         // The rules were replaced: the windows that are open follow them (their opacity, their
         // size limits; the `open-*` properties are for windows that open).
-        engine.reevaluate_all_window_rules(handle);
-        engine.apply_all(handle);
+        if layout_changed || plan.reevaluates_rules() {
+            engine.apply_reloaded_layout(handle);
+        }
     }
-    message_loop.reload_hotkeys();
+    // The hotkey thread re-derives everything it owns from the published config, so the pass
+    // is not "binds only": `build_hotkey_list` resolves `Mod` from `input { mod-key }` and
+    // reads the pointer triggers, `publish_recent_input` hands the switcher its
+    // `recent-windows` options, and the same message re-arms the pointer focus policy, the
+    // drag-and-drop edges, the touch pen, the precision-touchpad raw input, the gestures and
+    // the hot corners.  Gating it on the bind table alone left a touchpad opt-in
+    // unregistered and an `input { mod-key }` reload on the old chords.
+    if plan.reapplies_hotkeys() {
+        message_loop.reload_hotkeys();
+    }
 }
 
 /// `layout { hide-method }`: `hide` (the default) or `cloak`.  A value that is neither is
@@ -1364,6 +1436,7 @@ fn sync_monitors_from_backend(
             engine.unregister_monitor(&oid);
         }
 
+        engine.invalidate_all_native_bounds();
         engine.apply_all(handle);
     }
 
@@ -1372,6 +1445,7 @@ fn sync_monitors_from_backend(
             monitor_name: monitor.name,
         });
     }
+    refresh_native_bounds_batch(handle, engine);
 }
 
 fn print_help() {
@@ -1500,11 +1574,10 @@ fn handle_backend_event(
             };
             if current_before_retry {
                 add_window_if_tileable(hwnd, "via foreground retry", handle, engine, ipc_server);
-                // Ask outside the engine lock, retaining the existing per-window retry cap.
+                // Ask outside the engine lock, using native freshness/backoff.
                 // Stale notices must not admit/activate an old foreground through this path.
-                if was_managed && engine.read().min_width_query_wanted(window_id) {
-                    let answer = handle.min_track_width(hwnd);
-                    engine.write().learn_min_width(window_id, answer, handle);
+                if was_managed {
+                    refresh_native_bounds_for_window(hwnd, handle, engine);
                 }
             }
             let owner = wiri::layout::engine::root_owner_of(hwnd);
@@ -1520,17 +1593,8 @@ fn handle_backend_event(
             let (live, location) =
                 eng.observe_native_foreground(hwnd, owner, stamp, is_current, handle);
             if live {
-                ipc_server.broadcast_event(IpcEvent::WindowFocused { window_hwnd: hwnd });
-                if let Some((col_idx, ws_id)) = location {
-                    let number = match managed.and_then(|w| eng.locate_window(w)) {
-                        Some((oid, _, _)) => eng.workspace_number_on(oid, ws_id),
-                        None => wiri::layout::workspace_number(ws_id),
-                    };
-                    ipc_server.broadcast_event(IpcEvent::ColumnFocused {
-                        window_hwnd: hwnd,
-                        column_index: col_idx,
-                        workspace_id: number,
-                    });
+                for event in eng.live_focus_events(hwnd, managed, location) {
+                    ipc_server.broadcast_event(event);
                 }
             }
         }
@@ -1541,6 +1605,7 @@ fn handle_backend_event(
         // overridden by the tiling engine on next layout pass; but we
         // still forward them as IPC events for external listeners.
         BackendEvent::WindowMoved { hwnd, rect } => {
+            refresh_native_bounds_for_window(hwnd, handle, engine);
             ipc_server.broadcast_event(IpcEvent::WindowMoved {
                 window_hwnd: hwnd,
                 x: rect.loc.x,
@@ -1550,6 +1615,13 @@ fn handle_backend_event(
             });
         }
         BackendEvent::WindowResized { hwnd, rect } => {
+            refresh_native_bounds_for_window(hwnd, handle, engine);
+            // A window that changed its own size keeps it and the layout follows: niri reads
+            // the committed size as the truth for the column and only asks again for the
+            // width it wants (`src/layout/scrolling.rs:1278-1305`).
+            engine
+                .write()
+                .note_window_self_resized(WindowId::new(hwnd), handle);
             ipc_server.broadcast_event(IpcEvent::WindowResized {
                 window_hwnd: hwnd,
                 width: rect.size.w,
@@ -1557,13 +1629,7 @@ fn handle_backend_event(
             });
         }
         BackendEvent::WindowTitleChanged { hwnd } => {
-            // A newly created terminal may answer its minimum only once its title is ready.
-            // Reuse the same three-query lifetime cap as foreground retries, outside the lock.
-            let window_id = WindowId::new(hwnd);
-            if engine.read().min_width_query_wanted(window_id) {
-                let answer = handle.min_track_width(hwnd);
-                engine.write().learn_min_width(window_id, answer, handle);
-            }
+            refresh_native_bounds_for_window(hwnd, handle, engine);
             // The backend has read the new title already.  The engine keeps it, and the
             // window rules that look at titles are evaluated again for the window (only
             // when some rule does).
@@ -1585,7 +1651,10 @@ fn handle_backend_event(
             let id = WindowId::new(hwnd);
             if !eng.native_move_resize_active(id) {
                 eng.window_size_class_changed(id, zoomed, covers_monitor, handle);
+                eng.invalidate_native_bounds(id);
             }
+            drop(eng);
+            refresh_native_bounds_for_window(hwnd, handle, engine);
         }
 
         BackendEvent::WindowMoveResizeStart { hwnd } => {
@@ -1682,7 +1751,7 @@ fn add_window_if_tileable(
     // How narrow can the window be made?  Asked here, once, before the engine lock is
     // taken (the window answers on its own thread): a terminal that will not go below
     // 462 px has to get a column that wide, or it lies on top of its neighbour.
-    let min_width = handle.min_track_width(hwnd);
+    let native_bounds = handle.native_bounds(hwnd);
 
     // The check above ran without the write lock: the creation, show and foreground
     // events and the reconcile pass can find the same new window at the same moment.
@@ -1707,8 +1776,7 @@ fn add_window_if_tileable(
         } else {
             info!("+ {} ({}) [{}]", window.title, window.class_name, source);
         }
-        eng.add_window(window, handle);
-        eng.note_min_width_answer(window_id, min_width);
+        eng.add_window_with_native_bounds(window, handle, false, native_bounds);
         // New windows take the focus; scroll the strip so the new column is on screen.
         eng.reveal_focused();
         eng.apply_all(handle);
@@ -1717,6 +1785,43 @@ fn add_window_if_tileable(
     // (The reconcile pass comes here too, not only the events.)
     wiri::ipc::notify_state_changed();
     true
+}
+
+/// Query at most one due application outside the engine lock. Context checks
+/// also invalidate physical conversion after a DPI, frame or output change.
+fn refresh_native_bounds_for_window(
+    hwnd: isize,
+    handle: &BackendHandle,
+    engine: &Arc<RwLock<TilingEngine>>,
+) -> bool {
+    let Some(context) = handle.native_bounds_context(hwnd) else {
+        return false;
+    };
+    let query =
+        engine
+            .write()
+            .native_bounds_query(WindowId::new(hwnd), context, std::time::Instant::now());
+    let Some(query) = query else {
+        return false;
+    };
+    let answer = handle.native_bounds(hwnd);
+    engine
+        .write()
+        .finish_native_bounds_query(query, answer, std::time::Instant::now(), handle);
+    true
+}
+
+fn refresh_native_bounds_batch(handle: &BackendHandle, engine: &Arc<RwLock<TilingEngine>>) {
+    let candidates = engine.read().native_bounds_candidates();
+    let mut queried = 0;
+    for id in candidates {
+        if refresh_native_bounds_for_window(id.as_isize(), handle, engine) {
+            queried += 1;
+            if queried == 2 {
+                break;
+            }
+        }
+    }
 }
 
 /// One reconcile pass.  True when it admitted a window the events had missed.
@@ -1739,6 +1844,7 @@ fn reconcile_visible_windows(
         }
     }
 
+    refresh_native_bounds_batch(handle, engine);
     if !added_any {
         // Re-hide any inactive-workspace windows that Windows re-shown outside
         // wiri's model. try_write keeps this maintenance loop from blocking IPC

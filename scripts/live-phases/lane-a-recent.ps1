@@ -154,11 +154,67 @@ function H20RScope([byte]$key, [long]$scope) {
     return (H20RWait { (H20RShown) -and (H20RProp 'WiriRecentScope') -eq $scope })
 }
 
+function H20RReloadConfig([string]$text, [string]$tag) {
+    # Drain the write-triggered reload before requesting the explicit one. Otherwise the
+    # watcher's trailing-edge reload can cancel a switcher opened after the IPC reload.
+    # Both acknowledgements come from the daemon: the IPC reply alone proves nothing.
+    $watchedBefore = @(LogLines $h20rLog 'Config file changed').Count
+    [IO.File]::WriteAllText($cfg, $text, (New-Object Text.UTF8Encoding($false)))
+    if (-not (H20RWait { @(LogLines $h20rLog 'Config file changed').Count -gt $watchedBefore } 2500)) {
+        return $false
+    }
+    $before = @(LogLines $h20rLog 'Config reloaded successfully').Count
+    $null = Ctl $tag @('reload-config')
+    return (H20RWait { @(LogLines $h20rLog 'Config reloaded successfully').Count -gt $before } 2500)
+}
+function H20RHostMax([int]$durationMs, [int]$intervalMs = 25) {
+    # A host that lives for less than one poll interval must still be seen, so the
+    # count is sampled all the time and not read once at the end.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $max = 0; $samples = 0
+    do {
+        $count = @(H20RHosts).Count
+        if ($count -gt $max) { $max = $count }
+        $samples++
+        Start-Sleep -Milliseconds $intervalMs
+    } while ($clock.ElapsedMilliseconds -lt $durationMs)
+    return [pscustomobject]@{ max = $max; samples = $samples; elapsed_ms = $clock.ElapsedMilliseconds }
+}
+function H20RStartEvents([string]$tag) {
+    # A live subscriber to the daemon's event stream.  Every event type is taken and
+    # filtered here, so the gate does not depend on the daemon's filter names.
+    $out = Join-Path $D "$tag.jsonl"
+    $err = Join-Path $D "$tag.err"
+    Remove-Item -Force $out, $err -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $ctl -ArgumentList @('event-stream','--stream') `
+        -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+    Start-Sleep -Milliseconds 600   # the subscription must be live before the focus changes
+    return [pscustomobject]@{ proc = $p; out = $out; err = $err }
+}
+function H20RStopEvents($stream) {
+    $events = @()
+    try {
+        if (-not $stream.proc.HasExited) { $stream.proc.Kill() }
+        $null = $stream.proc.WaitForExit(3000)
+    } catch { }
+    foreach ($line in @(Get-Content $stream.out -ErrorAction SilentlyContinue)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $events += ($line | ConvertFrom-Json) } catch { }
+    }
+    return $events
+}
+function H20RStampNs($event) {
+    # The event carries {"secs":N,"nanos":M}: compare the stamps as nanoseconds.
+    if ($null -eq $event -or $null -eq $event.data -or $null -eq $event.data.focus_timestamp) { return -1 }
+    return ([double]$event.data.focus_timestamp.secs * 1e9) + [double]$event.data.focus_timestamp.nanos
+}
 $h20rGates = @('real_dwm_previews','repeated_cycle','sources_unchanged','modifier_release_commit',
     'cancel_restores_origin','scope_navigation','preview_height_cap','debounce_skips_intermediate',
-    'keyboard_input_commits','app_id_ignores_titles','no_hosts_after_quit','fragment_completed')
+    'keyboard_input_commits','app_id_ignores_titles','no_hosts_after_quit','fragment_completed',
+    'recent_windows_off_creates_no_host','recent_windows_off_still_timestamps_focus')
 foreach ($gate in $h20rGates) { $summary["h20_$gate"] = $false }
 $h20rProc = $null; $h20rProcId = 0; $h20rForms = @(); $h20rWatch = $null
+$h20rLog = Join-Path $D 'h20-stderr.log'
 $h20rOldDpi = [IntPtr]::Zero
 $h20rIssues = New-Object 'System.Collections.Generic.List[string]'
 $h20rState = @{ sequence = 0 }
@@ -210,7 +266,7 @@ public static class H20RecentNative {
     }
     $h20rOldDpi = [H20RecentNative]::SetThreadDpiAwarenessContext([IntPtr](-4))
     H20RRequire ($h20rOldDpi -ne [IntPtr]::Zero) 'Cannot establish physical-pixel, per-monitor-v2 observation context.'
-    $h20rProc = Start-WiriWithConfig $h20rConfig (Join-Path $D 'h20-stderr.log')
+    $h20rProc = Start-WiriWithConfig $h20rConfig $h20rLog
     $h20rProcId = $h20rProc.Id
     H20RRequire (-not $h20rProc.HasExited) 'H20 daemon exited during startup.'
     # Cache the live process handle, as Ctl does: otherwise Start-Process's object
@@ -367,6 +423,121 @@ public static class H20RecentNative {
         $h20rEvidence['fixture_titles'] = @($h20rForms | ForEach-Object { [LT]::Title($_) })
         Shot 'h20-same-app-different-titles'
     } finally { H20REndSession }
+
+    # ---- recent-windows { off }: the switcher must not intercept -------------------------
+    # The chord is a custom one (Ctrl+Alt+F8): while the switcher is off the key is NOT
+    # swallowed, and a native Alt+Tab would reach the shell and switch the desktop behind
+    # the lane's back.  The lane's own config is restored at the end of this section, so
+    # the remaining gates run against the config they were written for.
+    $h20rDefaultsFile = Join-Path $D 'legacy-default-binds.kdl'
+    $h20rDefaultsInclude = ''
+    if (Test-Path $h20rDefaultsFile) { $h20rDefaultsInclude = 'include r#"' + $h20rDefaultsFile + '"#' + "`n" }
+    $h20rOffConfig = $h20rDefaultsInclude + @'
+input { mod-key "ctrl-alt"; }
+layout { gaps 16; }
+animations { off; }
+recent-windows {
+    off
+    debounce-ms 750
+    open-delay-ms 150
+    highlight { padding 30; }
+    previews { max-height 96; max-scale 0.5; }
+    binds {
+        Ctrl+Alt+F8 { next-window; }
+        Ctrl+Alt+F9 { previous-window; }
+    }
+}
+'@
+    $h20rOffEvidence = [ordered]@{
+        off_config = 'recent-windows { off; binds { Ctrl+Alt+F8/F9 } }'
+        reload_applied = $false
+        hosts_before = -1
+        max_hosts_while_off = -1
+        host_samples = 0
+        key_log_while_off = ''
+        chord_passed_through = $false
+        opened_closed_while_off = $false
+        max_hosts_after_open_close = -1
+        focus_events = 0
+        first_stamp_ns = -1
+        last_stamp_ns = -1
+        stamp_advanced = $false
+        restored = $false
+        host_after_restore = $false
+        restore_ms = -1
+        daemon_alive = $false
+    }
+    try {
+        $h20rOffEvidence.reload_applied = H20RReloadConfig $h20rOffConfig 'h20-recent-off-reload'
+        H20RRequire $h20rOffEvidence.reload_applied 'The daemon did not apply the recent-windows { off; } config.'
+        $h20rOffEvidence.hosts_before = @(H20RHosts).Count
+        # The recorder must own the keyboard: the pass-through is only observable when
+        # the chord reaches the application.
+        $recorder = $h20rForms[0]
+        $null = Ctl 'h20-off-focus-recorder' @('focus-window', [string][int64]$recorder)
+        H20RRequire (H20RWait { [LT]::GetForegroundWindow() -eq $recorder } 3000) 'Cannot focus the key recorder.'
+        [TestForms]::ClearKeys()
+        # The chord of the disabled switcher: no host may appear while it is off.
+        [LT]::Key(0x11, $false); [LT]::Key(0x12, $false)
+        Start-Sleep -Milliseconds 40
+        H20RTap 0x77               # F8 down and up: the recorder observes KeyDown.
+        Start-Sleep -Milliseconds 80
+        [LT]::Key(0x12, $true); [LT]::Key(0x11, $true)
+        $watch = H20RHostMax 2500
+        $h20rOffEvidence.max_hosts_while_off = $watch.max
+        $h20rOffEvidence.host_samples = $watch.samples
+        $h20rOffEvidence.key_log_while_off = [TestForms]::KeyLog()
+        $h20rOffEvidence.chord_passed_through = ([TestForms]::KeyLog() -match '(^|,)F8(,|$)')
+        # Open and close an owned window while the switcher is off: neither may make a host.
+        $opened = [TestForms]::Open('wiri-h20-off-window', 120, 60, 150)
+        $h20rForms += $opened
+        $null = Ctl 'h20-off-focus-new' @('focus-window', [string][int64]$opened)
+        $null = H20RWait { [LT]::GetForegroundWindow() -eq $opened } 3000
+        [TestForms]::CloseForm($opened)
+        $h20rOffEvidence.opened_closed_while_off = (H20RWait { -not [LT]::IsWindow($opened) } 3000)
+        $watch2 = H20RHostMax 1200
+        $h20rOffEvidence.max_hosts_after_open_close = $watch2.max
+        # The focus timestamps do not depend on the switcher: they must still be published.
+        $stream = H20RStartEvents 'h20-off-focus-events'
+        try {
+            $focusOrder = @($h20rForms[1], $recorder, $h20rForms[1], $recorder)
+            for ($i = 0; $i -lt $focusOrder.Count; $i++) {
+                $null = Ctl "h20-off-focus-$i" @('focus-window', [string][int64]$focusOrder[$i])
+                $null = H20RWait { [LT]::GetForegroundWindow() -eq $focusOrder[$i] } 3000
+                Start-Sleep -Milliseconds 350
+            }
+        } finally { $events = H20RStopEvents $stream }
+        $recorderId = [int64]$recorder
+        $mine = @($events | Where-Object {
+            $_.type -ceq 'window_focus_timestamp_changed' -and $null -ne $_.data -and [int64]$_.data.id -eq $recorderId })
+        $stamps = @($mine | ForEach-Object { H20RStampNs $_ } | Where-Object { $_ -ge 0 })
+        $h20rOffEvidence.focus_events = $mine.Count
+        if ($stamps.Count -ge 2) {
+            $h20rOffEvidence.first_stamp_ns = $stamps[0]
+            $h20rOffEvidence.last_stamp_ns = $stamps[-1]
+            $h20rOffEvidence.stamp_advanced = ($stamps[-1] -gt $stamps[0])
+        }
+        # The lane's own config back: the switcher must work again.
+        $h20rOffEvidence.restored = H20RReloadConfig ($h20rDefaultsInclude + $h20rConfig) 'h20-recent-on-reload'
+        H20RRequire $h20rOffEvidence.restored 'The daemon did not restore the default recent-windows config.'
+        $restoreClock = [Diagnostics.Stopwatch]::StartNew()
+        $h20rOffEvidence.host_after_restore = H20ROpen
+        $h20rOffEvidence.restore_ms = $restoreClock.ElapsedMilliseconds
+        H20REndSession
+        $h20rOffEvidence.daemon_alive = (-not $h20rProc.HasExited)
+        $summary.h20_recent_windows_off_creates_no_host = ($h20rOffEvidence.reload_applied -and
+            $h20rOffEvidence.hosts_before -eq 0 -and $h20rOffEvidence.max_hosts_while_off -eq 0 -and
+            $h20rOffEvidence.chord_passed_through -and $h20rOffEvidence.opened_closed_while_off -and
+            $h20rOffEvidence.max_hosts_after_open_close -eq 0 -and $h20rOffEvidence.restored -and
+            $h20rOffEvidence.host_after_restore -and $h20rOffEvidence.daemon_alive)
+        $summary.h20_recent_windows_off_still_timestamps_focus = ($h20rOffEvidence.focus_events -ge 2 -and
+            $h20rOffEvidence.stamp_advanced -and $h20rOffEvidence.max_hosts_while_off -eq 0 -and
+            $h20rOffEvidence.daemon_alive)
+        $h20rEvidence['recent_windows_off'] = $h20rOffEvidence
+    } catch {
+        $h20rIssues.Add("recent-windows off: $($_.Exception.Message)")
+        $h20rEvidence['recent_windows_off'] = $h20rOffEvidence
+    } finally { H20RRelease }
 
     # Quit WHILE the real host exists, not just after a cancellation already destroyed it.
     try {

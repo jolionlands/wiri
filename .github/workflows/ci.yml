@@ -76,7 +76,9 @@ jobs:
 
       - name: Test CI result validation (no desktop automation)
         shell: powershell
-        run: ./scripts/ci/test-live-summary.ps1
+        run: |
+          ./scripts/ci/test-live-summary.ps1
+          ./scripts/ci/test-session-probe.ps1
 
       - name: Native tests
         run: cargo test --release -j 2 --locked

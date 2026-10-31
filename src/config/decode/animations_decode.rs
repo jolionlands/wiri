@@ -50,19 +50,24 @@ impl Decoder {
                     }
                 }
                 "slowdown" => {
-                    if let Some(v) = self.arg_number(child, 0.0, 1000.0) {
+                    // niri: `slowdown: Option<FloatOrInt<0, { i32::MAX }>>`
+                    // (niri-config/src/animations.rs:56-64).
+                    if let Some(v) = self.arg_number(child, 0.0, i32::MAX as f64) {
                         cfg.slowdown = v;
                     }
                 }
                 "duration" | "duration-ms" => {
-                    if let Some(v) = self.arg_u32(child, 60000) {
+                    // niri: `duration_ms: u32` with no upper bound
+                    // (niri-config/src/animations.rs:664-680).
+                    if let Some(v) = self.arg_u32(child, u32::MAX) {
                         cfg.duration = v;
                         cfg.legacy_easing = true;
                     }
                 }
                 "easing" | "curve" => {
                     if let Some(v) = self.animation_curve(child) {
-                        cfg.easing = v;
+                        cfg.easing = child.args[0].as_str().unwrap().to_owned();
+                        cfg.typed_curve = Some(v);
                         cfg.legacy_easing = true;
                     }
                 }
@@ -172,14 +177,54 @@ impl Decoder {
         }
     }
 
-    fn animation_curve(&mut self, node: &Node) -> Option<String> {
-        let name = self.arg_text(node)?;
-        if Easing::parse(&name).is_none() {
+    fn animation_curve(&mut self, node: &Node) -> Option<Easing> {
+        self.no_props(node);
+        self.no_children(node);
+        let Some(first) = node.args.first() else {
+            self.error(node.pos, "animation curve needs a name");
+            return None;
+        };
+        let name = self.value_text(node, first)?;
+        let Some(named) = Easing::parse(&name) else {
             self.error(node.pos, format!("unknown animation curve '{name}'; expected linear, ease-out-quad, ease-out-cubic, or ease-out-expo"));
-            None
-        } else {
-            Some(name)
+            return None;
+        };
+        let bezier = name.to_ascii_lowercase().replace('_', "-") == "cubic-bezier";
+        // Deliberate legacy compatibility: the bare name still means CubicOut.
+        if node.args.len() == 1 {
+            return Some(named);
         }
+        if !bezier || node.args.len() != 5 {
+            self.error(
+                node.pos,
+                if bezier {
+                    "cubic-bezier expects exactly four control coordinates"
+                } else {
+                    "named animation curves expect exactly one argument"
+                },
+            );
+            return None;
+        }
+        let mut controls = [0.0; 4];
+        for (index, value) in node.args[1..].iter().enumerate() {
+            // Unlike legacy numeric options, the niri grammar does not coerce strings.
+            if value.as_f64().is_none() {
+                self.error(value.pos, "Bezier control coordinates must be numbers");
+                return None;
+            }
+            let (min, max) = if index % 2 == 0 {
+                (0.0, 1.0)
+            } else {
+                (i32::MIN as f64, i32::MAX as f64)
+            };
+            controls[index] = self.value_number(node, value, min, max)?;
+        }
+        Some(Easing::CubicBezier {
+            x1: controls[0],
+            y1: controls[1],
+            x2: controls[2],
+            y2: controls[3],
+        })
     }
 
     fn animation_spring(&mut self, node: &Node) -> Option<Spring> {
@@ -197,10 +242,12 @@ impl Decoder {
                 );
                 valid = false;
             }
-            let range = match key.as_str() {
-                "damping-ratio" => (0.0, 100.0),
-                "stiffness" => (0.000001, 1_000_000_000.0),
-                "epsilon" => (0.000000000001, 1.0),
+            let (min, max) = match key.as_str() {
+                // niri: damping-ratio 0.1..=10.0, stiffness an integer >= 1, epsilon
+                // 0.00001..=0.1 (niri-config/src/animations.rs:886-900).
+                "damping-ratio" => (0.1, 10.0),
+                "stiffness" => (1.0, u32::MAX as f64),
+                "epsilon" => (0.00001, 0.1),
                 _ => {
                     self.error(
                         prop.key_pos,
@@ -210,14 +257,20 @@ impl Decoder {
                     continue;
                 }
             };
-            match self.value_number(node, &prop.value, range.0, range.1) {
-                Some(v) => match key.as_str() {
-                    "damping-ratio" => spring.damping_ratio = v,
-                    "stiffness" => spring.stiffness = v,
-                    "epsilon" => spring.epsilon = v,
-                    _ => unreachable!(),
-                },
-                None => valid = false,
+            let Some(value) = self.value_number(node, &prop.value, min, max) else {
+                valid = false;
+                continue;
+            };
+            if key == "stiffness" && value.fract() != 0.0 {
+                self.error(prop.key_pos, "'stiffness' expects an integer");
+                valid = false;
+                continue;
+            }
+            match key.as_str() {
+                "damping-ratio" => spring.damping_ratio = value,
+                "stiffness" => spring.stiffness = value,
+                "epsilon" => spring.epsilon = value,
+                _ => unreachable!(),
             }
         }
         valid.then_some(spring)
@@ -259,14 +312,15 @@ impl Decoder {
                     spring = self.animation_spring(child);
                 }
                 "duration" | "duration-ms" => {
-                    if let Some(v) = self.arg_u32(child, 60000) {
+                    // niri: `duration_ms: u32` (niri-config/src/animations.rs:649-663).
+                    if let Some(v) = self.arg_u32(child, u32::MAX) {
                         duration = v;
                     }
                     easing = true;
                 }
                 "curve" | "easing" => {
                     if let Some(v) = self.animation_curve(child) {
-                        curve = Easing::parse(&v).unwrap();
+                        curve = v;
                     }
                     easing = true;
                 }
@@ -311,6 +365,130 @@ mod tests {
         let d = decode_text(&format!("animations {{ {body} }}"), "", None);
         assert!(d.issues.is_empty(), "{body}: {:?}", d.issues);
         d.config.animations
+    }
+
+    #[test]
+    fn parity_four_coordinate_bezier_is_decoded_and_sampled_as_identity() {
+        let cfg = decode_animations(
+            "horizontal-view-movement { duration-ms 1000; curve \"cubic-bezier\" 0 0 1 1; };",
+        );
+        let mut animation = crate::layout::animation::Animation::with_kind(
+            0.0,
+            100.0,
+            cfg.view_kind(),
+            cfg.slowdown,
+        );
+        assert!((animation.tick(250) - 25.0).abs() < 0.000001);
+    }
+
+    #[test]
+    fn parity_global_bezier_controls_reach_inherited_animation() {
+        let cfg = decode_animations("duration-ms 1000; curve \"cubic-bezier\" 0 1 1 1;");
+        let mut animation = crate::layout::animation::Animation::with_kind(
+            0.0,
+            100.0,
+            cfg.open_kind(),
+            cfg.slowdown,
+        );
+        // At parameter t=0.5, x=0.5 and y=0.875 for these controls.
+        assert!((animation.tick(500) - 87.5).abs() < 0.000001);
+    }
+
+    #[test]
+    fn parity_bezier_controls_reach_every_animation_block() {
+        let blocks = "workspace-switch { CURVE cubic_bezier 0 -0.5 1 1.5; }; \
+            horizontal-view-movement { easing cubic-bezier 0 -0.5 1 1.5; }; \
+            window-movement { curve cubic-bezier 0 -0.5 1 1.5; }; \
+            window-resize { curve cubic-bezier 0 -0.5 1 1.5; }; \
+            overview-open-close { curve cubic-bezier 0 -0.5 1 1.5; }; \
+            window-open { curve cubic-bezier 0 -0.5 1 1.5; }; \
+            window-close { curve cubic-bezier 0 -0.5 1 1.5; }; \
+            recent-windows-close { curve cubic-bezier 0 -0.5 1 1.5; };";
+        for body in [
+            format!("duration-ms 450; {blocks}"),
+            format!("{blocks} duration-ms 450;"),
+        ] {
+            let cfg = decode_animations(&body);
+            for kind in [
+                cfg.workspace_kind(),
+                cfg.view_kind(),
+                cfg.movement_kind(),
+                cfg.resize_kind(),
+                cfg.overview_kind(),
+                cfg.open_kind(),
+                cfg.close_kind(),
+                cfg.recent_windows_close_kind(),
+            ] {
+                let AnimationKind::Easing { curve, .. } = kind else {
+                    panic!("{kind:?}")
+                };
+                assert_eq!(
+                    curve,
+                    Easing::CubicBezier {
+                        x1: 0.0,
+                        y1: -0.5,
+                        x2: 1.0,
+                        y2: 1.5
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parity_bezier_rejects_invalid_controls_and_node_structure() {
+        for curve in [
+            "curve;",
+            "curve cubic-bezier 0;",
+            "curve cubic-bezier 0 0;",
+            "curve cubic-bezier 0 0 1;",
+            "curve cubic-bezier 0 0 1 1 2;",
+            "curve cubic-bezier -0.001 0 1 1;",
+            "curve cubic-bezier 1.001 0 1 1;",
+            "curve cubic-bezier 0 0 -0.001 1;",
+            "curve cubic-bezier 0 0 1.001 1;",
+            "curve cubic-bezier 0 -2147483649 1 1;",
+            "curve cubic-bezier 0 2147483648 1 1;",
+            "curve cubic-bezier 0 0 1 -2147483649;",
+            "curve cubic-bezier 0 0 1 2147483648;",
+            "curve cubic-bezier #nan 0 1 1;",
+            "curve cubic-bezier 0 #inf 1 1;",
+            "curve cubic-bezier 0 0 #-inf 1;",
+            "curve cubic-bezier 0 0 1 #nan;",
+            "curve cubic-bezier \"0\" 0 1 1;",
+            "curve cubic-bezier 0 true 1 1;",
+            "curve cubic-bezier 0 0 null 1;",
+            "curve cubic-bezier 0 0 1 \"1\";",
+            "curve cubic-bezier 0 0 1 1 bad=1;",
+            "curve cubic-bezier 0 0 1 1 { bad; };",
+            "curve linear 0 0 1 1;",
+            "curve linear bad=1;",
+            "curve linear { bad; };",
+        ] {
+            for body in [curve.to_owned(), format!("window-open {{ {curve} }};")] {
+                let d = decode_text(&format!("animations {{ {body} }}"), "", None);
+                assert!(
+                    d.issues
+                        .iter()
+                        .any(|issue| issue.severity == ValidationSeverity::Error),
+                    "invalid curve accepted: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parity_bezier_accepts_y_bounds_and_preserves_bare_name_compatibility() {
+        let cfg = decode_animations("curve cubic-bezier 0 -2147483648 1 2147483647;");
+        let AnimationKind::Easing { curve, .. } = cfg.base_kind() else {
+            panic!("expected easing")
+        };
+        assert!(curve.apply(0.25).is_finite());
+        assert_eq!(curve.apply(0.0), 0.0);
+        assert_eq!(curve.apply(1.0), 1.0);
+        let cfg = decode_animations("curve cubic-bezier;");
+        assert_eq!(cfg.base_kind(), easing(200, Easing::CubicOut));
+        assert_eq!(cfg.easing, "cubic-bezier");
     }
 
     #[test]
@@ -711,7 +889,10 @@ mod tests {
             for settings in [
                 "off \"typo\";",
                 "duration-ms -2;",
-                "duration-ms 60001;",
+                // niri's `duration_ms` is a `u32` with no smaller bound
+                // (niri-config/src/animations.rs:649-663); only values that do not fit are
+                // errors.
+                "duration-ms 4294967296;",
                 "curve \"typo\";",
                 "spring damping-ratio=-1;",
                 "spring stiffness=0;",

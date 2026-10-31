@@ -64,7 +64,10 @@ impl SnapGuide {
     /// returned `JoinHandle` — the thread lives until the process exits.
     pub fn spawn(&self) -> std::thread::JoinHandle<()> {
         let state = self.state.clone();
-        std::thread::spawn(move || run_window_loop(state))
+        std::thread::Builder::new()
+            .name("wiri-snap-guide".into())
+            .spawn(move || run_window_loop(state))
+            .expect("snap guide thread")
     }
 
     /// Show the guide at screen-X `x`, spanning the vertical strip

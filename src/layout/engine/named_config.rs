@@ -26,33 +26,68 @@ impl TilingEngine {
     /// Rebuild the cached global -> output -> workspace layout views only. A config
     /// reload (or a runtime reservation change) uses this: it never moves a workspace.
     pub(super) fn refresh_layout_views(&mut self) {
+        let tiled_heights = self.capture_tiled_height_presets();
+        self.refresh_layout_views_with_tiled_heights(tiled_heights);
+    }
+
+    /// update_config captures before replacing the global layer; other callers
+    /// capture through refresh_layout_views before discarding the old caches.
+    pub(super) fn refresh_layout_views_with_tiled_heights(
+        &mut self,
+        tiled_heights: Vec<presets::TiledHeightSnapshot>,
+    ) {
         self.config_per_monitor.clear();
         self.config_per_workspace.clear();
         let Some(mut config) = self.full_config.clone() else {
+            self.refresh_tiled_height_presets(tiled_heights);
             return;
         };
-        // ReserveArea updates the runtime global base; explicit output/workspace
-        // overrides retain their normal precedence. Keep it across name/hotplug events.
-        config.layout.reserve_top = self.config.reserve_top;
-        config.layout.reserve_bottom = self.config.reserve_bottom;
-        config.layout.reserve_left = self.config.reserve_left;
-        config.layout.reserve_right = self.config.reserve_right;
-        for output in &config.output {
-            let Some(partial) = output.layout_override.as_ref() else {
-                continue;
-            };
-            if output.name.is_empty() {
-                continue;
+        // Runtime requests retain their units independently of every projected view.
+        for (edge, request) in [
+            (&mut config.layout.struts.top, self.runtime_reservations.top),
+            (
+                &mut config.layout.struts.right,
+                self.runtime_reservations.right,
+            ),
+            (
+                &mut config.layout.struts.bottom,
+                self.runtime_reservations.bottom,
+            ),
+            (
+                &mut config.layout.struts.left,
+                self.runtime_reservations.left,
+            ),
+        ] {
+            if let Some(px) = request {
+                *edge = crate::config::InsetValue::Physical(px);
             }
-            let id = self
-                .find_output_by_name(&output.name)
-                .unwrap_or_else(|| OutputId::from_name(&output.name));
-            let mut merged = config.clone();
-            merged.layout = partial.apply_to(&config.layout);
-            self.config_per_monitor
-                .insert(id, LayoutConfig::from_config(&merged));
         }
+        let backdrop = self.config.backdrop.clone();
+        self.config = LayoutConfig::from_config(&config);
+        self.config.backdrop = backdrop;
         let outputs: Vec<_> = self.monitors.keys().copied().collect();
+        // Every connected output has a projected view, including outputs without
+        // any override. Merge all canonical layers before applying that output's DPI.
+        for output in &outputs {
+            let mut merged = config.clone();
+            for candidate in &config.output {
+                if candidate.name.is_empty() {
+                    continue;
+                }
+                let id = self
+                    .find_output_by_name(&candidate.name)
+                    .unwrap_or_else(|| OutputId::from_name(&candidate.name));
+                if id == *output {
+                    if let Some(partial) = &candidate.layout_override {
+                        merged.layout = partial.apply_to(&merged.layout);
+                    }
+                }
+            }
+            let scale = self.monitors.get(output).map_or(1.0, |m| m.scale_factor);
+            let mut view = LayoutConfig::from_config_at_scale(&merged, scale);
+            view.backdrop = self.config.backdrop.clone();
+            self.config_per_monitor.insert(*output, view);
+        }
         let mut views = WorkspaceLayouts::new();
         let mut merged = config.clone();
         for workspace in &config.workspace {
@@ -80,11 +115,16 @@ impl TilingEngine {
                     }
                 }
                 merged.layout = partial.apply_to(&base);
-                per_output.insert(*output, LayoutConfig::from_config(&merged));
+                let scale = self.monitors.get(output).map_or(1.0, |m| m.scale_factor);
+                let mut view = LayoutConfig::from_config_at_scale(&merged, scale);
+                view.backdrop = self.config.backdrop.clone();
+                per_output.insert(*output, view);
             }
             views.insert(workspace.name.clone(), per_output);
         }
         self.config_per_workspace = views;
+        self.refresh_tiled_height_presets(tiled_heights);
+        self.refresh_float_presets();
     }
 
     /// The ordered output preferences of one `workspace` declaration: its repeated
@@ -148,7 +188,7 @@ impl TilingEngine {
         views.get(workspace.name.as_deref()?)?.get(&output)
     }
 
-    pub(super) fn effective_config_for_workspace(
+    pub(crate) fn effective_config_for_workspace(
         &self,
         output: OutputId,
         workspace: i32,

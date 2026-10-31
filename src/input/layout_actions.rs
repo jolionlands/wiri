@@ -2,6 +2,71 @@
 use super::{Action, WorkspaceRef};
 use crate::utils::WindowId;
 
+/// A wiri-extension diagonal grid step (unified XY grid, `layout { unified-grid }`).
+///
+/// `unified-grid` gives a monitor one horizontal camera shared by every workspace
+/// row, which makes the desktop a single XY grid that can be traversed diagonally.
+/// A grid action is one row up or down (`Vertical`) and one column position left or
+/// right (`Right`) applied as **one** motion. With the mode off each one falls back to
+/// the sequential vertical-then-horizontal niri actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridAction {
+    /// `true` for one workspace row up, `false` for one row down.
+    pub up: bool,
+    /// `true` for one column position right, `false` for one column left.
+    pub right: bool,
+    /// `true` moves the focused window instead of the focus.
+    pub move_window: bool,
+}
+
+impl GridAction {
+    pub fn new(up: bool, right: bool, move_window: bool) -> Self {
+        Self {
+            up,
+            right,
+            move_window,
+        }
+    }
+
+    /// The name the config, `wiri-ctl action` and typed IPC all use.
+    pub fn name(self) -> &'static str {
+        match (self.move_window, self.up, self.right) {
+            (false, true, false) => "focus-up-left",
+            (false, true, true) => "focus-up-right",
+            (false, false, false) => "focus-down-left",
+            (false, false, true) => "focus-down-right",
+            (true, true, false) => "move-window-up-left",
+            (true, true, true) => "move-window-up-right",
+            (true, false, false) => "move-window-down-left",
+            (true, false, true) => "move-window-down-right",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridPan {
+    /// `true` scrolls the shared camera right, `false` left.
+    pub right: bool,
+    /// `true` moves one workspace row down, `false` one row up.
+    pub down: bool,
+}
+
+impl GridPan {
+    pub fn new(right: bool, down: bool) -> Self {
+        Self { right, down }
+    }
+
+    /// The name the config, `wiri-ctl action` and typed IPC all use.
+    pub fn name(self) -> &'static str {
+        match (self.down, self.right) {
+            (false, false) => "pan-up-left",
+            (false, true) => "pan-up-right",
+            (true, false) => "pan-down-left",
+            (true, true) => "pan-down-right",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FocusAction {
     ColumnRightOrFirst,
@@ -30,6 +95,9 @@ pub enum FocusAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkspaceAction {
+    Focus {
+        reference: WorkspaceRef,
+    },
     MoveWindow {
         window: Option<WindowId>,
         reference: WorkspaceRef,
@@ -59,6 +127,90 @@ pub enum WorkspaceAction {
     UnsetName {
         workspace: Option<WorkspaceRef>,
     },
+}
+
+impl From<crate::ipc::WorkspaceReferenceArg> for WorkspaceRef {
+    fn from(reference: crate::ipc::WorkspaceReferenceArg) -> Self {
+        match reference {
+            crate::ipc::WorkspaceReferenceArg::Id(id) => Self::Id(id),
+            crate::ipc::WorkspaceReferenceArg::Index(index) => Self::Index(u32::from(index).max(1)),
+            crate::ipc::WorkspaceReferenceArg::Name(name) => Self::Name(name),
+        }
+    }
+}
+
+impl crate::ipc::WorkspaceIpcAction {
+    pub(crate) fn action_name(&self) -> &'static str {
+        use crate::ipc::WorkspaceIpcAction as I;
+        match self {
+            I::FocusWorkspace { .. } => "focus-workspace",
+            I::MoveWindowToWorkspace { .. } => "move-window-to-workspace",
+            I::MoveColumnToWorkspace { .. } => "move-column-to-workspace",
+            I::MoveWorkspaceToIndex { .. } => "move-workspace-to-index",
+            I::SetWorkspaceName { .. } => "set-workspace-name",
+            I::UnsetWorkspaceName { .. } => "unset-workspace-name",
+            I::MoveWorkspaceToMonitor { .. } => "move-workspace-to-monitor",
+        }
+    }
+
+    /// Convert transport types without resolving an ID against transient state.
+    pub(crate) fn into_input_action(self) -> Result<Action, String> {
+        use crate::ipc::WorkspaceIpcAction as I;
+        use WorkspaceAction as W;
+        Ok(match self {
+            I::FocusWorkspace { reference } => match WorkspaceRef::from(reference) {
+                WorkspaceRef::Index(index) => Action::FocusWorkspace(index as i32),
+                WorkspaceRef::Name(name) => Action::FocusWorkspaceNamed(name),
+                reference @ WorkspaceRef::Id(_) => Action::WorkspaceAction(W::Focus { reference }),
+            },
+            I::MoveWindowToWorkspace {
+                window_id,
+                reference,
+                focus,
+            } => {
+                let window = window_id
+                    .map(|id| isize::try_from(id).map(WindowId::new))
+                    .transpose()
+                    .map_err(|_| "window id exceeds the native handle range")?;
+                Action::WorkspaceAction(W::MoveWindow {
+                    window,
+                    reference: reference.into(),
+                    focus,
+                })
+            }
+            I::MoveColumnToWorkspace { reference, focus } => {
+                Action::WorkspaceAction(W::MoveColumn {
+                    reference: reference.into(),
+                    focus,
+                })
+            }
+            I::MoveWorkspaceToIndex { index, reference } => {
+                // Larger valid usize destinations all clamp to the end of the
+                // finite workspace stack, just like the engine's u32 maximum.
+                Action::WorkspaceAction(W::MoveToIndex {
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    workspace: reference.map(Into::into),
+                })
+            }
+            I::SetWorkspaceName {
+                name,
+                workspace: None,
+            } => Action::RenameWorkspace(name),
+            I::SetWorkspaceName { name, workspace } => Action::WorkspaceAction(W::SetName {
+                name,
+                workspace: workspace.map(Into::into),
+            }),
+            I::UnsetWorkspaceName { reference } => Action::WorkspaceAction(W::UnsetName {
+                workspace: reference.map(Into::into),
+            }),
+            I::MoveWorkspaceToMonitor { output, reference } => {
+                Action::MonitorAction(MonitorAction::MoveWorkspace {
+                    workspace: reference.map(Into::into),
+                    target: MonitorTarget::Name(output),
+                })
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -190,6 +342,18 @@ pub(super) fn parse(name: &str, args: &[String], quoted: &[bool]) -> Option<Opti
             | "rename-workspace"
             | "rename-ws"
             | "unset-workspace-name"
+            | "focus-up-left"
+            | "focus-up-right"
+            | "focus-down-left"
+            | "focus-down-right"
+            | "move-window-up-left"
+            | "move-window-up-right"
+            | "move-window-down-left"
+            | "move-window-down-right"
+            | "pan-up-left"
+            | "pan-up-right"
+            | "pan-down-left"
+            | "pan-down-right"
             | "focus-monitor"
             | "focus-monitor-left"
             | "focus-monitor-right"
@@ -277,7 +441,7 @@ impl<'a> Words<'a> {
                             _ => return None,
                         })
                     }
-                    "--workspace" if words.workspace.is_none() => {
+                    "--workspace" | "--reference" if words.workspace.is_none() => {
                         words.workspace = Some(WorkspaceRef::from_word(value, value_quoted)?)
                     }
                     "--id" if words.window.is_none() => {
@@ -328,15 +492,18 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
         | "move-column-down"
         | "move-column-to-workspace-above"
         | "move-column-to-workspace-below" => &["--focus"],
-        "move-workspace-to-index"
-        | "set-workspace-name"
-        | "rename-workspace"
-        | "rename-ws"
-        | "unset-workspace-name" => &["--workspace"],
+        // niri's CLI names the target of `move-workspace-to-index` and
+        // `move-workspace-to-monitor` `--reference` (niri:niri-ipc/src/lib.rs:579-586,
+        // 805-812) and that of `set-workspace-name` `--workspace` (lib.rs:595-602); wiri's
+        // older `--workspace` spelling keeps working for all of them.
+        "move-workspace-to-index" => &["--workspace", "--reference"],
+        "set-workspace-name" | "rename-workspace" | "rename-ws" | "unset-workspace-name" => {
+            &["--workspace"]
+        }
         "focus-window-previous" | "focus-previous" | "alt-tab" | "focus-history-back" => {
             &["--debounce-ms"]
         }
-        n if n.starts_with("move-workspace-to-monitor") => &["--workspace"],
+        n if n.starts_with("move-workspace-to-monitor") => &["--workspace", "--reference"],
         n if n.starts_with("move-window-to-monitor")
             || n == "move-to-monitor-left"
             || n == "move-to-monitor-right" =>
@@ -358,11 +525,13 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
     match name {
         "focus-column-right-or-first" => focus(F::ColumnRightOrFirst),
         "focus-column-left-or-last" => focus(F::ColumnLeftOrLast),
+        // `focus-column` takes a `usize` and `focus-window-in-column` a `u8`
+        // (niri:niri-config/src/binds.rs:163,175): 300 is no window index.
         "focus-column" => Some(Action::LayoutFocus(F::Column(
-            w.one()?.parse::<u32>().ok()?.max(1),
+            super::parse_usize_index(w.one()?)?.max(1),
         ))),
         "focus-window-in-column" => Some(Action::LayoutFocus(F::WindowInColumn(
-            w.one()?.parse::<u32>().ok()?.max(1),
+            u32::from(w.one()?.parse::<u8>().ok()?).max(1),
         ))),
         "focus-window-down-or-column-left" => focus(F::DownOrColumnLeft),
         "focus-window-down-or-column-right" => focus(F::DownOrColumnRight),
@@ -391,6 +560,7 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
             })
         }
         "focus-workspace" => match w.reference()? {
+            WorkspaceRef::Id(_) => None,
             WorkspaceRef::Index(index) => Some(Action::FocusWorkspace(i32::try_from(index).ok()?)),
             WorkspaceRef::Name(name) => Some(Action::FocusWorkspaceNamed(name)),
         },
@@ -442,7 +612,7 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
         "move-workspace-down" | "swap-workspace-down" => simple(Action::MoveWorkspaceDown),
         "move-workspace-up" | "swap-workspace-up" => simple(Action::MoveWorkspaceUp),
         "move-workspace-to-index" => Some(Action::WorkspaceAction(W::MoveToIndex {
-            index: w.one()?.parse::<u32>().ok()?.max(1),
+            index: super::parse_usize_index(w.one()?)?.max(1),
             workspace: w.workspace.clone(),
         })),
         "set-workspace-name" | "rename-workspace" | "rename-ws" => {
@@ -455,6 +625,22 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
         "unset-workspace-name" if empty => Some(Action::WorkspaceAction(W::UnsetName {
             workspace: w.workspace,
         })),
+        // wiri extension: the unified-grid diagonal steps. Unit actions, like niri's
+        // own directional actions.
+        "focus-up-left" => simple(Action::Grid(GridAction::new(true, false, false))),
+        "focus-up-right" => simple(Action::Grid(GridAction::new(true, true, false))),
+        "focus-down-left" => simple(Action::Grid(GridAction::new(false, false, false))),
+        "focus-down-right" => simple(Action::Grid(GridAction::new(false, true, false))),
+        "move-window-up-left" => simple(Action::Grid(GridAction::new(true, false, true))),
+        "move-window-up-right" => simple(Action::Grid(GridAction::new(true, true, true))),
+        "move-window-down-left" => simple(Action::Grid(GridAction::new(false, false, true))),
+        "move-window-down-right" => simple(Action::Grid(GridAction::new(false, true, true))),
+        // wiri extension: the unified-grid diagonal pan (touchpad two-finger scroll or a
+        // wheel that carries both axes).
+        "pan-up-left" => simple(Action::GridPan(GridPan::new(false, false))),
+        "pan-up-right" => simple(Action::GridPan(GridPan::new(true, false))),
+        "pan-down-left" => simple(Action::GridPan(GridPan::new(false, true))),
+        "pan-down-right" => simple(Action::GridPan(GridPan::new(true, true))),
         _ => {
             let (kind, suffix) = if let Some(s) = name.strip_prefix("focus-monitor") {
                 (0, s)

@@ -39,7 +39,9 @@ static OWNER_THREAD: AtomicU32 = AtomicU32::new(0);
 static FOLLOWS_MOUSE: AtomicBool = AtomicBool::new(false);
 static MOTION_PENDING: AtomicBool = AtomicBool::new(false);
 static MOTION_POINT: AtomicU64 = AtomicU64::new(0);
-static FOREGROUND_PENDING: AtomicBool = AtomicBool::new(false);
+// Zero means no outstanding post; otherwise the value identifies its owner.
+static FOREGROUND_PENDING: AtomicU64 = AtomicU64::new(0);
+static FOREGROUND_GENERATION: AtomicU64 = AtomicU64::new(0);
 static FOREGROUND_HWND: AtomicIsize = AtomicIsize::new(0);
 static WARP_PENDING: AtomicBool = AtomicBool::new(false);
 static WARP_POINT: AtomicU64 = AtomicU64::new(0);
@@ -60,12 +62,142 @@ fn unpack(value: u64) -> Point {
 }
 
 fn post(message: u32) -> bool {
+    #[cfg(test)]
+    if let Some(result) = activation_test_support::record_post(message) {
+        return result;
+    }
     let thread = OWNER_THREAD.load(Ordering::Acquire);
     if thread == 0 {
         return false;
     }
     // SAFETY: no pointers are sent; the owner has already created its message queue.
     unsafe { PostThreadMessageW(thread, message, WPARAM(0), LPARAM(0)).is_ok() }
+}
+
+/// A native activation may finish after its foreground event was delivered,
+/// without another focus/location event when the target's geometry is unchanged.
+/// Revalidate only that observed request; the input thread retains suppression,
+/// completed-warp deduplication and all foreground/geometry checks.
+pub(crate) fn activation_completed(window: isize) {
+    if window == 0 || FOREGROUND_HWND.load(Ordering::Acquire) != window {
+        return;
+    }
+    request_foreground_revalidation();
+}
+
+fn request_foreground_revalidation() {
+    let mut generation = FOREGROUND_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    // One failed post may have hidden a newer coalesced publication. Recover
+    // that publication once, without spinning when a queue stays unavailable.
+    for _ in 0..2 {
+        if FOREGROUND_PENDING
+            .compare_exchange(0, generation, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if post(WM_FOREGROUND_WARP) {
+            return;
+        }
+        // A delivered message may already have released our claim and a newer
+        // publisher acquired its own. Never clear that publisher's wake.
+        if FOREGROUND_PENDING
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let latest = FOREGROUND_GENERATION.load(Ordering::Acquire);
+        if latest == generation {
+            return;
+        }
+        generation = latest;
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod activation_test_support {
+    use super::*;
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    thread_local! {
+        static POSTS: RefCell<Option<Vec<isize>>> = const { RefCell::new(None) };
+        static FAIL_WITH_FOREGROUND: RefCell<Option<(isize, bool)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn fail_next_post_with_foreground(window: isize) {
+        FAIL_WITH_FOREGROUND.with(|next| *next.borrow_mut() = Some((window, false)));
+    }
+
+    pub(crate) fn fail_next_post_after_delivery_with_foreground(window: isize) {
+        FAIL_WITH_FOREGROUND.with(|next| *next.borrow_mut() = Some((window, true)));
+    }
+
+    pub(crate) fn foreground_wake_pending() -> bool {
+        FOREGROUND_PENDING.load(Ordering::Acquire) != 0
+    }
+
+    pub(super) fn record_post(message: u32) -> Option<bool> {
+        if POSTS.with(|posts| posts.borrow().is_none()) {
+            return None;
+        }
+        let interleaved = FAIL_WITH_FOREGROUND.with(|next| next.borrow_mut().take());
+        if let Some((window, delivered)) = interleaved {
+            if delivered {
+                // Simulate the owner consuming an older queued notification
+                // before a new publisher acquires its own posting claim.
+                FOREGROUND_PENDING.store(0, Ordering::Release);
+            }
+            if window != 0 {
+                // SYSTEM_FOREGROUND only publishes its HWND; unlike object
+                // events, this callback branch makes no native queries.
+                unsafe {
+                    foreground_event(
+                        HWINEVENTHOOK::default(),
+                        EVENT_SYSTEM_FOREGROUND,
+                        HWND(window as *mut std::ffi::c_void),
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+            return Some(false);
+        }
+        POSTS.with(|posts| {
+            let mut posts = posts.borrow_mut();
+            let posts = posts.as_mut()?;
+            if message == WM_FOREGROUND_WARP {
+                posts.push(FOREGROUND_HWND.load(Ordering::Acquire));
+            }
+            Some(true)
+        })
+    }
+
+    /// The early foreground message has already been delivered while native
+    /// activation is unfinished. Capture later wakes without touching Win32.
+    pub(crate) fn after_early_foreground<T>(
+        window: isize,
+        finish: impl FnOnce() -> T,
+    ) -> (T, Vec<isize>) {
+        let _serial = SERIAL.lock().unwrap();
+        let saved_window = FOREGROUND_HWND.swap(window, Ordering::AcqRel);
+        let saved_pending = FOREGROUND_PENDING.swap(0, Ordering::AcqRel);
+        let saved_generation = FOREGROUND_GENERATION.swap(0, Ordering::AcqRel);
+        POSTS.with(|posts| *posts.borrow_mut() = Some(Vec::new()));
+        FAIL_WITH_FOREGROUND.with(|next| *next.borrow_mut() = None);
+        let result = finish();
+        let posts = POSTS.with(|posts| posts.borrow_mut().take().unwrap());
+        FAIL_WITH_FOREGROUND.with(|next| *next.borrow_mut() = None);
+        FOREGROUND_HWND.store(saved_window, Ordering::Release);
+        FOREGROUND_PENDING.store(saved_pending, Ordering::Release);
+        FOREGROUND_GENERATION.store(saved_generation, Ordering::Release);
+        (result, posts)
+    }
 }
 
 /// Called by WH_MOUSE_LL, including while its grab-state mutex is held.
@@ -115,7 +247,7 @@ pub fn shutdown() {
     FOLLOWS_MOUSE.store(false, Ordering::Release);
     OWNER_THREAD.store(0, Ordering::Release);
     MOTION_PENDING.store(false, Ordering::Release);
-    FOREGROUND_PENDING.store(false, Ordering::Release);
+    FOREGROUND_PENDING.store(0, Ordering::Release);
     WARP_PENDING.store(false, Ordering::Release);
     STATE.with(|slot| {
         if let Some(mut state) = slot.borrow_mut().take() {
@@ -142,7 +274,7 @@ pub fn handle_message(message: &MSG) -> bool {
                 true
             }
             WM_FOREGROUND_WARP if message.hwnd.is_invalid() => {
-                if FOREGROUND_PENDING.swap(false, Ordering::AcqRel) {
+                if FOREGROUND_PENDING.swap(0, Ordering::AcqRel) != 0 {
                     state.foreground(FOREGROUND_HWND.load(Ordering::Acquire));
                 }
                 true
@@ -281,7 +413,7 @@ impl FocusState {
             // SAFETY: this thread owns the successfully installed hook.
             let _ = unsafe { UnhookWinEvent(hook) };
         }
-        FOREGROUND_PENDING.store(false, Ordering::Release);
+        FOREGROUND_PENDING.store(0, Ordering::Release);
     }
 
     fn stop_timer(&mut self) {
@@ -468,7 +600,8 @@ impl FocusState {
             return;
         }
         // A queued foreground event can precede actual activation. Keep the
-        // pending request; object-focus/location notifications revalidate it.
+        // pending request; native activation completion and object-focus/location
+        // notifications revalidate it.
         let foreground = unsafe { GetForegroundWindow() };
         if foreground.0 as isize != event_hwnd {
             return;
@@ -570,9 +703,7 @@ unsafe extern "system" fn foreground_event(
     } else {
         return;
     }
-    if !FOREGROUND_PENDING.swap(true, Ordering::AcqRel) && !post(WM_FOREGROUND_WARP) {
-        FOREGROUND_PENDING.store(false, Ordering::Release);
-    }
+    request_foreground_revalidation();
 }
 
 fn cursor_position() -> Option<Point> {
@@ -688,12 +819,9 @@ fn reveal_scroll(engine: &TilingEngine, target: FocusTarget, percent: Option<f64
     if workspace.layout_mode != WorkspaceLayout::Scrolling {
         return Some(before);
     }
-    let config = engine.effective_config(target.output);
-    let view_width = monitor.work_area.size.w as i32
-        - config.outer_gaps.1
-        - config.outer_gaps.3
-        - config.reserve_left as i32
-        - config.reserve_right as i32;
+    let config = engine.effective_config_for_workspace(target.output, target.workspace);
+    let precise_width = TilingEngine::precise_tiling_area(monitor, config).width;
+    let view_width = precise_width.floor() as i32;
     if view_width <= 0 {
         return None;
     }
@@ -722,7 +850,7 @@ fn reveal_scroll(engine: &TilingEngine, target: FocusTarget, percent: Option<f64
         &explicit,
         &mins,
         &maxs,
-        view_width,
+        precise_width,
         config.column_gap,
         config,
     );

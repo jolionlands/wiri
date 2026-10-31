@@ -43,6 +43,243 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Identifies wiri's activation nudge so it cannot count as application input.
 pub(crate) const ACTIVATION_INPUT_TAG: usize = 0x5749_5249;
 
+// Keep native activation attempts separate from their completion boundary so
+// the event ordering can be exercised without activating a real HWND.
+fn activation_with_completion(hwnd: isize, attempt: impl FnOnce() -> Result<()>) -> Result<()> {
+    attempt()?;
+    crate::input::focus::activation_completed(hwnd);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod activation_attempt_test_support {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ATTEMPTS: RefCell<Option<Vec<isize>>> = const { RefCell::new(None) };
+        static NATIVE: RefCell<Option<NativeSim>> = const { RefCell::new(None) };
+    }
+
+    /// What a simulated native foreground does with an activation request that is not
+    /// already satisfied (a request for the window that already is foreground never
+    /// reaches this: the real `activate_window_native` returns at its first check).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Activation {
+        /// Windows refuses (the foreground lock): the foreground does not change.
+        Refuse,
+        /// Windows accepts and the foreground changes, but never raises
+        /// EVENT_SYSTEM_FOREGROUND (the aa6c884 h15 evidence).
+        SwitchWithoutNotice,
+        /// Windows accepts the request but the foreground has not changed yet.
+        AcceptDeferred,
+    }
+
+    struct NativeSim {
+        foreground: isize,
+        activation: Activation,
+        attempts: Vec<isize>,
+    }
+
+    /// Run `run` against a simulated native foreground window. Returns the activation
+    /// attempts the backend made (never one for the window that already was foreground).
+    pub(crate) fn with_native_foreground<T>(
+        foreground: isize,
+        activation: Activation,
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<isize>) {
+        struct Restore(Option<NativeSim>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                NATIVE.with(|sim| *sim.borrow_mut() = self.0.take());
+            }
+        }
+
+        let _restore = Restore(NATIVE.with(|sim| {
+            sim.replace(Some(NativeSim {
+                foreground,
+                activation,
+                attempts: Vec::new(),
+            }))
+        }));
+        let result = run();
+        let attempts = NATIVE.with(|sim| {
+            sim.borrow_mut()
+                .as_mut()
+                .map(|sim| std::mem::take(&mut sim.attempts))
+                .unwrap_or_default()
+        });
+        (result, attempts)
+    }
+
+    /// The simulated foreground window, when a simulation is installed.
+    pub(super) fn native_foreground() -> Option<isize> {
+        NATIVE.with(|sim| sim.borrow().as_ref().map(|sim| sim.foreground))
+    }
+
+    /// The simulation's answer to an activation request, or None without a simulation.
+    pub(super) fn native_activation(hwnd: isize) -> Option<bool> {
+        NATIVE.with(|sim| {
+            let mut sim = sim.borrow_mut();
+            let sim = sim.as_mut()?;
+            if sim.foreground == hwnd {
+                return Some(true);
+            }
+            sim.attempts.push(hwnd);
+            match sim.activation {
+                Activation::Refuse => Some(false),
+                Activation::SwitchWithoutNotice => {
+                    sim.foreground = hwnd;
+                    Some(true)
+                }
+                Activation::AcceptDeferred => Some(true),
+            }
+        })
+    }
+
+    /// Observe real backend activation dispatch without activating fabricated HWNDs.
+    /// Refusals also ensure callers cannot rely on a successful foreground event.
+    pub(crate) fn with_refused_activation_attempts<T>(run: impl FnOnce() -> T) -> (T, Vec<isize>) {
+        struct Restore(Option<Vec<isize>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ATTEMPTS.with(|attempts| *attempts.borrow_mut() = self.0.take());
+            }
+        }
+
+        let _restore = Restore(ATTEMPTS.with(|attempts| attempts.replace(Some(Vec::new()))));
+        let result = run();
+        let attempts = ATTEMPTS.with(|attempts| attempts.borrow_mut().take().unwrap());
+        (result, attempts)
+    }
+
+    pub(super) fn record_refusal(hwnd: isize) -> bool {
+        ATTEMPTS.with(|attempts| {
+            let mut attempts = attempts.borrow_mut();
+            let Some(attempts) = attempts.as_mut() else {
+                return false;
+            };
+            attempts.push(hwnd);
+            true
+        })
+    }
+}
+
+#[cfg(test)]
+mod activation_completion_tests {
+    use super::*;
+    use crate::input::focus::activation_test_support::{
+        after_early_foreground, fail_next_post_after_delivery_with_foreground,
+        fail_next_post_with_foreground, foreground_wake_pending,
+    };
+
+    #[test]
+    fn activation_success_rechecks_pending_warp_without_another_native_event() {
+        let (result, wakes) =
+            after_early_foreground(20, || activation_with_completion(20, || Ok(())));
+        assert!(result.is_ok());
+        assert_eq!(
+            wakes,
+            vec![20],
+            "successful activation must wake pending warp revalidation"
+        );
+    }
+
+    #[test]
+    fn failed_activation_does_not_publish_a_warp_completion() {
+        let (result, wakes) = after_early_foreground(20, || {
+            activation_with_completion(20, || Err(anyhow::anyhow!("activation refused")))
+        });
+        assert!(result.is_err());
+        assert!(wakes.is_empty());
+    }
+
+    #[test]
+    fn activation_completion_does_not_replace_a_newer_foreground_request() {
+        let (result, wakes) =
+            after_early_foreground(30, || activation_with_completion(20, || Ok(())));
+        assert!(result.is_ok());
+        assert!(wakes.is_empty());
+    }
+
+    #[test]
+    fn activation_completion_coalesces_duplicate_successes() {
+        let (result, wakes) = after_early_foreground(20, || {
+            activation_with_completion(20, || Ok(()))?;
+            activation_with_completion(20, || Ok(()))
+        });
+        assert!(result.is_ok());
+        assert_eq!(wakes, vec![20]);
+    }
+
+    #[test]
+    fn activation_post_failure_preserves_an_interleaved_new_foreground_wake() {
+        let (result, wakes) = after_early_foreground(20, || {
+            // While this completion's post is in flight, the live owner thread
+            // receives a newer foreground event and coalesces its notification.
+            fail_next_post_with_foreground(30);
+            activation_with_completion(20, || Ok(()))
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            wakes,
+            vec![30],
+            "a failed older post must not lose the newer foreground wake"
+        );
+    }
+
+    #[test]
+    fn activation_post_failure_allows_a_later_completion_to_publish() {
+        let (result, wakes) = after_early_foreground(20, || {
+            fail_next_post_with_foreground(0);
+            activation_with_completion(20, || Ok(()))?;
+            activation_with_completion(20, || Ok(()))
+        });
+        assert!(result.is_ok());
+        assert_eq!(wakes, vec![20]);
+    }
+
+    #[test]
+    fn activation_post_failure_does_not_clear_a_newer_successfully_queued_wake() {
+        let ((result, pending), wakes) = after_early_foreground(20, || {
+            fail_next_post_after_delivery_with_foreground(30);
+            let result = activation_with_completion(20, || Ok(()));
+            (result, foreground_wake_pending())
+        });
+        assert!(result.is_ok());
+        assert_eq!(wakes, vec![30]);
+        assert!(
+            pending,
+            "the newer queued notification must remain consumable"
+        );
+    }
+}
+
+/// Application tracking bounds in visible physical pixels; zero is unconstrained.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeBounds {
+    pub min_width: u32,
+    pub min_height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+/// The native identity and conversion inputs sampled without an engine lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeBoundsContext {
+    pub dpi: u32,
+    pub style: isize,
+    pub ex_style: isize,
+    pub monitor: isize,
+    pub process_id: u32,
+    pub thread_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeBoundsSample {
+    pub bounds: NativeBounds,
+    pub context: NativeBoundsContext,
+}
+
 /// Inject a harmless key press (F24, which no keyboard has and nothing binds).
 ///
 /// Windows grants the right to call `SetForegroundWindow` to the process that
@@ -886,6 +1123,41 @@ impl BackendHandle {
     /// Returns an error only when every step failed; callers log that once and
     /// do not retry (see `TilingEngine::activate_now`).
     pub fn activate_window(&self, hwnd: isize) -> Result<()> {
+        activation_with_completion(hwnd, || self.activate_window_native(hwnd))
+    }
+
+    /// The native foreground window right now (0 for none): a fresh `GetForegroundWindow`
+    /// query, never a remembered notice. Tests see the simulated foreground, or none.
+    #[cfg(not(test))]
+    pub fn foreground_window(&self) -> isize {
+        // SAFETY: GetForegroundWindow takes no arguments; the handle is only compared.
+        unsafe { GetForegroundWindow().0 as isize }
+    }
+
+    #[cfg(test)]
+    pub fn foreground_window(&self) -> isize {
+        activation_attempt_test_support::native_foreground().unwrap_or(0)
+    }
+
+    fn activate_window_native(&self, hwnd: isize) -> Result<()> {
+        #[cfg(test)]
+        if let Some(accepted) = activation_attempt_test_support::native_activation(hwnd) {
+            return if accepted {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "injected foreground refusal for hwnd={}",
+                    hwnd
+                ))
+            };
+        }
+        #[cfg(test)]
+        if activation_attempt_test_support::record_refusal(hwnd) {
+            return Err(anyhow::anyhow!(
+                "injected foreground refusal for hwnd={}",
+                hwnd
+            ));
+        }
         let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
         unsafe {
             if !IsWindow(hwnd_win).as_bool() {
@@ -1013,6 +1285,52 @@ impl BackendHandle {
         let outer = query_min_track_width(hwnd_win)?;
         let border = measured_shadow_margins(hwnd_win).map_or(0, |m| m[0] + m[2]);
         visible_min_width(outer, border)
+    }
+
+    /// Cheap context validation; no application message is sent.
+    pub fn native_bounds_context(&self, hwnd: isize) -> Option<NativeBoundsContext> {
+        use windows::Win32::UI::HiDpi::GetDpiForWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, GWL_STYLE};
+        let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+        unsafe {
+            if !IsWindow(hwnd).as_bool() {
+                return None;
+            }
+            let mut process_id = 0;
+            let thread_id = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+            if process_id == 0 || thread_id == 0 {
+                return None;
+            }
+            Some(NativeBoundsContext {
+                dpi: GetDpiForWindow(hwnd),
+                style: GetWindowLongPtrW(hwnd, GWL_STYLE),
+                ex_style: GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+                monitor: MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize,
+                process_id,
+                thread_id,
+            })
+        }
+    }
+
+    /// A bounded coherent answer. `None` means failed/stale, while `Some` may
+    /// contain four zeros and must replace an older constrained answer.
+    /// Call outside engine locks: WM_GETMINMAXINFO runs on the app's UI thread.
+    pub fn native_bounds(&self, hwnd: isize) -> Option<NativeBoundsSample> {
+        let context = self.native_bounds_context(hwnd)?;
+        let hwnd_win = HWND(hwnd as *mut std::ffi::c_void);
+        let raw = query_track_bounds(hwnd_win)?;
+        refresh_native_bounds_sample(
+            hwnd,
+            [
+                raw.ptMinTrackSize.x,
+                raw.ptMinTrackSize.y,
+                raw.ptMaxTrackSize.x,
+                raw.ptMaxTrackSize.y,
+            ],
+            context,
+            || fresh_shadow_margins(hwnd_win),
+            || self.native_bounds_context(hwnd),
+        )
     }
 
     /// Put a window back exactly where it was before wiri tiled it.  `rect` is
@@ -1461,6 +1779,381 @@ mod tests {
     }
 
     #[test]
+    fn native_bounds_conversion_subtracts_asymmetric_margins_on_both_axes() {
+        assert_eq!(
+            visible_track_bounds([114, 209, 654, 489], [5, 2, 9, 7]),
+            NativeBounds {
+                min_width: 100,
+                min_height: 200,
+                max_width: 640,
+                max_height: 480
+            }
+        );
+        // Native answers are already physical pixels: DPI is not an argument
+        // to this conversion, and Wiri's tile border is not subtracted here.
+    }
+
+    #[test]
+    fn native_bounds_conversion_preserves_zero_and_discards_invalid_axes() {
+        assert_eq!(
+            visible_track_bounds([0, 5, -1, 20_000], [7, 4, 7, 4]),
+            NativeBounds::default()
+        );
+    }
+
+    #[test]
+    fn native_bounds_review_missing_margin_measurement_is_not_a_successful_sample() {
+        // A new outer answer cannot be converted into visible bounds when DWM
+        // cannot supply the frame measurement. Returning None lets the engine
+        // retain its previously good visible bounds instead of replacing them.
+        assert_eq!(
+            native_bounds_sample([414, 247, 814, 607], None, NativeBoundsContext::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn native_bounds_margin_refresh_failure_retains_unchanged_context_placement() {
+        let hwnd: isize = 0x5EED_0084;
+        let margins = [7, 2, 9, 8];
+        let context = NativeBoundsContext {
+            dpi: 144,
+            style: 0x00CF_0000,
+            ..Default::default()
+        };
+        let wanted = Rect::new(100, 50, 600, 400);
+        SHADOW_MARGINS.lock().insert(hwnd, margins);
+
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [416, 250, 816, 610],
+            context,
+            || None, // DWM and GetWindowRect temporarily disagree during an asynchronous move.
+            || Some(context),
+        );
+        let placement = expand_for_shadow_margin(HWND(hwnd as *mut std::ffi::c_void), wanted);
+        forget_shadow_margins(hwnd);
+
+        assert_eq!(
+            sample, None,
+            "an unavailable fresh measurement must fail the bounds sample"
+        );
+        assert_eq!(
+            placement,
+            apply_shadow_margins(wanted, margins),
+            "a failed refresh in an unchanged context must retain usable placement compensation"
+        );
+    }
+
+    #[test]
+    fn native_bounds_margin_refresh_changed_context_discards_obsolete_placement() {
+        let hwnd: isize = 0x5EED_0085;
+        let context = NativeBoundsContext {
+            dpi: 144,
+            style: 0x00CF_0000,
+            ..Default::default()
+        };
+        let changed = NativeBoundsContext {
+            style: 0,
+            ..context
+        };
+        let wanted = Rect::new(100, 50, 600, 400);
+        SHADOW_MARGINS.lock().insert(hwnd, [7, 2, 9, 8]);
+
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [416, 250, 816, 610],
+            context,
+            || None,
+            || Some(changed),
+        );
+        let retained = SHADOW_MARGINS.lock().get(&hwnd).copied();
+        let placement = expand_for_shadow_margin(HWND(hwnd as *mut std::ffi::c_void), wanted);
+        forget_shadow_margins(hwnd);
+
+        assert_eq!(sample, None);
+        assert_eq!(
+            retained, None,
+            "a changed native frame context invalidates old margins"
+        );
+        assert_eq!(
+            placement, wanted,
+            "obsolete frame margins must not expand later placement"
+        );
+    }
+
+    #[test]
+    fn native_bounds_margin_refresh_success_publishes_after_context_validation() {
+        let hwnd: isize = 0x5EED_0086;
+        let old = [7, 2, 9, 8];
+        let fresh = [5, 1, 7, 6];
+        let context = NativeBoundsContext {
+            dpi: 144,
+            ..Default::default()
+        };
+        SHADOW_MARGINS.lock().insert(hwnd, old);
+
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [412, 247, 812, 607],
+            context,
+            || {
+                assert_eq!(SHADOW_MARGINS.lock().get(&hwnd).copied(), Some(old));
+                Some(fresh)
+            },
+            || {
+                assert_eq!(SHADOW_MARGINS.lock().get(&hwnd).copied(), Some(old));
+                Some(context)
+            },
+        );
+        let published = SHADOW_MARGINS.lock().get(&hwnd).copied();
+        let wanted = Rect::new(100, 50, 600, 400);
+        let placement = expand_for_shadow_margin(HWND(hwnd as *mut std::ffi::c_void), wanted);
+        forget_shadow_margins(hwnd);
+
+        assert_eq!(
+            sample,
+            Some(NativeBoundsSample {
+                bounds: NativeBounds {
+                    min_width: 400,
+                    min_height: 240,
+                    max_width: 800,
+                    max_height: 600
+                },
+                context,
+            })
+        );
+        assert_eq!(published, Some(fresh));
+        assert_eq!(placement, apply_shadow_margins(wanted, fresh));
+    }
+
+    #[test]
+    fn native_bounds_margin_refresh_changed_context_rejects_fresh_measurement() {
+        let hwnd: isize = 0x5EED_0087;
+        let context = NativeBoundsContext {
+            dpi: 144,
+            ..Default::default()
+        };
+        SHADOW_MARGINS.lock().insert(hwnd, [7, 2, 9, 8]);
+
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [412, 247, 812, 607],
+            context,
+            || Some([5, 1, 7, 6]),
+            || {
+                Some(NativeBoundsContext {
+                    dpi: 192,
+                    ..context
+                })
+            },
+        );
+        let published = SHADOW_MARGINS.lock().get(&hwnd).copied();
+        forget_shadow_margins(hwnd);
+
+        assert_eq!(sample, None);
+        assert_eq!(
+            published, None,
+            "neither old nor freshly measured margins survive a context change"
+        );
+    }
+
+    fn native_bounds_margin_context_engine(
+        hwnd: isize,
+    ) -> (
+        crate::layout::TilingEngine,
+        BackendHandle,
+        NativeBoundsContext,
+    ) {
+        let backend = BackendHandle::default_for_test();
+        let mut engine = crate::layout::TilingEngine::default();
+        engine.register_monitor(
+            OutputId::from_name("NativeMarginContextTest"),
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1040),
+        );
+        let context = NativeBoundsContext {
+            dpi: 144,
+            style: 0x00CF_0000,
+            process_id: 1000,
+            thread_id: 7,
+            ..Default::default()
+        };
+        engine.add_window_with_native_bounds(
+            WindowInfo {
+                hwnd,
+                title: "native margin context fixture".into(),
+                class_name: "TestClass".into(),
+                process_id: context.process_id,
+                bounds: Rect::new(100, 100, 800, 600),
+                state: WindowState::Normal,
+                is_visible: true,
+            },
+            &backend,
+            false,
+            Some(NativeBoundsSample {
+                bounds: NativeBounds {
+                    min_width: 400,
+                    min_height: 240,
+                    max_width: 800,
+                    max_height: 600,
+                },
+                context,
+            }),
+        );
+        // Establish real successful refresh provenance in A after admission,
+        // rather than merely inserting an unclassified margin-cache entry.
+        assert!(refresh_native_bounds_sample(
+            hwnd,
+            [416, 250, 816, 610],
+            context,
+            || Some([7, 2, 9, 8]),
+            || Some(context),
+        )
+        .is_some());
+        (engine, backend, context)
+    }
+
+    #[test]
+    fn native_bounds_margin_context_between_queries_discards_previous_placement() {
+        use std::time::{Duration, Instant};
+        let hwnd: isize = 0x5EED_0088;
+        let (mut engine, backend, before) = native_bounds_margin_context_engine(hwnd);
+        let current = NativeBoundsContext {
+            dpi: 192,
+            style: 0,
+            monitor: 2,
+            ..before
+        };
+        let id = crate::utils::WindowId::new(hwnd);
+        let now = Instant::now() + Duration::from_secs(3);
+
+        // NativeCache::begin observes A -> B. The application then answers in
+        // stable B, but DWM cannot yet measure B's new frame.
+        let query = engine.native_bounds_query(id, current, now).unwrap();
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [416, 250, 816, 610],
+            current,
+            || None,
+            || Some(current),
+        );
+        engine.finish_native_bounds_query(query, sample, now, &backend);
+        let retained = SHADOW_MARGINS.lock().get(&hwnd).copied();
+        let wanted = Rect::new(100, 50, 600, 400);
+        let placement = expand_for_shadow_margin(HWND(hwnd as *mut std::ffi::c_void), wanted);
+        forget_shadow_margins(hwnd);
+
+        assert_eq!(sample, None, "fresh bounds remain unavailable in B");
+        assert_eq!(
+            placement, wanted,
+            "placement in B must not use A's invisible frame margins"
+        );
+        assert_eq!(
+            retained, None,
+            "A's margins must not survive a between-query context transition"
+        );
+    }
+
+    #[test]
+    fn native_bounds_margin_context_between_queries_retains_unchanged_placement() {
+        use std::time::{Duration, Instant};
+        let hwnd: isize = 0x5EED_0089;
+        let (mut engine, backend, context) = native_bounds_margin_context_engine(hwnd);
+        let id = crate::utils::WindowId::new(hwnd);
+        let now = Instant::now() + Duration::from_secs(3);
+
+        let query = engine.native_bounds_query(id, context, now).unwrap();
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [416, 250, 816, 610],
+            context,
+            || None,
+            || Some(context),
+        );
+        engine.finish_native_bounds_query(query, sample, now, &backend);
+        let wanted = Rect::new(100, 50, 600, 400);
+        let placement = expand_for_shadow_margin(HWND(hwnd as *mut std::ffi::c_void), wanted);
+        forget_shadow_margins(hwnd);
+
+        assert_eq!(sample, None);
+        assert_eq!(
+            placement,
+            Rect::new(93, 48, 616, 410),
+            "same-context failure retains the good compensation"
+        );
+    }
+
+    #[test]
+    fn native_bounds_margin_context_between_queries_success_then_return_invalidates_only_owner() {
+        use std::time::{Duration, Instant};
+        let hwnd: isize = 0x5EED_008A;
+        let other_hwnd: isize = 0x5EED_008B;
+        let (mut engine, backend, before) = native_bounds_margin_context_engine(hwnd);
+        let current = NativeBoundsContext {
+            dpi: 192,
+            style: 0,
+            monitor: 2,
+            ..before
+        };
+        let id = crate::utils::WindowId::new(hwnd);
+        let mut now = Instant::now() + Duration::from_secs(3);
+        let fresh = [5, 1, 7, 6];
+        let other_margins = [3, 0, 3, 3];
+        SHADOW_MARGINS.lock().insert(other_hwnd, other_margins);
+
+        let query = engine.native_bounds_query(id, current, now).unwrap();
+        assert_eq!(SHADOW_MARGINS.lock().get(&hwnd).copied(), None);
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [412, 247, 812, 607],
+            current,
+            || Some(fresh),
+            || Some(current),
+        );
+        engine.finish_native_bounds_query(query, sample, now, &backend);
+        assert!(sample.is_some());
+        assert_eq!(SHADOW_MARGINS.lock().get(&hwnd).copied(), Some(fresh));
+
+        // A failed later refresh still in B retains B's newly validated margins.
+        now += Duration::from_secs(3);
+        let query = engine.native_bounds_query(id, current, now).unwrap();
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [412, 247, 812, 607],
+            current,
+            || None,
+            || Some(current),
+        );
+        engine.finish_native_bounds_query(query, sample, now, &backend);
+        assert_eq!(SHADOW_MARGINS.lock().get(&hwnd).copied(), Some(fresh));
+
+        // Returning to A is another context transition, not permission to reuse
+        // B's margins or resurrect the earlier A entry.
+        let query = engine.native_bounds_query(id, before, now).unwrap();
+        let sample = refresh_native_bounds_sample(
+            hwnd,
+            [416, 250, 816, 610],
+            before,
+            || None,
+            || Some(before),
+        );
+        engine.finish_native_bounds_query(query, sample, now, &backend);
+        let owner_margins = SHADOW_MARGINS.lock().get(&hwnd).copied();
+        let unrelated_margins = SHADOW_MARGINS.lock().get(&other_hwnd).copied();
+        forget_shadow_margins(hwnd);
+        forget_shadow_margins(other_hwnd);
+
+        assert_eq!(sample, None);
+        assert_eq!(owner_margins, None);
+        assert_eq!(
+            unrelated_margins,
+            Some(other_margins),
+            "context invalidation belongs to one HWND"
+        );
+    }
+
+    #[test]
     fn test_min_track_width_of_a_window_that_is_not_there_is_none() {
         let handle = BackendHandle::default_for_test();
         assert_eq!(handle.min_track_width(0), None);
@@ -1532,14 +2225,21 @@ fn expand_for_shadow_margin(hwnd: HWND, rect: Rect) -> Rect {
 /// right after a (now asynchronous) move they briefly do not.  Measure once,
 /// while the window is at rest, and reuse the answer.
 fn measured_shadow_margins(hwnd: HWND) -> Option<[i32; 4]> {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
     let key = hwnd.0 as isize;
     if let Some(margins) = SHADOW_MARGINS.lock().get(&key).copied() {
         return Some(margins);
     }
+
+    let margins = fresh_shadow_margins(hwnd)?;
+    SHADOW_MARGINS.lock().insert(key, margins);
+    Some(margins)
+}
+
+/// Read both native rectangles without consulting or publishing placement cache.
+fn fresh_shadow_margins(hwnd: HWND) -> Option<[i32; 4]> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
     let mut frame = RECT::default();
     let mut visible = RECT::default();
@@ -1558,9 +2258,7 @@ fn measured_shadow_margins(hwnd: HWND) -> Option<[i32; 4]> {
         }
     }
 
-    let margins = shadow_margins_from(&frame, &visible)?;
-    SHADOW_MARGINS.lock().insert(key, margins);
-    Some(margins)
+    shadow_margins_from(&frame, &visible)
 }
 
 /// How long to wait for a window to answer `WM_GETMINMAXINFO` (a window that has just been
@@ -1572,6 +2270,10 @@ const MIN_TRACK_QUERY_TIMEOUT_MS: u32 = 120;
 /// (`SMTO_ABORTIFHUNG` returns at once), it belongs to a process wiri may not send messages
 /// to, or it is too busy to answer within the timeout.
 fn query_min_track_width(hwnd: HWND) -> Option<i32> {
+    query_track_bounds(hwnd).map(|info| info.ptMinTrackSize.x)
+}
+
+fn query_track_bounds(hwnd: HWND) -> Option<windows::Win32::UI::WindowsAndMessaging::MINMAXINFO> {
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_GETMINMAXINFO,
@@ -1602,8 +2304,62 @@ fn query_min_track_width(hwnd: HWND) -> Option<i32> {
         if answered.0 == 0 {
             return None;
         }
-        Some(info.ptMinTrackSize.x)
+        Some(info)
     }
+}
+
+fn visible_track_bounds(outer: [i32; 4], margins: [i32; 4]) -> NativeBounds {
+    let horizontal = margins[0].max(0).saturating_add(margins[2].max(0));
+    let vertical = margins[1].max(0).saturating_add(margins[3].max(0));
+    let visible = |size: i32, inset: i32| {
+        if size <= 0 || size > 16_384 {
+            0
+        } else {
+            size.saturating_sub(inset).max(0) as u32
+        }
+    };
+    // Track maxima are Windows tracking answers. A DefWindowProc default can
+    // appear here too; distinguishing it from an app-authored maximum remains
+    // provisional pending the owned default-response fixture evidence.
+    NativeBounds {
+        min_width: visible(outer[0], horizontal),
+        min_height: visible(outer[1], vertical),
+        max_width: visible(outer[2], horizontal),
+        max_height: visible(outer[3], vertical),
+    }
+}
+
+fn native_bounds_sample(
+    outer: [i32; 4],
+    measured_margins: Option<[i32; 4]>,
+    context: NativeBoundsContext,
+) -> Option<NativeBoundsSample> {
+    // A failed DWM measurement cannot convert outer tracking sizes to visible
+    // bounds. Fail the sample so the engine retains its last good bounds.
+    let margins = measured_margins?;
+    Some(NativeBoundsSample {
+        bounds: visible_track_bounds(outer, margins),
+        context,
+    })
+}
+
+// The fresh measurement remains private until its native context is validated.
+// On transient failure, retain the placement cache only in an unchanged context.
+fn refresh_native_bounds_sample(
+    hwnd: isize,
+    outer: [i32; 4],
+    context: NativeBoundsContext,
+    measure: impl FnOnce() -> Option<[i32; 4]>,
+    current_context: impl FnOnce() -> Option<NativeBoundsContext>,
+) -> Option<NativeBoundsSample> {
+    let margins = measure();
+    if current_context() != Some(context) {
+        forget_shadow_margins(hwnd);
+        return None;
+    }
+    let sample = native_bounds_sample(outer, margins, context)?;
+    SHADOW_MARGINS.lock().insert(hwnd, margins?);
+    Some(sample)
 }
 
 /// The visible minimum width of a window that answered `outer` (its minimum window width)

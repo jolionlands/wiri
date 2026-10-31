@@ -1,6 +1,8 @@
 //! Important Hotkeys: a lazy, monitor-local, non-activating help surface.
 //! No HWND, thread, timer or font survives dismissal. The existing input hooks
 //! dismiss it; the key that dismisses it (including its release) is consumed.
+use crate::overlay::markup_text::{self, FontCache, GdiMeasurer};
+use crate::overlay::pango_markup::{self, Parsed, Style};
 use crate::utils::Rect;
 use parking_lot::Mutex;
 use std::sync::{
@@ -10,9 +12,9 @@ use std::sync::{
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS,
-    DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT,
+    DT_SINGLELINE, DT_VCENTER, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -78,6 +80,13 @@ struct Session {
     hwnd: AtomicIsize,
     page: AtomicUsize,
     rows: Vec<BindingRow>,
+    /// The description of each row as Pango runs: niri paints a bind's
+    /// `hotkey-overlay-title` with `set_markup`, so a title is markup and an invalid one
+    /// is the whole original string, plain (see `pango_markup`).
+    titles: Vec<Parsed>,
+    /// One GDI font per distinct run style, created on first paint and deleted with the
+    /// session: nothing survives dismissal.
+    fonts: Mutex<FontCache>,
     layout: SheetLayout,
 }
 #[derive(Default)]
@@ -111,12 +120,22 @@ impl BindingsCheatsheet {
             return;
         }
         let (work, scale) = focused_work_area();
+        // Parse each row's description once, now, with the same base style the painter
+        // uses; an invalid title falls back to the whole original string here, exactly
+        // once, with a warning already logged at config load.
+        let body = Style::overlay_body();
+        let titles: Vec<Parsed> = rows
+            .iter()
+            .map(|(_, title)| pango_markup::title(title, &body))
+            .collect();
         let session = Arc::new(Session {
             closed: AtomicBool::new(false),
             hwnd: AtomicIsize::new(0),
             page: AtomicUsize::new(0),
             layout: SheetLayout::fit(work, scale, rows.len()),
             rows,
+            titles,
+            fonts: Mutex::new(FontCache::new()),
         });
         *self.session.lock() = Some(session.clone());
         let failed = session.clone();
@@ -329,40 +348,12 @@ unsafe fn paint(hwnd: HWND, s: &Session) {
     );
     let _ = DeleteObject(brush);
     SetBkMode(dc, TRANSPARENT);
-    let font = CreateFontW(
-        -(13.0 * g.scale).round().max(9.0) as i32,
-        0,
-        0,
-        0,
-        400,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        PCWSTR(wide("Segoe UI").as_ptr()),
-    );
-    let title = CreateFontW(
-        -(19.0 * g.scale).round().max(10.0) as i32,
-        0,
-        0,
-        0,
-        600,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        PCWSTR(wide("Segoe UI").as_ptr()),
-    );
-    let old = SelectObject(dc, title);
+    // Every font this paint needs, created on first use and kept for the showing (never
+    // beyond it): the sheet's title, the body text, and one per distinct run style.
+    let body = Style::overlay_body();
+    let mut fonts = s.fonts.lock();
     let margin = (16.0 * g.scale).round() as i32;
+    let original = fonts.select(dc, &markup_text::heading_style(), g.scale);
     text(
         dc,
         "Important Hotkeys",
@@ -374,38 +365,62 @@ unsafe fn paint(hwnd: HWND, s: &Session) {
         },
         0x00ffffff,
     );
-    SelectObject(dc, font);
+    let _ = fonts.select(dc, &body, g.scale);
     let page_size = g.page_size();
     let first = s.page.load(Ordering::Relaxed) * page_size;
-    for (index, (chord, desc)) in s.rows.iter().skip(first).take(page_size).enumerate() {
-        let column = index / g.rows;
-        let row = index % g.rows;
+    let last = s.rows.len().min(first.saturating_add(page_size));
+    let gap = (8.0 * g.scale).round().max(1.0) as i32;
+    // The chord column is as wide as its widest painted chord; the measurement uses the
+    // same cached font the chord is painted with, and `chord_split` keeps the description
+    // column usable.
+    let mut widest = 0;
+    for index in first..last {
+        widest = widest.max(fonts.advance(dc, &s.rows[index].0, &body, g.scale));
+    }
+    for position in 0..last.saturating_sub(first) {
+        let index = first + position;
+        let (chord, title) = &s.rows[index];
+        let column = position / g.rows;
+        let row = position % g.rows;
         let col_width = width / g.columns as i32;
         let x = column as i32 * col_width + margin;
         let y = g.header + row as i32 * g.row_height;
-        let split = x + (col_width * 40 / 100);
+        let split = markup_text::chord_split(x, col_width, widest, gap);
         text(
             dc,
             chord,
             RECT {
                 left: x,
                 top: y,
-                right: split - 8,
+                right: split - gap,
                 bottom: y + g.row_height,
             },
             0x00ccddee,
         );
-        text(
-            dc,
-            desc,
-            RECT {
-                left: split,
-                top: y,
-                right: (column as i32 + 1) * col_width - margin,
-                bottom: y + g.row_height,
-            },
-            0x00eeeeee,
-        );
+        let title_rect = RECT {
+            left: split,
+            top: y,
+            right: (column as i32 + 1) * col_width - margin,
+            bottom: y + g.row_height,
+        };
+        let parsed = &s.titles[index];
+        if parsed.markup {
+            // A configured title is Pango markup: fit its styled runs to the column with
+            // the same fonts the painter then uses, and paint them run by run.
+            let fitted = {
+                let mut measurer = GdiMeasurer::new(dc, g.scale, &mut fonts);
+                pango_markup::fit_runs(
+                    &parsed.runs,
+                    title_rect.right - title_rect.left,
+                    &mut measurer,
+                )
+            };
+            markup_text::draw(dc, &fitted, title_rect, 0x00eeeeee, g.scale, &mut fonts);
+        } else {
+            // The fast path every generated description (and every plain title) keeps:
+            // one DrawTextW with ellipsis, exactly as before markup support.
+            text(dc, title, title_rect, 0x00eeeeee);
+        }
     }
     let pages = s.rows.len().div_ceil(page_size).max(1);
     let footer = if pages > 1 {
@@ -428,9 +443,8 @@ unsafe fn paint(hwnd: HWND, s: &Session) {
         },
         0x00aaaaaa,
     );
-    SelectObject(dc, old);
-    let _ = DeleteObject(font);
-    let _ = DeleteObject(title);
+    let _ = SelectObject(dc, original);
+    drop(fonts);
     let _ = EndPaint(hwnd, &ps);
 }
 

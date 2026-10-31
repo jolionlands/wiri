@@ -20,7 +20,11 @@ impl Decoder {
                     let mut values = [0.0f32; 4];
                     let mut valid = true;
                     for (i, value) in node.args.iter().enumerate() {
-                        if let Some(radius) = self.value_number(node, value, 0.0, 65535.0) {
+                        // niri: `CornerRadius` is four plain f32s with no parse-time bound
+                        // (niri-config/src/appearance.rs:168-177).
+                        if let Some(radius) =
+                            self.value_number(node, value, f32::MIN as f64, f32::MAX as f64)
+                        {
                             values[i] = radius as f32;
                         } else {
                             valid = false;
@@ -207,7 +211,7 @@ window-rule {
         let result = crate::window::resolve_window_rules(&cfg.window_rules, &ctx);
         let fx = result.effects.apply_to(&cfg.layout.effects);
         assert!(!fx.border.off);
-        assert_eq!(fx.border.width, 11);
+        assert_eq!(fx.border.width, 11.0);
         assert_eq!(
             fx.border.inactive,
             crate::config::PaintStyle::color("#0000ff")

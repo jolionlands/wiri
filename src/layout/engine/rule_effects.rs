@@ -7,11 +7,7 @@ impl TilingEngine {
         self.rule_state
             .get(&window)
             .map_or(cfg.border_inset(), |state| {
-                state
-                    .resolved
-                    .effects
-                    .border
-                    .inset(&cfg.effects.border, cfg.border_inset())
+                cfg.border_inset_with(&state.resolved.effects.border)
             })
     }
 
@@ -74,7 +70,7 @@ mod tests {
         let mut engine = TilingEngine::new(Default::default());
         let window = WindowId::new(123);
         let mut resolved = crate::window::ResolvedWindowRules::default();
-        resolved.effects.border.width = Some(12);
+        resolved.effects.border.width = Some(12.0);
         engine.rule_state.insert(
             window,
             RuleState {

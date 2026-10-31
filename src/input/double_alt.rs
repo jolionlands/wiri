@@ -66,6 +66,7 @@ impl DoubleAlt {
                 consume: true,
                 mask_menu: true,
                 action: Some(Action::OverviewToggle),
+                chorded: false,
             }
         } else {
             self.first = Some(now);
