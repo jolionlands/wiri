@@ -200,7 +200,8 @@ then made the `strict-new-window-focus-policy` debug flag real on Windows, so th
 from N/A to partial. The overview lane replaced the fit-everything overview with niri's
 fixed-zoom camera, so "Live zoomed-out view" returns to partial until its `h97_*` gates pass
 in an official cycle (they passed in the lane's own desktop probes). The current totals are
-**304 done / 93 partial / 88 N/A** across 485 rows: **304/397 applicable rows (76.6%)**. Floating-height resolution/routing and the
+**309 done / 88 partial / 88 N/A** across 485 rows: **309/397 applicable rows (77.8%)**, after
+the official dba4606 cycle passed all 11 `h93_*` gates and five pointer rows moved to done. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
 remain partial for physical mixed-DPI and remaining lifecycle routes. The lifecycle
 checkpoint qualifies its listed source cases; earlier floating native evidence
@@ -391,7 +392,7 @@ physical digitizer`.
   thumbnail yet never dropped the window to a workspace below (`touch_overview_long_press_observed`,
   `moved=false`). Both stay unit-tested only until a probe explains them.
 
-Recount: **310/397 applicable rows (78.1%), 87 partial, 88 N/A** across 485 rows (five rows moved from
-`partial` to `done`). The five new `done` rows rest on this lane's own probe run; the gates are the same
-ones the lead's official cycle will run, so a failure there returns them to `partial`. No `src/` file
+Recount at that branch point: 310/397 (78.1%); on the integrated branch, where the overview row had
+returned to partial, it is **309/397 (77.8%), 88 partial, 88 N/A**. The five new `done` rows were
+confirmed by the official dba4606 cycle, which passed all 11 `h93_*` gates. No `src/` file
 changed: the probes demonstrated no defect in the touch, pen or DnD paths.
