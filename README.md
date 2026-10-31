@@ -22,9 +22,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/shot-three-windows.png" alt="Three tiled columns with gaps; the focused window has a blue ring" width="860">
+  <a href="docs/assets/demo.mp4"><img src="docs/assets/demo.webp" alt="wiri on a live desktop: columns on an endless strip, move and resize, tabbed columns, workspaces, the pannable overview, floating and fullscreen, and the unified XY grid" width="860"></a>
   <br>
-  <em>Three columns on the strip, with gaps. The focused window has a blue ring.</em>
+  <em>wiri on a live desktop, recorded by <a href="scripts/demo/record-demo.ps1">scripts/demo/record-demo.ps1</a>. Click it for the full-quality MP4.</em>
 </p>
 
 ## Status
@@ -44,7 +44,9 @@ wiri's first release, [v0.1.0](https://github.com/jolionlands/wiri/releases/tag/
 | :---: | :---: |
 | ![The overview: workspaces zoomed out](docs/assets/shot-overview.png)<br>**Overview.** The workspaces zoomed out, with live window thumbnails. Toggle it with `Ctrl+Alt+Space`. | ![A tabbed column](docs/assets/shot-tabbed.png)<br>**Tabbed column.** A tab indicator sits on the column's edge, and the second window is the one shown. |
 | ![A focused window with a focus ring and border](docs/assets/shot-decorated.png)<br>**Focus ring and border.** The focused window gets a coloured ring and border. The others keep a grey frame. | ![The Important Hotkeys overlay](docs/assets/shot-hotkeys.png)<br>**Important Hotkeys.** The overlay lists the bound keys and what they do. Any key or click closes it. |
-| ![A workspace switch in progress](docs/assets/shot-workspace-slide.png)<br>**Workspace switch.** Caught mid-animation: the windows slide as the workspace changes. | Screenshots come from the live desktop test harness on a 1366×768 display. |
+| ![A workspace switch in progress](docs/assets/shot-workspace-slide.png)<br>**Workspace switch.** Caught mid-animation: the windows slide as the workspace changes. | ![Three tiled columns with gaps](docs/assets/shot-three-windows.png)<br>**Columns on the strip.** Three columns with gaps. The focused window has a blue ring. |
+
+Screenshots come from the live desktop test harness on a 1366×768 display.
 
 ## Quick start
 
