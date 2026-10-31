@@ -13,7 +13,9 @@ $h98Keys = @(
     'h98_focus_down_left_lands_on_the_diagonal_target',
     'h98_move_window_up_right_moves_the_window_to_the_target_row',
     'h98_two_arrows_together_land_on_the_diagonal_target',
-    'h98_without_the_flag_behaviour_is_niris'
+    'h98_without_the_flag_behaviour_is_niris',
+    'h98_overview_rows_share_one_camera',
+    'h98_overview_diagonal_focus_pans_the_camera'
 )
 foreach ($key in $h98Keys) { $summary[$key] = $false }
 
@@ -238,4 +240,175 @@ try {
 } finally {
     if ($null -ne $h98Proc) { Stop-WiriGracefully $h98Proc 'h98-final' }
     foreach ($h98Form in $h98Forms) { if ([LT]::IsWindow($h98Form)) { [TestForms]::CloseForm($h98Form) } }
+}
+
+# ---- The zoomed-out view: the overview draws the same one shared camera ---------------
+#
+# With `unified-grid` on, every workspace row of the overview must be drawn through the
+# monitor's one camera, so column k of three rows with different column counts sits at the
+# same on-screen x, and `focus-up-right` inside the overview has to move the camera in x
+# and y together and land on the window diagonally up-and-right.  The overview host
+# publishes the per-tile destination rects (`WiriOverviewTileCount`,
+# `WiriOverviewTile{i}{Window,X,Y,W,H}`, in draw order) plus the workspace stack, so the
+# gates read the geometry the DWM thumbnails really get.
+if (-not ('H98Native' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class H98Native {
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetProp(IntPtr h, string name);
+}
+'@
+}
+function H98oHost { return [H98Native]::FindWindow('WiriThumbnailOverviewHost', $null) }
+function H98oProp($handle, [string]$name) {
+    if ($handle -eq [IntPtr]::Zero) { return [int64]-1 }
+    return [H98Native]::GetProp($handle, ('WiriOverview' + $name)).ToInt64()
+}
+# One array per workspace row, each sorted left to right (the host publishes tiles top to
+# bottom, then left to right, but a row is what the gate compares).
+function H98oRows($handle) {
+    $groups = @{}
+    $count = H98oProp $handle 'TileCount'
+    for ($index = 0; $index -lt $count; $index++) {
+        $prefix = 'Tile' + $index
+        $y = H98oProp $handle ($prefix + 'Y')
+        $key = [string]$y
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = New-Object System.Collections.ArrayList }
+        [void]$groups[$key].Add([pscustomobject]@{
+                window = H98oProp $handle ($prefix + 'Window')
+                x = H98oProp $handle ($prefix + 'X')
+                y = $y
+                w = H98oProp $handle ($prefix + 'W')
+            })
+    }
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($key in ($groups.Keys | Sort-Object { [int64]$_ })) {
+        [void]$rows.Add(@($groups[$key] | Sort-Object x))
+    }
+    return , $rows.ToArray()
+}
+# The y of the row the camera is centred on (the active workspace's stack entry).
+function H98oActiveY($handle) {
+    $active = H98oProp $handle 'ActiveWorkspace'
+    for ($index = 0; $index -lt (H98oProp $handle 'WorkspaceCount'); $index++) {
+        if ((H98oProp $handle ('Workspace' + $index + 'Id')) -eq $active) {
+            return H98oProp $handle ('Workspace' + $index + 'Y')
+        }
+    }
+    return [int64]::MinValue
+}
+
+$h98oConfig = @'
+input {
+    mod-key "ctrl-alt"
+}
+layout {
+    gaps 8
+    unified-grid
+    unified-grid-chord-ms 150
+    focus-ring { off; }
+    border { off; }
+}
+window-rule {
+    match title="^h98o-"
+    default-column-width { fixed 350; }
+}
+'@
+$h98oForms = @()
+$h98oProc = $null
+try {
+    try {
+        $h98oProc = Start-WiriWithConfig $h98oConfig (Join-Path $D 'wiri.stderr98o.log')
+        # Three rows of different column counts (5, 3 and 2) of equal 350 px columns, so
+        # column k starts at the same strip x in every row.
+        $h98oPlan = @(5, 3, 2)
+        for ($h98oRow = 0; $h98oRow -lt $h98oPlan.Count; $h98oRow++) {
+            if ($h98oRow -gt 0) {
+                $null = Ctl ("h98o-mk{0}" -f $h98oRow) @('action', 'focus-workspace-down')
+                Start-Sleep -Milliseconds 300
+            }
+            for ($h98oCol = 0; $h98oCol -lt $h98oPlan[$h98oRow]; $h98oCol++) {
+                $h98oForms += [TestForms]::Open(("h98o-{0}-{1}" -f ($h98oRow + 1), ($h98oCol + 1)), 40, 60, 120)
+                Start-Sleep -Milliseconds 240
+            }
+        }
+        # Back to the first row with the camera on its first column, then open the camera.
+        $null = Ctl 'h98o-home' @('action', 'focus-workspace', '1')
+        Start-Sleep -Milliseconds 800
+        $h98oOutputs = Ctl 'h98o-outputs' @('list-monitors')
+        $h98oGridOn = [bool]($h98oOutputs -match 'unified-grid: on')
+        $null = Ctl 'h98o-open' @('action', 'toggle-overview')
+        Start-Sleep -Milliseconds 1500
+        $h98oHost = H98oHost
+        $h98oRows = H98oRows $h98oHost
+        Set-Content (Join-Path $D 'h98o-rows.txt') (($h98oRows | ForEach-Object {
+                    (@($_ | ForEach-Object { "$($_.x),$($_.y),$($_.w)" }) -join ' ')
+                }) -join ' | ')
+        # 1. One shared camera: column 0 and column 1 of every row are drawn at the same x,
+        #    and the rows really do hold different column counts (2, 3 and 5).
+        $h98oCounts = @($h98oRows | ForEach-Object { @($_).Count })
+        $h98oSortedCounts = @($h98oCounts | Sort-Object)
+        $h98oFirsts = @($h98oRows | ForEach-Object { @($_)[0].x })
+        $h98oSeconds = @($h98oRows | ForEach-Object { @($_)[1].x })
+        $summary.h98_overview_rows_share_one_camera = (
+            $h98oGridOn -and ($h98oHost -ne [IntPtr]::Zero) -and
+            ($h98oRows.Count -eq 3) -and (($h98oSortedCounts -join ',') -eq '2,3,5') -and
+            (@($h98oFirsts | Sort-Object -Unique).Count -eq 1) -and
+            (@($h98oSeconds | Sort-Object -Unique).Count -eq 1) -and
+            (@($h98oFirsts)[0] -gt 0))
+        Set-Content (Join-Path $D 'h98o-camera.txt') "grid=$h98oGridOn counts=$($h98oCounts -join ',') firsts=$($h98oFirsts -join ',') seconds=$($h98oSeconds -join ',')"
+
+        # 2. `focus-up-right` inside the overview: one row up and one column right, with the
+        #    camera panning right (the diagonal target's right edge is past the view).
+        $null = Ctl 'h98o-row2' @('action', 'focus-workspace', '2')
+        Start-Sleep -Milliseconds 1200
+        $null = Ctl 'h98o-right1' @('action', 'focus-column-right')
+        Start-Sleep -Milliseconds 400
+        $null = Ctl 'h98o-right2' @('action', 'focus-column-right')
+        Start-Sleep -Milliseconds 900
+        $h98oHost = H98oHost
+        $h98oActiveBefore = H98oProp $h98oHost 'ActiveWorkspace'
+        $h98oYBefore = H98oActiveY $h98oHost
+        $h98oFocusBefore = H98oProp $h98oHost 'FocusedWindow'
+        $h98oBefore = H98oRows $h98oHost
+        $h98oXBefore = @(@($h98oBefore)[0])[0].x
+        $h98oLeftBefore = @($h98oRows | ForEach-Object { @($_)[0].x })
+        $null = Ctl 'h98o-upright' @('action', 'focus-up-right')
+        Start-Sleep -Milliseconds 1400
+        $h98oHost = H98oHost
+        $h98oActiveAfter = H98oProp $h98oHost 'ActiveWorkspace'
+        $h98oYAfter = H98oActiveY $h98oHost
+        $h98oFocusAfter = H98oProp $h98oHost 'FocusedWindow'
+        $h98oAfter = H98oRows $h98oHost
+        $h98oXAfter = @(@($h98oAfter)[0])[0].x
+        # Row 1 (5 columns) column 4 is the diagonal target: row 2's third column is the
+        # anchor, row 1 matches its second column and one step right is the fourth.
+        $h98oExpected = [int64]$h98oForms[3]
+        Set-Content (Join-Path $D 'h98o-diagonal.txt') "before=x$h98oXBefore active=$h98oActiveBefore y=$h98oYBefore focus=$h98oFocusBefore after=x$h98oXAfter active=$h98oActiveAfter y=$h98oYAfter focus=$h98oFocusAfter expected=$h98oExpected lefts=$($h98oLeftBefore -join ',')"
+        $summary.h98_overview_diagonal_focus_pans_the_camera = (
+            ($h98oHost -ne [IntPtr]::Zero) -and
+            ($h98oActiveBefore -ne $h98oActiveAfter) -and
+            ($h98oFocusAfter -eq $h98oExpected) -and
+            ($h98oFocusAfter -ne $h98oFocusBefore) -and
+            # x: every row's left edge moved left by the same camera pan.
+            ($h98oXAfter -lt $h98oXBefore) -and
+            (@($h98oAfter | ForEach-Object { @($_)[0].x } | Sort-Object -Unique).Count -eq 1) -and
+            # y: the newly active row now sits where the old one was centred.
+            ([math]::Abs($h98oYAfter - $h98oYBefore) -le 2))
+    } catch {
+        $_ | Out-String | Set-Content (Join-Path $D 'h98o-error.txt')
+    } finally {
+        if ($null -ne $h98oProc) { Stop-WiriGracefully $h98oProc 'h98o-overview' }
+        foreach ($h98oForm in $h98oForms) { if ([LT]::IsWindow($h98oForm)) { [TestForms]::CloseForm($h98oForm) } }
+        $h98oForms = @()
+        $h98oProc = $null
+        Start-Sleep -Milliseconds 400
+    }
+} catch {
+    $_ | Out-String | Set-Content (Join-Path $D 'h98o-outer-error.txt')
+} finally {
+    if ($null -ne $h98oProc) { Stop-WiriGracefully $h98oProc 'h98o-final' }
+    foreach ($h98oForm in $h98oForms) { if ([LT]::IsWindow($h98oForm)) { [TestForms]::CloseForm($h98oForm) } }
 }
