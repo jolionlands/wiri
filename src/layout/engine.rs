@@ -10100,9 +10100,20 @@ mod tests {
     #[test]
     fn test_overview_no_columns() {
         let mut engine = make_engine();
-        // No windows — overview should gracefully handle
+        // niri's overview is a camera over the workspace stack, not a window list:
+        // `toggle_overview` just flips `overview_open` and every monitor gets
+        // `set_overview_progress` (src/layout/mod.rs:4624-4666), while the stack has
+        // one entry per workspace even when it is empty
+        // (src/layout/monitor.rs:1467). So an empty desktop opens the backdrop.
         engine.enter_overview(&BackendHandle::default_for_test());
-        assert!(!engine.is_overview()); // No columns => can't enter overview
+        assert!(engine.is_overview());
+        // With no columns the scene publishes nothing to draw, and leaving the
+        // overview restores the normal view without touching a window.
+        let oid = engine.focused_output().unwrap();
+        let (positions, clips) = engine.workspace_overview_scene(oid);
+        assert!(positions.is_empty() && clips.is_empty());
+        engine.exit_overview(&BackendHandle::default_for_test());
+        assert!(!engine.is_overview());
     }
 
     #[test]
@@ -11771,10 +11782,15 @@ mod tests {
 
         let state = engine.overview_state().expect("overview state present");
         // niri's stack has one entry per workspace (`Monitor::workspaces_render_geo`,
-        // src/layout/monitor.rs:1467): the empty workspace 2 keeps its slot, so its
-        // neighbours do not jump when it is used or dropped.
+        // src/layout/monitor.rs:1467), in visible order and including the trailing
+        // empty workspace: dropping an empty entry would shift its neighbours.
         let ids: Vec<i32> = state.workspace_offsets.iter().map(|(id, _)| *id).collect();
-        assert_eq!(&ids[..4], &[0, 1, 2, 3]);
+        let visible = engine.monitors().get(&oid).unwrap().workspace_ids();
+        assert_eq!(
+            ids, visible,
+            "one stack entry per workspace, in visible order"
+        );
+        assert!(ids.len() >= 4, "the fixture keeps four workspaces: {ids:?}");
 
         // Offsets follow the 10%-of-view-height gap scaled by the zoom, so the stride
         // between neighbours is constant and the first entry is centred in the view.
@@ -12089,7 +12105,10 @@ mod tests {
 
     #[test]
     fn test_calculate_positions_fixed_overview_zoom() {
-        // With Fixed mode and overview zoom, all column rects must fit within the work area.
+        // niri does not fit a Fixed-width strip into the view: the overview draws each
+        // workspace's OWN strip at `zoom` (src/layout/monitor.rs:1467) and crops it at
+        // that workspace's rectangle (src/layout/monitor.rs:1735), so a strip wider than
+        // the screen is panned and its far columns are off the workspace.
         let mut engine = make_engine();
         for i in 100..110 {
             let window = make_window(i, 500, 400);
@@ -12099,35 +12118,47 @@ mod tests {
         assert!(engine.is_overview());
         assert!(
             engine.overview_zoom() < 1.0,
-            "10 Fixed-500px columns must need zoom-out"
+            "the fixture is in the overview, so the camera is zoomed"
         );
 
         let oid = engine.focused_output().unwrap();
-        let monitor = engine.monitors().get(&oid).unwrap();
-        let workspace = monitor.workspace().unwrap();
         let work_rect = Rect::new(4, 4, 1912, 1032);
-        let positions = engine.calculate_positions(workspace, work_rect, &engine.config);
+        // Fixed mode keeps the configured 500 px column in the normal view...
+        let normal = {
+            let monitor = engine.monitors().get(&oid).unwrap();
+            let workspace = monitor.workspace().unwrap();
+            engine.calculate_positions_at_zoom(workspace, work_rect, 0, 1032, &engine.config, 1.0)
+        };
+        assert_eq!(normal.len(), 10, "all 10 windows are laid out");
+        // ...and the camera only scales it: exactly `zoom` times the same tile.
+        let (positions, clips) = engine.workspace_overview_scene(oid);
         assert_eq!(
             positions.len(),
             10,
             "all 10 windows must be positioned in overview"
         );
-        let work_right = work_rect.loc.x + work_rect.size.w as i32;
-        for (_, rect) in &positions {
-            assert!(
-                rect.loc.x >= work_rect.loc.x,
-                "window x={} left of work area x={}",
-                rect.loc.x,
-                work_rect.loc.x
-            );
-            // Allow 10px slop for integer rounding.
-            assert!(
-                rect.loc.x + rect.size.w as i32 <= work_right + 10,
-                "window right={} exceeds work right={}+10",
-                rect.loc.x + rect.size.w as i32,
-                work_right
-            );
-        }
+        let scaled = positions
+            .iter()
+            .find(|(wid, _)| *wid == normal[0].0)
+            .expect("the overview publishes the same tiles")
+            .1;
+        let expected = (normal[0].1.size.w as f64 * engine.overview_zoom()).round() as u32;
+        assert!(
+            scaled.size.w.abs_diff(expected) <= 1,
+            "tile {} px in the overview is {}x{}, not zoom*tile",
+            scaled.size.w,
+            engine.overview_zoom(),
+            normal[0].1.size.w
+        );
+        let workspace = clips[0].1;
+        // Ten 500 px columns cannot fit a workspace at half zoom, so part of the strip
+        // lies outside the workspace (and outside the work area) instead of being fitted.
+        assert!(
+            positions
+                .iter()
+                .any(|(_, rect)| rect.loc.x < work_rect.loc.x || rect.right() > workspace.right()),
+            "the strip extends past the visible area"
+        );
     }
 
     #[test]

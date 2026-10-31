@@ -317,12 +317,8 @@ impl TilingEngine {
         // insets inside it (C2), rather than inheriting the active workspace's view.
         let view = monitor.work_area;
         let zoom = self.overview_zoom();
-        let workspaces = overview_workspace_stack(
-            monitor,
-            view,
-            zoom,
-            self.overview_camera.render_index,
-        );
+        let workspaces =
+            overview_workspace_stack(monitor, view, zoom, self.overview_camera.render_index);
         let mut positions = Vec::new();
         let mut clips = Vec::new();
         for entry in &workspaces {
@@ -352,18 +348,8 @@ impl TilingEngine {
                 1.0,
             );
             let mut push = |wid: WindowId, rect: Rect| {
-                let panned = Rect::new(
-                    rect.loc.x - camera,
-                    rect.loc.y,
-                    rect.size.w,
-                    rect.size.h,
-                );
-                let screen = overview_geometry::zoom_tile(
-                    panned,
-                    workspace_rect,
-                    view_rect,
-                    zoom,
-                );
+                let panned = Rect::new(rect.loc.x - camera, rect.loc.y, rect.size.w, rect.size.h);
+                let screen = overview_geometry::zoom_tile(panned, workspace_rect, view_rect, zoom);
                 positions.push((wid, screen));
                 clips.push((wid, workspace_rect));
             };
@@ -522,10 +508,8 @@ mod tests {
         // niri's stack over this view at the default half zoom: two entries, the
         // second one is workspace key 1 (src/layout/monitor.rs:1467).
         let rects = overview_geometry::workspace_rects(view, 2, 0.0, zoom);
-        let camera = overview_geometry::workspace_camera(
-            monitor.workspaces[&1].scroll_offset.x,
-            None,
-        );
+        let camera =
+            overview_geometry::workspace_camera(monitor.workspaces[&1].scroll_offset.x, None);
         let panned = Rect::new(
             normal[0].1.loc.x - camera,
             normal[0].1.loc.y,
@@ -639,7 +623,9 @@ mod tests {
         m.workspaces.get_mut(&0).unwrap().name = Some("web".into());
         m.workspaces.get_mut(&2).unwrap().name = Some(String::new());
         let view = Rect::new(-1366, 0, 1366, 728);
-        let stack = overview_workspace_stack(&m, view, 0.5, 0.0);
+        // niri computes the stack from the focused workspace's index (its
+        // `workspace_render_idx`, src/layout/monitor.rs:1467); key 0 is the second row.
+        let stack = overview_workspace_stack(&m, view, 0.5, 1.0);
         // Visible order [5, 0, 2]; the active one (key 0) is centred on the view.
         assert_eq!(
             stack.iter().map(|w| w.id).collect::<Vec<_>>(),

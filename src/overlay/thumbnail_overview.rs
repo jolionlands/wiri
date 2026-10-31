@@ -1128,8 +1128,9 @@ mod tests {
         let bounds = Rect::new(0, 0, 1366, 768);
         // A 400 px wide thumbnail whose last 125 px stay inside the workspace.
         let ws = Rect::new(342, 192, 683, 384);
-        let (dst, src) = thumbnail_geometry(Rect::new(900, 192, 400, 384), bounds, (800, 768), Some(ws))
-            .expect("the overlapping part is visible");
+        let (dst, src) =
+            thumbnail_geometry(Rect::new(900, 192, 400, 384), bounds, (800, 768), Some(ws))
+                .expect("the overlapping part is visible");
         assert_eq!(dst, Rect::new(900, 192, 125, 384));
         // 125/400 of the source width is kept, from its left edge.
         assert_eq!(src, Rect::new(0, 0, 250, 768));

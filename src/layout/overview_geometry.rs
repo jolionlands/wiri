@@ -148,12 +148,7 @@ pub fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     if right <= x || bottom <= y {
         return None;
     }
-    Some(Rect::new(
-        x,
-        y,
-        (right - x) as u32,
-        (bottom - y) as u32,
-    ))
+    Some(Rect::new(x, y, (right - x) as u32, (bottom - y) as u32))
 }
 
 /// Where a tile drawn at `tile` (in the workspace's own, unscaled coordinate space,
@@ -215,7 +210,7 @@ mod tests {
         assert_eq!(workspace_gap(view(), 0.5), 38); // 38.4 rounded
         assert_eq!(workspace_gap(view(), 1.0), 77); // 76.8 rounded
         assert_eq!(workspace_gap(view(), 0.01), 1); // never below one pixel
-        // 0.3 of 1366 = 409.8, ceiled like niri's physical ceil.
+                                                    // 0.3 of 1366 = 409.8, ceiled like niri's physical ceil.
         assert_eq!(workspace_size(view(), 0.3).w, 410);
     }
 
@@ -246,7 +241,7 @@ mod tests {
         let second = workspace_rects(view(), 3, 1.0, 0.5);
         assert_eq!(second[0].loc.y - first[0].loc.y, -stride);
         assert_eq!(second[1].loc.y, first[0].loc.y); // workspace 1 is now where 0 was
-        // Halfway through the switch the stack sits half a stride up.
+                                                     // Halfway through the switch the stack sits half a stride up.
         let middle = workspace_rects(view(), 3, 0.5, 0.5);
         assert_eq!(first[0].loc.y - middle[0].loc.y, stride / 2);
     }
@@ -271,12 +266,7 @@ mod tests {
         let ws = rects[5];
         let tile = Rect::new(1000, 0, 500, 768);
         let before = zoom_tile(tile, ws, view(), zoom);
-        let after = zoom_tile(
-            Rect::new(1000 - 300, 0, 500, 768),
-            ws,
-            view(),
-            zoom,
-        );
+        let after = zoom_tile(Rect::new(1000 - 300, 0, 500, 768), ws, view(), zoom);
         assert_eq!(before.loc.x - after.loc.x, 150);
     }
 
