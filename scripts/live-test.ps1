@@ -1707,7 +1707,25 @@ $w = $w8
 $h8BindWarnings = (LogLines $log8 'Config bind:').Count
 function WsList([string]$tag) {
     $raw = Ctl $tag @('--json', 'get-workspace-list')
-    try { return @(($raw | ConvertFrom-Json).result.workspaces) } catch { return @() }
+    $all = @()
+    try { $all = @(($raw | ConvertFrom-Json).result.workspaces) } catch { return @() }
+    # Two displays: this legacy list covers every monitor (each entry names its monitor_id), while
+    # these gates count the primary monitor's workspaces.  On one display the filter keeps every entry.
+    $primary = PrimaryMonitorId
+    if ($null -eq $primary) { return $all }
+    return @($all | Where-Object { [int64]$_.monitor_id -eq $primary })
+}
+# The engine's monitor id of the Windows primary display, from wiri's own monitor list.  Cached: the
+# answer cannot change without a display change, which is itself a new run of the phase.
+$primaryMonitorIdCache = $null
+function PrimaryMonitorId {
+    if ($null -ne $primaryMonitorIdCache) { return $primaryMonitorIdCache }
+    $raw = Ctl 'primary-monitor-list' @('--json', 'list-monitors')
+    try {
+        $entry = @(($raw | ConvertFrom-Json).result | Where-Object { $_.name -ieq $primaryScreen.DeviceName }) | Select-Object -First 1
+        if ($null -ne $entry) { $script:primaryMonitorIdCache = [int64]$entry.output_id }
+    } catch { }
+    return $primaryMonitorIdCache
 }
 $wl = WsList 'h8-workspaces-at-start'
 $h8Names = @($wl | ForEach-Object { $_.name })
@@ -2672,7 +2690,7 @@ $h15OneFocused = ($h15FocusedWindows.Count -eq 1) -and ([int64]$h15FocusedWindow
 $h15FocusedWs = @($h15Workspaces | Where-Object { $_.is_focused -eq $true })
 $h15WsFields = ($h15Workspaces.Count -ge 2) -and ($h15FocusedWs.Count -eq 1) -and ($h15FocusedWs[0].name -eq 'chat') -and ($h15FocusedWs[0].idx -eq 1) -and
     ($h15FocusedWs[0].is_active -eq $true) -and (-not [string]::IsNullOrEmpty($h15FocusedWs[0].output)) -and
-    ([int64]$h15FocusedWs[0].active_window_id -eq $h15Fg) -and (@($h15Workspaces | ForEach-Object { $_.id } | Select-Object -Unique).Count -eq $h15Workspaces.Count)
+    ([int64]$h15FocusedWs[0].active_window_id -eq $h15Fg) -and (@($h15Workspaces | ForEach-Object { "$($_.output)|$($_.id)" } | Select-Object -Unique).Count -eq $h15Workspaces.Count)
 $h15WsOfWindows = ([int64]$h15FocusedWindows[0].workspace_id -eq [int64]$h15FocusedWs[0].id)
 $h15ConfigReplayed = (@(EvOf $h15Replay 'config_loaded').Count -ge 1) -and ((EvOf $h15Replay 'config_loaded')[0].data.failed -eq $false)
 Shot 'h15-01-three-windows'
@@ -3486,6 +3504,30 @@ $fgEvents | Set-Content -Encoding UTF8 (Join-Path $D 'foreground-log.tsv')
 $summary['foreground_events'] = $fgEvents.Count
 $summary['foreground_elevated_titles'] = @($fgEvents | ForEach-Object { ($_ -split "`t", 4)[3] } |
     Where-Object { $_ -like 'Administrator:*' } | Sort-Object -Unique)
+# A subset run (WIRI_LIVE_ONLY) never dot-sources the other lanes, whose gates therefore keep the
+# placeholders this script declares above and would read as failures.  Drop the ones the skipped lane
+# files name, and count them, so nobody mistakes a subset for the full cycle.
+if ($liveOnly.Count -gt 0) {
+    $liveOnlyRemoved = 0
+    foreach ($laneFile in @(Get-ChildItem (Join-Path $PSScriptRoot 'live-phases') -Filter 'lane-*.ps1' |
+            Where-Object { -not (LaneWanted ($_.BaseName -replace '-', '_')) })) {
+        $names = @([regex]::Matches((Get-Content $laneFile.FullName -Raw), '(?<![A-Za-z0-9_])(h\d+_[a-z0-9_]*)') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        # A name the file builds at run time (`$summary["h81_${case}_settled"]`) is captured as the
+        # literal prefix of it; a prefix that ends in `_` stands for every gate the lane composes.
+        $exactNames = @($names | Where-Object { -not $_.EndsWith('_') })
+        $prefixNames = @($names | Where-Object { $_.EndsWith('_') })
+        $candidates = @($summary.Keys | Where-Object {
+                $key = [string]$_
+                ($exactNames -contains $key) -or (@($prefixNames | Where-Object { $key.StartsWith($_) }).Count -gt 0)
+            })
+        foreach ($gateName in $candidates) {
+            # Only a gate that is still false: a number 0 is not a failed gate.
+            if (($summary[$gateName] -is [bool]) -and ($summary[$gateName] -eq $false)) { $summary.Remove($gateName); $liveOnlyRemoved++ }
+        }
+    }
+    $summary['live_only_gates_removed'] = $liveOnlyRemoved
+}
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }

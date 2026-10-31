@@ -1070,7 +1070,7 @@ public static class LaneMultimonNative {
                     monitors = @(MmMonitors | ForEach-Object { "$($_.Device) $($_.W)x$($_.H)@$($_.Dpi) at $($_.L),$($_.T)" }) })
             }
             MmGate 'h99_output_off_detaches_only_display2' $offOk ([ordered]@{ workspace = $offWs; windows_moved = $movedOk })
-            MmGate 'h99_output_off_moves_its_windows_to_display1' ($offOk -and $movedOk) ([ordered]@{ rect_a = (Rc $mmOffA); rect_b = (Rc $mmOffB) })
+            MmGate 'h99_output_off_moves_its_windows_to_display1' ($offOk -and $movedOk) ([ordered]@{ rect_a = $rectA; rect_b = $rectB })
             # Back from the dead: the monitor re-registers, wiri lists it again, and the workspace
             # object (same IPC id, same index) is on it with its windows.
             $back = MmWaitMonitor $mmD2Name $true 25
