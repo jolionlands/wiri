@@ -154,18 +154,19 @@ impl IpcServer {
         self.describe(&mut mirror)
     }
 
-    /// Send the subscribers what changed since they were last told.
+    /// Send the subscribers what changed since they were last told.  Returns the events that
+    /// found no receiver, for the next subscriber's replay.
     pub fn sync_state(&self) {
         if self.event_tx.receiver_count() == 0 {
             return;
         }
         let mut mirror = self.mirror.lock();
-        self.sync_locked(&mut mirror);
+        let _ = self.sync_locked(&mut mirror);
     }
 
-    fn sync_locked(&self, mirror: &mut Mirror) {
+    fn sync_locked(&self, mirror: &mut Mirror) -> Vec<IpcEvent> {
         let Some(snapshot) = self.describe(mirror) else {
-            return;
+            return Vec::new();
         };
         for event in state::diff(&mirror.last, &snapshot) {
             let _ = self.event_tx.send(event);
@@ -174,22 +175,30 @@ impl IpcServer {
         // The legacy focus broadcast of a focus change the engine made itself after its own
         // activation request succeeded (no native notice follows one that Windows never
         // raises); a notice that does follow is not broadcast again.
+        let mut unheard = Vec::new();
         if let Some(engine) = self.engine.as_ref() {
             for event in engine.read().take_live_focus_events() {
-                let _ = self.event_tx.send(event);
+                // Nobody listening yet is not the same as nobody to tell: `send` hands the
+                // event back, and the first subscriber is told it in its replay.
+                if let Err(broadcast::error::SendError(event)) = self.event_tx.send(event) {
+                    unheard.push(event);
+                }
             }
         }
+        unheard
     }
 
     /// A new subscriber: bring what the others were told up to date, subscribe, and return
     /// what the new one is told first.  Nothing is sent between the subscription and the
     /// description (the mirror is held), so the replay and the events that follow it neither
-    /// miss a change nor repeat one.
+    /// miss a change nor repeat one.  A notice the state pass took while the channel still had
+    /// no receiver goes into the replay; sent before the subscription it would be lost.
     fn subscribe_with_replay(&self) -> (broadcast::Receiver<IpcEvent>, Vec<IpcEvent>) {
         let mut mirror = self.mirror.lock();
-        self.sync_locked(&mut mirror);
+        let unheard = self.sync_locked(&mut mirror);
         let receiver = self.event_tx.subscribe();
         let mut replay = state::replay(&mirror.last);
+        replay.extend(unheard);
         if let Some(config) = self.last_config.lock().clone() {
             replay.push(config);
         }

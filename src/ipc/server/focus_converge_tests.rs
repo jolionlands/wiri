@@ -195,3 +195,44 @@ fn run_action_focus_window_with_id_converges_like_the_typed_request() {
     assert_eq!(reply["success"], true, "{reply}");
     assert_eq!(focused(&engine), Some(K2 as u64));
 }
+
+/// The legacy notice is taken by the event-stream state pass, and the pass that brings a new
+/// subscriber up to date runs before it subscribes: a notice queued while nobody listened
+/// must reach that first subscriber instead of being sent into an empty channel.
+#[test]
+fn a_notice_queued_before_anyone_listened_is_told_to_the_first_subscriber() {
+    let (server, _engine, _backend) = fixture();
+    let (reply, _) = with_native_foreground(K3, Activation::SwitchWithoutNotice, || {
+        focus_window(&server, K1)
+    });
+    assert_eq!(reply["success"], true, "{reply}");
+    assert_eq!(
+        server.event_tx.receiver_count(),
+        0,
+        "nobody was listening when the notice was queued"
+    );
+
+    let (mut events, replay) = server.subscribe_with_replay();
+    assert_eq!(
+        count(
+            &replay,
+            |e| matches!(e, IpcEvent::WindowFocused { window_hwnd } if *window_hwnd == K1)
+        ),
+        1,
+        "the first subscriber is told: {replay:?}"
+    );
+    // It went to that subscriber once, and the following events are the ordinary ones.
+    assert!(
+        drain(&mut events)
+            .iter()
+            .all(|e| !matches!(e, IpcEvent::WindowFocused { .. })),
+        "no second copy after the subscription"
+    );
+    server.sync_state();
+    assert!(
+        drain(&mut events)
+            .iter()
+            .all(|e| !matches!(e, IpcEvent::WindowFocused { .. })),
+        "told once"
+    );
+}
