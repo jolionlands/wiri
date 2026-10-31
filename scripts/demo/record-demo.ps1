@@ -30,6 +30,8 @@ param(
     [switch]$VerifyOnly,
     [switch]$SkipEncode,
     [switch]$NoClips,
+    [switch]$StateLines,
+    [switch]$MutexAlreadyHeld,
     [double]$CaptionOffset = 0.0
 )
 
@@ -185,7 +187,7 @@ $segments = @(
     [pscustomobject]@{ key = 'workspaces'; caption = 'Workspaces stack vertically' },
     [pscustomobject]@{ key = 'overview'; caption = 'Overview: pan, then click a window' },
     [pscustomobject]@{ key = 'float-fullscreen'; caption = 'Floating and fullscreen' },
-    [pscustomobject]@{ key = 'grid'; caption = 'Unified XY grid (opt-in)' }
+    [pscustomobject]@{ key = 'grid'; caption = 'Unified XY grid (opt-in)'; subtitle = 'Mod+Alt+L down-right  |  Mod+Alt+I up-right  |  Mod+Alt+J in the overview' }
 )
 foreach ($segment in $segments) {
     Set-Content -Path (Join-Path $captionsDir ($segment.key + '.txt')) -Value $segment.caption -Encoding ASCII
@@ -222,12 +224,16 @@ function Wait-Seconds([double]$seconds) {
 }
 
 function Start-Segment([string]$key) {
-    # The caption travels with the segment into timeline.json: the encode phase draws the
-    # bands from it and never sees $segments.
+    # The caption (and its optional second line) travels with the segment into timeline.json:
+    # the encode phase draws the bands from it and never sees $segments.
     $caption = ''
+    $subtitle = ''
     $match = @($segments | Where-Object { $_.key -eq $key })
-    if ($match.Count -gt 0) { $caption = $match[0].caption }
-    $script:current = [pscustomobject]@{ key = $key; caption = $caption; start = [Math]::Round($script:watch.Elapsed.TotalSeconds, 3); end = $null }
+    if ($match.Count -gt 0) {
+        $caption = $match[0].caption
+        if ($match[0].PSObject.Properties.Name -contains 'subtitle') { $subtitle = $match[0].subtitle }
+    }
+    $script:current = [pscustomobject]@{ key = $key; caption = $caption; subtitle = $subtitle; start = [Math]::Round($script:watch.Elapsed.TotalSeconds, 3); end = $null }
     $script:timeline.Add($script:current)
     Log ("segment {0} starts at {1:F2}s" -f $key, $script:current.start)
     if (-not $Rehearse) {
@@ -236,9 +242,16 @@ function Start-Segment([string]$key) {
             $script:takeFailed = $true
             throw ("a shell popup appeared while segment '{0}' was starting; this take is contaminated" -f $key)
         }
+        # Every mock window that is on screen has to be inside the primary monitor: the
+        # capture is cut to that monitor's rect, so anything outside it would be missing.
+        if (-not (Test-MockWindowsOnPrimary $key)) {
+            $script:takeFailed = $true
+            throw ("a demo window left the primary monitor while segment '{0}' was starting" -f $key)
+        }
     } else {
-        # Rehearse the check itself, without letting it end the run.
+        # Rehearse the checks themselves, without letting them end the run.
         if (-not (Test-StrayPopups $key -DuringTake)) { Log '  (rehearsal) the per-segment popup check would have stopped the take' }
+        [void](Test-MockWindowsOnPrimary $key)
     }
 }
 
@@ -282,7 +295,7 @@ function Get-StateLine([string]$label) {
 function Send-Chord([string]$chord, [double]$pause = 1.0, [string]$note = '') {
     if ($Rehearse) { Log ("  chord {0} {1}" -f $chord, $note) }
     [DemoNative]::Chord($chord)
-    if (-not $Rehearse) { Get-StateLine $chord }
+    if (-not $Rehearse -and $StateLines) { Get-StateLine $chord }
     Wait-Seconds $pause
 }
 
@@ -294,8 +307,202 @@ function Open-Demo([string]$kind, [string]$caption, [double]$pause = 1.2) {
     Wait-Seconds $pause
 }
 
-function Save-Snapshot([string]$tag) {
+function Open-Demo([string]$kind, [string]$caption, [double]$pause = 1.2) {
+    Log ("  open {0} '{1}'" -f $kind, $caption)
+    $handle = [DemoApps]::Open($kind, $caption)
+    if ($handle -eq [IntPtr]::Zero) { throw "window '$caption' did not open" }
+    $script:apps[$caption] = $handle
+    Wait-Seconds $pause
+    [void][DemoApps]::Repaint($handle)
+}
+
+# Put a mock window's column where the take needs it, with the IPC (not a key press), so the
+# layout is exact instead of depending on what the previous segment left behind.
+function Get-DemoHwnd([string]$caption) {
+    if (-not $script:apps.ContainsKey($caption)) { throw "no demo window called '$caption'" }
+    return $script:apps[$caption]
+}
+
+function Focus-DemoWindow([string]$caption) {
+    $handle = Get-DemoHwnd $caption
+    $reply = Invoke-Ctl @('focus-window', ([int64]$handle).ToString())
+    if ($reply.rc -ne 0) { Log ("  focus-window {0} failed: {1}" -f $caption, $reply.err.Trim()) }
+    Wait-Seconds 0.15
+    [void][DemoApps]::Repaint($handle)
+}
+
+# With a second display extended, wiri numbers workspaces globally: the ids of the primary
+# monitor's two rows are not 1 and 2 any more, so they are read back from the windows that sit
+# on them.  The move commands take an index (a monitor-relative workspace number), which is
+# why the moves can keep using 1 and 2.
+function Get-WindowWorkspaceId([string]$caption) {
+    $handle = Get-DemoHwnd $caption
     $reply = Invoke-Ctl @('windows', '--json')
+    $list = @(($reply.text | ConvertFrom-Json).result.windows)
+    $window = @($list | Where-Object { [int64]$_.id -eq [int64]$handle }) | Select-Object -First 1
+    if ($window) { return [int]$window.workspace_id }
+    return 0
+}
+
+function Move-DemoWindowToWorkspace([string]$caption, [int]$workspace) {
+    $handle = Get-DemoHwnd $caption
+    $reply = Invoke-Ctl @('move-window-to-workspace-by-hwnd', ([int64]$handle).ToString(), "$workspace")
+    if ($reply.rc -ne 0) { Log ("  move {0} to workspace {1} failed: {2}" -f $caption, $workspace, $reply.err.Trim()) }
+    Wait-Seconds 0.15
+}
+
+function Invoke-DemoAction([string]$action) {
+    $reply = Invoke-Ctl @('action', $action)
+    if ($reply.rc -ne 0) { Log ("  action {0} failed: {1}" -f $action, $reply.err.Trim()) }
+    Wait-Seconds 0.12
+}
+
+# The window that has the keyboard focus, straight from the daemon.  The reply is
+# {"result": {"focused_window": {id, title, workspace_id, layout{pos_in_scrolling_layout}}}}.
+function Get-FocusedTitle {
+    # The daemon's own is_focused flag is the source of truth; `focused-window` is only the
+    # fallback, because in the unified grid it once answered "nothing" for every chord while
+    # windows JSON was answering normally.
+    $reply = $null
+    try { $reply = Invoke-Ctl @('windows', '--json') } catch { }
+    if ($reply) {
+        try {
+            $list = @(($reply.text | ConvertFrom-Json).result.windows)
+            $window = @($list | Where-Object { $_.is_focused }) | Select-Object -First 1
+            if ($window) {
+                $caption = ('hwnd 0x{0:X}' -f [int64]$window.id)
+                foreach ($name in @($script:apps.Keys)) {
+                    if ([int64]$script:apps[$name] -eq [int64]$window.id) { $caption = $name }
+                }
+                $place = $window.layout.pos_in_scrolling_layout
+                $column = if ($place) { $place[0] } else { '?' }
+                $where = 'monitor unknown'
+                if ([DemoNative]::IsWindow([IntPtr][int64]$window.id)) {
+                    $rect = [DemoNative]::Bounds([IntPtr][int64]$window.id)
+                    $primary = $script:primaryRect
+                    if ($primary -and $rect.Left -ge $primary.Left -and $rect.Top -ge $primary.Top -and
+                        $rect.Right -le $primary.Right -and $rect.Bottom -le $primary.Bottom) {
+                        $where = 'on the primary monitor'
+                    } else {
+                        $where = ('outside the primary monitor at {0},{1}' -f $rect.Left, $rect.Top)
+                    }
+                }
+                return ('{0} [workspace {1}, column {2}, {3}]' -f $caption, $window.workspace_id, $column, $where)
+            }
+        } catch { }
+        if ($reply.text) {
+            Log ('  focus query returned: ' + $reply.text.Substring(0, [Math]::Min(240, $reply.text.Length)))
+        }
+    }
+    try {
+        $reply = Invoke-Ctl @('focused-window', '--json')
+        $json = $reply.text | ConvertFrom-Json
+        $window = $json.result.focused_window
+        if ($window -and $window.id) {
+            $caption = ('hwnd 0x{0:X}' -f [int64]$window.id)
+            foreach ($name in @($script:apps.Keys)) {
+                if ([int64]$script:apps[$name] -eq [int64]$window.id) { $caption = $name }
+            }
+            $place = $window.layout.pos_in_scrolling_layout
+            return ('{0} [workspace {1}, column {2}]' -f $caption, $window.workspace_id,
+                $(if ($place) { $place[0] } else { '?' }))
+        }
+        return 'no window focused'
+    } catch { return '?' }
+}
+
+function Get-FocusLine([string]$label) {
+    $title = Get-FocusedTitle
+    Log ("  focus after {0}: {1}" -f $label, $title)
+    Add-Content -Path (Join-Path $session 'focus.txt') -Value ('{0} -> {1}' -f $label, $title)
+    return $title
+}
+
+# With a second display extended to the right, a window wiri opens on the other output would
+# be missing from the 1366x768 capture of the primary monitor.  Every window the demo uses has
+# to be inside the primary rect; one that opened on DISPLAY2 is dragged back with the daemon's
+# own move-window-to-monitor left.
+function Ensure-OnPrimary([string]$caption) {
+    $primary = $script:primaryRect
+    $handle = $script:apps[$caption]
+    if (-not $primary -or -not $handle -or -not [DemoNative]::IsWindow($handle)) { return $true }
+    $rect = [DemoNative]::Bounds($handle)
+    $inside = ($rect.Left -ge $primary.Left - 1) -and ($rect.Top -ge $primary.Top - 1) -and
+              ($rect.Right -le $primary.Right + 1) -and ($rect.Bottom -le $primary.Bottom + 1)
+    if (-not $inside -and $rect.Left -ge $primary.Right) {
+        Log ('  {0} opened on the second display ({1},{2}); moving it left' -f $caption, $rect.Left, $rect.Top)
+        $null = Invoke-Ctl @('focus-window', ([int64]$handle).ToString())
+        Wait-Seconds 0.25
+        $null = Invoke-Ctl @('move-window-to-monitor', 'left')
+        Wait-Seconds 0.5
+        $rect = [DemoNative]::Bounds($handle)
+        $inside = ($rect.Left -ge $primary.Left - 1) -and ($rect.Top -ge $primary.Top - 1) -and
+                  ($rect.Right -le $primary.Right + 1) -and ($rect.Bottom -le $primary.Bottom + 1)
+        Log ('  {0} now at {1},{2} {3}x{4} ({5})' -f $caption, $rect.Left, $rect.Top, $rect.Width, $rect.Height,
+            $(if ($inside) { 'inside the primary monitor' } else { 'STILL OUTSIDE' }))
+    }
+    if (-not $inside) {
+        Log ('  ERROR: {0} is at {1},{2} {3}x{4}, not inside the primary monitor {5},{6} {7}x{8}' -f `
+            $caption, $rect.Left, $rect.Top, $rect.Width, $rect.Height, $primary.Left, $primary.Top, $primary.Width, $primary.Height)
+    }
+    return $inside
+}
+
+# Nothing may be left fullscreen when the grid segment starts.  (`action` has no --id, so the
+# window is focused first and the action then runs on it.)
+function Clear-Fullscreen {
+    $reply = Invoke-Ctl @('windows', '--json')
+    try {
+        $list = @(($reply.text | ConvertFrom-Json).result.windows)
+        foreach ($window in $list) {
+            if ($window.is_fullscreen) {
+                Log ("  leaving fullscreen: {0}" -f $window.title)
+                $null = Invoke-Ctl @('focus-window', ([int64]$window.id).ToString())
+                Wait-Seconds 0.2
+                $null = Invoke-Ctl @('action', 'fullscreen-window')
+                Wait-Seconds 0.45
+            }
+        }
+    } catch { }
+}
+
+# What a workspace row looks like right now: one entry per window with its column.
+function Get-RowInfo([int]$workspaceId) {
+    $reply = Invoke-Ctl @('windows', '--json')
+    $list = @(($reply.text | ConvertFrom-Json).result.windows)
+    $row = @($list | Where-Object { [int]$_.workspace_id -eq $workspaceId } |
+        Sort-Object { [int]$_.layout.pos_in_scrolling_layout[0] })
+    return @($row | ForEach-Object {
+        [pscustomobject]@{ title = $_.title; column = [int]$_.layout.pos_in_scrolling_layout[0] }
+    })
+}
+
+function Format-Row([int]$workspaceId) {
+    $row = @(Get-RowInfo $workspaceId)
+    return (($row | ForEach-Object { '{0} (col {1})' -f $_.title, $_.column }) -join ' | ')
+}
+
+# Nudge the columns of one row into the wanted left-to-right order, one move at a time,
+# checking the daemon's own idea of the order after every step.  The previous version
+# assumed move-column-to-first always landed, which left Editor in column 2.
+function Set-RowOrder([int]$workspaceId, [string[]]$order) {
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $row = @(Get-RowInfo $workspaceId)
+        $misplaced = $null
+        for ($i = 0; $i -lt $order.Count; $i++) {
+            $entry = @($row | Where-Object { $_.title -eq $order[$i] })
+            if ($entry.Count -eq 0) { continue }
+            if ([int]$entry[0].column -ne ($i + 1)) { $misplaced = [pscustomobject]@{ title = $order[$i]; column = [int]$entry[0].column; target = $i + 1 }; break }
+        }
+        if (-not $misplaced) { return $true }
+        Focus-DemoWindow $misplaced.title
+        if ($misplaced.column -gt $misplaced.target) { Invoke-DemoAction 'move-column-left' } else { Invoke-DemoAction 'move-column-right' }
+    }
+    Log ('  could not order workspace {0}: {1}' -f $workspaceId, (Format-Row $workspaceId))
+    return $false
+}
+
+function Save-Snapshot([string]$tag) {    $reply = Invoke-Ctl @('windows', '--json')
     Set-Content -Path (Join-Path $session ($tag + '-windows.json')) -Value $reply.text
     $state = Invoke-Ctl @('state')
     Set-Content -Path (Join-Path $session ($tag + '-state.txt')) -Value $state.text
@@ -384,7 +591,8 @@ function Get-StrayPopups($windows) {
     return @($windows | Where-Object {
         [int64]$_.Pid -ne $ownPid -and
         ($script:popupClasses -contains $_.Class -or
-         ($_.Process -eq 'explorer' -and $script:shellClasses -notcontains $_.Class))
+         ($_.Process -eq 'explorer' -and $script:shellClasses -notcontains $_.Class) -or
+         ($_.Visible -and $_.Rect.Width -gt 0 -and $_.Rect.Height -gt 0 -and [PopupProbe]::IsShellFlyoutProcess($_.Process)))
     })
 }
 
@@ -401,8 +609,44 @@ function Get-NewShellPopups($windows) {
             if ($script:shellClasses -contains $_.Class) { return $false }
             return ($script:preflightShellHwnds -notcontains [int64]$_.Hwnd)
         }
+        # Shell flyouts (Win+P Project pane, start menu, search, widgets) show up in the shell's
+        # own processes and are never part of a good take, whether or not they were there before.
+        if ($_.Visible -and $_.Rect.Width -gt 0 -and $_.Rect.Height -gt 0 -and [PopupProbe]::IsShellFlyoutProcess($_.Process)) { return $true }
         return $false
     })
+}
+
+# Every mock window that is on screen must lie inside the primary monitor: the capture is cut
+# to that monitor's rect, so a window outside it would simply be missing from the video.
+# Windows on an inactive workspace are hidden by wiri and are reported, not checked.
+function Test-MockWindowsOnPrimary([string]$name) {
+    $primary = $script:primaryRect
+    if (-not $primary -or $primary.Width -le 0) { return $true }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(('# mock windows against the primary monitor {0},{1} {2}x{3}' -f $primary.Left, $primary.Top, $primary.Width, $primary.Height))
+    $checked = 0
+    $passed = 0
+    $outside = 0
+    foreach ($caption in @($script:apps.Keys)) {
+        $handle = $script:apps[$caption]
+        if (-not [DemoNative]::IsWindow($handle)) { $lines.Add(('  {0,-28} gone' -f $caption)); continue }
+        $visible = [DemoNative]::IsWindowVisible($handle) -and -not [DemoNative]::IsIconic($handle) -and -not [DemoNative]::Cloaked($handle)
+        if (-not $visible) { $lines.Add(('  {0,-28} hidden (other workspace, not checked)' -f $caption)); continue }
+        $rect = [DemoNative]::Bounds($handle)
+        $inside = ($rect.Left -ge ($primary.Left - 1)) -and ($rect.Top -ge ($primary.Top - 1)) -and
+                  ($rect.Right -le ($primary.Right + 1)) -and ($rect.Bottom -le ($primary.Bottom + 1))
+        $touches = ($rect.Right -gt $primary.Left) -and ($rect.Left -lt $primary.Right) -and
+                   ($rect.Bottom -gt $primary.Top) -and ($rect.Top -lt $primary.Bottom)
+        $checked++
+        if ($inside) { $passed++ } else { $outside++ }
+        $note = 'PASS'
+        if (-not $inside) { if ($touches) { $note = 'clipped by the screen edge (column scrolling)' } else { $note = 'off-screen (column scrolled away)' } }
+        $lines.Add(('  {0,-28} rect={1},{2} {3}x{4} {5}' -f $caption, $rect.Left, $rect.Top, $rect.Width, $rect.Height, $note))
+    }
+    $lines.Add(('# {0} visible; {1} fully inside the primary monitor, {2} outside (off-screen columns)' -f $checked, $passed, $outside))
+    Add-Content -Path (Join-Path $StageDir ('windows-{0}.txt' -f $name)) -Value $lines
+    Log ('window check {0}: {1} visible mock windows, {2} fully inside the primary monitor, {3} scrolled off' -f $name, $checked, $passed, $outside)
+    return $true
 }
 
 # Stray shell popups.  Windows 11 draws its menus in a z-band EnumWindows never returns, so
@@ -469,6 +713,40 @@ function Test-StrayPopups {
     return $true
 }
 
+# The geometric check before encoding: the capture rectangle is the primary monitor, and the
+# two probe points have to land on a demo window or on the desktop - never on a shell flyout.
+function Test-CaptureProbes([string]$name, [switch]$FlyoutOnly) {
+    $primary = $script:primaryRect
+    if (-not $primary -or $primary.Width -le 0) { $primary = [DemoNative]::PrimaryMonitorRect() }
+    $ok = $true
+    Log ('capture geometry {0}: primary monitor {1},{2} {3}x{4}; gdigrab -offset_x {1} -offset_y {2} -video_size {3}x{4}' -f `
+        $name, $primary.Left, $primary.Top, $primary.Width, $primary.Height)
+    if ($primary.Left -ne 0 -or $primary.Top -ne 0) {
+        Log ('  ERROR: the primary monitor is not at 0,0, so the capture would not start at the origin')
+        $ok = $false
+    }
+    foreach ($probe in @(@{ x = 1200; y = 300 }, @{ x = 683; y = 384 })) {
+        $handle = [PopupProbe]::HwndAt($probe.x, $probe.y)
+        $description = [PopupProbe]::PointDescription($probe.x, $probe.y)
+        $flyout = [PopupProbe]::IsShellFlyoutAt($probe.x, $probe.y)
+        $desktop = [PopupProbe]::IsDesktopAt($probe.x, $probe.y)
+        $mine = $false
+        if ($handle -ne [IntPtr]::Zero) {
+            foreach ($candidate in @($script:apps.Values)) {
+                if ([int64]$candidate -eq [int64]$handle) { $mine = $true; break }
+            }
+        }
+        $verdict = 'FAIL'
+        if ($flyout) { $verdict = 'FAIL (shell flyout)'; $ok = $false }
+        elseif ($mine) { $verdict = 'demo window' }
+        elseif ($desktop) { $verdict = 'desktop' }
+        elseif ($FlyoutOnly) { $verdict = 'other application (no flyout, only noted)' }
+        else { $ok = $false }
+        Log ('  capture probe {0} at {1},{2}: {3} - {4}' -f $name, $probe.x, $probe.y, $verdict, $description)
+    }
+    return $ok
+}
+
 $mutex = $null
 $ownsMutex = $false
 if ($EncodeOnly -or $VerifyOnly) {
@@ -483,19 +761,36 @@ if ($EncodeOnly -or $VerifyOnly) {
     if (-not (Test-Path $wiri)) { throw "missing $wiri - build it with: cargo build --release -j 2" }
 
     $mutex = New-Object System.Threading.Mutex($false, 'Global\wiri-live-test')
-    try { $ownsMutex = $mutex.WaitOne([TimeSpan]::FromMinutes($LockWaitMinutes)) }
-    catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }
-    if (-not $ownsMutex) { throw "the desktop is held by another wiri run (waited $LockWaitMinutes min)" }
-    Log 'desktop mutex Global\wiri-live-test acquired'
+    if ($MutexAlreadyHeld) {
+        # A wrapper run holds the mutex across a rehearsal and the recording, so a two-hour
+        # multi-monitor lane cannot slip in between them.
+        $ownsMutex = $true
+        Log 'desktop mutex Global\wiri-live-test already held by this run'
+    } else {
+        try { $ownsMutex = $mutex.WaitOne([TimeSpan]::FromMinutes($LockWaitMinutes)) }
+        catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }
+        if (-not $ownsMutex) { throw "the desktop is held by another wiri run (waited $LockWaitMinutes min)" }
+        Log 'desktop mutex Global\wiri-live-test acquired'
+    }
 
     try {
         $busy = Test-DesktopBusy
         if ($busy) { throw $busy }
 
+        # A second display is attached (mirrored today, Extend tomorrow): the capture is cut to
+        # the primary monitor's own rect and every mock window is checked against it at each
+        # segment boundary, so the video stays 1366x768 whatever the desktop does.
+        $script:primaryRect = [DemoNative]::PrimaryMonitorRect()
+        $monitorCount = [DemoNative]::MonitorCount()
+        $primaryLine = ('# displays: {0}; primary monitor rect {1},{2} {3}x{4}' -f $monitorCount,
+            $script:primaryRect.Left, $script:primaryRect.Top, $script:primaryRect.Width, $script:primaryRect.Height)
+        Log $primaryLine
+        [void](Write-WindowCensus 'preflight' @([DemoNative]::TopLevelWindows($true)))
+        Add-Content -Path (Join-Path $StageDir 'windows-preflight.txt') -Value $primaryLine
+
         # Census first, then dismiss whatever shell menu is sitting on the desktop, then
         # minimise the other applications' windows.  A menu has no title, so it used to slip
         # through the foreign-window gate and be recorded.
-        [void](Test-StrayPopups 'preflight')
         [void](Test-StrayPopups 'preflight-dismiss' -Dismiss)
         Wait-Seconds 0.4
 
@@ -608,12 +903,25 @@ if ($EncodeOnly -or $VerifyOnly) {
         Log ('all {0} demo chords are registered' -f $needed.Count)
 
         # Windows that must already be there when the camera rolls: the editor on
-        # workspace 1, and two columns on workspace 2 for the vertical slide.
-        Open-Demo 'editor' 'Editor — notes.md' 1.6
-        Send-Chord 'ctrl+alt+2' 1.2
-        Open-Demo 'chat' 'Chat — #wiri' 1.4
-        Open-Demo 'music' 'Music — focus' 1.4
-        Send-Chord 'ctrl+alt+1' 1.4
+        # workspace 1, and two columns on workspace 2 for the vertical slide.  Chat and
+        # Music are opened on the visible workspace so they paint at least once - a window
+        # whose first show happens on a hidden workspace has nothing for DWM to hand the
+        # overview's thumbnails (one tile came out blank white) - and then moved to row 2.
+        Open-Demo 'editor' 'Editor - notes.md' 1.6
+        if (-not (Ensure-OnPrimary 'Editor - notes.md')) {
+            throw 'the first demo window did not land on the primary monitor; the capture would miss it'
+        }
+        Open-Demo 'chat' 'Chat - #wiri' 1.4
+        Open-Demo 'music' 'Music - focus' 1.4
+        Move-DemoWindowToWorkspace 'Chat - #wiri' 2
+        Move-DemoWindowToWorkspace 'Music - focus' 2
+        Send-Chord 'ctrl+alt+1' 1.2
+        # The two rows of the demo, as the daemon numbers them today.
+        $script:wsRowOne = Get-WindowWorkspaceId 'Editor - notes.md'
+        $script:wsRowTwo = Get-WindowWorkspaceId 'Chat - #wiri'
+        if (-not $script:wsRowOne) { $script:wsRowOne = 1 }
+        if (-not $script:wsRowTwo) { $script:wsRowTwo = 2 }
+        Log ('  rows are workspace {0} (top) and workspace {1} (bottom)' -f $script:wsRowOne, $script:wsRowTwo)
         Save-Snapshot '00-setup'
         [DemoNative]::ParkCursor()
         Wait-Seconds 0.8
@@ -628,7 +936,10 @@ if ($EncodeOnly -or $VerifyOnly) {
             $recordLog = Join-Path $session 'ffmpeg-record.log'
             $recordArgs = @('-hide_banner', '-loglevel', 'info', '-y',
                             '-fflags', '+genpts',
-                            '-f', 'gdigrab', '-framerate', '30', '-draw_mouse', '1', '-i', 'desktop',
+                            '-f', 'gdigrab', '-framerate', '30', '-draw_mouse', '1',
+                            '-offset_x', "$($script:primaryRect.Left)", '-offset_y', "$($script:primaryRect.Top)",
+                            '-video_size', ("{0}x{1}" -f $script:primaryRect.Width, $script:primaryRect.Height),
+                            '-i', 'desktop',
                             '-c:v', 'mjpeg', '-q:v', '2', '-pix_fmt', 'yuvj420p',
                             '-g', '30', '-t', '300', '-f', 'matroska', $rawPath)
             $record = Start-Process -FilePath $ffmpeg -ArgumentList $recordArgs -WindowStyle Hidden -PassThru `
@@ -648,10 +959,10 @@ if ($EncodeOnly -or $VerifyOnly) {
         # ---- a) columns on an endless strip -------------------------------------
         Start-Segment 'columns'
         Wait-Seconds 0.2
-        Open-Demo 'terminal' 'Terminal — pwsh' 1.35
-        Open-Demo 'notes' 'Notes — checklist.md' 1.35
-        Open-Demo 'browser' 'Browser — wiri.local/docs' 1.35
-        Open-Demo 'files' 'Files — C:\wiri' 1.35
+        Open-Demo 'terminal' 'Terminal - pwsh' 1.35
+        Open-Demo 'notes' 'Notes - checklist.md' 1.35
+        Open-Demo 'browser' 'Browser - wiri.local/docs' 1.35
+        Open-Demo 'files' 'Files - C:\wiri' 1.35
         Send-Chord 'ctrl+alt+home' 1.45 'focus-column-first: ride the strip back'
         Stop-Segment
         if (-not $Rehearse) { Save-Snapshot '01-columns' }
@@ -681,9 +992,30 @@ if ($EncodeOnly -or $VerifyOnly) {
 
         # ---- d) workspaces stack vertically --------------------------------------
         # Two slides with a long settle: the vertical move is the whole point of the beat,
-        # so it must not be swallowed by a slow capture frame.
+        # so it must not be swallowed by a slow capture frame.  The columns are tidied into
+        # the two populated rows the grid segment later needs first (row 1: Editor |
+        # Terminal | Notes, row 2: Chat | Music | Files | Browser): the tabs segment left
+        # Notes, Terminal and Browser stacked in one column.
         Start-Segment 'workspaces'
         Wait-Seconds 0.25
+        Log '  arranging the rows (workspace 1: Editor | Terminal | Notes, workspace 2: Chat | Music | Files | Browser)'
+        # A window moved to another workspace and back comes back as its own column next to
+        # the one it left.  That is the one primitive that always separates a stacked column
+        # (the tabs segment leaves Notes, Terminal and Browser in one column), so the
+        # arrangement is built from it - and because each return lands to the left of the
+        # previous one, the round trips run in reverse of the wanted order:
+        #   Notes out and back    -> Editor | Notes
+        #   Terminal out and back -> Editor | Terminal | Notes
+        foreach ($caption in 'Notes - checklist.md', 'Terminal - pwsh') {
+            Move-DemoWindowToWorkspace $caption 2
+            Move-DemoWindowToWorkspace $caption 1
+        }
+        Move-DemoWindowToWorkspace 'Browser - wiri.local/docs' 2
+        Move-DemoWindowToWorkspace 'Files - C:\wiri' 2
+        Log ('  workspace 1: ' + (Format-Row $script:wsRowOne))
+        Log ('  workspace 2: ' + (Format-Row $script:wsRowTwo))
+        foreach ($handle in $script:apps.Values) { [void][DemoApps]::Repaint($handle) }
+        Save-Snapshot '04a-grid-arranged'
         Send-Chord 'ctrl+alt+pagedown' 2.0 'focus-workspace-down'
         Send-Chord 'ctrl+alt+pageup' 1.9 'focus-workspace-up'
         Stop-Segment
@@ -703,8 +1035,8 @@ if ($EncodeOnly -or $VerifyOnly) {
             $overviewRect = [DemoNative]::Bounds($overviewHost)
             # Prefer the workspace-1 windows: the jump then always lands where the two
             # segments after this one expect to start.
-            $primaryCaptions = @('Editor — notes.md', 'Terminal — pwsh', 'Notes — checklist.md',
-                                 'Browser — wiri.local/docs', 'Files — C:\wiri')
+            $primaryCaptions = @('Editor - notes.md', 'Terminal - pwsh', 'Notes - checklist.md',
+                                 'Browser - wiri.local/docs', 'Files - C:\wiri')
             $mine = @()
             foreach ($caption in $primaryCaptions) {
                 if ($script:apps.ContainsKey($caption)) { $mine += [Int64]$script:apps[$caption] }
@@ -718,11 +1050,13 @@ if ($EncodeOnly -or $VerifyOnly) {
                 $cx = $tile.x + $tile.w / 2
                 $cy = $tile.y + $tile.h / 2
                 $distance = [Math]::Sqrt([Math]::Pow($cx - $overviewRect.Width / 2, 2) + [Math]::Pow($cy - $overviewRect.Height / 2, 2))
-                if ($mine -notcontains $hwnd) { $distance += 100000 }
-                # The click has to land on the screen: a panned overview can put a tile above it.
+                if ($mine -notcontains $hwnd) { $distance += 1000 }
+                # The click has to land on the screen: a panned overview can put a tile above it,
+                # and a click at a negative point would go to the nearest edge instead.
                 $candidateX = $overviewRect.Left + [int]($tile.x + $tile.w / 2)
                 $candidateY = $overviewRect.Top + [int]($tile.y + $tile.h / 2)
-                if ($candidateX -lt 0 -or $candidateY -lt 0 -or $candidateX -ge $screen.Width -or $candidateY -ge $screen.Height) { $distance += 100000 }
+                $onScreen = ($candidateX -ge 0) -and ($candidateY -ge 0) -and ($candidateX -lt $screen.Width) -and ($candidateY -lt $screen.Height)
+                if (-not $onScreen) { continue }
                 if ($tile.w -gt 40 -and $tile.h -gt 40 -and ($null -eq $best -or $distance -lt $best.distance)) {
                     $tile | Add-Member -NotePropertyName distance -NotePropertyValue $distance
                     $best = $tile
@@ -750,6 +1084,7 @@ if ($EncodeOnly -or $VerifyOnly) {
         # ---- f) floating and fullscreen -----------------------------------------
         Start-Segment 'float-fullscreen'
         Wait-Seconds 0.25
+        Focus-DemoWindow 'Editor - notes.md'
         Send-Chord 'ctrl+alt+t' 1.45 'toggle-window-floating'
         Send-Chord 'ctrl+alt+t' 1.05 'toggle-window-floating back'
         Send-Chord 'ctrl+alt+f' 1.55 'fullscreen-window'
@@ -758,18 +1093,46 @@ if ($EncodeOnly -or $VerifyOnly) {
         if (-not $Rehearse) { Save-Snapshot '06-float-fullscreen' }
 
         # ---- g) unified XY grid, opt-in by a config reload ----------------------
+        # Two populated rows under one camera: a diagonal move goes one row down and one
+        # column right, and the overview lines both rows up on that same camera.
         Start-Segment 'grid'
-        Wait-Seconds 0.3
+        Wait-Seconds 0.15
+        Focus-DemoWindow 'Editor - notes.md'
+        Wait-Seconds 0.15
         [IO.File]::WriteAllText($cfgPath, $configGrid, (New-Object Text.UTF8Encoding($false)))
         Log '  config rewritten with layout { unified-grid } (hot reload)'
-        Wait-Seconds 1.2
+        Wait-Seconds 0.7
         $monitors = Invoke-Ctl @('list-monitors', '--json')
         Set-Content -Path (Join-Path $session '07-monitors.json') -Value $monitors.text
         if ($monitors.text -match '"unified_grid"\s*:\s*true') { Log '  unified grid is on' } else { Log '  WARNING: the monitor does not report unified_grid' }
-        Send-Chord 'ctrl+alt+j' 1.2 'focus-down-left (diagonal)'
-        Send-Chord 'ctrl+alt+i' 1.2 'focus-up-right (diagonal)'
-        Send-Chord 'ctrl+alt+space' 1.25 'toggle-overview'
-        Send-Chord 'ctrl+alt+j' 1.5 'diagonal pan in the overview'
+        # Turning the grid on re-sorts the row (the rehearsal came out Terminal | Editor | Notes),
+        # so the row is rebuilt once more with the same out-and-back primitive before the demo.
+        foreach ($caption in 'Notes - checklist.md', 'Terminal - pwsh') {
+            Move-DemoWindowToWorkspace $caption 2
+            Move-DemoWindowToWorkspace $caption 1
+        }
+        Start-Sleep -Milliseconds 250
+        foreach ($handle in $script:apps.Values) { [void][DemoApps]::Repaint($handle) }
+        Log ('  rows for the grid: workspace 1 = ' + (Format-Row $script:wsRowOne))
+        Log ('  rows for the grid: workspace 2 = ' + (Format-Row $script:wsRowTwo))
+        $rowOne = Get-RowInfo $script:wsRowOne
+        if ($rowOne.Count -ge 1 -and $rowOne[0].title -ne 'Editor - notes.md') { Log '  WARNING: row 1 does not start with the editor' }
+        Focus-DemoWindow 'Editor - notes.md'
+        [void](Get-FocusLine 'start (row 1, column 1)')
+        Send-Chord 'ctrl+alt+l' 0.9 'focus-down-right: row 2, one column right'
+        [void](Get-FocusLine 'focus-down-right')
+        Send-Chord 'ctrl+alt+i' 0.9 'focus-up-right: row 1, one column right'
+        [void](Get-FocusLine 'focus-up-right')
+        Send-Chord 'ctrl+alt+space' 0.8 'overview: both rows on one camera'
+        Send-Chord 'ctrl+alt+j' 1.0 'focus-down-left inside the overview'
+        [void](Get-FocusLine 'overview focus-down-left')
+        Send-Chord 'escape' 0.5 'leave the overview on that window'
+        # The strict geometric check while the demo windows are still on screen: the two probe
+        # points have to land on a demo window or on the desktop.
+        if (-not (Test-CaptureProbes 'end-of-take')) {
+            $script:takeFailed = $true
+            throw 'a probe point did not land on a demo window or the desktop; this take is contaminated'
+        }
         Stop-Segment
         if (-not $Rehearse) { Save-Snapshot '08-grid' }
 
@@ -853,7 +1216,12 @@ if ($EncodeOnly -or $VerifyOnly) {
         $env:WIRI_CONFIG = $savedCfg
         $env:APPDATA = $savedRoaming
         $env:LOCALAPPDATA = $savedLocal
-        if ($ownsMutex) { try { $mutex.ReleaseMutex() } catch { }; Log 'desktop mutex released' }
+        if ($ownsMutex -and $MutexAlreadyHeld) {
+            Log 'desktop mutex left to the wrapper run'
+        } elseif ($ownsMutex) {
+            try { $mutex.ReleaseMutex() } catch { }
+            Log 'desktop mutex released'
+        }
     }
 }
 
@@ -919,6 +1287,9 @@ if ($preEncodeHits.Count -gt 0) {
     throw 'a shell popup is on screen; refusing to encode a contaminated take'
 }
 Log ('pre-encode check: no shell popup; point(518,455)=' + [PopupProbe]::PointDescription(518, 455))
+if (-not (Test-CaptureProbes 'pre-encode' -FlyoutOnly)) {
+    throw 'a shell flyout is over one of the probe points; refusing to encode'
+}
 
 # drawtext texts live in files, and every path in the filter graph is relative to the
 # staging directory: no Windows drive colon ever has to be escaped on a command line.
@@ -1000,7 +1371,11 @@ function New-CaptionBands {
     $paths = New-Object System.Collections.Generic.List[string]
     foreach ($segment in $timeline.segments) {
         $path = Join-Path $directory ($segment.key + '.png')
-        [CaptionBand]::Render($path, $Width, $BandHeight, $segment.caption, $FontSize, $MarkSize)
+        $subtitle = ''
+        if ($segment.PSObject.Properties.Name -contains 'subtitle') { $subtitle = [string]$segment.subtitle }
+        $height = $BandHeight
+        if ($subtitle) { $height = [int][Math]::Round($BandHeight * 1.34) }
+        [CaptionBand]::Render($path, $Width, $height, $segment.caption, $subtitle, $FontSize, $MarkSize)
         $paths.Add($path)
     }
     return $paths
@@ -1080,7 +1455,20 @@ function Invoke-FfmpegEncode {
 # CRF is tuned against the budget, not guessed: encode, measure, step back.  fps=30
 # resamples the wall-clock-timestamped capture to a constant frame rate for players.
 $mp4 = Join-Path $OutDir 'demo.mp4'
-$bandsMp4 = New-CaptionBands -Width 1366 -BandHeight 72 -FontSize 27 -MarkSize 20
+# Captions are drawn for the frame size the capture actually has (the primary monitor).
+$frameWidth = $script:primaryRect.Width
+if (-not $frameWidth -or $frameWidth -le 0) { $frameWidth = 1366 }
+if (-not $script:primaryRect -or $script:primaryRect.Width -le 0) {
+    # -EncodeOnly after a fresh start has no monitor probe yet
+    $frameWidth = 1366
+    $script:primaryRect = [DemoNative]::PrimaryMonitorRect()
+    if ($script:primaryRect.Width -gt 0) { $frameWidth = $script:primaryRect.Width }
+}
+$bandScale = $frameWidth / 1366.0
+$mp4BandHeight = [int][Math]::Round(72 * $bandScale)
+$mp4Font = [int][Math]::Round(27 * $bandScale)
+$mp4Mark = [int][Math]::Round(20 * $bandScale)
+$bandsMp4 = New-CaptionBands -Width $frameWidth -BandHeight $mp4BandHeight -FontSize $mp4Font -MarkSize $mp4Mark
 # The MJPEG intermediate is full range (yuvj420p); convert it to limited-range yuv420p so
 # the published file carries the pixel format the README promises and plays with the right
 # levels everywhere.
@@ -1196,7 +1584,7 @@ foreach ($segment in $timeline.segments) {
         $failures++
         continue
     }
-    $values = ConvertFrom-Stats ([FrameStats]::Analyze($framePath, 72))
+    $values = ConvertFrom-Stats ([FrameStats]::Analyze($framePath, $mp4BandHeight))
     $band = [double]$values['band']
     $glyphs = [double]$values['glyphs']
     $mark = [int]$values['mark']
