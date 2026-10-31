@@ -149,7 +149,7 @@ function EvTyped([string]$tag, $request) {
     $json = $request | ConvertTo-Json -Depth 8 -Compress
     $reply = (EvCtl $tag @('raw-request', (Q $json))) | ConvertFrom-Json
     if ($null -eq $reply.PSObject.Properties['Ok'] -or $reply.Ok -ne 'Handled') {
-        throw "H95 typed request was not handled: $tag"
+        throw "H95 typed request was not handled: $tag $($reply | ConvertTo-Json -Compress) (request $json)"
     }
     Start-Sleep -Milliseconds 550
     return $reply
@@ -304,11 +304,16 @@ try {
         $h95ShadowOn = @'
 input { mod-key "Alt"; }
 animations { off; }
-layout { gaps 0; border { off; } focus-ring { off; } shadow { off; } }
+layout {
+    gaps 0
+    border { off; }
+    focus-ring { off; }
+    shadow { off; }
+}
 overview {
     zoom 0.5
     backdrop-color "#102030"
-    workspace-shadow { offset-y 10; softness 0; spread 0; color "#ff0000"; }
+    workspace-shadow { offset y=10; softness 0; spread 0; color "#ff0000"; }
 }
 '@
         EvReload $h95ShadowOn 'shadow-on'
@@ -326,7 +331,7 @@ overview {
         $h95OnPass = (EvNearColor $h95Red (EvRgb '#ff0000') 40)
         $h95Details.observations.Add([ordered]@{ stage = 'shadow-on'; x = $h95X; y = ($h95Bottom + 2); rgb = $h95Red })
         # niri's `off`: the same point is the configured backdrop again.
-        $h95ShadowOff = $h95ShadowOn.Replace('workspace-shadow { offset-y 10; softness 0; spread 0; color "#ff0000"; }', 'workspace-shadow { off; }')
+        $h95ShadowOff = $h95ShadowOn.Replace('workspace-shadow { offset y=10; softness 0; spread 0; color "#ff0000"; }', 'workspace-shadow { off; }')
         EvReload $h95ShadowOff 'shadow-off'
         $h95Host = EvWaitOverview 500000
         Start-Sleep -Milliseconds 700
@@ -359,7 +364,12 @@ overview {
         $h95Deprecated = @"
 input { mod-key "Alt"; }
 animations { off; }
-layout { gaps 0; border { off; } focus-ring { off; } shadow { off; } }
+layout {
+    gaps 0
+    border { off; }
+    focus-ring { off; }
+    shadow { off; }
+}
 output r#"$h95Name"# { background-color "#204060"; }
 overview { zoom 0.5; workspace-shadow { off; }; }
 "@
@@ -392,7 +402,12 @@ overview { zoom 0.5; workspace-shadow { off; }; }
         $h95Centered = @'
 input { mod-key "Alt"; }
 animations { off; }
-layout { gaps 16; border { off; } focus-ring { off; } shadow { off; } }
+layout {
+    gaps 16
+    border { off; }
+    focus-ring { off; }
+    shadow { off; }
+}
 '@
         EvReload $h95Centered 'centre-column'
         EvCloseForms
@@ -462,6 +477,11 @@ layout {
 '@
         EvReload $h95Tabs 'tab-urgent'
         EvCloseForms
+        # The desktop's other applications are adopted into the first workspace, so the tab
+        # fixtures get a fresh workspace of their own: the "no foreign tiles in this strip row"
+        # precondition below then holds by construction instead of depending on what the rest of
+        # the desktop holds, and the two fixtures are that row's first and second column.
+        EvAction 'tab-workspace' @('focus-workspace', '2')
         $h95TabA = [TestForms]::Open('wiri-h95-tab-a', 60, 160, 60); $h95Forms.Add($h95TabA) | Out-Null
         Start-Sleep -Milliseconds 1400
         $h95TabB = [TestForms]::Open('wiri-h95-tab-b', 160, 60, 160); $h95Forms.Add($h95TabB) | Out-Null
@@ -551,7 +571,12 @@ layout {
         $h95Floats = @'
 input { mod-key "Alt"; }
 animations { off; }
-layout { gaps 16; border { off; } focus-ring { off; } shadow { off; } }
+layout {
+    gaps 16
+    border { off; }
+    focus-ring { off; }
+    shadow { off; }
+}
 window-rule { match title="^wiri-h95-float$"; open-floating true; }
 '@
         EvReload $h95Floats 'floating'
@@ -562,7 +587,10 @@ window-rule { match title="^wiri-h95-float$"; open-floating true; }
         if ($null -eq $h95FloatEntry -or -not $h95FloatEntry.floating) {
             throw 'H95 opened fixture is not a floating window'
         }
-        $null = EvTyped 'float-place' @{ Action = @{ MoveFloatingWindow = @{ id = [int64]$h95Float; x = 300; y = 200 } } }
+        # x/y are niri's PositionChange values (`SetFixed`, `SetProportion`, `AdjustFixed`, ...),
+        # not bare pixels: a number here is rejected while the request is decoded.
+        $null = EvTyped 'float-place' @{ Action = @{ MoveFloatingWindow = @{
+            id = [int64]$h95Float; x = @{ SetFixed = 300.0 }; y = @{ SetFixed = 200.0 } } } }
         Start-Sleep -Milliseconds 700
         $h95Before = EvRect $h95Float
         if ($h95Before.W -lt 150 -or $h95Before.H -lt 100) { throw 'H95 floating fixture has no usable rectangle' }
@@ -688,7 +716,12 @@ window-rule { match title="^wiri-h95-float$"; open-floating true; }
         $h95Inhibit = @'
 input { mod-key "Alt"; }
 animations { off; }
-layout { gaps 16; border { off; } focus-ring { off; } shadow { off; } }
+layout {
+    gaps 16
+    border { off; }
+    focus-ring { off; }
+    shadow { off; }
+}
 binds {
     Ctrl+Alt+F8 { toggle-window-floating; }
     Ctrl+Alt+F7 { toggle-keyboard-shortcuts-inhibit; }
