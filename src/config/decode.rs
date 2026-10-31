@@ -937,9 +937,36 @@ impl Decoder {
         Some(n as u32)
     }
 
+    /// An integer-only value, with a range that may be wider than `u32` (niri's `FloatOrInt`
+    /// bounds are i32-typed).  A decimal is a type error, matching knuffel's integer scalars.
+    fn arg_integer(&mut self, node: &Node, min: f64, max: f64) -> Option<f64> {
+        let v = self.one_arg(node)?;
+        let n = self.value_number(node, v, min, max)?;
+        if n.fract() != 0.0 {
+            self.error(v.pos, format!("'{}' expects an integer", node.name));
+            return None;
+        }
+        Some(n)
+    }
+
+    /// A niri `i32` value.  Pinned niri decodes `output { position }` x/y as plain `i32`
+    /// properties (niri-config/src/output.rs:139-152), so a fractional value is a type error
+    /// rather than something to round, and the whole i32 range is accepted.
+    fn value_i32(&mut self, node: &Node, v: &Value) -> Option<i32> {
+        let n = self.value_number(node, v, i32::MIN as f64, i32::MAX as f64)?;
+        if n.fract() != 0.0 {
+            self.error(
+                v.pos,
+                format!("'{}' expects an integer, found {}", node.name, n),
+            );
+            return None;
+        }
+        Some(n as i32)
+    }
+
     fn arg_i32(&mut self, node: &Node) -> Option<i32> {
-        let n = self.arg_number(node, -1_000_000.0, 1_000_000.0)?;
-        Some(n.round() as i32)
+        let v = self.one_arg(node)?;
+        self.value_i32(node, v)
     }
 
     fn arg_text(&mut self, node: &Node) -> Option<String> {
@@ -1175,7 +1202,14 @@ impl Decoder {
                         cfg.cursor.hide_after_inactive_ms = Some(ms);
                     }
                 }
-                "xcursor-theme" | "xcursor-size" => {
+                "xcursor-size" => {
+                    // Windows has no Xcursor, but niri still type-checks the value
+                    // (`xcursor_size: Option<u8>`, niri-config/src/misc.rs:36-40).
+                    if self.arg_u32(child, 255).is_some() {
+                        self.unsupported(child, "the cursor theme belongs to Windows");
+                    }
+                }
+                "xcursor-theme" => {
                     self.unsupported(child, "the cursor theme belongs to Windows");
                 }
                 _ => self.unknown(
@@ -1681,6 +1715,14 @@ impl Decoder {
             "accel-speed" if scope.is_pointer() => {
                 self.unsupported(child, "Windows has one pointer speed for all devices")
             }
+            "pinch-sensitivity" if scope == InputScope::Touchpad => {
+                // niri: `pinch_sensitivity: Option<FloatOrInt<0, 100>>`
+                // (niri-config/src/input.rs:228-230).  Windows has no pinch gesture on a
+                // precision touchpad, but the value is still niri's.
+                if self.arg_number(child, 0.0, 100.0).is_some() {
+                    self.unsupported(child, "Windows handles precision-touchpad pinch itself");
+                }
+            }
             // pointing-device options shared by mouse, touchpad, trackpoint and trackball
             "off"
             | "accel-profile"
@@ -2020,8 +2062,8 @@ impl Decoder {
                     let mut y = None;
                     for p in &child.props {
                         match p.key.as_str() {
-                            "x" => x = self.value_number(child, &p.value, -1e6, 1e6),
-                            "y" => y = self.value_number(child, &p.value, -1e6, 1e6),
+                            "x" => x = self.value_i32(child, &p.value),
+                            "y" => y = self.value_i32(child, &p.value),
                             other => {
                                 let msg = format!("unexpected property '{}' on 'position'", other);
                                 self.error(p.key_pos, msg);
@@ -2029,17 +2071,17 @@ impl Decoder {
                         }
                     }
                     if child.args.len() == 2 {
-                        x = self.value_number(child, &child.args[0], -1e6, 1e6);
-                        y = self.value_number(child, &child.args[1], -1e6, 1e6);
+                        x = self.value_i32(child, &child.args[0]);
+                        y = self.value_i32(child, &child.args[1]);
                     } else if !child.args.is_empty() {
                         self.error(child.args[0].pos, "'position' takes x and y");
                     }
                     if let Some(v) = x {
-                        out.position.x = v.round() as i32;
+                        out.position.x = v;
                         out.position_set = true;
                     }
                     if let Some(v) = y {
-                        out.position.y = v.round() as i32;
+                        out.position.y = v;
                         out.position_set = true;
                     }
                 }
@@ -2873,7 +2915,10 @@ impl Decoder {
                     }
                 }
                 "opacity" => {
-                    if let Some(v) = self.arg_number(child, 0.0, 1.0) {
+                    // niri: `opacity: Option<f32>` with no parse-time bound
+                    // (niri-config/src/window_rule.rs:61-62); the clamp to 0..=1 happens when
+                    // the rule is resolved (src/layout/rules.rs).
+                    if let Some(v) = self.arg_number(child, f32::MIN as f64, f32::MAX as f64) {
                         rule.opacity = Some(v);
                     }
                 }
@@ -2915,10 +2960,12 @@ impl Decoder {
                     self.set_flag(child, &mut rule.open_maximized_to_edges)
                 }
                 "open-focused" => self.set_flag(child, &mut rule.open_focused),
-                "min-width" => self.set_u32(child, 100_000, &mut rule.min_width),
-                "min-height" => self.set_u32(child, 100_000, &mut rule.min_height),
-                "max-width" => self.set_u32(child, 100_000, &mut rule.max_width),
-                "max-height" => self.set_u32(child, 100_000, &mut rule.max_height),
+                // niri: `min_width .. max_height: Option<u16>`
+                // (niri-config/src/window_rule.rs:43-49).
+                "min-width" => self.set_u32(child, 65535, &mut rule.min_width),
+                "min-height" => self.set_u32(child, 65535, &mut rule.min_height),
+                "max-width" => self.set_u32(child, 65535, &mut rule.max_width),
+                "max-height" => self.set_u32(child, 65535, &mut rule.max_height),
                 "default-column-width" => {
                     if let Some(v) = self.decode_size_block(child) {
                         rule.default_column_width = Some(v);
@@ -2990,13 +3037,18 @@ impl Decoder {
         for child in node.kids() {
             match norm(&child.name).as_str() {
                 "proportion" => {
-                    if let Some(v) = self.arg_number(child, 0.0, 100.0) {
+                    // niri: `Proportion(f64)` with no parse-time range
+                    // (niri-config/src/layout.rs:127-152).
+                    if let Some(v) = self.arg_number(child, f64::MIN, f64::MAX) {
                         sizes.push(SizeSpec::Proportion(v));
                     }
                 }
                 "fixed" => {
-                    if let Some(v) = self.arg_number(child, 1.0, 100_000.0) {
-                        sizes.push(SizeSpec::Fixed(v.round() as u32));
+                    // niri: `Fixed(i32)` (niri-config/src/layout.rs:127-152), so a decimal is
+                    // a type error.  Wiri stores a `u32`, so a negative fixed size is reported
+                    // rather than wrapped.
+                    if let Some(v) = self.arg_integer(child, 0.0, u32::MAX as f64) {
+                        sizes.push(SizeSpec::Fixed(v as u32));
                     }
                 }
                 _ => {
@@ -3028,12 +3080,12 @@ impl Decoder {
         let first = &kids[0];
         match norm(&first.name).as_str() {
             "proportion" => {
-                let v = self.arg_number(first, 0.0001, 10.0)?;
+                let v = self.arg_number(first, f64::MIN, f64::MAX)?;
                 Some(Some(SizeSpec::Proportion(v)))
             }
             "fixed" => {
-                let v = self.arg_u32(first, 100_000)?;
-                Some(Some(SizeSpec::Fixed(v)))
+                let v = self.arg_integer(first, 0.0, u32::MAX as f64)?;
+                Some(Some(SizeSpec::Fixed(v as u32)))
             }
             _ => {
                 self.unknown(first, node.name.as_str(), &["proportion", "fixed"]);
@@ -3399,7 +3451,9 @@ impl Decoder {
                     self.decode_bind_release(node, &p.value, &mut bind);
                 }
                 "cooldown-ms" => {
-                    if let Some(v) = self.value_number(node, &p.value, 0.0, 3_600_000.0) {
+                    // niri: `cooldown = Duration::from_millis(u64)`
+                    // (niri-config/src/binds.rs:848-852): any whole millisecond count.
+                    if let Some(v) = self.value_number(node, &p.value, 0.0, u32::MAX as f64) {
                         if v.fract() == 0.0 {
                             bind.cooldown_ms = Some(v as u32);
                         } else {
@@ -4327,8 +4381,13 @@ overview { backdrop-color \"#000000\" }",
 
     #[test]
     fn a_bad_preset_window_height_is_an_error_not_a_silent_drop() {
-        let d = load("layout { preset-window-heights { fixed 0 } }\n");
+        // niri keeps `proportion` unbounded and `fixed` an integer `i32`
+        // (niri-config/src/layout.rs:157-162): a decimal fixed size is a type error, not a
+        // value to round.
+        let d = load("layout { preset-window-heights { fixed 0.5 } }\n");
         assert_eq!(errors(&d).len(), 1);
+        let zero = load("layout { preset-window-heights { fixed 0 } }\n");
+        assert_eq!(errors(&zero).len(), 0, "niri accepts a zero fixed size");
     }
 
     #[test]
@@ -4873,8 +4932,13 @@ overview { backdrop-color \"#000000\" }",
             is_active_in_column: false,
         };
         assert!(r.matches(&ctx));
-        // An out-of-range value must not silently alter the requested rule.
-        let d = load("window-rule { class-name \"Bright\"\n opacity 2.5 }\n");
+        // niri parses `opacity` as an unbounded f32 (niri-config/src/window_rule.rs:69) and the
+        // clamp to 0..=1 happens when the rule is resolved (src/layout/rules.rs), so 2.5 is
+        // stored as it was written.
+        let clamped = clean("window-rule { class-name \"Bright\"\n opacity 2.5 }\n");
+        assert_eq!(clamped.window_rules[0].opacity, Some(2.5));
+        // A value that is not a number is still an error and must not alter the rule.
+        let d = load("window-rule { class-name \"Bright\"\n opacity \"x\" }\n");
         assert_eq!(errors(&d).len(), 1);
         assert_eq!(d.config.window_rules[0].opacity, None);
         assert!(warnings(&d).is_empty());

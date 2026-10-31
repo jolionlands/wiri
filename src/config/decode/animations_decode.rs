@@ -50,12 +50,16 @@ impl Decoder {
                     }
                 }
                 "slowdown" => {
-                    if let Some(v) = self.arg_number(child, 0.0, 1000.0) {
+                    // niri: `slowdown: Option<FloatOrInt<0, { i32::MAX }>>`
+                    // (niri-config/src/animations.rs:56-64).
+                    if let Some(v) = self.arg_number(child, 0.0, i32::MAX as f64) {
                         cfg.slowdown = v;
                     }
                 }
                 "duration" | "duration-ms" => {
-                    if let Some(v) = self.arg_u32(child, 60000) {
+                    // niri: `duration_ms: u32` with no upper bound
+                    // (niri-config/src/animations.rs:664-680).
+                    if let Some(v) = self.arg_u32(child, u32::MAX) {
                         cfg.duration = v;
                         cfg.legacy_easing = true;
                     }
@@ -238,10 +242,12 @@ impl Decoder {
                 );
                 valid = false;
             }
-            let range = match key.as_str() {
-                "damping-ratio" => (0.0, 100.0),
-                "stiffness" => (0.000001, 1_000_000_000.0),
-                "epsilon" => (0.000000000001, 1.0),
+            let (min, max) = match key.as_str() {
+                // niri: damping-ratio 0.1..=10.0, stiffness an integer >= 1, epsilon
+                // 0.00001..=0.1 (niri-config/src/animations.rs:886-900).
+                "damping-ratio" => (0.1, 10.0),
+                "stiffness" => (1.0, u32::MAX as f64),
+                "epsilon" => (0.00001, 0.1),
                 _ => {
                     self.error(
                         prop.key_pos,
@@ -251,14 +257,20 @@ impl Decoder {
                     continue;
                 }
             };
-            match self.value_number(node, &prop.value, range.0, range.1) {
-                Some(v) => match key.as_str() {
-                    "damping-ratio" => spring.damping_ratio = v,
-                    "stiffness" => spring.stiffness = v,
-                    "epsilon" => spring.epsilon = v,
-                    _ => unreachable!(),
-                },
-                None => valid = false,
+            let Some(value) = self.value_number(node, &prop.value, min, max) else {
+                valid = false;
+                continue;
+            };
+            if key == "stiffness" && value.fract() != 0.0 {
+                self.error(prop.key_pos, "'stiffness' expects an integer");
+                valid = false;
+                continue;
+            }
+            match key.as_str() {
+                "damping-ratio" => spring.damping_ratio = value,
+                "stiffness" => spring.stiffness = value,
+                "epsilon" => spring.epsilon = value,
+                _ => unreachable!(),
             }
         }
         valid.then_some(spring)
@@ -300,7 +312,8 @@ impl Decoder {
                     spring = self.animation_spring(child);
                 }
                 "duration" | "duration-ms" => {
-                    if let Some(v) = self.arg_u32(child, 60000) {
+                    // niri: `duration_ms: u32` (niri-config/src/animations.rs:649-663).
+                    if let Some(v) = self.arg_u32(child, u32::MAX) {
                         duration = v;
                     }
                     easing = true;
@@ -876,7 +889,10 @@ mod tests {
             for settings in [
                 "off \"typo\";",
                 "duration-ms -2;",
-                "duration-ms 60001;",
+                // niri's `duration_ms` is a `u32` with no smaller bound
+                // (niri-config/src/animations.rs:649-663); only values that do not fit are
+                // errors.
+                "duration-ms 4294967296;",
                 "curve \"typo\";",
                 "spring damping-ratio=-1;",
                 "spring stiffness=0;",

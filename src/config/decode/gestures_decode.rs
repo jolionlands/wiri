@@ -42,17 +42,22 @@ impl Decoder {
             for key in child.kids() {
                 match norm(&key.name).as_str() {
                     k if k == trigger => {
-                        if let Some(v) = self.arg_number(key, 0.0, 10000.0) {
+                        // niri: `trigger_width/height: Option<FloatOrInt<0, 65535>>`
+                        // (niri-config/src/gestures.rs:45-52, 79-86).
+                        if let Some(v) = self.arg_number(key, 0.0, 65535.0) {
                             target.trigger = v;
                         }
                     }
                     "delay-ms" => {
-                        if let Some(v) = self.arg_u32(key, 60000) {
+                        // niri: `delay_ms: Option<u16>` (niri-config/src/gestures.rs:47).
+                        if let Some(v) = self.arg_u32(key, 65535) {
                             target.delay_ms = v;
                         }
                     }
                     "max-speed" => {
-                        if let Some(v) = self.arg_number(key, 0.0, 100000.0) {
+                        // niri: `max_speed: Option<FloatOrInt<0, 1_000_000>>`
+                        // (niri-config/src/gestures.rs:49).
+                        if let Some(v) = self.arg_number(key, 0.0, 1_000_000.0) {
                             target.max_speed = v;
                         }
                     }

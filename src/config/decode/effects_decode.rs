@@ -144,10 +144,17 @@ impl Decoder {
                     Some(c) => to = Some(c),
                     None => ok = false,
                 },
-                "angle" => match self.value_number(node, &prop.value, -360_000.0, 360_000.0) {
-                    Some(a) => angle = a,
-                    None => ok = false,
-                },
+                "angle" => {
+                    // niri: `angle: i16`, default 180 (niri-config/src/appearance.rs:99-102).
+                    match self.value_number(node, &prop.value, i16::MIN as f64, i16::MAX as f64) {
+                        Some(a) if a.fract() == 0.0 => angle = a,
+                        Some(_) => {
+                            self.error(prop.value.pos, "'angle' expects an integer");
+                            ok = false;
+                        }
+                        None => ok = false,
+                    }
+                }
                 "relative-to" => match prop.value.as_str() {
                     Some("window") => relative_to_view = false,
                     Some("workspace-view") => relative_to_view = true,
@@ -236,7 +243,10 @@ impl Decoder {
                 }
             }
             "width" => {
-                if let Some(w) = self.arg_number(c, 0.0, 4096.0) {
+                // niri: `width: Option<FloatOrInt<0, 65535>>`
+                // (niri-config/src/appearance.rs:617-620).  Wiri paints whole pixels, so the
+                // value is stored rounded; the range is niri's.
+                if let Some(w) = self.arg_number(c, 0.0, 65535.0) {
                     style.width = w.round() as u32;
                 }
             }
@@ -314,15 +324,19 @@ impl Decoder {
                     }
                 }
                 "softness" | "blur" => {
-                    if let Some(v) = self.arg_number(c, 0.0, 4096.0) {
+                    // niri: `softness: Option<FloatOrInt<0, 1024>>`
+                    // (niri-config/src/appearance.rs:648-655).
+                    if let Some(v) = self.arg_number(c, 0.0, 1024.0) {
                         style.softness = v;
                         p.shadow_blur = Some(v.round() as u32);
                     }
                 }
                 "spread" => {
-                    if let Some(v) = self.arg_number(c, -4096.0, 4096.0) {
+                    // niri: `spread: Option<FloatOrInt<-1024, 1024>>`; a negative spread is
+                    // accepted and shrinks the shadow, so the old clamp to 0 was wrong.
+                    if let Some(v) = self.arg_number(c, -1024.0, 1024.0) {
                         style.spread = v;
-                        p.shadow_spread = Some(v.max(0.0).round() as u32);
+                        p.shadow_spread = (v >= 0.0).then(|| v.round() as u32);
                     }
                 }
                 "opacity" => {
