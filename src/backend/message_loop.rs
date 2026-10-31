@@ -754,7 +754,9 @@ impl MessageLoop {
                 if ret.0 == 0 || ret.0 == -1 {
                     break;
                 }
-                if msg.message == WM_STOP_MESSAGE_LOOP {
+                // A thread message has no window; the tray's callback message shares this id
+                // and must reach `DispatchMessageW` instead.
+                if msg.message == WM_STOP_MESSAGE_LOOP && msg.hwnd.0.is_null() {
                     break;
                 }
                 // The tray icon is hosted here too: one session UI thread instead of two pumps.
@@ -772,7 +774,7 @@ impl MessageLoop {
                 {
                     continue;
                 }
-                if msg.message == WM_RELOAD_HOTKEYS {
+                if msg.message == WM_RELOAD_HOTKEYS && msg.hwnd.0.is_null() {
                     crate::input::focus::reload();
                     crate::input::dnd::configure(engine.clone(), backend_handle.clone());
                     crate::input::touchpen::shutdown();
