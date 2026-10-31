@@ -314,7 +314,9 @@ A bind is the key combination (`Mod`, `Ctrl`, `Shift`, `Alt`, `Super`/`Win`, the
 xkb names such as `Bracket_Left`, `Page_Up`, `Return`, `Grave`, or letters, digits, `F1`...`F24`) and
 exactly one action in braces.  Properties: `repeat=false` (holding the key fires the action once),
 `cooldown-ms=` (ignore the bind for that long after it fired), `hotkey-overlay-title=`
-(accepted; `null` hides it), `allow-when-locked=` and `allow-inhibiting=` (accepted: Windows never
+(Pango markup, as in niri: `"<b>Browser</b>"`, `"R&amp;D"`, `<span foreground="#ff8800">`; an
+invalid title is shown as the whole original string and warned about once at load; `null` hides the
+row), `allow-when-locked=` and `allow-inhibiting=` (accepted: Windows never
 delivers hotkeys to a locked session, and wiri has no shortcut inhibition).  Action properties of
 niri (`focus=false`, `show-pointer=false`, `skip-confirmation=true`) are accepted.
 

@@ -175,7 +175,7 @@ found the implementation but the row's remaining delta should be re-read before 
 | C2 | What a reload re-applies (binds, outputs, rules, layout) | event-driven reload; `h12_*`, `h13_*` cover binds and rules | layout/output half of the reload scope is ungated |
 | C24 | niri action names accepted in binds | action vocabulary in `config/decode.rs` + `input/mod.rs` | no completeness gate — a new action can ship with no name test |
 | C27 | Curated Important Hotkeys list (~15 core actions) | `overlay/hotkey_rows.rs::curated_rows` with unit tests; `h75_*` covers startup/skip/hide-not-bound | curated content not asserted live |
-| C28 | `hotkey-overlay-title` per bind, markup, `null` hides | `hotkey_rows.rs`; null path gated by `h75_hotkey_overlay_hide_not_bound` | titles and markup not asserted |
+| C28 | `hotkey-overlay-title` per bind, markup, `null` hides | `hotkey_rows.rs`; null path gated by `h75_hotkey_overlay_hide_not_bound` | Lane PANGO parsed, measured and painted the markup (`pango_markup.rs`, `markup_text.rs`) with `h89_*` gates added but not yet run; row text/status pending the lead cycle |
 | C51 | `spawn` home expansion | executable-only `~` expansion plus `ShellExecuteExW` fallback | no gate (low value; the row may belong in class (c) instead) |
 
 ## 4. Class (b): needs real hardware — 29 rows

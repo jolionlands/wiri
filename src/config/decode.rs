@@ -3474,6 +3474,24 @@ impl Decoder {
                 "hotkey-overlay-title" => match &p.value.scalar {
                     Scalar::Null => bind.hotkey_overlay_title = Some(None),
                     Scalar::Str { text, .. } => {
+                        // niri paints the title with Pango's set_markup (wiki
+                        // Configuration:-Key-Bindings, "Custom Hotkey Overlay Titles"), so
+                        // an invalid title is not partially styled: it is shown as the
+                        // whole original string.  Say so once, here at load, instead of on
+                        // every paint; the title itself is kept verbatim so the overlay can
+                        // fall back and a later reload can succeed.
+                        if let Err(error) = crate::overlay::pango_markup::parse(
+                            text,
+                            &crate::overlay::pango_markup::Style::overlay_body(),
+                        ) {
+                            self.warn(
+                                p.value.pos,
+                                format!(
+                                    "hotkey-overlay-title \"{}\" is not valid Pango markup ({}) so it is shown literally; escape '&' as '&amp;' and '<' as '&lt;'",
+                                    text, error
+                                ),
+                            );
+                        }
                         bind.hotkey_overlay_title = Some(Some(text.clone()))
                     }
                     _ => {
@@ -4701,6 +4719,35 @@ overview { backdrop-color \"#000000\" }",
                 bind.chord_text()
             );
         }
+    }
+
+    // Pinned niri applies a title with Pango set_markup (wiki
+    // Configuration:-Key-Bindings, "Custom Hotkey Overlay Titles";
+    // niri-config/src/binds.rs:873-875 keeps the string verbatim).  A bad title is a
+    // *warning* at load and stays in the config as written, because the overlay paints the
+    // whole original string when the markup is invalid.
+    #[test]
+    fn invalid_hotkey_overlay_markup_warns_once_and_keeps_the_title() {
+        let d = load(
+            "binds {\n    Mod+F9 hotkey-overlay-title=\"<b>R&D</b>\" { spawn \"notepad.exe\"; }\n}\n",
+        );
+        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+        assert_eq!(warnings(&d).len(), 1, "{:?}", warnings(&d));
+        assert!(
+            warnings(&d)[0].contains("is not valid Pango markup"),
+            "{:?}",
+            warnings(&d)
+        );
+        assert!(warnings(&d)[0].contains("R&D"), "{:?}", warnings(&d));
+        assert_eq!(
+            d.config.binds.hotkeys[0].hotkey_overlay_title,
+            Some(Some("<b>R&D</b>".to_string()))
+        );
+        // Valid markup, entities and a plain title say nothing.
+        let d = load(
+            "binds {\n    Mod+F8 hotkey-overlay-title=\"<b>R&amp;D</b>\" { spawn \"notepad.exe\"; }\n    Mod+F7 hotkey-overlay-title=\"Plain\" { spawn \"notepad.exe\"; }\n}\n",
+        );
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
     }
 
     #[test]
