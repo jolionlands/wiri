@@ -13,10 +13,6 @@ pub(super) struct TiledHeightSnapshot {
 }
 
 impl TilingEngine {
-    pub(super) fn column_presets(&self, output: OutputId) -> Vec<SizeSpec> {
-        Self::column_presets_from_config(self.active_workspace_config(output))
-    }
-
     pub(super) fn column_presets_for_workspace(
         &self,
         output: OutputId,
@@ -256,7 +252,14 @@ impl TilingEngine {
             return;
         };
         let workspace = monitor.active_workspace;
-        self.switch_tiled_window_height_at(output, workspace, column_index, window, forwards, backend);
+        self.switch_tiled_window_height_at(
+            output,
+            workspace,
+            column_index,
+            window,
+            forwards,
+            backend,
+        );
     }
 
     /// niri `switch-preset-window-height[-back]` for a named tile (`SwitchPresetWindowHeightById`,
@@ -276,7 +279,14 @@ impl TilingEngine {
         let Some((output, workspace, column_index)) = self.locate_window(window) else {
             return;
         };
-        self.switch_tiled_window_height_at(output, workspace, column_index, window, forwards, backend);
+        self.switch_tiled_window_height_at(
+            output,
+            workspace,
+            column_index,
+            window,
+            forwards,
+            backend,
+        );
     }
 
     fn switch_tiled_window_height_at(

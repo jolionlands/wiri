@@ -162,7 +162,10 @@ fn consume_or_expel_window_left_by_id_moves_the_named_tile_and_nothing_else() {
     let outcome = run(&fx, "consume-or-expel-window-left", R);
     assert_focus_neutral(&fx, &outcome);
     // R was alone in column 2: it now shares Q's column (column 1).
-    assert_eq!(column_of(&fx, R).map(|c| c.2), column_of(&fx, Q).map(|c| c.2));
+    assert_eq!(
+        column_of(&fx, R).map(|c| c.2),
+        column_of(&fx, Q).map(|c| c.2)
+    );
     assert_eq!(column_of(&fx, R).map(|c| c.2), Some(1));
 }
 
@@ -172,7 +175,10 @@ fn consume_or_expel_window_right_by_id_acts_on_another_output() {
     // U is alone in column 0 of monitor B's active workspace: it joins V on its right.
     let outcome = run(&fx, "consume-or-expel-window-right", U);
     assert_focus_neutral(&fx, &outcome);
-    assert_eq!(column_of(&fx, U).map(|c| c.2), column_of(&fx, V).map(|c| c.2));
+    assert_eq!(
+        column_of(&fx, U).map(|c| c.2),
+        column_of(&fx, V).map(|c| c.2)
+    );
     assert_eq!(column_of(&fx, U).map(|c| c.0), Some(fx.b));
     // A floating window has no column to leave: nothing happens, focus stays.
     let engine_floating = {
@@ -222,7 +228,11 @@ fn center_window_by_id_centres_only_the_active_column_of_its_workspace() {
     set(&fx, fx.b, 5, 12345);
     let outcome = run(&fx, "center-window", W);
     assert_focus_neutral(&fx, &outcome);
-    assert_eq!(scroll(&fx, fx.b, 5), 12345, "a column that is not active stays");
+    assert_eq!(
+        scroll(&fx, fx.b, 5),
+        12345,
+        "a column that is not active stays"
+    );
     let outcome = run(&fx, "center-window", W2);
     assert_focus_neutral(&fx, &outcome);
     assert_ne!(scroll(&fx, fx.b, 5), 12345, "the active column is centred");
