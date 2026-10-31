@@ -2723,6 +2723,47 @@ fn configured_names_are_not_rebound_after_runtime_rename_unset_and_reload() {
     }
 }
 
+/// niri's `reload_config` unnames a workspace whose configured name disappeared from the
+/// config (niri e19df12 src/niri.rs:1701-1710) and leaves the other declarations alone.
+#[test]
+fn reload_unnames_a_removed_configuration_and_keeps_the_others() {
+    let mut engine = TilingEngine::new(LayoutConfig::default());
+    let output = OutputId::from_name("display-names-reload");
+    engine.register_monitor(
+        output,
+        Rect::new(0, 0, 1200, 800),
+        Rect::new(0, 0, 1200, 800),
+    );
+    let declaration = |name: &str| crate::config::WorkspaceConfig {
+        name: name.to_string(),
+        ..crate::config::WorkspaceConfig::default_config()
+    };
+    let named = |engine: &TilingEngine, name: &str| {
+        engine
+            .monitors
+            .get(&output)
+            .unwrap()
+            .workspaces
+            .values()
+            .any(|workspace| workspace.name.as_deref() == Some(name))
+    };
+    let mut config = crate::config::Config::default();
+    config.workspace = vec![declaration("gone"), declaration("kept")];
+    engine.set_full_config(config.clone());
+    assert!(named(&engine, "gone") && named(&engine, "kept"));
+
+    config.workspace = vec![declaration("kept")];
+    engine.set_full_config(config);
+    assert!(
+        !named(&engine, "gone"),
+        "a configured name that left the config is dropped on reload"
+    );
+    assert!(
+        named(&engine, "kept"),
+        "an unchanged declaration keeps its workspace"
+    );
+}
+
 #[test]
 fn configured_name_waits_until_the_connector_name_is_registered() {
     let mut engine = TilingEngine::new(LayoutConfig::default());

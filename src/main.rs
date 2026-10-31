@@ -1259,40 +1259,79 @@ fn apply_loaded_config(
     mouse_tracker: &Arc<RwLock<MouseTracker>>,
     keyboard_session: &Mutex<KeyboardConfigSession>,
 ) {
-    configure_session(&new_config, keyboard_session);
-    wiri::screenshot::configure(&new_config);
+    use wiri::config::reload::{plan as plan_reload, ReloadStep};
+    // niri's `reload_config` re-applies only what changed, in a fixed order
+    // (niri e19df12 src/niri.rs:1683-1967).  The plan compares the config the engine holds
+    // with the one just decoded; an unchanged section is not applied again, so a bind-only
+    // reload does not rewrite pointer settings or re-place every window.
+    let old_config = engine.read().full_config().cloned();
+    let plan = plan_reload(old_config.as_ref(), &new_config);
+    if plan.contains(ReloadStep::Environment) {
+        if let Err(error) = wiri::hooks::environment::configure(&new_config.environment) {
+            warn!(%error, "Child environment unchanged");
+        }
+    }
+    if plan.contains(ReloadStep::SwitchEvents) {
+        if let Err(error) =
+            wiri::hooks::switch_events::configure(new_config.switch_events.subscriptions())
+        {
+            warn!(%error, "Switch-event subscriptions could not be updated");
+        }
+    }
+    if plan.contains(ReloadStep::Screenshot) {
+        wiri::screenshot::configure(&new_config);
+    }
     // Lane D: reload physical differences outside the engine lock, then refresh geometry/DPI.
-    wiri::backend::outputs::apply(&new_config);
-    wiri::backend::output_runtime::refresh(handle);
-    let new_layout_config = LayoutConfig::from_config(&new_config);
-    let mouse_config = MouseFocusConfig {
-        focus_follows_mouse: new_config.input.focus_follows_mouse,
-        warp_on_focus: new_config.input.warp_on_focus,
-        focus_delay_ms: new_config.input.focus_delay_ms,
-        raise_on_click: true,
-    };
-
-    apply_mouse_config(&new_config.input);
-    // Lane P: pointing-device options follow a reload; the ones the new config no longer names
-    // go back to what the OS had before wiri changed them.
-    wiri::input::pointer_settings::apply_config(&new_config.input, &new_config.cursor);
-    // Lane LAST: a reload that drops `hide-after-inactive-ms` shows the pointer again (and the
-    // one timer goes away); one that adds it waits for the next pointer movement.
-    wiri::input::cursor_hide::configure(&new_config.cursor);
-    mouse_tracker.write().set_config(mouse_config);
+    if plan.contains(ReloadStep::Outputs) {
+        wiri::backend::outputs::apply(&new_config);
+        wiri::backend::output_runtime::refresh(handle);
+    }
+    if plan.contains(ReloadStep::Input) {
+        // niri: keyboard repeat and xkb first (`src/niri.rs:1750-1764`, 1888-1891), then the
+        // libinput settings on the current devices (`1893-1902`); the cursor theme and the
+        // cursor timeout follow the same section.
+        keyboard_session.lock().apply(&new_config.input);
+        let mouse_config = MouseFocusConfig {
+            focus_follows_mouse: new_config.input.focus_follows_mouse,
+            warp_on_focus: new_config.input.warp_on_focus,
+            focus_delay_ms: new_config.input.focus_delay_ms,
+            raise_on_click: true,
+        };
+        apply_mouse_config(&new_config.input);
+        // Lane P: pointing-device options follow a reload; the ones the new config no longer
+        // names go back to what the OS had before wiri changed them.
+        wiri::input::pointer_settings::apply_config(&new_config.input, &new_config.cursor);
+        // Lane LAST: a reload that drops `hide-after-inactive-ms` shows the pointer again (and
+        // the one timer goes away); one that adds it waits for the next pointer movement.
+        wiri::input::cursor_hide::configure(&new_config.cursor);
+        mouse_tracker.write().set_config(mouse_config);
+    }
+    let layout_changed = plan.contains(ReloadStep::Layout);
+    let new_layout_config = layout_changed.then(|| LayoutConfig::from_config(&new_config));
     let hide_method = hide_method_of(&new_config);
     wiri::backend::cloak::set_hide_method(hide_method);
     {
         let mut engine = engine.write();
-        engine.update_config(new_layout_config);
-        wiri::backend::output_runtime::sync(&new_config, handle, &mut engine);
+        if let Some(new_layout_config) = new_layout_config {
+            engine.update_config(new_layout_config);
+        }
+        if layout_changed || plan.contains(ReloadStep::Outputs) {
+            wiri::backend::output_runtime::sync(&new_config, handle, &mut engine);
+        }
+        // Publishing the config is not optional: the engine reads `binds`, the effects, the
+        // recent-window options and the workspace declarations from it, and `reload_hotkeys`
+        // runs after this block.
         engine.set_full_config(new_config);
         engine.set_hide_method(hide_method);
         // The rules were replaced: the windows that are open follow them (their opacity, their
         // size limits; the `open-*` properties are for windows that open).
-        engine.apply_reloaded_layout(handle);
+        if layout_changed || plan.reevaluates_rules() {
+            engine.apply_reloaded_layout(handle);
+        }
     }
-    message_loop.reload_hotkeys();
+    if plan.contains(ReloadStep::Binds) {
+        message_loop.reload_hotkeys();
+    }
 }
 
 /// `layout { hide-method }`: `hide` (the default) or `cloak`.  A value that is neither is

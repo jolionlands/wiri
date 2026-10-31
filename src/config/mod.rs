@@ -9,6 +9,7 @@ pub mod loader;
 pub mod overview_config;
 pub mod parse;
 pub mod recent_windows_config;
+pub mod reload;
 pub mod search;
 pub mod types;
 mod validation;
