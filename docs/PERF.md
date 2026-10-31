@@ -88,8 +88,55 @@ limits, and separately observe focus/cursor completion and animation cadence.
 The older poller inventory below is historical: the current main loop, reconciliation
 and animation wakeups are demand-driven, and the runtime already bounds its workers.
 Remaining source-backed candidates include the synchronous 40 ms activation fallback
-under the engine lock and active animation pacing at 16 ms plus processing time.
-Measure those paths before changing them; retain final-geometry delivery guarantees.
+under the engine lock; measure that path before changing it and retain final-geometry
+delivery guarantees. Active animation pacing is no longer a candidate: the fixed 16 ms
+sleep is gone (Lane PACE, 2026-10-30, measured below), replaced by the desktop's
+presentation clock.
+
+## Animation clock measurement, 2026-10-30 (Lane PACE)
+
+The animation frame worker used to `sleep(16 ms)` between ticks inside its Tokio task. While
+timelines run it now waits for the desktop's presentation clock — `DCompositionWaitForCompositorClock`
+(`dcomp.dll`, resolved with `GetProcAddress` on the first animation so wiri also starts without
+it) on a blocking-pool task, then `DwmFlush`, then a sleep of one interval derived from the
+output refresh rate (`DwmGetCompositionTimingInfo().rateRefresh`, else
+`EnumDisplaySettingsW().dmDisplayFrequency`, else 60 Hz). Frame timestamps are `Instant`s
+(QueryPerformanceCounter, the compositor clock's domain), so a spring or easing advances by the
+measured presentation interval. The wait is armed by the first animation request and disarmed
+when the last timeline finishes (`src/animation/`); nothing at all is armed at rest.
+
+Method: one `#[ignore]` measurement test, one run, no other workload of ours, on TRIDARIS
+(Windows 11 22631, one 1366x768 display at 96 DPI) built from `2bce5dd9` plus this lane:
+
+```powershell
+cargo test --release -j 2 --lib -- --ignored --nocapture compositor_frame_cadence_measurement
+```
+
+It waits for 120 frames through the same async path the daemon uses, and measures each interval
+from the end of one wait to the end of the next. CPU is this process's kernel+user time
+(`GetProcessTimes`), so it includes the test's own work, not only the waits.
+
+| Observation, 121 waits / 120 measured intervals | Result |
+| --- | ---: |
+| Chosen backend / refresh source | `DCompositionWaitForCompositorClock` / `dwm-timing` |
+| Interval used | 16.665 ms |
+| Mean / median interval | 16.664 / 16.663 ms |
+| p95 / max interval | 16.703 / 16.735 ms |
+| Wall time | 2 018 ms |
+| Process CPU / per interval | 15.6 ms / 0.130 ms |
+
+This is one short sample, not a stress or soak test, and other lanes were compiling on the same
+laptop during it. It proves the compositor clock is reachable here, that the chosen backend paces
+at the reported refresh (median 2 µs below the interval, p95 38 µs above it) and what one frame
+costs this process. It does not prove displayed-frame cadence, a vsync-locked flip (DWM still
+composites), idle CPU under the official collector, or any other refresh rate, output count or
+RDP session. While nothing animates the frame worker parks on its notifier: no timer, no blocking
+wait and no thread of its own. During a burst one of the runtime's four blocking threads is
+occupied by the compositor wait, so the bound in `src/runtime.rs` is unchanged and still
+applies. Both facts, and the remaining cadence/CPU budget claims, are for the lead's live cycle
+to measure: the `h90_*` gates in `scripts/live-phases/lane-pace.ps1` read the one
+`animation clock: backend=... frames=... mean_us=... max_us=...` line a burst logs at debug
+level (`-v`) and the process CPU time of a settled daemon.
 
 ## Reproduce
 

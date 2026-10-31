@@ -784,13 +784,18 @@ async fn run() -> Result<()> {
 
     print_help();
 
-    // Animations have their own frame worker; idle animations need no polling.
+    // Animations have their own frame worker; idle animations need no polling. While
+    // timelines run it waits for the presentation clock instead of a fixed 16 ms timer:
+    // DCompositionWaitForCompositorClock, then DwmFlush, then a sleep derived from the
+    // output refresh rate (see `wiri::animation`). A frame's delta is the measured
+    // presentation interval, so springs and easings advance by presented frames, and the
+    // wait is disarmed the moment the last timeline finishes.
     let animation_worker = {
         let weak_engine = Arc::downgrade(&engine);
         let wake = Arc::clone(&animation_wake);
         let animation_handle = handle.clone();
         tokio::spawn(async move {
-            let mut last_tick = std::time::Instant::now();
+            let mut clock = wiri::animation::FrameClock::new();
             loop {
                 // Register before probing so an animation starting during the
                 // transition to idle cannot leave the worker asleep.
@@ -805,24 +810,19 @@ async fn run() -> Result<()> {
                     active
                 };
                 if !active {
+                    // Nothing is armed from here on: no timer, no blocking wait, no thread.
+                    clock.disarm();
                     notified.await;
-                    last_tick = std::time::Instant::now();
                     continue;
                 }
 
-                tokio::time::sleep(Duration::from_millis(16)).await;
-                let now = std::time::Instant::now();
-                let delta_ms = now
-                    .duration_since(last_tick)
-                    .as_millis()
-                    .min(u32::MAX as u128) as u32;
-                last_tick = now;
+                let frame = clock.next_frame().await;
                 let Some(engine) = weak_engine.upgrade() else {
                     break;
                 };
                 let _ = engine
                     .write()
-                    .tick_animations_with_backend(delta_ms, &animation_handle);
+                    .tick_animations_with_backend(frame.delta_ms, &animation_handle);
             }
         })
     };

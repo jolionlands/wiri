@@ -3337,6 +3337,10 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1') } catch { LanePhas
 # test starts one private daemon whose own explicit hide/restore is the only cursor change,
 # and its `finally` reloads the user's cursor scheme unconditionally.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1') } catch { LanePhaseError 'lane_last' $_ }
+# Lane PACE: the animation frame clock waits for the desktop's presentation clock while
+# timelines run and arms nothing at rest.  h90_* read the burst line the daemon logs (it
+# always runs with -v) and the CPU time of a settled daemon; no display setting is touched.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-pace.ps1') } catch { LanePhaseError 'lane_pace' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
