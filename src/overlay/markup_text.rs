@@ -159,9 +159,26 @@ fn points_to_px(units: i32, scale: f64) -> f64 {
     (units as f64 / PANGO_SCALE as f64) * (96.0 / 72.0) * scale
 }
 
-unsafe fn create_face(dc: HDC, key: &FontKey, scale: f64) -> Face {
-    let height = (-points_to_px(key.size, scale).round() as i32).min(-1);
-    let family = key.face.as_deref().unwrap_or(DEFAULT_FACE);
+/// The largest character height GDI is asked for, in pixels: past this there is no font to
+/// make.  The markup's size is clamped while it is parsed; this is the last line of defence.
+const MAX_FONT_HEIGHT: i32 = 16_384;
+
+/// The character height GDI wants: negative (a character height, not a cell height), never
+/// zero, and never so large that no font can be made — an extreme markup size would otherwise
+/// ask for `-2147483647` and get no handle at all.
+fn gdi_height(size: i32, scale: f64) -> i32 {
+    let pixels = points_to_px(size, scale).round();
+    // An f64-to-i32 cast saturates, so a huge size lands on the clamp instead of wrapping.
+    let height = if pixels.is_finite() {
+        (pixels as i32).saturating_neg()
+    } else {
+        -1
+    };
+    height.clamp(-MAX_FONT_HEIGHT, -1)
+}
+
+/// The `LOGFONTW` of `family` at `height` with the weight and slant of the run.
+fn logfont_for(family: &str, height: i32, key: &FontKey) -> LOGFONTW {
     let mono = family.eq_ignore_ascii_case("Consolas");
     let mut logfont = LOGFONTW {
         lfHeight: height,
@@ -190,11 +207,24 @@ unsafe fn create_face(dc: HDC, key: &FontKey, scale: f64) -> Face {
     {
         *slot = unit;
     }
-    let font = CreateFontIndirectW(&logfont);
+    logfont
+}
+
+unsafe fn create_face(dc: HDC, key: &FontKey, scale: f64) -> Face {
+    let height = gdi_height(key.size, scale);
+    let family = key.face.as_deref().unwrap_or(DEFAULT_FACE);
+    let mut font = CreateFontIndirectW(&logfont_for(family, height, key));
+    if font.is_invalid() {
+        // GDI would not make this font (an extreme size, a face it cannot find). A null
+        // handle must never be selected into the DC: the sheet's default face stands in.
+        font = CreateFontIndirectW(&logfont_for(DEFAULT_FACE, height, key));
+    }
     let old = SelectObject(dc, HGDIOBJ(font.0));
     let mut metrics = TEXTMETRICW::default();
     let ok = GetTextMetricsW(dc, &mut metrics).as_bool();
     SelectObject(dc, old);
+    // A font GDI refused twice (not even the default face) leaves the DC's own font
+    // selected: its metrics are still closer to the truth than a guess.
     Face {
         font: font.0 as isize,
         ascent: if ok { metrics.tmAscent } else { 10 },
@@ -486,5 +516,55 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
         drop(cache);
+    }
+
+    /// GDI never gets a font height it cannot make: an extreme markup size would otherwise
+    /// ask for `-2147483647` and get no handle, which then would be selected into the DC.
+    #[test]
+    fn an_extreme_size_cannot_ask_gdi_for_an_impossible_font() {
+        // The sheet's own sizes keep their pixels: 9.75 pt is 13 px at 96 dpi, 20 at 150%.
+        assert_eq!(gdi_height(Style::overlay_body().size, 1.0), -13);
+        assert_eq!(gdi_height(heading_style().size, 1.0), -19);
+        assert_eq!(gdi_height(Style::overlay_body().size, 1.5), -20);
+        assert_eq!(gdi_height(0, 1.0), -1);
+        for (size, scale) in [
+            (i32::MAX, 1.0),
+            (i32::MAX, 4.0),
+            (i32::MIN, 1.0),
+            (-1_000_000, 2.0),
+            (0, 0.0),
+        ] {
+            let height = gdi_height(size, scale);
+            assert!(
+                height < 0 && height >= -MAX_FONT_HEIGHT,
+                "size {size} at scale {scale}: {height}"
+            );
+        }
+        assert_eq!(gdi_height(i32::MAX, 4.0), -MAX_FONT_HEIGHT);
+        // The stand-in names the sheet's default face, so a refused request is never
+        // retried with the face GDI just refused.
+        let key = FontKey {
+            face: Some("No Such Face".into()),
+            size: Style::overlay_body().size,
+            weight: 400,
+            italic: false,
+        };
+        assert_eq!(face_name(&logfont_for(DEFAULT_FACE, -13, &key)), DEFAULT_FACE);
+        assert_eq!(face_name(&logfont_for("Consolas", -13, &key)), "Consolas");
+        // GDI's face name is 32 units, the last of them the terminator.
+        let long = "A".repeat(40);
+        let truncated = face_name(&logfont_for(&long, -13, &key));
+        assert_eq!(truncated.len(), 31, "{truncated}");
+        assert!(logfont_for(&long, -13, &key).lfFaceName[31] == 0);
+    }
+
+    /// The face name GDI reads out of a `LOGFONTW`.
+    fn face_name(logfont: &LOGFONTW) -> String {
+        let len = logfont
+            .lfFaceName
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(logfont.lfFaceName.len());
+        String::from_utf16_lossy(&logfont.lfFaceName[..len])
     }
 }
