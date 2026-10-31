@@ -231,10 +231,18 @@ impl FrameClock {
             }
             Backend::CompositorClock => {
                 let timeout_ms = millis(timeout);
-                match tokio::task::spawn_blocking(move || compositor_clock_wait(timeout_ms)).await {
-                    Ok(outcome) => outcome,
-                    // The blocking task panicked or was cancelled by shutdown.
-                    Err(_) => Wait::Failed,
+                let task =
+                    tokio::task::spawn_blocking(move || compositor_clock_wait(timeout_ms));
+                // The wait itself gives up after `timeout`, but a thread has to be free
+                // first: the blocking pool is capped at four threads (src/runtime.rs) and
+                // IPC work runs on it too, so a busy pool would otherwise hold
+                // `next_frame()` and make the animation jump. Allow one `timeout` of queue
+                // and then fall back exactly like the DwmFlush arm.
+                match tokio::time::timeout(timeout.saturating_mul(2), task).await {
+                    Ok(Ok(outcome)) => outcome,
+                    // The blocking task panicked or was cancelled by shutdown, or the pool
+                    // stayed busy long enough that this frame is late anyway.
+                    Ok(Err(_)) | Err(_) => Wait::Failed,
                 }
             }
             Backend::DwmFlush => {
@@ -285,6 +293,38 @@ mod tests {
         // 16.667 ms, not the old hard-coded 16 ms.
         assert_eq!(clock.interval(), Duration::from_micros(16_667));
         assert!(clock.interval() > Duration::from_millis(16));
+    }
+
+    /// The blocking pool is capped and shared with IPC work (src/runtime.rs), so the
+    /// compositor-clock join is bounded like the DwmFlush one: a busy pool makes this frame
+    /// late, it does not park `next_frame()` until a thread frees.
+    #[test]
+    fn a_busy_blocking_pool_cannot_stall_the_compositor_clock_wait() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime with timers");
+        // Hold the pool's only thread; the bound keeps a failing run from hanging.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let _held = runtime.spawn_blocking(move || {
+            let _ = held.recv_timeout(Duration::from_millis(600));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let outcome = runtime.block_on(FrameClock::wait(
+            Backend::CompositorClock,
+            Duration::from_millis(50),
+        ));
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+
+        assert_eq!(outcome, Wait::Failed, "the wait gave up, as DwmFlush does");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "the frame clock waited {elapsed:?} for a free blocking thread"
+        );
     }
 
     /// One short measurement, not a stress test: 120 presented frames through the backend
