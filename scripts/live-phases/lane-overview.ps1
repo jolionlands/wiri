@@ -205,24 +205,24 @@ try {
         $hostHwnd = H97Host
         $ws = H97Active $hostHwnd
         $wsX = $ws.x
-        $steps = @()
+        $h97Samples = @()
         for ($i = 0; $i -lt 7; $i++) {
             $null = Ctl "h97-right-$i" @('action', 'focus-column-right')
             # The strip camera animates (`animations.view`); let it finish.
             Start-Sleep -Milliseconds 700
             $hostHwnd = H97Host
-            $steps += [pscustomobject]@{ x = H97Prop $hostHwnd 'FocusX'; w = H97Prop $hostHwnd 'FocusW'; ws = (H97Active $hostHwnd).x }
+            $h97Samples += [pscustomobject]@{ x = H97Prop $hostHwnd 'FocusX'; w = H97Prop $hostHwnd 'FocusW'; ws = (H97Active $hostHwnd).x }
         }
-        $h97Checks.panX = @($steps | ForEach-Object { $_.x })
+        $h97Checks.panX = @($h97Samples | ForEach-Object { $_.x })
         # The camera moves inside a fixed workspace frame: the workspace rectangle never
         # changes, the focused tile keeps the zoomed width, and its place inside the
         # workspace changes on most steps (the strip is panned, not fitted).
-        $moved = 0; $previous = $steps[0].x
-        for ($i = 1; $i -lt $steps.Count; $i++) { if ($steps[$i].x -ne $previous) { $moved++ }; $previous = $steps[$i].x }
+        $moved = 0; $previous = $h97Samples[0].x
+        for ($i = 1; $i -lt $h97Samples.Count; $i++) { if ($h97Samples[$i].x -ne $previous) { $moved++ }; $previous = $h97Samples[$i].x }
         $summary.h97_focus_column_right_pans_camera = (
             ($hostHwnd -ne [IntPtr]::Zero) -and
-            (@($steps | Where-Object { $_.ws -ne $wsX }).Count -eq 0) -and
-            (@($steps | Where-Object { [math]::Abs($_.w - [math]::Round($h97Tile * 0.5)) -gt 1 }).Count -eq 0) -and
+            (@($h97Samples | Where-Object { $_.ws -ne $wsX }).Count -eq 0) -and
+            (@($h97Samples | Where-Object { [math]::Abs($_.w - [math]::Round($h97Tile * 0.5)) -gt 1 }).Count -eq 0) -and
             ($moved -ge 2))
         # Vertical: a workspace change moves the whole stack up by exactly one stride and
         # the camera follows the new focused workspace (niri's `workspace_render_idx`).

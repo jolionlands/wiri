@@ -95,6 +95,10 @@ New-Item -ItemType Directory -Force $testRoaming, $testLocal | Out-Null
 $wiri = Join-Path $Bin 'wiri.exe'
 $ctl = Join-Path $Bin 'wiri-ctl.exe'
 $steps = New-Object System.Collections.Generic.List[object]
+# Lane files are dot-sourced into this scope: a lane that reused the name `$steps` for its own samples
+# replaced this list with a fixed-size array, and every later Ctl call threw. Read-only keeps .Add()
+# working but turns such a reassignment into an error inside that lane's own try/catch.
+Set-Variable -Name steps -Option ReadOnly
 $log1 = Join-Path $D 'wiri.stderr.log'
 $log2 = Join-Path $D 'wiri.stderr2.log'
 
