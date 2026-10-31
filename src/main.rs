@@ -1616,6 +1616,12 @@ fn handle_backend_event(
         }
         BackendEvent::WindowResized { hwnd, rect } => {
             refresh_native_bounds_for_window(hwnd, handle, engine);
+            // A window that changed its own size keeps it and the layout follows: niri reads
+            // the committed size as the truth for the column and only asks again for the
+            // width it wants (`src/layout/scrolling.rs:1278-1305`).
+            engine
+                .write()
+                .note_window_self_resized(WindowId::new(hwnd), handle);
             ipc_server.broadcast_event(IpcEvent::WindowResized {
                 window_hwnd: hwnd,
                 width: rect.size.w,

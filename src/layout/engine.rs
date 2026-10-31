@@ -48,6 +48,8 @@ mod monitor_actions_tests;
 #[cfg(test)]
 mod recent_admission_focus_parity_tests;
 #[cfg(test)]
+mod self_resize_parity_tests;
+#[cfg(test)]
 mod tiled_height_parity_tests;
 mod workspace_actions;
 #[cfg(test)]
@@ -71,6 +73,7 @@ mod presets;
 mod recent;
 mod rule_effects;
 mod rule_policy;
+mod self_resize;
 mod strip_model;
 mod tabs;
 mod transitions;
@@ -918,6 +921,11 @@ pub struct TilingEngine {
     /// the loop looking every 33 ms.
     last_noted_workspace: Option<i32>,
     frame_in_progress: bool,
+    /// True while `apply_layout_for_monitor` is committing a SetWindowPos batch.  A size
+    /// change reported meanwhile is wiri's own, not the window's: the self-resize
+    /// reconciliation must not adopt it (niri only reads the size a *client* committed,
+    /// `scrolling.rs:1287-1300`).
+    applying_batch: bool,
     transitions: transitions::Transitions,
     gesture_output: Option<OutputId>,
     gesture_workspace_offset: Option<(OutputId, f64)>,
@@ -1014,6 +1022,7 @@ impl TilingEngine {
             animation_wake: None,
             last_noted_workspace: None,
             frame_in_progress: false,
+            applying_batch: false,
             transitions: Default::default(),
             gesture_output: None,
             gesture_workspace_offset: None,
@@ -3185,6 +3194,11 @@ impl TilingEngine {
             windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
             WindowId,
         )> = Vec::new();
+        // The width this pass asks each window for, in pixels of the whole tile.  niri asks
+        // again for the column's width *intent* on every layout pass
+        // (`scrolling.rs:1293-1300`, `column.update_tile_sizes`); once that request is
+        // narrower than the size a window chose for itself, the request governs again.
+        let mut requested_tile_widths: HashMap<WindowId, i32> = HashMap::new();
 
         for (window_id, rect) in positions {
             if self.native_move_resize_active(window_id) {
@@ -3288,6 +3302,7 @@ impl TilingEngine {
                 !overview_active && draw_mode == DrawMode::Inset,
             );
             let inset_rect = geometry.window;
+            requested_tile_widths.insert(window_id, inset_rect.size.w as i32 + 2 * inset);
 
             // The corner radius the config asks for, as the preference DWM understands (windows
             // keep what they have when it asks for none, and on Windows 10 there is nothing to ask).
@@ -3514,7 +3529,9 @@ impl TilingEngine {
                 .iter()
                 .map(|(hwnd, rect, flags, _)| (*hwnd, *rect, *flags))
                 .collect();
+            self.applying_batch = true;
             let positioned = backend.set_window_positions_batched_with_results(&batch_slice);
+            self.applying_batch = false;
             #[cfg(test)]
             {
                 self.win32_call_count += 1;
@@ -3571,6 +3588,16 @@ impl TilingEngine {
                             if let Some(&rect) = position_map.get(&tile.window_id) {
                                 tile.cached_bounds = rect;
                             }
+                            // See the non-overview pass below: a narrower request ends the
+                            // window's word on its column's width.
+                            if let Some(&want) = requested_tile_widths.get(&tile.window_id) {
+                                if tile
+                                    .observed_width
+                                    .is_some_and(|observed| observed as i32 > want)
+                                {
+                                    tile.observed_width = None;
+                                }
+                            }
                         }
                     }
                 }
@@ -3584,6 +3611,18 @@ impl TilingEngine {
                         // we actually issued a Win32 call this pass).
                         if let Some(&rect) = position_map.get(&tile.window_id) {
                             tile.cached_bounds = rect;
+                        }
+                        // A request narrower than the size the window chose for itself ends
+                        // the window's word on its column (niri asks for the intent again,
+                        // `scrolling.rs:1293-1300`); a wider one leaves it alone, because
+                        // `Column::laid_out_width` already prefers the window's size.
+                        if let Some(&want) = requested_tile_widths.get(&tile.window_id) {
+                            if tile
+                                .observed_width
+                                .is_some_and(|observed| observed as i32 > want)
+                            {
+                                tile.observed_width = None;
+                            }
                         }
                     }
                 }
@@ -4288,6 +4327,17 @@ impl TilingEngine {
             column_gap,
             cfg,
         );
+        // niri `Column::width` (scrolling.rs:4860-4875): a column is as wide as the widest
+        // size its windows committed, not as wide as the layout asked for, and the
+        // neighbours move with it rather than being re-divided (ScrollingSpace::update_window,
+        // scrolling.rs:1287-1305).  A window that kept a size of its own therefore pushes
+        // the columns to its right instead of lying over them.
+        let col_widths: Vec<i32> = workspace
+            .columns
+            .iter()
+            .zip(col_widths)
+            .map(|(column, requested)| column.laid_out_width(requested))
+            .collect();
 
         let mut col_x: Vec<i32> = Vec::with_capacity(num_columns);
         let mut x = 0i32;

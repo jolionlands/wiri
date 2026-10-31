@@ -50,6 +50,14 @@ pub struct Tile {
     /// of the whole tile; 0 = no limit).
     pub min_height: u32,
     pub max_height: u32,
+    /// The width the *window* chose for itself, in pixels of the whole tile, when it last
+    /// resized on its own instead of accepting what the layout asked for (`None` = the
+    /// layout's request has the last word).  niri keeps a column as wide as the widest size
+    /// its windows committed (`src/layout/scrolling.rs:4860-4875`, `Column::width`), and
+    /// only asks again for the column width *intent* on a later layout pass; the window
+    /// that would not take the request keeps its size.  Cleared as soon as wiri itself asks
+    /// the window for something narrower (`TilingEngine::adopt_self_resize`).
+    pub observed_width: Option<u32>,
 }
 
 impl Tile {
@@ -67,6 +75,7 @@ impl Tile {
             max_width: 0,
             min_height: 0,
             max_height: 0,
+            observed_width: None,
         }
     }
 }
@@ -155,7 +164,10 @@ impl Column {
     }
 
     /// Give the column an explicit width.  This ends a maximized state: a column
-    /// that has a width of its own is not "as wide as the view" any more.
+    /// that has a width of its own is not "as wide as the view" any more, and it ends
+    /// any size a window had chosen for itself: an explicit width is the layout's word
+    /// again (niri re-resolves the column from `ColumnWidth` on the next request,
+    /// `scrolling.rs:4961-4972`).
     pub fn set_width(&mut self, width: Option<u32>) {
         self.maximized = false;
         self.sizing_forced = false;
@@ -165,6 +177,9 @@ impl Column {
         self.width_fixed_logical = None;
         self.width_fixed_window = None;
         self.width = width;
+        for tile in &mut self.tiles {
+            tile.observed_width = None;
+        }
     }
 
     pub fn set_proportion(&mut self, proportion: f64, view: impl Into<f64>, gap: i32) {
@@ -194,6 +209,10 @@ impl Column {
     /// Works for a column of any number of tiles.
     pub fn toggle_maximized(&mut self, view_width: u32) {
         self.sizing_forced = false;
+        // A width of the layout's own ends any size a window had chosen for itself.
+        for tile in &mut self.tiles {
+            tile.observed_width = None;
+        }
         if self.maximized {
             self.maximized = false;
             self.width = self.pre_max_width.take().unwrap_or(None);
@@ -231,7 +250,33 @@ impl Column {
         if max > 0 {
             width = width.min(max);
         }
-        width.max(min)
+        let width = width.max(min);
+        self.laid_out_width(width)
+    }
+
+    /// The width the column occupies when the layout asks for `requested`, which is what
+    /// [`Self::resolved_width`] would return if no window of the column had chosen a size of
+    /// its own.
+    ///
+    /// niri: `Column::width()` (`src/layout/scrolling.rs:4860-4875`) is the *widest size its
+    /// windows committed*, and the neighbours move with it (`ScrollingSpace::update_window`,
+    /// `scrolling.rs:1287-1305`), not the width the column asked for; the request
+    /// (`ColumnWidth`, `scrolling.rs:4961-4972`) only decides what the next configure asks
+    /// for.  So a window that kept a size of its own widens (or narrows) its column instead
+    /// of lying over its neighbour.  The windows' minimum and maximum still hold, and the
+    /// minimum wins when the two clash, as in `Column::update_tile_sizes`
+    /// (`scrolling.rs:4622-4627`).
+    pub fn laid_out_width(&self, requested: i32) -> i32 {
+        let Some(observed) = self.tiles.iter().filter_map(|t| t.observed_width).max() else {
+            return requested;
+        };
+        let min = self.min_width() as i32;
+        let mut width = (observed as i32).max(min);
+        let max = self.max_width() as i32;
+        if max > 0 {
+            width = width.min(max.max(min));
+        }
+        width
     }
 
     /// Keep the active tab of a tabbed column on a tile that exists.
