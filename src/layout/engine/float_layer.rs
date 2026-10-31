@@ -249,7 +249,8 @@ mod tests {
                 active_column_fullscreen: bits & 8 != 0,
             };
             // niri workspace.rs:1722-1728 and scrolling.rs:2946-2962, written out.
-            let fullscreen_above = facts.has_columns && facts.view_static && facts.active_column_fullscreen;
+            let fullscreen_above =
+                facts.has_columns && facts.view_static && facts.active_column_fullscreen;
             let niri = facts.floating_active || !fullscreen_above;
             assert_eq!(facts.floating_visible(), niri, "{facts:?}");
         }
@@ -327,17 +328,17 @@ mod tests {
             assert!(engine.floats_hidden_by_fullscreen(output));
 
             // scrolling.rs:2952: while the view offset animates, the floats are drawn.
-            engine.animation = crate::layout::AnimationManager::new(
-                true,
-                200,
-                crate::layout::Easing::Linear,
-            );
+            engine.animation =
+                crate::layout::AnimationManager::new(true, 200, crate::layout::Easing::Linear);
             engine
                 .animation
                 .animate(AnimationTarget::ScrollX(output), 0.0, 100.0);
             assert!(!engine.floats_hidden_by_fullscreen(output));
             engine.refresh_float_visibility(output, &backend);
-            assert!(float_visible(&engine, F), "shown for the length of the scroll");
+            assert!(
+                float_visible(&engine, F),
+                "shown for the length of the scroll"
+            );
             engine.animation.cancel_all();
             assert!(engine.floats_hidden_by_fullscreen(output));
             engine.refresh_float_visibility(output, &backend);
