@@ -689,10 +689,9 @@ async fn run() -> Result<()> {
     // Overview-mode banner — shown while the user is in overview ("Space or
     // Esc to exit").  Engine reaches it via the
     // `overlay::overview_banner::global_*` helpers; we install the singleton
-    // here once so those calls actually do something.  Dropping the
-    // JoinHandle is intentional — the thread lives until process exit.
+    // here once so those calls actually do something.  Its message-pump thread
+    // and window are created by the first `show`, not here.
     let overview_banner = Arc::new(OverviewBanner::new());
-    let _ = overview_banner.clone().spawn();
     wiri::overlay::overview_banner::install_global(overview_banner.clone());
 
     // Key-bindings cheatsheet overlay — toggled by the ShowKeyBindings action

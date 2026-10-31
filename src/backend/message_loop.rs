@@ -623,9 +623,16 @@ impl MessageLoop {
     ) {
         let running = self.running.clone();
         let quit_tx = self.quit_tx.clone();
-        std::thread::spawn(move || {
-            Self::run_message_loop(running, engine, backend_handle, quit_tx);
-        });
+        // The one session UI thread: the hotkey window, the low-level keyboard hook, the
+        // compositor and decoration windows and the tray icon all pump here.
+        let spawned = std::thread::Builder::new()
+            .name("wiri-ui".to_string())
+            .spawn(move || {
+                Self::run_message_loop(running, engine, backend_handle, quit_tx);
+            });
+        if let Err(e) = spawned {
+            error!("Failed to start the hotkey message loop: {}", e);
+        }
     }
 
     fn run_message_loop(
@@ -750,6 +757,10 @@ impl MessageLoop {
                 if msg.message == WM_STOP_MESSAGE_LOOP {
                     break;
                 }
+                // The tray icon is hosted here too: one session UI thread instead of two pumps.
+                if crate::hooks::tray::handle_message(msg.message) {
+                    continue;
+                }
                 if crate::overlay::compositor::handle_message(msg.message) {
                     continue;
                 }
@@ -863,6 +874,7 @@ impl MessageLoop {
         }
 
         drop(switch_events); // Unregister power notifications on this pump, before DestroyWindow.
+        crate::hooks::tray::shutdown();
         unregister_hotkeys(hwnd, &registered_ids);
         crate::ipc::keyboard_notify::shutdown(hwnd);
         crate::input::stop_keyboard_hook();
@@ -913,6 +925,19 @@ impl MessageLoop {
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Post `message` to the session UI thread (the one pump that owns the hotkey window,
+    /// the keyboard hook, the overlay windows and the tray icon).  False when that thread has
+    /// not started, so a caller can fall back to a pump of its own.
+    pub fn post_to_ui_thread(message: u32) -> bool {
+        let state = HOTKEY_THREAD.lock();
+        match state.as_ref() {
+            Some(s) => unsafe {
+                PostThreadMessageW(s.thread_id, message, WPARAM(0), LPARAM(0)).is_ok()
+            },
+            None => false,
         }
     }
 

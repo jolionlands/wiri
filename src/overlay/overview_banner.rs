@@ -9,8 +9,9 @@
 //!
 //! Architecture mirrors `WorkspaceIndicator`:
 //! 1. The public handle (`OverviewBanner`) holds an `Arc<BannerState>`.
-//! 2. [`OverviewBanner::spawn`] starts a dedicated Win32 message-pump
-//!    thread that owns the layered popup HWND.
+//! 2. The first `show`/`hide` starts the Win32 message-pump thread that owns
+//!    the layered popup HWND ([`OverviewBanner::ensure_thread`]); nothing
+//!    exists while the user never opens the overview.
 //! 3. [`OverviewBanner::show`] / `hide` mutate the shared state and post a
 //!    custom message (via the HWND) so the pump thread reconfigures the
 //!    window without us touching the HWND from the engine thread.
@@ -19,6 +20,7 @@
 //! overview enter and `OverviewBanner::hide` on overview exit (see the
 //! `Action::OverviewToggle` dispatch site).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -68,13 +70,15 @@ struct BannerState {
     hwnd: Mutex<Option<isize>>,
     /// Monitor bounds to anchor against (None = primary).
     monitor_bounds: Mutex<Option<MonitorBounds>>,
+    /// Whether the pump thread has been started (it is started on first use).
+    started: AtomicBool,
 }
 
 /// Public handle to the overview banner overlay.
 ///
-/// Construct once in `main.rs`, call `.clone().spawn()` to start the pump
-/// thread, then `show_at` / `hide` from anywhere.  Internally `Arc`-shared
-/// so cloning is cheap.
+/// Construct once in `main.rs`; the pump thread starts by itself the first
+/// time the banner is shown, then `show_at` / `hide` from anywhere.  Internally
+/// `Arc`-shared so cloning is cheap.
 pub struct OverviewBanner {
     state: Arc<BannerState>,
 }
@@ -87,6 +91,7 @@ impl OverviewBanner {
                 visible: Mutex::new(false),
                 hwnd: Mutex::new(None),
                 monitor_bounds: Mutex::new(None),
+                started: AtomicBool::new(false),
             }),
         }
     }
@@ -119,16 +124,32 @@ impl OverviewBanner {
         }
     }
 
-    /// Spawn the dedicated Win32 message-pump thread.  Drop the returned
-    /// JoinHandle — the thread lives until the process exits.
-    pub fn spawn(self: Arc<Self>) -> std::thread::JoinHandle<()> {
+    /// Start the pump thread on first use.  False when it could not be started
+    /// (a later `show` tries again).
+    fn ensure_thread(&self) -> bool {
+        if self.state.started.swap(true, Ordering::AcqRel) {
+            return true;
+        }
         let state = self.state.clone();
-        std::thread::spawn(move || run_window_loop(state))
+        match std::thread::Builder::new()
+            .name("wiri-overview-banner".into())
+            .spawn(move || run_window_loop(state))
+        {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(%error, "overview banner unavailable");
+                self.state.started.store(false, Ordering::Release);
+                false
+            }
+        }
     }
 
     /// Post the wake-up message so the pump thread re-reads `visible` and
     /// reconfigures the window without us touching the HWND.
     fn wake(&self) {
+        if !self.ensure_thread() {
+            return;
+        }
         let hwnd_raw = *self.state.hwnd.lock();
         if let Some(raw) = hwnd_raw {
             unsafe {
@@ -241,6 +262,14 @@ fn run_window_loop(state: Arc<BannerState>) {
 
         // Start hidden — only `show()` should bring us on screen.
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
+        // The `show`/`hide` that started this thread may have run before the HWND existed, so
+        // its wake-up was dropped; read the requested state once now (a message, not a timer).
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            hwnd,
+            WM_BANNER_UPDATE,
+            WPARAM(0),
+            LPARAM(0),
+        );
 
         let mut msg = MSG::default();
         loop {
