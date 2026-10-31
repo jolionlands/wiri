@@ -14,24 +14,29 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="Platform: Windows x64 and ARM64" src="https://img.shields.io/badge/platform-Windows%20x64%20%7C%20ARM64-0078D4">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=black">
+  <a href="https://github.com/jolionlands/wiri/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jolionlands/wiri?color=8957e5"></a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/shot-three-windows.png" alt="Three tiled columns with gaps; the focused window has a blue ring" width="860">
+  <a href="https://github.com/jolionlands/wiri/releases/latest"><img alt="Download wiri for Windows (x64 and ARM64)" src="https://img.shields.io/badge/Download-Windows%20x64%20%7C%20ARM64-2ea44f?style=for-the-badge&logo=windows11&logoColor=white"></a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/demo.mp4"><img src="docs/assets/demo.webp" alt="wiri on a live desktop: columns on an endless strip, move and resize, tabbed columns, workspaces, the pannable overview, floating and fullscreen, and the unified XY grid" width="860"></a>
   <br>
-  <em>Three columns on the strip, with gaps. The focused window has a blue ring.</em>
+  <em>wiri on a live desktop, recorded by <a href="scripts/demo/record-demo.ps1">scripts/demo/record-demo.ps1</a>. Click it for the full-quality MP4.</em>
 </p>
 
 ## Status
 
-wiri is a working prototype. It builds for x86_64 and ARM64 Windows. The measurements below come from one x64 laptop, and multi-monitor, mixed-DPI and ARM64 testing on real hardware are still in progress.
+wiri's first release, [v0.1.0](https://github.com/jolionlands/wiri/releases/tag/v0.1.0), is out with prebuilt binaries for x86_64 and ARM64 Windows. The measurements below come from one x64 laptop, and multi-monitor, mixed-DPI and ARM64 testing on real hardware are still in progress.
 
 ## Why wiri
 
 - **niri's model, on Windows.** Windows are columns on an endless strip, and each monitor has its own stack of dynamic workspaces. Opening a window never resizes the others.
 - **Light and quick.** Idle CPU measures effectively zero, and a key press has the window in its new place in under 6 ms at the median. See [Performance](#performance).
 - **Speaks niri's language.** The config uses niri's KDL syntax, so `binds {}` blocks and `window-rule`s paste in as they are. `wiri-ctl` mirrors `niri msg`, with niri-shaped JSON for windows and workspaces.
-- **Tested on a real desktop.** An automated harness sends real keyboard input to real windows and checks the results. Its latest fully green official run passed all 769 enforced checks.
+- **Tested on a real desktop.** An automated harness sends real keyboard input to real windows and checks the results. The run behind v0.1.0 passed 911 of its 915 checks.
 
 ## Screenshots
 
@@ -39,11 +44,15 @@ wiri is a working prototype. It builds for x86_64 and ARM64 Windows. The measure
 | :---: | :---: |
 | ![The overview: workspaces zoomed out](docs/assets/shot-overview.png)<br>**Overview.** The workspaces zoomed out, with live window thumbnails. Toggle it with `Ctrl+Alt+Space`. | ![A tabbed column](docs/assets/shot-tabbed.png)<br>**Tabbed column.** A tab indicator sits on the column's edge, and the second window is the one shown. |
 | ![A focused window with a focus ring and border](docs/assets/shot-decorated.png)<br>**Focus ring and border.** The focused window gets a coloured ring and border. The others keep a grey frame. | ![The Important Hotkeys overlay](docs/assets/shot-hotkeys.png)<br>**Important Hotkeys.** The overlay lists the bound keys and what they do. Any key or click closes it. |
-| ![A workspace switch in progress](docs/assets/shot-workspace-slide.png)<br>**Workspace switch.** Caught mid-animation: the windows slide as the workspace changes. | Screenshots come from the live desktop test harness on a 1366×768 display. |
+| ![A workspace switch in progress](docs/assets/shot-workspace-slide.png)<br>**Workspace switch.** Caught mid-animation: the windows slide as the workspace changes. | ![Three tiled columns with gaps](docs/assets/shot-three-windows.png)<br>**Columns on the strip.** Three columns with gaps. The focused window has a blue ring. |
+
+Screenshots come from the live desktop test harness on a 1366×768 display.
 
 ## Quick start
 
-You need [Rust](https://rustup.rs) and Git. In PowerShell:
+**Download:** grab the zip for your machine from the [latest release](https://github.com/jolionlands/wiri/releases/latest) (`x86_64` for most PCs, `aarch64` for Windows on ARM), unzip it and run `wiri.exe`. Each zip has a `.sha256` file to check it against. The binaries are not code-signed yet, so SmartScreen may ask before the first start.
+
+**Build from source:** you need [Rust](https://rustup.rs) and Git. In PowerShell:
 
 ```pwsh
 git clone https://github.com/jolionlands/wiri.git
@@ -152,7 +161,7 @@ wiri-ctl events --types '*'             # stream events as they happen
 
 wiri is checked against niri's main branch (snapshot of 22 October 2026). Each feature row is checked in the code, not in the docs. At the latest recount, from 30 October 2026:
 
-- **309 of 397** applicable features are done (77.8%), **88** are partial, and **none** are missing. Rows move to done only after their live checks pass in a full desktop run.
+- **314 of 397** applicable features are done (79.1%), **83** are partial, and **none** are missing. Rows move to done only after their live checks pass in a full desktop run.
 - All **143** niri actions are recognised. The nine that are specific to Wayland compositors return an explicit error.
 
 Row-by-row status and open items are in [docs/parity/README.md](docs/parity/README.md).

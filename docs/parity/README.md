@@ -19,8 +19,8 @@ against niri `main` at e19df12cf8 (2026-10-22; the latest release tag is v26.04)
 
 | Matrix | done | partial | missing | N/A on Windows |
 | --- | --- | --- | --- | --- |
-| Layout and behaviour (226 rows) | 164 | 45 | 0 | 17 |
-| Config, input and IPC (259 rows) | 141 | 47 | 0 | 71 |
+| Layout and behaviour (226 rows) | 171 | 38 | 0 | 17 |
+| Config, input and IPC (259 rows) | 144 | 44 | 0 | 71 |
 
 The counts are a recount of current feature-row statuses including integrated Phase 2B,
 retained Phase 2C Lane B/D and Lane G/H/S/Z/W/K/F2/T/C2/V/L2/P/A11Y updates and
@@ -200,8 +200,10 @@ then made the `strict-new-window-focus-policy` debug flag real on Windows, so th
 from N/A to partial. The overview lane replaced the fit-everything overview with niri's
 fixed-zoom camera, so "Live zoomed-out view" returns to partial until its `h97_*` gates pass
 in an official cycle (they passed in the lane's own desktop probes). The current totals are
-**309 done / 88 partial / 88 N/A** across 485 rows: **309/397 applicable rows (77.8%)**, after
-the official dba4606 cycle passed all 11 `h93_*` gates and five pointer rows moved to done. Floating-height resolution/routing and the
+**314 done / 83 partial / 88 N/A** across 485 rows: **314/397 applicable rows (79.1%)**, after
+the official dba4606 cycle passed all 11 `h93_*` gates and five pointer rows moved to done, and
+then the official dab9a88 cycle of 2026-10-31 passed the h88-h97, h61 and h17 gate families and
+six more rows moved to done. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
 remain partial for physical mixed-DPI and remaining lifecycle routes. The lifecycle
 checkpoint qualifies its listed source cases; earlier floating native evidence
@@ -211,7 +213,7 @@ hardware evidence remain open. See the [full-parity plan](../superpowers/plans/2
 for the active work; a gate count alone is not full parity.
 
 **2026-10-30 partial-row reconcile (Lane EVIDENCE).** [partial-rows-2026-10-30.md](partial-rows-2026-10-30.md)
-classifies all 92 partial rows by one primary condition: **5 missing or incorrect software, 15
+classifies all 92 rows that were partial at that base by one primary condition: **5 missing or incorrect software, 15
 implemented but evidence not reconciled, 37 hardware evidence unavailable, 35 Windows backend
 differences**. The matrix totals are unchanged — **164 done / 45 partial / 17 N/A** (layout) and
 **141 done / 47 partial / 71 N/A** (config, input and IPC), 305 / 92 / 88 of 485 — because no row
@@ -222,6 +224,31 @@ they need. Eight `h95_*` gates are now written in `scripts/live-phases/lane-evid
 of those rows plus the overview half of one backend row; the remaining rows point at gates that
 already exist in `lane-a-camera-motion.ps1`, `lane-startup-rules.ps1`, `lane-pango.ps1`,
 `lane-pace.ps1`, `lane-cfg.ps1` or `lane-focus.ps1`, or name the one check still to write.
+
+**2026-10-31 official cycle `dab9a88` (Lane PROMOTE).** The official tridaris cycle at
+`dab9a88` (run directory `C:\wiri-dev\evidence\dab9a88-live`, 2026-10-31, 911/915 boolean gates
+passed) ran the gates that the remaining rows were waiting for: `h88_*` 10/10, `h89_*` 6/6,
+`h90_*` 2/2, `h91_*` 4/4, `h92_*` 11/11, `h94_*` 6/6, `h95_*` 8/8, `h96_*` 6/6, `h97_*` 8/8,
+`h61_*` 4/4, `h17_*` 48/48 (niri's exact numeric limits accepted and values just past them
+rejected), `h25_*` 8/8, `h28_*` 3/3 and every `h15_*`. The only non-passing entries were the three
+`h98_*` movement gates (a wiri extension, not a parity row) and
+`h30_floating_directional_focus_stays_in_workspace`, one raw-IPC case that raced its fixture
+while the identical CLI case passed. Five rows move from `partial` to `done`, each citing the gate
+that passed: Mouse move/resize of floats via the Mod key, Tab indicator, the "Live zoomed-out
+view" overview row, `hotkey-overlay-title` Pango markup and "What a reload re-applies".
+Gesture kinetics (L45) keeps `partial`: `h90_no_animation_wakeups_at_rest` passed, but no live gate drives a touchpad gesture on this host, which has no real precision touchpad, so spring decay and rubber-band remain unit-tested only. Fourteen more rows had their named gates pass but keep `partial`: their text also
+records a hardware, mixed-DPI, multi-output or Windows-backend condition that a gate cannot
+clear (self-resize's unread maximum sizes and minimum heights, `center-column` on differing
+physical outputs, `FloatingActive::NoButRaised`, the overview's multi-display keyboard path, the
+opaque-host alpha of the backdrop and workspace shadow, the new-window token path and strict
+cross-workspace detail in both focus-policy rows, other refresh rates and multi-output for the
+animation clock, a real Precision Touchpad, non-animation config bounds, the action census's six
+executor-evidence partials, `background-color`'s per-output backdrop and Windows' absent
+per-client inhibition protocol). Recount: **170 done / 39 partial / 17 N/A** (layout, 226 rows) and
+**144 done / 44 partial / 71 N/A** (config, input and IPC, 259 rows), i.e. **314 done / 83
+partial / 88 N/A** across 485 rows, **314/397 applicable rows (79.1%)**. The stale "pending"
+sentences in the rows this cycle settled are replaced by the gate names and the official run
+they passed in.
 
 Earlier checkpoints (layout; config): Phase 2A (`b702890`) was 53 / 58 / 100 / 15; 43 / 74 / 72 / 70, Phase 1 was
 30 / 70 / 111 / 15; 15 / 86 / 88 / 70, and the original audit was 2 / 85 / 124 / 15;

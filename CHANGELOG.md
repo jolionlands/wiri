@@ -5,6 +5,36 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane PROMOTE — six parity rows to done on the official dab9a88 cycle
+
+The official tridaris cycle at `dab9a88` (run directory
+`C:\wiri-dev\evidence\dab9a88-live`, 2026-10-31, 911/915 boolean gates) ran the gates the
+remaining parity rows were named against: `h88_*` 10/10, `h89_*` 6/6, `h90_*` 2/2, `h91_*` 4/4,
+`h92_*` 11/11, `h94_*` 6/6, `h95_*` 8/8, `h96_*` 6/6, `h97_*` 8/8, `h61_*` 4/4, `h17_*` 48/48,
+`h25_*` 8/8, `h28_*` 3/3 and every `h15_*`. Only three `h98_*` movement gates (a wiri extension,
+not a parity row) and one raw-IPC `h30_*` case that raced its fixture did not pass; the identical
+CLI case passed.
+
+- Five rows move from `partial` to `done`, each citing the gate that passed: Mouse move/resize of
+  floats via the Mod key (`h95_mod_drag_*`), the tab indicator's urgent colour
+  (`h95_tab_indicator_*`), the "Live zoomed-out view" overview row (all eight `h97_*`), `hotkey-overlay-title` Pango
+  markup (all six `h89_*`) and "What a reload re-applies" (all four `h91_*`).
+- Gesture kinetics (L45) keeps `partial`: `h90_no_animation_wakeups_at_rest` passed, but no live
+  gate drives a touchpad gesture on this host, which has no real precision touchpad, so spring decay and rubber-band remain unit-tested only.
+- Fourteen rows kept `partial` although their gate passed, because their text also records a
+  condition a gate cannot clear (unread maximum/minimum sizes, differing physical outputs,
+  `FloatingActive::NoButRaised`, multi-display overview keyboard, the opaque host's alpha over
+  the backdrop and workspace shadow, the xdg-activation token path, other refresh rates, a real
+  Precision Touchpad, non-animation config bounds, the action census's six executor-evidence
+  partials, `background-color`'s per-output backdrop and Windows' absent per-client inhibition
+  protocol). Their evidence now names the passed gate next to what still remains.
+- The Lane FS row "Fullscreen and maximized windows cannot be floating" already cited its
+  `h88_*` gates as pending; it now records that all ten passed in this cycle.
+
+Recount: **170 done / 39 partial / 17 N/A** (layout, 226 rows) and **144 done / 44 partial /
+71 N/A** (config, input and IPC, 259 rows) — **314 done / 83 partial / 88 N/A** across 485 rows,
+**314/397 applicable rows (79.1 %)**, up from 309/397 (77.8 %).
+
 ### Lane FIXRUN2 — the dba4606 run's remaining live-gate failures
 
 Five gate classes in the frozen full run (883/913) were gate defects, not product defects; each

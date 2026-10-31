@@ -241,8 +241,14 @@ jobs:
               gh release create $env:RELEASE_TAG --repo $env:GH_REPO --target $env:RELEASE_SHA --verify-tag --draft --generate-notes
               if ($LASTEXITCODE -ne 0) { throw 'Could not create draft release' }
           }
-          # Recheck draft status immediately before any clobber, including on reruns.
-          $release = Get-ReleaseForTag
+          # Recheck draft status immediately before any clobber, including on reruns. The release
+          # listing can lag a draft created a moment ago (v0.1.0's first run failed here and its
+          # rerun found the draft), so give it a short bounded wait before calling it gone.
+          $release = $null
+          for ($attempt = 1; $attempt -le 10 -and $null -eq $release; $attempt++) {
+              $release = Get-ReleaseForTag
+              if ($null -eq $release) { Start-Sleep -Seconds 3 }
+          }
           if ($null -eq $release) { throw 'Draft disappeared before upload' }
           $dir = Join-Path $env:GITHUB_WORKSPACE '.scratch/release'
           $assets = @('aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc') | ForEach-Object {
