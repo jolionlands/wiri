@@ -39,7 +39,10 @@ impl TilingEngine {
         }
 
         let outer = std::mem::replace(&mut self.activation_suppressed, true);
-        let mut restore = Restore { engine: self, outer };
+        let restore = Restore {
+            engine: self,
+            outer,
+        };
         f(&mut *restore.engine)
     }
 
@@ -311,9 +314,8 @@ mod tests {
         assert!(!engine.activation_suppressed, "nothing is suppressed yet");
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.without_activation(|_| -> () {
-                panic!("an IPC-dispatched by-id action unwound")
-            });
+            engine
+                .without_activation(|_| -> () { panic!("an IPC-dispatched by-id action unwound") });
         }));
         assert!(unwound.is_err(), "the panic reaches the caller");
         assert!(
