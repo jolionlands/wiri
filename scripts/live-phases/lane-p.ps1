@@ -571,10 +571,12 @@ input {
             $pCurated.non_curated_text.Count -eq 0) $pCurated
 
         PCheckpoint 'checking-per-bind-overlay-titles'
-        # The Windows GDI sheet renders markup literally, not as Pango formatting.
-        # Assert the complete supplied string, including tags; never strip markup
-        # in the test and thereby accidentally accept the default action title.
-        $pMarkupTitle = '<b>C28 Launch</b>'
+        # niri paints a bind's title with Pango set_markup (wiki
+        # Configuration:-Key-Bindings, "Custom Hotkey Overlay Titles"), so `<b>` is
+        # formatting, not text: the row shows the title's words, without the tag.  Look for
+        # those words (they are still the title, not the default action description) and
+        # require that the tag was not painted literally.
+        $pMarkupTitle = 'C28 Launch'
         $pTitleConfig = @'
 hotkey-overlay { skip-at-startup; hide-not-bound; }
 binds {
@@ -584,6 +586,9 @@ binds {
 }
 '@
         $pTitles = PContentProbe 'per-bind-titles' $pTitleConfig @($pMarkupTitle) 1
+        # The tag is markup, not text: a literal rendering would have painted it.
+        $pTitles['markup_not_literal'] = ($pTitles.rendered_text -notmatch '<b>' -and
+            $pTitles.rendered_text -notmatch 'b>C28')
         # null does NOT unregister the bind: its binding-table row remains, but
         # curated_rows omits it from the sheet altogether (not an empty title row).
         $pTitles['null_binding'] = @($pTitles.bindings | Where-Object {
@@ -593,6 +598,7 @@ binds {
             $_.vk_code -eq 0x78 -and $_.modifiers -eq 3 -and $_.action -like 'Spawn*'
         })
         PGate 'h80_hotkey_overlay_title_per_bind' ($pTitles.pass -and
+            $pTitles.markup_not_literal -and
             @($pTitles.bindings).Count -eq 2 -and $pTitles.null_binding.Count -eq 1 -and
             $pTitles.titled_binding.Count -eq 1 -and $pTitles.rendered_text -notmatch 'Close window|Launch application') $pTitles
     } catch {

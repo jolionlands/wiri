@@ -3276,6 +3276,15 @@ $summary = [ordered]@{
     h86_inactive_fullscreen_id_preserves_native_focus = $false
     h86_inactive_height_id_preserves_native_focus = $false
     h86_owned_cleanup = $false
+    h88_toggle_window_floating_on_a_fullscreen_float_tile = $false
+    # H89: a configured hotkey-overlay-title is Pango markup; its live gates are added by
+    # `lane-pango.ps1` and replace these defaults only after observing the painted sheet.
+    h89_markup_title_text_and_entity_render = $false
+    h89_markup_colour_span_is_painted = $false
+    h89_markup_bold_run_has_more_ink = $false
+    h89_invalid_markup_falls_back_to_the_whole_string = $false
+    h89_invalid_markup_logs_one_warning_at_load = $false
+    h89_markup_cleanup = $false
     steps = $steps
 }
 # One lane's unexpected error must not end the run: its gates stay false and the error is recorded.
@@ -3314,6 +3323,10 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-workspace-ids.ps1') } catch {
 # leaving the state floats it again where it was (niri workspace.rs:1288-1476).
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-float-sizing.ps1') } catch { LanePhaseError 'lane_float_sizing' $_ }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-cfg.ps1') } catch { LanePhaseError 'lane_cfg' $_ }
+# H89: a bind's `hotkey-overlay-title` is Pango markup, as niri paints it with set_markup:
+# bold, a colour span and `&amp;` paint styled, an invalid title paints the whole original
+# string, and that invalid title is warned about once at config load.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-pango.ps1') } catch { LanePhaseError 'lane_pango' $_ }
 # Lane P: pointer-device settings, the hotkey overlay's startup options and the
 # dry-run audit of pointer writes.  Its daemons carry WIRI_POINTER_SETTINGS_DRY_RUN,
 # so nothing here changes this machine's real pointer or touchpad settings.
