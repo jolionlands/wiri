@@ -79,13 +79,16 @@ function H97Stack($h) {
 }
 # Wait for the overview host, then until the camera zoom stops moving. Returns the samples of
 # (ms, height) changes so the p_ keys can report the animation's publish cadence.
+# The overview request is asynchronous: the IPC reply arrives before the main loop opens the
+# host window, so a host that is not there yet must be *waited for* (bounded by limitMs, as
+# before); it used to break out at once and hand every gate a null handle.
 function H97Settle([int]$limitMs = 6000) {
     $samples = New-Object System.Collections.ArrayList
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $lastH = [int64]::MinValue; $same = 0; $hostHandle = [IntPtr]::Zero
     while ($watch.ElapsedMilliseconds -lt $limitMs) {
         $hostHandle = H97Host
-        if ($hostHandle -eq [IntPtr]::Zero) { break }
+        if ($hostHandle -eq [IntPtr]::Zero) { $hostHandle = [IntPtr]::Zero; Start-Sleep -Milliseconds 20; continue }
         $active = H97Active $hostHandle
         if ($null -ne $active -and $active.h -gt 0) {
             if ($active.h -ne $lastH) {
@@ -162,7 +165,9 @@ try {
     # ---- gate group A: fixed zoom from config, niri's stack geometry ----
     try {
         $normalRect = H97Rect $h97Forms[0]
-        $h97Checks.normal = @($normalRect.L, $normalRect.T, $normalRect.R - $normalRect.L, $normalRect.B - $normalRect.T)
+        # One expression per element: `a, $b - $c, $d` parses as `a, ($b - ($c, $d))` in
+        # PowerShell (the comma binds tighter than the arithmetic), which throws on Object[].
+        $h97Checks.normal = @($normalRect.L, $normalRect.T, ($normalRect.R - $normalRect.L), ($normalRect.B - $normalRect.T))
         $null = Ctl 'h97-open' @('action', 'toggle-overview')
         $settled = H97Settle
         $hostHwnd = $settled.hwnd
