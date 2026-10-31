@@ -356,3 +356,42 @@ claim (`move-column-to-index` is 1-based) and nine further contract mismatches, 
 row 178 to done: **304/396 applicable rows (76.8%), 92 partial, 89 N/A**. Rows 232 and 257 stay
 partial: nine `*ById` forms still activate the named window first, and `--print-request` prints
 wiri's dialect.
+
+### Lane SYNTH — touch, pen and drag-and-drop on OS-synthesized input (2026-10-31)
+
+The last five rows that were "implemented and unit-tested only" on the pointer paths now have live
+evidence that does not depend on hardware: `scripts/live-phases/lane-synth.ps1` (H93, eleven enforced
+gates, dot-sourced next to the other lanes) creates a real Windows pointer device with
+`CreateSyntheticPointerDevice(PT_TOUCH/PT_PEN)` and injects contacts with
+`InjectSyntheticPointerInput`, and it drives drag-and-drop with a genuine OLE drag
+(`DoDragDrop` from a WinForms mouse-down, so the capture belongs to OLE's own window of the source
+process). A `WH_MOUSE_LL` recorder proves the promotion wiri's hook consumes: touch is
+`MI_WP_SIGNATURE | 0x80 | contact-id`, pen is the same without `0x80`, the pen barrel is promoted to
+`WM_RBUTTONDOWN`, and plain `SendInput` input carries no signature at all. The final owned probe run
+(`.live/synth-probe-20261031-000911`, this worktree's release binaries) passed **11/11 gates**.
+Evidence wording for the rows below is `OS synthetic pointer device (InjectSyntheticPointerInput), no
+physical digitizer`.
+
+- DnD edge view scroll, DnD edge workspace switch and DnD hold-to-activate move from `partial` to
+  `done`: the strip travelled 217-238 px with every fixture's top edge and height unchanged and the
+  frames stopped when the zone was left; `trigger-width 140`/`delay-ms 600` suppressed scrolling
+  before the delay and outside the zone; the overview opened under a held drag stepped exactly one
+  workspace and did not repeat; the native foreground followed a 1.15 s hover.
+- Tablet pen (Mod+drag a window) moves to `done`: the promoted pen events carry exactly the extra info
+  wiri classifies, and a Mod+pen drag moved a floating window by -80/+56 px and left it there.
+- Tablet stylus triggers `TabletStylusButton1-3` moves to `done`: the `Alt+TabletStylusButton2` bind
+  registered once and fired from a promoted barrel contact (tiled -> floating). Buttons 1 and 3 use
+  the same mapping but were not exercised live, and which physical button a driver promotes to which
+  mouse button remains an approximation.
+- Touchscreen Mod+drag and the touch overview stay `partial`: the drag/scroll halves are now live
+  (`h93_touch_mod_drag_scrolls_the_view` moved the strip 216 px for a 150 px contact drag;
+  `h93_touch_mod_drag_moves_a_floating_window` moved a float +96/+64 px), but the second-finger tap
+  was not promoted by Windows for a synthetic second contact in the observation window
+  (`second_contact_hook_lines` empty) and the overview's long-press pickup pressed inside the painted
+  thumbnail yet never dropped the window to a workspace below (`touch_overview_long_press_observed`,
+  `moved=false`). Both stay unit-tested only until a probe explains them.
+
+Recount: **310/397 applicable rows (78.1%), 87 partial, 88 N/A** across 485 rows (five rows moved from
+`partial` to `done`). The five new `done` rows rest on this lane's own probe run; the gates are the same
+ones the lead's official cycle will run, so a failure there returns them to `partial`. No `src/` file
+changed: the probes demonstrated no defect in the touch, pen or DnD paths.
