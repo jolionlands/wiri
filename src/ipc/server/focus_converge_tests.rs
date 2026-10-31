@@ -86,12 +86,18 @@ fn focus_window_on_a_silently_switched_foreground_converges_and_is_told_once() {
     server.sync_state();
     let told = drain(&mut events);
     assert_eq!(
-        count(&told, |e| matches!(e, IpcEvent::WindowFocusChanged { id: Some(id) } if *id == K1 as u64)),
+        count(
+            &told,
+            |e| matches!(e, IpcEvent::WindowFocusChanged { id: Some(id) } if *id == K1 as u64)
+        ),
         1,
         "{told:?}"
     );
     assert_eq!(
-        count(&told, |e| matches!(e, IpcEvent::WindowFocused { window_hwnd } if *window_hwnd == K1)),
+        count(
+            &told,
+            |e| matches!(e, IpcEvent::WindowFocused { window_hwnd } if *window_hwnd == K1)
+        ),
         1,
         "{told:?}"
     );
@@ -132,7 +138,10 @@ fn focus_window_on_the_window_that_already_is_native_foreground_converges() {
     server.sync_state();
     let told = drain(&mut events);
     assert_eq!(
-        count(&told, |e| matches!(e, IpcEvent::WindowFocused { window_hwnd } if *window_hwnd == K1)),
+        count(
+            &told,
+            |e| matches!(e, IpcEvent::WindowFocused { window_hwnd } if *window_hwnd == K1)
+        ),
         1,
         "{told:?}"
     );

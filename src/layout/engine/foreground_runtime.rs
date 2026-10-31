@@ -408,7 +408,11 @@ mod tests {
         let (_, attempts) = with_native_foreground(100, Activation::SwitchWithoutNotice, || {
             engine.focus_action_window(b, &backend)
         });
-        assert_eq!(attempts, vec![101], "one request, then the query settles it");
+        assert_eq!(
+            attempts,
+            vec![101],
+            "one request, then the query settles it"
+        );
         assert_eq!(engine.os_foreground, Some(b));
         assert_eq!(engine.ipc_snapshot().focused_window(), Some(101));
         assert_eq!(
@@ -439,7 +443,11 @@ mod tests {
             engine.focus_action_window(b, &backend)
         });
         assert!(!attempts.is_empty());
-        assert_eq!(engine.os_foreground, Some(a), "the query does not name B yet");
+        assert_eq!(
+            engine.os_foreground,
+            Some(a),
+            "the query does not name B yet"
+        );
         // The notice that follows is the ordinary path.
         assert!(observe(&mut engine, &backend, 101, 1000, 1, true));
         assert_eq!(engine.os_foreground, Some(b));
