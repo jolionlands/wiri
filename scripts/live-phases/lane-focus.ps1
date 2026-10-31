@@ -283,3 +283,256 @@ layout { gaps 0; center-focused-column "never"; }
         }
     }
 }
+
+# H92 (new-window focus policy): niri's default heuristic (a new window is focused unless the active window is
+# fullscreen) and `debug { strict-new-window-focus-policy }` (only a window Windows itself gave the foreground is
+# focused), mapped to Windows (niri:src/handlers/compositor.rs:149-176). A window "without a token" is one that
+# appeared without the foreground: these gates open one with ShowWithoutActivation. The other half, a window Windows
+# did give the foreground (niri's valid token), has no deterministic desktop trigger and is unit-proven only.
+# One private daemon per policy; only lane-owned forms are focused, fullscreened or closed.
+& {
+    $fpRoot = Join-Path $D 'lane-focus-policy'
+    $fpDir = Join-Path $fpRoot ([Guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Force -Path $fpDir
+    $fpDetails = [ordered]@{ fixture_directory = $fpDir }
+    $fpGates = @(
+        'h92_new_window_default_heuristic_focuses_a_window_without_the_foreground',
+        'h92_new_window_default_heuristic_keeps_a_fullscreen_window_focused',
+        'h92_new_window_strict_policy_does_not_focus_a_window_without_the_foreground',
+        'h92_new_window_strict_policy_still_honours_an_explicit_focus_request'
+    )
+    foreach ($fpGate in $fpGates) {
+        $summary[$fpGate] = $false
+        $fpDetails[$fpGate] = [ordered]@{ pass = $false; status = 'not reached' }
+    }
+    $fpForms = New-Object System.Collections.ArrayList
+    $fpSavedPipe = $env:WIRI_PIPE
+    $fpSavedConfig = if (Test-Path -LiteralPath $cfg) { [IO.File]::ReadAllText($cfg) } else { $null }
+    $fpState = @{ process = $null; pipe = '' }
+    function FPGate([string]$name, [bool]$pass, $observed) {
+        $summary[$name] = $pass
+        $fpDetails[$name] = [ordered]@{ pass = $pass; status = 'checked'; observed = $observed }
+        $fpDetails | ConvertTo-Json -Depth 16 | Set-Content -Encoding UTF8 (Join-Path $fpRoot 'evidence.json')
+    }
+    function FPCtl([string]$tag, [string[]]$words) {
+        $process = $fpState.process
+        if ($null -eq $process -or $process.HasExited -or $env:WIRI_PIPE -ne $fpState.pipe) {
+            throw 'H92 policy daemon/pipe ownership is no longer valid'
+        }
+        $text = Ctl ('h92p-' + $tag) $words
+        if ($steps.Count -eq 0 -or [string]$steps[$steps.Count - 1].rc -ne '0') {
+            throw "H92 policy CLI failed: $tag $text"
+        }
+        return $text
+    }
+    function FPAction([string]$tag, [string[]]$words) {
+        $reply = (FPCtl $tag (@('--json', 'action') + $words)) | ConvertFrom-Json
+        if ($reply.success -ne $true) {
+            throw "H92 policy action was rejected: $tag $($reply | ConvertTo-Json -Compress)"
+        }
+        Start-Sleep -Milliseconds 900
+    }
+    function FPManaged() {
+        $query = (PipeRequest '{"type":"focused_window"}') | ConvertFrom-Json
+        if ($query.success -and $null -ne $query.result.focused_window) { return [int64]$query.result.focused_window.id }
+        return $null
+    }
+    function FPManagedWaits([IntPtr]$h, [int]$maxMs) {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            if ((FPManaged) -eq [int64]$h) { return $true }
+            Start-Sleep -Milliseconds 40
+        } while ($clock.ElapsedMilliseconds -lt $maxMs)
+        return ((FPManaged) -eq [int64]$h)
+    }
+    function FPFocusSettled([IntPtr]$h) {
+        foreach ($attempt in 1..3) {
+            $null = FPCtl ('settle-' + $h.ToInt64() + '-' + $attempt) @('--json', 'focus-window', [string][int64]$h)
+            if ((WaitForeground $h 900 4000) -and (FPManagedWaits $h 2500)) { Start-Sleep -Milliseconds 250; return }
+        }
+        throw "H92 policy form did not gain focus: $h"
+    }
+    function FPOpen([string]$name) {
+        $h = [TestForms]::Open($name, 90, 120, 200)
+        [void]$fpForms.Add($h)
+        Start-Sleep -Milliseconds 1200
+        return $h
+    }
+    function FPOpenQuiet([string]$name) {
+        $h = [LaneFocusForms]::OpenNoActivate($name)
+        [void]$fpForms.Add($h)
+        # Admission, a possible native activation and the stream settle.
+        Start-Sleep -Milliseconds 2200
+        return $h
+    }
+    function FPManagedEntry([string]$tag, [IntPtr]$h) {
+        $reply = (FPCtl $tag @('--json', 'window-list')) | ConvertFrom-Json
+        $entry = @($reply.result | Where-Object { [int64]$_.hwnd -eq [int64]$h })
+        return $(if ($entry.Count -eq 1) { $entry[0] } else { $null })
+    }
+    function FPStart([string]$tag, [string]$configText) {
+        if (@(Get-Process -Name wiri -ErrorAction SilentlyContinue).Count -ne 0) {
+            throw 'H92 policy refuses an existing wiri instance'
+        }
+        $fpState.pipe = '\\.\pipe\wiri_live_h92p_' + $PID + '_' + [Guid]::NewGuid().ToString('N')
+        $env:WIRI_PIPE = $fpState.pipe
+        $fpState.process = Start-WiriWithConfig $configText (Join-Path $fpDir ('wiri.' + $tag + '.stderr.log')) -NoDefaultBinds
+        $null = $fpState.process.Handle
+        if ($fpState.process.HasExited) { throw "H92 policy daemon exited during startup: $tag" }
+        $fpDetails[$tag + '_daemon_pid'] = $fpState.process.Id
+    }
+    function FPStop([string]$tag) {
+        foreach ($fpForm in @($fpForms)) {
+            try {
+                if ([LT]::IsWindow($fpForm) -and [LT]::Pid($fpForm) -eq $PID) { [LaneFocusForms]::Close($fpForm); [TestForms]::CloseForm($fpForm) }
+            } catch { $fpDetails['form_cleanup_error'] = [string]$_ }
+        }
+        $fpForms.Clear()
+        Start-Sleep -Milliseconds 600
+        $process = $fpState.process
+        try {
+            if ($null -ne $process -and -not $process.HasExited) {
+                if ($env:WIRI_PIPE -eq $fpState.pipe) { Stop-WiriGracefully $process ('h92p-' + $tag) }
+                elseif (-not $process.HasExited) { $process.Kill(); $null = $process.WaitForExit(5000) }
+            }
+        } catch {
+            $fpDetails[$tag + '_daemon_cleanup_error'] = [string]$_
+            if ($null -ne $process -and -not $process.HasExited) {
+                try { $process.Kill(); $null = $process.WaitForExit(5000) } catch { $fpDetails[$tag + '_daemon_kill_error'] = [string]$_ }
+            }
+        }
+        $fpState.process = $null
+    }
+    try {
+        if (-not ('LaneFocusForms' -as [type])) {
+            Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Threading;
+using System.Windows.Forms;
+public class LaneFocusNoActivateForm : Form {
+  protected override bool ShowWithoutActivation { get { return true; } }
+}
+public static class LaneFocusForms {
+  static readonly List<Form> forms = new List<Form>();
+  // A window that appears without taking the foreground: a background launch.
+  public static IntPtr OpenNoActivate(string title) {
+    IntPtr handle = IntPtr.Zero;
+    var ready = new ManualResetEvent(false);
+    var t = new Thread(delegate() {
+      var f = new LaneFocusNoActivateForm();
+      f.Text = title; f.Width = 520; f.Height = 380;
+      f.BackColor = Color.FromArgb(40, 120, 90);
+      f.StartPosition = FormStartPosition.WindowsDefaultLocation;
+      f.Shown += delegate(object s, EventArgs e) { handle = f.Handle; ready.Set(); };
+      lock (forms) { forms.Add(f); }
+      Application.Run(f);
+    });
+    t.SetApartmentState(ApartmentState.STA);
+    t.IsBackground = true;
+    t.Start();
+    ready.WaitOne(15000);
+    return handle;
+  }
+  public static void Close(IntPtr h) {
+    lock (forms) {
+      foreach (var f in forms) {
+        if (f.IsHandleCreated && f.Handle == h) { var ff = f; ff.BeginInvoke((MethodInvoker)delegate() { ff.Close(); }); }
+      }
+    }
+  }
+}
+'@ -ErrorAction Stop
+        }
+
+        # Phase 1: the default heuristic.
+        try {
+            FPStart 'default' @'
+input { mod-key "ctrl-alt"; }
+animations { off; }
+layout { gaps 0; center-focused-column "never"; }
+'@
+            $fpA = FPOpen 'lane-h92p-a'
+            FPFocusSettled $fpA
+            # Group 1: a background launch is focused by default.
+            try {
+                $fpB = FPOpenQuiet 'lane-h92p-b'
+                $fpBEntry = FPManagedEntry 'g1-b-entry' $fpB
+                $fpBManaged = (FPManagedWaits $fpB 2500)
+                $fpBNative = ([LT]::GetForegroundWindow() -eq $fpB)
+                FPGate 'h92_new_window_default_heuristic_focuses_a_window_without_the_foreground' (
+                    $null -ne $fpBEntry -and $fpBManaged -and $fpBNative) @{
+                        entry = $fpBEntry; managed = $fpBManaged; native = $fpBNative; managed_id = (FPManaged)
+                        foreground = [LT]::GetForegroundWindow().ToInt64() }
+            } catch { $fpDetails['group_default_error'] = ($_ | Out-String).Trim() }
+            # Group 2: a fullscreen window keeps the focus against a background launch.
+            try {
+                FPFocusSettled $fpA
+                FPAction 'g2-fullscreen-on' @('fullscreen-window')
+                $fpAFullscreen = FPManagedEntry 'g2-a-fullscreen' $fpA
+                $fpC = FPOpenQuiet 'lane-h92p-c'
+                $fpCEntry = FPManagedEntry 'g2-c-entry' $fpC
+                $fpKeptManaged = ((FPManaged) -eq [int64]$fpA)
+                $fpKeptNative = ([LT]::GetForegroundWindow() -eq $fpA)
+                Start-Sleep -Milliseconds 900
+                $fpKeptLater = (((FPManaged) -eq [int64]$fpA) -and ([LT]::GetForegroundWindow() -eq $fpA))
+                $fpAAfter = FPManagedEntry 'g2-a-after' $fpA
+                FPGate 'h92_new_window_default_heuristic_keeps_a_fullscreen_window_focused' (
+                    $null -ne $fpAFullscreen -and $fpAFullscreen.fullscreen -eq $true -and $null -ne $fpCEntry -and
+                    $fpKeptManaged -and $fpKeptNative -and $fpKeptLater -and $null -ne $fpAAfter -and
+                    $fpAAfter.fullscreen -eq $true) @{
+                        a_fullscreen = $fpAFullscreen; c_entry = $fpCEntry; kept_managed = $fpKeptManaged
+                        kept_native = $fpKeptNative; kept_later = $fpKeptLater; a_after = $fpAAfter }
+                FPAction 'g2-fullscreen-off' @('fullscreen-window')
+            } catch { $fpDetails['group_fullscreen_error'] = ($_ | Out-String).Trim() }
+        } catch { $fpDetails['phase_default_error'] = ($_ | Out-String).Trim() }
+        finally { FPStop 'default' }
+
+        # Phase 2: debug { strict-new-window-focus-policy }.
+        try {
+            FPStart 'strict' @'
+input { mod-key "ctrl-alt"; }
+animations { off; }
+layout { gaps 0; center-focused-column "never"; }
+debug { strict-new-window-focus-policy; }
+'@
+            $fpSA = FPOpen 'lane-h92p-sa'
+            FPFocusSettled $fpSA
+            $fpSB = $null
+            # Group 3: a window that appeared without the foreground is not focused.
+            try {
+                $fpSB = FPOpenQuiet 'lane-h92p-sb'
+                $fpSBEntry = FPManagedEntry 'g3-b-entry' $fpSB
+                $fpSKeptManaged = ((FPManaged) -eq [int64]$fpSA)
+                $fpSKeptNative = ([LT]::GetForegroundWindow() -eq $fpSA)
+                Start-Sleep -Milliseconds 900
+                $fpSKeptLater = (((FPManaged) -eq [int64]$fpSA) -and ([LT]::GetForegroundWindow() -eq $fpSA))
+                FPGate 'h92_new_window_strict_policy_does_not_focus_a_window_without_the_foreground' (
+                    $null -ne $fpSBEntry -and $fpSKeptManaged -and $fpSKeptNative -and $fpSKeptLater) @{
+                        entry = $fpSBEntry; kept_managed = $fpSKeptManaged; kept_native = $fpSKeptNative
+                        kept_later = $fpSKeptLater; managed_id = (FPManaged)
+                        foreground = [LT]::GetForegroundWindow().ToInt64() }
+            } catch { $fpDetails['group_strict_error'] = ($_ | Out-String).Trim() }
+            # Group 4: an explicit focus request still reaches the unfocused window.
+            try {
+                if ($null -eq $fpSB) { throw 'H92 strict group 3 did not open its window' }
+                $null = FPCtl 'g4-focus' @('--json', 'focus-window', [string][int64]$fpSB)
+                $fpSNative = (WaitForeground $fpSB 900 4000)
+                $fpSManaged = (FPManagedWaits $fpSB 2500)
+                FPGate 'h92_new_window_strict_policy_still_honours_an_explicit_focus_request' (
+                    $fpSNative -and $fpSManaged) @{ native = $fpSNative; managed = $fpSManaged; managed_id = (FPManaged) }
+            } catch { $fpDetails['group_strict_focus_error'] = ($_ | Out-String).Trim() }
+        } catch { $fpDetails['phase_strict_error'] = ($_ | Out-String).Trim() }
+        finally { FPStop 'strict' }
+        $fpDetails['stage'] = 'gates-complete'
+    } catch {
+        $fpDetails['error'] = ($_ | Out-String).Trim()
+    } finally {
+        try { if ($null -ne $fpState.process -and -not $fpState.process.HasExited) { FPStop 'final' } } catch { $fpDetails['final_cleanup_error'] = [string]$_ }
+        $env:WIRI_PIPE = $fpSavedPipe
+        if ($null -ne $fpSavedConfig) { [IO.File]::WriteAllText($cfg, $fpSavedConfig, (New-Object Text.UTF8Encoding($false))) }
+        $fpDetails | ConvertTo-Json -Depth 16 | Set-Content -Encoding UTF8 (Join-Path $fpRoot 'evidence.json')
+        $summary['lane_focus_policy_details'] = $fpDetails
+    }
+}

@@ -319,7 +319,6 @@ fn top_level_unsupported(name: &str) -> Option<&'static str> {
         "prefer-no-csd" => Some("Windows applications draw their own title bars"),
         "blur" => Some("no compositor blur on Windows"),
         "xwayland-satellite" => Some("there is no Xwayland on Windows"),
-        "debug" => Some("these are compositor debug options"),
         _ => None,
     }
 }
@@ -1100,6 +1099,7 @@ impl Decoder {
                 }
                 "overview" => self.decode_overview(node, &mut cfg.overview),
                 "accessibility" => self.decode_accessibility(node, cfg),
+                "debug" => self.decode_debug(node, cfg),
                 "include" => self.decode_include(node, cfg),
                 other => match top_level_unsupported(other) {
                     Some(why) => self.unsupported(node, why),
@@ -2693,6 +2693,23 @@ impl Decoder {
     /// `accessibility` — screen-reader announcements (wiri extension: niri's Accessibility
     /// support has no config key and is always on).  A bare node means on, `false` turns it
     /// off, and the section form accepts the same two spellings.
+    /// niri `debug { … }`. `strict-new-window-focus-policy` is honoured (see
+    /// `layout::engine::rules::new_window_activation`); every other option configures compositor
+    /// internals (DRM, PipeWire, frame queueing, ...) and is reported, not an error.
+    fn decode_debug(&mut self, node: &Node, cfg: &mut Config) {
+        self.section(node);
+        for child in node.kids() {
+            match norm(&child.name).as_str() {
+                "strict-new-window-focus-policy" => {
+                    if let Some(value) = self.flag(child) {
+                        cfg.debug.strict_new_window_focus_policy = value;
+                    }
+                }
+                _ => self.unsupported(child, "a compositor debug option with no Windows counterpart"),
+            }
+        }
+    }
+
     fn decode_accessibility(&mut self, node: &Node, cfg: &mut Config) {
         let kids = node.kids();
         if kids.is_empty() {
@@ -3648,6 +3665,36 @@ mod tests {
         assert_eq!(cfg.input.keyboard_layout, "us");
         assert_eq!(cfg.output.len(), 1);
         assert!(cfg.binds.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn debug_strict_new_window_focus_policy_is_a_flag_and_other_debug_options_are_reported() {
+        // niri:niri-config/src/debug.rs, wiki:Configuration:-Debug-Options (25.01).
+        assert!(!clean("").debug.strict_new_window_focus_policy);
+        assert!(
+            clean("debug { strict-new-window-focus-policy; }")
+                .debug
+                .strict_new_window_focus_policy
+        );
+        assert!(
+            clean("debug { strict-new-window-focus-policy true; }")
+                .debug
+                .strict_new_window_focus_policy
+        );
+        assert!(
+            !clean("debug { strict-new-window-focus-policy false; }")
+                .debug
+                .strict_new_window_focus_policy
+        );
+        // Every other niri debug option configures compositor internals: a warning, the
+        // strict flag next to it still applies, and the config still loads.
+        let d = load("debug {\n    disable-direct-scanout\n    strict-new-window-focus-policy\n}");
+        assert!(!d.has_errors(), "{:?}", d.issues);
+        assert!(d.config.debug.strict_new_window_focus_policy);
+        assert_eq!(warnings(&d).len(), 1, "{:?}", d.issues);
+        assert!(warnings(&d)[0].contains("disable-direct-scanout"));
+        // A value that is not a boolean is an error, not a silent default.
+        assert!(load("debug { strict-new-window-focus-policy \"maybe\"; }").has_errors());
     }
 
     #[test]
