@@ -168,6 +168,23 @@ frame, historical speedup or zero-CPU certification. The first readiness failure
 retains its zero-input diagnostics; full R3 remains failed. See the
 [performance endpoints and context](2026-10-29-tridaris-r4.md#owned-target-acknowledgement-performance).
 
+**Lane CFG config-bounds and reload checkpoint (`109de46`, `b524943`).** wiri's numeric
+config bounds are now niri's: every numeric or ranged option was compared with the pinned
+decoder and recorded in [config-bounds-census.md](config-bounds-census.md) (type, range and
+error with file:line, wiri before/after, regression). Integer options reject decimals instead
+of rounding, window-rule sizes are `u16`, `opacity`/`geometry-corner-radius` take niri's
+unbounded range, and options Windows cannot apply (`accel-speed`, `pinch-sensitivity`,
+`xcursor-size`) are still type- and range-checked. A reload now re-applies exactly the sections
+niri re-applies, in niri's order: `src/config/reload.rs` plans from a diff of the config the
+engine holds and the new one, `apply_loaded_config` applies only the planned sections (so a
+bind-only reload no longer rewrites pointer settings or re-places windows), and a workspace
+whose `workspace "x"` declaration disappeared is unnamed while runtime renames survive. The
+suite is **2130 tests**; the release build and `cargo check --release --all-targets` are clean
+under `-D warnings`. Four `h91_*` live gates are written in
+`scripts/live-phases/lane-cfg.ps1` and parse-checked, but they have not run: neither matrix row
+leaves `partial` until the lead's cycle passes them. No dependency, timer, polling loop or
+thread was added.
+
 The source audit found missing DPI projection on five appearance rows and a
 missing floating-height preset consumer affecting two rows previously marked done.
 After the qualified R4 source and native follow-ups, `gaps`, `struts` and the
