@@ -535,9 +535,10 @@ physical mixed-DPI qualification keep both height rows partial.
   floats it again at its remembered geometry; 22 engine cases plus the work-area fraction
   helper pin niri `workspace.rs:1288-1476`, `floating.rs:425-552`, `scrolling.rs:999-1014`
   (see matrix row 123). Live gates `h88_*` (`lane-float-sizing.ps1`) are added and have not
-  run in a cycle. Not done: hiding floats under a fullscreen tile (`is_floating_visible`,
-  row 131), the physical-size rescale across output scales, and a float's returning column
-  width (`floating.rs:545`).
+  run in a cycle. Hiding floats under a fullscreen tile (`is_floating_visible`, row 131) is
+  implemented in `float_layer.rs` with live gates `h96_*` not yet run in a cycle (not done there:
+  `NoButRaised`). Not done: the physical-size rescale across output scales, and a float's
+  returning column width (`floating.rs:545`).
 - Admission-focus heuristics and continuous four-finger/touch-overview behavior.
 - [x] Exhaustive pinned action/CLI contract census, 2026-10-30:
   [action-census.md](../../parity/action-census.md). All 143 pinned actions (142 typed
