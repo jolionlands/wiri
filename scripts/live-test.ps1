@@ -3348,6 +3348,9 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-pace.ps1') } catch { LanePhas
 # H92: the focus core. One focus-window request settles managed focus on the native foreground (no retry);
 # niri's *ById actions change the named window and never move native or managed focus.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-focus.ps1') } catch { LanePhaseError 'lane_focus' $_ }
+# H96: niri hides the floating layer while the workspace's active window is a fullscreen tile and the floating
+# layer is not active (workspace.rs:1722-1728); focusing a float or leaving fullscreen brings it back in place.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-dpi-floats.ps1') } catch { LanePhaseError 'lane_dpi_floats' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

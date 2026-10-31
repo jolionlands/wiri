@@ -359,9 +359,12 @@ impl TilingEngine {
             ),
             lone_tile,
         };
-        // Floats keep their window size; their border is outside that rectangle.
+        // Floats keep their window size; their border is outside that rectangle. While the
+        // floating layer is hidden under a fullscreen tile there is nothing to decorate.
+        let floats_hidden = self.floats_hidden_by_fullscreen(output_id);
         for wid in &self.floating_windows {
-            if self.float_location(*wid) != Some((output_id, monitor.active_workspace))
+            if (floats_hidden && !self.sticky_windows.contains(wid))
+                || self.float_location(*wid) != Some((output_id, monitor.active_workspace))
                 || self.minimized.contains_key(wid)
             {
                 continue;

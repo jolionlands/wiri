@@ -12,7 +12,7 @@
 //! floats it again at the geometry it floated at. `toggle-window-floating` on such a tile
 //! floats it with both states gone. Windowed fullscreen (mod.rs:3586-3604, window/mapped.rs:1321-1351)
 //! has no Windows counterpart (matrix row 120). Not covered here: niri hides the floating layer
-//! under a fullscreen scrolling window (workspace.rs:1722-1728), which wiri does not do.
+//! under a fullscreen scrolling window (workspace.rs:1722-1728); that is `float_layer.rs`.
 //!
 //! Engine-level only. Model HWNDs are negative and invalid: no native window, pump, hook or
 //! input fixture is created, and every activation attempt is refused.

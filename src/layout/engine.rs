@@ -32,6 +32,7 @@ mod lane_l;
 pub use lane_l::FocusLayer;
 #[cfg(test)]
 mod decor_dpi_tests;
+mod float_layer;
 #[cfg(test)]
 mod float_sizing_parity_tests;
 #[cfg(test)]
@@ -3673,6 +3674,9 @@ impl TilingEngine {
             return;
         }
         self.remember_action_focus(wid);
+        // The focus layer may just have changed: a float cannot take the focus while it is
+        // hidden under a fullscreen tile, and a tile that takes it puts the floats away.
+        self.refresh_float_visibility_of_window(wid, backend);
         self.last_activated = Some(wid);
         match backend.activate_window(wid.as_isize()) {
             // Windows does not always raise EVENT_SYSTEM_FOREGROUND for a request it
@@ -3710,6 +3714,8 @@ impl TilingEngine {
         }
         let previous = self.os_foreground;
         let result = self.follow_os_foreground(window_id, backend);
+        // The focus layer follows the native foreground: floats leave or return with it.
+        self.refresh_float_visibility_of_window(window_id, backend);
         // Do not wait for the separate hook-registry clear event: IPC and rules
         // must already see the foreground window as no longer asking for attention.
         if self.is_urgent(window_id) {
@@ -3747,7 +3753,11 @@ impl TilingEngine {
                 .applied_state
                 .get(&window_id)
                 .map_or(true, |s| s.visible);
-            if !(on_inactive_workspace || hidden_by_wiri) {
+            // A float hidden under a fullscreen tile that the user asks for (Alt+Tab with
+            // `hide-method "cloak"`) is the floating layer coming back, not a replacement
+            // Windows picked for a window hidden a moment ago.
+            let asked_for = self.float_reveal_requested(window_id);
+            if !(on_inactive_workspace || (hidden_by_wiri && !asked_for)) {
                 self.touch_float(window_id);
                 self.remember_action_focus(window_id);
             }
@@ -4970,11 +4980,14 @@ impl TilingEngine {
     /// Show the floating windows of the active workspace of `output_id` and hide
     /// the ones of its other workspaces.  Part of every layout pass, next to the
     /// same job for tiles: a floating window is not left behind on screen when its
-    /// workspace is left.
+    /// workspace is left.  The floats of the active workspace are hidden too while
+    /// niri would not draw them: the active window is a fullscreen tile and the
+    /// floating layer is not active (`float_layer.rs`).
     fn reconcile_floats(&mut self, output_id: OutputId, backend: &BackendHandle) {
         let Some(active) = self.monitors.get(&output_id).map(|m| m.active_workspace) else {
             return;
         };
+        let layer_hidden = self.floats_hidden_by_fullscreen(output_id);
         let mut to_hide: Vec<WindowId> = Vec::new();
         let mut to_show: Vec<WindowId> = Vec::new();
         for (wid, home) in &self.float_homes {
@@ -4985,7 +4998,7 @@ impl TilingEngine {
             {
                 continue;
             }
-            if home.workspace == active {
+            if home.workspace == active && !layer_hidden {
                 to_show.push(*wid);
             } else {
                 to_hide.push(*wid);
