@@ -2,6 +2,71 @@
 use super::{Action, WorkspaceRef};
 use crate::utils::WindowId;
 
+/// A wiri-extension diagonal grid step (unified XY grid, `layout { unified-grid }`).
+///
+/// `unified-grid` gives a monitor one horizontal camera shared by every workspace
+/// row, which makes the desktop a single XY grid that can be traversed diagonally.
+/// A grid action is one row up or down (`Vertical`) and one column position left or
+/// right (`Right`) applied as **one** motion. With the mode off each one falls back to
+/// the sequential vertical-then-horizontal niri actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridAction {
+    /// `true` for one workspace row up, `false` for one row down.
+    pub up: bool,
+    /// `true` for one column position right, `false` for one column left.
+    pub right: bool,
+    /// `true` moves the focused window instead of the focus.
+    pub move_window: bool,
+}
+
+impl GridAction {
+    pub fn new(up: bool, right: bool, move_window: bool) -> Self {
+        Self {
+            up,
+            right,
+            move_window,
+        }
+    }
+
+    /// The name the config, `wiri-ctl action` and typed IPC all use.
+    pub fn name(self) -> &'static str {
+        match (self.move_window, self.up, self.right) {
+            (false, true, false) => "focus-up-left",
+            (false, true, true) => "focus-up-right",
+            (false, false, false) => "focus-down-left",
+            (false, false, true) => "focus-down-right",
+            (true, true, false) => "move-window-up-left",
+            (true, true, true) => "move-window-up-right",
+            (true, false, false) => "move-window-down-left",
+            (true, false, true) => "move-window-down-right",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridPan {
+    /// `true` scrolls the shared camera right, `false` left.
+    pub right: bool,
+    /// `true` moves one workspace row down, `false` one row up.
+    pub down: bool,
+}
+
+impl GridPan {
+    pub fn new(right: bool, down: bool) -> Self {
+        Self { right, down }
+    }
+
+    /// The name the config, `wiri-ctl action` and typed IPC all use.
+    pub fn name(self) -> &'static str {
+        match (self.down, self.right) {
+            (false, false) => "pan-up-left",
+            (false, true) => "pan-up-right",
+            (true, false) => "pan-down-left",
+            (true, true) => "pan-down-right",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FocusAction {
     ColumnRightOrFirst,
@@ -277,6 +342,18 @@ pub(super) fn parse(name: &str, args: &[String], quoted: &[bool]) -> Option<Opti
             | "rename-workspace"
             | "rename-ws"
             | "unset-workspace-name"
+            | "focus-up-left"
+            | "focus-up-right"
+            | "focus-down-left"
+            | "focus-down-right"
+            | "move-window-up-left"
+            | "move-window-up-right"
+            | "move-window-down-left"
+            | "move-window-down-right"
+            | "pan-up-left"
+            | "pan-up-right"
+            | "pan-down-left"
+            | "pan-down-right"
             | "focus-monitor"
             | "focus-monitor-left"
             | "focus-monitor-right"
@@ -548,6 +625,22 @@ fn parse_known(name: &str, args: &[String], quoted: &[bool]) -> Option<Action> {
         "unset-workspace-name" if empty => Some(Action::WorkspaceAction(W::UnsetName {
             workspace: w.workspace,
         })),
+        // wiri extension: the unified-grid diagonal steps. Unit actions, like niri's
+        // own directional actions.
+        "focus-up-left" => simple(Action::Grid(GridAction::new(true, false, false))),
+        "focus-up-right" => simple(Action::Grid(GridAction::new(true, true, false))),
+        "focus-down-left" => simple(Action::Grid(GridAction::new(false, false, false))),
+        "focus-down-right" => simple(Action::Grid(GridAction::new(false, true, false))),
+        "move-window-up-left" => simple(Action::Grid(GridAction::new(true, false, true))),
+        "move-window-up-right" => simple(Action::Grid(GridAction::new(true, true, true))),
+        "move-window-down-left" => simple(Action::Grid(GridAction::new(false, false, true))),
+        "move-window-down-right" => simple(Action::Grid(GridAction::new(false, true, true))),
+        // wiri extension: the unified-grid diagonal pan (touchpad two-finger scroll or a
+        // wheel that carries both axes).
+        "pan-up-left" => simple(Action::GridPan(GridPan::new(false, false))),
+        "pan-up-right" => simple(Action::GridPan(GridPan::new(true, false))),
+        "pan-down-left" => simple(Action::GridPan(GridPan::new(false, true))),
+        "pan-down-right" => simple(Action::GridPan(GridPan::new(true, true))),
         _ => {
             let (kind, suffix) = if let Some(s) = name.strip_prefix("focus-monitor") {
                 (0, s)

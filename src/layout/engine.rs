@@ -73,6 +73,9 @@ mod rule_policy;
 mod strip_model;
 mod tabs;
 mod transitions;
+// wiri extension `unified-grid`: one shared horizontal camera per monitor, the
+// x-matched vertical moves and the diagonal grid actions.
+mod unified_grid;
 
 // ---------------------------------------------------------------------------
 // Per-window applied-state cache
@@ -389,6 +392,14 @@ pub struct LayoutConfig {
     pub preset_window_heights: Vec<crate::config::types::SizeSpec>,
     /// `empty-workspace-above-first`: keep an empty workspace above the first one.
     pub empty_workspace_above_first: bool,
+    /// wiri extension `unified-grid`: all workspace rows of a monitor share one
+    /// horizontal camera, so vertical moves land on the x-matched column. Off by
+    /// default, which keeps niri's one-camera-per-row behaviour exactly.
+    pub unified_grid: bool,
+    /// wiri extension `unified-grid-chord-ms`: the window in which two arrow presses
+    /// merge into one diagonal action, in milliseconds, measured from the input events'
+    /// own timestamps. `0` disables merging.
+    pub unified_grid_chord_ms: u32,
     /// `fullscreen-backdrop-color`: the colour behind a fullscreen window, as `#rrggbb(aa)`.
     pub fullscreen_backdrop_color: Option<String>,
     pub default_column_width: Option<Option<crate::config::types::SizeSpec>>,
@@ -480,6 +491,8 @@ impl Default for LayoutConfig {
             preset_column_widths: Vec::new(),
             preset_window_heights: Vec::new(),
             empty_workspace_above_first: false,
+            unified_grid: false,
+            unified_grid_chord_ms: 150,
             fullscreen_backdrop_color: None,
             default_column_width: None,
             max_visible_columns: 0,
@@ -611,6 +624,8 @@ impl LayoutConfig {
         lc.preset_column_widths = config.layout.preset_column_widths.clone();
         lc.preset_window_heights = config.layout.preset_window_heights.clone();
         lc.empty_workspace_above_first = config.layout.empty_workspace_above_first;
+        lc.unified_grid = config.layout.unified_grid;
+        lc.unified_grid_chord_ms = config.layout.unified_grid_chord_ms.min(1000);
         lc.fullscreen_backdrop_color = config.layout.fullscreen_backdrop_color.clone();
         lc.default_column_width = config.layout.default_column_width;
         lc.strip_frame = config.layout.strip_frame;
@@ -908,6 +923,11 @@ pub struct TilingEngine {
     transitions: transitions::Transitions,
     gesture_output: Option<OutputId>,
     gesture_workspace_offset: Option<(OutputId, f64)>,
+    /// wiri `unified-grid` rule 5: the state the last chordable vertical arrow started
+    /// from, so a merged chord continues from there. `None` with the mode off.
+    grid_chord: Option<unified_grid::GridAnchor>,
+    /// The next grid action continues from `grid_chord` (set by the chorded dispatch).
+    grid_chorded: bool,
     // ---- Item 3: sticky windows (visible on all workspaces) ----
     /// Windows marked sticky by the user; they float above all workspaces and
     /// are never hidden during workspace switches.
@@ -999,6 +1019,8 @@ impl TilingEngine {
             transitions: Default::default(),
             gesture_output: None,
             gesture_workspace_offset: None,
+            grid_chord: None,
+            grid_chorded: false,
             sticky_windows: HashSet::new(),
             focus_history: focus_actions::FocusHistory::default(),
             foreground_observations: foreground::ForegroundReducer::default(),
@@ -4584,7 +4606,14 @@ impl TilingEngine {
             .unwrap_or_default();
 
         // Switch workspace
-        if let Some(monitor) = self.monitors.get_mut(&focused_output) {
+        let unified_camera = self
+            .unified_grid_for(focused_output)
+            .then(|| self.camera_offset(focused_output));
+        if unified_camera.is_some() {
+            // wiri `unified-grid`: every row shares one horizontal camera, so the row
+            // change carries x across and lands on the column under its anchor.
+            self.unified_switch_workspace(focused_output, workspace_id);
+        } else if let Some(monitor) = self.monitors.get_mut(&focused_output) {
             monitor.switch_workspace(workspace_id);
         }
         // An empty workspace in the middle disappears once the user has left it (niri).
@@ -4650,7 +4679,14 @@ impl TilingEngine {
                 .start_workspace_slide(focused_output, from_offset, 0.0, 0);
         }
 
-        self.reveal_focused_column(focused_output);
+        // Unified mode keeps the shared camera across the row change: the x-matched
+        // column is already under it, and the slide animates only vertically. Niri's
+        // per-row camera still reveals the new row's own focus.
+        if let Some(camera) = unified_camera {
+            self.set_camera_offset(focused_output, camera);
+        } else {
+            self.reveal_focused_column(focused_output);
+        }
         self.apply_layout_for_monitor(focused_output, backend);
 
         // Activate the focused window on the new workspace
@@ -8535,6 +8571,9 @@ impl TilingEngine {
         direction: WorkspaceDirection,
         backend: &BackendHandle,
     ) {
+        // wiri `unified-grid` rule 5: this is the chordable vertical focus arrow, so
+        // remember where it started before the row changes.
+        self.note_grid_vertical(matches!(direction, WorkspaceDirection::Previous), false);
         let target = self.monitors.focused().and_then(|monitor| {
             monitor.workspace_next_to(
                 monitor.active_workspace,

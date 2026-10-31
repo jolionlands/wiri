@@ -5,6 +5,54 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane GRID — the unified XY grid (wiri extension, opt-in)
+
+- `layout { unified-grid }` (also `unified-grid true` / `unified-grid false`, and accepted in a
+  per-output `layout {}` override) makes the desktop **one 2D grid**: x is each workspace's
+  endless column strip, y is the monitor's workspace stack, and every row of a monitor shares
+  **one** horizontal camera instead of niri's one camera per row. Off by default; with the flag
+  absent or false every code path in the lane is bypassed and behaviour is bit-identical to the
+  niri-parity behaviour the matrices measure. `layout { unified-grid-chord-ms 150 }` sets the
+  arrow-chord window (integer `0..=1000`; `0` disables merging).
+- The camera keeps living in the active workspace's `scroll_offset.x`, so `calculate_positions`,
+  `is_over_gap`, the gestures, the animation driver and the IPC geometry are untouched. What
+  changes is the row change: `unified_switch_workspace` carries the offset across and lands on
+  the column under the camera's x anchor. Horizontal focus and column moves inside a row keep
+  today's reveal/centre rules; the workspace slide animates only vertically.
+- Rule 3 (x-matched vertical moves) applies to `focus-workspace-up`/`-down`,
+  `focus-window-or-workspace-up`/`-down` when they cross rows, `move-window-to-workspace-up`/`-down`
+  and `move-column-to-workspace-up`/`-down`, and to named/indexed workspace moves: the destination
+  column is the one whose strip x-range contains the focus's horizontal centre; an anchor in a gap,
+  before the first column or past the last one takes the nearest column by distance (ties to the
+  earlier one), an empty row just becomes active, and a moved window or column is inserted at the
+  index the anchor falls into, keeping its width.
+- Eight new actions, usable from `binds {}`, `wiri-ctl action <name>` and typed IPC:
+  `focus-up-left`, `focus-up-right`, `focus-down-left`, `focus-down-right`,
+  `move-window-up-left`, `move-window-up-right`, `move-window-down-left`,
+  `move-window-down-right`. They resolve the row and the column before anything moves, so the
+  row change and the horizontal reveal are one camera motion. With the mode off they fall back to
+  the sequential vertical-then-horizontal niri actions.
+- Rule 5 (two arrows together): the keyboard engine remembers the chordable vertical arrow with
+  its virtual key and the input event's own timestamp (`KBDLLHOOKSTRUCT::time`). When the
+  perpendicular arrow of the same family fires while that key is still held and within
+  `unified-grid-chord-ms`, the pair becomes the diagonal action and the engine continues from the
+  pre-vertical snapshot, retargeting the in-flight camera animation. **A single arrow press never
+  waits** — it is dispatched by the same `event` call that observed the key-down, and a test pins
+  that.
+- Rule 6 (diagonal pan): `pan-up-left`, `pan-up-right`, `pan-down-left`, `pan-down-right` scroll
+  the shared camera one `scroll-step` along x and move one row along y in one pass.
+- IPC: `monitors` / `outputs` now report `unified_grid` per output. Diagonal moves go through the
+  ordinary focus and workspace paths, so the usual focus/workspace events are emitted with no new
+  event type.
+- Tests: 15 engine cases in `src/layout/engine/unified_grid.rs` (3 rows x 4-6 columns of varied
+  widths: x-match, gaps, row ends, empty row, insertion of moved windows/columns, diagonal focus
+  and move, chord continuation, direct diagonal, diagonal pan, 100% mode-off identity) and 7
+  keyboard cases (single-arrow dispatch, merge, released key, out-of-window, other family, move
+  family, window `0`).
+- Live gates: `scripts/live-phases/lane-grid.ps1` (`h98_*`), written and parse-checked.
+- No timer, thread, polling loop or idle wake-up is added; with the mode off the only added work is
+  one `bool` read on the workspace-switch and vertical-action paths.
+
 ### Lane DPI task 1 — border, focus ring and shadow are logical pixels projected per output
 - `border { width }`, `focus-ring { width }` and the window-rule overrides of both now keep their fractional LOGICAL value (`RingStyle::width` and `RingOverride::width` are `f64`; the decoder no longer rounds). The engine turns them into physical pixels once for the output a window is on, with niri's `round_logical_in_physical_max1` (`layout/tile.rs:244,252-257`, `utils/mod.rs:185-191`; new `layout::metrics::ring_width_px`): zero stays zero, any other width is at least one physical pixel, halves round away from zero. `LayoutConfig::from_config_at_scale` carries the result in `border_width` / `focus_ring_width`, so the tile shrink, native allocation, proportional widths, the drawn band and the ring's outward extent follow the output's scale, and a scale change or a move to another output re-projects them. `RingOverride::inset` takes the scale for rule widths and for the saved width of an off layout border a rule enables (`LayoutConfig::border_inset_with`).
 - The shadow's softness, spread and offsets (layout and rule) are projected like niri's `Shadow` (`shadow.rs:43-61`, new `layout::metrics::project_shadow`): the blur sigma scales unrounded, the spread magnitude and each offset are ceiled to a physical pixel.

@@ -113,6 +113,33 @@ in both.
   `set-workspace-layout`, ...) keep their older lenient arms.
 - `workspace=` as a property of the workspace actions and `--workspace` on `move-workspace-to-*`.
 
+### wiri extensions that are not niri actions: the unified XY grid (Lane GRID)
+
+These twelve names are **not** part of niri's vocabulary and are therefore not rows of the
+census table below; they are wiri's own `layout { unified-grid }` extension
+(`docs/design/unified-grid.md`). All of them parse from a KDL bind, from
+`wiri-ctl action <name>` and from typed IPC `RunAction`, and all are unit actions that
+take no arguments.
+
+| wiri action | unified-grid mode ON | mode OFF (niri sequential fallback) |
+| --- | --- | --- |
+| `focus-up-left` | one row up (rule 3) then one column left from the x-matched column, one camera motion | `focus-window-or-workspace-up` then `focus-column-left` |
+| `focus-up-right` | one row up, one column right | `focus-window-or-workspace-up` then `focus-column-right` |
+| `focus-down-left` | one row down, one column left | `focus-window-or-workspace-down` then `focus-column-left` |
+| `focus-down-right` | one row down, one column right | `focus-window-or-workspace-down` then `focus-column-right` |
+| `move-window-up-left` | move the focused window one row up and one column position left, focus stays on it | `move-window-to-workspace-up` then `move-column-left` |
+| `move-window-up-right` | one row up, one column position right | `move-window-to-workspace-up` then `move-column-right` |
+| `move-window-down-left` | one row down, one column position left | `move-window-to-workspace-down` then `move-column-left` |
+| `move-window-down-right` | one row down, one column position right | `move-window-to-workspace-down` then `move-column-right` |
+| `pan-up-left` | shared camera scrolls one `scroll-step` left and the desktop moves one row up, one motion | `scroll-left` then `focus-workspace-up` |
+| `pan-up-right` | one step right, one row up | `scroll-right` then `focus-workspace-up` |
+| `pan-down-left` | one step left, one row down | `scroll-left` then `focus-workspace-down` |
+| `pan-down-right` | one step right, one row down | `scroll-right` then `focus-workspace-down` |
+
+The arrow **chords** (rule 5) are not new action names: a vertical arrow followed by the
+perpendicular arrow of the same family within `layout { unified-grid-chord-ms }` becomes
+the corresponding `focus-*` or `move-window-*` diagonal above.
+
 ## Remaining gaps
 
 1. The first official live run of the h92_by_id_* gates (the nine by-id actions are unit-proven).

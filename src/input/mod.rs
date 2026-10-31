@@ -28,7 +28,9 @@ pub mod touchpen;
 
 pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
 pub use hotkey::{HotkeyBinding, HotkeyId};
-pub use layout_actions::{FocusAction, MonitorAction, MonitorTarget, WorkspaceAction};
+pub use layout_actions::{
+    FocusAction, GridAction, GridPan, MonitorAction, MonitorTarget, WorkspaceAction,
+};
 pub use low_level_hook::{
     begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab, current_grab,
     is_grab_active, last_press_was_repeat, start_keyboard_hook, start_mouse_hook,
@@ -189,6 +191,12 @@ pub enum Action {
     MoveWindowDownOrToWorkspaceDown,
     /// niri `move-window-up-or-to-workspace-up`.
     MoveWindowUpOrToWorkspaceUp,
+    /// wiri extension (unified XY grid): a diagonal step — one workspace row up or
+    /// down and one column left or right, applied as one motion.
+    Grid(GridAction),
+    /// wiri extension (unified XY grid): a diagonal pan — the shared camera scrolls
+    /// one step along x and the desktop moves one row along y, as one motion.
+    GridPan(GridPan),
     /// niri `move-column-left-or-to-monitor-left`: left inside the strip, else the whole
     /// column to the monitor on the left.
     MoveColumnLeftOrToMonitorLeft,

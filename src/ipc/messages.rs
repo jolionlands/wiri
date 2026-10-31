@@ -1057,6 +1057,10 @@ pub struct MonitorInfo {
     pub window_count: usize,
     /// True for the focused output (where new window operations go).
     pub focused: bool,
+    /// wiri extension: this monitor runs the unified XY grid (`layout { unified-grid }`),
+    /// where every workspace row shares one horizontal camera.
+    #[serde(default)]
+    pub unified_grid: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

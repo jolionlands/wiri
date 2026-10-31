@@ -1624,6 +1624,17 @@ fn print_monitor_list(resp: &serde_json::Value) {
         result.len(),
         if result.len() == 1 { "" } else { "s" }
     );
+    // wiri extension: which outputs run the unified XY grid (`layout { unified-grid }`).
+    let unified: Vec<&str> = result
+        .iter()
+        .filter(|m| m.get("unified_grid").and_then(|v| v.as_bool()) == Some(true))
+        .map(|m| m.get("name").and_then(|v| v.as_str()).unwrap_or("?"))
+        .collect();
+    if unified.is_empty() {
+        outln!("  unified-grid: off (niri: one horizontal camera per workspace row)");
+    } else {
+        outln!("  unified-grid: on for {}", unified.join(", "));
+    }
 }
 
 /// Format the response to `ListBindings` (sent by `test-bindings`) as a

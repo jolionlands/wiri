@@ -2423,6 +2423,10 @@ impl Decoder {
                 "smart-borders" | "border-smart" | "smart" => {
                     self.set_flag(child, &mut p.smart_borders)
                 }
+                // wiri extension: one shared horizontal camera per monitor, so the
+                // desktop is a single XY grid. Off by default (niri parity).
+                "unified-grid" | "unified-xy-grid" => self.set_flag(child, &mut p.unified_grid),
+                "unified-grid-chord-ms" => self.set_u32(child, 1000, &mut p.unified_grid_chord_ms),
                 "status-bar" => self.set_flag(child, &mut p.status_bar),
                 "hide-method" => self.set_text(child, &mut p.hide_method),
                 "reserve-top" => {
@@ -2520,6 +2524,8 @@ impl Decoder {
                         "preset-column-widths",
                         "default-column-width",
                         "background-color",
+                        "unified-grid",
+                        "unified-grid-chord-ms",
                     ],
                 ),
             }

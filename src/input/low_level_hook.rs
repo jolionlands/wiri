@@ -494,7 +494,7 @@ unsafe extern "system" fn keyboard_hook_callback(
     }
     let mut decision = crate::input::keyboard::ENGINE
         .lock()
-        .event(vk, pressed, now);
+        .event_at(vk, pressed, now, kb.time);
     let mods = crate::input::keyboard::ENGINE.lock().modifiers();
     let double_alt = DOUBLE_ALT
         .lock()
@@ -506,7 +506,11 @@ unsafe extern "system" fn keyboard_hook_callback(
         mask_shell_menu();
     }
     if let Some(action) = decision.action {
-        crate::input::dispatch::send(action);
+        if decision.chorded {
+            crate::input::dispatch::send_chorded(action);
+        } else {
+            crate::input::dispatch::send(action);
+        }
     }
     // Escape remains available to applications, but also exits the manager's modes.
     if pressed && vk == VK_ESCAPE && !decision.consume {

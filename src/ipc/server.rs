@@ -1682,6 +1682,7 @@ impl IpcServer {
                                     .workspace_number_on(*oid, m.active_workspace_id()),
                                 window_count,
                                 focused: Some(*oid) == focused,
+                                unified_grid: eng.unified_grid_for(*oid),
                             }
                         })
                         .collect();

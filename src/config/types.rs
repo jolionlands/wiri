@@ -632,6 +632,12 @@ pub struct LayoutConfigPartial {
     pub snap_threshold_px: Option<u32>,
     pub status_bar: Option<bool>,
     pub hide_method: Option<String>,
+    /// wiri extension `unified-grid`: one shared horizontal camera per monitor
+    /// instead of niri's one camera per workspace row.
+    pub unified_grid: Option<bool>,
+    /// wiri extension `unified-grid-chord-ms`: how long two arrow presses count as
+    /// one diagonal chord, measured from the input events' own timestamps.
+    pub unified_grid_chord_ms: Option<u32>,
     /// Unset edges inherit independently; explicit physical zero remains an override.
     pub struts: Edges<Option<InsetValue>>,
     /// The `focus-ring`, `border`, `shadow`, `insert-hint` and `tab-indicator` blocks this
@@ -729,6 +735,12 @@ impl LayoutConfigPartial {
         }
         if let Some(v) = self.empty_workspace_above_first {
             out.empty_workspace_above_first = v;
+        }
+        if let Some(v) = self.unified_grid {
+            out.unified_grid = v;
+        }
+        if let Some(v) = self.unified_grid_chord_ms {
+            out.unified_grid_chord_ms = v;
         }
         if let Some(ref v) = self.fullscreen_backdrop_color {
             out.fullscreen_backdrop_color = Some(v.clone());
@@ -853,6 +865,14 @@ pub struct LayoutConfig {
     /// `empty-workspace-above-first`: the workspace list keeps an empty workspace above the
     /// first one, so that `focus-workspace-up` from the first workspace has somewhere to go.
     pub empty_workspace_above_first: bool,
+    /// wiri extension `unified-grid`: all workspace rows of a monitor share one
+    /// horizontal camera, so vertical moves land on the x-matched column and the
+    /// desktop can be traversed diagonally. Off by default (niri parity).
+    pub unified_grid: bool,
+    /// wiri extension `unified-grid-chord-ms`: the window, in milliseconds, in which
+    /// two arrow presses merge into one diagonal action. Measured from the input
+    /// events' own timestamps. `0` disables merging.
+    pub unified_grid_chord_ms: u32,
     /// `fullscreen-backdrop-color`: the colour the overlay layer fills the monitor with
     /// behind a fullscreen window (`#rrggbb`, `#rrggbbaa`); `None` draws nothing.
     pub fullscreen_backdrop_color: Option<String>,
@@ -950,6 +970,8 @@ impl LayoutConfig {
             preset_column_widths: Vec::new(),
             preset_window_heights: Vec::new(),
             empty_workspace_above_first: false,
+            unified_grid: false,
+            unified_grid_chord_ms: 150,
             fullscreen_backdrop_color: None,
             default_column_width: None,
             default_column_display: "normal".to_string(),

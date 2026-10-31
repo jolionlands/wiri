@@ -60,6 +60,54 @@ pub struct Decision {
     pub consume: bool,
     pub mask_menu: bool,
     pub action: Option<Action>,
+    /// The action is the second half of a wiri `unified-grid` arrow chord: the pair was
+    /// merged into one diagonal grid action, so the engine continues from the state the
+    /// first arrow started on instead of from where it already moved the focus.
+    pub chorded: bool,
+}
+
+/// The vertical arrow that opened a `unified-grid` chord, and what it needs to be
+/// continued by the perpendicular arrow of the same family.
+#[derive(Clone)]
+struct ChordPending {
+    /// `true` when the vertical leg moves a window (`move-*`), `false` for focus arrows.
+    move_window: bool,
+    /// `true` for a row-up step.
+    up: bool,
+    /// The virtual key of the vertical arrow, so the pair needs it still held.
+    vk: u32,
+    /// The vertical arrow's own input-event timestamp, in milliseconds.
+    event_ms: u32,
+}
+
+/// `Some((move_window, up))` for the vertical arrows a `unified-grid` chord can start
+/// from: focus arrows merge with focus arrows, move arrows with move arrows.
+fn chord_vertical(action: &Action) -> Option<(bool, bool)> {
+    use super::FocusAction as F;
+    use super::WorkspaceAction as W;
+    match action {
+        Action::LayoutFocus(F::WindowOrWorkspaceUp) => Some((false, true)),
+        Action::LayoutFocus(F::WindowOrWorkspaceDown) => Some((false, false)),
+        Action::FocusWorkspacePrevious => Some((false, true)),
+        Action::FocusWorkspaceNext => Some((false, false)),
+        Action::WorkspaceAction(W::MoveWindowRelative { down, .. }) => Some((true, !*down)),
+        Action::MoveColumnToWorkspaceUp | Action::MoveWindowUpOrToWorkspaceUp => Some((true, true)),
+        Action::MoveColumnToWorkspaceDown | Action::MoveWindowDownOrToWorkspaceDown => {
+            Some((true, false))
+        }
+        _ => None,
+    }
+}
+
+/// `Some(right)` for the horizontal arrows a chord can be continued with, per family.
+fn chord_horizontal(action: &Action, move_window: bool) -> Option<bool> {
+    match (move_window, action) {
+        (false, Action::FocusColumnLeft) => Some(false),
+        (false, Action::FocusColumnRight) => Some(true),
+        (true, Action::MoveColumnLeft) => Some(false),
+        (true, Action::MoveColumnRight) => Some(true),
+        _ => None,
+    }
 }
 
 pub fn modifier(vk: u32) -> u32 {
@@ -84,6 +132,11 @@ pub struct KeyboardEngine {
     inhibited: bool,
     /// niri's Latin-key fallback, consulted only when the observed key names no bind.
     latin: Option<std::sync::Arc<dyn super::keylayout::LatinFallback>>,
+    /// wiri `unified-grid`: the vertical arrow the next perpendicular arrow can merge
+    /// with, if it comes soon enough and its key is still held.
+    chord: Option<ChordPending>,
+    /// `layout { unified-grid-chord-ms }`; `0` disables merging.
+    chord_ms: u32,
 }
 impl Default for KeyboardEngine {
     fn default() -> Self {
@@ -93,6 +146,8 @@ impl Default for KeyboardEngine {
             captured: HashMap::new(),
             inhibited: false,
             latin: None,
+            chord: None,
+            chord_ms: 0,
         }
     }
 }
@@ -104,6 +159,55 @@ impl KeyboardEngine {
         fallback: Option<std::sync::Arc<dyn super::keylayout::LatinFallback>>,
     ) {
         self.latin = fallback;
+    }
+
+    /// `layout { unified-grid-chord-ms }`: how long two arrow presses count as one
+    /// diagonal chord. Called at startup and on every reload, never per keystroke.
+    pub fn set_unified_grid_chord_ms(&mut self, ms: u32) {
+        self.chord_ms = ms.min(1000);
+        if self.chord_ms == 0 {
+            self.chord = None;
+        }
+    }
+
+    /// Whether a physical key is still down. The chord window needs the first arrow of
+    /// the pair to still be held when the second one fires.
+    pub fn is_down(&self, vk: u32) -> bool {
+        self.down.get(vk as usize).copied().unwrap_or(false)
+    }
+
+    /// Merge a perpendicular arrow into the diagonal action when the vertical arrow that
+    /// opened the chord is still held and fired within `unified-grid-chord-ms`, measured
+    /// from the two input events' own timestamps.
+    fn merge_chord(&mut self, action: Action, vk: u32, event_ms: u32) -> (Action, bool) {
+        let pending = self.chord.take();
+        if let Some(pending) = pending {
+            let in_window = self.chord_ms > 0
+                && event_ms.wrapping_sub(pending.event_ms) <= self.chord_ms
+                && pending.vk != vk
+                && self.is_down(pending.vk);
+            if in_window {
+                if let Some(right) = chord_horizontal(&action, pending.move_window) {
+                    return (
+                        Action::Grid(super::GridAction::new(
+                            pending.up,
+                            right,
+                            pending.move_window,
+                        )),
+                        true,
+                    );
+                }
+            }
+        }
+        if let Some((move_window, up)) = chord_vertical(&action) {
+            self.chord = Some(ChordPending {
+                move_window,
+                up,
+                vk,
+                event_ms,
+            });
+        }
+        (action, false)
     }
 
     /// The bind an observed `(modifiers, virtual key)` names.
@@ -180,6 +284,22 @@ impl KeyboardEngine {
         }
     }
     pub fn event(&mut self, vk: u32, pressed: bool, now: Instant) -> Decision {
+        self.event_at(vk, pressed, now, 0)
+    }
+
+    /// [`Self::event`] with the input event's own timestamp in milliseconds, which is what
+    /// the `unified-grid` chord window is measured from.
+    pub fn event_at(&mut self, vk: u32, pressed: bool, now: Instant, event_ms: u32) -> Decision {
+        let mut decision = self.event_inner(vk, pressed, now);
+        if let Some(action) = decision.action.take() {
+            let (action, chorded) = self.merge_chord(action, vk, event_ms);
+            decision.action = Some(action);
+            decision.chorded = chorded;
+        }
+        decision
+    }
+
+    fn event_inner(&mut self, vk: u32, pressed: bool, now: Instant) -> Decision {
         let Some(slot) = self.down.get_mut(vk as usize) else {
             return Decision::default();
         };
@@ -206,6 +326,7 @@ impl KeyboardEngine {
                     consume: true,
                     action,
                     mask_menu: false,
+                    chorded: false,
                 };
             }
             return Decision::default();
@@ -224,6 +345,7 @@ impl KeyboardEngine {
                 consume: true,
                 action,
                 mask_menu: false,
+                chorded: false,
             };
         }
         // Do not steal an auto-repeat whose first down reached the application.
@@ -250,6 +372,7 @@ impl KeyboardEngine {
             consume: true,
             action,
             mask_menu: mods & (1 | 8) != 0,
+            chorded: false,
         }
     }
     /// RegisterHotKey is only a down fallback when the LL hook cannot observe input.
@@ -438,6 +561,147 @@ mod tests {
         e.event(0x54, false, t);
         assert!(e.event(0x54, true, t).action.is_some());
     }
+    fn grid_engine() -> KeyboardEngine {
+        use crate::input::{FocusAction, WorkspaceAction};
+        let mut e = KeyboardEngine::default();
+        e.configure(
+            &[
+                (
+                    0,
+                    0x26,
+                    Action::LayoutFocus(FocusAction::WindowOrWorkspaceUp),
+                ),
+                (
+                    0,
+                    0x28,
+                    Action::LayoutFocus(FocusAction::WindowOrWorkspaceDown),
+                ),
+                (0, 0x27, Action::FocusColumnRight),
+                (0, 0x25, Action::FocusColumnLeft),
+                (0, 0x22, Action::MoveColumnRight),
+                (
+                    0,
+                    0x21,
+                    Action::WorkspaceAction(WorkspaceAction::MoveWindowRelative {
+                        window: None,
+                        down: false,
+                        focus: true,
+                    }),
+                ),
+            ],
+            &HashMap::new(),
+        );
+        e.set_unified_grid_chord_ms(150);
+        e
+    }
+
+    /// A single arrow press is dispatched on the key-down that observed it: nothing waits
+    /// for a possible second arrow, so the hotkey path costs what it always did.
+    #[test]
+    fn a_single_vertical_arrow_dispatches_on_the_first_down() {
+        use crate::input::FocusAction;
+        let mut e = grid_engine();
+        let t = Instant::now();
+        let d = e.event_at(0x26, true, t, 1_000);
+        assert!(d.consume);
+        assert_eq!(
+            d.action,
+            Some(Action::LayoutFocus(FocusAction::WindowOrWorkspaceUp))
+        );
+        assert!(!d.chorded);
+    }
+
+    /// Rule 5: the perpendicular arrow of the same family, within the window and with the
+    /// first key still held, becomes the diagonal action.
+    #[test]
+    fn two_arrows_together_merge_into_the_diagonal_action() {
+        use crate::input::{FocusAction, GridAction};
+        let mut e = grid_engine();
+        let t = Instant::now();
+        assert_eq!(
+            e.event_at(0x26, true, t, 1_000).action,
+            Some(Action::LayoutFocus(FocusAction::WindowOrWorkspaceUp))
+        );
+        let d = e.event_at(0x27, true, t, 1_080);
+        assert!(d.chorded);
+        assert_eq!(
+            d.action,
+            Some(Action::Grid(GridAction::new(true, true, false)))
+        );
+        // A merge consumes the pair: the next horizontal press is plain again.
+        e.event_at(0x26, false, t, 1_090);
+        e.event_at(0x27, false, t, 1_091);
+        let plain = e.event_at(0x27, true, t, 1_100);
+        assert!(!plain.chorded);
+        assert_eq!(plain.action, Some(Action::FocusColumnRight));
+    }
+
+    #[test]
+    fn a_released_first_arrow_does_not_merge() {
+        let mut e = grid_engine();
+        let t = Instant::now();
+        e.event_at(0x26, true, t, 1_000);
+        e.event_at(0x26, false, t, 1_050);
+        let d = e.event_at(0x27, true, t, 1_080);
+        assert!(!d.chorded);
+        assert_eq!(d.action, Some(Action::FocusColumnRight));
+    }
+
+    #[test]
+    fn a_second_arrow_outside_the_window_does_not_merge() {
+        let mut e = grid_engine();
+        let t = Instant::now();
+        e.event_at(0x26, true, t, 1_000);
+        let d = e.event_at(0x27, true, t, 1_151);
+        assert!(!d.chorded);
+        assert_eq!(d.action, Some(Action::FocusColumnRight));
+    }
+
+    #[test]
+    fn arrows_of_different_families_do_not_merge() {
+        let mut e = grid_engine();
+        let t = Instant::now();
+        e.event_at(0x26, true, t, 1_000);
+        // A move arrow after a focus arrow is not a chord.
+        let d = e.event_at(0x22, true, t, 1_050);
+        assert!(!d.chorded);
+        assert_eq!(d.action, Some(Action::MoveColumnRight));
+    }
+
+    #[test]
+    fn the_move_family_merges_into_the_diagonal_window_move() {
+        use crate::input::{GridAction, WorkspaceAction};
+        let mut e = grid_engine();
+        let t = Instant::now();
+        assert_eq!(
+            e.event_at(0x21, true, t, 1_000).action,
+            Some(Action::WorkspaceAction(
+                WorkspaceAction::MoveWindowRelative {
+                    window: None,
+                    down: false,
+                    focus: true,
+                }
+            ))
+        );
+        let d = e.event_at(0x22, true, t, 1_060);
+        assert!(d.chorded);
+        assert_eq!(
+            d.action,
+            Some(Action::Grid(GridAction::new(true, true, true)))
+        );
+    }
+
+    #[test]
+    fn a_chord_window_of_zero_disables_merging() {
+        let mut e = grid_engine();
+        e.set_unified_grid_chord_ms(0);
+        let t = Instant::now();
+        e.event_at(0x26, true, t, 1_000);
+        let d = e.event_at(0x27, true, t, 1_001);
+        assert!(!d.chorded);
+        assert_eq!(d.action, Some(Action::FocusColumnRight));
+    }
+
     #[test]
     fn cooldown_is_per_bind_and_covers_separate_presses() {
         let mut e = engine(BindOptions {

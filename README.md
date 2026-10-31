@@ -116,6 +116,27 @@ animations {
 
 Add your own binds to the same `binds` block. A bind on the same keys as a built-in wins. [`examples/cheatsheet.kdl`](examples/cheatsheet.kdl) binds every action to a memorable chord, which is a good way to learn the keymap. A mistake in the file is reported with its line and column, and the last good config stays in use. For every option, see [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) (section 4).
 
+## Unified XY grid (opt-in wiri extension)
+
+With `unified-grid` on, the desktop is one 2D grid: every workspace row on a monitor shares one horizontal camera, so moving up or down lands on the column under you, and you can move diagonally in one step. Columns keep their own widths. Without the flag, wiri behaves exactly like niri.
+
+```kdl
+layout {
+    unified-grid
+    unified-grid-chord-ms 150   // two arrows within this window make one diagonal move; 0 turns it off
+}
+
+binds {
+    Mod+Alt+U { focus-up-left; }
+    Mod+Alt+I { focus-up-right; }
+    Mod+Alt+J { focus-down-left; }
+    Mod+Alt+L { focus-down-right; }
+}
+```
+
+The same four directions exist as `move-window-up-left` … `move-window-down-right` and `pan-up-left` … `pan-down-right`, from binds, `wiri-ctl action` and IPC. Hold one arrow and press the perpendicular one to make a single diagonal move; a single press never waits. It can be turned on for one monitor only. The full design is in [docs/design/unified-grid.md](docs/design/unified-grid.md).
+
+
 ## Scripting with wiri-ctl
 
 `wiri-ctl` talks to the running daemon over a named pipe. Its output is readable by default, and `--json` gives raw output for scripts.
@@ -155,7 +176,7 @@ The key-press figure runs from the real `SendInput` call to the moved window's o
 These are in progress:
 
 - **Pannable overview.** The overview becomes niri's fixed-zoom view of the endless grid, which you can pan.
-- **Unified XY grid (opt-in).** All workspace rows share one camera, so focus can move diagonally.
+- **Unified XY grid in the overview.** The [unified grid](#unified-xy-grid-opt-in-wiri-extension) works in the normal view; the overview will draw it with the same shared camera.
 - **Multi-monitor and mixed-DPI checks** on real hardware.
 - **ARM64 performance numbers.**
 

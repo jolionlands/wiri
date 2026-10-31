@@ -718,9 +718,12 @@ impl MessageLoop {
         }
         let (mut current_hotkeys, bind_options) = build_hotkey_list(&engine);
         publish_recent_input(&engine, &current_hotkeys);
-        keyboard::ENGINE
-            .lock()
-            .configure(&current_hotkeys, &bind_options);
+        let chord_ms = engine.read().unified_grid_chord_ms();
+        {
+            let mut keys = keyboard::ENGINE.lock();
+            keys.configure(&current_hotkeys, &bind_options);
+            keys.set_unified_grid_chord_ms(chord_ms);
+        }
         keyboard::configure_latin_fallback();
         let (mut registered_ids, _) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
@@ -785,6 +788,9 @@ impl MessageLoop {
                     keyboard::ENGINE
                         .lock()
                         .configure(&new_hotkeys, &new_options);
+                    keyboard::ENGINE
+                        .lock()
+                        .set_unified_grid_chord_ms(engine.read().unified_grid_chord_ms());
                     keyboard::configure_latin_fallback();
                     let (new_ids, _) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
@@ -802,6 +808,13 @@ impl MessageLoop {
                         match work {
                             crate::input::dispatch::Work::Action(action) => {
                                 info!("KEYHOOK -> {:?}", action);
+                                execute_action(&action, &engine, &backend_handle, &quit_tx);
+                            }
+                            crate::input::dispatch::Work::ChordedAction(action) => {
+                                // wiri `unified-grid` rule 5: continue from the state the
+                                // first arrow started on, not from where it already moved.
+                                info!("KEYHOOK -> {:?} (chord)", action);
+                                engine.write().note_grid_chord();
                                 execute_action(&action, &engine, &backend_handle, &quit_tx);
                             }
                             crate::input::dispatch::Work::Recent(input) => {
@@ -1113,6 +1126,13 @@ pub(crate) fn perform_action_on(
         Action::LayoutFocus(action) => engine.write().focus_layout_action(action, backend),
         Action::WorkspaceAction(action) => engine.write().workspace_layout_action(action, backend),
         Action::MonitorAction(action) => engine.write().monitor_layout_action(action, backend),
+        Action::Grid(step) => {
+            // wiri extension: the diagonal step of the unified XY grid. `note_grid_chord`
+            // was set by the chorded dispatch; a direct bind runs from the current focus.
+            let chorded = engine.read().grid_chord_pending();
+            engine.write().apply_grid_action(*step, chorded, backend);
+        }
+        Action::GridPan(pan) => engine.write().unified_grid_pan(*pan, backend),
         Action::ToggleKeyboardShortcutsInhibit => {
             keyboard::ENGINE.lock().toggle_inhibit();
             info!(
