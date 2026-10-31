@@ -39,3 +39,6 @@ link.bat
 # Live-test output written inside a worktree (scripts/live-test.ps1 -Out .live)
 /.live/
 /.live[0-9]*/
+
+# Demo-video recording staging (scripts/demo/record-demo.ps1): raw takes, logs, frames
+/.demo/
