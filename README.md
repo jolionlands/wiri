@@ -159,7 +159,7 @@ wiri-ctl events --types '*'             # stream events as they happen
 
 wiri is checked against niri's main branch (snapshot of 22 October 2026). Each feature row is checked in the code, not in the docs. At the latest recount, from 30 October 2026:
 
-- **315 of 397** applicable features are done (79.3%), **82** are partial, and **none** are missing. Rows move to done only after their live checks pass in a full desktop run.
+- **314 of 397** applicable features are done (79.1%), **83** are partial, and **none** are missing. Rows move to done only after their live checks pass in a full desktop run.
 - All **143** niri actions are recognised. The nine that are specific to Wayland compositors return an explicit error.
 
 Row-by-row status and open items are in [docs/parity/README.md](docs/parity/README.md).

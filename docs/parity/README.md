@@ -200,7 +200,7 @@ then made the `strict-new-window-focus-policy` debug flag real on Windows, so th
 from N/A to partial. The overview lane replaced the fit-everything overview with niri's
 fixed-zoom camera, so "Live zoomed-out view" returns to partial until its `h97_*` gates pass
 in an official cycle (they passed in the lane's own desktop probes). The current totals are
-**315 done / 82 partial / 88 N/A** across 485 rows: **315/397 applicable rows (79.3%)**, after
+**314 done / 83 partial / 88 N/A** across 485 rows: **314/397 applicable rows (79.1%)**, after
 the official dba4606 cycle passed all 11 `h93_*` gates and five pointer rows moved to done, and
 then the official dab9a88 cycle of 2026-10-31 passed the h88-h97, h61 and h17 gate families and
 six more rows moved to done. Floating-height resolution/routing and the
@@ -233,10 +233,10 @@ passed) ran the gates that the remaining rows were waiting for: `h88_*` 10/10, `
 rejected), `h25_*` 8/8, `h28_*` 3/3 and every `h15_*`. The only non-passing entries were the three
 `h98_*` movement gates (a wiri extension, not a parity row) and
 `h30_floating_directional_focus_stays_in_workspace`, one raw-IPC case that raced its fixture
-while the identical CLI case passed. Six rows move from `partial` to `done`, each citing the gate
+while the identical CLI case passed. Five rows move from `partial` to `done`, each citing the gate
 that passed: Mouse move/resize of floats via the Mod key, Tab indicator, the "Live zoomed-out
-view" overview row, Gesture kinetics, `hotkey-overlay-title` Pango markup and "What a reload
-re-applies". Fourteen more rows had their named gates pass but keep `partial`: their text also
+view" overview row, `hotkey-overlay-title` Pango markup and "What a reload re-applies".
+Gesture kinetics (L45) keeps `partial`: `h90_no_animation_wakeups_at_rest` passed, but no live gate drives a touchpad gesture on this host, which has no real precision touchpad, so spring decay and rubber-band remain unit-tested only. Fourteen more rows had their named gates pass but keep `partial`: their text also
 records a hardware, mixed-DPI, multi-output or Windows-backend condition that a gate cannot
 clear (self-resize's unread maximum sizes and minimum heights, `center-column` on differing
 physical outputs, `FloatingActive::NoButRaised`, the overview's multi-display keyboard path, the
@@ -244,9 +244,9 @@ opaque-host alpha of the backdrop and workspace shadow, the new-window token pat
 cross-workspace detail in both focus-policy rows, other refresh rates and multi-output for the
 animation clock, a real Precision Touchpad, non-animation config bounds, the action census's six
 executor-evidence partials, `background-color`'s per-output backdrop and Windows' absent
-per-client inhibition protocol). Recount: **171 done / 38 partial / 17 N/A** (layout, 226 rows) and
-**144 done / 44 partial / 71 N/A** (config, input and IPC, 259 rows), i.e. **315 done / 82
-partial / 88 N/A** across 485 rows, **315/397 applicable rows (79.3%)**. The stale "pending"
+per-client inhibition protocol). Recount: **170 done / 39 partial / 17 N/A** (layout, 226 rows) and
+**144 done / 44 partial / 71 N/A** (config, input and IPC, 259 rows), i.e. **314 done / 83
+partial / 88 N/A** across 485 rows, **314/397 applicable rows (79.1%)**. The stale "pending"
 sentences in the rows this cycle settled are replaced by the gate names and the official run
 they passed in.
 

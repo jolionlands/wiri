@@ -15,11 +15,12 @@ remaining parity rows were named against: `h88_*` 10/10, `h89_*` 6/6, `h90_*` 2/
 not a parity row) and one raw-IPC `h30_*` case that raced its fixture did not pass; the identical
 CLI case passed.
 
-- Six rows move from `partial` to `done`, each citing the gate that passed: Mouse move/resize of
+- Five rows move from `partial` to `done`, each citing the gate that passed: Mouse move/resize of
   floats via the Mod key (`h95_mod_drag_*`), the tab indicator's urgent colour
-  (`h95_tab_indicator_*`), the "Live zoomed-out view" overview row (all eight `h97_*`), gesture
-  kinetics (`h90_no_animation_wakeups_at_rest`), `hotkey-overlay-title` Pango markup (all six
-  `h89_*`) and "What a reload re-applies" (all four `h91_*`).
+  (`h95_tab_indicator_*`), the "Live zoomed-out view" overview row (all eight `h97_*`), `hotkey-overlay-title` Pango
+  markup (all six `h89_*`) and "What a reload re-applies" (all four `h91_*`).
+- Gesture kinetics (L45) keeps `partial`: `h90_no_animation_wakeups_at_rest` passed, but no live
+  gate drives a touchpad gesture on this host, which has no real precision touchpad, so spring decay and rubber-band remain unit-tested only.
 - Fourteen rows kept `partial` although their gate passed, because their text also records a
   condition a gate cannot clear (unread maximum/minimum sizes, differing physical outputs,
   `FloatingActive::NoButRaised`, multi-display overview keyboard, the opaque host's alpha over
@@ -30,9 +31,9 @@ CLI case passed.
 - The Lane FS row "Fullscreen and maximized windows cannot be floating" already cited its
   `h88_*` gates as pending; it now records that all ten passed in this cycle.
 
-Recount: **171 done / 38 partial / 17 N/A** (layout, 226 rows) and **144 done / 44 partial /
-71 N/A** (config, input and IPC, 259 rows) — **315 done / 82 partial / 88 N/A** across 485 rows,
-**315/397 applicable rows (79.3 %)**, up from 309/397 (77.8 %).
+Recount: **170 done / 39 partial / 17 N/A** (layout, 226 rows) and **144 done / 44 partial /
+71 N/A** (config, input and IPC, 259 rows) — **314 done / 83 partial / 88 N/A** across 485 rows,
+**314/397 applicable rows (79.1 %)**, up from 309/397 (77.8 %).
 
 ### Lane FIXRUN2 — the dba4606 run's remaining live-gate failures
 

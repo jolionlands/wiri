@@ -46,26 +46,25 @@ text rather than the older survey's per-row prose.
 The 2026-10-30 counts in this table were 2/8/21/14 and 3/7/16/21, **45** and **47**, **92** in
 total. The movement is the five pointer rows promoted by the official `dba4606` cycle (one
 tablet-pen, three drag-and-drop and one tablet-stylus row) plus the "Live zoomed-out view"
-overview row that this snapshot did not list, and the six rows promoted by the official
+overview row that this snapshot did not list, and the five rows promoted by the official
 `dab9a88` cycle described below.
 
-Matrix totals after the 2026-10-31 `dab9a88` cycle: **171 done / 38 partial / 17 N/A** (layout,
-226 rows) and **144 done / 44 partial / 71 N/A** (config/input/IPC, 259 rows), i.e. **315 done /
-82 partial / 88 N/A** across 485 rows, **315 of 397 applicable rows (79.3 %)**. The 2026-10-30
+Matrix totals after the 2026-10-31 `dab9a88` cycle: **170 done / 39 partial / 17 N/A** (layout,
+226 rows) and **144 done / 44 partial / 71 N/A** (config/input/IPC, 259 rows), i.e. **314 done /
+83 partial / 88 N/A** across 485 rows, **314 of 397 applicable rows (79.1 %)**. The 2026-10-30
 pass itself promoted nothing.
 
 ## Rows promoted since this snapshot
 
 The official `dab9a88` cycle of 2026-10-31 (run directory
 `C:\wiri-dev\evidence\dab9a88-live`, 911/915 boolean gates) passed the gates these rows were
-waiting for. Six rows left `partial` because the gate was their only remaining condition:
+waiting for. Five rows left `partial` because the gate was their only remaining condition:
 
 | Row | Matrix | Gate(s) that passed |
 | --- | --- | --- |
 | Mouse move/resize of floats via the Mod key (L11) | layout | `h95_mod_drag_moves_a_floating_window`, `h95_mod_drag_resizes_a_floating_window`, `h95_mod_drag_escape_cancels_to_the_pre_drag_rect` |
 | Tab indicator (L14) | layout | `h95_tab_indicator_urgent_colour_overrides_the_selection` |
 | Live zoomed-out view of every workspace (not listed below) | layout | all eight `h97_*` gates |
-| Gesture kinetics: spring decay, rubber-band (L45) | layout | `h90_no_animation_wakeups_at_rest` |
 | What a reload re-applies (C2) | config/input/IPC | all four `h91_*` gates |
 | `hotkey-overlay-title` Pango markup (C23) | config/input/IPC | all six `h89_*` gates |
 
@@ -131,7 +130,7 @@ among the partial rows of that matrix in file order, because the matrices have n
 | L42 | Gestures | Drag-and-drop edge view scroll | promoted to done (official dba4606 cycle) | Settled: `h93_dnd_edge_view_scroll_moves_the_strip` and `h93_dnd_edge_view_scroll_honours_its_knobs` passed against a real OLE drag source. |
 | L43 | Gestures | Drag-and-drop edge workspace switch | promoted to done (official dba4606 cycle) | Settled: `h93_dnd_edge_workspace_switch_steps_once` passed against a real OLE drag source. |
 | L44 | Gestures | Drag-and-drop hold-to-activate | promoted to done (official dba4606 cycle) | Settled: `h93_dnd_hold_to_activate_focuses_the_hovered_window` passed against a real OLE drag source. |
-| L45 | Gestures | Gesture kinetics: spring decay, rubber-band | promoted to done (official dab9a88 cycle) | Settled: `h90_no_animation_wakeups_at_rest` passed in the official 2026-10-31 cycle, so the reused Phase 2B clock is measured to arm nothing at rest. |
+| L45 | Gestures | Gesture kinetics: spring decay, rubber-band | unit-tested only | `h90_no_animation_wakeups_at_rest` passed in the official 2026-10-31 cycle, so the reused Phase 2B clock is measured to arm nothing at rest, but no live gate drives a touchpad gesture on this host, which has no real precision touchpad. |
 | C1 | Config system | Range-checked values (scale 0..10, accel-speed -1..1, percentages) | implemented, evidence not reconciled | The `h17_*` family passed 48/48 in the official dab9a88 cycle, feeding niri's exact numeric limits and values one past them, but only for the `animations` block: no live gate yet feeds an out-of-range `input { accel-speed }`, `output { scale }` or percentage value and asserts its load diagnostic, and the other bounds items recorded in the matrix remain. |
 | C2 | Config system | What a reload re-applies | promoted to done (official dab9a88 cycle) | Settled: `h91_gap_reload_moves_the_window`, `h91_window_rule_reload_affects_a_new_window`, `h91_bind_reload_registers_the_new_chord` and `h91_animation_reload_changes_motion` all passed in the official 2026-10-31 cycle. |
 | C3 | Keyboard input | Pick the active layout by name from config | hardware evidence unavailable | Selecting another keyboard layout changes a machine-wide setting that is never written on the shared laptop, so only H68's dry-run log exists. |
