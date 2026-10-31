@@ -2417,8 +2417,10 @@ mod tests {
         );
         assert!(!decoded.has_errors(), "{:?}", decoded.issues);
         assert!(LayoutConfig::from_config(&decoded.config).strict_new_window_focus_policy);
-        assert!(!LayoutConfig::from_config(&crate::config::Config::default())
-            .strict_new_window_focus_policy);
+        assert!(
+            !LayoutConfig::from_config(&crate::config::Config::default())
+                .strict_new_window_focus_policy
+        );
     }
 
     #[test]

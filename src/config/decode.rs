@@ -2705,7 +2705,10 @@ impl Decoder {
                         cfg.debug.strict_new_window_focus_policy = value;
                     }
                 }
-                _ => self.unsupported(child, "a compositor debug option with no Windows counterpart"),
+                _ => self.unsupported(
+                    child,
+                    "a compositor debug option with no Windows counterpart",
+                ),
             }
         }
     }
