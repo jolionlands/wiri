@@ -1123,13 +1123,18 @@ impl IpcServer {
                             | crate::input::Action::ConsumeOrExpelWindowRight => {
                                 engine.write().consume_or_expel_window_for(
                                     WindowId::new(hwnd),
-                                    matches!(action, crate::input::Action::ConsumeOrExpelWindowRight),
+                                    matches!(
+                                        action,
+                                        crate::input::Action::ConsumeOrExpelWindowRight
+                                    ),
                                     backend,
                                 );
                                 return serde_json::json!({"success": true});
                             }
                             crate::input::Action::CenterWindow => {
-                                engine.write().center_window_for(WindowId::new(hwnd), backend);
+                                engine
+                                    .write()
+                                    .center_window_for(WindowId::new(hwnd), backend);
                                 return serde_json::json!({"success": true});
                             }
                             crate::input::Action::ResetWindowHeight => {
@@ -1166,7 +1171,10 @@ impl IpcServer {
                             | crate::input::Action::MoveWindowToTiling => {
                                 engine.write().set_floating_by_id(
                                     WindowId::new(hwnd),
-                                    Some(matches!(action, crate::input::Action::MoveWindowToFloating)),
+                                    Some(matches!(
+                                        action,
+                                        crate::input::Action::MoveWindowToFloating
+                                    )),
                                     backend,
                                 );
                                 return serde_json::json!({"success": true});

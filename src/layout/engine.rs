@@ -7653,7 +7653,9 @@ impl TilingEngine {
         col_idx: usize,
         forwards: bool,
     ) -> bool {
-        let cfg = self.effective_config_for_workspace(output, workspace).clone();
+        let cfg = self
+            .effective_config_for_workspace(output, workspace)
+            .clone();
         let Some((current, view, gap)) = self.monitors.get(&output).and_then(|monitor| {
             let view = Self::precise_tiling_area(monitor, &cfg).width;
             let strip = monitor.workspaces.get(&workspace)?;

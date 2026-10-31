@@ -47,17 +47,26 @@ impl TilingEngine {
         }
         self.locate_window(window)
             .and_then(|(output, workspace, _)| strip_of(output, workspace))
-            .is_some_and(|strip| strip.active_float.is_none() && strip.active_window == Some(window))
+            .is_some_and(|strip| {
+                strip.active_float.is_none() && strip.active_window == Some(window)
+            })
     }
 
     /// After a column operation on a named tile: keep the monitor's focus column on its
     /// focused window (its index may have shifted) and lay out without activating.
-    fn finish_by_id_column_op(&mut self, output: OutputId, workspace: i32, backend: &BackendHandle) {
+    fn finish_by_id_column_op(
+        &mut self,
+        output: OutputId,
+        workspace: i32,
+        backend: &BackendHandle,
+    ) {
         if let Some(monitor) = self.monitors.get_mut(&output) {
             if monitor.active_workspace == workspace {
-                let column = monitor
-                    .focus_window
-                    .and_then(|window| monitor.workspace().and_then(|w| w.find_window_column(window)));
+                let column = monitor.focus_window.and_then(|window| {
+                    monitor
+                        .workspace()
+                        .and_then(|w| w.find_window_column(window))
+                });
                 if column.is_some() {
                     monitor.focus_column = column;
                 }
@@ -137,18 +146,25 @@ impl TilingEngine {
             if monitor.active_workspace == workspace && monitor.focus_window.is_some() {
                 monitor.focus_column
             } else {
-                strip.active_window.and_then(|w| strip.find_window_column(w))
+                strip
+                    .active_window
+                    .and_then(|w| strip.find_window_column(w))
             }
         });
         if active_column != Some(column) {
             return;
         }
         self.refresh_strip_widths(output);
-        let cfg = self.effective_config_for_workspace(output, workspace).clone();
+        let cfg = self
+            .effective_config_for_workspace(output, workspace)
+            .clone();
         let metrics = self.monitors.get(&output).and_then(|monitor| {
             let view_width = Self::view_width_for_monitor(monitor, &cfg);
             let strip = monitor.workspaces.get(&workspace)?;
-            Some((view_width, Self::workspace_default_width(strip, view_width, &cfg)))
+            Some((
+                view_width,
+                Self::workspace_default_width(strip, view_width, &cfg),
+            ))
         });
         let Some((view_width, column_width)) = metrics else {
             return;
