@@ -197,8 +197,10 @@ curated hotkey list move to done, the 2026-10-30 action census moves
 cannot be floating" to done on 22 source-pinned engine cases (its `h88_*` live gates
 are pending their first cycle; the row returns to partial if they fail). The focus lane
 then made the `strict-new-window-focus-policy` debug flag real on Windows, so that row moves
-from N/A to partial. The current totals are **305 done / 92 partial / 88 N/A** across 485
-rows: **305/397 applicable rows (76.8%)**. Floating-height resolution/routing and the
+from N/A to partial. The overview lane replaced the fit-everything overview with niri's
+fixed-zoom camera, so "Live zoomed-out view" returns to partial until its `h97_*` gates pass
+in an official cycle (they passed in the lane's own desktop probes). The current totals are
+**304 done / 93 partial / 88 N/A** across 485 rows: **304/397 applicable rows (76.6%)**. Floating-height resolution/routing and the
 sole/tabbed tiled-height correction are source-qualified. Both preset-height rows
 remain partial for physical mixed-DPI and remaining lifecycle routes. The lifecycle
 checkpoint qualifies its listed source cases; earlier floating native evidence
