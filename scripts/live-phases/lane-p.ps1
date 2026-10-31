@@ -245,7 +245,9 @@
                 if ($window -ne [IntPtr]::Zero -and $rows -eq $expectedRows) {
                     try {
                         $text = POverlayText $window $capture $deadline
-                        $missing = @($expectedTitles | Where-Object { $text.IndexOf($_, [StringComparison]::Ordinal) -lt 0 })
+                        # OCR misreads letter case at this size ("Workspace up" for "Workspace Up" in the
+                        # 8897246 run): the words must all be there, their case is not evidence.
+                        $missing = @($expectedTitles | Where-Object { $text.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -lt 0 })
                         $ocrError = $null
                         if ($missing.Count -eq 0) { break }
                     } catch { $ocrError = [string]$_ }

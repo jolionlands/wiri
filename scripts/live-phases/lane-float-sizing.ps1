@@ -185,9 +185,13 @@ window-rule { match title="^lane-h88-(float|other)$"; open-floating true; }
             $fsIdOnEntry = FSEntry 'g3-on' $fsA
             $fsIdOnRect = Rc $fsA
             $fsIdOnForeground = ([LT]::GetForegroundWindow() -eq $fsB)
+            # The column is fullscreen-sized, but the view does not scroll to it: niri activates (and
+            # moves the camera to) the window only when it already was the active one
+            # (workspace.rs:1420, 1433-1443). So check the monitor's size, not its position.
             FSGate 'h88_explicit_inactive_float_fullscreen_keeps_foreground' (
                 (FSInStrip $fsIdOnEntry) -and $fsIdOnEntry.fullscreen -eq $true -and $fsIdOnForeground -and
-                (FSFills $fsIdOnRect $fsMonitor)) @{
+                (FSNear ($fsIdOnRect.R - $fsIdOnRect.L) ($fsMonitor.R - $fsMonitor.L) 8) -and
+                (FSNear ($fsIdOnRect.B - $fsIdOnRect.T) ($fsMonitor.B - $fsMonitor.T) 8)) @{
                     entry = $fsIdOnEntry; rect = $fsIdOnRect; other_foreground = $fsIdOnForeground }
             FSAction 'g3-by-id-off' @('fullscreen-window', '--id', [string][int64]$fsA)
             $fsIdOffEntry = FSEntry 'g3-off' $fsA

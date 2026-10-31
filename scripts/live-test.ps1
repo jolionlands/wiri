@@ -1106,6 +1106,8 @@ Chord 'ctrl+alt+f'; Start-Sleep -Milliseconds 1800
 $r4 = Rc $fa
 Shot 'h3-04-float-fullscreen-left'
 $h3FullscreenRestores = (Near $r4.L $r2.L 4) -and (Near $r4.T $r2.T 4) -and (Near $r4.W $r2.W 4) -and (Near $r4.H $r2.H 4)
+# Information: the float before fullscreen and after leaving it (L,T WxH), so a miss shows by how much.
+$h3FloatRects = "before=$($r2.L),$($r2.T) $($r2.W)x$($r2.H) after=$($r4.L),$($r4.T) $($r4.W)x$($r4.H)"
 
 # IPC focus-window raises a floating window (it used to answer "ok" and do nothing), tiles still get it too.
 $null = Ctl 'h3-ipc-focus-tile' @('focus-window', [string][int64]$forms[0])
@@ -1305,6 +1307,7 @@ $floatGateSnapshot = [ordered]@{
     h3_fullscreen_covers_monitor = $h3FullscreenCovers
     h3_fullscreen_only_the_float = ($h3FullscreenOthers -eq 0)
     h3_fullscreen_exit_restores_float = $h3FullscreenRestores
+    h3_float_rects_around_fullscreen = $h3FloatRects
     h3_ipc_focus_window_tile = $h3IpcFocusTile
     h3_ipc_focus_window_float = $h3IpcFocusFloat
     h3_ipc_action_centers_float = $h3IpcCenters
@@ -2958,6 +2961,7 @@ $summary = [ordered]@{
     h3_fullscreen_covers_monitor = $h3FullscreenCovers
     h3_fullscreen_only_the_float = ($h3FullscreenOthers -eq 0)
     h3_fullscreen_exit_restores_float = $h3FullscreenRestores
+    h3_float_rects_around_fullscreen = $h3FloatRects
     h3_ipc_focus_window_tile = $h3IpcFocusTile
     h3_ipc_focus_window_float = $h3IpcFocusFloat
     h3_ipc_action_centers_float = $h3IpcCenters
