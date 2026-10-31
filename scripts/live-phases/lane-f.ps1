@@ -500,7 +500,8 @@ window-rule {
                     @{g='h30_indexed_windows_clamp';a='focus-window-in-column';v=@(1);s=$fB;e=$fA},
                     @{g='h30_indexed_windows_clamp';a='focus-window-in-column';v=@(0);s=$fD;e=$fC},
                     @{g='h30_indexed_windows_clamp';a='focus-window-in-column';v=@(2);s=$fA;e=$fB},
-                    @{g='h30_indexed_windows_clamp';a='focus-window-in-column';v=@(999);s=$fC;e=$fD},
+                    # niri types the index as u8 (FocusWindowInColumn(u8)), so 255 is the largest it can send.
+                    @{g='h30_indexed_windows_clamp';a='focus-window-in-column';v=@(255);s=$fC;e=$fD},
                     @{g='h30_column_wraps';a='focus-column-right-or-first';v=@();s=$fA;e=$fD},
                     @{g='h30_column_wraps';a='focus-column-right-or-first';v=@();s=$fD;e=$fB},
                     @{g='h30_column_wraps';a='focus-column-left-or-last';v=@();s=$fC;e=$fB},
