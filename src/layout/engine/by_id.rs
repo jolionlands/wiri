@@ -22,11 +22,25 @@ use crate::layout::ColumnDisplay;
 impl TilingEngine {
     /// Run `f` without any native activation request. The engine's own focus selection is
     /// not touched either; a later layout pass or focus action reasserts it as usual.
+    ///
+    /// The flag is put back by a drop guard, not by an assignment after the call: these
+    /// are IPC-dispatched actions, and one that unwinds would otherwise leave activation
+    /// suppressed for the rest of the process (`backend::activation_attempt_test_support`
+    /// restores its recorder the same way).
     fn without_activation<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        struct Restore<'a> {
+            engine: &'a mut TilingEngine,
+            outer: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.engine.activation_suppressed = self.outer;
+            }
+        }
+
         let outer = std::mem::replace(&mut self.activation_suppressed, true);
-        let result = f(self);
-        self.activation_suppressed = outer;
-        result
+        let mut restore = Restore { engine: self, outer };
+        f(&mut *restore.engine)
     }
 
     /// niri's `active_window()` of the workspace the window is on: the tile when the
@@ -282,5 +296,33 @@ impl TilingEngine {
                 engine.float_window(window, backend);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The actions here are dispatched from IPC, so a panic in one unwinds through this
+    /// guard. Activation must not stay suppressed for the rest of the process afterwards.
+    #[test]
+    fn a_panicking_action_puts_activation_back_the_way_it_was() {
+        let mut engine = TilingEngine::new(Default::default());
+        assert!(!engine.activation_suppressed, "nothing is suppressed yet");
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.without_activation(|_| -> () {
+                panic!("an IPC-dispatched by-id action unwound")
+            });
+        }));
+        assert!(unwound.is_err(), "the panic reaches the caller");
+        assert!(
+            !engine.activation_suppressed,
+            "a panic must not leave activation suppressed for the process"
+        );
+
+        // The flag is still set *inside*, so the actions stay non-activating.
+        assert!(engine.without_activation(|inner| inner.activation_suppressed));
+        assert!(!engine.activation_suppressed);
     }
 }
