@@ -14,6 +14,11 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="Platform: Windows x64 and ARM64" src="https://img.shields.io/badge/platform-Windows%20x64%20%7C%20ARM64-0078D4">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=black">
+  <a href="https://github.com/jolionlands/wiri/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jolionlands/wiri?color=8957e5"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/jolionlands/wiri/releases/latest"><img alt="Download wiri for Windows (x64 and ARM64)" src="https://img.shields.io/badge/Download-Windows%20x64%20%7C%20ARM64-2ea44f?style=for-the-badge&logo=windows11&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -24,14 +29,14 @@
 
 ## Status
 
-wiri is a working prototype. It builds for x86_64 and ARM64 Windows. The measurements below come from one x64 laptop, and multi-monitor, mixed-DPI and ARM64 testing on real hardware are still in progress.
+wiri's first release, [v0.1.0](https://github.com/jolionlands/wiri/releases/tag/v0.1.0), is out with prebuilt binaries for x86_64 and ARM64 Windows. The measurements below come from one x64 laptop, and multi-monitor, mixed-DPI and ARM64 testing on real hardware are still in progress.
 
 ## Why wiri
 
 - **niri's model, on Windows.** Windows are columns on an endless strip, and each monitor has its own stack of dynamic workspaces. Opening a window never resizes the others.
 - **Light and quick.** Idle CPU measures effectively zero, and a key press has the window in its new place in under 6 ms at the median. See [Performance](#performance).
 - **Speaks niri's language.** The config uses niri's KDL syntax, so `binds {}` blocks and `window-rule`s paste in as they are. `wiri-ctl` mirrors `niri msg`, with niri-shaped JSON for windows and workspaces.
-- **Tested on a real desktop.** An automated harness sends real keyboard input to real windows and checks the results. Its latest fully green official run passed all 769 enforced checks.
+- **Tested on a real desktop.** An automated harness sends real keyboard input to real windows and checks the results. The run behind v0.1.0 passed 911 of its 915 checks.
 
 ## Screenshots
 
@@ -43,7 +48,9 @@ wiri is a working prototype. It builds for x86_64 and ARM64 Windows. The measure
 
 ## Quick start
 
-You need [Rust](https://rustup.rs) and Git. In PowerShell:
+**Download:** grab the zip for your machine from the [latest release](https://github.com/jolionlands/wiri/releases/latest) (`x86_64` for most PCs, `aarch64` for Windows on ARM), unzip it and run `wiri.exe`. Each zip has a `.sha256` file to check it against. The binaries are not code-signed yet, so SmartScreen may ask before the first start.
+
+**Build from source:** you need [Rust](https://rustup.rs) and Git. In PowerShell:
 
 ```pwsh
 git clone https://github.com/jolionlands/wiri.git
