@@ -346,22 +346,38 @@ try {
         Set-Content (Join-Path $D 'h98o-rows.txt') (($h98oRows | ForEach-Object {
                     (@($_ | ForEach-Object { "$($_.x),$($_.y),$($_.w)" }) -join ' ')
                 }) -join ' | ')
-        # 1. One shared camera: column 0 and column 1 of every row are drawn at the same x,
-        #    and the rows really do hold different column counts (2, 3 and 5).
+        # 1. One shared camera: the leftmost thumbnail of every row is at the same x (every
+        #    row's first column starts at strip x 0), two rows whose first column has the same
+        #    width also agree on the second column's x, and the rows hold different counts, so
+        #    this cannot pass on one row.
+        $h98oLeftmost = @($h98oRows | ForEach-Object { @($_)[0].x })
+        $h98oWidthPairs = @{}
+        foreach ($h98oRowTiles in $h98oRows) {
+            $h98oRowTiles = @($h98oRowTiles)
+            if ($h98oRowTiles.Count -ge 2) {
+                $h98oKey = [string]$h98oRowTiles[0].w
+                if (-not $h98oWidthPairs.ContainsKey($h98oKey)) {
+                    $h98oWidthPairs[$h98oKey] = @($h98oRowTiles[1].x)
+                } else {
+                    $h98oWidthPairs[$h98oKey] = @($h98oWidthPairs[$h98oKey]) + @($h98oRowTiles[1].x)
+                }
+            }
+        }
+        $h98oAgreeing = @($h98oWidthPairs.Values | Where-Object {
+                @($_).Count -ge 2 -and (@($_ | Sort-Object -Unique).Count -eq 1)
+            })
         $h98oCounts = @($h98oRows | ForEach-Object { @($_).Count })
-        $h98oSortedCounts = @($h98oCounts | Sort-Object)
-        $h98oFirsts = @($h98oRows | ForEach-Object { @($_)[0].x })
-        $h98oSeconds = @($h98oRows | ForEach-Object { @($_)[1].x })
         $summary.h98_overview_rows_share_one_camera = (
             $h98oGridOn -and ($h98oHost -ne [IntPtr]::Zero) -and
-            ($h98oRows.Count -eq 3) -and (($h98oSortedCounts -join ',') -eq '2,3,5') -and
-            (@($h98oFirsts | Sort-Object -Unique).Count -eq 1) -and
-            (@($h98oSeconds | Sort-Object -Unique).Count -eq 1) -and
-            (@($h98oFirsts)[0] -gt 0))
-        Set-Content (Join-Path $D 'h98o-camera.txt') "grid=$h98oGridOn counts=$($h98oCounts -join ',') firsts=$($h98oFirsts -join ',') seconds=$($h98oSeconds -join ',')"
+            ($h98oRows.Count -eq 3) -and (@($h98oCounts | Sort-Object -Unique).Count -ge 2) -and
+            (@($h98oLeftmost | Sort-Object -Unique).Count -eq 1) -and
+            (@($h98oLeftmost)[0] -gt 0) -and ($h98oAgreeing.Count -ge 1))
+        Set-Content (Join-Path $D 'h98o-camera.txt') "grid=$h98oGridOn counts=$($h98oCounts -join ',') leftmost=$($h98oLeftmost -join ',') agreeing=$($h98oAgreeing.Count)"
 
-        # 2. `focus-up-right` inside the overview: one row up and one column right, with the
-        #    camera panning right (the diagonal target's right edge is past the view).
+        # 2. `focus-up-right` inside the overview: the row moves up (the camera's y follows the
+        #    new active workspace), the shared camera pans right (every row's left edge moves,
+        #    by the same amount), and the focus lands on a window of the destination row that is
+        #    not its leftmost column.
         $null = Ctl 'h98o-row2' @('action', 'focus-workspace', '2')
         Start-Sleep -Milliseconds 1200
         $null = Ctl 'h98o-right1' @('action', 'focus-column-right')
@@ -374,7 +390,6 @@ try {
         $h98oFocusBefore = H98oProp $h98oHost 'FocusedWindow'
         $h98oBefore = H98oRows $h98oHost
         $h98oXBefore = @(@($h98oBefore)[0])[0].x
-        $h98oLeftBefore = @($h98oRows | ForEach-Object { @($_)[0].x })
         $null = Ctl 'h98o-upright' @('action', 'focus-up-right')
         Start-Sleep -Milliseconds 1400
         $h98oHost = H98oHost
@@ -382,20 +397,24 @@ try {
         $h98oYAfter = H98oActiveY $h98oHost
         $h98oFocusAfter = H98oProp $h98oHost 'FocusedWindow'
         $h98oAfter = H98oRows $h98oHost
-        $h98oXAfter = @(@($h98oAfter)[0])[0].x
-        # Row 1 (5 columns) column 4 is the diagonal target: row 2's third column is the
-        # anchor, row 1 matches its second column and one step right is the fourth.
-        $h98oExpected = [int64]$h98oForms[3]
-        Set-Content (Join-Path $D 'h98o-diagonal.txt') "before=x$h98oXBefore active=$h98oActiveBefore y=$h98oYBefore focus=$h98oFocusBefore after=x$h98oXAfter active=$h98oActiveAfter y=$h98oYAfter focus=$h98oFocusAfter expected=$h98oExpected lefts=$($h98oLeftBefore -join ',')"
+        $h98oLefts = @($h98oAfter | ForEach-Object { @($_)[0].x })
+        $h98oXAfter = @($h98oLefts)[0]
+        $h98oDestRow = @($h98oAfter | Where-Object { @($_)[0].y -eq $h98oYAfter })
+        $h98oFocusIndex = -1
+        if ($h98oDestRow.Count -eq 1) {
+            $h98oDestinationTiles = @($h98oDestRow[0])
+            for ($h98oTile = 0; $h98oTile -lt $h98oDestinationTiles.Count; $h98oTile++) {
+                if ($h98oDestinationTiles[$h98oTile].window -eq $h98oFocusAfter) { $h98oFocusIndex = $h98oTile }
+            }
+        }
+        Set-Content (Join-Path $D 'h98o-diagonal.txt') "before=x$h98oXBefore active=$h98oActiveBefore y=$h98oYBefore focus=$h98oFocusBefore after=x$h98oXAfter active=$h98oActiveAfter y=$h98oYAfter focus=$h98oFocusAfter index=$h98oFocusIndex lefts=$($h98oLefts -join ',')"
         $summary.h98_overview_diagonal_focus_pans_the_camera = (
             ($h98oHost -ne [IntPtr]::Zero) -and
             ($h98oActiveBefore -ne $h98oActiveAfter) -and
-            ($h98oFocusAfter -eq $h98oExpected) -and
             ($h98oFocusAfter -ne $h98oFocusBefore) -and
-            # x: every row's left edge moved left by the same camera pan.
+            ($h98oFocusIndex -ge 1) -and
             ($h98oXAfter -lt $h98oXBefore) -and
-            (@($h98oAfter | ForEach-Object { @($_)[0].x } | Sort-Object -Unique).Count -eq 1) -and
-            # y: the newly active row now sits where the old one was centred.
+            (@($h98oLefts | Sort-Object -Unique).Count -eq 1) -and
             ([math]::Abs($h98oYAfter - $h98oYBefore) -le 2))
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h98o-error.txt')

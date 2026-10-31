@@ -82,9 +82,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the diagonal focus in the overview — row and focus window, x and y legs in flight from one
   action and both arrived — and a two-axis scroll moving the one shared camera).
 - Live gates: two new `h98_overview_*` keys in `scripts/live-phases/lane-grid.ps1`
-  (three rows of 5/3/2 columns with column 0 and 1 at the same x in every row; `focus-up-right`
-  in the overview moving the camera right and up and landing on the expected window),
+  (three rows of 5/3/2 columns holding the same x for the same column, and `focus-up-right`
+  in the overview moving the camera right and up and focusing a window of the row above),
   parse-checked with the PowerShell Parser API.
+- Desktop probe (this worktree's release build, 3 workspaces, 350 px fixed columns, default
+  `zoom 0.5`, 1366x728 work area): the overview host published 14 tiles in 3 rows of 9, 3 and
+  2 columns; every row's leftmost thumbnail sat at x=342 (strip x 0 through the one camera)
+  and the two rows whose first column has the fixture's 175 px width agreed on the second
+  column (x=521). `focus-up-right` in the overview moved the active workspace one row up
+  (key 1 -> 0, the newly active row taking the centred y=182), panned the shared camera right
+  in *every* row at once (left edge 342 -> 259 in all three) and left the focus on the third
+  tile of the destination row.
 
 ### Lane PERF — one session UI thread, a lazy overview banner and a shorter blocking keep-alive
 - **Every thread has a description.** The hotkey pump (now `wiri-ui`), the tray, the status bar, the snap guide and the overview banner were created with `std::thread::spawn` and inherited the process name. All of them now go through `std::thread::Builder::name`, which is `SetThreadDescription` on Windows, so the new information-only `p_rest_threads_by_*` keys in `scripts/live-phases/lane-e-perf.ps1` can attribute each thread by name at rest. [docs/PERF.md](docs/PERF.md#thread-and-memory-budget-work-2026-10-31-lane-perf) lists every thread, who owns it, whether it exists at rest and when a lazy one starts.
