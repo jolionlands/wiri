@@ -375,6 +375,9 @@ pub struct LayoutConfig {
     pub column_width: u32,
     pub column_width_mode: ColumnWidthMode,
     pub default_tabbed: bool,
+    /// niri `debug { strict-new-window-focus-policy }`: a new window is focused only when Windows
+    /// itself gave it the foreground (see `rules::new_window_activation`).
+    pub strict_new_window_focus_policy: bool,
     pub center_focused_column: CenterFocusedColumn,
     pub always_center_single_column: bool,
     pub preset_column_widths: Vec<crate::config::types::SizeSpec>,
@@ -468,6 +471,7 @@ impl Default for LayoutConfig {
             column_width: 500,
             column_width_mode: ColumnWidthMode::Fixed,
             default_tabbed: false,
+            strict_new_window_focus_policy: false,
             center_focused_column: CenterFocusedColumn::Never,
             always_center_single_column: false,
             preset_column_widths: Vec::new(),
@@ -574,6 +578,7 @@ impl LayoutConfig {
         lc.column_width = config.layout.column_width;
         lc.max_visible_columns = config.layout.max_visible_columns;
         lc.default_tabbed = config.layout.default_column_display == "tabbed";
+        lc.strict_new_window_focus_policy = config.debug.strict_new_window_focus_policy;
         lc.column_width_mode = match config.layout.column_width_mode.as_str() {
             "fixed" => ColumnWidthMode::Fixed,
             _ => ColumnWidthMode::Proportional,
@@ -1735,7 +1740,9 @@ impl TilingEngine {
                 rule_workspace = Some(workspace);
             }
         }
-        let focus_before = self.focus_before(rule_output);
+        let mut focus_before = self.focus_before(rule_output);
+        // A window Windows itself made the foreground window is wiri's valid activation token.
+        focus_before.given_foreground = backend.foreground_window() == hwnd;
         self.remember_open_rules(window_id, rule_output, rule_workspace, &window, &rules);
 
         if rules.float {

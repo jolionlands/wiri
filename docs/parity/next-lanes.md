@@ -231,7 +231,7 @@ Listed so they are not mistaken for gate work:
 | `move-floating-window` (x/y set/adjust/proportion) | no `move-floating-window` entry in the action vocabulary at all |
 | Mouse move/resize of floats via the Mod key | the LL-hook grab is not extended to the float layer |
 | `at-startup` (first 60 s after launch) | only startup-enumerated windows get `at_startup`; no 60 s clock |
-| New-window focus policy (heuristic auto-focus) | no heuristic; only `open-focused` rules |
+| New-window focus policy (heuristic auto-focus) | done in the focus-core lane (heuristic, `debug { strict-new-window-focus-policy }`, h92_new_window_* gates); remaining gaps are listed in the layout-behaviour matrix row |
 | Easing curve set (linear, ease-out-*, Bezier grammar) | no Bezier solver |
 | Spring animations: typed kinds and gesture velocity | kinds exist in config; the velocity wiring to the driver does not |
 | Gesture kinetics (spring decay, rubber band) | needs the above |

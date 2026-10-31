@@ -34,6 +34,18 @@ pub struct Config {
     /// Screen-reader announcements (niri's Accessibility support).  On by default, as in
     /// niri; `accessibility false` turns them off (wiri extension).
     pub accessibility: bool,
+    /// niri `debug { … }`: the one option with a Windows meaning.
+    pub debug: DebugConfig,
+}
+
+/// niri's `debug {}` section. Only `strict-new-window-focus-policy` has a Windows counterpart;
+/// the other options configure compositor internals and are reported as unsupported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DebugConfig {
+    /// `strict-new-window-focus-policy` (niri 25.01, wiki:Configuration:-Debug-Options):
+    /// disables the heuristic automatic focusing of new windows. On Windows only a window that
+    /// Windows itself gave the foreground (its creator held foreground rights) is focused.
+    pub strict_new_window_focus_policy: bool,
 }
 
 impl Default for Config {
@@ -75,6 +87,7 @@ impl Default for Config {
             switch_events: Default::default(),
             disable_failed_config_notification: false,
             accessibility: true,
+            debug: DebugConfig::default(),
         }
     }
 }

@@ -132,10 +132,30 @@ pub(super) struct UnfocusedOpen {
     pub until: Instant,
 }
 
-/// Where the focus of a monitor was before a window opened on it.
+/// Where the focus of a monitor was before a window opened on it, and whether Windows itself
+/// had already given the new window the foreground (`given_foreground`: wiri's counterpart of a
+/// valid xdg-activation token, see [`new_window_takes_focus`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct FocusBefore {
     pub window: Option<WindowId>,
+    pub given_foreground: bool,
+}
+
+/// niri's decision whether a window that mapped without an `open-focused` rule takes the focus
+/// (niri:src/handlers/compositor.rs:149-176, resolved for `ActivateWindow::Smart` in
+/// src/layout/workspace.rs:652 and src/layout/mod.rs:1060, src/layout/monitor.rs:618),
+/// mapped to Windows. A valid xdg-activation token has no Windows equivalent, but its effect has:
+/// the creator held foreground rights (the user launched the program, or the application was
+/// legitimately asked to come forward), and Windows made the new window the foreground window.
+/// That window is focused whatever the policy says. Otherwise `strict-new-window-focus-policy`
+/// refuses the focus, and the default heuristic grants it unless the active window of the
+/// workspace is fullscreen ("don't steal focus from an active fullscreen window").
+pub(super) fn new_window_takes_focus(
+    given_foreground: bool,
+    strict_policy: bool,
+    active_is_fullscreen: bool,
+) -> bool {
+    given_foreground || !(strict_policy || active_is_fullscreen)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -624,6 +644,7 @@ impl TilingEngine {
     pub(super) fn focus_before(&self, output: OutputId) -> FocusBefore {
         FocusBefore {
             window: self.monitors.get(&output).and_then(|m| m.focus_window),
+            given_foreground: false,
         }
     }
 
@@ -707,7 +728,9 @@ impl TilingEngine {
             self.set_maximized_to_edges(window_id, true, backend);
         }
         if rules.open_focused == Some(false) && !at_startup {
-            self.keep_the_focus(window_id, before);
+            self.keep_the_focus(window_id, before, true);
+        } else if rules.open_focused.is_none() && !at_startup && !floating {
+            self.apply_new_window_focus_policy(window_id, before);
         }
         if rules.open_fullscreen == Some(true) && !self.fullscreen_windows.contains(&window_id) {
             self.toggle_fullscreen_for(window_id, backend);
@@ -741,7 +764,39 @@ impl TilingEngine {
     /// back to it at once, the new window goes to the back of the focus history, and when
     /// Windows gives the new window the focus on its own (the application asked for it) the
     /// first focus report for it hands the focus back (see `sync_os_foreground`).
-    fn keep_the_focus(&mut self, window_id: WindowId, before: FocusBefore) {
+    /// niri's heuristic for a window that opened without an `open-focused` rule (see
+    /// [`new_window_takes_focus`]). Only the focused output's active workspace is affected:
+    /// niri's `Smart` activation never moves the active monitor or workspace, and wiri already
+    /// leaves the focus of every other workspace and output alone. Floating windows (dialogs and
+    /// the like) are not selected at admission at all; they take the focus only when Windows
+    /// hands it to them. A refused window does not get the `open-focused false` hand-back: a
+    /// later foreground notice for it is Windows (or the user) asking for the window, which is
+    /// what niri's token arriving after the map does too.
+    fn apply_new_window_focus_policy(&mut self, window_id: WindowId, before: FocusBefore) {
+        let Some((output, workspace, _)) = self.locate_window(window_id) else {
+            return;
+        };
+        let on_focused_active_workspace = self.monitors.focused_id() == Some(output)
+            && self
+                .monitors
+                .get(&output)
+                .is_some_and(|monitor| monitor.active_workspace == workspace);
+        if !on_focused_active_workspace {
+            return;
+        }
+        let active_is_fullscreen = before
+            .window
+            .is_some_and(|active| active != window_id && self.fullscreen_windows.contains(&active));
+        if !new_window_takes_focus(
+            before.given_foreground,
+            self.config.strict_new_window_focus_policy,
+            active_is_fullscreen,
+        ) {
+            self.keep_the_focus(window_id, before, false);
+        }
+    }
+
+    fn keep_the_focus(&mut self, window_id: WindowId, before: FocusBefore, hand_back: bool) {
         let previous = before
             .window
             .or(self.os_foreground)
@@ -767,6 +822,9 @@ impl TilingEngine {
                 monitor.focus_ring.remove(window_id);
                 monitor.focus_ring.push_back(window_id);
             }
+        }
+        if !hand_back {
+            return;
         }
         let now = Instant::now();
         self.unfocused_opens.retain(|_, open| open.until > now);
@@ -2185,6 +2243,182 @@ mod tests {
             engine.monitors.get(&oid).unwrap().focus_window,
             Some(WindowId::new(3))
         );
+    }
+
+    // ---- niri's new-window focus heuristic and `strict-new-window-focus-policy` ---------------
+
+    use crate::backend::activation_attempt_test_support::{with_native_foreground, Activation};
+
+    fn focus_of(engine: &TilingEngine) -> Option<WindowId> {
+        engine
+            .monitors
+            .get(&OutputId::from_name("M"))
+            .unwrap()
+            .focus_window
+    }
+
+    /// `engine.add_window` while Windows shows `foreground` as the foreground window.
+    fn open_while_foreground_is(
+        engine: &mut TilingEngine,
+        foreground: isize,
+        hwnd: isize,
+        title: &str,
+    ) {
+        with_native_foreground(foreground, Activation::Refuse, || {
+            engine.add_window(window(hwnd, title), &be());
+        });
+    }
+
+    #[test]
+    fn new_windows_take_focus_when_windows_gave_it_or_the_heuristic_allows() {
+        // niri compositor.rs:149-176 (token, then strict, then Smart) with Smart's
+        // workspace.rs:652 fullscreen guard.
+        for (given, strict, fullscreen, takes) in [
+            (false, false, false, true),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, false),
+            (true, false, false, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                new_window_takes_focus(given, strict, fullscreen),
+                takes,
+                "given {given} strict {strict} fullscreen {fullscreen}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_heuristic_still_focuses_a_window_without_the_foreground() {
+        // A background launch is focused by default (niri's Smart): the existing admission
+        // behaviour that wiri-spawned and user-started windows rely on.
+        let mut engine = engine();
+        engine.add_window(window(1, "work"), &be());
+        engine.add_window(window(2, "background launch"), &be());
+        assert_eq!(focus_of(&engine), Some(WindowId::new(2)));
+        assert!(engine.unfocused_opens.is_empty());
+    }
+
+    #[test]
+    fn the_default_heuristic_does_not_steal_focus_from_a_fullscreen_window() {
+        let mut engine = engine();
+        engine.add_window(window(1, "video"), &be());
+        engine.toggle_fullscreen_for(WindowId::new(1), &be());
+        assert!(engine.is_fullscreen(WindowId::new(1)));
+        engine.add_window(window(2, "background launch"), &be());
+        assert_eq!(focus_of(&engine), Some(WindowId::new(1)));
+        assert!(place_of(&engine, 2).is_some(), "it is in the strip");
+        assert!(
+            engine.unfocused_opens.is_empty(),
+            "a later foreground notice is a request for the window, not one to refuse"
+        );
+        // Windows (or the user) bringing it forward afterwards focuses it.
+        engine.sync_os_foreground(WindowId::new(2), &be());
+        assert_eq!(focus_of(&engine), Some(WindowId::new(2)));
+    }
+
+    #[test]
+    fn a_window_windows_gave_the_foreground_is_focused_over_a_fullscreen_window() {
+        let mut engine = engine();
+        engine.add_window(window(1, "video"), &be());
+        engine.toggle_fullscreen_for(WindowId::new(1), &be());
+        open_while_foreground_is(&mut engine, 2, 2, "user launch");
+        assert_eq!(focus_of(&engine), Some(WindowId::new(2)));
+    }
+
+    #[test]
+    fn strict_policy_focuses_only_windows_windows_gave_the_foreground() {
+        let mut engine = engine();
+        engine.config.strict_new_window_focus_policy = true;
+        // The first window of an empty workspace has nothing else to take the focus from.
+        engine.add_window(window(1, "work"), &be());
+        assert_eq!(focus_of(&engine), Some(WindowId::new(1)));
+        engine.add_window(window(2, "background launch"), &be());
+        assert_eq!(focus_of(&engine), Some(WindowId::new(1)));
+        assert!(place_of(&engine, 2).is_some(), "it is in the strip");
+        let oid = OutputId::from_name("M");
+        let monitor = engine.monitors.get(&oid).unwrap();
+        assert_eq!(monitor.focus_ring.current(), Some(WindowId::new(1)));
+        assert_eq!(
+            monitor.workspace().unwrap().active_window,
+            Some(WindowId::new(1))
+        );
+        // The foreground Windows gives it afterwards is honoured (niri: a token after the map).
+        engine.sync_os_foreground(WindowId::new(2), &be());
+        assert_eq!(focus_of(&engine), Some(WindowId::new(2)));
+        // A user launch that Windows made the foreground window is focused at once.
+        open_while_foreground_is(&mut engine, 3, 3, "user launch");
+        assert_eq!(focus_of(&engine), Some(WindowId::new(3)));
+    }
+
+    #[test]
+    fn open_focused_rules_win_over_the_policy_both_ways() {
+        let mut engine = engine();
+        engine.config.strict_new_window_focus_policy = true;
+        engine.set_window_rules(vec![
+            title_rule(
+                "^loud",
+                WindowRule {
+                    open_focused: Some(true),
+                    ..WindowRule::default()
+                },
+            ),
+            title_rule(
+                "^quiet",
+                WindowRule {
+                    open_focused: Some(false),
+                    ..WindowRule::default()
+                },
+            ),
+        ]);
+        engine.add_window(window(1, "work"), &be());
+        // `open-focused true` is niri's ActivateWindow::Yes: focused although strict.
+        engine.add_window(window(2, "loud"), &be());
+        assert_eq!(focus_of(&engine), Some(WindowId::new(2)));
+        // `open-focused false` stays No even for a window Windows made the foreground one,
+        // and keeps its hand-back of an unsolicited foreground report.
+        open_while_foreground_is(&mut engine, 3, 3, "quiet one");
+        assert_eq!(focus_of(&engine), Some(WindowId::new(2)));
+        assert!(engine.unfocused_opens.contains_key(&WindowId::new(3)));
+    }
+
+    #[test]
+    fn strict_policy_leaves_startup_windows_and_floating_windows_alone() {
+        let mut engine = engine();
+        engine.config.strict_new_window_focus_policy = true;
+        engine.add_window_at_startup(window(1, "old one"), &be());
+        engine.add_window_at_startup(window(2, "old two"), &be());
+        assert_eq!(
+            focus_of(&engine),
+            Some(WindowId::new(2)),
+            "the startup scan is not a new window"
+        );
+        engine.set_window_rules(vec![title_rule(
+            "^float",
+            WindowRule {
+                open_floating: Some(true),
+                ..WindowRule::default()
+            },
+        )]);
+        engine.add_window(window(3, "float"), &be());
+        assert!(engine.floating_windows.contains(&WindowId::new(3)));
+        assert_eq!(focus_of(&engine), Some(WindowId::new(2)));
+    }
+
+    #[test]
+    fn the_strict_flag_reaches_the_engine_from_the_config() {
+        let decoded = crate::config::decode::decode_text(
+            "debug { strict-new-window-focus-policy; }",
+            "",
+            None,
+        );
+        assert!(!decoded.has_errors(), "{:?}", decoded.issues);
+        assert!(LayoutConfig::from_config(&decoded.config).strict_new_window_focus_policy);
+        assert!(!LayoutConfig::from_config(&crate::config::Config::default())
+            .strict_new_window_focus_policy);
     }
 
     #[test]
