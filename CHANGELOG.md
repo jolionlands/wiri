@@ -5,6 +5,59 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Lane FIXRUN2 — the dba4606 run's remaining live-gate failures
+
+Five gate classes in the frozen full run (883/913) were gate defects, not product defects; each
+was reproduced in a harness-context probe (lane files dot-sourced into the real `live-test.ps1`
+scope: the same `Ctl`/`Chord`/`Shot`/`LanePhaseError`, `$steps` list, `$summary` hashtable, run
+profile, pipe and `Global\wiri-live-test` mutex) before and after its fix.
+
+- **H28** (`h28_both_null_actions_still_copy`) compared two window captures taken at *different
+  output scales*: the null config wrote no `scale` line, so its reload dropped the output from
+  the configured 1.25 to the monitor's real 96 dpi and the layout re-tiled the fixture. A window
+  screenshot is the window's pixels at that moment, so the null config now keeps the h27 scale
+  and the `reload without a scale line is the real DPI` gate gets its own reload. lane-d also
+  asks wiri for the focus (`FocusForm`, which retries) instead of `SwitchToThisWindow` — the
+  latter silently left an unrelated zero-sized window foreground, so `screenshot-window`
+  captured the whole screen — records every value the gate compares (clipboard sequence numbers,
+  both captures, both rectangles, the captured handle) in `lane-d-values.json`, and uses niri's
+  `screenshot-window --id` when the session's foreground cannot be moved at all.
+- **H91** (`h91_gap_reload_moves_the_window`) read `.X`/`.Y` on the harness's `Rc` rectangle
+  (L/T/R/B/W/H): the vertical delta was `$null - $null = 0`, and the recorded probe shows the
+  44 px top-edge move and the 88 px view shrink it asserts. `H91Near` had the same defect.
+- **H94** (six `h94_*`) had no daemon: the lane is dot-sourced after the harness quits its main
+  daemon and relied on one another lane happened to leave running, so every `h94-00N-windows`
+  query exited rc=1. The lane now owns its daemon (refusing a pre-existing one) on a workspace of
+  its own and quits it in its `finally`.
+- **H95** (eight `h95_*`) reloaded configs the parser rejects, so `EvCtl` threw on the first
+  reload of each group: five of the seven texts put `layout { ... border { off; } ... }` child
+  blocks on one line, and the shadow group used `workspace-shadow { offset-y 10 }` (niri's option
+  is `offset x=.. y=..`). Reproduced with the daemon's own validator (5 of 7 rc=1 before, all rc=0
+  after) and verified live. Three further harness-context defects were hiding behind it: the
+  typed `MoveFloatingWindow` x/y must be niri `PositionChange` values (`SetFixed`, ...), not bare
+  numbers; the tab group's "no foreign tiles" precondition can never hold on the first workspace,
+  which always holds the desktop's own adopted windows, so it takes a workspace of its own; and
+  `EvTyped` now reports the daemon's reply text.
+- **H97** (seven `h97_*`) never saw the overview host: `H97Settle` broke out of its wait as soon
+  as the host was absent, and `toggle-overview` answers before the main loop creates it, so every
+  group got a null handle. Group A also threw on `@($r.L, $r.T, $r.R - $r.L, $r.B - $r.T)` — the
+  comma binds tighter than the subtraction in PowerShell, so it becomes `$r.R - ($r.L, $r.B) -
+  $r.T` on an `Object[]`. 7 of 8 gates now pass in the probe; the click gate still needs the OS
+  to hand the foreground to the clicked window, which this agent session's shell-owned foreground
+  refuses.
+- **H98** (six movement gates) compared `.X`/`.Y` fields that do not exist, and then could not
+  use screen rectangles at all: the desktop's windows are adopted into the first workspace and an
+  inactive row or a parked column keeps its last active rectangle. The fixture rows now live on
+  workspaces 2-4, and the gates reconstruct each row's strip from the engine's own
+  `pos_in_scrolling_layout` and `tile_size` and check the row/column `src/layout/engine/
+  unified_grid.rs` resolves (rules 3-5) before the step, keeping the screen check only for "the
+  window is on the monitor's view". The strip math was checked offline against the rectangles a
+  previous probe recorded (anchor 164 -> row 2 column 2, where the engine put
+  `move-window-up-right`) and three of the six gates pass in the harness probe; the other three
+  read `is_focused`, which wiri cannot report while another process owns the OS foreground (this
+  agent session's foreground is the shell's XAML island), and fall back to the active row's
+  remembered window.
+
 ### Lane GRID — the unified XY grid (wiri extension, opt-in)
 
 - `layout { unified-grid }` (also `unified-grid true` / `unified-grid false`, and accepted in a
