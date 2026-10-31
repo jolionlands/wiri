@@ -24,6 +24,7 @@
     }
     $h94Forms = New-Object System.Collections.ArrayList
     $h94Runtime = @{ serial = 0 }
+    $h94Proc = $null
     Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -292,7 +293,26 @@ public static class H94SelfResize {
         } 4000 200
         return $h
     }
+    # The lane owns its daemon: dot-sourced late in the cycle, it used to run after the
+    # harness's main daemon had already quit, so every `windows --json` call (and therefore
+    # every H94 gate) failed with rc=1 against no pipe at all.
+    $h94Base = @'
+input { mod-key "ctrl-alt" }
+animations { off; }
+layout {
+    gaps 16
+    focus-ring { off; }
+    border { off; }
+}
+'@
     try {
+        if (@(Get-Process -Name wiri -ErrorAction SilentlyContinue).Count) { throw 'H94 refuses an existing daemon' }
+        $h94Proc = Start-WiriWithConfig $h94Base (Join-Path $h94Dir 'wiri.stderr.log')
+        if ($null -eq $h94Proc -or $h94Proc.HasExited) { throw 'H94 daemon did not start' }
+        # A workspace of its own: the shared desktop already holds other applications'
+        # windows, and the two fixtures must be the columns their strip positions describe.
+        $null = Ctl 'h94-workspace' @('action', 'focus-workspace', '2')
+        Start-Sleep -Milliseconds 800
         try {
             $first = H94Open 'h94-self-one'
             $before = [H94SelfResize]::Outer($first)
@@ -432,6 +452,7 @@ public static class H94SelfResize {
     } finally {
         try { [H94SelfResize]::CloseAll() } catch { }
         $null = H94Wait { [H94SelfResize]::AllClosed } 12000
+        if ($null -ne $h94Proc -and -not $h94Proc.HasExited) { Stop-WiriGracefully $h94Proc 'h94' }
         Save-H94Evidence
     }
 }
