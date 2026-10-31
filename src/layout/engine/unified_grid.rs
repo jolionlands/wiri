@@ -321,12 +321,11 @@ impl TilingEngine {
             );
             return;
         }
-        // Resolve the row and the camera target before anything moves, so the x scroll and
-        // the row slide are one motion rather than two.
-        let target_row = self
+        let from_row = self
             .monitors
             .get(&output)
-            .and_then(|monitor| monitor.workspace_next_to(monitor.active_workspace, pan.down));
+            .map(|monitor| monitor.active_workspace)
+            .unwrap_or(0);
         let from = self.camera_offset(output);
         let step = self.effective_config(output).scroll_step;
         let target = if pan.right {
@@ -334,13 +333,46 @@ impl TilingEngine {
         } else {
             from.saturating_sub(step)
         };
+        self.unified_pan_rows(output, from_row, from, pan.down, target, backend);
+    }
+
+    /// One diagonal camera motion on a unified monitor: one row from `from_row` in
+    /// `down`'s direction and the shared camera from `camera_from` to `x_target`.
+    ///
+    /// Both legs are resolved here before anything moves, so the row change and the x
+    /// scroll animate together instead of one after the other.
+    fn unified_pan_rows(
+        &mut self,
+        output: OutputId,
+        from_row: i32,
+        camera_from: i32,
+        down: bool,
+        x_target: i32,
+        backend: &BackendHandle,
+    ) {
+        let x_target = x_target.max(0);
+        // A row change that already happened as a separate leg is undone here, so the row
+        // does not move twice; the overview's own vertical pan keeps heading for the same
+        // row, so the two legs stay one motion.
+        if self.monitors.get(&output).map(|m| m.active_workspace) != Some(from_row) {
+            if let Some(monitor) = self.monitors.get_mut(&output) {
+                monitor.switch_workspace(from_row);
+            }
+        }
+        let target_row = self
+            .monitors
+            .get(&output)
+            .and_then(|monitor| monitor.workspace_next_to(from_row, down));
+        // Restore the pre-gesture camera, so the row change carries that x across and the
+        // pan below animates from where the gesture actually started.
+        self.set_camera_offset(output, camera_from);
         // The shared camera keeps x across the row change and lands on the x-matched
         // column; the pan below is then the existing view scroll, applied on top.
         if let Some(row) = target_row {
             self.unified_switch_workspace(output, row);
         }
-        self.set_camera_offset(output, target.max(0));
-        self.queue_view(output, from, target.max(0));
+        self.set_camera_offset(output, x_target);
+        self.queue_view(output, camera_from, x_target);
         let cfg = self.active_workspace_config(output).clone();
         if let Some(monitor) = self.monitors.get_mut(&output) {
             let view_width = Self::view_width_for_monitor(monitor, &cfg);
@@ -350,6 +382,40 @@ impl TilingEngine {
                 .unwrap_or_else(|| Self::effective_column_width(0, view_width, &cfg));
             if let Some(workspace) = monitor.workspace_mut() {
                 workspace.clamp_scroll(col_w, cfg.column_gap, view_width);
+            }
+        }
+        self.apply_layout_for_monitor(output, backend);
+    }
+
+    /// A row change inside the overview: niri's `NextWorkspace` / `PreviousWorkspace`
+    /// camera step (a vertical wheel, a touch drag or a dwell), and the vertical leg of a
+    /// two-axis scroll.
+    ///
+    /// With the mode off this is exactly the monitor-local `switch_workspace` the overview
+    /// always used. With it on the row change carries the monitor's one camera and lands on
+    /// the x-matched column (rule 3), so the two axes of a two-finger scroll move the *same*
+    /// camera: x and y animate together instead of x panning the active row only.
+    pub(super) fn overview_step_row(&mut self, down: bool, backend: &BackendHandle) {
+        let Some(output) = self.monitors.focused_id() else {
+            return;
+        };
+        let unified = self.unified_grid_for(output);
+        let target = self.monitors.get(&output).and_then(|monitor| {
+            let ids = monitor.workspace_ids();
+            let index = ids.iter().position(|id| *id == monitor.active_workspace)?;
+            let next = if down {
+                (index + 1).min(ids.len().saturating_sub(1))
+            } else {
+                index.saturating_sub(1)
+            };
+            ids.get(next).copied()
+        });
+        if let Some(id) = target {
+            // No hide/show and no workspace slide: the overview moves its own camera.
+            if unified {
+                self.unified_switch_workspace(output, id);
+            } else if let Some(monitor) = self.monitors.get_mut(&output) {
+                monitor.switch_workspace(id);
             }
         }
         self.apply_layout_for_monitor(output, backend);

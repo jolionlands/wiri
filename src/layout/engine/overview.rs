@@ -306,6 +306,13 @@ impl TilingEngine {
     /// (`Monitor::render_workspaces`, src/layout/monitor.rs:1735-1745), so a column
     /// that is half past the edge is cut there and a fully scrolled-out one is not
     /// drawn at all.
+    ///
+    /// With the opt-in `layout { unified-grid }` on for this monitor every row is
+    /// drawn through the monitor's *one* shared camera instead
+    /// ([`TilingEngine::camera_offset`]), so the columns of different rows sit at the
+    /// same on-screen x and the zoomed-out view reads as the same XY grid the normal
+    /// view is. Empty slots stay empty: a row shorter than the camera offset simply
+    /// has nothing there, exactly like rule 3's "past the row's ends".
     pub(super) fn workspace_overview_scene(
         &self,
         output: OutputId,
@@ -317,6 +324,11 @@ impl TilingEngine {
         // insets inside it (C2), rather than inheriting the active workspace's view.
         let view = monitor.work_area;
         let zoom = self.overview_zoom();
+        // wiri `unified-grid`: one camera for every row of a unified monitor, so the
+        // rows line up in x. `None` (mode off, the default) keeps niri's per-row camera.
+        let monitor_camera = self
+            .unified_grid_for(output)
+            .then(|| self.camera_offset(output));
         let workspaces =
             overview_workspace_stack(monitor, view, zoom, self.overview_camera.render_index);
         let mut positions = Vec::new();
@@ -336,11 +348,13 @@ impl TilingEngine {
                 workspace_view.width as u32,
                 workspace_view.height as u32,
             );
-            // The per-workspace horizontal camera: the layout already applies this
-            // workspace's own scroll offset (niri's `render_scrolling`), so only the
-            // difference a shared monitor camera would need is applied here.  The
-            // follow-up unified-grid mode fills that in.
-            let camera = overview_geometry::workspace_camera_adjustment(ws.scroll_offset.x, None);
+            // The horizontal camera: the layout already applies this workspace's own
+            // scroll offset (niri's `render_scrolling`), so only the difference a shared
+            // monitor camera needs is applied here.  With `unified-grid` on that
+            // difference is `monitor camera - this row's own offset`, which makes the
+            // drawn x of every tile the same `strip x - monitor camera` in every row.
+            let camera =
+                overview_geometry::workspace_camera_adjustment(ws.scroll_offset.x, monitor_camera);
             let normal = self.calculate_positions_at_zoom(
                 ws,
                 workspace_view,
@@ -349,22 +363,25 @@ impl TilingEngine {
                 cfg,
                 1.0,
             );
-            let mut push = |wid: WindowId, rect: Rect| {
+            let mut push = |wid: WindowId, rect: Rect, camera: i32| {
                 let panned = Rect::new(rect.loc.x - camera, rect.loc.y, rect.size.w, rect.size.h);
                 let screen = overview_geometry::zoom_tile(panned, workspace_rect, view_rect, zoom);
                 positions.push((wid, screen));
                 clips.push((wid, workspace_rect));
             };
             for (wid, rect) in normal {
-                push(wid, rect);
+                push(wid, rect, camera);
             }
+            // Floating windows are not part of the grid (`docs/design/unified-grid.md`):
+            // their rects are already screen positions in their own workspace, so the
+            // shared camera never shifts them (and never shifts them with the mode off).
             for (wid, rect) in self.float_homes.iter().filter_map(|(wid, home)| {
                 (home.output == output && home.workspace == id)
                     .then(|| self.float_rect_of(*wid))
                     .flatten()
                     .map(|rect| (*wid, rect))
             }) {
-                push(wid, rect);
+                push(wid, rect, 0);
             }
         }
         // One session host exists, on the output the camera opened over: another
@@ -433,27 +450,8 @@ impl TilingEngine {
                 self.overview_drop_window(window, target, backend);
             }
             OverviewCommand::ScrollView(delta) => self.overview_scroll_view(delta, backend),
-            OverviewCommand::PreviousWorkspace | OverviewCommand::NextWorkspace => {
-                let Some(output) = self.monitors.focused_id() else {
-                    return;
-                };
-                if let Some(m) = self.monitors.get_mut(&output) {
-                    let ids = m.workspace_ids();
-                    let index = ids
-                        .iter()
-                        .position(|id| *id == m.active_workspace)
-                        .unwrap_or(0);
-                    let next = if command == OverviewCommand::NextWorkspace {
-                        (index + 1).min(ids.len().saturating_sub(1))
-                    } else {
-                        index.saturating_sub(1)
-                    };
-                    if let Some(id) = ids.get(next) {
-                        m.switch_workspace(*id);
-                    }
-                }
-                self.apply_layout_for_monitor(output, backend);
-            }
+            OverviewCommand::PreviousWorkspace => self.overview_step_row(false, backend),
+            OverviewCommand::NextWorkspace => self.overview_step_row(true, backend),
         }
     }
 }
@@ -845,5 +843,201 @@ mod tests {
             overview_geometry::zoom_tile(view, ws, view, 0.5),
             Rect::new(-1024, 182, 683, 364)
         );
+    }
+
+    /// Three rows of different column counts (4, 2 and 3) of 400 px columns 16 px apart on
+    /// a 1000 px wide view, each row with its own remembered offset: the fixture for the
+    /// unified camera and the diagonal actions in the overview.
+    fn grid_overview_engine(unified: bool) -> (TilingEngine, BackendHandle, OutputId) {
+        use crate::layout::{ColumnWidthMode, Monitor, Workspace};
+        let backend = BackendHandle::default_for_test();
+        let output = OutputId::from_name("overview-grid");
+        let mut e = TilingEngine::new(crate::layout::LayoutConfig {
+            unified_grid: unified,
+            column_width: 400,
+            column_width_mode: ColumnWidthMode::Fixed,
+            column_gap: 16,
+            outer_gaps: (0, 0, 0, 0),
+            ..crate::layout::LayoutConfig::default()
+        });
+        let mut m = Monitor::new(
+            output,
+            Rect::new(0, 0, 1000, 800),
+            Rect::new(0, 0, 1000, 760),
+        );
+        // Row 0: 1000..1004, row 1: 1100..1102, row 2: 1200..1203. Each row's own
+        // remembered offset is a valid one for its own strip and different from the others.
+        for (workspace, count, first, offset) in
+            [(0, 4, 1000, 100), (1, 2, 1100, 0), (2, 3, 1200, 200)]
+        {
+            let mut ws = Workspace::new();
+            for index in 0..count {
+                ws.add_window_to_new_column_with_width(WindowId::new(first + index), Some(400));
+            }
+            ws.scroll_offset.x = offset;
+            m.insert_workspace(workspace, ws);
+        }
+        e.monitors.insert(output, m);
+        e.monitors.set_focused(output);
+        (e, backend, output)
+    }
+
+    /// Open the camera state without a host, for tests that only read the scene or move the
+    /// camera: `enter_overview` needs a DWM sink, these do not.
+    fn overview_at_half(engine: &mut TilingEngine) {
+        engine.overview = Some(OverviewState {
+            zoom: 0.5,
+            workspace_offsets: Vec::new(),
+        });
+    }
+
+    /// The drawn x of every tile of the scene, keyed by window.
+    fn scene_x(
+        engine: &TilingEngine,
+        output: OutputId,
+    ) -> std::collections::HashMap<WindowId, i32> {
+        engine
+            .workspace_overview_scene(output)
+            .0
+            .into_iter()
+            .map(|(id, rect)| (id, rect.loc.x))
+            .collect()
+    }
+
+    /// wiri `unified-grid` in the overview: one camera for every row, so column k of three
+    /// rows with different column counts is drawn at the same screen x. With the mode off
+    /// every row keeps its own camera (niri's behaviour, unchanged).
+    #[test]
+    fn unified_grid_draws_every_row_with_the_monitor_camera() {
+        let (mut e, _backend, output) = grid_overview_engine(true);
+        overview_at_half(&mut e);
+        // The monitor's camera is the active row's offset; pin it to a known x.
+        e.monitors.get_mut(&output).unwrap().active_workspace = 0;
+        e.set_camera_offset(output, 316);
+        let x = scene_x(&e, output);
+        // Columns 0 and 1 exist in every row (4, 2 and 3 columns).
+        for (row0, row1, row2) in [(1000, 1100, 1200), (1001, 1101, 1201)] {
+            assert_eq!(x[&WindowId::new(row0)], x[&WindowId::new(row1)]);
+            assert_eq!(x[&WindowId::new(row1)], x[&WindowId::new(row2)]);
+        }
+        // The rows still hold their own tile counts: an empty slot stays empty.
+        assert_eq!(x.len(), 9);
+        // The camera really is the monitor's: panning it moves every row by the same x.
+        let before = x[&WindowId::new(1200)];
+        e.set_camera_offset(output, 516);
+        let after = scene_x(&e, output)[&WindowId::new(1200)];
+        // 200 strip px at the half zoom.
+        assert_eq!(before - after, 100);
+
+        // Mode off: niri's per-row camera, so the same columns sit at different x.
+        let (mut e, _backend, output) = grid_overview_engine(false);
+        overview_at_half(&mut e);
+        let x = scene_x(&e, output);
+        assert_ne!(x[&WindowId::new(1000)], x[&WindowId::new(1100)]);
+        assert_ne!(x[&WindowId::new(1100)], x[&WindowId::new(1200)]);
+    }
+
+    /// wiri `unified-grid` rule 4 in the overview: `focus-up-right` resolves the row and the
+    /// column before anything moves, so the zoomed-out camera pans in x and y as one motion
+    /// and the focus lands on the window diagonally up-and-right.
+    #[test]
+    fn a_diagonal_focus_in_the_overview_pans_the_camera_and_lands_on_the_window() {
+        use crate::input::GridAction;
+        use crate::overlay::MockThumbnailOverview;
+        let (mut e, backend, output) = grid_overview_engine(true);
+        // niri's motion on, so both legs of the diagonal run as animations rather than
+        // snapping: this is what "one camera motion" means for the assertion below.
+        e.configure_motion(&crate::config::AnimationsConfig {
+            enabled: true,
+            legacy_easing: true,
+            duration: 100,
+            easing: "linear".into(),
+            ..Default::default()
+        });
+        e.install_thumbnail_overview(MockThumbnailOverview::new());
+        e.set_animation_notifier(std::sync::Arc::new(tokio::sync::Notify::new()));
+        // Row 1 (two columns) with its second column focused, at the monitor camera 0.
+        {
+            let monitor = e.monitors.get_mut(&output).unwrap();
+            monitor.switch_workspace(1);
+            monitor.focus_column = Some(1);
+            monitor.focus_window = Some(WindowId::new(1101));
+            monitor.workspaces.get_mut(&1).unwrap().scroll_offset.x = 0;
+        }
+        e.enter_overview(&backend);
+        e.tick_animations_with_backend(60_000, &backend);
+        assert!(e.has_thumbnail_overview());
+        assert_eq!(e.overview_zoom(), 0.5);
+        assert_eq!(e.camera_offset(output), 0);
+        // The camera opened centred on the focused row (row 1 of 0,1,2).
+        assert_eq!(e.overview_camera.render_index, 1.0);
+
+        // The anchor is column 1's centre (616); row 0 matches column 1, one column right
+        // is column 2 (window 1002), whose right edge is past the 1000 px view.
+        e.apply_grid_action(GridAction::new(true, true, false), false, &backend);
+        let monitor = e.monitors.get(&output).unwrap();
+        assert_eq!(monitor.active_workspace, 0);
+        assert_eq!(monitor.focus_window, Some(WindowId::new(1002)));
+        // Both legs are in flight from the one action: the stack slides up to row 0 and the
+        // x camera is retargeted towards column 2 (the x animation starts at the offset the
+        // camera had, so nothing has jumped yet).
+        assert_eq!(
+            e.overview_camera_target(output),
+            Some(0.0),
+            "y did not move"
+        );
+        assert!(
+            e.overview_camera.animating(),
+            "one motion should be running"
+        );
+        assert_eq!(e.camera_offset(output), 0, "x jumped instead of animating");
+        // One tick pair moves both: 232 strip px is what brings column 2's right edge
+        // (1232) onto the 1000 px view's edge, and the stack arrives at row 0.
+        e.tick_animations_with_backend(60_000, &backend);
+        assert_eq!(e.camera_offset(output), 232, "x did not arrive");
+        assert_eq!(e.overview_camera.render_index, 0.0, "y did not arrive");
+        // A zoomed-out row of 1000 px now shows column 2 completely.
+        assert!(e.camera_offset(output) + 1000 >= 832 + 400);
+        // Nothing else moved focus: the window is focused on its own row.
+        assert_eq!(e.monitors.get(&output).unwrap().focus_column, Some(2));
+    }
+
+    /// wiri `unified-grid` rule 6 in the overview: the vertical axis of a two-finger scroll
+    /// steps the row and carries the one camera, then the horizontal axis pans that same
+    /// camera, so every row moves with it instead of only the active one.
+    #[test]
+    fn a_two_axis_scroll_in_the_overview_pans_the_one_shared_camera() {
+        let (mut e, backend, output) = grid_overview_engine(true);
+        overview_at_half(&mut e);
+        {
+            let monitor = e.monitors.get_mut(&output).unwrap();
+            monitor.switch_workspace(1);
+            monitor.workspaces.get_mut(&1).unwrap().scroll_offset.x = 0;
+        }
+        // The vertical axis: one row down (niri's `NextWorkspace`), camera carried, not
+        // row 2's own remembered offset.
+        e.overview_command(super::OverviewCommand::NextWorkspace, &backend);
+        assert_eq!(e.monitors.get(&output).unwrap().active_workspace, 2);
+        assert_eq!(e.camera_offset(output), 0);
+        // The horizontal axis: 60 screen px at the half zoom is 120 strip px of the one
+        // camera, so the drawn x of every row follows.
+        e.overview_scroll_view(60, &backend);
+        assert_eq!(e.camera_offset(output), 120);
+        let x = scene_x(&e, output);
+        assert_eq!(x[&WindowId::new(1000)], x[&WindowId::new(1200)]);
+        // Mode off: the vertical step lands on the row's own camera, and the horizontal
+        // scroll moves only that row, which is niri's per-row behaviour.
+        let (mut e, backend, output) = grid_overview_engine(false);
+        overview_at_half(&mut e);
+        {
+            let monitor = e.monitors.get_mut(&output).unwrap();
+            monitor.switch_workspace(1);
+        }
+        e.overview_command(super::OverviewCommand::NextWorkspace, &backend);
+        assert_eq!(e.camera_offset(output), 200);
+        e.overview_scroll_view(60, &backend);
+        assert_eq!(e.camera_offset(output), 320);
+        let x = scene_x(&e, output);
+        assert_ne!(x[&WindowId::new(1000)], x[&WindowId::new(1200)]);
     }
 }

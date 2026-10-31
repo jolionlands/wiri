@@ -296,6 +296,59 @@ mod tests {
         assert_eq!(rects[2], Rect::new(342, 192 + stride, 683, 384));
     }
 
+    /// wiri `unified-grid` in the overview: with the monitor's one camera, a column at
+    /// strip x `k * 416` is drawn at the same screen x in every row, whatever each row's
+    /// own remembered offset is (three rows of 4, 2 and 6 equal columns). With the mode
+    /// off every row keeps its own camera, which is niri's behaviour, unchanged.
+    #[test]
+    fn a_unified_camera_puts_the_same_strip_x_at_the_same_screen_x_in_every_row() {
+        let view = view();
+        let zoom = 0.5;
+        let rects = workspace_rects(view, 3, 1.0, zoom);
+        // Column k starts at k * (400 px + 16 px) in every row; rows 0..2 hold 4, 2 and 6.
+        let column_count = [4, 2, 6];
+        let own_offset = [0, 500, 1200];
+        let monitor_camera = 316;
+        let drawn_x = |row: usize, k: usize, camera: Option<i32>| {
+            let own = own_offset[row];
+            let adjustment = workspace_camera_adjustment(own, camera);
+            // `calculate_positions_at_zoom` already subtracts the row's own offset.
+            let tile = Rect::new(
+                k as i32 * (400 + 16) - own - adjustment,
+                0,
+                400,
+                view.size.h,
+            );
+            zoom_tile(tile, rects[row], view, zoom).loc.x
+        };
+        // The first two columns exist in every row.
+        for k in 0..2 {
+            assert!(column_count.iter().all(|count| k < *count));
+            let unified: Vec<i32> = (0..3)
+                .map(|row| drawn_x(row, k, Some(monitor_camera)))
+                .collect();
+            assert_eq!(unified[0], unified[1], "column {k} row 0 vs row 1");
+            assert_eq!(unified[1], unified[2], "column {k} row 1 vs row 2");
+        }
+        // Also inside the workspace rect: (683 - 400 * 0.5) is not the whole frame, so
+        // this is the zoom of a strip x, not a fit.
+        assert_eq!(
+            drawn_x(2, 1, Some(monitor_camera)) - drawn_x(2, 0, Some(monitor_camera)),
+            208
+        );
+        // Mode off: each row draws through its own camera, so the rows differ.
+        let off: Vec<i32> = (0..3).map(|row| drawn_x(row, 0, None)).collect();
+        assert_ne!(off[0], off[1]);
+        assert_ne!(off[1], off[2]);
+        // The two seams the rows are built from: niri's per-row camera, and the monitor's
+        // one camera in unified mode.
+        assert_eq!(workspace_camera(own_offset[0], None), own_offset[0]);
+        assert_eq!(
+            workspace_camera(own_offset[0], Some(monitor_camera)),
+            monitor_camera
+        );
+    }
+
     /// A thumbnail whose column runs past the workspace edge is cropped exactly
     /// there (`Monitor::render_workspaces` crops to the workspace height and the
     /// workspace's own render rect); a fully off-screen column is dropped.

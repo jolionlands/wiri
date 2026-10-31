@@ -69,6 +69,8 @@ pub enum OverviewCommand {
         window: WindowId,
         target: crate::overlay::overview_pointer::DropTarget,
     },
+    /// A horizontal scroll of the camera, in screen pixels (a right-drag or the
+    /// horizontal axis of a two-finger scroll).
     ScrollView(i32),
     Close,
 }
@@ -640,6 +642,25 @@ mod win {
             property(hwnd, "WiriOverviewFocusY", rect.loc.y as isize);
             property(hwnd, "WiriOverviewFocusW", rect.size.w as isize);
             property(hwnd, "WiriOverviewFocusH", rect.size.h as isize);
+            // Per-tile destination geometry in draw order (top to bottom, then left to
+            // right), so the live harness can read where each column of each workspace row
+            // actually sits instead of trusting a screenshot. Session-local like the rest.
+            let mut tiles: Vec<(WindowId, Rect)> = self
+                .scene
+                .tiles
+                .iter()
+                .filter_map(|(id, tile)| tile.rect.map(|rect| (*id, rect)))
+                .collect();
+            tiles.sort_by_key(|(id, rect)| (rect.loc.y, rect.loc.x, id.as_isize()));
+            property(hwnd, "WiriOverviewTileCount", tiles.len() as isize);
+            for (index, (id, rect)) in tiles.iter().enumerate() {
+                let prefix = format!("WiriOverviewTile{index}");
+                property(hwnd, &format!("{prefix}Window"), id.as_isize());
+                property(hwnd, &format!("{prefix}X"), rect.loc.x as isize);
+                property(hwnd, &format!("{prefix}Y"), rect.loc.y as isize);
+                property(hwnd, &format!("{prefix}W"), rect.size.w as isize);
+                property(hwnd, &format!("{prefix}H"), rect.size.h as isize);
+            }
             if background_changed {
                 self.background = appearance::background(
                     self.bounds,
