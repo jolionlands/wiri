@@ -32,9 +32,11 @@ function H91Chord([byte]$key) {
 }
 
 # Rectangles sample motion; a couple of pixels of rounding must not fail a gate.
+# `Rc` reports niri's L/T/R/B/W/H (the harness helper's own fields), so the position
+# fields are L and T; `.X`/`.Y` do not exist and silently compared $null with $null.
 function H91Near($a, $b, [int]$tolerance = 3) {
-    return ([math]::Abs($a.X - $b.X) -le $tolerance) -and
-           ([math]::Abs($a.Y - $b.Y) -le $tolerance) -and
+    return ([math]::Abs($a.L - $b.L) -le $tolerance) -and
+           ([math]::Abs($a.T - $b.T) -le $tolerance) -and
            ([math]::Abs($a.W - $b.W) -le $tolerance) -and
            ([math]::Abs($a.H - $b.H) -le $tolerance)
 }
@@ -61,8 +63,8 @@ try {
         # The re-placement animates (window-movement 1200 ms): sample the settled rect.
         Start-Sleep -Milliseconds 900
         $h91After = Rc $h91Forms[0]
-        $deltaX = $h91After.X - $h91Before.X
-        $deltaY = $h91After.Y - $h91Before.Y
+        $deltaX = $h91After.L - $h91Before.L
+        $deltaY = $h91After.T - $h91Before.T
         # niri keeps the scrolled view's horizontal offset, so only the vertical placement is a
         # fixed function of the gap difference: the top edge moves by `60 - 16 = 44` px and the
         # view shrinks by twice that. The horizontal delta depends on where the strip happens
@@ -70,7 +72,7 @@ try {
         # it is only used as evidence, not asserted.
         $summary.h91_gap_reload_moves_the_window = ($deltaY -ge 30) -and ($deltaY -le 60) -and
             (($h91Before.H - $h91After.H) -ge 60) -and ($h91After.W -eq $h91Before.W)
-        Set-Content (Join-Path $D 'h91-gap.txt') "before=$($h91Before.X),$($h91Before.Y),$($h91Before.W),$($h91Before.H) after=$($h91After.X),$($h91After.Y),$($h91After.W),$($h91After.H) dx=$deltaX dy=$deltaY"
+        Set-Content (Join-Path $D 'h91-gap.txt') "before=$($h91Before.L),$($h91Before.T),$($h91Before.W),$($h91Before.H) after=$($h91After.L),$($h91After.T),$($h91After.W),$($h91After.H) dx=$deltaX dy=$deltaY"
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h91-gap-error.txt')
     }
@@ -88,7 +90,7 @@ try {
         # work-area height). The width is not a discriminator: a tiled column is ~500 px wide
         # and the floating fixture is ~520, so the height is asserted.
         $summary.h91_window_rule_reload_affects_a_new_window = ($h91Floating.H -lt ($h91Monitor.H - 100)) -and ($h91Floating.W -gt 400) -and ($h91Monitor.W -gt 400) -and ($h91BeforeRule -ge 1)
-        Set-Content (Join-Path $D 'h91-rule.txt') "tiled=$($h91Monitor.X),$($h91Monitor.Y),$($h91Monitor.W),$($h91Monitor.H) opened=$($h91Floating.X),$($h91Floating.Y),$($h91Floating.W),$($h91Floating.H)"
+        Set-Content (Join-Path $D 'h91-rule.txt') "tiled=$($h91Monitor.L),$($h91Monitor.T),$($h91Monitor.W),$($h91Monitor.H) opened=$($h91Floating.L),$($h91Floating.T),$($h91Floating.W),$($h91Floating.H)"
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h91-rule-error.txt')
     }
