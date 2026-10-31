@@ -29,7 +29,7 @@ wiri is a working prototype. It builds for x86_64 and ARM64 Windows. The measure
 ## Why wiri
 
 - **niri's model, on Windows.** Windows are columns on an endless strip, and each monitor has its own stack of dynamic workspaces. Opening a window never resizes the others.
-- **Light and quick.** Idle CPU measures effectively zero, and a key press moves a window in about 20 ms at the median. See [Performance](#performance).
+- **Light and quick.** Idle CPU measures effectively zero, and a key press has the window in its new place in under 6 ms at the median. See [Performance](#performance).
 - **Speaks niri's language.** The config uses niri's KDL syntax, so `binds {}` blocks and `window-rule`s paste in as they are. `wiri-ctl` mirrors `niri msg`, with niri-shaped JSON for windows and workspaces.
 - **Tested on a real desktop.** An automated harness sends real keyboard input to real windows and checks the results. Its latest fully green official run passed all 769 enforced checks.
 
@@ -131,7 +131,7 @@ wiri-ctl events --types '*'             # stream events as they happen
 
 wiri is checked against niri's main branch (snapshot of 22 October 2026). Each feature row is checked in the code, not in the docs. At the latest recount, from 30 October 2026:
 
-- **304 of 396** applicable features are done (76.8%), **92** are partial, and **none** are missing.
+- **305 of 397** applicable features are done (76.8%), **92** are partial, and **none** are missing.
 - All **143** niri actions are recognised. The nine that are specific to Wayland compositors return an explicit error.
 
 Row-by-row status and open items are in [docs/parity/README.md](docs/parity/README.md).
@@ -143,12 +143,12 @@ These figures come from one Windows 11 x64 laptop (Intel Core i5-8350U, 1366×76
 | What | Result |
 | --- | --- |
 | Idle CPU over 30 seconds | 0 ms, below the counter's 15.6 ms resolution |
-| Key press to window move (10 keys) | median 20 ms, max 24 ms |
+| Key press to window repositioned (10 keys, timed at the target window) | median 5.85 ms, max 7.54 ms |
 | Launch to first tiled layout | about 64 ms (one cold start) |
 | Animation frame interval | 16.7 ms (60 Hz), about 0.13 ms of CPU per frame |
-| Private memory at startup | about 8 MiB |
+| Memory at rest | about 4.4 MiB private, 17.8 MiB working set |
 
-The memory run did not record how many windows were open. These are x64 numbers, and ARM64 measurements are still to come. The method and the raw numbers are in [docs/PERF.md](docs/PERF.md).
+The key-press figure runs from the real `SendInput` call to the moved window's own UI thread receiving its new position, so it excludes only drawing the frame. The memory figures come from the same measured run ([details](docs/parity/2026-10-29-tridaris-r4.md#owned-target-acknowledgement-performance)). These are x64 numbers, and ARM64 measurements are still to come. The method and the raw numbers are in [docs/PERF.md](docs/PERF.md).
 
 ## Coming soon
 
