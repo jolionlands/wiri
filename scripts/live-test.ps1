@@ -416,6 +416,52 @@ public static class TestForms {
     }
   }
 }
+
+// Run-wide foreground log: every EVENT_SYSTEM_FOREGROUND with time, window, process id and title, so a
+// failed focus gate can be told apart from another program taking the foreground during the run.
+public static class FgLog {
+  delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+  [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr h; public uint m; public IntPtr w; public IntPtr l; public uint t; public int x; public int y; }
+  [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc proc, uint pid, uint tid, uint flags);
+  [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr h);
+  [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr h, uint min, uint max);
+  [DllImport("user32.dll")] static extern bool PostThreadMessage(uint tid, uint msg, IntPtr w, IntPtr l);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  static readonly List<string> events = new List<string>();
+  static WinEventProc keep;
+  static System.Threading.Thread thread;
+  static uint threadId;
+  public static void Start() {
+    if (thread != null) return;
+    var ready = new System.Threading.ManualResetEvent(false);
+    thread = new System.Threading.Thread(() => {
+      threadId = GetCurrentThreadId();
+      keep = (hook, ev, hwnd, idObject, idChild, tid, time) => {
+        uint pid; GetWindowThreadProcessId(hwnd, out pid);
+        var title = new StringBuilder(160); GetWindowText(hwnd, title, 160);
+        lock (events) { events.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "\t" + hwnd.ToInt64() + "\t" + pid + "\t" + title.ToString()); }
+      };
+      IntPtr hk = SetWinEventHook(3, 3, IntPtr.Zero, keep, 0, 0, 0);   // EVENT_SYSTEM_FOREGROUND, out of context
+      ready.Set();
+      MSG m;
+      while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
+      if (hk != IntPtr.Zero) UnhookWinEvent(hk);
+    });
+    thread.IsBackground = true;
+    thread.Start();
+    ready.WaitOne(2000);
+  }
+  public static string[] Stop() {
+    if (thread != null) {
+      PostThreadMessage(threadId, 0x0012, IntPtr.Zero, IntPtr.Zero);   // WM_QUIT
+      thread.Join(2000);
+      thread = null;
+    }
+    lock (events) { return events.ToArray(); }
+  }
+}
 '@
 
 function Shot([string]$name) {
@@ -602,6 +648,7 @@ $ctlSubsystem = [BitConverter]::ToUInt16($ctlBytes, [BitConverter]::ToInt32($ctl
 
 $topBefore = [LT]::TopLevel()
 $topAtStart = $topBefore   # the end-of-run terminal sweep closes only windows this run created
+[FgLog]::Start()
 $w = Start-Wiri $log1 (Join-Path $D 'wiri.stdout.log')
 Start-Sleep -Seconds 4
 $steps.Add([pscustomobject]@{ step = 'start'; args = "pid $($w.Id)"; rc = $(if ($w.HasExited) { $w.ExitCode } else { 'running' }); bytes = 0 })
@@ -3290,6 +3337,13 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') } catch { LanePh
 # clean desktop. Information only (a count), never a gate.
 $summary['terminal_windows_swept_at_end'] = CloseNewTerminalWindows $topAtStart @()
 $summary['terminal_windows_left_open'] = $terminalWindowsLeftOpen
+# Foreground changes over the whole run. The harness never runs elevated, so an "Administrator:" window
+# taking the foreground is another program interfering with the run. Information only, never a gate.
+$fgEvents = @([FgLog]::Stop())
+$fgEvents | Set-Content -Encoding UTF8 (Join-Path $D 'foreground-log.tsv')
+$summary['foreground_events'] = $fgEvents.Count
+$summary['foreground_elevated_titles'] = @($fgEvents | ForEach-Object { ($_ -split "`t", 4)[3] } |
+    Where-Object { $_ -like 'Administrator:*' } | Sort-Object -Unique)
 ([pscustomobject]$summary) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $D 'summary.json')
 if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $D 'config.kdl.last') -Force }
 if (Test-Path $wiriLog) { Copy-Item $wiriLog (Join-Path $D 'wiri.log.copy') -Force }
