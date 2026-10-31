@@ -3380,6 +3380,10 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-grid.ps1') } catch { LanePhas
 # tab indicator's urgent colour, Mod+button grabs on a floating window, and the keyboard-
 # shortcuts inhibitor.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-evidence.ps1') } catch { LanePhaseError 'lane_evidence' $_ }
+# H94: windows keep the final say over their size. Harness-owned WinForms fixtures resize themselves
+# from their own UI thread; the layout must keep that size, move the neighbours and never write the
+# window's geometry again (niri scrolling.rs:4860-4875, :1287-1305, :1293-1300).
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-resize.ps1') } catch { LanePhaseError 'lane_resize' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
