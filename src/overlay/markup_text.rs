@@ -108,7 +108,7 @@ impl FontCache {
             let ok = GetTextExtentPoint32W(dc, &wide, &mut size).as_bool();
             SelectObject(dc, old);
             if ok {
-                size.cx + letter_spacing_px(style, scale) * wide.len() as i32
+                run_advance(size.cx, letter_spacing_px(style, scale), wide.len())
             } else {
                 0
             }
@@ -157,6 +157,26 @@ fn letter_spacing_px(style: &Style, scale: f64) -> i32 {
 /// [`PANGO_SCALE`]ths of a point to physical pixels at this DPI scale (96 dpi reference).
 fn points_to_px(units: i32, scale: f64) -> f64 {
     (units as f64 / PANGO_SCALE as f64) * (96.0 / 72.0) * scale
+}
+
+/// The advance of `text` in its style: the glyphs plus the letter spacing of every UTF-16
+/// unit. Both come from a title, so the product is computed wide and clamped to a pixel
+/// count: a wrapped negative width would paint the row backwards and mis-measure it.
+fn run_advance(glyphs: i32, spacing_px: i32, units: usize) -> i32 {
+    let spacing =
+        i64::from(spacing_px).saturating_mul(i64::try_from(units).unwrap_or(i64::MAX));
+    match i64::from(glyphs).saturating_add(spacing).try_into() {
+        Ok(width) => width,
+        Err(_) if spacing < 0 => i32::MIN,
+        Err(_) => i32::MAX,
+    }
+}
+
+/// The baseline GDI draws a run at: the sheet's baseline, up by the font's ascent and by the
+/// run's `rise`.  A `rise` from a title must not overflow the coordinate it is subtracted
+/// from (that would panic in a debug build and move the text in release).
+fn risen_y(baseline: i32, ascent: i32, rise: i32) -> i32 {
+    baseline.saturating_sub(ascent).saturating_sub(rise)
 }
 
 /// The largest character height GDI is asked for, in pixels: past this there is no font to
@@ -289,7 +309,7 @@ pub unsafe fn draw(
         let _ = ExtTextOutW(
             dc,
             x,
-            baseline - face.ascent - rise,
+            risen_y(baseline, face.ascent, rise),
             ETO_CLIPPED,
             Some(&clip),
             PCWSTR(wide.as_ptr()),
@@ -516,6 +536,24 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
         drop(cache);
+    }
+
+    /// The measurer adds the letter spacing once per UTF-16 unit and the painter shifts the
+    /// baseline by `rise`: a title must not be able to overflow either.
+    #[test]
+    fn an_extreme_letter_spacing_or_rise_stays_a_pixel_count() {
+        assert_eq!(run_advance(10, 0, 5), 10);
+        assert_eq!(run_advance(10, 2, 5), 20);
+        assert_eq!(run_advance(0, -2, 5), -10);
+        // A wrapped product would be negative here, and wrap again on the way out.
+        assert_eq!(run_advance(0, i32::MAX, 4), i32::MAX);
+        assert_eq!(run_advance(0, i32::MIN, 4), i32::MIN);
+        assert_eq!(run_advance(i32::MAX, 1, 2), i32::MAX);
+        assert_eq!(run_advance(i32::MIN, -1, 2), i32::MIN);
+        // The baseline shift saturates instead of wrapping around the origin.
+        assert_eq!(risen_y(100, 13, 0), 87);
+        assert_eq!(risen_y(100, 13, -5), 92);
+        assert_eq!(risen_y(0, 0, i32::MIN), i32::MAX);
     }
 
     /// GDI never gets a font height it cannot make: an extreme markup size would otherwise

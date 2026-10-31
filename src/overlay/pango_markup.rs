@@ -53,6 +53,27 @@ pub const SCALE_X_LARGE: f64 = 1.44;
 /// `PANGO_SCALE_XX_LARGE`.
 pub const SCALE_XX_LARGE: f64 = 1.728;
 
+/// The largest size the sheet can be asked for, in [`PANGO_SCALE`]ths of a point: 1000 pt
+/// (1333 px at 96 dpi).  A markup title may name any number, and an unbounded one makes both
+/// the pixel arithmetic and GDI's font creation impossible.
+pub const MAX_SIZE: i32 = 1000 * PANGO_SCALE;
+/// A size is never zero or negative: a font of height zero is not a font.
+pub const MIN_SIZE: i32 = 1;
+/// The largest `rise` or `letter_spacing`, in [`PANGO_SCALE`]ths of a point: 1000 pt of extra
+/// spacing per character, far past anything a layout can use.
+pub const MAX_OFFSET: i32 = 1000 * PANGO_SCALE;
+
+/// A size, kept inside the range a title can sensibly ask for.
+pub fn clamp_size(size: i32) -> i32 {
+    size.clamp(MIN_SIZE, MAX_SIZE)
+}
+
+/// A `rise` or `letter_spacing`, kept inside the range the measurer and the painter can
+/// multiply by a title's length without overflowing.
+pub fn clamp_offset(units: i32) -> i32 {
+    units.clamp(-MAX_OFFSET, MAX_OFFSET)
+}
+
 /// The concrete GDI face a Pango *generic* monospace family resolves to on Windows
 /// (Pango would ask fontconfig for `Monospace`).
 pub const MONOSPACE_FACE: &str = "Consolas";
@@ -313,11 +334,12 @@ pub trait TextMeasurer {
     fn advance(&mut self, text: &str, style: &Style) -> i32;
 }
 
-/// The width of `runs`, measured run by run with each run's own style.
+/// The width of `runs`, measured run by run with each run's own style.  The sum saturates:
+/// a title is arbitrary text and no wrapped width may turn into a negative one.
 pub fn runs_width(runs: &[Run], m: &mut dyn TextMeasurer) -> i32 {
     runs.iter()
         .map(|run| m.advance(&run.text, &run.style))
-        .sum()
+        .fold(0, i32::saturating_add)
 }
 
 /// The runs to paint in `width` pixels: all of them when they fit, otherwise the prefix
@@ -600,7 +622,9 @@ fn open_tag(tag: &Tag, base: &Style) -> Result<Style, String> {
 }
 
 fn scaled(size: i32, factor: f64) -> i32 {
-    ((size as f64) * factor).round() as i32
+    // Nested `<big>` tags and percentages can ask for any size, so the clamp belongs here,
+    // where the size is computed.
+    clamp_size(((size as f64) * factor).round() as i32)
 }
 
 fn apply_attribute(style: &mut Style, name: &str, value: &str) -> Result<(), String> {
@@ -752,10 +776,10 @@ fn parse_size(current: i32, value: &str) -> Result<i32, String> {
     let (number, suffix) = split_number(v).ok_or_else(|| format!("invalid size '{value}'"))?;
     match suffix.to_ascii_lowercase().as_str() {
         // A bare number is Pango units, i.e. 1024ths of a point: size="12288" is 12 pt.
-        "" => Ok(number.round() as i32),
-        "pt" => Ok((number * PANGO_SCALE as f64).round() as i32),
+        "" => Ok(clamp_size(number.round() as i32)),
+        "pt" => Ok(clamp_size((number * PANGO_SCALE as f64).round() as i32)),
         // 96 dpi is the CSS reference: 1 px is 0.75 pt.
-        "px" => Ok((number * 0.75 * PANGO_SCALE as f64).round() as i32),
+        "px" => Ok(clamp_size((number * 0.75 * PANGO_SCALE as f64).round() as i32)),
         "%" => Ok(scaled(current, number / 100.0)),
         other => Err(format!("invalid size unit '{other}'")),
     }
@@ -765,11 +789,14 @@ fn parse_size(current: i32, value: &str) -> Result<i32, String> {
 fn parse_units(value: &str) -> Result<i32, String> {
     let v = value.trim();
     let (number, suffix) = split_number(v).ok_or_else(|| format!("invalid value '{value}'"))?;
-    match suffix.to_ascii_lowercase().as_str() {
-        "" => Ok(number.round() as i32),
-        "pt" => Ok((number * PANGO_SCALE as f64).round() as i32),
-        other => Err(format!("invalid unit '{other}'")),
-    }
+    let units = match suffix.to_ascii_lowercase().as_str() {
+        "" => number.round() as i32,
+        "pt" => (number * PANGO_SCALE as f64).round() as i32,
+        other => return Err(format!("invalid unit '{other}'")),
+    };
+    // The measurer adds this once per character and the painter shifts the baseline by it:
+    // a value from a title is clamped so neither can overflow.
+    Ok(clamp_offset(units))
 }
 
 /// Split `12.5pt` into `(12.5, "pt")`.  A leading `+`/`-` is allowed.
@@ -919,8 +946,8 @@ fn apply_font_description(style: &mut Style, value: &str) -> Result<(), String> 
 fn parse_description_size(word: &str) -> Option<i32> {
     let (number, suffix) = split_number(word)?;
     match suffix.to_ascii_lowercase().as_str() {
-        "" | "pt" => Some((number * PANGO_SCALE as f64).round() as i32),
-        "px" => Some((number * 0.75 * PANGO_SCALE as f64).round() as i32),
+        "" | "pt" => Some(clamp_size((number * PANGO_SCALE as f64).round() as i32)),
+        "px" => Some(clamp_size((number * 0.75 * PANGO_SCALE as f64).round() as i32)),
         _ => None,
     }
 }
@@ -1125,6 +1152,35 @@ mod tests {
         assert_eq!(sub[0].style.rise, -2 * PANGO_SCALE);
         let sup = parse("<sup>x</sup>", &body()).unwrap();
         assert_eq!(sup[0].style.rise, 2 * PANGO_SCALE);
+    }
+
+    /// A title can name any number for these three; the measurer and the painter multiply
+    /// them by the length of the text and shift the baseline by them, so they are clamped
+    /// where they are parsed.
+    #[test]
+    fn an_unbounded_letter_spacing_rise_or_size_is_clamped() {
+        let huge = "99999999999999999999";
+        let style = |src: &str| parse(src, &body()).unwrap()[0].style.clone();
+        assert_eq!(
+            style(&format!("<span letter_spacing=\"{huge}\">x</span>")).letter_spacing,
+            MAX_OFFSET
+        );
+        assert_eq!(
+            style(&format!("<span letter_spacing=\"-{huge}\">x</span>")).letter_spacing,
+            -MAX_OFFSET
+        );
+        assert_eq!(style(&format!("<span rise=\"{huge}\">x</span>")).rise, MAX_OFFSET);
+        assert_eq!(style(&format!("<span size=\"{huge}\">x</span>")).size, MAX_SIZE);
+        assert_eq!(style(&format!("<span size=\"-{huge}\">x</span>")).size, MIN_SIZE);
+        // Growing a size (<big>, a percentage) stops at the maximum instead of overflowing.
+        assert_eq!(scaled(i32::MAX, SCALE_LARGE), MAX_SIZE);
+        assert_eq!(scaled(MAX_SIZE, SCALE_XX_LARGE), MAX_SIZE);
+        assert_eq!(scaled(MIN_SIZE, SCALE_SMALL), MIN_SIZE);
+        // What a real title asks for is untouched.
+        let ordinary =
+            style("<span letter_spacing=\"512\" rise=\"2048\" size=\"10pt\">x</span>");
+        assert_eq!((ordinary.letter_spacing, ordinary.rise), (512, 2048));
+        assert_eq!(ordinary.size, 10 * PANGO_SCALE);
     }
 
     #[test]
