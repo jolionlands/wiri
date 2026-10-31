@@ -38,8 +38,8 @@ too (as niri does), `-` no such form.
 | | actions |
 | --- | --- |
 | census rows | **143** |
-| **full** parity (every niri-valid form accepted with niri's fields and defaults on every entry point niri has, executor `done` in matrices A/B, no known deviation) | **119** |
-| **partial** (the contract matches; an executor-evidence gap or a by-id deviation remains, listed below) | **15** |
+| **full** parity (every niri-valid form accepted with niri's fields and defaults on every entry point niri has, executor `done` in matrices A/B, no known deviation) | **128** |
+| **partial** (the contract matches; an executor-evidence gap remains, listed below) | **6** |
 | **missing** (applicable, no executor or no entry point) | **0** |
 | **N/A on Windows** (compositor or Wayland specific, refused with an explicit error everywhere) | **9** |
 
@@ -55,15 +55,19 @@ The **partial** actions:
   secure-desktop behaviour are not pinned requirements), `toggle-keyboard-shortcuts-inhibit` (manual
   inhibitor only, no per-client protocol), `center-column`, `move-floating-window` and
   `switch-preset-window-height` / `-back` (matrix A: physical mixed-DPI and lifecycle routes);
-- nine whose `--id` / `id` / `window_id` form still **activates the named window first** and then acts,
-  while niri's `*ById` variant never changes focus (niri:src/input/mod.rs:1110-1119, 1728-1736,
-  2111-2117, 2213-2221): `consume-or-expel-window-left` / `-right`, `center-window`,
-  `reset-window-height`, `switch-preset-window-width` / `-back`, `toggle-window-floating`,
-  `move-window-to-floating`, `move-window-to-tiling` (plus the tiled forms of
-  `switch-preset-window-height` / `-back`, already counted above).  These need focus-neutral engine
-  routes (the `_for(window)` shape that `fullscreen-window`, `set-window-width/height`,
-  `maximize-window-to-edges`, the workspace and monitor transfers already have); that is engine work
-  with live verification and is the largest remaining action gap.
+The nine actions whose `--id` / `id` / `window_id` form used to **activate the named window first**
+(`consume-or-expel-window-left` / `-right`, `center-window`, `reset-window-height`,
+`switch-preset-window-width` / `-back`, `toggle-window-floating`, `move-window-to-floating`,
+`move-window-to-tiling`; niri's `*ById` variants never change focus: niri:src/input/mod.rs:1110-1136,
+1684-1736, 2111-2117, 2213-2250) now have focus-neutral engine routes (`src/layout/engine/by_id.rs`,
+the same `_for(window)` shape as `fullscreen-window`, `set-window-width/height` and
+`maximize-window-to-edges`), and so does the tiled form of `switch-preset-window-height` / `-back`.
+They are `full` on this evidence: `ipc::server::by_id_focus_tests` drives the real `RunAction`
+handler with `--id` against a two-monitor engine (a non-focused tile, an inactive workspace of
+another output, a floating window) and asserts that no activation was requested, the simulated
+native foreground did not move, and the IPC focus, the focused output and every monitor's
+workspace and focus selection are unchanged; the h92_by_id_* gates of `scripts/live-phases/lane-focus.ps1`
+check the same on the desktop (their first official run is still to come).
 
 ## What this lane fixed
 
@@ -85,6 +89,7 @@ and the strict census row check failed; the census row check named `quit`,
 | 9 | `niri msg -j`, `niri msg layers` and `niri msg casts` did not parse | niri:src/cli.rs:44-45, 74, 114 | `-j` short flag; `layers` and `casts` forward niri's own request name and print the daemon's "not available on Windows" error, exit status 1 | `niri_msg_short_json_flag_and_every_msg_subcommand_exist`, `layers_and_casts_travel_as_niris_own_request_names` (ctl) |
 | 10 | `maximize-window-to-edges --id N` and `toggle-window-rule-opacity --id N` activated window N first | niri:src/input/mod.rs:1753-1761 (`MaximizeWindowToEdgesById` never focuses) | direct `_for(window)` calls in `IpcServer`, a floating target is left alone as for the focused one | `ipc::server::tests::maximize_and_rule_opacity_with_id_leave_the_focus_alone` |
 | 11 | typed defaults and required fields were unmeasured | niri-ipc/src/lib.rs `#[serde(default...)]` | measured: omitted `focus`/`show_pointer`/`write_to_disk`/axes equal their explicit defaults; 20 required fields are refused when absent | `omitted_typed_fields_take_niris_serde_defaults`, `required_typed_fields_are_required` |
+| 12 | nine `*ById` actions (and the tiled preset heights) activated the named window first | niri:src/input/mod.rs:1110-1136, 1684-1736, 2111-2117, 2213-2250; src/layout/mod.rs:1930-1975, 2313-2330, 3042-3086, 3148-3170, 3178-3260; src/layout/workspace.rs:1129-1147, 1190-1199, 1252-1280, 1418-1445 | `layout/engine/by_id.rs`: acts on the window's own workspace and output, under a no-activation guard; a floating window is left alone by consume/expel and reset, centred and preset-sized by the floating layer; a tile is centred only when its column is its workspace's active one; a moved tile becomes active only when it already was | `ipc::server::by_id_focus_tests` (12 tests) |
 
 Spot check of every numeric action argument against the pinned engine code (so fix 1 is not an
 isolated claim): `focus-column`, `focus-window-in-column` (`scrolling.rs:1615,4879`),
@@ -95,7 +100,7 @@ in both.
 ## Where wiri accepts more than niri (extensions, not mismatches)
 
 - `--id` / `--window-id` on **any** `RunAction` (niri has a window id on 27 actions only: `--id` on 26, `--window-id` on `move-window-to-workspace`); on an action
-  without a niri by-id variant it activates the window first.
+  without a niri by-id variant it activates the window first (the 27 actions that have one act in place, without changing focus).
 - `focus-window`, `toggle/set/unset-window-urgent` and `load-config-file` are also accepted as binds
   (niri: `#[knuffel(skip)]`); the urgency actions work without an id (the focused window) in every form,
   where niri requires `id`.
@@ -110,7 +115,7 @@ in both.
 
 ## Remaining gaps
 
-1. The nine focus-first by-id actions above (engine work, needs live verification).
+1. The first official live run of the h92_by_id_* gates (the nine by-id actions are unit-proven).
 2. The six executor-evidence partials above.
 3. `--print-request` prints wiri's adjacent-tagged request, not niri's externally tagged JSON, so a
    script that pipes it into a niri-style client sees a different line (matrix B row 232 stays
@@ -206,8 +211,8 @@ Status is `full`, `partial` or `N/A` as defined under Totals.
 | 49 | `move-window-up` |  | ok | ok | ok | full | MoveWindowUp -> engine.move_window_in_column(-1) (floating: float_move_by) |  |
 | 50 | `move-window-down-or-to-workspace-down` |  | ok | ok | ok | full | MoveWindowDownOrToWorkspaceDown -> engine.move_window_or_to_workspace(true) |  |
 | 51 | `move-window-up-or-to-workspace-up` |  | ok | ok | ok | full | MoveWindowUpOrToWorkspaceUp -> engine.move_window_or_to_workspace(false) |  |
-| 52 | `consume-or-expel-window-left` | id: Option<u64> = None | ok | ok | ok | partial | ConsumeOrExpelWindowLeft -> engine.consume_or_expel_window_left | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
-| 53 | `consume-or-expel-window-right` | id: Option<u64> = None | ok | ok | ok | partial | ConsumeOrExpelWindowRight -> engine.consume_or_expel_window_right | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
+| 52 | `consume-or-expel-window-left` | id: Option<u64> = None | ok | ok | ok | full | ConsumeOrExpelWindowLeft -> engine.consume_or_expel_window_left (by id: consume_or_expel_window_for, focus unchanged) |  |
+| 53 | `consume-or-expel-window-right` | id: Option<u64> = None | ok | ok | ok | full | ConsumeOrExpelWindowRight -> engine.consume_or_expel_window_right (by id: consume_or_expel_window_for, focus unchanged) |  |
 | 54 | `consume-window-into-column` |  | ok | ok | ok | full | ConsumeWindowIntoColumn -> engine.consume_window_into_column |  |
 | 55 | `expel-window-from-column` |  | ok | ok | ok | full | ExpelWindowFromColumn -> engine.expel_window_from_column |  |
 | 56 | `swap-window-right` |  | ok | ok | ok | full | SwapWindowRight -> engine.swap_window_toward(true) |  |
@@ -215,7 +220,7 @@ Status is `full`, `partial` or `N/A` as defined under Totals.
 | 58 | `toggle-column-tabbed-display` |  | ok | ok | ok | full | ColumnToggleTabbed -> engine.toggle_tabbed_for_focused_column |  |
 | 59 | `set-column-display` | display: ColumnDisplay (Normal \| Tabbed) | ok | ok | ok | full | SetColumnDisplay -> message_loop::set_column_display |  |
 | 60 | `center-column` |  | ok | ok | ok | partial | CenterColumn -> engine.center_focused_column (floating: float_center) | explicit-action evidence for variable-width edge columns and mixed outputs pending (matrix A) |
-| 61 | `center-window` | id: Option<u64> = None | ok | ok | ok | partial | CenterWindow -> engine.center_focused_column / float_center | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
+| 61 | `center-window` | id: Option<u64> = None | ok | ok | ok | full | CenterWindow -> engine.center_focused_column / float_center (by id: center_window_for, focus unchanged) |  |
 | 62 | `center-visible-columns` |  | ok | ok | ok | full | CenterVisibleColumns -> engine.center_visible_columns |  |
 | 63 | `focus-workspace-down` |  | ok | ok | ok | full | FocusWorkspaceNext -> engine.focus_workspace_relative(Next) |  |
 | 64 | `focus-workspace-up` |  | ok | ok | ok | full | FocusWorkspacePrevious -> engine.focus_workspace_relative(Previous) |  |
@@ -255,13 +260,13 @@ Status is `full`, `partial` or `N/A` as defined under Totals.
 | 98 | `move-column-to-monitor` | output: String | ok | ok | ok | full | MonitorAction(MoveColumn(Name)) -> engine.monitor_layout_action |  |
 | 99 | `set-window-width` | id: Option<u64> = None, change: SizeChange (SetFixed i32 \| SetProportion f64 \| AdjustFixed i32 \| AdjustProportion f64) | ok | ok | ok | full | SizeAction / SetColumnWidth -> change_size(Width) (explicit id: set_window_width_for) |  |
 | 100 | `set-window-height` | id: Option<u64> = None, change: SizeChange (SetFixed i32 \| SetProportion f64 \| AdjustFixed i32 \| AdjustProportion f64) | ok | ok | ok | full | SizeAction / SetWindowHeight -> change_size(Height) (explicit id: set_window_height_for) |  |
-| 101 | `reset-window-height` | id: Option<u64> = None | ok | ok | ok | partial | ResetWindowHeight -> engine.reset_window_height | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
+| 101 | `reset-window-height` | id: Option<u64> = None | ok | ok | ok | full | ResetWindowHeight -> engine.reset_window_height (by id: reset_window_height_for, focus unchanged) |  |
 | 102 | `switch-preset-column-width` |  | ok | ok | ok | full | ColumnWidthPresetCycle -> engine.switch_preset_column_width(true) |  |
 | 103 | `switch-preset-column-width-back` |  | ok | ok | ok | full | ColumnWidthPresetCycleBack -> engine.switch_preset_column_width(false) |  |
-| 104 | `switch-preset-window-width` | id: Option<u64> = None | ok | ok | ok | partial | WindowWidthPresetCycle -> engine.switch_preset_window_width(true) | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
-| 105 | `switch-preset-window-width-back` | id: Option<u64> = None | ok | ok | ok | partial | WindowWidthPresetCycleBack -> engine.switch_preset_window_width(false) | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
-| 106 | `switch-preset-window-height` | id: Option<u64> = None | ok | ok | ok | partial | WindowHeightPresetCycle -> engine.switch_preset_window_height(true) | native mixed-DPI and some lifecycle routes still need physical evidence (matrix A); a tiled target by id is activated first (floating targets are not) |
-| 107 | `switch-preset-window-height-back` | id: Option<u64> = None | ok | ok | ok | partial | WindowHeightPresetCycleBack -> engine.switch_preset_window_height(false) | same row as switch-preset-window-height (matrix A); a tiled target by id is activated first |
+| 104 | `switch-preset-window-width` | id: Option<u64> = None | ok | ok | ok | full | WindowWidthPresetCycle -> engine.switch_preset_window_width(true) (by id: switch_preset_window_width_for, focus unchanged) |  |
+| 105 | `switch-preset-window-width-back` | id: Option<u64> = None | ok | ok | ok | full | WindowWidthPresetCycleBack -> engine.switch_preset_window_width(false) (by id: switch_preset_window_width_for, focus unchanged) |  |
+| 106 | `switch-preset-window-height` | id: Option<u64> = None | ok | ok | ok | partial | WindowHeightPresetCycle -> engine.switch_preset_window_height(true) | native mixed-DPI and some lifecycle routes still need physical evidence (matrix A); by id (tiled or floating) the named window cycles without any focus change |
+| 107 | `switch-preset-window-height-back` | id: Option<u64> = None | ok | ok | ok | partial | WindowHeightPresetCycleBack -> engine.switch_preset_window_height(false) | same row as switch-preset-window-height (matrix A); by id the named window cycles without any focus change |
 | 108 | `maximize-column` |  | ok | ok | ok | full | MaximizeColumn -> engine.toggle_maximize_focused_column |  |
 | 109 | `maximize-window-to-edges` | id: Option<u64> = None | ok | ok | ok | full | MaximizeWindowToEdges -> engine.toggle_maximize_window_to_edges_for |  |
 | 110 | `set-column-width` | change: SizeChange | ok | ok | ok | full | SetColumnWidth -> change_size(Width) |  |
@@ -279,9 +284,9 @@ Status is `full`, `partial` or `N/A` as defined under Totals.
 | 122 | `debug-toggle-opaque-regions` |  | n/a | n/a | n/a | N/A | none | compositor render debugging (opaque-region overlay) |
 | 123 | `debug-toggle-damage` |  | n/a | n/a | n/a | N/A | none | compositor render debugging (damage overlay) |
 | 124 | `toggle-touchpad` |  | ok | ok | ok | full | System(ToggleTouchpad) -> system_actions::toggle_touchpad |  |
-| 125 | `toggle-window-floating` | id: Option<u64> = None | ok | ok | ok | partial | ToggleFloating -> engine.toggle_floating_for | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
-| 126 | `move-window-to-floating` | id: Option<u64> = None | ok | ok | ok | partial | MoveWindowToFloating -> engine.set_window_floating(true) | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
-| 127 | `move-window-to-tiling` | id: Option<u64> = None | ok | ok | ok | partial | MoveWindowToTiling -> engine.set_window_floating(false) | by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path |
+| 125 | `toggle-window-floating` | id: Option<u64> = None | ok | ok | ok | full | ToggleFloating -> engine.toggle_floating_for (by id: toggle_floating_by_id, focus unchanged) |  |
+| 126 | `move-window-to-floating` | id: Option<u64> = None | ok | ok | ok | full | MoveWindowToFloating -> engine.set_window_floating(true) (by id: set_floating_by_id, focus unchanged) |  |
+| 127 | `move-window-to-tiling` | id: Option<u64> = None | ok | ok | ok | full | MoveWindowToTiling -> engine.set_window_floating(false) (by id: set_floating_by_id, focus unchanged) |  |
 | 128 | `focus-floating` |  | ok | ok | ok | full | FocusFloating -> engine.focus_layer_action(Floating) |  |
 | 129 | `focus-tiling` |  | ok | ok | ok | full | FocusTiling -> engine.focus_layer_action(Tiling) |  |
 | 130 | `switch-focus-between-floating-and-tiling` |  | ok | ok | ok | full | SwitchFocusBetweenFloatingAndTiling -> engine.focus_layer_action(Switch) |  |

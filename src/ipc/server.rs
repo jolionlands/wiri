@@ -1116,17 +1116,64 @@ impl IpcServer {
                                     .toggle_window_rule_opacity(WindowId::new(hwnd), backend);
                                 return serde_json::json!({"success": true});
                             }
+                            // niri's other `*ById` variants (input/mod.rs:1110-1136, 1684-1736,
+                            // 2111-2117, 2213-2250): the named window changes in place, on its own
+                            // workspace and output, and neither native nor managed focus moves.
+                            crate::input::Action::ConsumeOrExpelWindowLeft
+                            | crate::input::Action::ConsumeOrExpelWindowRight => {
+                                engine.write().consume_or_expel_window_for(
+                                    WindowId::new(hwnd),
+                                    matches!(action, crate::input::Action::ConsumeOrExpelWindowRight),
+                                    backend,
+                                );
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::CenterWindow => {
+                                engine.write().center_window_for(WindowId::new(hwnd), backend);
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::ResetWindowHeight => {
+                                engine
+                                    .write()
+                                    .reset_window_height_for(WindowId::new(hwnd), backend);
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::WindowWidthPresetCycle
+                            | crate::input::Action::WindowWidthPresetCycleBack => {
+                                engine.write().switch_preset_window_width_for(
+                                    WindowId::new(hwnd),
+                                    matches!(action, crate::input::Action::WindowWidthPresetCycle),
+                                    backend,
+                                );
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::WindowHeightPresetCycle
+                            | crate::input::Action::WindowHeightPresetCycleBack => {
+                                engine.write().switch_preset_window_height_for(
+                                    WindowId::new(hwnd),
+                                    matches!(action, crate::input::Action::WindowHeightPresetCycle),
+                                    backend,
+                                );
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::ToggleFloating => {
+                                engine
+                                    .write()
+                                    .toggle_floating_by_id(WindowId::new(hwnd), backend);
+                                return serde_json::json!({"success": true});
+                            }
+                            crate::input::Action::MoveWindowToFloating
+                            | crate::input::Action::MoveWindowToTiling => {
+                                engine.write().set_floating_by_id(
+                                    WindowId::new(hwnd),
+                                    Some(matches!(action, crate::input::Action::MoveWindowToFloating)),
+                                    backend,
+                                );
+                                return serde_json::json!({"success": true});
+                            }
                             _ => {}
                         }
-                        let preserve_float_height_focus =
-                            matches!(
-                                &action,
-                                crate::input::Action::WindowHeightPresetCycle
-                                    | crate::input::Action::WindowHeightPresetCycleBack
-                            ) && engine.read().is_floating(WindowId::new(hwnd));
-                        if !preserve_float_height_focus
-                            && !focus_window_by_hwnd(engine, backend, hwnd)
-                        {
+                        if !focus_window_by_hwnd(engine, backend, hwnd) {
                             return serde_json::json!({
                                 "success": false,
                                 "error": format!("no window with id {} to focus", hwnd)
@@ -2412,6 +2459,9 @@ pub(crate) fn split_window_target(
 
 #[cfg(test)]
 mod floating_height_parity_tests;
+
+#[cfg(test)]
+mod by_id_focus_tests;
 
 #[cfg(test)]
 mod focus_converge_tests;
