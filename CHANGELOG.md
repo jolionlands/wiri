@@ -5,7 +5,45 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Lane PROMOTE — six parity rows to done on the official dab9a88 cycle
+### Lane MULTIMON — two displays, mixed DPI (H99)
+
+`scripts/live-phases/lane-multimon.ps1` adds the 25 `h99_*` gates of the two-display lane; it is
+registered in `scripts/live-test.ps1` right after lane-grid and records every one of them as
+*skipped* (not failed) on a machine with fewer than two displays. The lane changes the second monitor
+only through wiri's own `msg output` (mode, scale, transform, position, off/on), always restores
+1920x1080 / 125% / (1366,0) / normal in a `finally`, and proves the restore with
+`h99_outputs_restored` (both displays exactly as they were, DISPLAY1 still primary). Test laptop:
+DISPLAY1 1366x768 at 96 dpi (primary), DISPLAY2 1920x1080 at 120 dpi to its right.
+
+- Two-display run `.live\two-display-2` (`WIRI_LIVE_ONLY=lane_d,lane_multimon`): 303 of the 311
+  recorded gates true. Six are placeholders of the animation lane that a subset does not dot-source,
+  `hidden_json_present_after_restart` is inverted (false is the pass) and one pre-existing core gate,
+  `h13_open_in_workspace_by_position`, failed once: the `open-in-workspace 3` window landed on the
+  chat workspace, DISPLAY1's last one, instead of the empty third, because the trailing empty
+  workspace was momentarily missing when the rule resolved. It passed in the earlier two-display run
+  and in the single-display cycle — a flake to watch, not a multi-monitor regression. Windows itself
+  refused four of the real mode, position and transform changes (CCD error 1610/31, or a position
+  that did not move); those gates are left out of the counted booleans and listed in `h99_skips`
+  with the error text, so a skip is never counted as a pass.
+- Fixed: the hotkey sheet sized itself from the *foreground window's* DPI, and `GetDpiForWindow`
+  answers 96 for a DPI-unaware application even on a 125% output, so the sheet and its input overlay
+  came out too small on the second display. `src/overlay/bindings_cheatsheet.rs` now asks
+  `GetDpiForMonitor` and keeps the window DPI only as the fallback (`sheet_dpi`); unit test
+  `the_sheet_is_sized_by_the_output_scale_not_the_foreground_window`.
+- Harness, so a second display cannot move a fixture out from under an existing gate: the run takes a
+  per-monitor-v2 DPI awareness context (every rectangle and screenshot in physical pixels), parks the
+  pointer on the primary and gives wiri's focus back to the primary before a phase opens its windows
+  (`ParkCursorAtPrimary`, `FocusPrimaryOutput`, `PrepareFixtureDesktop`); H9 measures the primary
+  screen instead of the whole virtual desktop; the legacy `get-workspace-list` gates count the primary
+  monitor's workspaces (`PrimaryMonitorId`); H15's workspace-id uniqueness check counts `output|id`.
+- `WIRI_LIVE_ONLY=lane_a,lane_grid,...` runs only the named lanes (unset keeps the full cycle
+  unchanged) and drops the placeholders of the lanes it skipped, the ones a lane composes at run time
+  included, so a subset cannot be mistaken for a full cycle.
+- Parity: 23 rows in `docs/parity/niri-gaps-layout-behaviour.md` and
+  `docs/parity/niri-gaps-config-input-ipc.md` now carry two-display evidence; they stay *partial*
+  (outputs and workspaces follow niri's model only in part).
+
+### Lane PROMOTE — five parity rows to done on the official dab9a88 cycle
 
 The official tridaris cycle at `dab9a88` (run directory
 `C:\wiri-dev\evidence\dab9a88-live`, 2026-10-31, 911/915 boolean gates) ran the gates the
