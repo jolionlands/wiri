@@ -1,9 +1,9 @@
 // Demo fixtures for scripts/demo/record-demo.ps1.
 //
 // Two jobs, both owned by the recording script's own process:
-//   DemoNative — the Win32 calls the choreography needs (real key chords, a real
+//   DemoNative - the Win32 calls the choreography needs (real key chords, a real
 //                click, window enumeration, the overview host's tile geometry).
-//   DemoApps   — the windows the video shows.  They are ordinary WinForms windows
+//   DemoApps   - the windows the video shows.  They are ordinary WinForms windows
 //                (wiri tiles them like any other application) painted to look like
 //                an editor, a terminal, notes, a browser, a file manager, a chat and
 //                a music player.  Nothing here reads a user file or opens a network
@@ -171,6 +171,36 @@ public static class DemoNative
     }
 
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+
+    public delegate bool MonitorEnumProc(IntPtr monitor, IntPtr dc, ref RECT rect, IntPtr data);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT point, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+    [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorEnumProc proc, IntPtr data);
+    [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+    const uint MONITOR_DEFAULTTOPRIMARY = 1;
+
+    // The primary monitor's full rect (not the work area): the capture is cut to exactly
+    // this, so a second display switched to Extend cannot widen the video.
+    public static RECT PrimaryMonitorRect()
+    {
+        var origin = new POINT(); origin.X = 0; origin.Y = 0;
+        IntPtr monitor = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        var info = new MONITORINFO();
+        info.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info)) return info.rcMonitor;
+        Rectangle bounds = Screen.PrimaryScreen.Bounds;
+        RECT fallback;
+        fallback.Left = bounds.Left; fallback.Top = bounds.Top; fallback.Right = bounds.Right; fallback.Bottom = bounds.Bottom;
+        return fallback;
+    }
+
+    public static int MonitorCount()
+    {
+        int count = 0;
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
+            delegate(IntPtr monitor, IntPtr dc, ref RECT rect, IntPtr data) { count++; return true; }, IntPtr.Zero);
+        return count;
+    }
 
     const int DWMWA_CLOAKED = 14;
     const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
@@ -439,6 +469,26 @@ public static class DemoApps
         return false;
     }
 
+    // Force a paint on the window's own thread.  A mock window that has never painted has
+    // nothing for DWM to hand the overview's thumbnails - one tile came out blank white
+    // because its window was created on a workspace that was hidden at the time.
+    public static bool Repaint(IntPtr hwnd)
+    {
+        Form form = null;
+        lock (Openings)
+        {
+            foreach (var opening in Openings)
+                if (opening.Ready && opening.Handle == hwnd) { form = opening.Form; break; }
+        }
+        if (form == null || form.IsDisposed || !form.IsHandleCreated) return false;
+        try
+        {
+            form.BeginInvoke((MethodInvoker)delegate { form.Invalidate(true); form.Update(); form.Refresh(); });
+            return true;
+        }
+        catch (InvalidOperationException) { return false; }
+    }
+
     public static int CloseAll()
     {
         var pending = new List<Opening>();
@@ -637,7 +687,7 @@ public static class FrameStats
 // filter crashed on the full graph.  One band per segment per output width.
 public static class CaptionBand
 {
-    public static void Render(string path, int width, int bandHeight, string caption, int fontSize, int markSize)
+    public static void Render(string path, int width, int bandHeight, string caption, string subtitle, int fontSize, int markSize)
     {
         using (var bitmap = new Bitmap(width, bandHeight, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
         {
@@ -651,21 +701,27 @@ public static class CaptionBand
                 using (var line = new SolidBrush(Color.FromArgb(230, 0x4C, 0x8D, 0xFF)))
                     graphics.FillRectangle(line, 0, 0, width, Math.Max(1, bandHeight / 36));
                 float scale = bandHeight / 72f;
+                bool hasSubtitle = !string.IsNullOrEmpty(subtitle);
+                float mainHeight = hasSubtitle ? bandHeight * 0.58f : bandHeight;
                 using (var mark = new Font("Segoe UI Semibold", Math.Max(8f, markSize), FontStyle.Bold, GraphicsUnit.Pixel))
                 using (var text = new Font("Segoe UI Semibold", Math.Max(10f, fontSize), FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var sub = new Font("Segoe UI", Math.Max(8f, fontSize * 0.58f), FontStyle.Regular, GraphicsUnit.Pixel))
                 using (var markBrush = new SolidBrush(Color.FromArgb(0x9C, 0xBE, 0xFF)))
                 using (var textBrush = new SolidBrush(Color.White))
+                using (var subBrush = new SolidBrush(Color.FromArgb(0xC3, 0xCC, 0xDE)))
                 {
                     var format = new StringFormat(StringFormat.GenericTypographic);
                     format.Alignment = StringAlignment.Near;
                     format.LineAlignment = StringAlignment.Center;
                     var markFormat = new StringFormat(format);
-                    markFormat.Alignment = StringAlignment.Near;
                     float markLeft = 18f * scale;
                     graphics.DrawString("wiri", mark, markBrush, new RectangleF(markLeft, 0, width, bandHeight), markFormat);
                     // The caption is centred on the video, not in the space left of the mark.
                     format.Alignment = StringAlignment.Center;
-                    graphics.DrawString(caption, text, textBrush, new RectangleF(0, 0, width, bandHeight), format);
+                    graphics.DrawString(caption, text, textBrush, new RectangleF(0, 0, width, mainHeight), format);
+                    if (hasSubtitle)
+                        graphics.DrawString(subtitle, sub, subBrush,
+                            new RectangleF(0, mainHeight, width, bandHeight - mainHeight), format);
                 }
             }
             bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
@@ -696,6 +752,64 @@ public static class PopupProbe
         "#32768",
     };
     static readonly string[] DesktopClasses = new string[] { "Progman", "WorkerW", "SysListView32" };
+    // Flyouts the shell shows in its own processes: the Win+P Project pane, the start menu,
+    // search, the widget board, the volume/network flyouts.  They are normal top-level windows
+    // of a shell process, so no class list can catch them.
+    static readonly string[] ShellFlyoutProcesses = new string[]
+    {
+        "ShellExperienceHost", "StartMenuExperienceHost", "SearchHost", "ShellHost",
+    };
+    // The only explorer.exe windows that are allowed to be on screen: the desktop, its view,
+    // the taskbar and the secondary taskbar.
+    static readonly string[] ExplorerAllowedClasses = new string[]
+    {
+        "Progman", "WorkerW", "SysListView32", "SHELLDLL_DefView", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+    };
+
+    public static bool IsShellFlyoutProcess(string process)
+    {
+        if (string.IsNullOrEmpty(process)) return false;
+        foreach (string candidate in ShellFlyoutProcesses)
+            if (string.Equals(process, candidate, StringComparison.OrdinalIgnoreCase)) return true;
+        return process.StartsWith("Widgets", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // The top-level window at a point.
+    public static IntPtr HwndAt(int x, int y)
+    {
+        var point = new DemoNative.POINT(); point.X = x; point.Y = y;
+        IntPtr hwnd = DemoNative.WindowFromPoint(point);
+        if (hwnd == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr root = DemoNative.GetAncestor(hwnd, 2);
+        return root == IntPtr.Zero ? hwnd : root;
+    }
+
+    // A shell flyout, whoever owns it: a shell process, or an explorer window that is not one
+    // of the pieces of shell furniture that are always there.
+    public static bool IsShellFlyout(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        string process = DemoNative.ProcessOf(hwnd);
+        if (IsShellFlyoutProcess(process)) return true;
+        if (process == "explorer")
+        {
+            string cls = DemoNative.ClassOf(hwnd);
+            foreach (string candidate in ExplorerAllowedClasses) if (cls == candidate) return false;
+            return true;
+        }
+        return false;
+    }
+
+    // The same questions for one point, for the geometric check before encoding.
+    public static bool IsShellFlyoutAt(int x, int y)
+    {
+        return IsShellFlyout(HwndAt(x, y));
+    }
+
+    public static bool IsDesktopAt(int x, int y)
+    {
+        return IsDesktopPoint(x, y);
+    }
 
     public static string Describe(IntPtr hwnd, string source)
     {
@@ -721,7 +835,7 @@ public static class PopupProbe
         IntPtr root = DemoNative.GetAncestor(hwnd, 2);
         if (root == IntPtr.Zero) root = hwnd;
         string cls = DemoNative.ClassOf(root);
-        if (IsPointPopupClass(cls) || DemoNative.Title(root) == "PopupHost")
+        if (IsPointPopupClass(cls) || DemoNative.Title(root) == "PopupHost" || IsShellFlyout(root))
             return Describe(root, string.Format("point({0},{1})", x, y));
         return null;
     }
@@ -763,7 +877,7 @@ public static class PopupProbe
         foreach (string prefix in ForegroundPopupPrefixes)
             if (cls.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) popupClass = true;
         if (title == "PopupHost") popupClass = true;
-        if (popupClass || (process == "explorer" && emptyRect))
+        if (popupClass || IsShellFlyout(hwnd) || (process == "explorer" && emptyRect))
             return Describe(hwnd, string.Format("foreground (emptyRect={0})", emptyRect));
         return null;
     }
@@ -787,7 +901,7 @@ public static class PopupProbe
                 long id = root.ToInt64();
                 if (seen.Contains(id)) continue;
                 string cls = DemoNative.ClassOf(root);
-                if (!(IsPointPopupClass(cls) || DemoNative.Title(root) == "PopupHost")) continue;
+                if (!(IsPointPopupClass(cls) || DemoNative.Title(root) == "PopupHost" || IsShellFlyout(root))) continue;
                 seen.Add(id);
                 hits.Add(Describe(root, string.Format("point({0},{1})", x, y)));
             }
@@ -1139,7 +1253,7 @@ sealed class DemoForm : Form
         int y = art.Bottom + 16;
         using (var brush = new SolidBrush(Ink)) g.DrawString("Focus", headFont, brush, area.Left, y);
         y += 30;
-        using (var brush = new SolidBrush(Sub)) g.DrawString("wiri demo playlist · 7 tracks", smallFont, brush, area.Left, y);
+        using (var brush = new SolidBrush(Sub)) g.DrawString("wiri demo playlist - 7 tracks", smallFont, brush, area.Left, y);
         y += 24;
         string[][] tracks = new string[][]
         {
