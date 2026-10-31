@@ -3348,6 +3348,10 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-pace.ps1') } catch { LanePhas
 # H92: the focus core. One focus-window request settles managed focus on the native foreground (no retry);
 # niri's *ById actions change the named window and never move native or managed focus.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-focus.ps1') } catch { LanePhaseError 'lane_focus' $_ }
+# H97: the overview is niri's fixed-zoom camera over the 2D grid (overview { zoom }, one stack entry per
+# workspace, gaps of 10% of the view height, each workspace through its own horizontal camera), not a
+# fit-everything zoom. It owns one daemon and 30 ordinary owned forms, and only reads published geometry.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-overview.ps1') } catch { LanePhaseError 'lane_overview' $_ }
 # H96: niri hides the floating layer while the workspace's active window is a fullscreen tile and the floating
 # layer is not active (workspace.rs:1722-1728); focusing a float or leaving fullscreen brings it back in place.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-dpi-floats.ps1') } catch { LanePhaseError 'lane_dpi_floats' $_ }
