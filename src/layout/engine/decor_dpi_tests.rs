@@ -353,7 +353,10 @@ fn parity_scale_one_keeps_integer_widths_and_shadow_bit_identical() {
 fn parity_fractional_widths_survive_the_decoder_and_project_per_output() {
     let config = crate::config::parse::parse_kdl_config(
         r##"
-layout { border { width 2.5; } focus-ring { width 3.25; } }
+layout {
+    border { width 2.5; }
+    focus-ring { width 3.25; }
+}
 window-rule {
     border { width 1.5; }
     focus-ring { width 0.4; }

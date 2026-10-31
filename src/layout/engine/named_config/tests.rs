@@ -1462,12 +1462,13 @@ fn parity_fractional_spacing_stacked_border_insets_carry_each_window_request() {
     engine.refresh_strip_widths(output);
     // The same 724.2-physical-pixel proportional request subtracts each
     // window's current physical border before flooring in logical units:
-    // plain floor(724.2/1.5)=482 -> 723; bordered floor(720.2/1.5)=480 -> 720.
-    // Borders stay in their existing physical units; appearance scaling is separate.
+    // plain floor(724.2/1.5)=482 -> 723. The rule's border is a logical 2 px, which
+    // niri's round_logical_in_physical_max1 makes 3 physical pixels at this 1.5 scale
+    // (tile.rs:244,257), so bordered floor((724.2-6)/1.5)=478 -> 717.
     assert_constrained_window_native_and_ipc(
         &engine,
         output,
         workspace,
-        &[(plain, 723, 0, 482), (bordered, 720, 2, 480)],
+        &[(plain, 723, 0, 482), (bordered, 717, 3, 478)],
     );
 }
