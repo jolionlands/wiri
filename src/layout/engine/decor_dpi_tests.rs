@@ -116,7 +116,11 @@ fn parity_projected_widths_match_niri_rounding_at_every_scale() {
     assert_eq!(ring_width_px(3.0, 1.5), 5);
     assert_eq!(ring_width_px(2.5, 1.25), 3);
     assert_eq!(ring_width_px(2.5, 1.75), 4);
-    assert_eq!(ring_width_px(0.2, 2.0), 1, "a non-zero width is one pixel at least");
+    assert_eq!(
+        ring_width_px(0.2, 2.0),
+        1,
+        "a non-zero width is one pixel at least"
+    );
 }
 
 #[test]
@@ -139,7 +143,12 @@ fn parity_projected_shadow_matches_niri_ceiling_at_every_scale() {
     // 100% leaves whole logical pixels unchanged.
     let at_96 = project_shadow(30.0, 5.0, 0.0, 5.0, 1.0);
     assert_eq!(
-        (at_96.softness_px, at_96.spread_px, at_96.offset_x_px, at_96.offset_y_px),
+        (
+            at_96.softness_px,
+            at_96.spread_px,
+            at_96.offset_x_px,
+            at_96.offset_y_px
+        ),
         (30.0, 5.0, 0.0, 5.0)
     );
     // Invalid scales and non-finite inputs fall back to 96 DPI and zero.
@@ -363,11 +372,17 @@ window-rule {
     assert_eq!(cfg.border_inset(), 3);
     assert_eq!(cfg.focus_ring_width, 3);
     assert_eq!(cfg.border_inset_with(&rule.effects.border), 2);
-    assert_eq!(ring_width_px(rule.effects.focus_ring.width.unwrap(), 1.0), 1);
+    assert_eq!(
+        ring_width_px(rule.effects.focus_ring.width.unwrap(), 1.0),
+        1
+    );
     // At 150%: 3.75 -> 4 and 4.875 -> 5; the rule's 2.25 -> 2 and 0.6 -> 1.
     let cfg = LayoutConfig::from_config_at_scale(&config, 1.5);
     assert_eq!(cfg.border_inset(), 4);
     assert_eq!(cfg.focus_ring_width, 5);
     assert_eq!(cfg.border_inset_with(&rule.effects.border), 2);
-    assert_eq!(ring_width_px(rule.effects.focus_ring.width.unwrap(), 1.5), 1);
+    assert_eq!(
+        ring_width_px(rule.effects.focus_ring.width.unwrap(), 1.5),
+        1
+    );
 }
