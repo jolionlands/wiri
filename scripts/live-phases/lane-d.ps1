@@ -53,6 +53,21 @@ function DPng([string]$path) {
     catch { $ok = $false }
     return @($w,$h,[int]$ok)
 }
+# One `screenshot-window` capture of the fixture.  The bind captures the *foreground* window,
+# so the fixture has to be foreground first; a session whose foreground is held by another
+# (invisible) window makes the OS refuse wiri's activation, and the same action is then
+# requested for the fixture's own id (`screenshot-window --id`, niri's form) so the gate still
+# describes the fixture instead of whatever happened to be foreground.  Returns which path ran.
+function DCaptureWindow([string]$tag) {
+    FocusForm $dForm
+    if ([LT]::GetForegroundWindow() -eq $dForm) {
+        Chord 'ctrl+alt+f9'; Start-Sleep -Milliseconds 2200
+        return 'bind'
+    }
+    $null = Ctl $tag @('action', 'screenshot-window', '--id', [string][int64]$dForm)
+    Start-Sleep -Milliseconds 1400
+    return 'id'
+}
 function DMonitors([string]$tag) { return @((Ctl $tag @('--json','list-monitors') | ConvertFrom-Json).result) }
 function DConfig([string]$pathSetting, [string]$scaleSetting) {
     return @"
@@ -91,7 +106,12 @@ try {
     $dProc = Start-WiriWithConfig $dText $dLog
     $dForm = [TestForms]::Open('lane-d-capture', 43, 177, 89)
     Start-Sleep -Milliseconds 1600
-    [LT]::SwitchToThisWindow($dForm,$true); Start-Sleep -Milliseconds 700
+    # Ask wiri for the focus and wait for it: `screenshot-window` captures the *foreground*
+    # window, and SwitchToThisWindow alone silently left another window foreground (measured
+    # 2026-10-31: a zero-sized handle whose capture was the whole screen), which made the
+    # window-capture gates describe a window that is not the fixture.
+    FocusForm $dForm
+    $dFocused = ([LT]::GetForegroundWindow() -eq $dForm)
     $dMons = @(DMonitors 'h29-monitors-start')
     $dMatch = @($dMons | Where-Object { $_.name -ieq $dScreen.DeviceName })
     DGate 'h29_connector_match_is_case_insensitive_not_by_index' ($dMatch.Count -eq 1 -and [Math]::Abs($dMatch[0].scale_factor-1.25) -lt 0.001)
@@ -113,9 +133,13 @@ try {
     [IO.File]::WriteAllText($cfg,$dText,(New-Object Text.UTF8Encoding($false)))
     Ctl 'h27-template-reload' @('reload-config') | Out-Null
     Start-Sleep -Milliseconds 1400
-    [LT]::SwitchToThisWindow($dForm,$true); Start-Sleep -Milliseconds 500
+    FocusForm $dForm
     $dRect = [LT]::Visible($dForm)
-    Chord 'ctrl+alt+f9'; Start-Sleep -Milliseconds 2200
+    # Which window the capture is of: `screenshot-window` uses the focused window, so the
+    # foreground handle is part of the evidence (a different window would change the image size).
+    $dCaptureHwnd = [LT]::GetForegroundWindow()
+    $dCaptureRect = [LT]::Visible($dCaptureHwnd)
+    $dCaptureVia = DCaptureWindow 'h27-window-capture'
     $dWindowFiles = @(Get-ChildItem $dDir -Filter 'window_*.png')
     $dWindowPng = @(0,0,0)
     if ($dWindowFiles.Count -eq 1) { $dWindowPng = @(DPng $dWindowFiles[0].FullName) }
@@ -126,16 +150,24 @@ try {
     Shot 'h27-window-capture'
     # null must still populate the clipboard and emit an event for each action, without a file.
     $filesBefore = @(Get-ChildItem $dDir | ForEach-Object { $_.Name }) -join ','
-    $dNullConfig = DConfig 'null' ''
+    # The output scale stays at the h27 value: a window screenshot is the window's own pixels
+    # at the moment of the action, and the scale decides that pixel size, so the null window
+    # capture is only comparable with the earlier one while the scale is unchanged.  The
+    # `reload without a scale line is the real DPI` gate below gets its own reload instead.
+    $dNullConfig = DConfig 'null' 'scale 1.25'
     [IO.File]::WriteAllText($cfg,$dNullConfig,(New-Object Text.UTF8Encoding($false)))
     Ctl 'h28-null-reload' @('reload-config') | Out-Null
     Start-Sleep -Milliseconds 1500
-    [LT]::SwitchToThisWindow($dForm,$true); Start-Sleep -Milliseconds 500
+    $dNullMons = @(DMonitors 'h28-monitors-null')
+    FocusForm $dForm
     $seq1 = [LaneD]::GetClipboardSequenceNumber()
     Chord 'ctrl+alt+f8'; Start-Sleep -Milliseconds 1800
     $seq2 = [LaneD]::GetClipboardSequenceNumber(); $nullScreen = [LaneD]::Clipboard()
-    [LT]::SwitchToThisWindow($dForm,$true); Start-Sleep -Milliseconds 300
-    Chord 'ctrl+alt+f9'; Start-Sleep -Milliseconds 2200
+    FocusForm $dForm
+    $dNullHwnd = [LT]::GetForegroundWindow()
+    $dNullRect = [LT]::Visible($dNullHwnd)
+    $dNullFormRect = [LT]::Visible($dForm)
+    $dNullVia = DCaptureWindow 'h28-window-null'
     $seq3 = [LaneD]::GetClipboardSequenceNumber(); $nullWindow = [LaneD]::Clipboard()
     $filesAfter = @(Get-ChildItem $dDir | ForEach-Object { $_.Name }) -join ','
     DGate 'h28_null_writes_no_files' ($filesBefore -eq $filesAfter)
@@ -144,11 +176,34 @@ try {
     $saved = @($captured | Where-Object { $null -ne $_.data.path })
     $clipboardOnly = @($captured | Where-Object { $null -eq $_.data.path })
     DGate 'h28_screenshot_captured_reports_paths_and_null' ($captured.Count -eq 4 -and $saved.Count -eq 2 -and $clipboardOnly.Count -eq 2 -and (Test-Path $saved[0].data.path) -and (Test-Path $saved[1].data.path))
+    # A reload with no `scale` line at all: the output must fall back to the monitor's real DPI
+    # (this config deliberately writes no scale).
+    [IO.File]::WriteAllText($cfg,(DConfig 'null' ''),(New-Object Text.UTF8Encoding($false)))
+    Ctl 'h29-reload-no-scale' @('reload-config') | Out-Null
+    Start-Sleep -Milliseconds 1500
     $dReloaded = @(DMonitors 'h29-monitors-reloaded' | Where-Object { $_.name -ieq $dScreen.DeviceName })
     DGate 'h29_reload_without_scale_preserves_real_dpi' ($dReloaded.Count -eq 1 -and [Math]::Abs($dReloaded[0].scale_factor - [LaneD]::Scale($dForm)) -lt 0.001)
     $dAfter = [LaneD]::Mode($dScreen.DeviceName)
     DGate 'h29_explicit_current_mode_does_not_change_the_desktop' (($dBefore -join ',') -eq ($dAfter -join ','))
-    [ordered]@{ connector=$dScreen.DeviceName; before=$dBefore; after=$dAfter; screen_png=$dScreenPng; window_png=$dWindowPng; clipboard_screen=$clipScreen; clipboard_window=$clipWindow; events=$captured } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $D 'lane-d-values.json')
+    [ordered]@{
+        connector=$dScreen.DeviceName; before=$dBefore; after=$dAfter
+        screen_png=$dScreenPng; window_png=$dWindowPng
+        clipboard_screen=$clipScreen; clipboard_window=$clipWindow
+        # The h28 null-path sub-checks, as observed: the three clipboard sequence numbers, the
+        # two null captures, the window rectangle of the capture before and after the reload,
+        # and the handle each `screenshot-window` action actually captured.
+        clipboard_seq=[ordered]@{ before=$seq0; null_screen=$seq1; after_null_screen=$seq2; after_null_window=$seq3 }
+        null_screen=$nullScreen; null_window=$nullWindow
+        window_png_size=@($dWindowPng[0],$dWindowPng[1])
+        capture_hwnd=[int64]$dCaptureHwnd; capture_rect=$dCaptureRect; capture_via=$dCaptureVia
+        null_capture_hwnd=[int64]$dNullHwnd; null_capture_rect=$dNullRect; null_capture_via=$dNullVia
+        null_form_rect=$dNullFormRect; form_focused_at_start=[bool]$dFocused
+        scale_after_null=@($dNullMons | ForEach-Object { [double]$_.scale_factor })
+        form_hwnd=[int64]$dForm; form_rect=$dRect; form_png=$dWindowFiles.Count
+        screen_png_files=@($dScreenFiles | ForEach-Object { $_.Name })
+        window_png_files=@($dWindowFiles | ForEach-Object { $_.Name })
+        events=$captured
+    } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $D 'lane-d-values.json')
 } catch {
     ($_ | Out-String) | Set-Content (Join-Path $D 'lane-d-error.txt')
 } finally {
