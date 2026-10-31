@@ -336,9 +336,11 @@ impl TilingEngine {
                 workspace_view.width as u32,
                 workspace_view.height as u32,
             );
-            // The per-workspace horizontal camera: this workspace's own view offset
-            // (the follow-up unified-grid mode fills in the monitor's camera here).
-            let camera = overview_geometry::workspace_camera(ws.scroll_offset.x, None);
+            // The per-workspace horizontal camera: the layout already applies this
+            // workspace's own scroll offset (niri's `render_scrolling`), so only the
+            // difference a shared monitor camera would need is applied here.  The
+            // follow-up unified-grid mode fills that in.
+            let camera = overview_geometry::workspace_camera_adjustment(ws.scroll_offset.x, None);
             let normal = self.calculate_positions_at_zoom(
                 ws,
                 workspace_view,
@@ -508,8 +510,10 @@ mod tests {
         // niri's stack over this view at the default half zoom: two entries, the
         // second one is workspace key 1 (src/layout/monitor.rs:1467).
         let rects = overview_geometry::workspace_rects(view, 2, 0.0, zoom);
-        let camera =
-            overview_geometry::workspace_camera(monitor.workspaces[&1].scroll_offset.x, None);
+        let camera = overview_geometry::workspace_camera_adjustment(
+            monitor.workspaces[&1].scroll_offset.x,
+            None,
+        );
         let panned = Rect::new(
             normal[0].1.loc.x - camera,
             normal[0].1.loc.y,
@@ -542,6 +546,62 @@ mod tests {
         );
         // The inactive workspace's insets really differ from the view the camera spans.
         assert_ne!(inset, view);
+    }
+
+    /// The workspace's own horizontal camera must be applied exactly once: the layout
+    /// already subtracts `scroll_offset.x`, so the overview only rescales and relocates
+    /// (niri's `render_workspaces`, src/layout/monitor.rs:1735).  Applying it twice put
+    /// the focused column off the workspace (observed on the desktop probe).
+    #[test]
+    fn the_workspace_camera_is_applied_exactly_once() {
+        use crate::layout::{LayoutConfig, Workspace};
+        let output = OutputId::from_name("overview-camera-once");
+        let view = Rect::new(0, 0, 1366, 728);
+        let mut engine = TilingEngine::new(LayoutConfig::default());
+        engine.register_monitor(output, view, view);
+        let id = WindowId::new(902);
+        let mut workspace = Workspace::new();
+        workspace.add_window_to_new_column_with_width(id, Some(300));
+        // As if the strip had been panned 700 px to the right.
+        workspace.scroll_offset.x = 700;
+        engine
+            .monitors
+            .get_mut(&output)
+            .unwrap()
+            .workspaces
+            .insert(0, workspace);
+        engine.overview = Some(OverviewState {
+            zoom: 0.5,
+            workspace_offsets: Vec::new(),
+        });
+        let (positions, clips) = engine.workspace_overview_scene(output);
+        let ws = clips.iter().find(|(w, _)| *w == id).unwrap().1;
+        let scaled = positions.iter().find(|(w, _)| *w == id).unwrap().1;
+        let monitor = engine.monitors.get(&output).unwrap();
+        let cfg = engine.effective_config_for_workspace(output, 0);
+        let inset = TilingEngine::precise_tiling_area(monitor, cfg);
+        let normal = engine.calculate_positions_at_zoom(
+            &monitor.workspaces[&0],
+            inset,
+            0,
+            inset.height,
+            cfg,
+            1.0,
+        );
+        let view_rect = Rect::new(
+            inset.loc.x,
+            inset.loc.y,
+            inset.width as u32,
+            inset.height as u32,
+        );
+        let expected = overview_geometry::zoom_tile(normal[0].1, ws, view_rect, 0.5);
+        assert_eq!(scaled, expected);
+        // 700 px of camera at half zoom is 350 px: the column is scrolled out of the
+        // workspace and therefore cropped away, not drawn inside it.
+        assert!(
+            overview_geometry::visible_tile(scaled, ws).is_none(),
+            "{scaled:?} should be left of {ws:?}"
+        );
     }
 
     #[test]

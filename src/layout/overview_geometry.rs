@@ -128,8 +128,8 @@ pub fn workspace_rects(view: Rect, count: usize, render_index: f64, zoom: f64) -
 
 /// The one per-workspace horizontal camera.
 ///
-/// Each workspace keeps its own endless strip and therefore its own view offset,
-/// so the overview shows the columns that workspace currently shows (scaled), and
+/// Each workspace keeps its own endless strip and therefore its own view offset, so
+/// the overview shows the columns that workspace currently shows (scaled), and
 /// `focus-column-left/right` pans *that* strip.  niri has no unified camera
 /// (`src/layout/monitor.rs:1720-1730` relocates every workspace by its own
 /// `geo.loc` and lets the workspace scroll itself), so `monitor_camera` is `None`
@@ -137,6 +137,16 @@ pub fn workspace_rects(view: Rect, count: usize, render_index: f64, zoom: f64) -
 /// camera so every row shares one horizontal offset.
 pub fn workspace_camera(workspace_scroll: i32, monitor_camera: Option<i32>) -> i32 {
     monitor_camera.unwrap_or(workspace_scroll)
+}
+
+/// The horizontal offset the overview still has to apply to a workspace's tiles.
+///
+/// The per-workspace layout already subtracts the workspace's own camera
+/// (`calculate_positions_at_zoom` uses `col_x - scroll_offset.x`), so niri's
+/// per-workspace camera needs no extra offset here.  A shared monitor camera is the
+/// difference between the two offsets.
+pub fn workspace_camera_adjustment(workspace_scroll: i32, monitor_camera: Option<i32>) -> i32 {
+    workspace_camera(workspace_scroll, monitor_camera) - workspace_scroll
 }
 
 /// Intersect two screen rectangles; `None` when they do not overlap.
@@ -262,6 +272,11 @@ mod tests {
         // Each workspace's strip is panned by its own camera.
         assert_eq!(workspace_camera(400, None), 400);
         assert_eq!(workspace_camera(400, Some(120)), 120);
+        // The layout already applied the workspace's own camera, so niri's
+        // per-workspace overview needs no extra offset; a shared monitor camera is
+        // the difference between the two.
+        assert_eq!(workspace_camera_adjustment(400, None), 0);
+        assert_eq!(workspace_camera_adjustment(400, Some(120)), -280);
         // Column focus moves pan the strip; the tile's on-screen x follows it.
         let ws = rects[5];
         let tile = Rect::new(1000, 0, 500, 768);

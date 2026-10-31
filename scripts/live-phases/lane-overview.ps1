@@ -7,14 +7,17 @@
 #    animated as 1 - progress*(1-zoom).
 #  * Monitor::workspaces_render_geo (src/layout/monitor.rs:1467): workspace size = view*zoom,
 #    gap = 10% of the view height * zoom, the focused workspace centred, neighbours above and
-#    below, one entry per workspace (empty ones included).
+#    below, one entry per workspace (empty ones included), the whole stack a camera.
 #  * Monitor::render_workspaces (src/layout/monitor.rs:1735): every workspace relocated to its
 #    stack rectangle, rescaled by the zoom (so a tile is exactly zoom * its normal size) and
 #    cropped inside that workspace.
 #
 # The parent harness owns the desktop mutex. This phase owns its daemon and its forms, only
-# reads geometry the host publishes as window properties, and changes no display or input
-# setting. Gates are enforced; the p_overview_* keys are information only.
+# reads the geometry the host publishes as window properties plus the typed `focused-window`
+# request, and changes no display or input setting. Gates are enforced; the p_overview_* keys
+# are information only. The ctl forms are the ones verified by hand on the desktop:
+# `focus-window <hwnd>`, `move-window-to-workspace <id>`, `switch-workspace <id>` and
+# `action <niri name>`.
 $h97Gates = @(
     'h97_thumbnails_are_the_configured_zoom',
     'h97_active_workspace_is_centred',
@@ -63,16 +66,27 @@ function H97Active($h) {
     }
     return $null
 }
+function H97Stack($h) {
+    $rows = @()
+    for ($i = 0; $i -lt (H97Prop $h 'WorkspaceCount'); $i++) {
+        $rows += [pscustomobject]@{
+            id = H97Prop $h ("Workspace{0}Id" -f $i)
+            x = H97Prop $h ("Workspace{0}X" -f $i); y = H97Prop $h ("Workspace{0}Y" -f $i)
+            w = H97Prop $h ("Workspace{0}W" -f $i); h = H97Prop $h ("Workspace{0}H" -f $i)
+        }
+    }
+    return $rows
+}
 # Wait for the overview host, then until the camera zoom stops moving. Returns the samples of
 # (ms, height) changes so the p_ keys can report the animation's publish cadence.
 function H97Settle([int]$limitMs = 6000) {
     $samples = New-Object System.Collections.ArrayList
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    $lastH = [int64]::MinValue; $same = 0; $host = [IntPtr]::Zero
+    $lastH = [int64]::MinValue; $same = 0; $hostHandle = [IntPtr]::Zero
     while ($watch.ElapsedMilliseconds -lt $limitMs) {
-        $host = H97Host
-        if ($host -eq [IntPtr]::Zero) { break }
-        $active = H97Active $host
+        $hostHandle = H97Host
+        if ($hostHandle -eq [IntPtr]::Zero) { break }
+        $active = H97Active $hostHandle
         if ($null -ne $active -and $active.h -gt 0) {
             if ($active.h -ne $lastH) {
                 [void]$samples.Add(@($watch.ElapsedMilliseconds, $active.h))
@@ -82,7 +96,7 @@ function H97Settle([int]$limitMs = 6000) {
         }
         Start-Sleep -Milliseconds 20
     }
-    return @{ ms = $watch.ElapsedMilliseconds; samples = $samples; host = $host }
+    return @{ ms = $watch.ElapsedMilliseconds; samples = $samples; hwnd = $hostHandle }
 }
 function H97WaitClosed([int]$limitMs = 6000) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -102,13 +116,19 @@ $h97Dir = Join-Path $D 'lane-overview'
 $null = New-Item -ItemType Directory -Path $h97Dir -Force
 $h97Saved = $null
 if (Test-Path $cfg) { $h97Saved = [IO.File]::ReadAllBytes($cfg) }
+# KDL needs one child per line: a whole `layout { a { }; b { }; }` on one line is rejected.
 $h97Base = @'
-input { mod-key "ctrl-alt"; }
+input {
+    mod-key "ctrl-alt"
+}
 layout {
     focus-ring { off; }
     border { off; }
 }
-window-rule { match title="^h97-"; default-column-width { fixed 350; }; }
+window-rule {
+    match title="^h97-"
+    default-column-width { fixed 350; }
+}
 '@
 try {
     if (@(Get-Process -Name wiri -ErrorAction SilentlyContinue).Count) { throw 'H97 refuses an existing daemon' }
@@ -121,60 +141,57 @@ try {
         Start-Sleep -Milliseconds 120
     }
     Start-Sleep -Milliseconds 3000
-    # Spread them over the workspaces. Workspace numbers are 1-based (niri's `move-to-workspace 2`
-    # is the second workspace), so the plan values are the numbers to send.
+    # Workspace numbers are 1-based (niri's `move-to-workspace 2` is the second workspace).
     for ($i = 1; $i -lt $h97Plan.Count; $i++) {
         if ($h97Plan[$i] -eq 1) { continue }
-        $null = Ctl "h97-focus-$i" @('action', 'focus-window', [string][int64]$h97Forms[$i])
+        $null = Ctl "h97-focus-$i" @('focus-window', [string][int64]$h97Forms[$i])
         Start-Sleep -Milliseconds 120
-        $null = Ctl "h97-move-$i" @('action', 'move-to-workspace', [string]$h97Plan[$i])
+        $null = Ctl "h97-move-$i" @('move-window-to-workspace', [string]$h97Plan[$i])
         Start-Sleep -Milliseconds 120
     }
     Start-Sleep -Milliseconds 1200
-    $null = Ctl 'h97-workspace-1' @('action', 'focus-workspace', '1')
+    $null = Ctl 'h97-workspace-1' @('switch-workspace', '1')
     Start-Sleep -Milliseconds 700
     FocusForm $h97Forms[0]
     $null = WaitForeground $h97Forms[0] 100 3000
+    $null = Ctl 'h97-focus-first' @('focus-window', [string][int64]$h97Forms[0])
+    Start-Sleep -Milliseconds 900
+    $work = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $h97Tile = 350
 
     # ---- gate group A: fixed zoom from config, niri's stack geometry ----
     try {
         $normalRect = H97Rect $h97Forms[0]
-        $normalW = $normalRect.R - $normalRect.L
-        $work = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $h97Checks.normal = @($normalRect.L, $normalRect.T, $normalRect.R - $normalRect.L, $normalRect.B - $normalRect.T)
         $null = Ctl 'h97-open' @('action', 'toggle-overview')
         $settled = H97Settle
-        $host = $settled.host
-        $active = H97Active $host
-        $rects = @()
-        $count = H97Prop $host 'WorkspaceCount'
-        for ($i = 0; $i -lt $count; $i++) {
-            $rects += [pscustomobject]@{
-                i = $i; id = H97Prop $host ("Workspace{0}Id" -f $i)
-                x = H97Prop $host ("Workspace{0}X" -f $i); y = H97Prop $host ("Workspace{0}Y" -f $i)
-                w = H97Prop $host ("Workspace{0}W" -f $i); h = H97Prop $host ("Workspace{0}H" -f $i)
-            }
-        }
-        $focusW = H97Prop $host 'FocusW'; $focusH = H97Prop $host 'FocusH'
+        $hostHwnd = $settled.hwnd
+        $active = H97Active $hostHwnd
+        $rects = H97Stack $hostHwnd
+        $focusW = H97Prop $hostHwnd 'FocusW'; $focusH = H97Prop $hostHwnd 'FocusH'
         $h97Checks.stack = $rects
-        $h97Checks.focus = @($focusW, $focusH, $normalW)
-        # niri default `overview { zoom 0.5 }`: a tile is exactly half its normal width and the
-        # workspace exactly half the view height. The old fit-everything camera gave ~0.32 here
-        # (4 workspaces stacked), which this rejects.
+        $h97Checks.focus = @($focusW, $focusH)
+        # The configured `default-column-width { fixed 350 }` is drawn at exactly
+        # zoom*tile: 175 px at the default 0.5 (the old fit-everything camera used ~0.19
+        # for five stacked workspaces, i.e. 66 px).
+        $expectedTile = [math]::Round($h97Tile * 0.5)
+        $h97Checks.expected = @($expectedTile, [math]::Ceiling($work.Height * 0.5))
         $summary.h97_thumbnails_are_the_configured_zoom = (
-            ($host -ne [IntPtr]::Zero) -and
-            ($active -ne $null) -and
+            ($hostHwnd -ne [IntPtr]::Zero) -and
+            ($null -ne $active) -and
             ([math]::Abs($active.h - [math]::Ceiling($work.Height * 0.5)) -le 1) -and
-            ($focusW -gt 0) -and
-            ([math]::Abs($focusW - [math]::Round($normalW * 0.5)) -le 2))
+            ([math]::Abs($focusW - $expectedTile) -le 1) -and
+            ($focusW -gt 120))
         # niri centres the focused workspace in the view: (view.h - ws.h)/2 above it.
         $summary.h97_active_workspace_is_centred = (
-            ($active -ne $null) -and
+            ($null -ne $active) -and
             ([math]::Abs(($active.y + $active.h / 2) - ($work.Top + $work.Height / 2)) -le 2))
         # The gap between workspaces is 10% of the view height, times the zoom.
         $gap = [math]::Round($work.Height * 0.1 * 0.5)
         $strides = @()
         for ($i = 1; $i -lt $rects.Count; $i++) { $strides += ($rects[$i].y - $rects[$i - 1].y) }
         $expectStride = $active.h + $gap
+        $h97Checks.stride = @($expectStride, $strides)
         $summary.h97_workspace_gap_and_stack = (
             ($rects.Count -ge 4) -and
             (@($strides | Where-Object { [math]::Abs($_ - $expectStride) -gt 1 }).Count -eq 0) -and
@@ -185,85 +202,87 @@ try {
 
     # ---- gate group B: keyboard focus pans the camera in x and y ----
     try {
-        # Start at the first column of the active workspace.
-        for ($i = 0; $i -lt 9; $i++) { $null = Ctl "h97-left-$i" @('action', 'focus-column-left'); Start-Sleep -Milliseconds 90 }
-        Start-Sleep -Milliseconds 500
-        $host = H97Host
-        $startX = H97Prop $host 'FocusX'
-        $wsX = (H97Active $host).x
+        $hostHwnd = H97Host
+        $ws = H97Active $hostHwnd
+        $wsX = $ws.x
         $steps = @()
-        for ($i = 0; $i -lt 3; $i++) {
+        for ($i = 0; $i -lt 7; $i++) {
             $null = Ctl "h97-right-$i" @('action', 'focus-column-right')
             # The strip camera animates (`animations.view`); let it finish.
-            Start-Sleep -Milliseconds 900
-            $host = H97Host
-            $steps += [pscustomobject]@{ x = H97Prop $host 'FocusX'; ws = (H97Active $host).x }
+            Start-Sleep -Milliseconds 700
+            $hostHwnd = H97Host
+            $steps += [pscustomobject]@{ x = H97Prop $hostHwnd 'FocusX'; w = H97Prop $hostHwnd 'FocusW'; ws = (H97Active $hostHwnd).x }
         }
-        $h97Checks.panX = @($startX, ($steps | ForEach-Object { $_.x }))
-        $decreasing = $true
-        $previous = $startX
-        foreach ($step in $steps) {
-            if ($step.x -ge $previous) { $decreasing = $false }
-            if ($step.ws -ne $wsX) { $decreasing = $false }
-            $previous = $step.x
-        }
-        # Three columns of 350 px at half zoom pan the camera by ~525 px of screen space.
+        $h97Checks.panX = @($steps | ForEach-Object { $_.x })
+        # The camera moves inside a fixed workspace frame: the workspace rectangle never
+        # changes, the focused tile keeps the zoomed width, and its place inside the
+        # workspace changes on most steps (the strip is panned, not fitted).
+        $moved = 0; $previous = $steps[0].x
+        for ($i = 1; $i -lt $steps.Count; $i++) { if ($steps[$i].x -ne $previous) { $moved++ }; $previous = $steps[$i].x }
         $summary.h97_focus_column_right_pans_camera = (
-            $decreasing -and ($startX - $steps[-1].x -ge 300))
-        # Vertical: moving one workspace down moves the stack up by exactly one stride
-        # (niri's workspace_render_idx pan). The fixture starts on workspace number 1,
-        # so `focus-workspace 2` is the down-neighbour.
-        $beforeDown = H97Active $host
-        $focusYBefore = H97Prop $host 'FocusY'
+            ($hostHwnd -ne [IntPtr]::Zero) -and
+            (@($steps | Where-Object { $_.ws -ne $wsX }).Count -eq 0) -and
+            (@($steps | Where-Object { [math]::Abs($_.w - [math]::Round($h97Tile * 0.5)) -gt 1 }).Count -eq 0) -and
+            ($moved -ge 2))
+        # Vertical: a workspace change moves the whole stack up by exactly one stride and
+        # the camera follows the new focused workspace (niri's `workspace_render_idx`).
+        $before = @{}
+        $hostHwnd = H97Host
+        foreach ($row in (H97Stack $hostHwnd)) { $before[[string]$row.id] = $row.y }
+        $beforeActive = H97Active $hostHwnd
+        $focusedBefore = H97Prop $hostHwnd 'FocusedWindow'
         $null = Ctl 'h97-down' @('action', 'focus-workspace', '2')
-        Start-Sleep -Milliseconds 1400
-        $host = H97Host
-        $afterDown = H97Active $host
-        $focusYAfter = H97Prop $host 'FocusY'
-        $stride = $beforeDown.h + [math]::Round([Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height * 0.1 * 0.5)
-        $h97Checks.panY = @($focusYBefore, $focusYAfter, $stride, $beforeDown.id, $afterDown.id)
+        Start-Sleep -Milliseconds 1500
+        $hostHwnd = H97Host
+        $afterActive = H97Active $hostHwnd
+        $stride = $beforeActive.h + [math]::Round($work.Height * 0.1 * 0.5)
+        $deltas = @{}
+        foreach ($row in (H97Stack $hostHwnd)) {
+            if ($before.ContainsKey([string]$row.id)) { $deltas[[string]$row.id] = $row.y - $before[[string]$row.id] }
+        }
+        $h97Checks.panY = @($stride, $deltas)
         $summary.h97_focus_workspace_down_pans_camera = (
-            ($host -ne [IntPtr]::Zero) -and
-            ($afterDown.id -ne $beforeDown.id) -and
-            ([math]::Abs(($beforeDown.y - $afterDown.y) - $stride) -le 1) -and
-            ([math]::Abs(($focusYBefore - $focusYAfter) - $stride) -le 3))
+            ($hostHwnd -ne [IntPtr]::Zero) -and
+            ($null -ne $afterActive) -and ($afterActive.index -eq $beforeActive.index + 1) -and
+            ($deltas.Count -ge 3) -and
+            (@($deltas.Values | Where-Object { [math]::Abs($_ + $stride) -gt 1 }).Count -eq 0) -and
+            ((H97Prop $hostHwnd 'FocusedWindow') -ne $focusedBefore))
         Shot 'h97-overview-panned'
     } catch { $h97Checks.groupB = $_ | Out-String }
 
     # ---- gate group C: overview { zoom 0.3 } after a reload changes the scale ----
     try {
-        [IO.File]::WriteAllText($cfg, ($h97Base + "`r`noverview { zoom 0.3; }`r`n"), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($cfg, ($h97Base + "`r`noverview {`r`n    zoom 0.3`r`n}`r`n"), (New-Object Text.UTF8Encoding($false)))
         $reloaded = CtlRaw @('reload-config')
-        Start-Sleep -Milliseconds 800
+        Start-Sleep -Milliseconds 900
         $settled = H97Settle 6000
-        $host = $settled.host
-        $active = H97Active $host
-        $focusW = H97Prop $host 'FocusW'
-        $work = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-        $h97Checks.reload = @($active.h, [math]::Ceiling($work.Height * 0.3), $focusW, $normalW)
+        $hostHwnd = $settled.hwnd
+        $active = H97Active $hostHwnd
+        $focusW = H97Prop $hostHwnd 'FocusW'
+        $h97Checks.reload = @($active.h, [math]::Ceiling($work.Height * 0.3), $focusW, [math]::Round($h97Tile * 0.3), $reloaded.text.Trim())
         $summary.h97_zoom_config_after_reload = (
             ($reloaded.rc -eq 0) -and
-            ($host -ne [IntPtr]::Zero) -and
+            ($hostHwnd -ne [IntPtr]::Zero) -and
             ([math]::Abs($active.h - [math]::Ceiling($work.Height * 0.3)) -le 1) -and
-            ([math]::Abs($focusW - [math]::Round($normalW * 0.3)) -le 2))
+            ([math]::Abs($focusW - [math]::Round($h97Tile * 0.3)) -le 1))
         Shot 'h97-overview-zoom-03'
     } catch { $h97Checks.groupC = $_ | Out-String }
 
     # ---- gate group D: clicking a panned thumbnail selects its window ----
     try {
-        $host = H97Host
-        $selected = H97Prop $host 'FocusedWindow'
-        $fx = H97Prop $host 'FocusX'; $fy = H97Prop $host 'FocusY'
-        $fw = H97Prop $host 'FocusW'; $fh = H97Prop $host 'FocusH'
-        $hostRect = H97Rect $host
+        $hostHwnd = H97Host
+        $selected = H97Prop $hostHwnd 'FocusedWindow'
+        $fx = H97Prop $hostHwnd 'FocusX'; $fy = H97Prop $hostHwnd 'FocusY'
+        $fw = H97Prop $hostHwnd 'FocusW'; $fh = H97Prop $hostHwnd 'FocusH'
+        $hostRect = H97Rect $hostHwnd
         $clickX = [int]($fx + $fw / 2 - $hostRect.L)
         $clickY = [int]($fy + $fh / 2 - $hostRect.T)
         $point = [IntPtr](($clickY -shl 16) -bor ($clickX -band 0xffff))
-        $null = [H97Native]::PostMessage($host, 0x201, [IntPtr]1, $point)
-        $null = [H97Native]::PostMessage($host, 0x202, [IntPtr]0, $point)
+        $null = [H97Native]::PostMessage($hostHwnd, 0x201, [IntPtr]1, $point)
+        $null = [H97Native]::PostMessage($hostHwnd, 0x202, [IntPtr]0, $point)
         $closedIn = H97WaitClosed 5000
         Start-Sleep -Milliseconds 900
-        $h97Checks.click = @($selected, [int64][LT]::GetForegroundWindow(), $fx, $fy, $fw, $fh, $closedIn)
+        $h97Checks.click = @($selected, [int64][LT]::GetForegroundWindow(), $closedIn, $fx, $fy, $fw, $fh)
         $summary.h97_click_on_panned_thumbnail_selects = (
             ($selected -gt 0) -and ($closedIn -ge 0) -and
             ([int64][LT]::GetForegroundWindow() -eq $selected))
@@ -274,7 +293,6 @@ try {
         if ((H97Host) -ne [IntPtr]::Zero) { $null = Ctl 'h97-info-close-first' @('action', 'close-overview'); $null = H97WaitClosed 4000 }
         if ($null -ne $h97Daemon) { $h97Daemon.Refresh() }
         $cpuBefore = if ($null -ne $h97Daemon) { $h97Daemon.TotalProcessorTime.TotalMilliseconds } else { 0 }
-        $openWatch = [Diagnostics.Stopwatch]::StartNew()
         $null = Ctl 'h97-info-open' @('action', 'toggle-overview')
         $settled = H97Settle 8000
         $summary.p_overview_open_ms = [int]$settled.ms
