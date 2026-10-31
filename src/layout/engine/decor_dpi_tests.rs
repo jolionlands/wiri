@@ -409,8 +409,7 @@ fn indicator_of(engine: &mut TilingEngine, output: OutputId, first: isize) -> Ta
     engine.install_decor_sink(sink.clone());
     let work = engine.monitors.get(&output).unwrap().work_area;
     let tile = Rect::new(work.loc.x + 100, work.loc.y + 100, 600, 400);
-    let positions: HashMap<WindowId, Rect> =
-        (first..first + 3).map(|n| (wid(n), tile)).collect();
+    let positions: HashMap<WindowId, Rect> = (first..first + 3).map(|n| (wid(n), tile)).collect();
     let modes: HashMap<WindowId, DrawMode> = HashMap::new();
     engine.refresh_decorations(output, &positions, &modes, work, false);
     sink.of_output(output.as_u64())
@@ -453,8 +452,14 @@ fn parity_the_tab_indicator_is_projected_through_the_output_scale() {
         let spec = indicator_of(&mut engine, output, 201);
         assert_eq!(spec.width, width, "width at scale {scale}");
         assert_eq!(spec.gap, gap, "gap at scale {scale}");
-        assert_eq!(spec.gaps_between, gaps_between, "gaps between at scale {scale}");
-        assert_eq!(spec.corner_radius, corner_radius, "corner radius at scale {scale}");
+        assert_eq!(
+            spec.gaps_between, gaps_between,
+            "gaps between at scale {scale}"
+        );
+        assert_eq!(
+            spec.corner_radius, corner_radius,
+            "corner radius at scale {scale}"
+        );
     }
 }
 

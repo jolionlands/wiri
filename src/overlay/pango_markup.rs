@@ -779,7 +779,9 @@ fn parse_size(current: i32, value: &str) -> Result<i32, String> {
         "" => Ok(clamp_size(number.round() as i32)),
         "pt" => Ok(clamp_size((number * PANGO_SCALE as f64).round() as i32)),
         // 96 dpi is the CSS reference: 1 px is 0.75 pt.
-        "px" => Ok(clamp_size((number * 0.75 * PANGO_SCALE as f64).round() as i32)),
+        "px" => Ok(clamp_size(
+            (number * 0.75 * PANGO_SCALE as f64).round() as i32
+        )),
         "%" => Ok(scaled(current, number / 100.0)),
         other => Err(format!("invalid size unit '{other}'")),
     }
@@ -947,7 +949,9 @@ fn parse_description_size(word: &str) -> Option<i32> {
     let (number, suffix) = split_number(word)?;
     match suffix.to_ascii_lowercase().as_str() {
         "" | "pt" => Some(clamp_size((number * PANGO_SCALE as f64).round() as i32)),
-        "px" => Some(clamp_size((number * 0.75 * PANGO_SCALE as f64).round() as i32)),
+        "px" => Some(clamp_size(
+            (number * 0.75 * PANGO_SCALE as f64).round() as i32
+        )),
         _ => None,
     }
 }
@@ -1169,16 +1173,24 @@ mod tests {
             style(&format!("<span letter_spacing=\"-{huge}\">x</span>")).letter_spacing,
             -MAX_OFFSET
         );
-        assert_eq!(style(&format!("<span rise=\"{huge}\">x</span>")).rise, MAX_OFFSET);
-        assert_eq!(style(&format!("<span size=\"{huge}\">x</span>")).size, MAX_SIZE);
-        assert_eq!(style(&format!("<span size=\"-{huge}\">x</span>")).size, MIN_SIZE);
+        assert_eq!(
+            style(&format!("<span rise=\"{huge}\">x</span>")).rise,
+            MAX_OFFSET
+        );
+        assert_eq!(
+            style(&format!("<span size=\"{huge}\">x</span>")).size,
+            MAX_SIZE
+        );
+        assert_eq!(
+            style(&format!("<span size=\"-{huge}\">x</span>")).size,
+            MIN_SIZE
+        );
         // Growing a size (<big>, a percentage) stops at the maximum instead of overflowing.
         assert_eq!(scaled(i32::MAX, SCALE_LARGE), MAX_SIZE);
         assert_eq!(scaled(MAX_SIZE, SCALE_XX_LARGE), MAX_SIZE);
         assert_eq!(scaled(MIN_SIZE, SCALE_SMALL), MIN_SIZE);
         // What a real title asks for is untouched.
-        let ordinary =
-            style("<span letter_spacing=\"512\" rise=\"2048\" size=\"10pt\">x</span>");
+        let ordinary = style("<span letter_spacing=\"512\" rise=\"2048\" size=\"10pt\">x</span>");
         assert_eq!((ordinary.letter_spacing, ordinary.rise), (512, 2048));
         assert_eq!(ordinary.size, 10 * PANGO_SCALE);
     }

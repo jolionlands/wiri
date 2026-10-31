@@ -163,8 +163,7 @@ fn points_to_px(units: i32, scale: f64) -> f64 {
 /// unit. Both come from a title, so the product is computed wide and clamped to a pixel
 /// count: a wrapped negative width would paint the row backwards and mis-measure it.
 fn run_advance(glyphs: i32, spacing_px: i32, units: usize) -> i32 {
-    let spacing =
-        i64::from(spacing_px).saturating_mul(i64::try_from(units).unwrap_or(i64::MAX));
+    let spacing = i64::from(spacing_px).saturating_mul(i64::try_from(units).unwrap_or(i64::MAX));
     match i64::from(glyphs).saturating_add(spacing).try_into() {
         Ok(width) => width,
         Err(_) if spacing < 0 => i32::MIN,
@@ -587,7 +586,10 @@ mod tests {
             weight: 400,
             italic: false,
         };
-        assert_eq!(face_name(&logfont_for(DEFAULT_FACE, -13, &key)), DEFAULT_FACE);
+        assert_eq!(
+            face_name(&logfont_for(DEFAULT_FACE, -13, &key)),
+            DEFAULT_FACE
+        );
         assert_eq!(face_name(&logfont_for("Consolas", -13, &key)), "Consolas");
         // GDI's face name is 32 units, the last of them the terminator.
         let long = "A".repeat(40);

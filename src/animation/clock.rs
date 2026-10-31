@@ -231,8 +231,7 @@ impl FrameClock {
             }
             Backend::CompositorClock => {
                 let timeout_ms = millis(timeout);
-                let task =
-                    tokio::task::spawn_blocking(move || compositor_clock_wait(timeout_ms));
+                let task = tokio::task::spawn_blocking(move || compositor_clock_wait(timeout_ms));
                 // The wait itself gives up after `timeout`, but a thread has to be free
                 // first: the blocking pool is capped at four threads (src/runtime.rs) and
                 // IPC work runs on it too, so a busy pool would otherwise hold
