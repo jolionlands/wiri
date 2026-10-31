@@ -1265,6 +1265,16 @@ fn apply_loaded_config(
     // reload does not rewrite pointer settings or re-place every window.
     let old_config = engine.read().full_config().cloned();
     let plan = plan_reload(old_config.as_ref(), &new_config);
+    // One line per reload: what the plan decided, and the two sections most often involved,
+    // so a gate that sees no effect can tell "not planned" from "planned but not applied".
+    debug!(
+        steps = ?plan.steps(),
+        gaps = ?old_config.as_ref().map(|c| (c.layout.inner_gaps, c.layout.outer_gaps)),
+        new_gaps = ?(new_config.layout.inner_gaps, new_config.layout.outer_gaps),
+        animations = ?(new_config.animations.enabled, new_config.animations.slowdown),
+        rules = new_config.window_rules.len(),
+        "config reload plan"
+    );
     if plan.contains(ReloadStep::Environment) {
         if let Err(error) = wiri::hooks::environment::configure(&new_config.environment) {
             warn!(%error, "Child environment unchanged");
@@ -1328,7 +1338,14 @@ fn apply_loaded_config(
             engine.apply_reloaded_layout(handle);
         }
     }
-    if plan.contains(ReloadStep::Binds) {
+    // The hotkey thread re-derives everything it owns from the published config, so the pass
+    // is not "binds only": `build_hotkey_list` resolves `Mod` from `input { mod-key }` and
+    // reads the pointer triggers, `publish_recent_input` hands the switcher its
+    // `recent-windows` options, and the same message re-arms the pointer focus policy, the
+    // drag-and-drop edges, the touch pen, the precision-touchpad raw input, the gestures and
+    // the hot corners.  Gating it on the bind table alone left a touchpad opt-in
+    // unregistered and an `input { mod-key }` reload on the old chords.
+    if plan.reapplies_hotkeys() {
         message_loop.reload_hotkeys();
     }
 }

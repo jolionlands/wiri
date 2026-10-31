@@ -16,7 +16,9 @@
 # idle-cost evidence for a Windows approximation, and the matrix row stays partial.
 $h90Gates = @('h90_animation_uses_a_presentation_clock', 'h90_no_animation_wakeups_at_rest')
 foreach ($gate in $h90Gates) { $summary[$gate] = $false }
-# slowdown 10 stretches a 150 ms column resize to about 1.5 s, i.e. ~90 frames at 60 Hz.
+# slowdown 10 stretches a column resize to several seconds (a measured burst: 251 frames
+# over 4168 ms at 60 Hz; the resize's default animation is a spring, and slowdown stretches
+# its settle time), so the burst is long enough to measure a cadence.
 $h90Config = @'
 input { mod-key "ctrl-alt"; }
 animations { slowdown 10; }
@@ -33,12 +35,24 @@ try {
     foreach ($i in 1..1) { $h90Forms += [TestForms]::Open("h90-$i", 120, 120, 160); Start-Sleep -Milliseconds 1800 }
     $h90Form = $h90Forms[-1]
     FocusForm $h90Form
+    # The summary line is written once, when a burst ends.  `slowdown 10` stretches the
+    # window-open spring of the fixture into several seconds and the slowed resize after it
+    # runs for several more, so a fixed delay cannot be used: wait for the opening burst's
+    # line first (up to 20 s), sample the count, then wait for the line the resize writes.
+    $h90Settle = [Diagnostics.Stopwatch]::StartNew()
+    while ($h90Settle.ElapsedMilliseconds -lt 20000 -and (LogLines $h90Log 'animation clock:').Count -eq 0) {
+        Start-Sleep -Milliseconds 200
+    }
     $h90Before = (LogLines $h90Log 'animation clock:').Count
     $null = Ctl 'h90-resize' @('action', 'set-column-width', '650')
-    # The slowed animation lasts ~1.5 s; wait it out before reading the summary line.
-    Start-Sleep -Milliseconds 3000
+    $h90Wait = [Diagnostics.Stopwatch]::StartNew()
+    while ($h90Wait.ElapsedMilliseconds -lt 25000 -and (LogLines $h90Log 'animation clock:').Count -le $h90Before) {
+        Start-Sleep -Milliseconds 200
+    }
     $h90Lines = @(LogLines $h90Log 'animation clock:')
     $h90New = @($h90Lines | Select-Object -Skip $h90Before)
+    $h90Evidence.settle_ms = $h90Settle.ElapsedMilliseconds
+    $h90Evidence.resize_wait_ms = $h90Wait.ElapsedMilliseconds
     $h90Last = if ($h90New.Count -gt 0) { $h90New[-1].Line } else { '' }
     $h90Fields = [ordered]@{}
     foreach ($key in 'backend', 'interval_us', 'refresh', 'frames', 'missed', 'timeouts', 'mean_us', 'max_us', 'span_ms') {

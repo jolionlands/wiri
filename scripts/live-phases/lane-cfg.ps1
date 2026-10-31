@@ -44,7 +44,11 @@ $h91Forms = @()
 $h91Spawned = Join-Path $D 'h91-bind-ran.txt'
 try {
     if (Test-Path $h91Spawned) { Remove-Item $h91Spawned -Force }
-    $h91Proc = Start-WiriWithConfig (H91Config 16 '' 'Ctrl+Alt+F9 { toggle-window-floating; }' 'window-movement { duration-ms 1200; curve "linear"; }') (Join-Path $D 'wiri.stderr91.log')
+    # `window-resize` drives the deltas probe below and `window-movement` the gap reload, so
+    # both are configured here: a width change animates from any strip position, while a
+    # column-focus scroll does not (the focused window can be the last column).
+    $h91Long = 'window-movement { duration-ms 1200; curve "linear"; }' + "`n" + 'window-resize { duration-ms 1200; curve "linear"; }'
+    $h91Proc = Start-WiriWithConfig (H91Config 16 '' 'Ctrl+Alt+F9 { toggle-window-floating; }' $h91Long) (Join-Path $D 'wiri.stderr91.log')
     $h91Forms += [TestForms]::Open('wiri-h91-a', 60, 80, 190)
     Start-Sleep -Milliseconds 1200
 
@@ -53,12 +57,20 @@ try {
         FocusForm $h91Forms[0]
         Start-Sleep -Milliseconds 300
         $h91Before = Rc $h91Forms[0]
-        H91Reload (H91Config 60 '' 'Ctrl+Alt+F9 { toggle-window-floating; }' 'window-movement { duration-ms 1200; curve "linear"; }') 'gap'
+        H91Reload (H91Config 60 '' 'Ctrl+Alt+F9 { toggle-window-floating; }' $h91Long) 'gap'
+        # The re-placement animates (window-movement 1200 ms): sample the settled rect.
+        Start-Sleep -Milliseconds 900
         $h91After = Rc $h91Forms[0]
         $deltaX = $h91After.X - $h91Before.X
         $deltaY = $h91After.Y - $h91Before.Y
-        $summary.h91_gap_reload_moves_the_window = ($deltaX -ge 30) -and ($deltaX -le 60) -and ($deltaY -ge 30) -and ($deltaY -le 60)
-        Set-Content (Join-Path $D 'h91-gap.txt') "before=$($h91Before.X),$($h91Before.Y),$($h91Before.W),$($h91Before.H) after=$($h91After.X),$($h91After.Y),$($h91After.W),$($h91After.H)"
+        # niri keeps the scrolled view's horizontal offset, so only the vertical placement is a
+        # fixed function of the gap difference: the top edge moves by `60 - 16 = 44` px and the
+        # view shrinks by twice that. The horizontal delta depends on where the strip happens
+        # to be scrolled (measured -16 for a right-aligned last column, +44 for the first), so
+        # it is only used as evidence, not asserted.
+        $summary.h91_gap_reload_moves_the_window = ($deltaY -ge 30) -and ($deltaY -le 60) -and
+            (($h91Before.H - $h91After.H) -ge 60) -and ($h91After.W -eq $h91Before.W)
+        Set-Content (Join-Path $D 'h91-gap.txt') "before=$($h91Before.X),$($h91Before.Y),$($h91Before.W),$($h91Before.H) after=$($h91After.X),$($h91After.Y),$($h91After.W),$($h91After.H) dx=$deltaX dy=$deltaY"
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h91-gap-error.txt')
     }
@@ -66,14 +78,16 @@ try {
     # 2. `window-rule`: a rule added by the reload governs the windows that open afterwards.
     try {
         $h91BeforeRule = @([LT]::TopLevel() | Where-Object { [LT]::Title($_) -like 'wiri-h91-*' }).Count
-        H91Reload (H91Config 60 'match title="^wiri-h91"; open-floating true;' 'Ctrl+Alt+F9 { toggle-window-floating; }' 'window-movement { duration-ms 1200; curve "linear"; }') 'rule'
+        H91Reload (H91Config 60 'match title="^wiri-h91"; open-floating true;' 'Ctrl+Alt+F9 { toggle-window-floating; }' $h91Long) 'rule'
         $h91Forms += [TestForms]::Open('wiri-h91-b', 60, 90, 120)
         Start-Sleep -Milliseconds 1200
         $h91Monitor = Rc $h91Forms[0]
         $h91Floating = Rc $h91Forms[1]
-        # The window that opened after the reload keeps its own size (floating); the tiled one
-        # spans the view width.
-        $summary.h91_window_rule_reload_affects_a_new_window = ($h91Floating.W -lt ($h91Monitor.W / 2)) -and ($h91Monitor.W -gt 400) -and ($h91BeforeRule -ge 1)
+        # The window that opened after the reload keeps its own size (floating, 520x380 from
+        # the fixture) instead of being stretched to the view (a tiled window spans the whole
+        # work-area height). The width is not a discriminator: a tiled column is ~500 px wide
+        # and the floating fixture is ~520, so the height is asserted.
+        $summary.h91_window_rule_reload_affects_a_new_window = ($h91Floating.H -lt ($h91Monitor.H - 100)) -and ($h91Floating.W -gt 400) -and ($h91Monitor.W -gt 400) -and ($h91BeforeRule -ge 1)
         Set-Content (Join-Path $D 'h91-rule.txt') "tiled=$($h91Monitor.X),$($h91Monitor.Y),$($h91Monitor.W),$($h91Monitor.H) opened=$($h91Floating.X),$($h91Floating.Y),$($h91Floating.W),$($h91Floating.H)"
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h91-rule-error.txt')
@@ -84,7 +98,7 @@ try {
         FocusForm $h91Forms[0]
         Start-Sleep -Milliseconds 300
         $h91Bind = 'Ctrl+Alt+F9 { spawn-sh "cmd /c echo h91 > ' + $h91Spawned.Replace('\', '\\') + '"; }'
-        H91Reload (H91Config 60 'match title="^wiri-h91"; open-floating true;' $h91Bind 'window-movement { duration-ms 1200; curve "linear"; }') 'bind'
+        H91Reload (H91Config 60 'match title="^wiri-h91"; open-floating true;' $h91Bind $h91Long) 'bind'
         H91Chord 0x78
         Start-Sleep -Milliseconds 300
         $summary.h91_bind_reload_registers_the_new_chord = WaitFile $h91Spawned 4
@@ -92,29 +106,31 @@ try {
         $_ | Out-String | Set-Content (Join-Path $D 'h91-bind-error.txt')
     }
 
-    # 4. `animations`: a reload from a long window-movement curve to `off` makes a move land
-    #    immediately.  The same move is sampled before and after the reload.
+    # 4. `animations`: a reload from a long window-resize curve to `off` makes the same width
+    #    change land immediately. A width change is used instead of a column-focus scroll,
+    #    because a scroll needs a column in that direction (the focused window can be the
+    #    last one, where `focus-column-right` has nothing to move and no motion is visible).
     try {
         FocusForm $h91Forms[0]
         Start-Sleep -Milliseconds 200
         $h91From = Rc $h91Forms[0]
-        $null = Ctl 'h91-focus-right' @('action', 'focus-column-right')
+        $null = Ctl 'h91-resize-long' @('action', 'set-column-width', '650')
         Start-Sleep -Milliseconds 150
         $h91Mid = Rc $h91Forms[0]
-        Start-Sleep -Milliseconds 1400
+        Start-Sleep -Milliseconds 1600
         $h91End = Rc $h91Forms[0]
         $h91Animated = -not (H91Near $h91Mid $h91End)
+        H91Reload (H91Config 60 'match title="^wiri-h91"; open-floating true;' 'Ctrl+Alt+F9 { toggle-window-floating; }' 'off;') 'anim'
         FocusForm $h91Forms[0]
         Start-Sleep -Milliseconds 200
-        H91Reload (H91Config 60 'match title="^wiri-h91"; open-floating true;' 'Ctrl+Alt+F9 { toggle-window-floating; }' 'off;') 'anim'
-        $null = Ctl 'h91-focus-left' @('action', 'focus-column-left')
+        $null = Ctl 'h91-resize-off' @('action', 'set-column-width', '420')
         Start-Sleep -Milliseconds 150
         $h91InstantMid = Rc $h91Forms[0]
-        Start-Sleep -Milliseconds 1400
+        Start-Sleep -Milliseconds 600
         $h91InstantEnd = Rc $h91Forms[0]
-        $h91Instant = H91Near $h91InstantMid $h91InstantEnd
+        $h91Instant = (H91Near $h91InstantMid $h91InstantEnd) -and ([math]::Abs($h91InstantEnd.W - $h91End.W) -gt 20)
         $summary.h91_animation_reload_changes_motion = $h91Animated -and $h91Instant
-        Set-Content (Join-Path $D 'h91-anim.txt') "from=$($h91From.X) mid=$($h91Mid.X) end=$($h91End.X) instantMid=$($h91InstantMid.X) instantEnd=$($h91InstantEnd.X)"
+        Set-Content (Join-Path $D 'h91-anim.txt') "from=$($h91From.W) mid=$($h91Mid.W) end=$($h91End.W) instantMid=$($h91InstantMid.W) instantEnd=$($h91InstantEnd.W)"
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h91-anim-error.txt')
     }

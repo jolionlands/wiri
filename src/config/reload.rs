@@ -12,6 +12,11 @@
 //! re-placement and rule re-evaluation.  A reload that changes only a bind therefore does not
 //! re-place every window.
 //!
+//! The hotkey thread's pass is wider than "binds": it also resolves `Mod` from
+//! `input { mod-key }`, republishes the switcher snapshot and re-arms the device state on that
+//! thread.  [`ReloadPlan::reapplies_hotkeys`] is the predicate for that pass and lists every
+//! section it reads.
+//!
 //! The comparison is [`std::fmt::Debug`]-based because [`Config`] and its sub-structs do not
 //! implement `PartialEq` (adding it would touch every config type, which other lanes own).
 //! Reloads are user actions, not a hot path, and the fingerprints are only taken on reload.
@@ -41,6 +46,11 @@ pub enum ReloadStep {
     /// `binds {}` and `gestures {}` (hotkeys, hot corners, drag-and-drop edges)
     /// (niri `src/niri.rs:1789-1809`, 1930-1932).
     Binds,
+    /// `recent-windows {}` is a wiri section with no niri counterpart: it feeds the
+    /// low-level switcher snapshot that the hotkey thread publishes
+    /// (`publish_recent_input`, `src/backend/message_loop.rs:368-381`).  It sits with the
+    /// binds because that is the pass which republishes the snapshot.
+    RecentWindows,
     /// `window-rule {}` and `layer-rule {}`: re-evaluated on the open windows
     /// (niri `src/niri.rs:1912-1918`).
     WindowRules,
@@ -87,6 +97,41 @@ impl ReloadPlan {
     pub fn reevaluates_rules(&self) -> bool {
         self.contains(ReloadStep::WindowRules)
     }
+
+    /// Whether the hotkey thread has to rebuild everything it derives from the config.
+    ///
+    /// That pass (`WM_RELOAD_HOTKEYS`, `src/backend/message_loop.rs:745-800`) is not only
+    /// the chord table.  It rebuilds the keyboard engine's table from `build_hotkey_list`
+    /// and republishes the low-level switcher snapshot with `publish_recent_input`, and it
+    /// re-arms the device state that lives on that thread.  Everything any of those read
+    /// must therefore be listed here, not just `binds`:
+    ///
+    /// * `binds` — the chords themselves,
+    /// * `input` — `mod-key` resolves the `Mod` prefix of every configured chord *and* of
+    ///   the default keymap (`resolve_mod_prefix`, used by `build_hotkey_list` and by
+    ///   `publish_recent_input` for the switcher), the pointer trigger buttons
+    ///   (`input::pointer::ENGINE`), the focus-follows-mouse/warp/delay policy
+    ///   (`input::focus::reload` posts `WM_RELOAD_FOCUS`) and the precision touchpad's
+    ///   raw-input opt-in (`input::touchpad::configure` at message_loop.rs:759-779),
+    /// * `gestures` — the drag-and-drop edge scroll and swipe state,
+    /// * `output` — `hot-corners` are configured per output (`hot_corner::reload`),
+    /// * `recent-windows` — `publish_recent_input` hands the switcher its debounce/open
+    ///   delay/preview options together with the same resolved `mod-key`.
+    ///
+    /// `hotkey-overlay` options need no pass of their own: `show_hotkey_overlay` reads them
+    /// from the engine's config every time the sheet opens
+    /// (`src/backend/message_loop.rs:1704-1725`), and the engine config is always published.
+    pub fn reapplies_hotkeys(&self) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(
+                step,
+                ReloadStep::Input
+                    | ReloadStep::Outputs
+                    | ReloadStep::Binds
+                    | ReloadStep::RecentWindows
+            )
+        })
+    }
 }
 
 /// A value fingerprint.  See the module comment for why this is not `PartialEq`.
@@ -132,6 +177,9 @@ pub fn plan(old: Option<&Config>, new: &Config) -> ReloadPlan {
     if !same(&old.binds, &new.binds) || !same(&old.gestures, &new.gestures) {
         push(ReloadStep::Binds);
     }
+    if !same(&old.recent_windows, &new.recent_windows) {
+        push(ReloadStep::RecentWindows);
+    }
     if !same(&old.window_rules, &new.window_rules) || !same(&old.layer_rules, &new.layer_rules) {
         push(ReloadStep::WindowRules);
     }
@@ -154,6 +202,7 @@ impl ReloadStep {
         ReloadStep::Input,
         ReloadStep::Outputs,
         ReloadStep::Binds,
+        ReloadStep::RecentWindows,
         ReloadStep::WindowRules,
         ReloadStep::SwitchEvents,
         ReloadStep::Screenshot,
@@ -452,5 +501,167 @@ mod tests {
         "#,
         );
         assert_eq!(plan(Some(&old), &new).steps(), &[] as &[ReloadStep]);
+    }
+
+    /// A first application has to run every pass, including the hotkey thread's.
+    #[test]
+    fn a_first_application_reapplies_the_hotkey_pass() {
+        let new = config(BASE);
+        let plan = plan(None, &new);
+        assert!(plan.contains(ReloadStep::Input));
+        assert!(plan.contains(ReloadStep::Binds));
+        assert!(plan.contains(ReloadStep::RecentWindows));
+        assert!(plan.reapplies_hotkeys());
+    }
+
+    /// `input { mod-key }` alone leaves every chord text unchanged, but it changes what
+    /// `Mod` resolves to (`build_hotkey_list`, `publish_recent_input`), so the hotkey pass
+    /// has to run again — and it must not re-place the windows.
+    #[test]
+    fn a_mod_key_change_reapplies_the_hotkey_pass() {
+        let old = config(BASE);
+        let new = config(
+            r#"
+            layout { gaps 16; }
+            animations { window-open { duration-ms 150; curve "ease-out-expo"; } }
+            environment { FOO "1"; }
+            input { mod-key "alt"; keyboard { repeat-delay 600; repeat-rate 25; } }
+            output "DP-1" { scale 1; }
+            binds { Ctrl+Alt+F8 { screenshot; } }
+            window-rule { match app-id="a"; opacity 0.9; }
+            switch-events { lid-close { spawn "x"; } }
+            screenshot-path "~/Pictures/a.png"
+            workspace "chat" {}
+        "#,
+        );
+        let plan = plan(Some(&old), &new);
+        assert_eq!(plan.steps(), &[ReloadStep::Input]);
+        assert!(plan.reapplies_hotkeys());
+        assert!(!plan.touches_engine());
+    }
+
+    /// `recent-windows {}` is read only by `publish_recent_input`: the switcher snapshot is
+    /// republished, nothing is re-placed.
+    #[test]
+    fn a_recent_windows_change_republishes_the_switcher_snapshot() {
+        let old = config(BASE);
+        let new = config(
+            r#"
+            layout { gaps 16; }
+            animations { window-open { duration-ms 150; curve "ease-out-expo"; } }
+            environment { FOO "1"; }
+            input { keyboard { repeat-delay 600; repeat-rate 25; } }
+            output "DP-1" { scale 1; }
+            binds { Ctrl+Alt+F8 { screenshot; } }
+            recent-windows { open-delay-ms 120; }
+            window-rule { match app-id="a"; opacity 0.9; }
+            switch-events { lid-close { spawn "x"; } }
+            screenshot-path "~/Pictures/a.png"
+            workspace "chat" {}
+        "#,
+        );
+        let plan = plan(Some(&old), &new);
+        assert_eq!(plan.steps(), &[ReloadStep::RecentWindows]);
+        assert!(plan.reapplies_hotkeys());
+        assert!(!plan.touches_engine());
+    }
+
+    /// Turning the precision touchpad's raw-input opt-in on and off again both re-run the
+    /// hotkey thread's pass: that is where `input::touchpad::configure` registers and
+    /// removes the `RIDEV_INPUTSINK` window (`src/backend/message_loop.rs:750-780`).
+    #[test]
+    fn a_touchpad_opt_in_and_out_reapplies_the_hotkey_pass() {
+        let off = config(BASE);
+        let on = config(
+            r#"
+            layout { gaps 16; }
+            animations { window-open { duration-ms 150; curve "ease-out-expo"; } }
+            environment { FOO "1"; }
+            input {
+                keyboard { repeat-delay 600; repeat-rate 25; }
+                touchpad { dwt; }
+            }
+            output "DP-1" { scale 1; }
+            binds { Ctrl+Alt+F8 { screenshot; } }
+            window-rule { match app-id="a"; opacity 0.9; }
+            switch-events { lid-close { spawn "x"; } }
+            screenshot-path "~/Pictures/a.png"
+            workspace "chat" {}
+        "#,
+        );
+        for (old, new) in [(&off, &on), (&on, &off)] {
+            let plan = plan(Some(old), new);
+            assert_eq!(plan.steps(), &[ReloadStep::Input]);
+            assert!(plan.reapplies_hotkeys());
+            assert!(!plan.touches_engine());
+        }
+    }
+
+    /// `hot-corners` live in `output {}`, and `hot_corner::reload` is part of the same pass.
+    #[test]
+    fn an_output_change_reapplies_the_hotkey_pass() {
+        let old = config(BASE);
+        let new = config(
+            r#"
+            layout { gaps 16; }
+            animations { window-open { duration-ms 150; curve "ease-out-expo"; } }
+            environment { FOO "1"; }
+            input { keyboard { repeat-delay 600; repeat-rate 25; } }
+            output "DP-1" { scale 1.5; }
+            binds { Ctrl+Alt+F8 { screenshot; } }
+            window-rule { match app-id="a"; opacity 0.9; }
+            switch-events { lid-close { spawn "x"; } }
+            screenshot-path "~/Pictures/a.png"
+            workspace "chat" {}
+        "#,
+        );
+        let plan = plan(Some(&old), &new);
+        // An output change is both a layout view rebuild and an output step (the existing
+        // `an_output_override_replans_layout_and_outputs` test documents the same pair).
+        assert_eq!(plan.steps(), &[ReloadStep::Layout, ReloadStep::Outputs]);
+        assert!(plan.reapplies_hotkeys());
+        assert!(plan.touches_engine());
+    }
+
+    /// Sections the hotkey thread never reads must not re-register a single chord: a gap, an
+    /// animation or a window-rule reload stays off that thread.
+    #[test]
+    fn the_other_sections_do_not_reapply_the_hotkey_pass() {
+        let base = config(BASE);
+        for changed in [
+            BASE.replace("gaps 16;", "gaps 8;"),
+            BASE.replace("duration-ms 150", "duration-ms 300"),
+            BASE.replace("opacity 0.9", "opacity 0.5"),
+        ] {
+            let new = config(&changed);
+            let plan = plan(Some(&base), &new);
+            assert!(!plan.steps().is_empty(), "{changed}");
+            assert!(!plan.reapplies_hotkeys(), "{changed}");
+        }
+    }
+
+    /// `hotkey-overlay` needs no pass of its own: the sheet reads the published config every
+    /// time it opens, so nothing is cached across a reload.
+    #[test]
+    fn a_hotkey_overlay_change_needs_no_hotkey_pass() {
+        let old = config(BASE);
+        let new = config(
+            r#"
+            layout { gaps 16; }
+            animations { window-open { duration-ms 150; curve "ease-out-expo"; } }
+            environment { FOO "1"; }
+            input { keyboard { repeat-delay 600; repeat-rate 25; } }
+            output "DP-1" { scale 1; }
+            binds { Ctrl+Alt+F8 { screenshot; } }
+            hotkey-overlay { hide-not-bound; }
+            window-rule { match app-id="a"; opacity 0.9; }
+            switch-events { lid-close { spawn "x"; } }
+            screenshot-path "~/Pictures/a.png"
+            workspace "chat" {}
+        "#,
+        );
+        let plan = plan(Some(&old), &new);
+        assert_eq!(plan.steps(), &[] as &[ReloadStep]);
+        assert!(!plan.reapplies_hotkeys());
     }
 }

@@ -143,7 +143,13 @@ public static class LanePangoNative {
         }
         return $ink
     }
-    # Orange-ish pixels inside the box: the requested #ff8800, allowing for anti-aliasing.
+    # Orange-ish pixels inside the box: a blend of the sheet's background (28,28,32) and the
+    # requested #ff8800.  The plain channel bounds this used to test (`R>=120, 60<=G<=200,
+    # B<=120`) also accept ClearType's colour fringes on ordinary light text - they are
+    # (143,70,32)-shaped on this sheet - so a plain row measured 39 "orange" pixels and the
+    # control comparison could never hold.  A pixel now has to lie on the background ->
+    # #ff8800 line: every channel's blend factor within 0.35 of the others, at least 0.6 of
+    # the way there.  The painted span keeps ~77 such pixels, a plain row none.
     function MPOrange($bitmap, $word) {
         $count = 0
         $left = [int][Math]::Floor($word.x); $top = [int][Math]::Floor($word.y)
@@ -153,7 +159,12 @@ public static class LanePangoNative {
         for ($y = $top; $y -le $bottom; $y++) {
             for ($x = $left; $x -le $right; $x++) {
                 $c = $bitmap.GetPixel($x, $y)
-                if ($c.R -ge 120 -and $c.G -ge 60 -and $c.G -le 200 -and $c.B -le 120) { $count++ }
+                $tr = ($c.R - 28) / 227.0
+                $tg = ($c.G - 28) / 108.0
+                $tb = (32 - $c.B) / 32.0
+                $lo = [Math]::Min($tr, [Math]::Min($tg, $tb))
+                $hi = [Math]::Max($tr, [Math]::Max($tg, $tb))
+                if ($lo -ge 0.6 -and ($hi - $lo) -le 0.35) { $count++ }
             }
         }
         return $count
