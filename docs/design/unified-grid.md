@@ -67,13 +67,18 @@ to a row:
   explicitly allows x to sit past a row's ends, and the x-match then picks the nearest
   column by distance.
 
-`TilingEngine::camera_offset(output)` is the read-only hook a future overview needs:
-it answers "what horizontal offset does this monitor's camera have right now". The
-overview files (`src/overlay/thumbnail_overview.rs`, `src/overlay/overview_*.rs`,
-`enter_overview` / `OverviewState` in `engine.rs`, `src/layout/engine/overview_input.rs`)
-are **not** touched by this lane and still draw each workspace with its own
-`scroll_offset.x`; a later overview lane should call `camera_offset` for the row the
-user is on and lay the other rows out at the same x so the grid reads as one camera.
+`TilingEngine::camera_offset(output)` is the read-only hook the overview uses: it answers
+"what horizontal offset does this monitor's camera have right now". The overview
+(`src/layout/engine/overview.rs`) draws **every** row of a unified monitor through that one
+camera, so the columns of different rows line up in x and the zoomed-out view is the same
+grid as the normal view; with the mode off it keeps niri's per-row camera unchanged. A row
+change inside the overview goes through `unified_switch_workspace`
+(`overview_step_row` / `switch_workspace_in_overview`), so it carries the camera and lands
+on the x-matched column exactly like a row change in the normal view.
+
+Because the overview pan is the shared `scroll_offset.x`, `focus-column-left/right`, the
+diagonal actions, the two-arrow chord and a two-axis scroll all move the one camera in the
+zoomed-out view: x and y animate together and every row follows.
 
 ## Rule 3 — vertical moves land on the x-matched column
 
@@ -180,9 +185,31 @@ and no-merge cases by the `layout::engine::unified_grid` tests.
 In normal view, when a scroll input carries **both** axes (precision-touchpad
 two-finger scroll, or horizontal tilt together with vertical wheel), unified mode pans
 the shared camera along x **and** moves between rows along y as one diagonal motion
-instead of two independent ones. The handler is `TilingEngine::unified_scroll_pan`; it
+instead of two independent ones. The handler is `TilingEngine::unified_grid_pan`; it
 runs only when the mode is on and only when the existing view (`ScrollLeft`/`ScrollRight`)
 and workspace-scroll handlers would both fire for the two axes.
+
+## The overview
+
+The overview is the same grid seen through `overview { zoom }` (see
+`src/layout/overview_geometry.rs`), so with the mode on `workspace_overview_scene` draws
+every row of the monitor through `camera_offset` — the rows line up in x, and a row that is
+shorter than the camera offset simply has empty space there (rule 3's "past the row's
+ends"). With the mode off each row keeps its own camera and nothing changes.
+
+* **Row change**: `switch_workspace_in_overview` and `overview_step_row` (the overview's
+  next/previous-workspace camera step, driven by a vertical wheel, a touch drag or an
+  action) go through `unified_switch_workspace`, so the camera moves y and keeps x.
+* **Diagonal actions**: `apply_grid_action` resolves the row and column before anything
+  moves, so `focus-up-left` … `move-window-down-right` pan the zoomed-out camera in x and
+  y from one action; the vertical camera (`OverviewCamera::pan`) and the x camera
+  (`queue_view`) animate together.
+* **Two arrows together**: unchanged — the chord produces the diagonal action above.
+* **Two axes of a scroll**: the vertical leg steps the row with the camera carried and the
+  horizontal leg (`overview_scroll_view`) pans the same camera, so every row follows
+  instead of only the active one.
+* A **floating** window is drawn at its own screen rect, because floats are not part of the
+  grid.
 
 ## Rule 7 — IPC
 
@@ -201,9 +228,8 @@ added work is one `bool` read on the workspace-switch and vertical-action paths.
 
 ## What is not done here
 
-* The overview still draws every row with its own camera; `camera_offset` is the hook.
 * Multi-monitor: the camera is per monitor by construction, but this lane's live gates
   run on the single-display test machine, so cross-output grid behaviour is covered by
   unit tests only.
 * Floating windows are not part of the grid; the diagonal focus keeps the existing
-  floating-layer rules.
+  floating-layer rules, and the overview draws a float at its own screen rect.

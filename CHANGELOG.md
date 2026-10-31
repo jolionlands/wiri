@@ -53,6 +53,39 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - No timer, thread, polling loop or idle wake-up is added; with the mode off the only added work is
   one `bool` read on the workspace-switch and vertical-action paths.
 
+### Lane GRID-OVERVIEW — the unified grid in the zoomed-out view
+
+- The overview now draws the opt-in unified grid with the monitor's **one** camera:
+  `workspace_overview_scene` feeds `overview_geometry::workspace_camera_adjustment` with
+  `TilingEngine::camera_offset`, so with `layout { unified-grid }` on, column k of every
+  workspace row sits at the same on-screen x, a row shorter than the camera offset simply has
+  empty space there, and a floating window (not part of the grid) keeps its own screen rect.
+  With the flag off each row keeps its own `scroll_offset.x`, exactly as niri does, and every
+  existing overview test and `h97_*` gate is unchanged.
+- A row change inside the overview (`switch_workspace_in_overview`, and the new
+  `unified_grid::overview_step_row` used for the overview's next/previous-workspace camera
+  step) goes through `unified_switch_workspace`: the camera is carried across and the focus
+  lands on the x-matched column (rule 3). The two axes of a two-finger scroll therefore move
+  the same camera in x and y instead of panning the active row only.
+- `focus-up-left` … `move-window-down-right` and the two-arrow chord work while the overview
+  is open: `apply_grid_action` resolves the row and the column before anything moves, so the
+  vertical camera (`OverviewCamera::pan`) and the x camera (`queue_view`) animate together as
+  one diagonal motion. `unified_grid_pan` was factored into `unified_pan_rows(from_row,
+  camera_from, down, x_target)` so the "one row plus one camera scroll" resolution has a
+  single implementation.
+- The DWM overview host publishes per-tile destination geometry for the live harness:
+  `WiriOverviewTileCount` plus `WiriOverviewTile{i}{Window,X,Y,W,H}`, sorted top to bottom
+  then left to right. Session-local, like the rest of the published overview state.
+- Tests: `layout/overview_geometry.rs` (the shared camera puts the same strip x at the same
+  screen x in three rows of 4/2/6 columns, and the mode-off per-row camera differs);
+  `layout/engine/overview.rs` (the scene x of column k across three rows of 4/2/3 columns,
+  the diagonal focus in the overview — row and focus window, x and y legs in flight from one
+  action and both arrived — and a two-axis scroll moving the one shared camera).
+- Live gates: two new `h98_overview_*` keys in `scripts/live-phases/lane-grid.ps1`
+  (three rows of 5/3/2 columns with column 0 and 1 at the same x in every row; `focus-up-right`
+  in the overview moving the camera right and up and landing on the expected window),
+  parse-checked with the PowerShell Parser API.
+
 ### Lane PERF — one session UI thread, a lazy overview banner and a shorter blocking keep-alive
 - **Every thread has a description.** The hotkey pump (now `wiri-ui`), the tray, the status bar, the snap guide and the overview banner were created with `std::thread::spawn` and inherited the process name. All of them now go through `std::thread::Builder::name`, which is `SetThreadDescription` on Windows, so the new information-only `p_rest_threads_by_*` keys in `scripts/live-phases/lane-e-perf.ps1` can attribute each thread by name at rest. [docs/PERF.md](docs/PERF.md#thread-and-memory-budget-work-2026-10-31-lane-perf) lists every thread, who owns it, whether it exists at rest and when a lazy one starts.
 - **The tray icon moved onto the session UI thread.** `hooks::tray::create_icon` now runs on the same pump as the hotkey window, the low-level keyboard hook and the compositor/decoration windows: `TrayIcon::setup` installs a request, posts `WM_TRAY_HOST` to that thread and waits (5 s bound) for the answer, and only falls back to the old dedicated `wiri-tray` thread when the pump is not running. `Shell_NotifyIconW(NIM_DELETE)` still runs on the thread that added the icon (`hooks::tray::shutdown`, called when the pump stops). Behaviour is unchanged except that an open tray context menu now delays hotkey delivery while it is up, as any Win32 application's modal menu does.

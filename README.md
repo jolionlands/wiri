@@ -134,7 +134,7 @@ binds {
 }
 ```
 
-The same four directions exist as `move-window-up-left` … `move-window-down-right` and `pan-up-left` … `pan-down-right`, from binds, `wiri-ctl action` and IPC. Hold one arrow and press the perpendicular one to make a single diagonal move; a single press never waits. It can be turned on for one monitor only. The full design is in [docs/design/unified-grid.md](docs/design/unified-grid.md).
+The same four directions exist as `move-window-up-left` … `move-window-down-right` and `pan-up-left` … `pan-down-right`, from binds, `wiri-ctl action` and IPC. Hold one arrow and press the perpendicular one to make a single diagonal move; a single press never waits. It can be turned on for one monitor only. The overview draws the same grid: with the flag on, every workspace row of the zoomed-out view uses that monitor's one camera, so columns line up across rows, and the diagonal actions, the two-arrow chord and a two-axis scroll pan the overview camera diagonally too. The full design is in [docs/design/unified-grid.md](docs/design/unified-grid.md).
 
 
 ## Scripting with wiri-ctl
@@ -176,7 +176,6 @@ The key-press figure runs from the real `SendInput` call to the moved window's o
 These are in progress:
 
 - **Pannable overview.** The overview becomes niri's fixed-zoom view of the endless grid, which you can pan.
-- **Unified XY grid in the overview.** The [unified grid](#unified-xy-grid-opt-in-wiri-extension) works in the normal view; the overview will draw it with the same shared camera.
 - **Multi-monitor and mixed-DPI checks** on real hardware.
 - **ARM64 performance numbers.**
 
