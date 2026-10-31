@@ -78,10 +78,11 @@
         $mmReport.checks[$name] = [ordered]@{ pass = $pass; observed = $observed }
         MmSave
     }
-    # A gate this run could not observe.  It is recorded as skipped, never as failed, and named in
-    # `h99_skips` so a green summary cannot hide it.
+    # A gate this run could not observe.  It is recorded as skipped, never as failed and never as
+    # passed: its boolean leaves the summary (so the gate totals do not count it) and it is named
+    # in `h99_skips` with the reason, so a green summary cannot hide it.
     function MmSkip([string]$name, [string]$reason) {
-        $summary[$name] = $true
+        $summary.Remove($name)
         $mmReport.skips[$name] = $reason
         $summary['h99_skips'] = @($mmReport.skips.Keys | ForEach-Object { [pscustomobject]@{ gate = $_; reason = $mmReport.skips[$_] } })
         MmSave
