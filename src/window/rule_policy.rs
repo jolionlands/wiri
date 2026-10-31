@@ -215,16 +215,19 @@ impl RulePolicy {
 ///
 /// The hook owns this state, resets it on snapshot/config replacement, and calls it
 /// only for unconsumed, non-injected application wheel events. A recipient or factor
-/// change resets both remainders so another window cannot inherit a partial delta.
+/// change resets the affected axis; snapshot/config changes reset both.
+/// Another window can never inherit a partial delta.
 #[derive(Debug, Clone, Default)]
 pub struct ScrollAccumulator {
-    context: Option<(WindowId, f64)>,
+    context: Option<WindowId>,
+    factors: [Option<f64>; 2],
     remainder: [f64; 2],
 }
 
 impl ScrollAccumulator {
     pub fn reset(&mut self) {
         self.context = None;
+        self.factors = [None; 2];
         self.remainder = [0.0; 2];
     }
 
@@ -235,16 +238,16 @@ impl ScrollAccumulator {
     /// injected events must bypass binding dispatch as well as this accumulator.
     pub fn scale(&mut self, target: WindowId, horizontal: bool, delta: i32, factor: f64) -> i32 {
         // A bad snapshot must not turn ordinary scrolling into a swallowed event.
-        let factor = if factor.is_finite() && factor >= 0.0 {
-            factor
-        } else {
-            1.0
-        };
-        if self.context != Some((target, factor)) {
+        let factor = if factor.is_finite() { factor } else { 1.0 };
+        if self.context != Some(target) {
             self.reset();
-            self.context = Some((target, factor));
+            self.context = Some(target);
         }
         let axis = usize::from(horizontal);
+        if self.factors[axis] != Some(factor) {
+            self.remainder[axis] = 0.0;
+            self.factors[axis] = Some(factor);
+        }
         let total = f64::from(delta) * factor + self.remainder[axis];
         let whole = total.trunc();
         // Saturation also covers an unexpectedly huge composed device multiplier.
@@ -508,7 +511,8 @@ mod tests {
         let target = WindowId::new(1);
         assert_eq!(scroll.scale(target, false, -120, 0.0), 0);
         assert_eq!(scroll.scale(target, true, -120, 1.0), -120);
-        for factor in [-1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(scroll.scale(target, false, 120, -1.0), -120);
+        for factor in [f64::NAN, f64::INFINITY] {
             assert_eq!(scroll.scale(target, false, 120, factor), 120);
         }
         assert_eq!(scroll.scale(target, false, 120, 100.0), 12_000);

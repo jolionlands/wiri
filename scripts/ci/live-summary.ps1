@@ -75,6 +75,17 @@ function Get-WiriLiveSummaryFailures {
         $expected = $name -ne 'hidden_json_present_after_restart'
         if ($value -isnot [bool] -or $value -ne $expected) { $failures.Add($name) }
     }
+    # Phases can append conditional gates after the static summary is created.
+    # Inspect top-level results only; descriptive objects and metrics stay informational.
+    foreach ($property in $Summary.PSObject.Properties) {
+        $name = $property.Name
+        $value = $property.Value
+        $failedDynamicBoolean = $name -match '^h[0-9]+_' -and $booleanGates -notcontains $name -and
+            $value -is [bool] -and -not $value
+        $phaseError = $name -like 'phase_error_*' -and $null -ne $value -and
+            -not [string]::IsNullOrWhiteSpace([string]$value)
+        if (($failedDynamicBoolean -or $phaseError) -and -not $failures.Contains($name)) { $failures.Add($name) }
+    }
     if (-not (Test-Number $Summary.windows_expected_after_quit) -or $Summary.windows_expected_after_quit -le 0 -or
         -not (Test-Number $Summary.windows_visible_after_quit) -or
         $Summary.windows_visible_after_quit -ne $Summary.windows_expected_after_quit) {

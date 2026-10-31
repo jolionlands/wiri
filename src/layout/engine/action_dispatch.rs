@@ -5,6 +5,7 @@ use crate::input::{MonitorAction, MonitorTarget, WorkspaceAction};
 impl TilingEngine {
     pub fn workspace_layout_action(&mut self, action: &WorkspaceAction, backend: &BackendHandle) {
         match action {
+            WorkspaceAction::Focus { reference } => self.focus_workspace_ref(reference, backend),
             WorkspaceAction::MoveWindow {
                 window,
                 reference,

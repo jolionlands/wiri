@@ -77,25 +77,37 @@ animations {
     window-resize { easing "cubic-bezier"; }
 }
 '@
+    # niri's exact bounds, tested *at* them (pinned e19df12 niri-config/src/animations.rs):
+    # `slowdown: Option<FloatOrInt<0, { i32::MAX }>>` (:57), `EasingParams { duration_ms: u32 }`
+    # with no upper bound (:119-122) and `SpringParams { damping_ratio: f64, stiffness: u32,
+    # epsilon: f64 }` (:134-138) validated as damping-ratio 0.1..=10.0, stiffness >= 1 and
+    # epsilon 0.00001..=0.1 (:888-900).  wiri's decoder now uses the same ranges, so the values
+    # at the limits must load clean (the previous fixture used wiri's old, narrower limits -
+    # slowdown 1000, duration-ms 60000, stiffness 1e9, epsilon 1 - and was wrong).
     H17Case 'numeric_limits_accepted' @'
 animations {
-    slowdown 1000; duration-ms 60000; curve "linear"
-    workspace-switch { spring damping-ratio=0 stiffness=0.000001 epsilon=0.000000000001; }
-    horizontal-view-movement { spring damping-ratio=100 stiffness=1000000000 epsilon=1; }
+    slowdown 2147483647; duration-ms 4294967295; curve "linear"
+    workspace-switch { spring damping-ratio=0.1 stiffness=1 epsilon=0.00001; }
+    horizontal-view-movement { spring damping-ratio=10 stiffness=4294967295 epsilon=0.1; }
     window-movement { duration-ms 0; curve "linear"; }
 }
 '@
     H17Case 'zero_slowdown_accepted' 'animations { slowdown 0; }'
 
     H17Case 'negative_slowdown_rejected' 'animations { slowdown -1; }' 1 @('slowdown.*must be between')
-    H17Case 'excessive_slowdown_rejected' 'animations { slowdown 1001; }' 1 @('slowdown.*must be between')
+    # One past `i32::MAX` (niri-config/src/animations.rs:57), not wiri's old 1000.
+    H17Case 'excessive_slowdown_rejected' 'animations { slowdown 2147483648; }' 1 @('slowdown.*must be between')
     H17Case 'nonfinite_slowdown_rejected' 'animations { slowdown "NaN"; }' 1 @('slowdown.*must be between')
     H17Case 'negative_duration_rejected' 'animations { window-movement { duration-ms -1; } }' 1 @('duration-ms.*must be between')
-    H17Case 'excessive_duration_rejected' 'animations { duration-ms 60001; }' 1 @('duration-ms.*must be between')
+    # `duration_ms` is a `u32` with no upper bound (niri-config/src/animations.rs:119-122), so
+    # only a value that does not fit the integer type is refused - not wiri's old 60000.
+    H17Case 'excessive_duration_rejected' 'animations { duration-ms 4294967296; }' 1 @('duration-ms.*must be between')
     H17Case 'negative_damping_rejected' 'animations { spring damping-ratio=-0.1; }' 1 @('spring.*must be between')
     H17Case 'excessive_damping_rejected' 'animations { spring damping-ratio=100.1; }' 1 @('spring.*must be between')
     H17Case 'zero_stiffness_rejected' 'animations { window-resize { spring stiffness=0; } }' 1 @('spring.*must be between')
-    H17Case 'excessive_stiffness_rejected' 'animations { spring stiffness=1000000001; }' 1 @('spring.*must be between')
+    # `stiffness: u32` with `stiffness must be >= 1` (niri-config/src/animations.rs:134-138,
+    # 893-895): 1000000001 is a valid stiffness, one past u32::MAX is not.
+    H17Case 'excessive_stiffness_rejected' 'animations { spring stiffness=4294967296; }' 1 @('spring.*must be between')
     H17Case 'zero_epsilon_rejected' 'animations { spring epsilon=0; }' 1 @('spring.*must be between')
     H17Case 'excessive_epsilon_rejected' 'animations { spring epsilon=1.01; }' 1 @('spring.*must be between')
     H17Case 'nonfinite_spring_rejected' 'animations { spring stiffness="NaN"; }' 1 @('spring.*must be between')

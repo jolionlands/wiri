@@ -11,6 +11,9 @@ use super::Action;
 pub const WM_INPUT_WORK: u32 = WM_USER + 305;
 pub enum Work {
     Action(Action),
+    /// A `unified-grid` arrow chord: the two arrow presses were merged into one diagonal
+    /// action, so the engine continues from the state the first arrow started on.
+    ChordedAction(Action),
     Recent(super::recent::RecentInput),
     Task(Box<dyn FnOnce() + Send>),
 }
@@ -46,6 +49,10 @@ pub fn send_recent(input: super::recent::RecentInput) -> bool {
 }
 pub fn send(action: Action) -> bool {
     enqueue(Work::Action(action))
+}
+/// Queue the second half of a `unified-grid` arrow chord.
+pub fn send_chorded(action: Action) -> bool {
+    enqueue(Work::ChordedAction(action))
 }
 pub fn send_work(work: Box<dyn FnOnce() + Send>) -> bool {
     enqueue(Work::Task(work))

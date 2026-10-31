@@ -117,7 +117,10 @@ impl StatusBar {
     /// Drop the returned `JoinHandle` — the thread lives until the process exits.
     pub fn spawn(self: Arc<Self>) -> std::thread::JoinHandle<()> {
         let state = self.state.clone();
-        std::thread::spawn(move || run_window_loop(state))
+        std::thread::Builder::new()
+            .name("wiri-status-bar".into())
+            .spawn(move || run_window_loop(state))
+            .expect("status bar thread")
     }
 }
 

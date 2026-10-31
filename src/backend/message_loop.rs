@@ -22,6 +22,7 @@ use crate::input::keyboard::bind_may_fire;
 use crate::input::keyboard::{self, BindOptions};
 use crate::input::{Action, SizeChange};
 use crate::layout::{FocusLayer, ScrollDirection, TilingEngine};
+use crate::utils::WindowId;
 
 const WM_STOP_MESSAGE_LOOP: u32 = WM_USER + 100;
 /// Custom message sent to the hotkey thread to trigger re-registration
@@ -289,7 +290,19 @@ fn build_hotkey_list(
             "Hotkeys: {} from defaults, 0 from config (0 overridden)",
             default_count
         );
-        return (defaults, HashMap::new());
+        let options = defaults
+            .iter()
+            .map(|(mods, vk, _)| {
+                (
+                    (*mods, *vk),
+                    BindOptions {
+                        overlay_uses_compositor_mod: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        return (defaults, options);
     }
 
     // Parse every config bind once.
@@ -301,25 +314,24 @@ fn build_hotkey_list(
         }
         match bind_to_hotkey(bind, prefix) {
             Ok(row) => {
-                if !bind.repeat
-                    || bind.release
-                    || !bind.allow_inhibiting
-                    || bind.cooldown_ms.is_some()
-                    || bind.hotkey_overlay_title.is_some()
-                {
-                    options.insert(
-                        (row.0, row.1),
-                        BindOptions {
-                            no_repeat: !bind.repeat,
-                            release: bind.release,
-                            allow_inhibiting: bind.allow_inhibiting,
-                            cooldown: bind
-                                .cooldown_ms
-                                .map(|ms| std::time::Duration::from_millis(ms as u64)),
-                            title: bind.hotkey_overlay_title.clone(),
-                        },
-                    );
-                }
+                // Keep an entry even for ordinary explicit Ctrl binds: their
+                // resolved mask cannot tell them apart from literal Mod.
+                options.insert(
+                    (row.0, row.1),
+                    BindOptions {
+                        no_repeat: !bind.repeat,
+                        release: bind.release,
+                        allow_inhibiting: bind.allow_inhibiting,
+                        cooldown: bind
+                            .cooldown_ms
+                            .map(|ms| std::time::Duration::from_millis(ms as u64)),
+                        title: bind.hotkey_overlay_title.clone(),
+                        overlay_uses_compositor_mod: bind
+                            .modifiers
+                            .iter()
+                            .any(|modifier| modifier.eq_ignore_ascii_case("mod")),
+                    },
+                );
                 parsed_config.push(row)
             }
             Err(why) => warn!("Config bind: {}, skipping", why),
@@ -328,6 +340,14 @@ fn build_hotkey_list(
 
     let config_count = parsed_config.len();
     let (merged, overridden) = merge_hotkeys(defaults, parsed_config, extend_defaults);
+    // Remaining rows originate in the opt-in default keymap's Mod chords.
+    // Config rows, including explicit non-Mod replacements, already have entries.
+    for (mods, vk, _) in &merged {
+        options.entry((*mods, *vk)).or_insert_with(|| BindOptions {
+            overlay_uses_compositor_mod: true,
+            ..Default::default()
+        });
+    }
     if extend_defaults {
         info!(
             "Hotkeys: {} from defaults, {} from config ({} overridden)",
@@ -516,6 +536,10 @@ pub struct RegisteredBinding {
     /// Action this binding fires.  Held as a debug-formatted string so the
     /// IPC layer (which doesn't depend on `Action`'s serde impl) can ship it.
     pub action: String,
+    /// Typed action for overlay selection/descriptions; runtime snapshots always
+    /// populate this. The debug string above remains the existing IPC contract.
+    pub overlay_action: Option<Action>,
+    pub overlay_uses_compositor_mod: bool,
     /// niri's `hotkey-overlay-title=`: `Some(Some(text))` is shown in the key-bindings overlay
     /// instead of the action name, `Some(None)` hides the bind from it.
     pub title: Option<Option<String>>,
@@ -541,6 +565,10 @@ fn update_current_bindings_snapshot(
             modifiers: *mods,
             vk_code: *vk,
             action: format!("{:?}", action),
+            overlay_action: Some(action.clone()),
+            overlay_uses_compositor_mod: options
+                .get(&(*mods, *vk))
+                .is_some_and(|o| o.overlay_uses_compositor_mod),
             title: options.get(&(*mods, *vk)).and_then(|o| o.title.clone()),
         });
     }
@@ -595,9 +623,16 @@ impl MessageLoop {
     ) {
         let running = self.running.clone();
         let quit_tx = self.quit_tx.clone();
-        std::thread::spawn(move || {
-            Self::run_message_loop(running, engine, backend_handle, quit_tx);
-        });
+        // The one session UI thread: the hotkey window, the low-level keyboard hook, the
+        // compositor and decoration windows and the tray icon all pump here.
+        let spawned = std::thread::Builder::new()
+            .name("wiri-ui".to_string())
+            .spawn(move || {
+                Self::run_message_loop(running, engine, backend_handle, quit_tx);
+            });
+        if let Err(e) = spawned {
+            error!("Failed to start the hotkey message loop: {}", e);
+        }
     }
 
     fn run_message_loop(
@@ -690,9 +725,12 @@ impl MessageLoop {
         }
         let (mut current_hotkeys, bind_options) = build_hotkey_list(&engine);
         publish_recent_input(&engine, &current_hotkeys);
-        keyboard::ENGINE
-            .lock()
-            .configure(&current_hotkeys, &bind_options);
+        let chord_ms = engine.read().unified_grid_chord_ms();
+        {
+            let mut keys = keyboard::ENGINE.lock();
+            keys.configure(&current_hotkeys, &bind_options);
+            keys.set_unified_grid_chord_ms(chord_ms);
+        }
         keyboard::configure_latin_fallback();
         let (mut registered_ids, _) = register_hotkeys(hwnd, &current_hotkeys);
         // Snapshot mirror for `current_bindings()` queries from IPC.
@@ -716,8 +754,14 @@ impl MessageLoop {
                 if ret.0 == 0 || ret.0 == -1 {
                     break;
                 }
-                if msg.message == WM_STOP_MESSAGE_LOOP {
+                // A thread message has no window; the tray's callback message shares this id
+                // and must reach `DispatchMessageW` instead.
+                if msg.message == WM_STOP_MESSAGE_LOOP && msg.hwnd.0.is_null() {
                     break;
+                }
+                // The tray icon is hosted here too: one session UI thread instead of two pumps.
+                if crate::hooks::tray::handle_message(msg.message) {
+                    continue;
                 }
                 if crate::overlay::compositor::handle_message(msg.message) {
                     continue;
@@ -730,7 +774,7 @@ impl MessageLoop {
                 {
                     continue;
                 }
-                if msg.message == WM_RELOAD_HOTKEYS {
+                if msg.message == WM_RELOAD_HOTKEYS && msg.hwnd.0.is_null() {
                     crate::input::focus::reload();
                     crate::input::dnd::configure(engine.clone(), backend_handle.clone());
                     crate::input::touchpen::shutdown();
@@ -757,6 +801,9 @@ impl MessageLoop {
                     keyboard::ENGINE
                         .lock()
                         .configure(&new_hotkeys, &new_options);
+                    keyboard::ENGINE
+                        .lock()
+                        .set_unified_grid_chord_ms(engine.read().unified_grid_chord_ms());
                     keyboard::configure_latin_fallback();
                     let (new_ids, _) = register_hotkeys(hwnd, &new_hotkeys);
                     registered_ids = new_ids;
@@ -774,6 +821,13 @@ impl MessageLoop {
                         match work {
                             crate::input::dispatch::Work::Action(action) => {
                                 info!("KEYHOOK -> {:?}", action);
+                                execute_action(&action, &engine, &backend_handle, &quit_tx);
+                            }
+                            crate::input::dispatch::Work::ChordedAction(action) => {
+                                // wiri `unified-grid` rule 5: continue from the state the
+                                // first arrow started on, not from where it already moved.
+                                info!("KEYHOOK -> {:?} (chord)", action);
+                                engine.write().note_grid_chord();
                                 execute_action(&action, &engine, &backend_handle, &quit_tx);
                             }
                             crate::input::dispatch::Work::Recent(input) => {
@@ -822,6 +876,7 @@ impl MessageLoop {
         }
 
         drop(switch_events); // Unregister power notifications on this pump, before DestroyWindow.
+        crate::hooks::tray::shutdown();
         unregister_hotkeys(hwnd, &registered_ids);
         crate::ipc::keyboard_notify::shutdown(hwnd);
         crate::input::stop_keyboard_hook();
@@ -872,6 +927,19 @@ impl MessageLoop {
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Post `message` to the session UI thread (the one pump that owns the hotkey window,
+    /// the keyboard hook, the overlay windows and the tray icon).  False when that thread has
+    /// not started, so a caller can fall back to a pump of its own.
+    pub fn post_to_ui_thread(message: u32) -> bool {
+        let state = HOTKEY_THREAD.lock();
+        match state.as_ref() {
+            Some(s) => unsafe {
+                PostThreadMessageW(s.thread_id, message, WPARAM(0), LPARAM(0)).is_ok()
+            },
+            None => false,
         }
     }
 
@@ -1012,6 +1080,21 @@ pub(crate) fn perform_action_on(
         Action::CloseWindow => engine
             .write()
             .resolve_action_target_for(foreground, true, backend),
+        Action::WindowHeightPresetCycle | Action::WindowHeightPresetCycleBack
+            if window.is_some_and(|hwnd| engine.read().is_floating(WindowId::new(hwnd))) =>
+        {
+            // An explicit floating resize must not report a new foreground
+            // window or change either output's active selection.
+            let engine = engine.read();
+            window
+                .map(WindowId::new)
+                .filter(|id| engine.tiled_windows().contains_key(id))
+                .map(|id| crate::layout::ActionTarget {
+                    window: id,
+                    floating: true,
+                    focus_hwnd: id.as_isize(),
+                })
+        }
         _ => engine
             .write()
             .resolve_action_target_for(foreground, false, backend),
@@ -1070,6 +1153,13 @@ pub(crate) fn perform_action_on(
         Action::LayoutFocus(action) => engine.write().focus_layout_action(action, backend),
         Action::WorkspaceAction(action) => engine.write().workspace_layout_action(action, backend),
         Action::MonitorAction(action) => engine.write().monitor_layout_action(action, backend),
+        Action::Grid(step) => {
+            // wiri extension: the diagonal step of the unified XY grid. `note_grid_chord`
+            // was set by the chorded dispatch; a direct bind runs from the current focus.
+            let chorded = engine.read().grid_chord_pending();
+            engine.write().apply_grid_action(*step, chorded, backend);
+        }
+        Action::GridPan(pan) => engine.write().unified_grid_pan(*pan, backend),
         Action::ToggleKeyboardShortcutsInhibit => {
             keyboard::ENGINE.lock().toggle_inhibit();
             info!(
@@ -1192,19 +1282,19 @@ pub(crate) fn perform_action_on(
             // wiri's older `maximize`: the window fills the work area.  It is the engine's
             // maximized-to-edges state now (the window keeps its place in its column), not
             // the native one that the layout pass used to fight.
+            // A floating window moves into the strip and is maximized there (niri: they
+            // cannot be floating and maximized).
             match target {
-                Some(t) if !t.floating => engine
+                Some(t) => engine
                     .write()
                     .set_maximized_to_edges(t.window, true, backend),
-                Some(_) => info!("Maximize: a floating window stays a floating window"),
                 None => warn!("Maximize: no window to maximize"),
             }
         }
         Action::MaximizeWindowToEdges => match target {
-            Some(t) if !t.floating => engine
+            Some(t) => engine
                 .write()
                 .toggle_maximize_window_to_edges_for(t.window, backend),
-            Some(_) => info!("maximize-window-to-edges: a floating window stays a floating window"),
             None => info!("maximize-window-to-edges: no window to maximize"),
         },
         Action::Minimize => {
@@ -1308,13 +1398,11 @@ pub(crate) fn perform_action_on(
         }
         Action::WindowHeightPresetCycle | Action::WindowHeightPresetCycleBack => {
             let forwards = matches!(action, Action::WindowHeightPresetCycle);
-            if float_of(target).is_some() {
-                // A floating window has no column to share: niri's presets are column shares.
-                info!("switch-preset-window-height: a floating window keeps its height");
-            } else {
-                engine
+            match float_of(target) {
+                Some(window) => engine.write().float_cycle_height(window, forwards, backend),
+                None => engine
                     .write()
-                    .switch_preset_window_height(forwards, backend);
+                    .switch_preset_window_height(forwards, backend),
             }
         }
         // wiri's fractions are niri proportions of the view.
@@ -2120,6 +2208,44 @@ mod tests {
     }
 
     #[test]
+    fn pinned_hotkey_runtime_snapshot_preserves_literal_mod_spawn_eligibility() {
+        // Ctrl and Mod resolve to the same Win32 mask here. Only the literal
+        // Mod bind qualifies for automatic spawn curation in pinned niri.
+        let source = r#"
+            input { mod-key "ctrl"; }
+            binds {
+                Ctrl+T { spawn "explicit-ctrl.exe"; }
+                Mod+Y { spawn "literal-mod.exe"; }
+                Super+U { spawn-sh "super-shell.exe --flag"; }
+            }
+        "#;
+        let config = crate::config::parse_kdl_config(source).unwrap();
+        let mut engine = TilingEngine::new(crate::layout::LayoutConfig::from_config(&config));
+        engine.set_full_config(config);
+        let (hotkeys, options) = build_hotkey_list(&Arc::new(parking_lot::RwLock::new(engine)));
+        assert_eq!(hotkeys.len(), 3);
+        assert_eq!(hotkeys[0].0, MOD_CTRL);
+        assert_eq!(hotkeys[1].0, MOD_CTRL);
+        assert_eq!(hotkeys[2].0, MOD_WIN);
+
+        // Model successful registration without registering a native hotkey.
+        let registered_ids: Vec<_> = (0..hotkeys.len()).map(|i| 32768 + i as i32).collect();
+        let saved = current_bindings();
+        update_current_bindings_snapshot(&hotkeys, &registered_ids, &options);
+        let snapshot = current_bindings();
+        *REGISTERED_BINDINGS.lock() = saved;
+        assert_eq!(snapshot.len(), 3);
+        let rows = crate::overlay::hotkey_rows::curated_rows(&snapshot, MOD_CTRL, true);
+        assert_eq!(
+            rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>(),
+            vec![
+                crate::ipc::server::format_chord(MOD_CTRL, 0x59),
+                crate::ipc::server::format_chord(MOD_WIN, 0x55),
+            ]
+        );
+    }
+
+    #[test]
     fn empty_replacement_never_restores_defaults() {
         let defaults = vec![d(MOD_CTRL | MOD_ALT, 0x51, "close")];
         let (merged, overridden) = merge_hotkeys(defaults, vec![], false);
@@ -2325,6 +2451,8 @@ mod tests {
             modifiers: MOD_CTRL | MOD_ALT,
             vk_code: vk,
             action: action.to_string(),
+            overlay_action: None,
+            overlay_uses_compositor_mod: false,
             title: title.map(|t| t.map(|s| s.to_string())),
         };
         let rows = overlay_rows(&[

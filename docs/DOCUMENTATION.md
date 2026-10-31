@@ -280,6 +280,8 @@ niri's `touchpad`, `trackpoint`, `trackball`, `tablet`, `xkb`, `track-layout`, `
 | `column-width N`, `column-width-mode "proportional"` or `"fixed"`, `max-visible-columns N`, `scroll-step N` | wiri's column sizing |
 | `dim-unfocused 0.92`, `strip-frame`, `snap-on-drag`, `snap-threshold-px N`, `smart-borders`, `status-bar` | |
 | `hide-method "hide"` or `"cloak"` | how the windows of other workspaces are hidden |
+| `unified-grid` / `unified-grid true` / `unified-grid false` | **wiri extension.** One horizontal camera shared by every workspace row of a monitor, so the desktop is one XY grid and vertical moves land on the column under the camera. Off by default; also accepted in a per-output `layout {}` override. See `docs/design/unified-grid.md` |
+| `unified-grid-chord-ms N` | **wiri extension.** Integer `0..=1000`, default 150: how long two arrow presses count as one diagonal chord, measured from the input events' own timestamps. `0` disables merging |
 
 niri's `center-focused-column`, `preset-column-widths`, `default-column-width`, `tab-indicator`,
 `insert-hint`, gradients and the rest are accepted with a warning.  The older flat keys
@@ -314,7 +316,9 @@ A bind is the key combination (`Mod`, `Ctrl`, `Shift`, `Alt`, `Super`/`Win`, the
 xkb names such as `Bracket_Left`, `Page_Up`, `Return`, `Grave`, or letters, digits, `F1`...`F24`) and
 exactly one action in braces.  Properties: `repeat=false` (holding the key fires the action once),
 `cooldown-ms=` (ignore the bind for that long after it fired), `hotkey-overlay-title=`
-(accepted; `null` hides it), `allow-when-locked=` and `allow-inhibiting=` (accepted: Windows never
+(Pango markup, as in niri: `"<b>Browser</b>"`, `"R&amp;D"`, `<span foreground="#ff8800">`; an
+invalid title is shown as the whole original string and warned about once at load; `null` hides the
+row), `allow-when-locked=` and `allow-inhibiting=` (accepted: Windows never
 delivers hotkeys to a locked session, and wiri has no shortcut inhibition).  Action properties of
 niri (`focus=false`, `show-pointer=false`, `skip-confirmation=true`) are accepted.
 

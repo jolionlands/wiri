@@ -5,6 +5,139 @@ All `p_*` properties in `summary.json` are numeric **information**, never pass/f
 `-1` means unavailable, not zero cost or a passing sample. Existing live gates are untouched.
 The proposed budgets below are future acceptance criteria, not enforced by this collector.
 
+## Tridaris R3 observation, 2026-10-29 UTC (`E8C1274F` source archive)
+
+The frozen full run `C:\wiri-dev\evidence\parity-full-r3-20261028-234058`
+finished with 735 passing and 111 failing desktop gates, 94 information entries
+and one cursor-restoration phase error. Builds remained stopped throughout this
+run. All 64 new H81-H86 checks passed, but the whole run is not qualified.
+
+| Observation, 28 managed windows / two sentinels | Result |
+| --- | ---: |
+| First complete IPC reply / first observed layout | 102.69 / 87.01 ms, one cold start |
+| Idle CPU / interval | Below counter resolution / 30.006 s |
+| Idle input-tick changes / positioning lines | 0 / 0 |
+| Idle context switches, endpoint lower bound | 14.73 per second |
+| Private memory, startup / after sampled actions | 13.77 / 13.61 MiB |
+| Working set, startup / after sampled actions | 35.51 / 36.82 MiB |
+| Threads, startup / after sampled actions | 14 / 15 |
+| Hotkey samples, valid / timeout / invalid preflight | 0 / 0 / 1 |
+| Hotkey latency | Unavailable |
+
+The collector requested focus of its exact owned sentinel, HWND 62067746, but
+Windows refused native activation; foreground remained HWND 86250240. The
+preflight correctly stopped before sending the hotkey batch. That foreground HWND was
+later identified as a visible elevated Windows Terminal window that predated
+this run. The evidence establishes activation refusal, not why Windows refused.
+It does not establish that all desktop failures have the same cause.
+
+A subsequent owned-window diagnostic on the same frozen binary completed four
+comparisons with clean cleanup. All 16 observations through 1,500 ms showed the
+requested owned window in the foreground. The initial foreground already belonged
+to the collector, so this did not reproduce the earlier Terminal-to-sentinel
+refusal or qualify hotkey latency. Collector, daemon and Terminal had the same
+integrity level in that diagnostic; this does not establish their earlier state.
+The original failed performance observation remains retained.
+
+A separate diagnostic retained the original daemon-first fixture startup order.
+Its first owned focus request succeeded from a medium-integrity PowerShell
+foreground window to the initially hidden, elevated owned target. That target
+remained foreground through 1,500 ms. This does not reproduce the original
+elevated-Terminal refusal. The passive state snapshots also add observation
+overhead; this diagnostic supplies no hotkey latency measurement.
+
+The idle counters and resource endpoints describe this workload. The action
+sequence omitted all ten hotkeys, so its final memory snapshot is not a matched
+comparison with f217. Two endpoints prove neither a leak nor a plateau. The
+single cold sample also has clock-mapping uncertainty (observer offsets were
+negative); its difference from the earlier run cannot establish a regression.
+
+Next qualify owned-target native foreground acknowledgement, then repeat the
+perf-only phase on the frozen binary. Retain the pre-injection refusal and record
+target/foreground ownership, focus reply and activation log. A later target-side
+geometry acknowledgement observer can separate collector wake delay; displayed
+frame timing requires separate evidence.
+
+## Historical Tridaris full-baseline checkpoint, 2026-10-28 (`f217e15`)
+
+The frozen full run at `C:\wiri-dev\evidence\parity-full-f217e15-20261028`
+recorded the following with 26 managed windows and two existing sentinels:
+
+| Observation | Result |
+| --- | ---: |
+| First complete IPC reply / first observed layout | 82.30 / 65.13 ms, one cold start |
+| Idle process CPU / interval | Below the counter increment / 30.005 s |
+| Idle placement lines / context switches | 0 / 17.20 per second |
+| Hotkey to first observed rectangle change | 27.52 ms median, 33.47 ms maximum, ten keys |
+| Largest rectangle-observer gap | 33.47 ms |
+| Private bytes, startup / after actions | 8.11 / 8.24 MiB |
+| Working set, startup / after actions | 24.02 / 26.02 MiB |
+| Threads, startup / after actions | 14 / 15 |
+| Collector errors | 0 |
+
+The run's verdict records concurrent compilation. It is not a quiet performance
+qualification, and the observer gap cannot resolve a 16 ms movement target.
+Two memory endpoints establish neither a leak nor a stable long-term plateau.
+These measurements precede the current startup, native sizing and activation fixes;
+they are not a matched comparison with current source. Command round-trip timings from
+focused gates are a separate measurement from hotkey-to-rectangle latency.
+
+Next: repeat the normal-desktop collector on the final frozen binary after builds
+stop, improve the external acknowledgement observer before enforcing sub-frame
+limits, and separately observe focus/cursor completion and animation cadence.
+The older poller inventory below is historical: the current main loop, reconciliation
+and animation wakeups are demand-driven, and the runtime already bounds its workers.
+Remaining source-backed candidates include the synchronous 40 ms activation fallback
+under the engine lock; measure that path before changing it and retain final-geometry
+delivery guarantees. Active animation pacing is no longer a candidate: the fixed 16 ms
+sleep is gone (Lane PACE, 2026-10-30, measured below), replaced by the desktop's
+presentation clock.
+
+## Animation clock measurement, 2026-10-30 (Lane PACE)
+
+The animation frame worker used to `sleep(16 ms)` between ticks inside its Tokio task. While
+timelines run it now waits for the desktop's presentation clock — `DCompositionWaitForCompositorClock`
+(`dcomp.dll`, resolved with `GetProcAddress` on the first animation so wiri also starts without
+it) on a blocking-pool task, then `DwmFlush`, then a sleep of one interval derived from the
+output refresh rate (`DwmGetCompositionTimingInfo().rateRefresh`, else
+`EnumDisplaySettingsW().dmDisplayFrequency`, else 60 Hz). Frame timestamps are `Instant`s
+(QueryPerformanceCounter, the compositor clock's domain), so a spring or easing advances by the
+measured presentation interval. The wait is armed by the first animation request and disarmed
+when the last timeline finishes (`src/animation/`); nothing at all is armed at rest.
+
+Method: one `#[ignore]` measurement test, one run, no other workload of ours, on TRIDARIS
+(Windows 11 22631, one 1366x768 display at 96 DPI) built from `2bce5dd9` plus this lane:
+
+```powershell
+cargo test --release -j 2 --lib -- --ignored --nocapture compositor_frame_cadence_measurement
+```
+
+It waits for 120 frames through the same async path the daemon uses, and measures each interval
+from the end of one wait to the end of the next. CPU is this process's kernel+user time
+(`GetProcessTimes`), so it includes the test's own work, not only the waits.
+
+| Observation, 121 waits / 120 measured intervals | Result |
+| --- | ---: |
+| Chosen backend / refresh source | `DCompositionWaitForCompositorClock` / `dwm-timing` |
+| Interval used | 16.665 ms |
+| Mean / median interval | 16.664 / 16.663 ms |
+| p95 / max interval | 16.703 / 16.735 ms |
+| Wall time | 2 018 ms |
+| Process CPU / per interval | 15.6 ms / 0.130 ms |
+
+This is one short sample, not a stress or soak test, and other lanes were compiling on the same
+laptop during it. It proves the compositor clock is reachable here, that the chosen backend paces
+at the reported refresh (median 2 µs below the interval, p95 38 µs above it) and what one frame
+costs this process. It does not prove displayed-frame cadence, a vsync-locked flip (DWM still
+composites), idle CPU under the official collector, or any other refresh rate, output count or
+RDP session. While nothing animates the frame worker parks on its notifier: no timer, no blocking
+wait and no thread of its own. During a burst one of the runtime's four blocking threads is
+occupied by the compositor wait, so the bound in `src/runtime.rs` is unchanged and still
+applies. Both facts, and the remaining cadence/CPU budget claims, are for the lead's live cycle
+to measure: the `h90_*` gates in `scripts/live-phases/lane-pace.ps1` read the one
+`animation clock: backend=... frames=... mean_us=... max_us=...` line a burst logs at debug
+level (`-v`) and the process CPU time of a settled daemon.
+
 ## Reproduce
 
 From an interactive Windows x64 worktree, with `RUSTFLAGS=-D warnings`:
@@ -480,3 +613,163 @@ correctness, validating budgets with less noisy repeated normal runs, a finer ex
 latency observer, checking normal non-verbose mode, and measuring ARM64. Separately,
 investigate the H9 terminal visible-frame overlap without weakening its recorded result.
 No stress/soak testing is proposed.
+
+## Thread and memory budget work, 2026-10-31 (Lane PERF)
+
+This section is the source-backed inventory the "Proposed Phase 4 budgets" table asked for, the
+changes that shrink it, and the before/after measurement of exactly those changes. Every thread
+below is named with `SetThreadDescription` when it starts (Rust's `std::thread::Builder::name`
+and Tokio's `thread_name` both do that), so a collector can attribute each one by description
+instead of by guesswork. Only the `notify` crate's own watcher thread is out of our naming reach.
+
+### Inventory: every thread wiri creates
+
+| Wall-clock point | Description | Owner (source) | Count | Lifetime |
+| --- | --- | --- | ---: | --- |
+| process start | `wiri.exe` (the unnamed main thread) | `main.rs::main` | 1 | process |
+| process start | `wiri-rt` | Tokio workers, `runtime.rs::build` (`WORKER_THREADS = 2`) | 2 | process |
+| on demand | `wiri-rt` | Tokio blocking pool, `MAX_BLOCKING_THREADS = 4`; created per `spawn_blocking` task, exits after `BLOCKING_KEEP_ALIVE` idle | 0..4 | transient |
+| process start | `wiri-ui` | `backend/message_loop.rs::run_message_loop`: hotkey window (`WiriHotkeyWnd`), `WH_KEYBOARD_LL`, the compositor and decoration windows and the tray icon pump here | 1 | process |
+| process start | `wiri-winevent-hook` | `backend/hooks.rs::WinEventHook` — `SetWinEventHook(WINEVENT_OUTOFCONTEXT)` needs its own pumping thread | 1 | process |
+| process start | `wiri-mouse-hook` | `input/low_level_hook.rs::start_mouse_hook` — `WH_MOUSE_LL` plus the one-shot cursor-hide timer | 1 | process |
+| process start | `wiri-config-reload` | `config/loader.rs::spawn_reload_handler` | 1 | process |
+| process start | *(unnamed, third party)* | the `notify` crate's `ReadDirectoryChangesW` watcher thread | 1 | process |
+| process start (default config) | — | nothing else: the four overlays below are all lazy | 0 | — |
+| first announcement | `wiri-a11y` | `a11y.rs::Provider::start` — the UIA provider window; created by the first `announce` | 0..1 | process |
+| first `overview-toggle` | `wiri-overview-banner` | `overlay/overview_banner.rs::ensure_thread` (was eager at startup) | 0..1 | process |
+| first workspace change | `wiri-ws-indicator` | `overlay/workspace_indicator.rs::ensure_thread` | 0..1 | process |
+| `show-key-bindings` / `hotkey-overlay` | `wiri-hotkeys` | `overlay/bindings_cheatsheet.rs` | 0..1 | sheet |
+| `status-bar true` | `wiri-status-bar` | `overlay/status_bar.rs::spawn` | 0..1 | process |
+| first snap-guide show | `wiri-snap-guide` | `input/snap_guide.rs::spawn` | 0..1 | process |
+| first `overview-select`/thumbnail use | `wiri-overview-host` | `overlay/thumbnail_overview.rs` | 0..1 | overview |
+| first window close fade | `wiri-recent-preview`, `wiri-recent-debounce` | `overlay/recent_windows*.rs` | 0..2 | fade |
+| first screenshot | `wiri-screenshot-ui` | `overlay/screenshot_ui.rs` | 0..1 | capture |
+| `quit skip-confirmation=false` | `wiri-quit-confirmation` | `input/system_actions.rs` | 0..1 | dialog |
+| a power action | `wiri-power-action` | `input/system_actions.rs` | 0..1 | request |
+| any animation burst | *(the Tokio blocking threads above)* | `animation/clock.rs` occupies one with `DCompositionWaitForCompositorClock`; it is released when the last timeline ends | 0..1 | transient |
+
+The hooks (`WH_MOUSE_LL`, `WH_KEYBOARD_LL`, the WinEvent hooks) are on threads that pump
+messages, as Win32 requires, and none of them is shared with a thread that can block on a
+modal operation: the tray context menu is the only modal call in the process and it now runs on
+`wiri-ui`, so an open menu delays hotkey delivery, exactly as it would in any other Win32
+application that shows a menu on its own UI thread.
+
+### What changed
+
+1. **One session UI thread.** `wiri-ui` now hosts the tray icon as well as the hotkey window,
+   the keyboard hook and the overlay windows. `hooks/tray.rs::create_icon` is called on that
+   pump (posted to it with `WM_TRAY_HOST`, answered through a `SyncSender`, 5 s bound) instead
+   of starting a second Win32 message loop; when the pump is not running yet the old dedicated
+   `wiri-tray` thread is used, so the icon can never be lost. This is the thread the task called
+   "one UI thread for overlays/tray/hotkeys". One thread fewer at rest.
+2. **Lazy overview banner.** The overview banner used to create its window and pump thread at
+   startup although only `overview-toggle` ever shows it. `OverviewBanner::ensure_thread` starts
+   it on the first `show`/`hide` (posting one `WM_BANNER_UPDATE` at creation so a `show` that
+   raced the thread is not lost). No timer, no poll. One thread fewer at rest.
+3. **Shorter blocking-pool keep-alive.** `runtime::BLOCKING_KEEP_ALIVE` fell from 2 s to 250 ms,
+   so an IPC burst (one blocking task per request) no longer leaves pool threads behind for
+   seconds after the last reply. A request that finds no idle thread starts one, which costs a
+   fraction of a millisecond.
+4. **Every remaining thread is named**, including the previously unnamed hotkey pump and the
+   status bar / snap guide / overview banner pumps, so `p_rest_threads_by_*` can attribute them.
+
+Not changed, deliberately: the WinEvent hook, the low-level mouse hook and the hotkey pump stay
+on three separate threads. Merging any two of them would put a blocking native call (a hook
+callback that can wait on a hung window, or a modal tray menu) in front of the input path that
+the "Hotkey movement" budget measures; the budget itself says "preserve independent LL hook
+responsiveness".
+
+### Measurement method
+
+`scripts/perf/lane-perf-probe.ps1` is the measurement tool. For one run it:
+
+1. opens the machine-wide mutex `Global\wiri-live-test` and waits for it (up to 120 minutes),
+   so no other tenant is on the desktop;
+2. copies `resources/default_config.kdl` into a temporary directory under `.perfprobe/`, writes
+   no shared config, and starts **one** `wiri.exe` from the caller's build with
+   `-v --no-autostart`, a private `APPDATA`/`LOCALAPPDATA`/`WIRI_CONFIG` and its own
+   `WIRI_PIPE`;
+3. creates only its own ordinary WinForms windows (2 for the idle budget, ~28 for the realistic
+   case) — never more — waits for a `get_state` reply and then 5 s for the first location events
+   to settle;
+4. snapshots threads (count and one row per description), private bytes, working set, handles and
+   `GetGuiResources` GDI/USER counts, then runs one single 30 s sleep with no IPC, input or
+   sampling in between, from which `LaneE.Native.Idle` derives process CPU
+   (`GetProcessTimes` via the process snapshot), per-thread cumulative context-switch deltas and
+   the `GetLastInputInfo` change flag;
+5. sends a short sequence of ordinary actions over IPC (`focus-column-right`,
+   `set-column-width 600`, `fullscreen-window` twice, `move-column-left`), snapshots again and
+   repeats the 30 s idle observation;
+6. quits gracefully with an IPC `quit`, stops only its own child if that fails, closes only its
+   own windows and releases the mutex in a `finally` block.
+
+Each configuration is measured three times and the spread is reported, because other lanes build
+on the same laptop. Threads by description are read with `OpenThread` +
+`GetThreadDescription`, the same mechanism the new `p_rest_threads_by_*` keys use, so the probe
+and the official collector attribute threads identically.
+
+### Numbers
+
+Measured on TRIDARIS (Windows 11 22631, one 1366x768 display at 96 DPI, 8 logical CPUs) on
+2026-10-31 between 04:55 and 05:11 UTC with other lanes idle but the machine shared. Each
+configuration was run three times, alternating before/after; the same probe binary measured both.
+"Before" is `.perfprobe/base-src`, an unmodified copy of `810e896` built into its own target
+directory; "after" is `target/release/wiri.exe` from this lane. The probe's own 28 windows plus
+4 pre-existing third-party windows were managed (32) after the action sequence; the rest endpoints
+were taken with the probe's first 2 windows only. Medians with the observed range in brackets.
+
+| Observation | Before (`810e896`) | After (this lane) |
+| --- | ---: | ---: |
+| Threads, rest | **14** (3/3) | **12** (3/3) |
+| Threads, after actions | **17** (3/3) | **13** (3/3) |
+| Private bytes, rest | 8,282,112 B (7.90 MiB) [7,946,240..8,298,496] | 7,884,800 B (7.52 MiB) [7,757,824..8,011,776] |
+| Private bytes, after actions | 9,437,184 B (9.00 MiB) [9,109,504..9,932,800] | 9,998,336 B (9.53 MiB) [8,708,096..10,248,192] |
+| Working set, rest | 24,465,408 B (23.33 MiB) [24,428,544..24,481,792] | 24,309,760 B (23.18 MiB) [24,190,976..24,969,216] |
+| Working set, after actions | 29,646,848 B (28.27 MiB) [29,564,928..30,138,368] | 28,372,992 B (27.06 MiB) [27,504,640..28,766,208] |
+| Handles, rest | 214 (3/3) | 211 [209..217] |
+| Handles, after actions | 263 (3/3) | 228 [228..234] |
+| GDI objects, rest / after | 12 / 12 (3/3) | 12 / 12 (3/3) |
+| USER objects, rest / after | 32 / 37 (3/3) | 28 [27..28] / 28 (3/3) |
+| Idle CPU, 30 s, rest | 0 ms (3/3) | 0 ms [0..15.625] |
+| Idle CPU, 30 s, after actions | 0 ms (3/3) | 0 ms (3/3) |
+| Idle context switches, rest | 18.19/s [9.17..23.46] | 17.12/s [16.83..17.62] |
+| Idle context switches, after actions | 16.09/s [12.40..18.77] | 16.96/s [16.29..19.26] |
+
+What the table does and does not say:
+
+1. **Threads are the change, and it is exactly the two the lane removed**: 14 → 12 at rest
+   (the eager overview banner and the second tray pump), and 17 → 13 after the actions (the four
+   `spawn_blocking` threads the shortened keep-alive no longer leaves behind for two seconds after
+   the last reply). The real run's log confirms the tray was hosted on the pump:
+   `System tray icon added on the session UI thread`.
+2. **The ≤8 settled budget is not met.** Of the 12 threads at rest, seven are wiri's own (main,
+   two `wiri-rt` workers, `wiri-ui`, `wiri-winevent-hook`, `wiri-mouse-hook`,
+   `wiri-config-reload`). The other five could not be attributed per thread on this host:
+   `GetThreadDescription` returned `0x10000000` for every thread, including the ones wiri names
+   (`scripts/perf/thread-name-check.ps1` shows both calls failing on a thread the same process
+   just named). The candidates are the `notify` crate's directory-change backend, the lazily
+   started workspace-indicator overlay and threads the Win32/WinRT layers start; this record does
+   not claim which. The next step that would fit the budget is the one the budget table already
+   names, **shared watcher delivery**: replace `notify` with one `ReadDirectoryChangesW` wait on
+   the existing `wiri-config-reload` thread (no new thread, no poll), which removes the crate's
+   backend thread(s) and makes the reload thread's wait explicit. That change was not made here:
+   config reload is covered by the `h91_*` live gates and a half-tested native watcher is worse
+   than a measured gap.
+3. **Memory did not regress and did not improve measurably.** At rest the medians are 7.52 vs
+   7.90 MiB private and 23.18 vs 23.33 MiB working set — inside each other's spread on a machine
+   with other tenants. The after-actions endpoints differ in both directions between runs
+   (private 9.53 vs 9.00 MiB, working set 27.06 vs 28.27 MiB) with overlapping ranges, so this is
+   **not** evidence of a leak or a saving; `USER` objects fell from 32/37 to 28/28, which is the
+   one tray window and its menu no longer existing twice over. Both endpoints stay under the
+   ≤24 MiB working-set budget at rest and within ~0.5 MiB of the ≤8 MiB private one.
+4. **Idle CPU stays below the collector's 15.625 ms counter increment** in five of six rest
+   samples and in all six after-action samples; one lane rest sample showed one increment. Idle
+   context switches stayed in the same 16-19/s band on both builds — the diagnostic is dominated
+   by other tenants' activity on this shared desktop (the base build's own rest samples span
+   9.17..23.46/s) and cannot resolve a two-thread difference.
+5. **Keypress-to-move latency was not re-measured here.** This probe drives actions over IPC, not
+   keys, and the lane did not touch the hook threads, the dispatch path or the engine lock, so the
+   5.85 ms median / 7.54 ms maximum stands on the official collector, which the lead's cycle runs.
+
+
+

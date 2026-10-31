@@ -62,6 +62,9 @@ pub(super) fn frame_specs(
     tiles: &[(WindowId, Rect, DrawMode)],
 ) -> Vec<DecorSpec> {
     let fx = &inputs.cfg.effects;
+    // The band is already physical (the view is projected per output); the ring and shadow
+    // metrics are logical and are projected here with the same output scale.
+    let scale = inputs.cfg.output_scale();
     let band = inputs.cfg.border_inset();
     let mut out = Vec::new();
     if inputs.lone_tile && inputs.cfg.smart_borders {
@@ -84,14 +87,14 @@ pub(super) fn frame_specs(
         } else {
             None
         };
-        let ring_width = fx.focus_ring.width as i32;
+        let ring_width = crate::layout::metrics::ring_width_px(fx.focus_ring.width, scale);
         let ring = if !fx.focus_ring.off && ring_width > 0 && is_active_window {
             paint_for(&fx.focus_ring, urgent, inputs.focus_monitor, inputs.accent)
         } else {
             None
         };
         let shadow = if fx.shadow.on {
-            shadow_of(&fx.shadow, focused)
+            shadow_of(&fx.shadow, focused, scale)
         } else {
             None
         };
@@ -117,7 +120,9 @@ pub(super) fn frame_specs(
     out
 }
 
-fn shadow_of(style: &crate::config::ShadowStyle, active: bool) -> Option<ShadowSpec> {
+/// The shadow of a window on an output of `scale`: softness, spread and offsets are logical
+/// in the configuration and physical in the spec (niri layout/shadow.rs:43-61).
+fn shadow_of(style: &crate::config::ShadowStyle, active: bool, scale: f64) -> Option<ShadowSpec> {
     let text = if active {
         &style.color
     } else {
@@ -128,11 +133,18 @@ fn shadow_of(style: &crate::config::ShadowStyle, active: bool) -> Option<ShadowS
     if !active && style.inactive_color.is_none() {
         color = color.faded(0.75);
     }
+    let metrics = crate::layout::metrics::project_shadow(
+        style.softness,
+        style.spread,
+        style.offset_x,
+        style.offset_y,
+        scale,
+    );
     Some(ShadowSpec {
-        softness: style.softness as f32,
-        spread: style.spread as f32,
-        offset_x: style.offset_x as f32,
-        offset_y: style.offset_y as f32,
+        softness: metrics.softness_px as f32,
+        spread: metrics.spread_px as f32,
+        offset_x: metrics.offset_x_px as f32,
+        offset_y: metrics.offset_y_px as f32,
         color,
         draw_behind_window: style.draw_behind_window,
     })
@@ -178,6 +190,18 @@ fn tab_specs(
     if style.off {
         return Vec::new();
     }
+    // The tab indicator's width, gap, gaps-between and corner radius are logical config
+    // values, like the ring and the shadow: the spec holds the physical pixels of this
+    // output (niri layout/tab_indicator.rs:100-105,164 and 323-335 pass them through the
+    // output scale). `length` stays a proportion, which has no units to project. The width
+    // is rounded through the scale here and the other three keep their fraction: niri's
+    // one-pixel minimums for them are the ones `TabsSpec::tab_rects` already applies to a
+    // physical value, so 100% output stays bit-identical.
+    let scale = cfg.output_scale();
+    let tab_width = crate::layout::metrics::ring_width_px(style.width, scale);
+    let tab_gap = style.gap * scale;
+    let tab_gaps_between = style.gaps_between_tabs * scale;
+    let tab_corner_radius = (style.corner_radius * scale) as f32;
     workspace
         .columns
         .iter()
@@ -247,11 +271,11 @@ fn tab_specs(
                 TabsSpec {
                     area,
                     position: style.position,
-                    width: style.width.round() as i32,
-                    gap: style.gap,
-                    gaps_between: style.gaps_between_tabs,
+                    width: tab_width,
+                    gap: tab_gap,
+                    gaps_between: tab_gaps_between,
                     length: style.length,
-                    corner_radius: style.corner_radius as f32,
+                    corner_radius: tab_corner_radius,
                     tabs: paints,
                     windows: col.tiles.iter().map(|tile| tile.window_id).collect(),
                     view,
@@ -347,9 +371,12 @@ impl TilingEngine {
             ),
             lone_tile,
         };
-        // Floats keep their window size; their border is outside that rectangle.
+        // Floats keep their window size; their border is outside that rectangle. While the
+        // floating layer is hidden under a fullscreen tile there is nothing to decorate.
+        let floats_hidden = self.floats_hidden_by_fullscreen(output_id);
         for wid in &self.floating_windows {
-            if self.float_location(*wid) != Some((output_id, monitor.active_workspace))
+            if (floats_hidden && !self.sticky_windows.contains(wid))
+                || self.float_location(*wid) != Some((output_id, monitor.active_workspace))
                 || self.minimized.contains_key(wid)
             {
                 continue;
@@ -1024,6 +1051,7 @@ mod tests {
                 area,
                 &workspace.columns[0],
                 &cfg.effects.tab_indicator,
+                1.0,
                 1.0,
                 DrawMode::Inset,
             ),

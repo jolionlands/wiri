@@ -19,6 +19,7 @@ pub mod pointer;
 pub mod pointer_settings;
 pub mod recent;
 pub(crate) mod rule_scroll;
+pub(crate) mod scroll_emulation;
 pub mod snap_guide;
 pub mod system_actions;
 pub mod touch;
@@ -27,7 +28,9 @@ pub mod touchpen;
 
 pub use grab::{ColumnReorderGrab, MoveGrab, ResizeEdge, ResizeGrab, COLUMN_REORDER_HIT_ZONE_PX};
 pub use hotkey::{HotkeyBinding, HotkeyId};
-pub use layout_actions::{FocusAction, MonitorAction, MonitorTarget, WorkspaceAction};
+pub use layout_actions::{
+    FocusAction, GridAction, GridPan, MonitorAction, MonitorTarget, WorkspaceAction,
+};
 pub use low_level_hook::{
     begin_column_reorder_grab, begin_move_grab, begin_resize_grab, cancel_grab, current_grab,
     is_grab_active, last_press_was_repeat, start_keyboard_hook, start_mouse_hook,
@@ -171,8 +174,10 @@ pub enum Action {
     MoveColumnToFirst,
     /// niri `move-column-to-last`.
     MoveColumnToLast,
-    /// niri `move-column-to-index N`: the focused column goes to the 0-based index `N`
-    /// of its workspace (an index past the end puts it last).
+    /// niri `move-column-to-index N`: the focused column goes to the 1-based index `N` of
+    /// its workspace; `0` is the first place as well and an index past the end puts it last
+    /// (niri:src/layout/scrolling.rs:1702-1707, `index.saturating_sub(1).min(len - 1)`).
+    /// The variant keeps niri's argument; the engine subtracts the one.
     MoveColumnToIndex(u32),
     /// niri `swap-window-left`: the focused window changes places with the window of
     /// the column on its left (the moved window keeps the focus).
@@ -186,6 +191,12 @@ pub enum Action {
     MoveWindowDownOrToWorkspaceDown,
     /// niri `move-window-up-or-to-workspace-up`.
     MoveWindowUpOrToWorkspaceUp,
+    /// wiri extension (unified XY grid): a diagonal step — one workspace row up or
+    /// down and one column left or right, applied as one motion.
+    Grid(GridAction),
+    /// wiri extension (unified XY grid): a diagonal pan — the shared camera scrolls
+    /// one step along x and the desktop moves one row along y, as one motion.
+    GridPan(GridPan),
     /// niri `move-column-left-or-to-monitor-left`: left inside the strip, else the whole
     /// column to the monitor on the left.
     MoveColumnLeftOrToMonitorLeft,
@@ -360,8 +371,8 @@ impl std::str::FromStr for SizeChange {
 /// separates it from its neighbours: two halves and the gap between them fill the view
 /// exactly, three thirds and two gaps too (niri: `(view - gap) * p - gap`, with the
 /// outer gaps counted in the view).
-pub fn proportion_px(view_px: i32, gap_px: i32, proportion: f64) -> i32 {
-    (proportion * (view_px + gap_px) as f64 - gap_px as f64).round() as i32
+pub fn proportion_px(view_px: impl Into<f64>, gap_px: i32, proportion: f64) -> i32 {
+    (proportion * (view_px.into() + gap_px as f64) - gap_px as f64).round() as i32
 }
 
 impl SizeChange {
@@ -369,8 +380,15 @@ impl SizeChange {
     /// long with `gap_px` between its neighbours.  `extra_px` is how much larger it is
     /// than the window it holds (the borders around the window), which a fixed size
     /// does not include.
-    pub fn resolve(self, current_px: i32, view_px: i32, gap_px: i32, extra_px: i32) -> i32 {
-        let whole = (view_px + gap_px).max(1) as f64;
+    pub fn resolve(
+        self,
+        current_px: i32,
+        view_px: impl Into<f64>,
+        gap_px: i32,
+        extra_px: i32,
+    ) -> i32 {
+        let view_px = view_px.into();
+        let whole = (view_px + gap_px as f64).max(1.0);
         match self {
             SizeChange::SetFixed(px) => px.saturating_add(extra_px),
             SizeChange::AdjustFixed(delta) => current_px.saturating_add(delta),
@@ -389,10 +407,11 @@ impl SizeChange {
     }
 }
 
-/// niri's workspace reference: a number is the (1-based) index of a workspace on the
-/// monitor, a quoted string is the name of a workspace.
+/// A workspace identity, visible index on an output, or global name.
+/// Stable IDs are available through typed IPC; CLI/KDL words select index/name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkspaceRef {
+    Id(u64),
     Index(u32),
     Name(String),
 }
@@ -406,14 +425,70 @@ impl WorkspaceRef {
             return None;
         }
         if !quoted {
-            if let Ok(index) = word.parse::<u32>() {
+            // niri:niri-ipc/src/lib.rs:1791-1805 (`WorkspaceReferenceArg::from_str`, the CLI)
+            // and niri:niri-config/src/binds.rs:754-758 (an integer literal in a bind): an
+            // integer is an index that must fit a `u8`.  A larger or negative one is an
+            // error, not a workspace that happens to be called "-1".  Only text that is not
+            // an `i32` at all is a name.
+            if let Ok(number) = word.parse::<i32>() {
                 // niri counts from 1; 0 is the first workspace as well.
-                return Some(WorkspaceRef::Index(index.max(1)));
+                return u8::try_from(number)
+                    .ok()
+                    .map(|index| WorkspaceRef::Index(u32::from(index).max(1)));
             }
         }
         Some(WorkspaceRef::Name(word.to_string()))
     }
 }
+
+/// A niri `usize` argument (`focus-column`, `move-column-to-index`,
+/// `move-workspace-to-index`; niri:niri-config/src/binds.rs:175,198,248).  Any non-negative
+/// integer is valid; the engine's finite stacks make every value past `u32::MAX` the last
+/// place, exactly as the typed IPC conversion already clamps it.
+pub(crate) fn parse_usize_index(word: &str) -> Option<u32> {
+    word.parse::<usize>()
+        .ok()
+        .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
+}
+
+/// niri's unit actions: the names whose KDL grammar takes no argument and no property
+/// (a unit variant of niri:niri-config/src/binds.rs `Action`; knuffel rejects a surplus
+/// argument).  Their legacy aliases keep the old lenient arms.
+const UNIT_NIRI_ACTIONS: &[&str] = &[
+    "toggle-keyboard-shortcuts-inhibit",
+    "move-column-to-first",
+    "move-column-to-last",
+    "move-window-up",
+    "move-window-down",
+    "consume-or-expel-window-left",
+    "consume-or-expel-window-right",
+    "move-column-left",
+    "move-column-right",
+    "close-window",
+    "fullscreen-window",
+    "toggle-window-floating",
+    "move-window-to-floating",
+    "move-window-to-tiling",
+    "center-window",
+    "toggle-overview",
+    "open-overview",
+    "close-overview",
+    "toggle-column-tabbed-display",
+    "center-column",
+    "reset-window-height",
+    "switch-preset-column-width",
+    "switch-preset-column-width-back",
+    "switch-preset-window-width",
+    "switch-preset-window-width-back",
+    "switch-preset-window-height",
+    "switch-preset-window-height-back",
+    "consume-window-into-column",
+    "expel-window-from-column",
+    "expand-column-to-available-width",
+    "maximize-column",
+    "maximize-window-to-edges",
+    "show-hotkey-overlay",
+];
 
 /// Parse an action name string (from config/IPC) into an Action.
 /// Returns None for unknown action names.
@@ -498,6 +573,11 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
             }
         });
     }
+    // A unit action of niri's grammar takes nothing: `close-window "x"` is a config error
+    // there, not a `close-window` that ignores the word.
+    if UNIT_NIRI_ACTIONS.contains(&name) && !args.is_empty() {
+        return None;
+    }
     match name {
         "toggle-keyboard-shortcuts-inhibit" => Some(Action::ToggleKeyboardShortcutsInhibit),
         "focus-column-left" | "focus-left" => Some(Action::FocusColumnLeft),
@@ -509,7 +589,7 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         "move-column-to-first" => Some(Action::MoveColumnToFirst),
         "move-column-to-last" => Some(Action::MoveColumnToLast),
         "move-column-to-index" if args.len() == 1 => {
-            args[0].parse::<u32>().ok().map(Action::MoveColumnToIndex)
+            parse_usize_index(&args[0]).map(Action::MoveColumnToIndex)
         }
         "swap-window-left" if args.is_empty() => Some(Action::SwapWindowLeft),
         "swap-window-right" if args.is_empty() => Some(Action::SwapWindowRight),
@@ -560,6 +640,7 @@ pub fn parse_action_flagged(name: &str, args: &[String], quoted: &[bool]) -> Opt
         // niri: a number is the index of the workspace on the monitor, a quoted string
         // is the name of a workspace.
         "focus-workspace" => match WorkspaceRef::from_word(args.first()?, is_quoted(0))? {
+            WorkspaceRef::Id(_) => None,
             WorkspaceRef::Index(index) => Some(Action::FocusWorkspace(index as i32)),
             WorkspaceRef::Name(name) => Some(Action::FocusWorkspaceNamed(name)),
         },
@@ -912,7 +993,7 @@ pub fn apply_mouse_config(config: &InputConfig) {
         config.natural_scroll,
         config.tap_to_click,
     );
-    rule_scroll::configure(config.mouse_speed);
+    rule_scroll::configure(config);
     set_mouse_runtime_config(MouseRuntimeConfig {
         natural_scroll: config.natural_scroll,
         scroll_speed: config.mouse_speed as f32,

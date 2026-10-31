@@ -272,7 +272,11 @@ fn parse_action(value: &Value) -> Result<Change, String> {
         OutputAction::Off => Change::Off,
         OutputAction::Mode { mode } => {
             let text = match mode {
-                ModeValue::Text(text) if text.eq_ignore_ascii_case("auto") => return Ok(Change::PreferredMode),
+                ModeValue::Text(text)
+                    if text == "Automatic" || text.eq_ignore_ascii_case("auto") =>
+                {
+                    return Ok(Change::PreferredMode)
+                }
                 ModeValue::Text(text) => text,
                 ModeValue::Specific(spec) | ModeValue::Tagged(TaggedMode::Specific(spec)) => {
                     let mut text = format!("{}x{}", spec.width, spec.height);
@@ -290,7 +294,11 @@ fn parse_action(value: &Value) -> Result<Change, String> {
         }
         OutputAction::Scale { scale } => {
             let number = match scale {
-                ScaleValue::Text(text) if text.eq_ignore_ascii_case("auto") => return Ok(Change::Scale(None)),
+                ScaleValue::Text(text)
+                    if text == "Automatic" || text.eq_ignore_ascii_case("auto") =>
+                {
+                    return Ok(Change::Scale(None))
+                }
                 ScaleValue::Text(text) => text.parse::<f64>().map_err(|_| "scale must be a positive number or Auto")?,
                 ScaleValue::Number(number) | ScaleValue::Tagged(TaggedScale::Specific(number)) => number,
             };
@@ -508,6 +516,66 @@ mod tests {
             parse_action(&json!({"Position":{"position":{"Specific":{"x":-1920,"y":0}}}})).unwrap(),
             Change::Position(-1920, 0)
         );
+    }
+
+    #[test]
+    fn parity_canonical_action_output_mode_automatic_selects_preferred_mode() {
+        // niri-ipc ModeToSet::Automatic serializes as "Automatic", not "auto".
+        assert_eq!(
+            parse_action(&json!({"Mode":{"mode":"Automatic"}})).unwrap(),
+            Change::PreferredMode
+        );
+    }
+
+    #[test]
+    fn parity_canonical_action_output_scale_automatic_clears_layout_override() {
+        assert_eq!(
+            parse_action(&json!({"Scale":{"scale":"Automatic"}})).unwrap(),
+            Change::Scale(None)
+        );
+    }
+
+    #[test]
+    fn parity_canonical_action_output_automatic_keeps_legacy_and_specific_controls() {
+        for alias in ["auto", "Auto", "AUTO"] {
+            assert_eq!(
+                parse_action(&json!({"Mode":{"mode":alias}})).unwrap(),
+                Change::PreferredMode
+            );
+            assert_eq!(
+                parse_action(&json!({"Scale":{"scale":alias}})).unwrap(),
+                Change::Scale(None)
+            );
+        }
+        assert_eq!(
+            parse_action(&json!({"Mode":{"mode":{"Specific":{
+                "width":1920,"height":1080,"refresh":60.0
+            }}}}))
+            .unwrap(),
+            Change::Mode("1920x1080@60".into())
+        );
+        assert_eq!(
+            parse_action(&json!({"Scale":{"scale":{"Specific":1.5}}})).unwrap(),
+            Change::Scale(Some(1.5))
+        );
+    }
+
+    #[test]
+    fn parity_canonical_action_output_rejects_malformed_automatic_and_specific_shapes() {
+        for value in [
+            json!({"Mode":{}}),
+            json!({"Scale":{}}),
+            json!({"Mode":{"mode":null}}),
+            json!({"Scale":{"scale":null}}),
+            json!({"Mode":{"mode":{"Automatic":1}}}),
+            json!({"Scale":{"scale":{"Automatic":1}}}),
+            json!({"Mode":{"mode":{"Specific":{"width":"1920","height":1080}}}}),
+            json!({"Scale":{"scale":{"Specific":"1.5"}}}),
+            json!({"Mode":{"mode":{"Specific":{"width":1920}}}}),
+            json!({"Scale":{"scale":{"Specific":0}}}),
+        ] {
+            assert!(parse_action(&value).is_err(), "{value}");
+        }
     }
 
     #[test]

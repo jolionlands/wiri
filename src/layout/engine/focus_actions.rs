@@ -253,12 +253,16 @@ impl TilingEngine {
 
     /// Focus a managed window across workspaces/outputs. This is also the MRU path: never
     /// activate a hidden tile without first selecting its workspace.
-    pub(super) fn focus_action_window(
+    pub(crate) fn focus_action_window(
         &mut self,
         window: WindowId,
         backend: &BackendHandle,
     ) -> bool {
         if self.floating_windows.contains(&window) {
+            if self.float_location(window).is_some() {
+                // Explicit selection supersedes the opening-only focus guard.
+                self.unfocused_opens.remove(&window);
+            }
             self.focus_layer = Some(FocusLayer::Floating);
             return self.focus_float(window, backend);
         }
@@ -269,6 +273,8 @@ impl TilingEngine {
         let Some((output, workspace, column)) = self.locate_window(window) else {
             return false;
         };
+        // Wait until restoration and lookup succeed before cancelling admission intent.
+        self.unfocused_opens.remove(&window);
         self.monitors.set_focused(output);
         if self.monitors.get(&output).map(|m| m.active_workspace) != Some(workspace) {
             self.switch_workspace(workspace, backend);

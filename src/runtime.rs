@@ -22,8 +22,10 @@ pub const WORKER_THREADS: usize = 2;
 pub const MAX_BLOCKING_THREADS: usize = 4;
 
 /// An idle blocking-pool thread exits after this long, so that the thread count falls back to
-/// its settled baseline soon after an IPC burst (tokio's default is ten seconds).
-pub const BLOCKING_KEEP_ALIVE: Duration = Duration::from_secs(2);
+/// its settled baseline almost immediately after an IPC burst (tokio's default is ten
+/// seconds, and the pool never retires a thread that is merely idle otherwise).  A request
+/// that finds no idle thread starts one, which costs far less than a millisecond.
+pub const BLOCKING_KEEP_ALIVE: Duration = Duration::from_millis(250);
 
 /// Build the runtime the daemon runs on.
 pub fn build() -> std::io::Result<tokio::runtime::Runtime> {

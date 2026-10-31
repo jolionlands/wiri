@@ -10,6 +10,18 @@
 //! end the wrong visit. It also cannot infer a transition not yet delivered by
 //! Windows: an action needing that history must resume on an observation rather
 //! than inventing elapsed dwell or waiting on a retry clock.
+//!
+//! One live-focus path exists besides `apply_current`: `converge_live_focus`
+//! (foreground_runtime.rs). Windows does not always raise a notice for a request wiri
+//! made (it raised none for an accepted `SetForegroundWindow`, and none for a request
+//! for the window that already is foreground), and nothing would ever end the wait. After
+//! wiri's own activation request returned success, and only then, a fresh
+//! `GetForegroundWindow` query under the engine lock may mirror a result that names the
+//! requested window into live engine/IPC focus. That is a native observation, not a
+//! synthetic one: the native API itself named the window; no stamp, dwell or transition
+//! is fabricated, and a refused or not-yet-carried-out request mirrors nothing. It never
+//! calls into this reducer, so this timeline still has entries only from the hook FIFO and
+//! a late real notice ends the previous visit at its own native time.
 
 use crate::backend::ForegroundStamp;
 use crate::utils::WindowId;

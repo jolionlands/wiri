@@ -8,6 +8,8 @@ pub struct AnimationsConfig {
     pub enabled: bool,
     pub duration: u32,
     pub easing: String,
+    /// Decoded controls cannot be represented by the legacy curve name alone.
+    pub typed_curve: Option<Easing>,
     pub focus_transition: bool,
     pub workspace_transition: bool,
     pub window_move: bool,
@@ -42,6 +44,7 @@ impl AnimationsConfig {
             enabled: false,
             duration: 200,
             easing: "cubic-bezier".into(),
+            typed_curve: None,
             focus_transition: true,
             workspace_transition: true,
             window_move: true,
@@ -68,7 +71,9 @@ impl AnimationsConfig {
             if self.legacy_easing {
                 AnimationKind::Easing {
                     duration_ms: self.duration,
-                    curve: Easing::parse(&self.easing).unwrap_or_default(),
+                    curve: self
+                        .typed_curve
+                        .unwrap_or_else(|| Easing::parse(&self.easing).unwrap_or_default()),
                 }
             } else {
                 AnimationKind::Spring(Spring::default())

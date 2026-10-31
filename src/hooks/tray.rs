@@ -76,6 +76,146 @@ pub struct TrayIcon {
     hwnd_raw: Arc<Mutex<Option<isize>>>,
 }
 
+/// Posted to the session UI thread: "create the tray icon on this pump".
+pub const WM_TRAY_HOST: u32 = WM_USER + 120;
+
+/// A pending request for the session UI thread to add the tray icon.
+struct HostRequest {
+    action_tx: mpsc::Sender<TrayAction>,
+    hwnd_raw: Arc<Mutex<Option<isize>>>,
+    ready: std::sync::mpsc::SyncSender<Result<()>>,
+}
+
+/// At most one request is in flight; `setup` installs it before posting the message.
+static HOST_REQUEST: Mutex<Option<HostRequest>> = Mutex::new(None);
+
+/// The tray window, so the icon is removed by the pump that added it.
+static TRAY_HWND: Mutex<Option<isize>> = Mutex::new(None);
+
+/// Register the tray window class, create the message-only window and add the icon on the
+/// calling thread, which must pump messages.  Returns once the icon is registered.
+unsafe fn create_icon(
+    action_tx: &mpsc::Sender<TrayAction>,
+    hwnd_raw: &Arc<Mutex<Option<isize>>>,
+) -> Result<()> {
+    let hinstance = GetModuleHandleW(None).context("GetModuleHandleW failed")?;
+
+    // Register window class
+    let class_name: Vec<u16> = "WiriTrayWnd\0".encode_utf16().collect();
+    let wnd_class = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(TrayIcon::tray_window_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance.into(),
+        hIcon: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
+        hCursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR::default(),
+        hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
+        lpszMenuName: PCWSTR::null(),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+    };
+    RegisterClassW(&wnd_class);
+
+    // Create message-only window
+    let window_name: Vec<u16> = "WiriTrayWindow\0".encode_utf16().collect();
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(window_name.as_ptr()),
+        WINDOW_STYLE(0),
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        hinstance,
+        None,
+    );
+    let hwnd = match hwnd {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("Failed to create tray window: {:?}", e);
+            return Err(anyhow::anyhow!("CreateWindowExW failed: {:?}", e));
+        }
+    };
+
+    // Publish the HWND so that destroy()/show_balloon() can reach it
+    *hwnd_raw.lock() = Some(hwnd.0 as isize);
+    *TRAY_HWND.lock() = Some(hwnd.0 as isize);
+
+    // Store action_tx in window user data for callback access
+    let tx_ptr = Box::into_raw(Box::new(action_tx.clone()));
+    windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+        tx_ptr as isize,
+    );
+
+    // Add tray icon
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    let tip: Vec<u16> = "wiri - Tiling WM\0".encode_utf16().collect();
+    nid.szTip[..tip.len().min(128)].copy_from_slice(&tip[..tip.len().min(128)]);
+
+    // Use a default system icon
+    nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(
+        None,
+        windows::Win32::UI::WindowsAndMessaging::IDI_APPLICATION,
+    )
+    .ok()
+    .unwrap_or_default();
+    if nid.hIcon.is_invalid() {
+        nid.hIcon = windows::Win32::UI::WindowsAndMessaging::HICON::default();
+    }
+
+    if !Shell_NotifyIconW(NIM_ADD, &nid as *const _ as *const _).as_bool() {
+        warn!("Shell_NotifyIconW NIM_ADD failed");
+    }
+    info!("System tray icon added");
+    Ok(())
+}
+
+/// Remove the icon from the thread that added it (a tray icon whose window is destroyed
+/// without `NIM_DELETE` stays in the notification area until it is hovered).
+fn remove_icon() {
+    let raw = TRAY_HWND.lock().take();
+    let Some(raw) = raw else {
+        return;
+    };
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = HWND(raw as *mut std::ffi::c_void);
+        nid.uID = 1;
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid as *const _ as *const _);
+    }
+}
+
+/// Answer the "host the tray icon here" request.  Called by the session UI thread's pump.
+/// Returns false for every other message, so the pump can offer it to the next owner.
+pub fn handle_message(message: u32) -> bool {
+    if message != WM_TRAY_HOST {
+        return false;
+    }
+    let Some(request) = HOST_REQUEST.lock().take() else {
+        return true;
+    };
+    // SAFETY: the caller is a message pump; the window class and window are created on it.
+    let result = unsafe { create_icon(&request.action_tx, &request.hwnd_raw) };
+    let _ = request.ready.send(result);
+    true
+}
+
+/// Remove the tray icon when the session UI thread stops.
+pub fn shutdown() {
+    remove_icon();
+}
+
 impl TrayIcon {
     pub fn new() -> Self {
         let (action_tx, action_rx) = mpsc::channel();
@@ -87,15 +227,38 @@ impl TrayIcon {
         }
     }
 
-    /// Setup the tray icon (starts the message loop thread)
+    /// Create the tray icon on the session UI thread — the pump that already owns the hotkey
+    /// window, the input hooks and the overlay windows — and fall back to a pump of its own
+    /// when that thread is not running.  Windows only asks that whoever adds the icon pumps
+    /// messages, so one thread is enough for the whole session UI.
     pub fn setup(&mut self) -> Result<()> {
         let action_tx = self.action_tx.clone();
         let hwnd_raw = self.hwnd_raw.clone();
-        let handle = std::thread::spawn(move || {
-            if let Err(e) = Self::run_tray_loop(action_tx, hwnd_raw) {
-                warn!("Tray icon error: {}", e);
-            }
+        // Install the request before posting it: the UI thread may answer immediately.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        *HOST_REQUEST.lock() = Some(HostRequest {
+            action_tx: action_tx.clone(),
+            hwnd_raw: hwnd_raw.clone(),
+            ready: ready_tx,
         });
+        if crate::backend::message_loop::MessageLoop::post_to_ui_thread(WM_TRAY_HOST) {
+            match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Ok(())) => {
+                    info!("System tray icon added on the session UI thread");
+                    return Ok(());
+                }
+                Ok(Err(e)) => warn!("System tray icon was refused: {}", e),
+                Err(e) => warn!("System tray icon setup did not answer: {}", e),
+            }
+            *HOST_REQUEST.lock() = None;
+        }
+        let handle = std::thread::Builder::new()
+            .name("wiri-tray".to_string())
+            .spawn(move || {
+                if let Err(e) = Self::run_tray_loop(action_tx, hwnd_raw) {
+                    warn!("Tray icon error: {}", e);
+                }
+            })?;
         self.thread_handle = Some(handle);
         info!("System tray icon initialized");
         Ok(())
@@ -106,84 +269,7 @@ impl TrayIcon {
         hwnd_raw: Arc<Mutex<Option<isize>>>,
     ) -> Result<()> {
         unsafe {
-            let hinstance = GetModuleHandleW(None).context("GetModuleHandleW failed")?;
-
-            // Register window class
-            let class_name: Vec<u16> = "WiriTrayWnd\0".encode_utf16().collect();
-            let wnd_class = WNDCLASSW {
-                style: CS_HREDRAW | CS_VREDRAW,
-                lpfnWndProc: Some(Self::tray_window_proc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: hinstance.into(),
-                hIcon: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
-                hCursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR::default(),
-                hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
-                lpszMenuName: PCWSTR::null(),
-                lpszClassName: PCWSTR(class_name.as_ptr()),
-            };
-            RegisterClassW(&wnd_class);
-
-            // Create message-only window
-            let window_name: Vec<u16> = "WiriTrayWindow\0".encode_utf16().collect();
-            let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                PCWSTR(class_name.as_ptr()),
-                PCWSTR(window_name.as_ptr()),
-                WINDOW_STYLE(0),
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                hinstance,
-                None,
-            );
-            let hwnd = match hwnd {
-                Ok(w) => w,
-                Err(e) => {
-                    warn!("Failed to create tray window: {:?}", e);
-                    return Err(anyhow::anyhow!("CreateWindowExW failed: {:?}", e));
-                }
-            };
-
-            // Publish the HWND so that destroy()/show_balloon() can reach it
-            *hwnd_raw.lock() = Some(hwnd.0 as isize);
-
-            // Store action_tx in window user data for callback access
-            let tx_ptr = Box::into_raw(Box::new(action_tx));
-            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                hwnd,
-                windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
-                tx_ptr as isize,
-            );
-
-            // Add tray icon
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = 1;
-            nid.uFlags = NIF_MESSAGE | NIF_TIP;
-            nid.uCallbackMessage = WM_TRAYICON;
-            let tip: Vec<u16> = "wiri - Tiling WM\0".encode_utf16().collect();
-            nid.szTip[..tip.len().min(128)].copy_from_slice(&tip[..tip.len().min(128)]);
-
-            // Use a default system icon
-            nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(
-                None,
-                windows::Win32::UI::WindowsAndMessaging::IDI_APPLICATION,
-            )
-            .ok()
-            .unwrap_or_default();
-            if nid.hIcon.is_invalid() {
-                nid.hIcon = windows::Win32::UI::WindowsAndMessaging::HICON::default();
-            }
-
-            if !Shell_NotifyIconW(NIM_ADD, &nid as *const _ as *const _).as_bool() {
-                warn!("Shell_NotifyIconW NIM_ADD failed");
-            }
-            info!("System tray icon added");
+            create_icon(&action_tx, &hwnd_raw)?;
 
             // Message loop
             let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
@@ -191,10 +277,8 @@ impl TrayIcon {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-
-            // Remove tray icon before exiting
-            let _ = Shell_NotifyIconW(NIM_DELETE, &nid as *const _ as *const _);
         }
+        remove_icon();
         Ok(())
     }
 

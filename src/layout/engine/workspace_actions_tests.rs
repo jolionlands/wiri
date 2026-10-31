@@ -114,6 +114,405 @@ fn two_output_fixture() -> (TilingEngine, BackendHandle, OutputId, OutputId) {
     (engine, BackendHandle::default_for_test(), left, right)
 }
 
+fn scaled_height_fixture() -> (TilingEngine, BackendHandle, OutputId, OutputId) {
+    let mut engine = TilingEngine::new(LayoutConfig {
+        outer_gaps: (0, 0, 0, 0),
+        column_gap: 0,
+        window_gap: 0,
+        border_width: 0,
+        reserve_top: 0,
+        reserve_bottom: 0,
+        reserve_left: 0,
+        reserve_right: 0,
+        ..LayoutConfig::default()
+    });
+    let left = install_monitor(
+        &mut engine,
+        "height-scale-global",
+        0,
+        vec![(40, workspace("global", &[&[100]]))],
+        40,
+        100,
+    );
+    let right = install_monitor(
+        &mut engine,
+        "height-scale-target",
+        1200,
+        vec![
+            (40, workspace("remote-active", &[&[210]])),
+            (7, workspace("remote-inactive", &[&[200, 201]])),
+        ],
+        40,
+        210,
+    );
+    let monitor = engine.monitors.get_mut(&right).unwrap();
+    monitor.bounds = Rect::new(1200, 0, 1200, 900);
+    monitor.work_area = monitor.bounds;
+    monitor.scale_factor = 1.5;
+    engine.monitors.set_focused(left);
+    engine.record_ipc_foreground(WindowId::new(100));
+    (engine, BackendHandle::default_for_test(), left, right)
+}
+
+fn scaled_height_tile_rect(engine: &TilingEngine, output: OutputId, window: isize) -> Rect {
+    let cfg = engine.effective_config_for_workspace(output, 7);
+    assert_eq!(cfg.border_inset(), 0, "tile and window sizes must coincide");
+    sizing_tile_rect(engine, output, window)
+}
+
+fn sizing_tile_rect(engine: &TilingEngine, output: OutputId, window: isize) -> Rect {
+    let monitor = engine.monitors.get(&output).unwrap();
+    let cfg = engine.effective_config_for_workspace(output, 7);
+    engine
+        .calculate_positions(
+            &monitor.workspaces[&7],
+            TilingEngine::tiling_work_rect(monitor, cfg),
+            cfg,
+        )
+        .into_iter()
+        .find(|(id, _)| *id == WindowId::new(window))
+        .unwrap()
+        .1
+}
+
+#[test]
+fn fixed_width_extremes_saturate_before_adding_tile_borders() {
+    for (logical, expected) in [(i32::MAX, 100_000), (i32::MIN, 50), (160, 248)] {
+        let mut col = column(&[200]);
+
+        col.set_fixed_logical(logical as f64, 1.5, 8);
+
+        assert_eq!(col.resolved_width(400), expected, "logical={logical}");
+    }
+}
+
+#[test]
+fn fixed_width_refresh_extremes_saturate_before_adding_tile_borders() {
+    for (logical, expected) in [(i32::MAX, 100_000), (i32::MIN, 50), (160, 248)] {
+        let (mut engine, _, left, right) = scaled_height_fixture();
+        engine.config.border_width = 4;
+        engine
+            .monitors
+            .get_mut(&right)
+            .unwrap()
+            .workspaces
+            .get_mut(&7)
+            .unwrap()
+            .columns[0]
+            .width_fixed_logical = Some(logical as f64);
+        let before = (cursor(&engine, left), cursor(&engine, right));
+
+        engine.refresh_strip_widths(right);
+
+        assert_eq!(sizing_tile_rect(&engine, right, 200).size.w, expected);
+        assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+    }
+}
+
+fn rule_border_sizing_fixture(
+    off: Option<bool>,
+    width: Option<u32>,
+) -> (TilingEngine, BackendHandle, OutputId, OutputId) {
+    let (mut engine, backend, left, right) = scaled_height_fixture();
+    engine.config.border_width = 4;
+    engine
+        .tiled_windows
+        .insert(WindowId::new(202), window_info(202));
+    let ws = engine
+        .monitors
+        .get_mut(&right)
+        .unwrap()
+        .workspaces
+        .get_mut(&7)
+        .unwrap();
+    ws.columns[0].set_width(Some(400));
+    let mut sibling = column(&[202]);
+    sibling.set_width(Some(400));
+    ws.columns.insert(0, sibling);
+    let mut resolved = crate::window::ResolvedWindowRules::default();
+    resolved.effects.border.off = off;
+    resolved.effects.border.width = width.map(f64::from);
+    engine.rule_state.insert(
+        WindowId::new(201),
+        rules::RuleState {
+            process_name: None,
+            aumid: None,
+            resolved,
+        },
+    );
+    (engine, backend, left, right)
+}
+
+#[test]
+fn explicit_fixed_width_uses_the_target_windows_rule_border_at_high_dpi() {
+    for (off, width, expected_tile_width) in [
+        (Some(true), None, 240),
+        (None, Some(12), 264),
+        (None, None, 248),
+    ] {
+        let (mut engine, backend, left, right) = rule_border_sizing_fixture(off, width);
+        let before = engine.ipc_snapshot();
+        let cursors = (cursor(&engine, left), cursor(&engine, right));
+
+        // 201 is not the column's selected tile (200), and its border differs.
+        engine.set_window_width_for(WindowId::new(201), SizeChange::SetFixed(160), &backend);
+
+        assert_eq!(
+            sizing_tile_rect(&engine, right, 201).size.w,
+            expected_tile_width
+        );
+        let after = engine.ipc_snapshot();
+        assert_eq!(
+            after
+                .windows
+                .iter()
+                .find(|w| w.id == 201)
+                .unwrap()
+                .layout
+                .window_size
+                .0,
+            160
+        );
+        for id in [100, 202, 210] {
+            assert_eq!(
+                after.windows.iter().find(|w| w.id == id).unwrap().layout,
+                before.windows.iter().find(|w| w.id == id).unwrap().layout,
+                "unrelated window {id}"
+            );
+        }
+        assert_eq!((cursor(&engine, left), cursor(&engine, right)), cursors);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(after.focused_window(), Some(100));
+    }
+}
+
+#[test]
+fn fixed_width_target_survives_split_and_restore_without_affecting_its_old_column() {
+    for expel in [false, true] {
+        let (mut engine, backend, left, right) = rule_border_sizing_fixture(Some(true), None);
+        let target = WindowId::new(201);
+        engine.set_window_width_for(target, SizeChange::SetFixed(160), &backend);
+        let cursors = (cursor(&engine, left), cursor(&engine, right));
+
+        let ws = engine
+            .monitors
+            .get_mut(&right)
+            .unwrap()
+            .workspaces
+            .get_mut(&7)
+            .unwrap();
+        if expel {
+            assert!(ws.consume_or_expel_left(target).is_some());
+        } else {
+            assert!(ws.move_window(target, ws.columns.len(), 0));
+        }
+        engine.refresh_strip_widths(right);
+
+        assert_eq!(sizing_tile_rect(&engine, right, 201).size.w, 240);
+        assert_eq!(sizing_tile_rect(&engine, right, 200).size.w, 248);
+        let ws = engine
+            .monitors
+            .get_mut(&right)
+            .unwrap()
+            .workspaces
+            .get_mut(&7)
+            .unwrap();
+        let original = ws.find_window_column(WindowId::new(200)).unwrap();
+        assert_eq!(ws.columns[original].width_fixed_window, None);
+        let slot = ws.slot_of(target).unwrap();
+        ws.remove_window(target).unwrap();
+        ws.put_back(slot);
+        engine.refresh_strip_widths(right);
+
+        assert_eq!(sizing_tile_rect(&engine, right, 201).size.w, 240);
+        assert_eq!(sizing_tile_rect(&engine, right, 200).size.w, 248);
+        assert_eq!((cursor(&engine, left), cursor(&engine, right)), cursors);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+    }
+}
+
+#[test]
+fn explicit_fixed_height_uses_the_target_windows_rule_border_at_high_dpi() {
+    for (off, width, expected_tile_height) in [
+        (Some(true), None, 240),
+        (None, Some(12), 264),
+        (None, None, 248),
+    ] {
+        let (mut engine, backend, left, right) = rule_border_sizing_fixture(off, width);
+        let before = engine.ipc_snapshot();
+        let cursors = (cursor(&engine, left), cursor(&engine, right));
+
+        engine.set_window_height_for(WindowId::new(201), SizeChange::SetFixed(160), &backend);
+
+        assert_eq!(
+            sizing_tile_rect(&engine, right, 201).size.h,
+            expected_tile_height
+        );
+        let after = engine.ipc_snapshot();
+        assert_eq!(
+            after
+                .windows
+                .iter()
+                .find(|w| w.id == 201)
+                .unwrap()
+                .layout
+                .window_size
+                .1,
+            160
+        );
+        for id in [100, 202, 210] {
+            assert_eq!(
+                after.windows.iter().find(|w| w.id == id).unwrap().layout,
+                before.windows.iter().find(|w| w.id == id).unwrap().layout,
+                "unrelated window {id}"
+            );
+        }
+        assert_eq!((cursor(&engine, left), cursor(&engine, right)), cursors);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(after.focused_window(), Some(100));
+    }
+}
+
+#[test]
+fn fixed_column_width_control_scales_logical_pixels() {
+    let (mut engine, backend, _, right) = scaled_height_fixture();
+    engine.monitors.set_focused(right);
+    let monitor = engine.monitors.get_mut(&right).unwrap();
+    monitor.switch_workspace(7);
+    monitor.set_focus(WindowId::new(200));
+
+    engine.set_column_width_by(SizeChange::SetFixed(160), &backend);
+
+    assert_eq!(scaled_height_tile_rect(&engine, right, 200).size.w, 240);
+}
+
+#[test]
+fn floating_window_width_scales_fixed_changes_on_the_target_output() {
+    for (change, width) in [
+        (SizeChange::SetFixed(160), 240),
+        (SizeChange::AdjustFixed(20), 430),
+    ] {
+        let (mut engine, backend, left, right) = scaled_height_fixture();
+        let window = WindowId::new(300);
+        engine.tiled_windows.insert(window, window_info(300));
+        engine.register_float(window, right, 7, Rect::new(1400, 50, 400, 450));
+        let before = (cursor(&engine, left), cursor(&engine, right));
+
+        engine.float_apply_size_change(window, SizeAxis::Width, change, &backend);
+
+        assert_eq!(
+            engine.float_homes[&window].rect,
+            Rect::new(1400, 50, width, 450)
+        );
+        assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+    }
+}
+
+#[test]
+fn proportional_window_heights_use_the_physical_view_once_at_high_dpi() {
+    for floating in [false, true] {
+        for (change, height) in [
+            (SizeChange::SetProportion(50_000), 450),
+            (SizeChange::AdjustProportion(10_000), 540),
+        ] {
+            let (mut engine, backend, left, right) = scaled_height_fixture();
+            let target = if floating {
+                let window = WindowId::new(300);
+                engine.tiled_windows.insert(window, window_info(300));
+                engine.register_float(window, right, 7, Rect::new(1400, 50, 400, 450));
+                window
+            } else {
+                WindowId::new(200)
+            };
+            let before = (cursor(&engine, left), cursor(&engine, right));
+
+            engine.set_window_height_for(target, change, &backend);
+
+            let actual = if floating {
+                engine.float_homes[&target].rect.size.h
+            } else {
+                scaled_height_tile_rect(&engine, right, 200).size.h
+            };
+            assert_eq!(actual, height, "floating={floating}, change={change:?}");
+            assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+            assert_eq!(engine.monitors.focused_id(), Some(left));
+            assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+        }
+    }
+}
+
+#[test]
+fn fixed_tiled_window_height_scales_logical_pixels_on_inactive_output_target() {
+    let (mut engine, backend, left, right) = scaled_height_fixture();
+    let before = (cursor(&engine, left), cursor(&engine, right));
+
+    engine.set_window_height_for(WindowId::new(200), SizeChange::SetFixed(160), &backend);
+
+    assert_eq!(scaled_height_tile_rect(&engine, right, 200).size.h, 240);
+    assert_eq!(scaled_height_tile_rect(&engine, right, 201).size.h, 660);
+    assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+    assert_eq!(engine.monitors.focused_id(), Some(left));
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+}
+
+#[test]
+fn adjusted_tiled_window_height_scales_logical_delta_on_inactive_output_target() {
+    let (mut engine, backend, left, right) = scaled_height_fixture();
+    let before = (cursor(&engine, left), cursor(&engine, right));
+    assert_eq!(scaled_height_tile_rect(&engine, right, 200).size.h, 450);
+
+    engine.set_window_height_for(WindowId::new(200), SizeChange::AdjustFixed(20), &backend);
+
+    assert_eq!(scaled_height_tile_rect(&engine, right, 200).size.h, 480);
+    assert_eq!(scaled_height_tile_rect(&engine, right, 201).size.h, 420);
+    assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+    assert_eq!(engine.monitors.focused_id(), Some(left));
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+}
+
+#[test]
+fn fixed_floating_window_height_scales_logical_pixels_on_inactive_output_target() {
+    let (mut engine, backend, left, right) = scaled_height_fixture();
+    let window = WindowId::new(300);
+    engine.tiled_windows.insert(window, window_info(300));
+    engine.register_float(window, right, 7, Rect::new(1400, 50, 400, 450));
+    let before = (cursor(&engine, left), cursor(&engine, right));
+
+    engine.set_window_height_for(window, SizeChange::SetFixed(160), &backend);
+
+    assert_eq!(
+        engine.float_homes[&window].rect,
+        Rect::new(1400, 50, 400, 240)
+    );
+    assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+    assert_eq!(engine.monitors.focused_id(), Some(left));
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+}
+
+#[test]
+fn adjusted_floating_window_height_scales_logical_delta_on_inactive_output_target() {
+    let (mut engine, backend, left, right) = scaled_height_fixture();
+    let window = WindowId::new(300);
+    engine.tiled_windows.insert(window, window_info(300));
+    engine.register_float(window, right, 7, Rect::new(1400, 50, 400, 450));
+    let before = (cursor(&engine, left), cursor(&engine, right));
+
+    engine.set_window_height_for(window, SizeChange::AdjustFixed(20), &backend);
+
+    assert_eq!(
+        engine.float_homes[&window].rect,
+        Rect::new(1400, 50, 400, 480)
+    );
+    assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+    assert_eq!(engine.monitors.focused_id(), Some(left));
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+}
+
 fn cursor(engine: &TilingEngine, output: OutputId) -> (i32, Option<usize>, Option<WindowId>) {
     let monitor = engine.monitors.get(&output).unwrap();
     (
@@ -121,6 +520,491 @@ fn cursor(engine: &TilingEngine, output: OutputId) -> (i32, Option<usize>, Optio
         monitor.focus_column,
         monitor.focus_window,
     )
+}
+
+fn transfer_view_fixture(stacked_source: bool) -> (TilingEngine, BackendHandle, OutputId) {
+    // Pinned niri keeps view_offset relative to its selected column. Removing a
+    // column to its left therefore preserves that column's visible position.
+    // Wiri stores absolute strip scroll instead: 1182 must lose the removed span.
+    let mut engine = TilingEngine::new(LayoutConfig {
+        column_width: 500,
+        column_gap: 8,
+        window_gap: 8,
+        outer_gaps: (8, 8, 8, 8),
+        center_focused_column: CenterFocusedColumn::Never,
+        ..LayoutConfig::default()
+    });
+    engine.update_animation_settings(false, 0, crate::layout::Easing::None);
+    let moving: &[isize] = if stacked_source { &[100, 101] } else { &[100] };
+    let output = install_monitor(
+        &mut engine,
+        "transfer-view-source",
+        0,
+        vec![
+            (
+                40,
+                workspace(
+                    "view-source",
+                    &[&[90], &[91], moving, &[200], &[300], &[400]],
+                ),
+            ),
+            (7, workspace("view-destination", &[&[500]])),
+            (25, workspace("view-foreground", &[&[600]])),
+        ],
+        40,
+        300,
+    );
+    let monitor = engine.monitors.get_mut(&output).unwrap();
+    monitor.bounds = Rect::new(0, 0, 1366, 768);
+    monitor.work_area = monitor.bounds;
+    monitor.workspaces.get_mut(&40).unwrap().scroll_offset.x = 1182;
+    engine.record_ipc_foreground(WindowId::new(300));
+    (engine, BackendHandle::default_for_test(), output)
+}
+
+/// The native visible rectangle requested by the ordinary layout path, before
+/// parking/animation. Synthetic HWNDs cannot prove a successful native apply;
+/// assert this calculated allocation independently of the applied-state cache.
+fn transfer_view_native_rect(
+    engine: &TilingEngine,
+    output: OutputId,
+    workspace: i32,
+    window: WindowId,
+) -> Rect {
+    let monitor = engine.monitors.get(&output).unwrap();
+    let cfg = engine.effective_config_for_workspace(output, workspace);
+    let tile = engine
+        .calculate_positions(
+            &monitor.workspaces[&workspace],
+            TilingEngine::tiling_work_rect(monitor, cfg),
+            cfg,
+        )
+        .into_iter()
+        .find(|(id, _)| *id == window)
+        .unwrap()
+        .1;
+    let inset = engine.rule_border_inset(window, cfg);
+    Rect::new(
+        tile.loc.x + inset,
+        tile.loc.y + inset,
+        tile.size.w.saturating_sub(2 * inset as u32),
+        tile.size.h.saturating_sub(2 * inset as u32),
+    )
+}
+
+#[test]
+fn parity_transfer_view_anchor_singleton_id_preserves_selected_native_allocation() {
+    for removed_width in [500, 420] {
+        let (mut engine, backend, output) = transfer_view_fixture(false);
+        engine
+            .monitors
+            .get_mut(&output)
+            .unwrap()
+            .workspaces
+            .get_mut(&40)
+            .unwrap()
+            .columns[2]
+            .width = Some(removed_width);
+        let selected = WindowId::new(300);
+        let before = transfer_view_native_rect(&engine, output, 40, selected);
+        let sibling = transfer_view_native_rect(&engine, output, 40, WindowId::new(200));
+        let mut applied = AppliedState::unset();
+        applied.rect = before;
+        engine.applied_state.insert(selected, applied);
+        let destination = engine.monitors.get(&output).unwrap().workspaces[&7].ipc_id;
+
+        engine.move_window_to_workspace_ref(
+            Some(WindowId::new(100)),
+            WorkspaceRef::Id(destination),
+            false,
+            &backend,
+        );
+
+        assert_tile_at(&engine, 100, output, 7);
+        assert_eq!(
+            transfer_view_native_rect(&engine, output, 40, selected),
+            before
+        );
+        assert_eq!(
+            transfer_view_native_rect(&engine, output, 40, WindowId::new(200)),
+            sibling
+        );
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().workspaces[&40]
+                .scroll_offset
+                .x,
+            1182 - removed_width as i32 - 8
+        );
+        assert_eq!(cursor(&engine, output), (40, Some(3), Some(selected)));
+        assert_eq!(engine.monitors.focused_id(), Some(output));
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(300));
+        assert_eq!(
+            engine.applied_state[&selected].rect, before,
+            "cache remains consistent; calculated allocation above is the geometry oracle"
+        );
+    }
+}
+
+#[test]
+fn parity_transfer_view_anchor_whole_column_detach_preserves_selected_allocation() {
+    let (mut engine, backend, output) = transfer_view_fixture(true);
+    let before = transfer_view_native_rect(&engine, output, 40, WindowId::new(300));
+    // The internal detach contract also accepts a source column independent of
+    // selection. This does not invent a typed API for explicitly naming columns.
+    engine.transfer_workspace_column((output, 40, 2), (output, 7), false, &backend);
+
+    assert_tile_at(&engine, 100, output, 7);
+    assert_tile_at(&engine, 101, output, 7);
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 40, WindowId::new(300)),
+        before
+    );
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().workspaces[&40]
+            .scroll_offset
+            .x,
+        674
+    );
+    assert_eq!(
+        cursor(&engine, output),
+        (40, Some(3), Some(WindowId::new(300)))
+    );
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(300));
+}
+
+#[test]
+fn parity_transfer_view_anchor_right_removal_and_stack_extraction_do_not_scroll() {
+    for (stacked, moving) in [(false, 400), (true, 100)] {
+        let (mut engine, backend, output) = transfer_view_fixture(stacked);
+        let before = transfer_view_native_rect(&engine, output, 40, WindowId::new(300));
+        let destination = engine.monitors.get(&output).unwrap().workspaces[&7].ipc_id;
+
+        engine.move_window_to_workspace_ref(
+            Some(WindowId::new(moving)),
+            WorkspaceRef::Id(destination),
+            false,
+            &backend,
+        );
+
+        assert_tile_at(&engine, moving, output, 7);
+        assert_eq!(
+            transfer_view_native_rect(&engine, output, 40, WindowId::new(300)),
+            before
+        );
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().workspaces[&40]
+                .scroll_offset
+                .x,
+            1182
+        );
+        assert_eq!(
+            cursor(&engine, output),
+            (40, Some(4), Some(WindowId::new(300)))
+        );
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(300));
+    }
+}
+
+fn transfer_reflow_fixture(
+    source_columns: &[&[isize]],
+    mode: ColumnWidthMode,
+) -> (TilingEngine, BackendHandle, OutputId) {
+    let mut config = LayoutConfig {
+        column_width_mode: mode,
+        column_width: 500,
+        column_gap: 8,
+        window_gap: 8,
+        outer_gaps: (8, 8, 8, 8),
+        border_width: 0,
+        max_visible_columns: 3,
+        center_focused_column: CenterFocusedColumn::Never,
+        ..LayoutConfig::default()
+    };
+    // Direct LayoutConfig fixtures must keep the resolved border-width cache in
+    // sync with the effects flag, as LayoutConfig::from_config does in production.
+    config.effects.border.off = true;
+    let mut engine = TilingEngine::new(config);
+    engine.update_animation_settings(false, 0, crate::layout::Easing::None);
+    let output = install_monitor(
+        &mut engine,
+        "transfer-reflow-source",
+        0,
+        vec![
+            (40, workspace("reflow-source", source_columns)),
+            (7, workspace("reflow-destination", &[&[500]])),
+        ],
+        40,
+        300,
+    );
+    let monitor = engine.monitors.get_mut(&output).unwrap();
+    monitor.bounds = Rect::new(0, 0, 1366, 768);
+    monitor.work_area = monitor.bounds;
+    engine.record_ipc_foreground(WindowId::new(300));
+    (engine, BackendHandle::default_for_test(), output)
+}
+
+#[test]
+fn parity_transfer_view_anchor_proportional_right_removal_preserves_selected_origin() {
+    let (mut engine, backend, output) =
+        transfer_reflow_fixture(&[&[100], &[300], &[400]], ColumnWidthMode::Proportional);
+    let selected = WindowId::new(300);
+    let cfg = engine.effective_config_for_workspace(output, 40);
+    let monitor = engine.monitors.get(&output).unwrap();
+    let work = TilingEngine::tiling_work_rect(monitor, cfg);
+    assert_eq!(work, Rect::new(8, 8, 1350, 752));
+    assert_eq!(cfg.column_gap, 8);
+    assert_eq!(cfg.border_inset(), 0);
+    assert_eq!(engine.rule_border_inset(selected, cfg), 0);
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 40, WindowId::new(100))
+            .size
+            .w,
+        444
+    );
+    let before = transfer_view_native_rect(&engine, output, 40, selected);
+    // Work origin 8 + preceding 444px column + one 8px gap, without borders.
+    assert_eq!(before.loc.x, 460);
+    assert_eq!(before.size.w, 444);
+    let destination = engine.monitors.get(&output).unwrap().workspaces[&7].ipc_id;
+
+    engine.move_window_to_workspace_ref(
+        Some(WindowId::new(400)),
+        WorkspaceRef::Id(destination),
+        false,
+        &backend,
+    );
+
+    assert_tile_at(&engine, 400, output, 7);
+    let after = transfer_view_native_rect(&engine, output, 40, selected);
+    // The surviving proportional columns grow from 444 to 671px. Their width
+    // changes, but niri's view remains relative to the selected column's origin.
+    assert_eq!(after.size.w, 671);
+    assert_eq!(after.loc, before.loc);
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().workspaces[&40]
+            .scroll_offset
+            .x,
+        227
+    );
+    assert_eq!(cursor(&engine, output), (40, Some(1), Some(selected)));
+    assert_eq!(engine.monitors.focused_id(), Some(output));
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(300));
+}
+
+#[test]
+fn parity_transfer_view_anchor_stack_minimum_extraction_preserves_selected_origin() {
+    let (mut engine, backend, output) =
+        transfer_reflow_fixture(&[&[100, 101], &[300]], ColumnWidthMode::Fixed);
+    engine.note_window_min_width(WindowId::new(100), 700);
+    let selected = WindowId::new(300);
+    let cfg = engine.effective_config_for_workspace(output, 40);
+    let monitor = engine.monitors.get(&output).unwrap();
+    assert_eq!(
+        TilingEngine::tiling_work_rect(monitor, cfg),
+        Rect::new(8, 8, 1350, 752)
+    );
+    assert_eq!(cfg.column_gap, 8);
+    assert_eq!(cfg.border_inset(), 0);
+    assert_eq!(engine.rule_border_inset(selected, cfg), 0);
+    assert_eq!(monitor.workspaces[&40].columns[0].min_width(), 700);
+    let before = transfer_view_native_rect(&engine, output, 40, selected);
+    // Work origin 8 + the 700px tile minimum + one 8px gap.
+    assert_eq!(before.loc.x, 716);
+    assert_eq!(before.size.w, 500);
+    let destination = engine.monitors.get(&output).unwrap().workspaces[&7].ipc_id;
+
+    engine.move_window_to_workspace_ref(
+        Some(WindowId::new(100)),
+        WorkspaceRef::Id(destination),
+        false,
+        &backend,
+    );
+
+    assert_tile_at(&engine, 100, output, 7);
+    assert_tile_at(&engine, 101, output, 40);
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 40, WindowId::new(101))
+            .size
+            .w,
+        500,
+        "the remaining stack loses the extracted window's dominant minimum"
+    );
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 40, selected),
+        before
+    );
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().workspaces[&40]
+            .scroll_offset
+            .x,
+        -200,
+        "signed absolute scroll preserves the selected origin after the 200px shrink"
+    );
+    assert_eq!(cursor(&engine, output), (40, Some(1), Some(selected)));
+    assert_eq!(engine.monitors.focused_id(), Some(output));
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(300));
+}
+
+#[test]
+fn parity_transfer_view_anchor_inactive_source_preserves_its_remembered_view() {
+    let (mut engine, backend, output) = transfer_view_fixture(false);
+    {
+        let monitor = engine.monitors.get_mut(&output).unwrap();
+        monitor.switch_workspace(25);
+        monitor.set_focus(WindowId::new(600));
+    }
+    engine.record_ipc_foreground(WindowId::new(600));
+    engine.animation =
+        crate::layout::AnimationManager::new(true, 1000, crate::layout::Easing::Linear);
+    engine
+        .animation
+        .animate(crate::layout::AnimationTarget::ScrollX(output), 0.0, 100.0);
+    engine.tick_animations(400);
+    let before = transfer_view_native_rect(&engine, output, 40, WindowId::new(300));
+    let foreground = transfer_view_native_rect(&engine, output, 25, WindowId::new(600));
+    let destination = engine.monitors.get(&output).unwrap().workspaces[&7].ipc_id;
+
+    engine.move_window_to_workspace_ref(
+        Some(WindowId::new(100)),
+        WorkspaceRef::Id(destination),
+        false,
+        &backend,
+    );
+
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 40, WindowId::new(300)),
+        before
+    );
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 25, WindowId::new(600)),
+        foreground
+    );
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().workspaces[&40].remembered_focus(),
+        Some((3, WindowId::new(300)))
+    );
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().workspaces[&40]
+            .scroll_offset
+            .x,
+        674
+    );
+    assert_eq!(
+        cursor(&engine, output),
+        (25, Some(0), Some(WindowId::new(600)))
+    );
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(600));
+    assert_eq!(
+        engine
+            .animation
+            .get_value(&crate::layout::AnimationTarget::ScrollX(output)),
+        Some(40.0),
+        "the foreground workspace's camera must not inherit a hidden source's rebase"
+    );
+    engine.tick_animations(600);
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().workspaces[&25]
+            .scroll_offset
+            .x,
+        100
+    );
+}
+
+#[test]
+fn parity_transfer_view_anchor_pending_absolute_scroll_keeps_its_relative_trajectory() {
+    let (mut engine, backend, output) = transfer_view_fixture(false);
+    engine.animation =
+        crate::layout::AnimationManager::new(true, 1000, crate::layout::Easing::Linear);
+    engine.animation.animate(
+        crate::layout::AnimationTarget::ScrollX(output),
+        1182.0,
+        1282.0,
+    );
+    engine.animation.animate(
+        crate::layout::AnimationTarget::WorkspaceX(output),
+        83.0,
+        0.0,
+    );
+    engine.tick_animations(400);
+    let slide_before = engine
+        .animation
+        .get_value(&crate::layout::AnimationTarget::WorkspaceX(output));
+    let before = transfer_view_native_rect(&engine, output, 40, WindowId::new(300));
+    let destination = engine.monitors.get(&output).unwrap().workspaces[&7].ipc_id;
+
+    engine.move_window_to_workspace_ref(
+        Some(WindowId::new(100)),
+        WorkspaceRef::Id(destination),
+        false,
+        &backend,
+    );
+
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 40, WindowId::new(300)),
+        before
+    );
+    assert_eq!(
+        engine
+            .animation
+            .get_value(&crate::layout::AnimationTarget::WorkspaceX(output)),
+        slide_before,
+        "the additive workspace-slide camera is independent of absolute strip scroll"
+    );
+    engine.tick_animations(100);
+    assert_eq!(
+        transfer_view_native_rect(&engine, output, 40, WindowId::new(300))
+            .loc
+            .x,
+        before.loc.x - 10,
+        "rebasing must retain the timeline's elapsed 400ms"
+    );
+    engine.tick_animations(500);
+    let terminal = transfer_view_native_rect(&engine, output, 40, WindowId::new(300));
+    assert_eq!(
+        terminal.loc.x,
+        before.loc.x - 60,
+        "the original 100px scroll must not resurrect the removed column's span"
+    );
+    assert_eq!(
+        engine.monitors.get(&output).unwrap().workspaces[&40]
+            .scroll_offset
+            .x,
+        774
+    );
+    assert_eq!(
+        cursor(&engine, output),
+        (40, Some(3), Some(WindowId::new(300)))
+    );
+    assert_eq!(engine.ipc_snapshot().focused_window(), Some(300));
+}
+
+fn ipc_id_fixture() -> (TilingEngine, BackendHandle, OutputId, OutputId, u64) {
+    let (mut engine, backend, left, right) = two_output_fixture();
+    for (output, base) in [(left, u64::MAX - 100), (right, u64::MAX - 200)] {
+        let monitor = engine.monitors.get_mut(&output).unwrap();
+        for (position, key) in monitor.workspace_ids().into_iter().enumerate() {
+            monitor.workspaces.get_mut(&key).unwrap().ipc_id = base - position as u64;
+        }
+    }
+    let id = u64::MAX - 17;
+    engine
+        .monitors
+        .get_mut(&right)
+        .unwrap()
+        .workspaces
+        .get_mut(&7)
+        .unwrap()
+        .ipc_id = id;
+    // Coercing Id into a name would select a different object on the left.
+    engine
+        .monitors
+        .get_mut(&left)
+        .unwrap()
+        .workspaces
+        .get_mut(&7)
+        .unwrap()
+        .name = Some(id.to_string());
+    (engine, backend, left, right, id)
 }
 
 fn columns_on(engine: &TilingEngine, output: OutputId, key: i32) -> Vec<Vec<isize>> {
@@ -221,46 +1105,353 @@ fn indices_and_numeric_names_are_distinct() {
 }
 
 #[test]
-fn explicit_window_move_crosses_outputs_without_changing_focus() {
-    let (mut engine, backend, left, right) = two_output_fixture();
-    let left_before = cursor(&engine, left);
-    let right_before = cursor(&engine, right);
-    let destination_id = engine.monitors.get(&right).unwrap().workspaces[&7].ipc_id;
-
-    // 101 is not focused; an explicit id must win over the focused tile 100.
-    engine.move_window_to_workspace_ref(
-        Some(WindowId::new(101)),
-        WorkspaceRef::Name("destination".to_string()),
-        false,
-        &backend,
+fn workspace_ipc_id_is_global_and_survives_rename_and_reorder() {
+    let (mut engine, backend, left, right, id) = ipc_id_fixture();
+    let reference = WorkspaceRef::Id(id);
+    let before = (cursor(&engine, left), cursor(&engine, right));
+    assert_eq!(
+        engine.resolve_workspace_reference(left, &reference),
+        Some((right, 7))
     );
-
-    assert_tile_at(&engine, 101, right, 7);
-    assert_tile_at(&engine, 100, left, 40);
-    assert_eq!(engine.monitors.focused_id(), Some(left));
-    assert_eq!(cursor(&engine, left), left_before);
-    assert_eq!(cursor(&engine, right), right_before);
+    assert_eq!(
+        engine.resolve_workspace_reference(left, &WorkspaceRef::Index(2)),
+        Some((left, 7))
+    );
+    assert_eq!(
+        engine.resolve_workspace_reference(left, &WorkspaceRef::Name(id.to_string())),
+        Some((left, 7))
+    );
+    engine.set_workspace_name("renamed-by-id", Some(reference.clone()), &backend);
+    engine.move_workspace_to_index(1, Some(reference.clone()), &backend);
+    engine.unset_workspace_name(Some(reference.clone()), &backend);
+    assert_eq!(engine.monitors.get(&right).unwrap().workspace_ids()[0], 7);
+    assert_eq!(
+        engine.resolve_workspace_reference(left, &reference),
+        Some((right, 7))
+    );
+    assert_eq!(
+        engine.monitors.get(&right).unwrap().workspaces[&7].ipc_id,
+        id
+    );
+    assert_eq!(engine.workspace_name_on(right, 7), None);
+    assert_eq!(engine.workspace_name_on(left, 7), Some(id.to_string()));
+    assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
     let snapshot = engine.ipc_snapshot();
-    let moved = snapshot
-        .windows
+    let target = snapshot
+        .workspaces
         .iter()
-        .find(|window| window.id == 101)
+        .find(|workspace| workspace.id == id)
         .unwrap();
-    assert_eq!(moved.workspace_id, Some(destination_id));
-    assert!(!moved.is_floating);
+    assert_eq!(target.idx, 1);
+    assert_eq!(target.name, None);
+    assert_eq!(
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == 210)
+            .unwrap()
+            .workspace_id,
+        Some(id)
+    );
 
-    // The same explicit id is now on an inactive workspace of the unfocused output.
-    engine.move_window_to_workspace_ref(
-        Some(WindowId::new(101)),
-        WorkspaceRef::Name("left".to_string()),
-        false,
+    engine.workspace_layout_action(
+        &crate::input::WorkspaceAction::Focus { reference },
         &backend,
     );
+    assert_eq!(engine.monitors.focused_id(), Some(right));
+    assert_eq!(cursor(&engine, right).0, 7);
+    assert_eq!(cursor(&engine, right).2, Some(WindowId::new(210)));
+}
+
+#[test]
+fn workspace_ipc_id_transfers_use_the_remote_object_without_following_focus() {
+    for focus in [false, true] {
+        let (mut engine, backend, left, right, id) = ipc_id_fixture();
+        let before = (cursor(&engine, left), cursor(&engine, right));
+        // The explicitly targeted window is not focused, so even focus=true
+        // must leave both outputs' active workspace and selection alone.
+        engine.move_window_to_workspace_ref(
+            Some(WindowId::new(101)),
+            WorkspaceRef::Id(id),
+            focus,
+            &backend,
+        );
+        assert_tile_at(&engine, 101, right, 7);
+        assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(
+            engine
+                .ipc_snapshot()
+                .windows
+                .iter()
+                .find(|window| window.id == 101)
+                .unwrap()
+                .workspace_id,
+            Some(id)
+        );
+    }
+    let (mut engine, backend, left, right, id) = ipc_id_fixture();
+    let right_before = cursor(&engine, right);
+    engine.move_column_to_workspace_ref(WorkspaceRef::Id(id), false, &backend);
+    assert_tile_at(&engine, 100, right, 7);
     assert_tile_at(&engine, 101, left, 40);
-    assert_tile_at(&engine, 100, left, 40);
-    assert_eq!(engine.monitors.focused_id(), Some(left));
-    assert_eq!(cursor(&engine, left), left_before);
+    assert_eq!(cursor(&engine, left).0, 40);
     assert_eq!(cursor(&engine, right), right_before);
+    assert_eq!(engine.monitors.focused_id(), Some(left));
+}
+
+#[test]
+fn workspace_ipc_id_follows_relocation_after_its_old_local_key_is_reused() {
+    let (mut engine, backend, left, right, id) = ipc_id_fixture();
+    let reference = WorkspaceRef::Id(id);
+    engine.move_workspace_to_monitor_action(
+        Some(reference.clone()),
+        &crate::input::MonitorTarget::Name("lane-f-left".into()),
+        &backend,
+    );
+    let (output, key) = engine
+        .resolve_workspace_reference(right, &reference)
+        .unwrap();
+    assert_eq!(output, left);
+    assert_ne!(key, 7, "the destination already owns this local key");
+    let mut replacement = workspace("replacement", &[&[220]]);
+    replacement.ipc_id = u64::MAX - 300;
+    engine
+        .tiled_windows
+        .insert(WindowId::new(220), window_info(220));
+    engine
+        .monitors
+        .get_mut(&right)
+        .unwrap()
+        .insert_workspace(7, replacement);
+    engine.maintain_empty_workspace(right);
+    engine.set_workspace_name("followed-the-object", Some(reference.clone()), &backend);
+    engine.move_workspace_to_index(1, Some(reference.clone()), &backend);
+    assert_eq!(
+        engine.workspace_name_on(left, key).as_deref(),
+        Some("followed-the-object")
+    );
+    assert_eq!(
+        engine.workspace_name_on(right, 7).as_deref(),
+        Some("replacement")
+    );
+    assert_tile_at(&engine, 210, left, key);
+    engine.focus_workspace_ref(&reference, &backend);
+    assert_eq!(engine.monitors.focused_id(), Some(left));
+    assert_eq!(cursor(&engine, left).0, key);
+    engine.move_workspace_to_monitor_action(
+        Some(reference.clone()),
+        &crate::input::MonitorTarget::Name("lane-f-right".into()),
+        &backend,
+    );
+    let (output, moved_key) = engine
+        .resolve_workspace_reference(left, &reference)
+        .unwrap();
+    assert_eq!(output, right);
+    assert_ne!(moved_key, 7);
+    assert_eq!(
+        engine.monitors.get(&right).unwrap().workspaces[&moved_key].ipc_id,
+        id
+    );
+    assert_tile_at(&engine, 210, right, moved_key);
+    assert_tile_at(&engine, 220, right, 7);
+    engine.move_window_to_workspace_ref(Some(WindowId::new(101)), reference, false, &backend);
+    assert_tile_at(&engine, 101, right, moved_key);
+}
+
+#[test]
+fn unknown_workspace_ipc_id_never_falls_back_to_a_local_key_or_focused_workspace() {
+    let (mut engine, backend, left, right, _) = ipc_id_fixture();
+    // Local key 7 exists on both outputs, but no workspace has IPC identity 7.
+    let reference = WorkspaceRef::Id(7);
+    let before = engine.ipc_snapshot();
+    let cursors = (cursor(&engine, left), cursor(&engine, right));
+    for action in [
+        crate::input::WorkspaceAction::Focus {
+            reference: reference.clone(),
+        },
+        crate::input::WorkspaceAction::MoveWindow {
+            window: Some(WindowId::new(101)),
+            reference: reference.clone(),
+            focus: true,
+        },
+        crate::input::WorkspaceAction::MoveColumn {
+            reference: reference.clone(),
+            focus: true,
+        },
+        crate::input::WorkspaceAction::MoveToIndex {
+            index: 1,
+            workspace: Some(reference.clone()),
+        },
+        crate::input::WorkspaceAction::SetName {
+            name: "must-not-rename".into(),
+            workspace: Some(reference.clone()),
+        },
+        crate::input::WorkspaceAction::UnsetName {
+            workspace: Some(reference.clone()),
+        },
+    ] {
+        engine.workspace_layout_action(&action, &backend);
+        assert_eq!(engine.ipc_snapshot(), before, "{action:?}");
+    }
+    engine.move_workspace_to_monitor_action(
+        Some(reference),
+        &crate::input::MonitorTarget::Name("lane-f-right".into()),
+        &backend,
+    );
+    assert_eq!(engine.ipc_snapshot(), before);
+    assert_eq!((cursor(&engine, left), cursor(&engine, right)), cursors);
+    assert_eq!(engine.monitors.focused_id(), Some(left));
+}
+
+#[test]
+fn explicit_height_targets_preserve_focus_across_outputs_and_inactive_workspaces() {
+    for target_workspace in [40, 7] {
+        for floating in [false, true] {
+            let (mut engine, backend, left, right) = two_output_fixture();
+            engine.record_ipc_foreground(WindowId::new(100));
+            let target = if floating {
+                let window = WindowId::new(300);
+                engine.tiled_windows.insert(window, window_info(300));
+                engine.register_float(
+                    window,
+                    right,
+                    target_workspace,
+                    Rect::new(1400, 50, 400, 500),
+                );
+                window
+            } else {
+                let (target, other) = if target_workspace == 40 {
+                    (200, 201)
+                } else {
+                    (210, 211)
+                };
+                engine
+                    .tiled_windows
+                    .insert(WindowId::new(other), window_info(other));
+                engine
+                    .monitors
+                    .get_mut(&right)
+                    .unwrap()
+                    .workspaces
+                    .get_mut(&target_workspace)
+                    .unwrap()
+                    .columns[0] = column(&[target, other]);
+                WindowId::new(target)
+            };
+            let before = (cursor(&engine, left), cursor(&engine, right));
+
+            engine.set_window_height_for(target, SizeChange::SetFixed(300), &backend);
+
+            if floating {
+                assert_eq!(
+                    engine.float_homes[&target].rect,
+                    Rect::new(1400, 50, 400, 300)
+                );
+            } else {
+                let tiles = &engine.monitors.get(&right).unwrap().workspaces[&target_workspace]
+                    .columns[0]
+                    .tiles;
+                assert!(
+                    tiles[0].height_weight < 1.0,
+                    "300 px is less than half the column"
+                );
+                assert_eq!(tiles[1].height_weight, 1.0);
+            }
+            assert_eq!((cursor(&engine, left), cursor(&engine, right)), before);
+            assert_eq!(engine.monitors.focused_id(), Some(left));
+            assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+        }
+    }
+}
+
+#[test]
+fn explicit_index_transfer_activates_the_unfocused_outputs_local_selection() {
+    for focus in [false, true] {
+        for kind in ["index", "name", "id"] {
+            let (mut engine, backend, left, right) = two_output_fixture();
+            engine.record_ipc_foreground(WindowId::new(100));
+            let left_before = cursor(&engine, left);
+            let id = engine.monitors.get(&right).unwrap().workspaces[&7].ipc_id;
+            let reference = match kind {
+                "index" => WorkspaceRef::Index(2),
+                "name" => WorkspaceRef::Name("destination".to_string()),
+                _ => WorkspaceRef::Id(id),
+            };
+
+            // 200 is selected on the right output, while 100 has global focus.
+            // The pinned Index path uses monitor-local smart activation; the
+            // Name/Id path uses global smart activation even on the same output.
+            engine.move_window_to_workspace_ref(
+                Some(WindowId::new(200)),
+                reference,
+                focus,
+                &backend,
+            );
+
+            let local_activation = kind == "index" && focus;
+            assert_tile_at(&engine, 200, right, 7);
+            assert_eq!(
+                cursor(&engine, right).0,
+                if local_activation { 7 } else { 40 },
+                "{kind}, focus={focus}"
+            );
+            assert_eq!(
+                cursor(&engine, right).2,
+                local_activation.then_some(WindowId::new(200)),
+                "{kind}, focus={focus}"
+            );
+            assert_eq!(cursor(&engine, left), left_before);
+            assert_eq!(engine.monitors.focused_id(), Some(left));
+            assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+        }
+    }
+}
+
+#[test]
+fn explicit_window_move_crosses_outputs_without_changing_focus() {
+    for focus in [false, true] {
+        let (mut engine, backend, left, right) = two_output_fixture();
+        let left_before = cursor(&engine, left);
+        let right_before = cursor(&engine, right);
+        let destination_id = engine.monitors.get(&right).unwrap().workspaces[&7].ipc_id;
+
+        // 101 is not focused; an explicit id must win over the focused tile 100.
+        // niri's focus=true is smart activation: it only follows an already focused window.
+        engine.move_window_to_workspace_ref(
+            Some(WindowId::new(101)),
+            WorkspaceRef::Name("destination".to_string()),
+            focus,
+            &backend,
+        );
+
+        assert_tile_at(&engine, 101, right, 7);
+        assert_tile_at(&engine, 100, left, 40);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(cursor(&engine, left), left_before);
+        assert_eq!(cursor(&engine, right), right_before);
+        let snapshot = engine.ipc_snapshot();
+        let moved = snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == 101)
+            .unwrap();
+        assert_eq!(moved.workspace_id, Some(destination_id));
+        assert!(!moved.is_floating);
+
+        // The same explicit id is now on an inactive workspace of the unfocused output.
+        engine.move_window_to_workspace_ref(
+            Some(WindowId::new(101)),
+            WorkspaceRef::Name("left".to_string()),
+            focus,
+            &backend,
+        );
+        assert_tile_at(&engine, 101, left, 40);
+        assert_tile_at(&engine, 100, left, 40);
+        assert_eq!(engine.monitors.focused_id(), Some(left));
+        assert_eq!(cursor(&engine, left), left_before);
+        assert_eq!(cursor(&engine, right), right_before);
+    }
 }
 
 #[test]
@@ -332,6 +1523,8 @@ fn focus_workspace_named_keeps_the_destination_output() {
 #[test]
 fn window_move_with_focus_selects_destination() {
     let (mut engine, backend, left, right) = two_output_fixture();
+    assert!(engine.focus_action_window(WindowId::new(101), &backend));
+    assert_eq!(cursor(&engine, left).2, Some(WindowId::new(101)));
     engine.move_window_to_workspace_ref(
         Some(WindowId::new(101)),
         WorkspaceRef::Name("destination".to_string()),
@@ -1530,6 +2723,47 @@ fn configured_names_are_not_rebound_after_runtime_rename_unset_and_reload() {
     }
 }
 
+/// niri's `reload_config` unnames a workspace whose configured name disappeared from the
+/// config (niri e19df12 src/niri.rs:1701-1710) and leaves the other declarations alone.
+#[test]
+fn reload_unnames_a_removed_configuration_and_keeps_the_others() {
+    let mut engine = TilingEngine::new(LayoutConfig::default());
+    let output = OutputId::from_name("display-names-reload");
+    engine.register_monitor(
+        output,
+        Rect::new(0, 0, 1200, 800),
+        Rect::new(0, 0, 1200, 800),
+    );
+    let declaration = |name: &str| crate::config::WorkspaceConfig {
+        name: name.to_string(),
+        ..crate::config::WorkspaceConfig::default_config()
+    };
+    let named = |engine: &TilingEngine, name: &str| {
+        engine
+            .monitors
+            .get(&output)
+            .unwrap()
+            .workspaces
+            .values()
+            .any(|workspace| workspace.name.as_deref() == Some(name))
+    };
+    let mut config = crate::config::Config::default();
+    config.workspace = vec![declaration("gone"), declaration("kept")];
+    engine.set_full_config(config.clone());
+    assert!(named(&engine, "gone") && named(&engine, "kept"));
+
+    config.workspace = vec![declaration("kept")];
+    engine.set_full_config(config);
+    assert!(
+        !named(&engine, "gone"),
+        "a configured name that left the config is dropped on reload"
+    );
+    assert!(
+        named(&engine, "kept"),
+        "an unchanged declaration keeps its workspace"
+    );
+}
+
 #[test]
 fn configured_name_waits_until_the_connector_name_is_registered() {
     let mut engine = TilingEngine::new(LayoutConfig::default());
@@ -1697,5 +2931,91 @@ fn configured_output_preferences_and_reload_top_insertion_preserve_prior_workspa
         assert_eq!(cursor(&engine, right), right_before);
         assert_trailing_empty(&engine, right);
         engine.set_full_config(config.clone());
+    }
+}
+
+// The live h32 fixture: A/B and C/D stacked columns on the source workspace, an empty named
+// target workspace on the same (only) output. niri `MoveWindowToWorkspaceById` maps `focus`
+// to ActivateWindow::Smart/No (input/mod.rs:1420-1470) and Monitor::move_to_workspace
+// resolves Smart as "the moved window is the monitor's active window" (monitor.rs:843-845,
+// pinned e19df12), so only the window that already has the focus is followed.
+fn live_h32_fixture() -> (TilingEngine, BackendHandle, OutputId) {
+    let mut engine = TilingEngine::new(LayoutConfig::default());
+    let output = install_monitor(
+        &mut engine,
+        "lane-f-live-h32",
+        0,
+        vec![
+            (40, workspace("source", &[&[100, 101], &[102, 103]])),
+            (7, workspace("target", &[])),
+        ],
+        40,
+        100,
+    );
+    (engine, BackendHandle::default_for_test(), output)
+}
+
+#[test]
+fn explicit_unfocused_window_move_never_takes_the_focus_for_default_or_false() {
+    for focus in [true, false] {
+        for index in [false, true] {
+            let (mut engine, backend, output) = live_h32_fixture();
+            engine.record_ipc_foreground(WindowId::new(100));
+            let before = cursor(&engine, output);
+            let reference = if index {
+                WorkspaceRef::Index(2)
+            } else {
+                WorkspaceRef::Name("target".to_string())
+            };
+            // `--id` names B while A is focused: B goes to the target, A keeps the focus.
+            engine.move_window_to_workspace_ref(
+                Some(WindowId::new(101)),
+                reference,
+                focus,
+                &backend,
+            );
+            let case = format!("focus={focus}, index={index}");
+            assert_tile_at(&engine, 101, output, 7);
+            assert_eq!(
+                columns_on(&engine, output, 40),
+                vec![vec![100], vec![102, 103]],
+                "{case}"
+            );
+            assert_eq!(columns_on(&engine, output, 7), vec![vec![101]], "{case}");
+            assert_eq!(cursor(&engine, output), before, "{case}");
+            assert_eq!(engine.ipc_snapshot().focused_window(), Some(100), "{case}");
+        }
+    }
+}
+
+#[test]
+fn explicit_focused_window_move_follows_only_with_the_default_focus_flag() {
+    for index in [false, true] {
+        let reference = || {
+            if index {
+                WorkspaceRef::Index(2)
+            } else {
+                WorkspaceRef::Name("target".to_string())
+            }
+        };
+        // Default focus: B was already focused, so Smart activation follows it.
+        let (mut engine, backend, output) = live_h32_fixture();
+        assert!(engine.focus_action_window(WindowId::new(101), &backend));
+        engine.record_ipc_foreground(WindowId::new(101));
+        engine.move_window_to_workspace_ref(Some(WindowId::new(101)), reference(), true, &backend);
+        assert_tile_at(&engine, 101, output, 7);
+        let (active, _, focus_window) = cursor(&engine, output);
+        assert_eq!(active, 7, "index={index}");
+        assert_eq!(focus_window, Some(WindowId::new(101)), "index={index}");
+
+        // `--focus false`: B moves, the source workspace stays active.
+        let (mut engine, backend, output) = live_h32_fixture();
+        assert!(engine.focus_action_window(WindowId::new(101), &backend));
+        engine.record_ipc_foreground(WindowId::new(101));
+        engine.move_window_to_workspace_ref(Some(WindowId::new(101)), reference(), false, &backend);
+        assert_tile_at(&engine, 101, output, 7);
+        let (active, _, focus_window) = cursor(&engine, output);
+        assert_eq!(active, 40, "index={index}");
+        assert_eq!(focus_window, Some(WindowId::new(100)), "index={index}");
     }
 }

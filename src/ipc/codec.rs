@@ -130,6 +130,7 @@ mod tests {
             active_workspace: 3,
             window_count: 7,
             focused: true,
+            unified_grid: true,
         };
         let json = serde_json::to_string(&m).unwrap();
         let parsed: crate::ipc::MonitorInfo = serde_json::from_str(&json).unwrap();

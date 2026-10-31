@@ -113,11 +113,16 @@ struct HookState {
 }
 
 impl HookState {
+    fn can_begin_pointer_gesture(&self) -> bool {
+        self.accepting_grabs && matches!(self.grab, GrabState::None) && self.pending_move.is_none()
+    }
+
+    fn try_begin_scroll(&self, modal_blocked: bool, begin: impl FnOnce() -> bool) -> bool {
+        !modal_blocked && self.can_begin_pointer_gesture() && begin()
+    }
+
     fn try_begin_grab(&mut self, grab: GrabState) -> bool {
-        if !self.accepting_grabs
-            || !matches!(self.grab, GrabState::None)
-            || self.pending_move.is_some()
-        {
+        if !self.can_begin_pointer_gesture() {
             return false;
         }
         if let GrabState::Move(g) = &grab {
@@ -330,6 +335,7 @@ pub fn start_mouse_hook(
 
 /// Stop the low-level mouse hook
 pub fn stop_mouse_hook() {
+    super::scroll_emulation::cancel();
     HOOK_STATE.lock().accepting_grabs = false;
     cancel_grab_on_shutdown();
     if let Some(hook_thread) = HOOK_HANDLE.lock().take() {
@@ -488,7 +494,7 @@ unsafe extern "system" fn keyboard_hook_callback(
     }
     let mut decision = crate::input::keyboard::ENGINE
         .lock()
-        .event(vk, pressed, now);
+        .event_at(vk, pressed, now, kb.time);
     let mods = crate::input::keyboard::ENGINE.lock().modifiers();
     let double_alt = DOUBLE_ALT
         .lock()
@@ -500,7 +506,11 @@ unsafe extern "system" fn keyboard_hook_callback(
         mask_shell_menu();
     }
     if let Some(action) = decision.action {
-        crate::input::dispatch::send(action);
+        if decision.chorded {
+            crate::input::dispatch::send_chorded(action);
+        } else {
+            crate::input::dispatch::send(action);
+        }
     }
     // Escape remains available to applications, but also exits the manager's modes.
     if pressed && vk == VK_ESCAPE && !decision.consume {
@@ -756,10 +766,34 @@ unsafe extern "system" fn mouse_hook_callback(
     if event.dwExtraInfo == super::rule_scroll::REINJECTED {
         return CallNextHookEx(None, n_code, w_param, l_param);
     }
+    let button_edge = mouse_button_edge(msg, event.mouseData);
+    let scroll_modal_blocked = crate::ipc::pick::is_active()
+        || crate::overlay::screenshot_ui::is_active()
+        || crate::overlay::bindings_cheatsheet::get_global_cheatsheet()
+            .is_some_and(|cs| cs.is_visible());
+    if scroll_modal_blocked {
+        super::scroll_emulation::cancel();
+    }
+    if let Some((button, down)) = button_edge {
+        if super::scroll_emulation::captured_button(button, down, event.pt) {
+            if !down {
+                // Retire PointerEngine's paired gesture/down state too. Its
+                // gesture marker prevents any reloaded release bind firing.
+                crate::input::pointer::ENGINE.lock().button(
+                    pointer_modifiers(),
+                    button,
+                    false,
+                    Instant::now(),
+                );
+            }
+            return LRESULT(1);
+        }
+    }
     if msg != WM_MOUSEMOVE {
         if let Some(cs) = crate::overlay::bindings_cheatsheet::get_global_cheatsheet()
             .filter(|cs| cs.is_visible())
         {
+            super::scroll_emulation::cancel();
             if msg == WM_MOUSEWHEEL {
                 cs.scroll((event.mouseData >> 16) as i16 > 0);
                 return LRESULT(1);
@@ -785,14 +819,17 @@ unsafe extern "system" fn mouse_hook_callback(
         crate::input::hot_corner::on_mouse_move(cursor);
     }
     if crate::ipc::pick::mouse_event(msg, cursor, event.flags & LLMHF_INJECTED != 0) {
+        super::scroll_emulation::cancel();
         return LRESULT(1);
     }
     // A screenshot session owns pointer interactions, including Mod+drag. Let
     // Windows deliver them to its host, never the ordinary bind/grab dispatcher.
     if crate::overlay::screenshot_ui::is_active() {
+        super::scroll_emulation::cancel();
         return CallNextHookEx(None, n_code, w_param, l_param);
     }
     if let Some(consume) = crate::input::gestures::captured_event(msg, cursor) {
+        super::scroll_emulation::cancel();
         return if consume {
             LRESULT(1)
         } else {
@@ -802,6 +839,7 @@ unsafe extern "system" fn mouse_hook_callback(
     if let Some(consume) =
         crate::input::touchpen::handle(msg, cursor, event.dwExtraInfo, pointer_modifiers())
     {
+        super::scroll_emulation::cancel();
         if consume && msg == WM_LBUTTONDOWN {
             mask_shell_menu();
         }
@@ -812,6 +850,11 @@ unsafe extern "system" fn mouse_hook_callback(
         };
     }
     if msg == WM_MOUSEMOVE {
+        if is_grab_active() {
+            super::scroll_emulation::cancel();
+        } else if super::scroll_emulation::motion(event.pt) {
+            return LRESULT(1);
+        }
         crate::input::focus::on_mouse_move(cursor);
     }
     // This mutex protects only a snapshot; no layout work holds it. Do not let
@@ -884,13 +927,7 @@ unsafe extern "system" fn mouse_hook_callback(
         return CallNextHookEx(None, n_code, w_param, l_param);
     }
     let mods = pointer_modifiers();
-    let button = match msg {
-        0x201 | 0x202 => Some((0, msg == 0x201)),
-        0x204 | 0x205 => Some((1, msg == 0x204)),
-        0x207 | 0x208 => Some((2, msg == 0x207)),
-        0x20B | 0x20C => Some((if event.mouseData >> 16 == 1 { 3 } else { 4 }, msg == 0x20B)),
-        _ => None,
-    };
+    let button = button_edge;
     let (consume, actions) = if let Some((b, down)) = button {
         let stylus = crate::input::touchpen::stylus_button(msg, event.dwExtraInfo);
         crate::input::pointer::ENGINE.lock().button_with_stylus(
@@ -911,6 +948,7 @@ unsafe extern "system" fn mouse_hook_callback(
         return CallNextHookEx(None, n_code, w_param, l_param);
     };
     if consume {
+        super::scroll_emulation::cancel();
         for a in actions {
             crate::input::dispatch::send(a);
         }
@@ -941,6 +979,7 @@ unsafe extern "system" fn mouse_hook_callback(
                 cursor,
                 b,
             ) {
+                super::scroll_emulation::cancel();
                 crate::input::pointer::ENGINE.lock().capture_gesture(b);
                 if mods & (1 | 8) != 0 {
                     mask_shell_menu();
@@ -954,6 +993,7 @@ unsafe extern "system" fn mouse_hook_callback(
         && mods == crate::input::pointer::ENGINE.lock().mod_key
         && crate::input::gestures::begin_middle(cursor)
     {
+        super::scroll_emulation::cancel();
         crate::input::pointer::ENGINE.lock().capture_gesture(2);
         if mods & (1 | 8) != 0 {
             mask_shell_menu();
@@ -1054,6 +1094,7 @@ unsafe extern "system" fn mouse_hook_callback(
                         crate::input::pointer::ENGINE
                             .lock()
                             .capture_gesture(if msg == WM_LBUTTONDOWN { 0 } else { 1 });
+                        super::scroll_emulation::cancel();
                         if mods & (1 | 8) != 0 {
                             mask_shell_menu();
                         }
@@ -1063,7 +1104,32 @@ unsafe extern "system" fn mouse_hook_callback(
             }
         }
     }
+    if let Some((button, true)) = button {
+        let admitted = HOOK_STATE
+            .lock()
+            .try_begin_scroll(scroll_modal_blocked, || {
+                super::scroll_emulation::begin(button, event.pt)
+            });
+        if admitted {
+            crate::input::pointer::ENGINE.lock().capture_gesture(button);
+            return LRESULT(1);
+        }
+    }
     CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+fn mouse_button_edge(message: u32, data: u32) -> Option<(u8, bool)> {
+    match message {
+        0x201 | 0x202 => Some((0, message == 0x201)),
+        0x204 | 0x205 => Some((1, message == 0x204)),
+        0x207 | 0x208 => Some((2, message == 0x207)),
+        0x20B | 0x20C => match data >> 16 {
+            1 => Some((3, message == 0x20B)),
+            2 => Some((4, message == 0x20B)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub(crate) fn preview_rect(wid: WindowId, rect: Rect, backend: &BackendHandle) {
@@ -1242,6 +1308,67 @@ mod motion_tests {
             engine: None,
             backend: None,
         }
+    }
+
+    #[test]
+    fn parity_button_scroll_admission_never_acquires_during_active_or_pending_grabs() {
+        let mut idle = hook_state();
+        assert!(
+            idle.try_begin_scroll(false, || true),
+            "idle hook admits an unbound explicit scroll gesture"
+        );
+        assert!(
+            !idle.try_begin_scroll(false, || false),
+            "unsupported button remains unconsumed"
+        );
+        let called = std::cell::Cell::new(false);
+        assert!(!idle.try_begin_scroll(true, || {
+            called.set(true);
+            true
+        }));
+        assert!(!called.get(), "modal owner prevents acquisition");
+        idle.accepting_grabs = false;
+        assert!(!idle.try_begin_scroll(false, || {
+            called.set(true);
+            true
+        }));
+        assert!(!called.get(), "stopped hook cannot acquire scrolling");
+        let cursor = Point::new(200, 200);
+        let rect = Rect::new(100, 100, 400, 300);
+        let window = WindowId::new(1);
+        let moving = MoveGrab::new(window, cursor, rect.loc, rect.size, 0);
+        let grabs = [
+            GrabState::Move(moving.clone()),
+            GrabState::Resize(ResizeGrab::new(
+                window,
+                crate::input::grab::ResizeEdge::Right,
+                cursor,
+                rect,
+            )),
+            GrabState::ColumnReorder(ColumnReorderGrab::new(window, 0, cursor)),
+        ];
+        for grab in grabs {
+            let mut state = hook_state();
+            assert!(state.try_begin_grab(grab));
+            let called = std::cell::Cell::new(false);
+            assert!(!state.try_begin_scroll(false, || {
+                called.set(true);
+                true
+            }));
+            assert!(
+                !called.get(),
+                "scroll reducer must never acquire a secondary button during a grab"
+            );
+        }
+        let mut pending = hook_state();
+        assert!(pending.try_begin_grab(GrabState::Move(moving)));
+        pending.grab = GrabState::None; // release cleanup still owns the move
+        let called = std::cell::Cell::new(false);
+        assert!(!pending.try_begin_scroll(false, || {
+            called.set(true);
+            true
+        }));
+        assert!(!called.get());
     }
 
     #[test]

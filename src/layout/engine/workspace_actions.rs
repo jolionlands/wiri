@@ -11,6 +11,11 @@ impl TilingEngine {
         reference: &WorkspaceRef,
     ) -> Option<(OutputId, i32)> {
         match reference {
+            WorkspaceRef::Id(ipc_id) => self.monitors.iter().find_map(|(output, monitor)| {
+                monitor.workspaces.iter().find_map(|(key, workspace)| {
+                    (workspace.ipc_id == *ipc_id).then_some((*output, *key))
+                })
+            }),
             WorkspaceRef::Index(index) => {
                 let ids = self.monitors.get(&source_output)?.workspace_ids();
                 let position = index.saturating_sub(1) as usize;
@@ -56,7 +61,7 @@ impl TilingEngine {
         }
     }
 
-    /// Indices are local to the window's output; names are global and may cross outputs.
+    /// Indices are local to the window's output; IDs and names are global.
     pub fn move_window_to_workspace_ref(
         &mut self,
         window: Option<WindowId>,
@@ -64,13 +69,39 @@ impl TilingEngine {
         focus: bool,
         backend: &BackendHandle,
     ) {
+        // Reject an unknown ID before resolving an implicit native foreground
+        // window, which may synchronize the engine's focus as a side effect.
+        let id_destination = if matches!(&reference, WorkspaceRef::Id(_)) {
+            let Some(destination) = self.workspace_action_target(Some(&reference)) else {
+                return;
+            };
+            Some(destination)
+        } else {
+            None
+        };
         let Some((window, output, workspace)) = self.workspace_move_window(window, backend) else {
             return;
         };
-        let Some(destination) = self.resolve_workspace_reference(output, &reference) else {
+        let Some(destination) =
+            id_destination.or_else(|| self.resolve_workspace_reference(output, &reference))
+        else {
             return;
         };
-        self.transfer_workspace_window(window, (output, workspace), destination, focus, backend);
+        let anchor = if self.unified_grid_for(output) {
+            self.locate_window(window)
+                .and_then(|(_, source, column)| self.grid_column_anchor(output, source, column))
+        } else {
+            None
+        };
+        self.transfer_workspace_window_with_activation_at(
+            window,
+            (output, workspace),
+            destination,
+            focus,
+            matches!(&reference, WorkspaceRef::Index(_)),
+            backend,
+            anchor,
+        );
     }
 
     pub fn move_window_to_workspace_relative(
@@ -80,6 +111,9 @@ impl TilingEngine {
         focus: bool,
         backend: &BackendHandle,
     ) {
+        // wiri `unified-grid` rule 5: remember where this vertical arrow started so a
+        // perpendicular arrow pressed while it is still held continues from here.
+        self.note_grid_vertical(!down, true);
         let Some((window, output, workspace)) = self.workspace_move_window(window, backend) else {
             return;
         };
@@ -90,12 +124,19 @@ impl TilingEngine {
         else {
             return;
         };
-        self.transfer_workspace_window(
+        let anchor = if self.unified_grid_for(output) {
+            self.locate_window(window)
+                .and_then(|(_, source, column)| self.grid_column_anchor(output, source, column))
+        } else {
+            None
+        };
+        self.transfer_workspace_window_at(
             window,
             (output, workspace),
             (output, destination),
             focus,
             backend,
+            anchor,
         );
     }
 
@@ -144,6 +185,69 @@ impl TilingEngine {
         focus: bool,
         backend: &BackendHandle,
     ) {
+        self.transfer_workspace_window_with_activation(
+            window,
+            source,
+            destination,
+            focus,
+            false,
+            backend,
+        );
+    }
+
+    /// wiri `unified-grid` rule 3: the same transfer, inserted at the column index the
+    /// moved window's own strip x falls into instead of next to the active column.
+    pub(super) fn transfer_workspace_window_at(
+        &mut self,
+        window: WindowId,
+        source: (OutputId, i32),
+        destination: (OutputId, i32),
+        focus: bool,
+        backend: &BackendHandle,
+        anchor_x: Option<i32>,
+    ) {
+        self.transfer_workspace_window_with_activation_at(
+            window,
+            source,
+            destination,
+            focus,
+            false,
+            backend,
+            anchor_x,
+        );
+    }
+
+    fn transfer_workspace_window_with_activation(
+        &mut self,
+        window: WindowId,
+        source: (OutputId, i32),
+        destination: (OutputId, i32),
+        focus: bool,
+        local_smart: bool,
+        backend: &BackendHandle,
+    ) {
+        self.transfer_workspace_window_with_activation_at(
+            window,
+            source,
+            destination,
+            focus,
+            local_smart,
+            backend,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_workspace_window_with_activation_at(
+        &mut self,
+        window: WindowId,
+        source: (OutputId, i32),
+        destination: (OutputId, i32),
+        focus: bool,
+        local_smart: bool,
+        backend: &BackendHandle,
+        anchor_x: Option<i32>,
+    ) {
         if source == destination
             || self
                 .workspace_insertion_column(destination.0, destination.1)
@@ -151,6 +255,22 @@ impl TilingEngine {
         {
             return;
         }
+        let globally_active = self.monitors.focused_id() == Some(source.0);
+        let activate = focus
+            && self
+                .monitors
+                .get(&source.0)
+                .is_some_and(|monitor| monitor.active_workspace == source.1)
+            && if local_smart {
+                self.monitors
+                    .get(&source.0)
+                    .is_some_and(|monitor| monitor.focus_window == Some(window))
+            } else {
+                globally_active
+                    && self
+                        .state_target()
+                        .is_some_and(|target| target.window == window)
+            };
         if self.floating_windows.contains(&window) {
             let source_work = self
                 .monitors
@@ -193,45 +313,40 @@ impl TilingEngine {
             let Some((_, _, source_column)) = self.locate_window(window) else {
                 return;
             };
-            let column = {
-                let Some(ws) = self
-                    .monitors
-                    .get_mut(&source.0)
-                    .and_then(|monitor| monitor.workspaces.get_mut(&source.1))
-                else {
-                    return;
-                };
-                let Some(column) = ws.columns.get_mut(source_column) else {
-                    return;
-                };
-                if column.index_of(window).is_none() {
-                    return;
-                }
-                if column.tiles.len() == 1 {
-                    ws.columns.remove(source_column)
-                } else {
-                    // Keep the requested proportion/logical width, not just its
-                    // source-output pixel cache, when splitting a stack.
-                    let mut moved = column.clone();
-                    let Some(tile) = column.remove_tile(window) else {
-                        return;
-                    };
-                    moved.tiles = vec![tile];
-                    moved.select_window(window);
-                    moved
-                }
+            let Some(column) = self.detach_workspace_transfer_column(
+                (source.0, source.1, source_column),
+                Some(window),
+            ) else {
+                return;
             };
             self.repair_workspace_move_cursor(source.0, source.1, source_column);
-            self.insert_workspace_column(destination.0, destination.1, column);
+            // `unified-grid`: enter the target row at the column index the anchor x falls
+            // into; with the mode off this is niri's "next to the active column".
+            match self.grid_insert_index(destination.0, destination.1, anchor_x) {
+                Some(at) => {
+                    self.insert_workspace_column_at(destination.0, destination.1, column, at)
+                }
+                None => self.insert_workspace_column(destination.0, destination.1, column),
+            }
         }
         if let Some(monitor) = self.monitors.get_mut(&source.0) {
             monitor.focus_ring.remove(window);
+        }
+        if activate && !globally_active {
+            // Index targets use monitor-local smart activation. Select the new
+            // workspace on that output without changing global keyboard focus.
+            if let Some(monitor) = self.monitors.get_mut(&destination.0) {
+                monitor.switch_workspace(destination.1);
+                monitor.set_focus(window);
+            }
+            self.remember_action_focus(window);
+            self.reveal_focused_column(destination.0);
         }
         self.finish_workspace_transfer(
             source.0,
             destination,
             &[window],
-            focus.then_some(window),
+            (activate && globally_active).then_some(window),
             backend,
         );
     }
@@ -266,7 +381,14 @@ impl TilingEngine {
         let Some(destination) = self.resolve_workspace_reference(output, &reference) else {
             return;
         };
-        self.transfer_workspace_column((output, workspace, column), destination, focus, backend);
+        let anchor = self.grid_column_anchor(output, workspace, column);
+        self.transfer_workspace_column_at(
+            (output, workspace, column),
+            destination,
+            focus,
+            backend,
+            anchor,
+        );
     }
 
     pub fn move_column_to_workspace_relative(
@@ -275,6 +397,8 @@ impl TilingEngine {
         focus: bool,
         backend: &BackendHandle,
     ) {
+        // wiri `unified-grid` rule 5: arm the diagonal chord from this vertical arrow.
+        self.note_grid_vertical(!down, true);
         let Some((output, workspace, column)) = self.active_workspace_column() else {
             return;
         };
@@ -285,11 +409,13 @@ impl TilingEngine {
         else {
             return;
         };
-        self.transfer_workspace_column(
+        let anchor = self.grid_column_anchor(output, workspace, column);
+        self.transfer_workspace_column_at(
             (output, workspace, column),
             (output, destination),
             focus,
             backend,
+            anchor,
         );
     }
 
@@ -300,6 +426,18 @@ impl TilingEngine {
         focus: bool,
         backend: &BackendHandle,
     ) {
+        self.transfer_workspace_column_at(source, destination, focus, backend, None);
+    }
+
+    /// wiri `unified-grid` rule 3: insert at the index the moved column's own x falls into.
+    pub(super) fn transfer_workspace_column_at(
+        &mut self,
+        source: (OutputId, i32, usize),
+        destination: (OutputId, i32),
+        focus: bool,
+        backend: &BackendHandle,
+        anchor_x: Option<i32>,
+    ) {
         if (source.0, source.1) == destination
             || self
                 .workspace_insertion_column(destination.0, destination.1)
@@ -307,17 +445,9 @@ impl TilingEngine {
         {
             return;
         }
-        let Some(ws) = self
-            .monitors
-            .get_mut(&source.0)
-            .and_then(|monitor| monitor.workspaces.get_mut(&source.1))
-        else {
+        let Some(column) = self.detach_workspace_transfer_column(source, None) else {
             return;
         };
-        if source.2 >= ws.columns.len() {
-            return;
-        }
-        let column = ws.columns.remove(source.2);
         let windows: Vec<WindowId> = column.tiles.iter().map(|tile| tile.window_id).collect();
         let selected = column.active_window();
         self.repair_workspace_move_cursor(source.0, source.1, source.2);
@@ -326,7 +456,10 @@ impl TilingEngine {
                 monitor.focus_ring.remove(*window);
             }
         }
-        self.insert_workspace_column(destination.0, destination.1, column);
+        match self.grid_insert_index(destination.0, destination.1, anchor_x) {
+            Some(at) => self.insert_workspace_column_at(destination.0, destination.1, column, at),
+            None => self.insert_workspace_column(destination.0, destination.1, column),
+        }
         self.finish_workspace_transfer(
             source.0,
             destination,
@@ -335,27 +468,136 @@ impl TilingEngine {
             backend,
         );
     }
+    fn workspace_transfer_column_x(
+        &self,
+        output: OutputId,
+        workspace: i32,
+        window: WindowId,
+    ) -> Option<i32> {
+        let monitor = self.monitors.get(&output)?;
+        let ws = monitor.workspaces.get(&workspace)?;
+        let column = ws.find_window_column(window)?;
+        let cfg = self.effective_config_for_workspace(output, workspace);
+        let (explicit, minimums, maximums) = Self::column_inputs(ws);
+        let (widths, _) = Self::column_widths_with_limits(
+            &explicit,
+            &minimums,
+            &maximums,
+            Self::precise_tiling_area(monitor, cfg).width,
+            cfg.column_gap,
+            cfg,
+        );
+        Some(widths[..column].iter().fold(0i32, |x, width| {
+            x.saturating_add(*width).saturating_add(cfg.column_gap)
+        }))
+    }
+
+    /// niri e19df12 keeps the view offset relative to the selected column.
+    /// Rebase our absolute strip coordinate around every transfer: even a right
+    /// removal or stack extraction can change widths preceding a surviving anchor.
+    pub(super) fn detach_workspace_transfer_column(
+        &mut self,
+        source: (OutputId, i32, usize),
+        window: Option<WindowId>,
+    ) -> Option<Column> {
+        let anchor = {
+            let monitor = self.monitors.get(&source.0)?;
+            let ws = monitor.workspaces.get(&source.1)?;
+            if source.2 >= ws.columns.len() {
+                return None;
+            }
+            let selected = (monitor.active_workspace == source.1)
+                .then_some(monitor.focus_window)
+                .flatten()
+                .and_then(|window| ws.find_window_column(window).map(|column| (column, window)))
+                .or_else(|| ws.remembered_focus());
+            selected
+                .filter(|(column, selected)| match window {
+                    Some(window) => window != *selected,
+                    None => source.2 != *column,
+                })
+                .and_then(|(_, window)| {
+                    self.workspace_transfer_column_x(source.0, source.1, window)
+                        .map(|x| (window, x))
+                })
+        };
+        let column = {
+            let ws = self
+                .monitors
+                .get_mut(&source.0)?
+                .workspaces
+                .get_mut(&source.1)?;
+            let column = ws.columns.get_mut(source.2)?;
+            if let Some(window) = window {
+                column.index_of(window)?;
+                if column.tiles.len() > 1 {
+                    // Keep the requested proportion/logical width, not just its
+                    // source-output pixel cache, when splitting a stack.
+                    let mut moved = column.clone();
+                    let tile = column.remove_tile(window)?;
+                    moved.tiles = vec![tile];
+                    moved.select_window(window);
+                    moved
+                } else {
+                    ws.columns.remove(source.2)
+                }
+            } else {
+                ws.columns.remove(source.2)
+            }
+        };
+        if let Some((window, old_x)) = anchor {
+            if let Some(new_x) = self.workspace_transfer_column_x(source.0, source.1, window) {
+                let delta = new_x.saturating_sub(old_x);
+                let monitor = self.monitors.get_mut(&source.0)?;
+                let ws = monitor.workspaces.get_mut(&source.1)?;
+                ws.scroll_offset.x = ws.scroll_offset.x.saturating_add(delta);
+                // ScrollX belongs only to this output's active workspace.
+                // An inactive source must not rebase another workspace's camera.
+                if monitor.active_workspace == source.1 {
+                    self.animation.translate(
+                        &crate::layout::AnimationTarget::ScrollX(source.0),
+                        delta as f64,
+                    );
+                }
+            }
+        }
+        Some(column)
+    }
 
     fn insert_workspace_column(&mut self, output: OutputId, workspace: i32, column: Column) {
         let Some(position) = self.workspace_insertion_column(output, workspace) else {
             return;
         };
-        if let Some(monitor) = self.monitors.get_mut(&output) {
-            if let Some(ws) = monitor.workspaces.get_mut(&workspace) {
-                let selected = ws
-                    .remembered_focus()
-                    .map(|(_, window)| window)
-                    .or_else(|| column.active_window());
-                ws.columns.insert(position, column);
-                if let Some(window) = selected {
-                    ws.remember_focus(window);
-                }
-                // Keep the existing target selected even if insertion shifted its index.
-                if monitor.active_workspace == workspace {
-                    if let Some(window) = monitor.focus_window {
-                        if let Some(column) = ws.find_window_column(window) {
-                            monitor.focus_column = Some(column);
-                        }
+        self.insert_workspace_column_at(output, workspace, column, position);
+    }
+
+    /// Insert a column at an explicit index (wiri `unified-grid` rule 3: the index the
+    /// anchor x falls into, not niri's "next to the active column").
+    pub(super) fn insert_workspace_column_at(
+        &mut self,
+        output: OutputId,
+        workspace: i32,
+        column: Column,
+        position: usize,
+    ) {
+        let Some(monitor) = self.monitors.get_mut(&output) else {
+            return;
+        };
+        if let Some(ws) = monitor.workspaces.get_mut(&workspace) {
+            let position = position.min(ws.columns.len());
+            let selected = ws
+                .remembered_focus()
+                .map(|(_, window)| window)
+                .or_else(|| column.active_window());
+            ws.columns.insert(position, column);
+            if let Some(window) = selected {
+                ws.remember_focus(window);
+            }
+            // Keep the existing target selected even if insertion shifted its index.
+            if monitor.active_workspace == workspace {
+                if let Some(window) = monitor.focus_window {
+                    if let Some(column) = ws.find_window_column(window) {
+                        monitor.focus_column = Some(column);
                     }
                 }
             }
@@ -363,7 +605,12 @@ impl TilingEngine {
     }
 
     /// Repair only cursors whose window left. Untouched source/target cursors are stable.
-    fn repair_workspace_move_cursor(&mut self, output: OutputId, workspace: i32, near: usize) {
+    pub(super) fn repair_workspace_move_cursor(
+        &mut self,
+        output: OutputId,
+        workspace: i32,
+        near: usize,
+    ) {
         let active_float = self
             .monitors
             .get(&output)
@@ -408,7 +655,7 @@ impl TilingEngine {
         }
     }
 
-    fn finish_workspace_transfer(
+    pub(super) fn finish_workspace_transfer(
         &mut self,
         source: OutputId,
         destination: (OutputId, i32),
@@ -416,6 +663,7 @@ impl TilingEngine {
         focus: Option<WindowId>,
         backend: &BackendHandle,
     ) {
+        self.refresh_float_presets();
         self.maintain_empty_workspace(source);
         if source != destination.0 {
             self.maintain_empty_workspace(destination.0);

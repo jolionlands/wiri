@@ -4,11 +4,25 @@ use super::{BackendHandle, DrawMode, TilingEngine};
 use crate::layout::workspace::ColumnDisplay;
 use crate::utils::{OutputId, WindowId};
 
+/// The pixels a placed tab indicator takes from its column (niri `tab_indicator.rs:323-335`,
+/// `extra_size`): the logical width and the gap, each rounded through the output scale on its
+/// own, then their sum, never below zero. `zoom` shrinks the strip in the overview, where the
+/// same physical pixels are scaled down again.
+pub(super) fn indicator_space(
+    style: &crate::config::TabIndicatorStyle,
+    zoom: f64,
+    scale: f64,
+) -> u32 {
+    let factor = zoom * crate::layout::metrics::valid_scale(scale);
+    ((style.width * factor).round() + (style.gap * factor).round()).max(0.0) as u32
+}
+
 pub(super) fn reserve_indicator(
     mut rect: crate::utils::Rect,
     column: &crate::layout::Column,
     style: &crate::config::TabIndicatorStyle,
     zoom: f64,
+    scale: f64,
     sizing: DrawMode,
 ) -> crate::utils::Rect {
     use crate::config::TabPosition;
@@ -20,9 +34,8 @@ pub(super) fn reserve_indicator(
     {
         return rect;
     }
-    // niri rounds each logical dimension to physical pixels before adding them. In
-    // particular a negative gap can cancel all of the reserved space, but never add it.
-    let space = ((style.width * zoom).round() + (style.gap * zoom).round()).max(0.0) as u32;
+    // A negative gap can cancel all of the reserved space, but never add it.
+    let space = indicator_space(style, zoom, scale);
     match style.position {
         TabPosition::Left => {
             let n = space.min(rect.size.w.saturating_sub(1));
@@ -223,7 +236,7 @@ mod tests {
         ] {
             style.position = position;
             assert_eq!(
-                reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+                reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
                 expected
             );
         }
@@ -238,23 +251,23 @@ mod tests {
         };
         let area = Rect::new(100, 200, 400, 600);
         for mode in [DrawMode::Exact, DrawMode::Edges] {
-            assert_eq!(reserve_indicator(area, &col, &style, 1.0, mode), area);
+            assert_eq!(reserve_indicator(area, &col, &style, 1.0, 1.0, mode), area);
         }
         // maximize-column changes the slot width, not its DrawMode.
         col.maximized = true;
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             Rect::new(109, 200, 391, 600)
         );
         style.off = true;
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             area
         );
         style.off = false;
         style.place_within_column = false;
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             area
         );
     }
@@ -270,12 +283,12 @@ mod tests {
         };
         let area = Rect::new(0, 0, 400, 600);
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             Rect::new(4, 0, 396, 600)
         );
         style.gap = -65535.0;
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             area
         );
         style.gap = 5.0;
@@ -283,20 +296,46 @@ mod tests {
         style.length = 0.0;
         // Rendering has a one-physical-pixel minimum; reservation intentionally uses raw width.
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             Rect::new(5, 0, 395, 600)
         );
         style.hide_when_single_tab = true;
         col.tiles.truncate(1);
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             area
         );
         style.hide_when_single_tab = false;
         col.display = ColumnDisplay::Stacked;
         assert_eq!(
-            reserve_indicator(area, &col, &style, 1.0, DrawMode::Inset),
+            reserve_indicator(area, &col, &style, 1.0, 1.0, DrawMode::Inset),
             area
+        );
+    }
+
+    #[test]
+    fn indicator_reservation_projects_each_dimension_through_the_output_scale() {
+        // niri tab_indicator.rs:323-335 rounds the width and the gap through the output
+        // scale, each on its own, and reserves their sum.
+        let col = column();
+        let style = crate::config::TabIndicatorStyle {
+            place_within_column: true,
+            width: 7.0,
+            gap: 3.0,
+            ..crate::config::TabIndicatorStyle::default()
+        };
+        let area = Rect::new(0, 0, 400, 600);
+        for (scale, reserve) in [(1.0, 10), (1.25, 13), (1.5, 16), (2.0, 20)] {
+            assert_eq!(
+                reserve_indicator(area, &col, &style, 1.0, scale, DrawMode::Inset),
+                Rect::new(reserve, 0, 400 - reserve as u32, 600),
+                "width 7 and gap 3 at scale {scale}"
+            );
+        }
+        // The overview zoom still shrinks what is reserved for the strip it is drawn on.
+        assert_eq!(
+            reserve_indicator(area, &col, &style, 0.5, 1.0, DrawMode::Inset),
+            Rect::new(6, 0, 394, 600)
         );
     }
 

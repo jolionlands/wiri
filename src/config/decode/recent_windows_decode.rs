@@ -44,12 +44,14 @@ impl Decoder {
                                 }
                             }
                             "padding" => {
-                                if let Some(v) = self.arg_number(option, 0.0, 100_000.0) {
+                                // niri: `padding: Option<FloatOrInt<0, 65535>>`
+                                // (niri-config/src/recent_windows.rs:95-100).
+                                if let Some(v) = self.arg_number(option, 0.0, 65535.0) {
                                     config.highlight.padding = v;
                                 }
                             }
                             "corner-radius" => {
-                                if let Some(v) = self.arg_number(option, 0.0, 100_000.0) {
+                                if let Some(v) = self.arg_number(option, 0.0, 65535.0) {
                                     config.highlight.corner_radius = v;
                                 }
                             }
@@ -66,7 +68,9 @@ impl Decoder {
                     for option in child.kids() {
                         match norm(&option.name).as_str() {
                             "max-height" => {
-                                if let Some(v) = self.arg_number(option, 1.0, 100_000.0) {
+                                // niri: `max_height: Option<FloatOrInt<1, 65535>>`
+                                // (niri-config/src/recent_windows.rs:127-132).
+                                if let Some(v) = self.arg_number(option, 1.0, 65535.0) {
                                     config.previews.max_height = v;
                                 }
                             }
@@ -116,11 +120,13 @@ impl Decoder {
     fn recent_milliseconds(&mut self, node: &Node) -> Option<u32> {
         let value = self.one_arg(node)?;
         match value.as_i64() {
-            Some(n) if (0..=u32::MAX as i64).contains(&n) => Some(n as u32),
+            // niri: `debounce_ms: Option<u16>`, `open_delay_ms: Option<u16>`
+            // (niri-config/src/recent_windows.rs:33-35).
+            Some(n) if (0..=65535).contains(&n) => Some(n as u32),
             _ => {
                 self.error(
                     value.pos,
-                    "expected an integer millisecond delay between 0 and 4294967295",
+                    "expected an integer millisecond delay between 0 and 65535",
                 );
                 None
             }

@@ -1,11 +1,18 @@
 use super::*;
 use crate::config::types::SizeSpec;
 
-impl TilingEngine {
-    pub(super) fn column_presets(&self, output: OutputId) -> Vec<SizeSpec> {
-        Self::column_presets_from_config(self.active_workspace_config(output))
-    }
+/// Old effective options and apparent geometry, retained only while publishing
+/// an infrequent configuration change. The window IDs guard column identity.
+pub(super) struct TiledHeightSnapshot {
+    output: OutputId,
+    workspace: i32,
+    column: usize,
+    windows: Vec<WindowId>,
+    presets: Vec<SizeSpec>,
+    rendered: Vec<i32>,
+}
 
+impl TilingEngine {
     pub(super) fn column_presets_for_workspace(
         &self,
         output: OutputId,
@@ -28,7 +35,21 @@ impl TilingEngine {
 
     /// `layout { preset-window-heights }`, or niri's default thirds/half/two-thirds.
     pub(super) fn window_height_presets(&self, output: OutputId) -> Vec<SizeSpec> {
-        let configured = &self.active_workspace_config(output).preset_window_heights;
+        Self::window_height_presets_from_config(self.active_workspace_config(output))
+    }
+
+    fn window_height_presets_for_workspace(
+        &self,
+        output: OutputId,
+        workspace: i32,
+    ) -> Vec<SizeSpec> {
+        Self::window_height_presets_from_config(
+            self.effective_config_for_workspace(output, workspace),
+        )
+    }
+
+    fn window_height_presets_from_config(cfg: &LayoutConfig) -> Vec<SizeSpec> {
+        let configured = &cfg.preset_window_heights;
         if configured.is_empty() {
             Self::PRESET_WINDOW_PROPORTIONS
                 .iter()
@@ -39,6 +60,177 @@ impl TilingEngine {
         }
     }
 
+    /// Read the old views before publishing either the global layout or caches.
+    /// Hidden tabs are projected independently by the pure geometry helper.
+    pub(super) fn capture_tiled_height_presets(&self) -> Vec<TiledHeightSnapshot> {
+        let mut snapshots = Vec::new();
+        for (output, monitor) in self.monitors.iter() {
+            for (workspace, strip) in &monitor.workspaces {
+                let presets = self.window_height_presets_for_workspace(*output, *workspace);
+                for (column, tiles) in strip.columns.iter().enumerate() {
+                    if tiles.tiles.is_empty() {
+                        continue;
+                    }
+                    let Some(rendered) =
+                        self.tiled_column_rendered_heights(*output, *workspace, column)
+                    else {
+                        continue;
+                    };
+                    snapshots.push(TiledHeightSnapshot {
+                        output: *output,
+                        workspace: *workspace,
+                        column,
+                        windows: tiles.tiles.iter().map(|tile| tile.window_id).collect(),
+                        presets: presets.clone(),
+                        rendered,
+                    });
+                }
+            }
+        }
+        snapshots
+    }
+
+    /// niri Column::update_config converts every height to Auto when its
+    /// effective list changes, including Fixed requests unrelated to presets.
+    pub(super) fn refresh_tiled_height_presets(&mut self, snapshots: Vec<TiledHeightSnapshot>) {
+        for snapshot in snapshots {
+            if snapshot.presets
+                == self.window_height_presets_for_workspace(snapshot.output, snapshot.workspace)
+            {
+                continue;
+            }
+            let Some(column) = self
+                .monitors
+                .get_mut(&snapshot.output)
+                .and_then(|monitor| monitor.workspaces.get_mut(&snapshot.workspace))
+                .and_then(|workspace| workspace.columns.get_mut(snapshot.column))
+            else {
+                continue;
+            };
+            if column.tiles.len() != snapshot.rendered.len()
+                || !column
+                    .tiles
+                    .iter()
+                    .map(|tile| tile.window_id)
+                    .eq(snapshot.windows.iter().copied())
+            {
+                continue;
+            }
+            let mut sorted = snapshot.rendered.clone();
+            sorted.sort_unstable();
+            let median = sorted[sorted.len() / 2].max(1) as f32;
+            for (tile, height) in column.tiles.iter_mut().zip(snapshot.rendered) {
+                tile.height_weight = height.max(1) as f32 / median;
+                tile.preferred_height = None;
+                tile.height_proportion = None;
+                tile.height_preset_idx = None;
+            }
+            // Clear the source as well as derived metadata: a later limit sync
+            // must not restore an opening default after the Auto conversion.
+            for window in snapshot.windows {
+                self.rule_heights.remove(&window);
+            }
+        }
+    }
+
+    /// Preset indices survive position changes and reloads of the same list, but
+    /// never refer to a replacement list, even if it is changed back before use.
+    pub(super) fn refresh_float_presets(&mut self) {
+        let lists: Vec<_> = self
+            .float_homes
+            .iter()
+            .map(|(window, home)| {
+                (
+                    *window,
+                    self.column_presets_for_workspace(home.output, home.workspace),
+                    self.window_height_presets_for_workspace(home.output, home.workspace),
+                )
+            })
+            .collect();
+        for (window, width_presets, height_presets) in lists {
+            if let Some(home) = self.float_homes.get_mut(&window) {
+                if home.width_preset_list != width_presets {
+                    home.width_preset_idx = None;
+                    home.width_preset_list = width_presets;
+                }
+                if home.height_preset_list != height_presets {
+                    home.height_preset_idx = None;
+                    home.height_preset_list = height_presets;
+                }
+            }
+        }
+    }
+
+    /// Floating heights use their own output's work area and logical preset
+    /// list, without the gaps or border band belonging to tiled columns.
+    pub fn float_cycle_height(
+        &mut self,
+        window: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        let Some((output, workspace)) = self.float_location(window) else {
+            return;
+        };
+        let Some((work, scale)) = self.monitors.get(&output).map(|m| {
+            (
+                m.work_area,
+                if m.scale_factor.is_finite() && m.scale_factor > 0.0 {
+                    m.scale_factor
+                } else {
+                    1.0
+                },
+            )
+        }) else {
+            return;
+        };
+        let Some(rect) = self.float_action_rect(window, backend) else {
+            return;
+        };
+        let presets = self.window_height_presets_for_workspace(output, workspace);
+        let resolved: Vec<f64> = presets
+            .iter()
+            .map(|spec| match spec {
+                SizeSpec::Proportion(p) => work.size.h as f64 / scale * p,
+                SizeSpec::Fixed(px) => *px as f64,
+            })
+            .collect();
+        let remembered = self.float_homes.get(&window).and_then(|home| {
+            if home.height_preset_list == presets {
+                home.height_preset_idx
+            } else {
+                None
+            }
+        });
+        let current = rect.size.h as f64 / scale;
+        let len = presets.len();
+        let next = match remembered {
+            Some(index) if forwards => (index + 1) % len,
+            Some(index) => (index + len - 1) % len,
+            None if forwards => resolved
+                .iter()
+                .position(|height| current + 1.0 < *height)
+                .unwrap_or(0),
+            None => resolved
+                .iter()
+                .rposition(|height| *height + 1.0 < current)
+                .unwrap_or(len - 1),
+        };
+        let height = (resolved[next].round().clamp(1.0, 100_000.0) * scale)
+            .round()
+            .max(1.0) as u32;
+        self.place_float_rect(
+            window,
+            Rect::new(rect.loc.x, rect.loc.y, rect.size.w, height),
+            true,
+            backend,
+        );
+        if let Some(home) = self.float_homes.get_mut(&window) {
+            home.height_preset_idx = Some(next);
+            home.height_preset_list = presets;
+        }
+    }
+
     /// niri `switch-preset-window-width` / `-back`: in the scrolling layout a window fills
     /// its column horizontally, so the window presets are the column presets (niri resolves
     /// them to the same width request).
@@ -46,106 +238,129 @@ impl TilingEngine {
         self.switch_preset_column_width(forwards, backend);
     }
 
-    /// niri `switch-preset-window-height` (`forwards`) and `-back`: the focused window takes
-    /// the next of `preset-window-heights` (a third, a half and two thirds of its column by
-    /// default).  The other windows of the column share what is left by their weights.  A
-    /// column of one window (and a tabbed column) always fills the view, so nothing visible
-    /// changes there; the choice is remembered all the same (niri leaves the blank space).
+    /// Cycle the focused tile's configured height. Sole and tabbed columns
+    /// retain the request and may leave blank space below it.
     pub fn switch_preset_window_height(&mut self, forwards: bool, backend: &BackendHandle) {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        let cfg = self.active_workspace_config(output).clone();
-        let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
-        // The column's room: the view height less the outer gaps, borders and the gaps
-        // between the tiles — the same numbers the layout pass uses.
-        let metrics = {
-            let Some(monitor) = self.monitors.get(&output) else {
-                return;
-            };
-            let view_h = monitor.work_area.size.h as i32
-                - cfg.outer_gaps.0
-                - cfg.outer_gaps.2
-                - cfg.reserve_top as i32
-                - cfg.reserve_bottom as i32;
-            let gap = cfg.window_gap;
-            let Some(column) = monitor
-                .workspace()
-                .and_then(|w| monitor.focus_column.and_then(|i| w.columns.get(i)))
-            else {
-                return;
-            };
-            let Some(window) = monitor.focus_window else {
-                return;
-            };
-            let Some(index) = column.index_of(window) else {
-                return;
-            };
-            let available = (view_h - gap * (column.tiles.len() as i32 - 1)).max(1);
-            let tile = &column.tiles[index];
-            let current = match (tile.preferred_height, tile.height_proportion) {
-                (Some(px), _) => px as i32,
-                (None, Some(proportion)) => proportion_px(available, gap, proportion),
-                (None, None) => {
-                    let weights: f32 = column.tiles.iter().map(|t| t.height_weight.max(0.1)).sum();
-                    let mine = column.tiles[index].height_weight.max(0.1);
-                    (available as f32 * mine / weights.max(0.1)).round() as i32
-                }
-            };
-            (
-                monitor.focus_column.unwrap_or(0),
-                index,
-                current,
-                available,
-                gap,
-                tile.height_preset_idx,
-                window,
-            )
+        let Some(monitor) = self.monitors.get(&output) else {
+            return;
         };
-        let (column_index, tile_index, current, available, gap, remembered, window) = metrics;
+        let (Some(column_index), Some(window)) = (monitor.focus_column, monitor.focus_window)
+        else {
+            return;
+        };
+        let workspace = monitor.active_workspace;
+        self.switch_tiled_window_height_at(
+            output,
+            workspace,
+            column_index,
+            window,
+            forwards,
+            backend,
+        );
+    }
+
+    /// niri `switch-preset-window-height[-back]` for a named tile (`SwitchPresetWindowHeightById`,
+    /// niri:src/input/mod.rs:1704-1717): the tile's own column, on whatever workspace or output
+    /// it is, without selecting or activating anything. A floating window is cycled by
+    /// `float_cycle_height` instead.
+    pub fn switch_preset_window_height_for(
+        &mut self,
+        window: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        if self.floating_windows.contains(&window) {
+            self.float_cycle_height(window, forwards, backend);
+            return;
+        }
+        let Some((output, workspace, column_index)) = self.locate_window(window) else {
+            return;
+        };
+        self.switch_tiled_window_height_at(
+            output,
+            workspace,
+            column_index,
+            window,
+            forwards,
+            backend,
+        );
+    }
+
+    fn switch_tiled_window_height_at(
+        &mut self,
+        output: OutputId,
+        workspace: i32,
+        column_index: usize,
+        window: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        let Some(monitor) = self.monitors.get(&output) else {
+            return;
+        };
+        let Some(column) = monitor
+            .workspaces
+            .get(&workspace)
+            .and_then(|workspace| workspace.columns.get(column_index))
+        else {
+            return;
+        };
+        let Some(tile_index) = column.index_of(window) else {
+            return;
+        };
+        let remembered = column.tiles[tile_index].height_preset_idx;
+        let cfg = self.effective_config_for_workspace(output, workspace);
+        let view_h = Self::precise_tiling_area(monitor, cfg).height;
+        let gap = cfg.window_gap;
+        let scale = monitor.scale_factor;
+        let border = 2 * self.rule_border_inset(window, cfg);
+        let indicator = self.vertical_tab_indicator_space(column, cfg, 1.0);
+        let Some(rendered) = self.tiled_column_rendered_heights(output, workspace, column_index)
+        else {
+            return;
+        };
+        let current = rendered[tile_index];
         let presets = self.window_height_presets(output);
-        // A fixed height in `preset-window-heights` is the height of the *window*, as niri
-        // counts it, and `HeightSpec::fixed` is in pixels of the whole tile: the border wiri
-        // paints around the window sits on top of it, exactly as `set-window-height "300"`
-        // (`SizeChange::SetFixed` adds the border) and a `default-window-height` rule
-        // (`rules::spec_px`) resolve the same number.  Without the border band a `fixed 300`
-        // preset came out 2 * border px shorter than the same height asked for any other way.
-        let border = 2 * cfg.border_inset();
+        // Proportions use the full inner view, including the gap basis; fixed
+        // entries are client sizes with the target's physical border added.
         let resolved: Vec<i32> = presets
             .iter()
             .map(|spec| match spec {
-                SizeSpec::Proportion(p) => proportion_px(available, gap, *p),
-                SizeSpec::Fixed(px) => (*px as f64 * scale).round() as i32 + border,
+                SizeSpec::Proportion(share) => proportion_px(view_h, gap, *share)
+                    .saturating_sub(indicator)
+                    .max(1),
+                SizeSpec::Fixed(px) => ((*px as f64 * scale).round() as i32 + border).max(1),
             })
             .collect();
         let preset = Self::next_preset_index(remembered, current, &resolved, forwards);
-        let changed = self
-            .monitors
-            .get_mut(&output)
-            .and_then(|monitor| monitor.workspace_mut())
-            .and_then(|workspace| workspace.columns.get_mut(column_index))
-            .and_then(|column| column.tiles.get_mut(tile_index))
-            .map(|tile| {
-                match presets[preset] {
-                    SizeSpec::Proportion(share) => {
-                        tile.height_proportion = Some(share);
-                        tile.preferred_height = None;
-                    }
-                    SizeSpec::Fixed(px) => {
-                        tile.height_proportion = None;
-                        tile.preferred_height =
-                            Some((((px as f64 * scale).round() as i32 + border).max(1)) as u32);
-                    }
-                }
-                tile.height_preset_idx = Some(preset);
-            })
-            .is_some();
-        if !changed {
+        if !self.prepare_tiled_height_owner(output, workspace, column_index, window, &rendered) {
             return;
         }
-        // The height the user chose replaces the one a window rule asked for.
+        let Some(tile) = self
+            .monitors
+            .get_mut(&output)
+            .and_then(|monitor| monitor.workspaces.get_mut(&workspace))
+            .and_then(|workspace| workspace.columns.get_mut(column_index))
+            .and_then(|column| column.tiles.get_mut(tile_index))
+        else {
+            return;
+        };
+        match presets[preset] {
+            SizeSpec::Proportion(share) => {
+                tile.height_proportion = Some(share);
+                tile.preferred_height = None;
+            }
+            SizeSpec::Fixed(_) => {
+                tile.height_proportion = None;
+                tile.preferred_height = Some(resolved[preset] as u32);
+            }
+        }
+        tile.height_preset_idx = Some(preset);
         self.rule_heights.remove(&window);
-        self.apply_layout_for_monitor(output, backend);
+        self.apply_layout_for_monitor_with_activation(output, backend, false);
     }
 }
 
@@ -344,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_window_column_remembers_the_preset_but_fills_the_view() {
+    fn a_single_window_column_remembers_the_preset_and_leaves_blank_space() {
         let (mut engine, be, output) = height_fixture(vec![SizeSpec::Proportion(0.5)]);
         {
             let monitor = engine.monitors.get_mut(&output).unwrap();
@@ -359,9 +574,9 @@ mod tests {
         assert_eq!(
             tile.height_proportion,
             Some(0.5),
-            "the choice is remembered for a column of several windows"
+            "the choice is remembered even for a column of one window"
         );
-        // The layout keeps the historic rule: a lone window fills the column.
+        // A lone preset tile keeps its requested extent rather than filling the view.
         assert_eq!(
             super::super::rules::distribute_heights(
                 600,
@@ -372,7 +587,7 @@ mod tests {
                     max: 0,
                 }]
             ),
-            vec![600]
+            vec![294]
         );
     }
 }

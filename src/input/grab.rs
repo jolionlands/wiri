@@ -98,6 +98,11 @@ impl MoveGrab {
         Arc::ptr_eq(&self.cancelled, &other.cancelled)
     }
 
+    /// Read the latched threshold without advancing a pending tiled move.
+    pub(crate) fn has_drag_started(&self) -> bool {
+        self.drag_started.load(Ordering::Acquire)
+    }
+
     /// niri layout/mod.rs: squared logical displacement must reach 256 * 256
     /// before a tiled window leaves its slot. A click/sub-threshold move is not a drop.
     pub(crate) fn tiled_drag_started(&self, cursor: Point, scale: f64) -> bool {

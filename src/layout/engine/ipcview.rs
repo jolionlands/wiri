@@ -38,6 +38,11 @@ impl TilingEngine {
     /// Duplicate foreground reports do not reorder MRU history. Unmanaged windows
     /// still break a focus interval, but never acquire managed-window history.
     pub(super) fn record_ipc_foreground(&mut self, window: WindowId) {
+        if self.os_foreground != Some(window) {
+            // Any other live focus change ends the converged window's claim that its
+            // broadcast was already made.
+            self.converged_broadcast = None;
+        }
         if self.os_foreground != Some(window) && self.tiled_windows.contains_key(&window) {
             let stamp = self.focus_epoch.elapsed().max(
                 self.last_focus_stamp
@@ -62,7 +67,11 @@ impl TilingEngine {
                 let work = Self::tiling_work_rect(monitor, cfg);
                 use crate::layout::workspace::WorkspaceLayout;
                 let positions = match workspace.layout_mode {
-                    WorkspaceLayout::Scrolling => self.calculate_positions(workspace, work, cfg),
+                    WorkspaceLayout::Scrolling => self.calculate_positions(
+                        workspace,
+                        Self::precise_tiling_area(monitor, cfg),
+                        cfg,
+                    ),
                     WorkspaceLayout::BStack => {
                         self.calculate_positions_bstack(workspace, work, cfg)
                     }
@@ -78,14 +87,22 @@ impl TilingEngine {
                     monitor.bounds,
                 );
                 for (window, rect) in positions {
-                    let inset = if modes.get(&window).copied().unwrap_or(DrawMode::Inset)
-                        == DrawMode::Inset
-                    {
-                        cfg.border_width.max(1)
+                    let normal =
+                        modes.get(&window).copied().unwrap_or(DrawMode::Inset) == DrawMode::Inset;
+                    let inset = if normal {
+                        self.rule_border_inset(window, cfg)
                     } else {
                         0
                     };
-                    layouts.insert(window, layout_geometry(rect, monitor.bounds, scale, inset));
+                    let resolved = self.resolved_window_geometry(window, rect, cfg, inset, normal);
+                    let mut geometry = layout_geometry(resolved.tile, monitor.bounds, scale, inset);
+                    if let Some(width) = resolved.logical_window_size.0 {
+                        geometry.window_size.0 = width;
+                    }
+                    if let Some(height) = resolved.logical_window_size.1 {
+                        geometry.window_size.1 = height;
+                    }
+                    layouts.insert(window, geometry);
                 }
             }
         }
@@ -718,6 +735,180 @@ mod tests {
             layout.tile_pos_in_workspace_view,
             Some((200.0 / 1.5, 100.0))
         );
+    }
+
+    fn geometry_fixture(
+        mut config: crate::config::Config,
+        inactive_layout: Option<crate::config::LayoutConfigPartial>,
+    ) -> (TilingEngine, OutputId, i32, i32) {
+        let mut active = crate::config::WorkspaceConfig::default_config();
+        active.name = "GeometryActive".to_string();
+        let mut inactive = crate::config::WorkspaceConfig::default_config();
+        inactive.name = "GeometryInactive".to_string();
+        inactive.layout_override = inactive_layout;
+        config.workspace = vec![active, inactive];
+        let mut engine = TilingEngine::new(LayoutConfig::from_config(&config));
+        engine.set_full_config(config);
+        let output = OutputId::from_name("ipc-geometry-fractional-scale");
+        engine.register_monitor_with_scale(
+            output,
+            Rect::new(-1920, 120, 1920, 1080),
+            Rect::new(-1920, 120, 1920, 1040),
+            1.5,
+        );
+        let key_of = |name: &str| {
+            engine
+                .monitors
+                .get(&output)
+                .unwrap()
+                .workspaces
+                .iter()
+                .find_map(|(key, workspace)| {
+                    (workspace.name.as_deref() == Some(name)).then_some(*key)
+                })
+                .unwrap()
+        };
+        let active = key_of("GeometryActive");
+        let inactive = key_of("GeometryInactive");
+        for (workspace, id) in [(active, 100), (inactive, 101)] {
+            let window = WindowId::new(id);
+            engine
+                .monitors
+                .get_mut(&output)
+                .unwrap()
+                .workspaces
+                .get_mut(&workspace)
+                .unwrap()
+                .add_window_to_new_column(window);
+            engine.tiled_windows.insert(window, make_window(id));
+        }
+        let monitor = engine.monitors.get_mut(&output).unwrap();
+        monitor.active_workspace = active;
+        monitor.focus_column = Some(0);
+        monitor.focus_window = Some(WindowId::new(100));
+        (engine, output, active, inactive)
+    }
+
+    fn assert_snapshot_matches_calculated_native_allocation(
+        engine: &TilingEngine,
+        output: OutputId,
+        workspace: i32,
+        expected_inset: i32,
+    ) {
+        let monitor = engine.monitors.get(&output).unwrap();
+        assert_eq!(monitor.scale_factor, 1.5);
+        let cfg = engine.effective_config_for_workspace(output, workspace);
+        let strip = &monitor.workspaces[&workspace];
+        let positions =
+            engine.calculate_positions(strip, TilingEngine::tiling_work_rect(monitor, cfg), cfg);
+        assert!(!positions.is_empty());
+        let snapshot = engine.ipc_snapshot();
+        for (window, tile) in positions {
+            // Ordinary tiles use this inset when apply_layout_for_monitor
+            // constructs the native visible allocation. Focus-ring thickness
+            // does not reserve window space; a disabled/zero-width border does
+            // not reserve an artificial pixel either.
+            let inset = engine.rule_border_inset(window, cfg);
+            assert_eq!(inset, expected_inset, "fixture's actual native inset");
+            let native = Rect::new(
+                tile.loc.x + inset,
+                tile.loc.y + inset,
+                tile.size.w.saturating_sub(2 * inset as u32),
+                tile.size.h.saturating_sub(2 * inset as u32),
+            );
+            let layout = &window_of(&snapshot, window.as_isize() as u64).layout;
+            let scale = monitor.scale_factor;
+            assert_eq!(
+                layout.tile_size,
+                (tile.size.w as f64 / scale, tile.size.h as f64 / scale),
+                "tile allocation for workspace {workspace} / {window:?}"
+            );
+            assert_eq!(
+                layout.window_size,
+                (
+                    (native.size.w as f64 / scale).round() as i32,
+                    (native.size.h as f64 / scale).round() as i32,
+                ),
+                "IPC must describe the native visible allocation, workspace {workspace} / {window:?}"
+            );
+            assert_eq!(
+                layout.window_offset_in_tile,
+                (
+                    (native.loc.x - tile.loc.x) as f64 / scale,
+                    (native.loc.y - tile.loc.y) as f64 / scale,
+                ),
+                "IPC inset must match native placement, workspace {workspace} / {window:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_ipc_layout_border_off_matches_native_allocation_at_fractional_scale() {
+        for border_width in [0.0, 7.0] {
+            for ring_width in [0.0, 9.0] {
+                for ring_off in [false, true] {
+                    let mut config = crate::config::Config::default();
+                    config.layout.effects.border.off = true;
+                    config.layout.effects.border.width = border_width;
+                    config.layout.effects.focus_ring.off = ring_off;
+                    config.layout.effects.focus_ring.width = ring_width;
+                    let (engine, output, active, inactive) = geometry_fixture(config, None);
+                    assert_eq!(engine.active_workspace_config(output).border_inset(), 0);
+                    assert_snapshot_matches_calculated_native_allocation(
+                        &engine, output, active, 0,
+                    );
+                    assert_snapshot_matches_calculated_native_allocation(
+                        &engine, output, inactive, 0,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parity_ipc_layout_enabled_border_uses_each_workspaces_own_inset() {
+        let mut config = crate::config::Config::default();
+        config.layout.effects.border.off = false;
+        config.layout.effects.border.width = 3.0;
+        config.layout.effects.focus_ring.width = 0.0;
+        let mut override_layout = crate::config::LayoutConfigPartial::default();
+        let mut border = crate::config::effects::RingStyle::border_default();
+        border.width = 6.0;
+        override_layout.effects.border = Some(border);
+        let mut ring = crate::config::effects::RingStyle::focus_ring_default();
+        ring.width = 11.0;
+        override_layout.effects.focus_ring = Some(ring);
+        override_layout.outer_gaps = Some(23.0);
+        let (engine, output, active, inactive) = geometry_fixture(config, Some(override_layout));
+        assert_ne!(active, inactive);
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().active_workspace,
+            active
+        );
+        // The widths are logical: niri's round_logical_in_physical_max1 at the fixture's
+        // 1.5 scale turns 3 into 4.5 -> 5 and 6 into 9 physical pixels.
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 5);
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, inactive, 9);
+    }
+
+    #[test]
+    fn parity_ipc_layout_inactive_border_off_does_not_inherit_active_inset() {
+        let mut config = crate::config::Config::default();
+        config.layout.effects.border.off = false;
+        config.layout.effects.border.width = 5.0;
+        let mut override_layout = crate::config::LayoutConfigPartial::default();
+        let mut border = crate::config::effects::RingStyle::border_default();
+        border.off = true;
+        border.width = 8.0;
+        override_layout.effects.border = Some(border);
+        let (engine, output, active, inactive) = geometry_fixture(config, Some(override_layout));
+        assert_eq!(
+            engine.monitors.get(&output).unwrap().active_workspace,
+            active
+        );
+        // Logical 5 at the fixture's 1.5 scale is 7.5 -> 8 physical pixels.
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 8);
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, inactive, 0);
     }
 
     #[test]

@@ -94,63 +94,35 @@ impl CloseFade {
     }
 }
 
-/// The fade the daemon installed from the config (`0` = no fade).  The overlay host thread
-/// has no engine, so the setting lives here; a reload replaces it.
-static CLOSE_FADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reload publishes a coherent duration + typed curve snapshot to the host thread.
+/// One lock per install/close preserves all Bezier controls without torn reads;
+/// the host copies the fade and holds no lock while rendering.
+struct CloseFadeSetting(Mutex<Option<CloseFade>>);
 
-/// A stable code for a curve, so the setting can cross the thread boundary as one number
-/// without depending on the enum's declaration order.
-fn curve_code(curve: crate::layout::animation::Easing) -> u64 {
-    use crate::layout::animation::Easing;
-    match curve {
-        Easing::None => 0,
-        Easing::Linear => 1,
-        Easing::EaseIn => 2,
-        Easing::EaseOut => 3,
-        Easing::EaseInOut => 4,
-        Easing::CubicOut => 5,
-        Easing::QuadOut => 6,
-        Easing::ExpoOut => 7,
+impl CloseFadeSetting {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn set(&self, kind: crate::layout::animation::AnimationKind) {
+        *self.0.lock() = CloseFade::of(kind);
+    }
+
+    fn get(&self) -> Option<CloseFade> {
+        *self.0.lock()
     }
 }
 
-fn curve_from_code(code: u64) -> crate::layout::animation::Easing {
-    use crate::layout::animation::Easing;
-    match code {
-        0 => Easing::None,
-        1 => Easing::Linear,
-        2 => Easing::EaseIn,
-        3 => Easing::EaseOut,
-        4 => Easing::EaseInOut,
-        5 => Easing::CubicOut,
-        7 => Easing::ExpoOut,
-        _ => Easing::QuadOut,
-    }
-}
+static CLOSE_FADE: CloseFadeSetting = CloseFadeSetting::new();
 
 /// Install `animations { recent-windows-close }` for the overlay host.
 pub fn set_close_fade(kind: crate::layout::animation::AnimationKind) {
-    use std::sync::atomic::Ordering;
-    let encoded = CloseFade::of(kind).map_or(0, |fade| {
-        // Lower 32 bits: milliseconds.  Upper byte: curve, so a reload can change the shape
-        // without the host holding a lock.
-        fade.duration_ms as u64 | (curve_code(fade.curve) << 32)
-    });
-    CLOSE_FADE.store(encoded, Ordering::Release);
+    CLOSE_FADE.set(kind);
 }
 
 /// The fade the overlay host should run when it closes, if any.
 pub fn close_fade() -> Option<CloseFade> {
-    use std::sync::atomic::Ordering;
-    let encoded = CLOSE_FADE.load(Ordering::Acquire);
-    if encoded == 0 {
-        return None;
-    }
-    let duration_ms = (encoded & 0xFFFF_FFFF) as u32;
-    (duration_ms > 0).then_some(CloseFade {
-        duration_ms,
-        curve: curve_from_code(encoded >> 32),
-    })
+    CLOSE_FADE.get()
 }
 
 #[derive(Debug, Default)]
@@ -658,18 +630,60 @@ mod tests {
 
     #[test]
     fn the_installed_fade_round_trips_through_the_published_setting() {
+        let setting = CloseFadeSetting::new();
         // Nothing installed: no fade (a daemon with animations off stays as it was).
-        set_close_fade(AnimationKind::Off);
-        assert!(close_fade().is_none());
-        set_close_fade(AnimationKind::Easing {
+        setting.set(AnimationKind::Off);
+        assert!(setting.get().is_none());
+        setting.set(AnimationKind::Easing {
             duration_ms: 150,
             curve: Easing::ExpoOut,
         });
-        let fade = close_fade().expect("a fade");
+        let fade = setting.get().expect("a fade");
         assert_eq!(fade.duration_ms(), 150);
         assert_eq!(fade.curve, Easing::ExpoOut);
-        set_close_fade(AnimationKind::Off);
-        assert!(close_fade().is_none());
+        setting.set(AnimationKind::Off);
+        assert!(setting.get().is_none());
+    }
+
+    #[test]
+    fn parity_published_fade_preserves_bezier_controls_across_reload() {
+        let setting = CloseFadeSetting::new();
+        let curve = Easing::CubicBezier {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 0.0,
+            y2: 1.0,
+        };
+        setting.set(AnimationKind::Easing {
+            duration_ms: 1000,
+            curve,
+        });
+        let old = setting.get().unwrap();
+        assert_eq!(old.curve, curve);
+        // x=.001 inverts to t=.1, y=.028, alpha rounds to 248.
+        assert_eq!(old.alpha(1), 248);
+        setting.set(AnimationKind::Easing {
+            duration_ms: 2000,
+            curve: Easing::CubicBezier {
+                x1: 0.0,
+                y1: 2.0,
+                x2: 1.0,
+                y2: 2.0,
+            },
+        });
+        let new = setting.get().unwrap();
+        assert_eq!(new.duration_ms(), 2000);
+        assert_eq!(new.alpha(1000), 0, "opacity clamps valid curve overshoot");
+        assert_eq!(new.alpha(0), 255);
+        assert_eq!(new.alpha(2000), 0);
+        assert_eq!(
+            old.duration_ms(),
+            1000,
+            "a running fade retains its snapshot"
+        );
+        assert_eq!(old.alpha(1), 248);
+        setting.set(AnimationKind::Off);
+        assert!(setting.get().is_none());
     }
 
     fn windows() -> Vec<RecentWindow> {

@@ -22,7 +22,7 @@ winget install -e --id Git.Git
 ## 2. Clone and build (~1 minute on a release build)
 
 ```powershell
-git clone https://github.com/wiri-wm/wiri.git
+git clone https://github.com/jolionlands/wiri.git
 cd wiri
 cargo build --release
 ```

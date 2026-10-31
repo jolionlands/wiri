@@ -213,9 +213,51 @@ impl TilingEngine {
             })
     }
 
+    /// niri's `reload_config` unnames the workspaces whose configured name is gone from the new
+    /// config (niri e19df12 src/niri.rs:1701-1710).  Runtime renames stay: wiri records exactly
+    /// the names it applied from a config in `configured_workspace_names`, and only those are
+    /// removed here.
+    pub(crate) fn unname_removed_workspaces(&mut self) {
+        let declared: HashSet<String> = self
+            .full_config
+            .as_ref()
+            .map(|config| {
+                config
+                    .workspace
+                    .iter()
+                    .filter(|workspace| !workspace.name.is_empty())
+                    .map(|workspace| workspace.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let removed: Vec<String> = self
+            .configured_workspace_names
+            .difference(&declared)
+            .cloned()
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        for monitor in self.monitors.values_mut() {
+            for workspace in monitor.workspaces.values_mut() {
+                if workspace
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| removed.iter().any(|gone| gone == name))
+                {
+                    workspace.name = None;
+                }
+            }
+        }
+        for name in removed {
+            self.configured_workspace_names.remove(&name);
+        }
+    }
+
     /// Apply each configured name once per session, in declaration order. Missing
     /// outputs remain pending, and config reloads never undo runtime renames/unsets.
     pub(crate) fn ensure_named_workspaces(&mut self) {
+        self.unname_removed_workspaces();
         let declarations: Vec<_> = self
             .full_config
             .as_ref()
