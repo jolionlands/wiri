@@ -87,6 +87,57 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - niri reads the size a client committed as the truth for its column and the width the column asked for as a request (`src/layout/scrolling.rs:4860-4875` `Column::width`, `:1287-1305` `ScrollingSpace::update_window` moves the neighbours with it, `:1293-1300` the intent is what the next configure asks for, and the same value is not asked for twice). wiri now does the same for a window that changes its own size after it was laid out: `TilingEngine::note_window_self_resized` (`layout/engine/self_resize.rs`) reads the window's live outer rectangle, compares it with the one wiri applied last (`applied_state.rect`) and adopts the size into `Tile.observed_width`, which `Column::laid_out_width` turns into the column's laid-out width (reached through `Column::resolved_width`, the position pass and every strip helper). The next target rectangle therefore equals what the window already is: wiri does not ask again, so a grid-snapping terminal that answers 452 to a 462 request settles instead of ping-ponging.
 - Only a size the *window* chose is adopted: an in-flight SetWindowPos batch or animation frame (`applying_batch`, `frame_in_progress`), a native caption/edge loop, a running transition, a floating, fullscreen or maximized tile, overview mode and an unknown target rectangle all reject the report. A request *narrower* than the window's size (an explicit `set-column-width`, a rule `max-width`) clears the observation, so the layout's word returns; `set_width` and `maximize-column` clear it too. A column of several stacked windows also gives the resized one its height (`Tile.preferred_height`, niri `Column::update_window` moving the windows below in tandem, `:4480-4527`), and the camera follows when the resized column is the focused one (`:1381-1401`).
 - 15 pure regressions in `layout/engine/self_resize_parity_tests.rs`; six `h94_*` live gates in `scripts/live-phases/lane-resize.ps1` (owned WinForms fixtures that resize themselves from their own UI thread). All six passed in a focused probe of an owned daemon on 2026-10-31: a 445 px window took 650 px and held it, a 200 px self-growth moved the neighbour 200 px with its own width unchanged and a constant 16 px gap, the shrink moved it back, a 1386 px window held wider than the 1366 px work area, and no `WM_WINDOWPOSCHANGED` arrived for 2.2 s once a size had settled. No timer, polling loop, thread or crate is added: the path runs only when the existing WinEvent hook reports a size change.
+### Lane SYNTH — touch, pen and drag-and-drop proven with input Windows synthesizes
+- **A real synthetic pointer device, not a mock.** `scripts/live-phases/lane-synth.ps1` creates
+  `CreateSyntheticPointerDevice(PT_TOUCH, 10, POINTER_FEEDBACK_NONE)` and `(PT_PEN, 1, ...)` and
+  injects contact sequences with `InjectSyntheticPointerInput`. No digitizer, tablet or touchscreen
+  is involved. The layout of the four pointer structures is asserted by the probe
+  (`POINTER_INFO=96`, `POINTER_TOUCH_INFO=144`, `POINTER_PEN_INFO=120`, `POINTER_TYPE_INFO=152` on
+  x64) so a wrong ABI cannot be mistaken for a product failure.
+- **What the hook really receives.** A `WH_MOUSE_LL` recorder in the lane (the same hook class wiri
+  installs) proves the promotion: a touch contact produces `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/
+  `WM_LBUTTONUP` with `dwExtraInfo = MI_WP_SIGNATURE | 0x80 | id` (`0xFF5157A0` for contact 32,
+  `0xFF5157AC` for contact 44), a pen tip produces the same messages *without* bit
+  `0x80` (`0xFF515736` for pen contact 54), the pen barrel button is promoted to `WM_RBUTTONDOWN`/`WM_RBUTTONUP` still
+  carrying the pen signature, and ordinary `SendInput` mouse input carries no signature at all. That
+  is exactly the `(extra & 0xFFFFFF00) == 0xFF515700` + `0x80` test `src/input/touchpen.rs::source`
+  makes, so from the hook inward a synthetic contact and a physical digitizer's promoted event are
+  the same message.
+- **Drag-and-drop is a genuine OLE drag.** A WinForms source calls `DoDragDrop` from its own
+  mouse-down, so the capture wiri's heuristic keys on belongs to OLE's `CLIPBRDWNDCLASS` window of
+  the source process (`capture-pid` = the source process, never wiri's) rather than to a bare held
+  button. The pointer then parks in a configured edge zone and the reaction is asserted on native
+  rectangles, the daemon's own `dnd edge frame`/`dnd workspace step` lines and IPC state.
+- **Eleven gates, each in its own `try`/`catch`:** promoted touch signature, promoted pen signature,
+  DnD edge view scroll (the whole strip travels together; frames stop when the zone is left),
+  `dnd-edge-view-scroll` knobs (`trigger-width 140` / `delay-ms 600`: nothing before the delay, frames
+  after it, and a second drag that stays 300 px from the edge never scrolls), hold-to-activate (the
+  native foreground moves to the hovered window while the drag is held), DnD edge workspace switch
+  (one step exactly, no repeat) with the overview opened *under* the drag, touch Mod+drag scrolls a
+  tiled view (−216 px for a 150 px contact drag, top edge unchanged), touch Mod+drag moves a floating
+  window (+96/+64 within 26 px and stable), pen Mod+drag moves a floating window, the pen barrel
+  button runs its `Alt+TabletStylusButton2` bind, and a one-finger vertical pan in the overview steps
+  exactly one workspace while a horizontal pan changes nothing.
+- **Live results (Tridaris, this worktree's release binaries).** A final owned probe run
+  (`.live/synth-probe-20261031-000911`) passed **11/11 enforced gates**; earlier runs in the same
+  session passed the same set plus the observations below. Evidence wording for the matrices is
+  `OS synthetic pointer device (InjectSyntheticPointerInput), no physical digitizer`.
+- **Two honest gaps, recorded as observations, not gates.** (1) The touch-overview long-press pickup
+  is located on screen by finding the fixture's own colour in a screenshot of the overview, and the
+  press landed inside the tile (`press 376,220`, thumbnail `360,204-506,538`), but the picked-up drop
+  never moved the window to a workspace below, so that half of the touch-overview row keeps its gap.
+  (2) A second simultaneous synthetic contact produced no promoted messages in its observation
+  window on this host, so whether Windows promotes it at all is undetermined here and the
+  "second-finger tap toggles floating" half of the touchscreen row stays unproven.
+- **No `src/` change.** The probes demonstrated no wiri defect in the touch, pen or DnD paths: every
+  behavioural gate above passed against unmodified `0c2581d` sources. The lane therefore adds no
+  unit test and no dependency, timer, polling loop or thread to the daemon; its only process-wide
+  object is the probe's own `WH_MOUSE_LL` hook, which exists only while the lane runs.
+- `scripts/probes/lane-synth-probe.ps1` is the standalone runner used for those probes: it supplies
+  the small harness surface the lane needs (`$D`, `$cfg`, `$steps`, `$summary`, `Ctl`, `Rc`,
+  `FocusForm`, `Start-Wiri`, ...), takes `Global\wiri-live-test`, starts its own wiri from this
+  worktree with its own config, runs the *same* gate file the lead's cycle dot-sources, and quits
+  that daemon in a `finally` block.
 
 ### Lane DPI task 1 — border, focus ring and shadow are logical pixels projected per output
 - `border { width }`, `focus-ring { width }` and the window-rule overrides of both now keep their fractional LOGICAL value (`RingStyle::width` and `RingOverride::width` are `f64`; the decoder no longer rounds). The engine turns them into physical pixels once for the output a window is on, with niri's `round_logical_in_physical_max1` (`layout/tile.rs:244,252-257`, `utils/mod.rs:185-191`; new `layout::metrics::ring_width_px`): zero stays zero, any other width is at least one physical pixel, halves round away from zero. `LayoutConfig::from_config_at_scale` carries the result in `border_width` / `focus_ring_width`, so the tile shrink, native allocation, proportional widths, the drawn band and the ring's outward extent follow the output's scale, and a scale change or a move to another output re-projects them. `RingOverride::inset` takes the scale for rule widths and for the saved width of an off layout border a rule enables (`LayoutConfig::border_inset_with`).

@@ -3384,6 +3384,9 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-evidence.ps1') } catch { Lane
 # from their own UI thread; the layout must keep that size, move the neighbours and never write the
 # window's geometry again (niri scrolling.rs:4860-4875, :1287-1305, :1293-1300).
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-resize.ps1') } catch { LanePhaseError 'lane_resize' $_ }
+# H93: touch, pen and drag-and-drop driven by input Windows itself synthesizes (a real
+# synthetic pointer device and a real OLE drag); no digitizer hardware is involved.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-synth.ps1') } catch { LanePhaseError 'lane_synth' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {
