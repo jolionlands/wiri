@@ -1,47 +1,57 @@
 //! The overview is a camera over a vertically stacked set of normal workspace views.
 //! It never reconfigures applications to thumbnail-sized rectangles.
+//!
+//! The geometry is niri's: a fixed zoom from `overview { zoom }` (never a
+//! fit-everything fit), every workspace of the monitor stacked vertically with a
+//! 10%-of-height gap and the focused one centred, and each workspace drawn through
+//! its own horizontal camera (see [`crate::layout::overview_geometry`]).
 use super::{AppliedState, BackendHandle, OverviewState, TilingEngine};
+use crate::layout::animation::Animation;
+use crate::layout::overview_geometry;
 use crate::overlay::thumbnail_overview::{OverviewCommand, OverviewContext, OverviewWorkspace};
 use crate::utils::{OutputId, Point, Rect, WindowId};
-
-use crate::layout::animation::Animation;
-
-const WORKSPACE_GAP: i32 = 50;
 
 #[derive(Default)]
 pub(super) struct OverviewCamera {
     pub timeline: Option<Animation>,
     pub closing: bool,
     pub output: Option<OutputId>,
+    /// niri's `workspace_render_idx`: the fractional index of the workspace the
+    /// camera is centred on.  It pans (never jumps) when the focused workspace
+    /// changes, exactly like niri's workspace-switch animation.
+    pub render_index: f64,
+    /// The in-flight vertical pan: the animation and the index it heads for.
+    pub pan: Option<(Animation, f64)>,
 }
 impl OverviewCamera {
     pub fn animating(&self) -> bool {
         self.timeline.as_ref().is_some_and(|a| !a.is_finished())
+            || self.pan.as_ref().is_some_and(|(a, _)| !a.is_finished())
     }
 }
 
-/// The monitor's workspaces as one vertical stack in visible order, centred on the active
-/// one. Pure: the host paints it, the pointer hit-tests it, drag-and-drop targets it and
-/// the engine lays tiles out inside it, so the four never disagree about where a workspace
-/// is. Rows carry the stable key, the IPC identity and the name (else "Workspace N").
+/// The monitor's workspaces as one vertical stack in visible order, centred on the
+/// camera's fractional workspace index. Pure: the host paints it, the pointer
+/// hit-tests it, drag-and-drop targets it and the engine lays tiles out inside it,
+/// so the four never disagree about where a workspace is. Rows carry the stable
+/// key, the IPC identity and the name (else "Workspace N").
+///
+/// Empty workspaces are ordinary rows: niri's stack has one entry per workspace
+/// (`Monitor::workspaces_render_geo`, src/layout/monitor.rs:1467), so leaving them
+/// out would shift every neighbour.
 pub(super) fn overview_workspace_stack(
     monitor: &crate::layout::Monitor,
     view: Rect,
     zoom: f64,
+    render_index: f64,
 ) -> Vec<OverviewWorkspace> {
     let ids = monitor.workspace_ids();
-    let active = ids
-        .iter()
-        .position(|id| *id == monitor.active_workspace)
-        .unwrap_or(0) as i32;
-    let height = (view.size.h as f64 * zoom).round() as i32;
-    let stride = height + (WORKSPACE_GAP as f64 * zoom).round() as i32;
-    let center_y = view.loc.y + (view.size.h as i32 - height) / 2;
+    let rects = overview_geometry::workspace_rects(view, ids.len(), render_index, zoom);
     ids.into_iter()
         .enumerate()
-        .filter_map(|(index, id)| {
+        .zip(rects)
+        .filter_map(|((index, id), rect)| {
             let ws = monitor.workspaces.get(&id)?;
-            let y = center_y + (index as i32 - active) * stride;
             Some(OverviewWorkspace {
                 id,
                 ipc_id: ws.ipc_id,
@@ -51,25 +61,14 @@ pub(super) fn overview_workspace_stack(
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| format!("Workspace {}", index + 1)),
                 active: id == monitor.active_workspace,
-                rect: zoom_rect(view, view, y, zoom),
+                rect,
             })
         })
         .collect()
 }
 
-fn zoom_rect(rect: Rect, view: Rect, section_y: i32, zoom: f64) -> Rect {
-    Rect::new(
-        view.loc.x
-            + (view.size.w as f64 * (1.0 - zoom) / 2.0).round() as i32
-            + ((rect.loc.x - view.loc.x) as f64 * zoom).round() as i32,
-        section_y + ((rect.loc.y - view.loc.y) as f64 * zoom).round() as i32,
-        (rect.size.w as f64 * zoom).round().max(1.0) as u32,
-        (rect.size.h as f64 * zoom).round().max(1.0) as u32,
-    )
-}
-
 impl TilingEngine {
-    fn overview_options(&self) -> crate::config::overview_config::OverviewConfig {
+    pub(super) fn overview_options(&self) -> crate::config::overview_config::OverviewConfig {
         let mut options = self
             .full_config
             .as_ref()
@@ -121,7 +120,7 @@ impl TilingEngine {
             let target = if self.overview_camera.closing {
                 1.0
             } else {
-                self.overview_options().zoom
+                overview_geometry::configured_zoom(self.overview_options().zoom)
             };
             self.start_overview_camera(target);
             // Even an Off retarget needs one frame to retire a closing host.
@@ -145,21 +144,91 @@ impl TilingEngine {
     }
 
     pub(super) fn tick_overview_camera(&mut self, delta_ms: u32, backend: &BackendHandle) {
-        let Some(a) = &mut self.overview_camera.timeline else {
+        // niri animates the workspace stack's vertical camera with the workspace
+        // switch and the zoom with the overview open/close animation; both are
+        // ticked here, then one layout pass republishes the scene.
+        let mut moved = false;
+        let mut finished_pan = false;
+        if let Some((a, target)) = &mut self.overview_camera.pan {
+            if !a.is_finished() {
+                self.overview_camera.render_index = a.tick(delta_ms);
+                moved = true;
+            }
+            if a.is_finished() {
+                self.overview_camera.render_index = *target;
+                finished_pan = true;
+            }
+        }
+        if finished_pan {
+            self.overview_camera.pan = None;
+        }
+        if let Some(a) = &mut self.overview_camera.timeline {
+            if !a.is_finished() {
+                let zoom = a.tick(delta_ms).clamp(0.0, 1.0);
+                if let Some(state) = &mut self.overview {
+                    state.zoom = zoom;
+                }
+                moved = true;
+                if a.is_finished() && self.overview_camera.closing {
+                    self.finish_overview_close(backend);
+                    return;
+                }
+            }
+        }
+        if moved {
+            if let Some(output) = self.overview_camera.output {
+                self.apply_layout_for_monitor(output, backend);
+            }
+        }
+    }
+
+    /// The vertical camera target: the fractional index of the monitor's focused
+    /// workspace (niri's `workspace_render_idx`, src/layout/monitor.rs:1410).
+    pub(super) fn overview_camera_target(&self, output: OutputId) -> Option<f64> {
+        let monitor = self.monitors.get(&output)?;
+        let ids = monitor.workspace_ids();
+        ids.iter()
+            .position(|id| *id == monitor.active_workspace)
+            .map(|index| index as f64)
+    }
+
+    /// Pan the workspace stack towards the focused workspace instead of jumping,
+    /// using the workspace-switch animation.  Called from the layout pass, so a
+    /// keyboard or IPC workspace change inside the overview is animated exactly
+    /// like niri's `workspace_render_idx`.
+    pub(super) fn retarget_overview_vertical_camera(&mut self) {
+        let Some(output) = self.overview_camera.output else {
             return;
         };
-        if a.is_finished() {
+        let Some(target) = self.overview_camera_target(output) else {
+            return;
+        };
+        let current = self.overview_camera.render_index;
+        if (current - target).abs() < 0.0005 {
+            self.overview_camera.render_index = target;
+            self.overview_camera.pan = None;
             return;
         }
-        let zoom = a.tick(delta_ms).clamp(0.0, 1.0);
-        let finished = a.is_finished();
-        if let Some(state) = &mut self.overview {
-            state.zoom = zoom;
+        if let Some((a, pan_target)) = &self.overview_camera.pan {
+            if !a.is_finished() && (*pan_target - target).abs() < 0.0005 {
+                return;
+            }
         }
-        if finished && self.overview_camera.closing {
-            self.finish_overview_close(backend);
-        } else if let Some(output) = self.overview_camera.output {
-            self.apply_layout_for_monitor(output, backend);
+        let kind = if self.animation_wake.is_some() {
+            self.motion.workspace_kind()
+        } else {
+            crate::layout::animation::AnimationKind::Off
+        };
+        let anim = Animation::with_kind(current, target, kind, self.motion.slowdown);
+        self.overview_camera.render_index = anim.current();
+        if anim.is_finished() {
+            self.overview_camera.render_index = target;
+            self.overview_camera.pan = None;
+        } else {
+            self.overview_camera.pan = Some((anim, target));
+            if let Some(wake) = &self.animation_wake {
+                wake.notify_one();
+            }
         }
     }
 
@@ -174,7 +243,9 @@ impl TilingEngine {
         if self.overview.is_some() {
             if self.overview_camera.closing {
                 self.overview_camera.closing = false;
-                self.start_overview_camera(self.overview_options().zoom);
+                self.start_overview_camera(overview_geometry::configured_zoom(
+                    self.overview_options().zoom,
+                ));
                 crate::a11y::announce_overview(true);
             }
             return;
@@ -193,7 +264,13 @@ impl TilingEngine {
         });
         crate::a11y::announce_overview(true);
         self.overview_camera.output = Some(output);
-        self.start_overview_camera(self.overview_options().zoom);
+        // Open centred on the focused workspace: niri computes the stack from the
+        // focused index, so opening never pans.
+        self.overview_camera.render_index = self.overview_camera_target(output).unwrap_or(0.0);
+        self.overview_camera.pan = None;
+        self.start_overview_camera(overview_geometry::configured_zoom(
+            self.overview_options().zoom,
+        ));
         sink.enter();
         let sources: Vec<_> = self
             .monitors
@@ -220,18 +297,36 @@ impl TilingEngine {
         self.apply_layout_for_monitor(output, backend);
     }
 
-    pub(super) fn workspace_overview_scene(&self, output: OutputId) -> Vec<(WindowId, Rect)> {
+    /// The tiles of every workspace on `output` under the overview camera, as
+    /// `(window, full screen rect)` plus the workspace rectangle each tile must be
+    /// cropped to.
+    ///
+    /// niri draws each workspace at `zoom *` its normal size through the
+    /// workspace's *own* horizontal camera and crops it to the workspace rect
+    /// (`Monitor::render_workspaces`, src/layout/monitor.rs:1735-1745), so a column
+    /// that is half past the edge is cut there and a fully scrolled-out one is not
+    /// drawn at all.
+    pub(super) fn workspace_overview_scene(
+        &self,
+        output: OutputId,
+    ) -> (Vec<(WindowId, Rect)>, Vec<(WindowId, Rect)>) {
         let Some(monitor) = self.monitors.get(&output) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         // The camera spans the full work area; each workspace resolves its own
         // insets inside it (C2), rather than inheriting the active workspace's view.
         let view = monitor.work_area;
         let zoom = self.overview_zoom();
-        let workspaces = overview_workspace_stack(monitor, view, zoom);
+        let workspaces = overview_workspace_stack(
+            monitor,
+            view,
+            zoom,
+            self.overview_camera.render_index,
+        );
         let mut positions = Vec::new();
+        let mut clips = Vec::new();
         for entry in &workspaces {
-            let (id, y) = (entry.id, entry.rect.loc.y);
+            let (id, workspace_rect) = (entry.id, entry.rect);
             let Some(ws) = monitor.workspaces.get(&id) else {
                 continue;
             };
@@ -239,6 +334,15 @@ impl TilingEngine {
             // camera transform places that inside the shared stack entry.
             let cfg = self.effective_config_for_workspace(output, id);
             let workspace_view = Self::precise_tiling_area(monitor, cfg);
+            let view_rect = Rect::new(
+                workspace_view.loc.x,
+                workspace_view.loc.y,
+                workspace_view.width as u32,
+                workspace_view.height as u32,
+            );
+            // The per-workspace horizontal camera: this workspace's own view offset
+            // (the follow-up unified-grid mode fills in the monitor's camera here).
+            let camera = overview_geometry::workspace_camera(ws.scroll_offset.x, None);
             let normal = self.calculate_positions_at_zoom(
                 ws,
                 workspace_view,
@@ -247,17 +351,33 @@ impl TilingEngine {
                 cfg,
                 1.0,
             );
-            positions.extend(
-                normal
-                    .into_iter()
-                    .map(|(wid, rect)| (wid, zoom_rect(rect, view, y, zoom))),
-            );
-            positions.extend(self.float_homes.iter().filter_map(|(wid, home)| {
+            let mut push = |wid: WindowId, rect: Rect| {
+                let panned = Rect::new(
+                    rect.loc.x - camera,
+                    rect.loc.y,
+                    rect.size.w,
+                    rect.size.h,
+                );
+                let screen = overview_geometry::zoom_tile(
+                    panned,
+                    workspace_rect,
+                    view_rect,
+                    zoom,
+                );
+                positions.push((wid, screen));
+                clips.push((wid, workspace_rect));
+            };
+            for (wid, rect) in normal {
+                push(wid, rect);
+            }
+            for (wid, rect) in self.float_homes.iter().filter_map(|(wid, home)| {
                 (home.output == output && home.workspace == id)
                     .then(|| self.float_rect_of(*wid))
                     .flatten()
-                    .map(|rect| (*wid, zoom_rect(rect, view, y, zoom)))
-            }));
+                    .map(|rect| (*wid, rect))
+            }) {
+                push(wid, rect);
+            }
         }
         // One session host exists, on the output the camera opened over: another
         // output's layout pass must not republish its own geometry to that host.
@@ -270,7 +390,7 @@ impl TilingEngine {
                 focused: monitor.focus_window,
             });
         }
-        positions
+        (positions, clips)
     }
 
     /// The workspace the overview currently draws under `point` (screen pixels), found in
@@ -281,10 +401,15 @@ impl TilingEngine {
             .iter()
             .find(|(_, m)| m.bounds.contains_point(point))?;
         // The same camera view `workspace_overview_scene` stacks the workspaces in.
-        overview_workspace_stack(monitor, monitor.work_area, self.overview_zoom())
-            .into_iter()
-            .find(|ws| point.y >= ws.rect.loc.y && point.y < ws.rect.bottom())
-            .map(|ws| (output, ws.id))
+        overview_workspace_stack(
+            monitor,
+            monitor.work_area,
+            self.overview_zoom(),
+            self.overview_camera.render_index,
+        )
+        .into_iter()
+        .find(|ws| point.y >= ws.rect.loc.y && point.y < ws.rect.bottom())
+        .map(|ws| (output, ws.id))
     }
 
     /// Called by the session-local host, never while holding a host mutex.
@@ -394,16 +519,29 @@ mod tests {
             &cfg,
             1.0,
         );
-        let height = (view.size.h as f64 * zoom).round() as i32;
-        let y = view.loc.y
-            + (view.size.h as i32 - height) / 2
-            + height
-            + (WORKSPACE_GAP as f64 * zoom).round() as i32;
-        let expected = zoom_rect(normal[0].1, view, y, zoom);
-        let scene = engine.workspace_overview_scene(output);
+        // niri's stack over this view at the default half zoom: two entries, the
+        // second one is workspace key 1 (src/layout/monitor.rs:1467).
+        let rects = overview_geometry::workspace_rects(view, 2, 0.0, zoom);
+        let camera = overview_geometry::workspace_camera(
+            monitor.workspaces[&1].scroll_offset.x,
+            None,
+        );
+        let panned = Rect::new(
+            normal[0].1.loc.x - camera,
+            normal[0].1.loc.y,
+            normal[0].1.size.w,
+            normal[0].1.size.h,
+        );
+        let expected = overview_geometry::zoom_tile(panned, rects[1], inset, zoom);
+        let (scene, clips) = engine.workspace_overview_scene(output);
         assert_eq!(
             scene.iter().find(|(wid, _)| *wid == id).unwrap().1,
             expected
+        );
+        // The tile is cropped to its own workspace rectangle.
+        assert_eq!(
+            clips.iter().find(|(wid, _)| *wid == id).unwrap().1,
+            rects[1]
         );
         // Prove the fixture distinguishes the old active-workspace rectangle.
         let wrong = engine.calculate_positions_at_zoom(
@@ -414,7 +552,10 @@ mod tests {
             &cfg,
             1.0,
         );
-        assert_ne!(zoom_rect(wrong[0].1, view, y, zoom), expected);
+        assert_ne!(
+            overview_geometry::zoom_tile(wrong[0].1, rects[1], inset, zoom),
+            expected
+        );
         // The inactive workspace's insets really differ from the view the camera spans.
         assert_ne!(inset, view);
     }
@@ -498,7 +639,7 @@ mod tests {
         m.workspaces.get_mut(&0).unwrap().name = Some("web".into());
         m.workspaces.get_mut(&2).unwrap().name = Some(String::new());
         let view = Rect::new(-1366, 0, 1366, 728);
-        let stack = overview_workspace_stack(&m, view, 0.5);
+        let stack = overview_workspace_stack(&m, view, 0.5, 0.0);
         // Visible order [5, 0, 2]; the active one (key 0) is centred on the view.
         assert_eq!(
             stack.iter().map(|w| w.id).collect::<Vec<_>>(),
@@ -513,9 +654,10 @@ mod tests {
             assert_eq!(w.active, w.id == m.active_workspace);
         }
         assert_eq!(stack[1].rect, Rect::new(-1024, 182, 683, 364));
-        // 50 px niri gap scaled with the workspaces: 364 + 25.
-        assert_eq!(stack[0].rect.loc.y, 182 - 389);
-        assert_eq!(stack[2].rect.loc.y, 182 + 389);
+        // niri's gap between workspaces is 10% of the view height, scaled by the
+        // zoom (src/layout/monitor.rs:1335): round(728 * 0.1 * 0.5) = 36.
+        assert_eq!(stack[0].rect.loc.y, 182 - 400);
+        assert_eq!(stack[2].rect.loc.y, 182 + 400);
     }
 
     #[test]
@@ -532,7 +674,7 @@ mod tests {
         // The camera spans the monitor's whole work area (C2): a workspace's own insets
         // move its tiles inside its stack entry, never the entry itself.
         let view = e.monitors.get(&output).unwrap().work_area;
-        let stack = overview_workspace_stack(e.monitors.get(&output).unwrap(), view, 0.35);
+        let stack = overview_workspace_stack(e.monitors.get(&output).unwrap(), view, 0.35, 0.0);
         assert_eq!(stack.len(), 2);
         // The host was handed exactly this stack, so paint, pointer and DnD agree.
         assert_eq!(sink.last_context().unwrap().workspaces, stack);
@@ -646,12 +788,15 @@ mod tests {
     fn overview_scales_half_and_preserves_normal_aspect_and_negative_origins() {
         let view = Rect::new(-1366, 0, 1366, 728);
         let tile = Rect::new(-1358, 8, 500, 700);
+        // niri relocates every tile into its workspace rectangle and rescales by the
+        // zoom (src/layout/monitor.rs:1735-1745).
+        let ws = Rect::new(-1024, 182, 683, 364);
         assert_eq!(
-            zoom_rect(tile, view, 182, 0.5),
+            overview_geometry::zoom_tile(tile, ws, view, 0.5),
             Rect::new(-1020, 186, 250, 350)
         );
         assert_eq!(
-            zoom_rect(view, view, 182, 0.5),
+            overview_geometry::zoom_tile(view, ws, view, 0.5),
             Rect::new(-1024, 182, 683, 364)
         );
     }

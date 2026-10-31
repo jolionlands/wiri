@@ -3,6 +3,7 @@ pub mod engine;
 pub mod floating;
 pub mod floating_position;
 pub mod metrics;
+pub mod overview_geometry;
 pub mod snap;
 pub mod snapshot;
 pub mod strip;
