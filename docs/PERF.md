@@ -679,3 +679,95 @@ callback that can wait on a hung window, or a modal tray menu) in front of the i
 the "Hotkey movement" budget measures; the budget itself says "preserve independent LL hook
 responsiveness".
 
+### Measurement method
+
+`scripts/perf/lane-perf-probe.ps1` is the measurement tool. For one run it:
+
+1. opens the machine-wide mutex `Global\wiri-live-test` and waits for it (up to 120 minutes),
+   so no other tenant is on the desktop;
+2. copies `resources/default_config.kdl` into a temporary directory under `.perfprobe/`, writes
+   no shared config, and starts **one** `wiri.exe` from the caller's build with
+   `-v --no-autostart`, a private `APPDATA`/`LOCALAPPDATA`/`WIRI_CONFIG` and its own
+   `WIRI_PIPE`;
+3. creates only its own ordinary WinForms windows (2 for the idle budget, ~28 for the realistic
+   case) — never more — waits for a `get_state` reply and then 5 s for the first location events
+   to settle;
+4. snapshots threads (count and one row per description), private bytes, working set, handles and
+   `GetGuiResources` GDI/USER counts, then runs one single 30 s sleep with no IPC, input or
+   sampling in between, from which `LaneE.Native.Idle` derives process CPU
+   (`GetProcessTimes` via the process snapshot), per-thread cumulative context-switch deltas and
+   the `GetLastInputInfo` change flag;
+5. sends a short sequence of ordinary actions over IPC (`focus-column-right`,
+   `set-column-width 600`, `fullscreen-window` twice, `move-column-left`), snapshots again and
+   repeats the 30 s idle observation;
+6. quits gracefully with an IPC `quit`, stops only its own child if that fails, closes only its
+   own windows and releases the mutex in a `finally` block.
+
+Each configuration is measured three times and the spread is reported, because other lanes build
+on the same laptop. Threads by description are read with `OpenThread` +
+`GetThreadDescription`, the same mechanism the new `p_rest_threads_by_*` keys use, so the probe
+and the official collector attribute threads identically.
+
+### Numbers
+
+Measured on TRIDARIS (Windows 11 22631, one 1366x768 display at 96 DPI, 8 logical CPUs) on
+2026-10-31 between 04:55 and 05:11 UTC with other lanes idle but the machine shared. Each
+configuration was run three times, alternating before/after; the same probe binary measured both.
+"Before" is `.perfprobe/base-src`, an unmodified copy of `810e896` built into its own target
+directory; "after" is `target/release/wiri.exe` from this lane. The probe's own 28 windows plus
+4 pre-existing third-party windows were managed (32) after the action sequence; the rest endpoints
+were taken with the probe's first 2 windows only. Medians with the observed range in brackets.
+
+| Observation | Before (`810e896`) | After (this lane) |
+| --- | ---: | ---: |
+| Threads, rest | **14** (3/3) | **12** (3/3) |
+| Threads, after actions | **17** (3/3) | **13** (3/3) |
+| Private bytes, rest | 8,282,112 B (7.90 MiB) [7,946,240..8,298,496] | 7,884,800 B (7.52 MiB) [7,757,824..8,011,776] |
+| Private bytes, after actions | 9,437,184 B (9.00 MiB) [9,109,504..9,932,800] | 9,998,336 B (9.53 MiB) [8,708,096..10,248,192] |
+| Working set, rest | 24,465,408 B (23.33 MiB) [24,428,544..24,481,792] | 24,309,760 B (23.18 MiB) [24,190,976..24,969,216] |
+| Working set, after actions | 29,646,848 B (28.27 MiB) [29,564,928..30,138,368] | 28,372,992 B (27.06 MiB) [27,504,640..28,766,208] |
+| Handles, rest | 214 (3/3) | 211 [209..217] |
+| Handles, after actions | 263 (3/3) | 228 [228..234] |
+| GDI objects, rest / after | 12 / 12 (3/3) | 12 / 12 (3/3) |
+| USER objects, rest / after | 32 / 37 (3/3) | 28 [27..28] / 28 (3/3) |
+| Idle CPU, 30 s, rest | 0 ms (3/3) | 0 ms [0..15.625] |
+| Idle CPU, 30 s, after actions | 0 ms (3/3) | 0 ms (3/3) |
+| Idle context switches, rest | 18.19/s [9.17..23.46] | 17.12/s [16.83..17.62] |
+| Idle context switches, after actions | 16.09/s [12.40..18.77] | 16.96/s [16.29..19.26] |
+
+What the table does and does not say:
+
+1. **Threads are the change, and it is exactly the two the lane removed**: 14 → 12 at rest
+   (the eager overview banner and the second tray pump), and 17 → 13 after the actions (the four
+   `spawn_blocking` threads the shortened keep-alive no longer leaves behind for two seconds after
+   the last reply). The real run's log confirms the tray was hosted on the pump:
+   `System tray icon added on the session UI thread`.
+2. **The ≤8 settled budget is not met.** Of the 12 threads at rest, seven are wiri's own (main,
+   two `wiri-rt` workers, `wiri-ui`, `wiri-winevent-hook`, `wiri-mouse-hook`,
+   `wiri-config-reload`). The other five are created outside wiri's source — the `notify` crate's
+   directory-change backend and whatever the Win32/WinRT layers start — and this host could not
+   attribute them per thread: `GetThreadDescription` returned `0x10000000` for every thread,
+   including the ones wiri names (`scripts/perf/thread-name-check.ps1` shows the two calls on a
+   thread the same process just named). The next step that would fit the budget is the one the
+   budget table already names, **shared watcher delivery**: replace `notify` with one
+   `ReadDirectoryChangesW` wait on the existing `wiri-config-reload` thread (no new thread, no
+   poll), which removes the crate's backend thread(s) and makes the reload thread's own
+   `WM`-equivalent wait explicit.
+3. **Memory did not regress and did not improve measurably.** At rest the medians are 7.52 vs
+   7.90 MiB private and 23.18 vs 23.33 MiB working set — inside each other's spread on a machine
+   with other tenants. The after-actions endpoints differ in both directions between runs
+   (private 9.53 vs 9.00 MiB, working set 27.06 vs 28.27 MiB) with overlapping ranges, so this is
+   **not** evidence of a leak or a saving; `USER` objects fell from 32/37 to 28/28, which is the
+   one tray window and its menu no longer existing twice over. Both endpoints stay under the
+   ≤24 MiB working-set budget at rest and within ~0.5 MiB of the ≤8 MiB private one.
+4. **Idle CPU stays below the collector's 15.625 ms counter increment** in five of six rest
+   samples and in all six after-action samples; one lane rest sample showed one increment. Idle
+   context switches stayed in the same 16-19/s band on both builds — the diagnostic is dominated
+   by other tenants' activity on this shared desktop (the base build's own rest samples span
+   9.17..23.46/s) and cannot resolve a two-thread difference.
+5. **Keypress-to-move latency was not re-measured here.** This probe drives actions over IPC, not
+   keys, and the lane did not touch the hook threads, the dispatch path or the engine lock, so the
+   5.85 ms median / 7.54 ms maximum stands on the official collector, which the lead's cycle runs.
+
+
+

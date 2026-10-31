@@ -9,7 +9,7 @@ function Invoke-LaneEPerf {
         'cold_start_call_ms', 'cold_observer_start_max_ms', 'existing_sentinel_windows', 'managed_windows',
         'idle_seconds', 'idle_cpu_ms', 'idle_one_core_percent', 'idle_context_switches_per_s',
         'idle_input_changed', 'idle_new_threads', 'idle_exited_threads', 'idle_positioning_lines',
-        'rest_threads_total', 'rest_threads_named', 'rest_threads_unnamed',
+        'rest_threads_total', 'rest_threads_named', 'rest_threads_unnamed', 'rest_threads_unavailable',
         'hotkey_samples', 'hotkey_timeouts', 'hotkey_invalid_samples', 'hotkey_move_median_ms',
         'hotkey_move_max_ms', 'hotkey_observer_gap_max_ms',
         'maximize_setwindowpos_lines_median', 'maximize_setwindowpos_lines_max',
@@ -160,8 +160,9 @@ function Invoke-LaneEPerf {
             [pscustomobject]@{ description = $_.Name; count = $_.Count; tids = @($_.Ids) }
         })
         PValue 'rest_threads_total' ([int](($restGroups | Measure-Object Count -Sum).Sum))
-        PValue 'rest_threads_named' ([int](($restGroups | Where-Object { $_.Name -ne '' } | Measure-Object Count -Sum).Sum))
+        PValue 'rest_threads_named' ([int](($restGroups | Where-Object { $_.Name -ne '' -and $_.Name -ne '<unavailable>' } | Measure-Object Count -Sum).Sum))
         PValue 'rest_threads_unnamed' ([int](($restGroups | Where-Object { $_.Name -eq '' } | Measure-Object Count -Sum).Sum))
+        PValue 'rest_threads_unavailable' ([int](($restGroups | Where-Object { $_.Name -eq '<unavailable>' } | Measure-Object Count -Sum).Sum))
         foreach ($group in $restGroups) {
             $key = 'rest_threads_by_' + (($group.Name.ToLowerInvariant() -replace '[^a-z0-9]+', '_').Trim('_'))
             if ($key -eq 'rest_threads_by_') { $key = 'rest_threads_by_unnamed' }

@@ -89,8 +89,9 @@ try {
         WIRI_PIPE = '\\.\pipe\' + [LaneE.Native]::PipeName
     }
 
-    # Ordinary windows, exactly like the live harness's own fixtures.
-    for ($i = 1; $i -le $Windows; $i++) {
+    # Ordinary windows, exactly like the live harness's own fixtures: two for the idle budget,
+    # then the rest for the realistic case. Never more than `Windows`.
+    for ($i = 1; $i -le [Math]::Min(2, $Windows); $i++) {
         $forms += [OwnedLiveForms]::Open("perf-probe-$i", 40 + ($i * 7 % 180), 110, 160)
     }
     Start-Sleep -Milliseconds 800
@@ -100,8 +101,10 @@ try {
     $info.Arguments = '-v --no-autostart --config "' + $config + '"'
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
-    $info.RedirectStandardError = $true
-    $info.RedirectStandardOutput = $true
+    # Do not redirect: a pipe nobody drains fills up and blocks the daemon. The child has no
+    # console, so its stderr layer is disabled and everything it keeps is in wiri.log.
+    $info.RedirectStandardError = $false
+    $info.RedirectStandardOutput = $false
     $info.WorkingDirectory = $work
     foreach ($key in $envVars.Keys) { $info.EnvironmentVariables[$key] = $envVars[$key] }
     $child = [Diagnostics.Process]::Start($info)
@@ -165,7 +168,15 @@ try {
     $rest = Snapshot 'rest'
     $idleRest = Idle 'rest'
 
-    # A short sequence of ordinary actions, then the same idle observation again.
+    # The realistic case: the rest of the ordinary windows, a short sequence of ordinary
+    # actions, then the same idle observation again.
+    for ($i = 3; $i -le $Windows; $i++) {
+        $forms += [OwnedLiveForms]::Open("perf-probe-$i", 40 + ($i * 7 % 180), 110, 160)
+        Start-Sleep -Milliseconds 60
+    }
+    Start-Sleep -Seconds 3 # let every new window be admitted and tiled
+    $managed = ([LaneE.Native]::Request('{"type":"window_list"}', 5000, $childId) | ConvertFrom-Json)
+    $managedCount = @($managed.result).Count
     Action 'focus-column-right' @()
     Action 'set-column-width' @('600')
     Action 'fullscreen-window' @()
@@ -183,6 +194,7 @@ try {
         exe_sha256 = (Get-FileHash $Exe -Algorithm SHA256).Hash
         pid = $childId
         windows = $Windows
+        managed_windows = $managedCount
         idle_seconds = $IdleSeconds
         rest = $rest
         idle_rest = $idleRest
@@ -202,7 +214,7 @@ try {
         } catch { }
         try { $child.Dispose() } catch { }
     }
-    foreach ($h in $forms) { try { [OwnedLiveForms]::Close($h) } catch { } }
+    foreach ($h in $forms) { try { $null = [OwnedLiveForms]::Close($h) } catch { } }
     if ($held) { try { $mutex.ReleaseMutex() } catch { } }
     $mutex.Dispose()
 }

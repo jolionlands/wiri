@@ -187,13 +187,16 @@ namespace LaneE {
         [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
         const uint THREAD_QUERY_LIMITED_INFORMATION = 0x0800;
-        // The description SetThreadDescription stores; unnamed threads answer "".
+        // The description SetThreadDescription stores; unnamed threads answer "" and a host
+        // whose description API refuses the call answers "<unavailable>" (distinct, so the
+        // lane never counts a refused call as an unnamed thread).
         public static string DescribeThread(long tid) {
             IntPtr thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, (uint)tid);
-            if (thread == IntPtr.Zero) return "";
+            if (thread == IntPtr.Zero) return "<unavailable>";
             try {
                 IntPtr text;
-                if (GetThreadDescription(thread, out text) != 0 || text == IntPtr.Zero) return "";
+                if (GetThreadDescription(thread, out text) != 0) return "<unavailable>";
+                if (text == IntPtr.Zero) return "";
                 try { return Marshal.PtrToStringUni(text) ?? ""; }
                 finally { LocalFree(text); }
             } finally { CloseHandle(thread); }
