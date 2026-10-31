@@ -171,6 +171,14 @@ impl IpcServer {
             let _ = self.event_tx.send(event);
         }
         mirror.last = snapshot;
+        // The legacy focus broadcast of a focus change the engine made itself after its own
+        // activation request succeeded (no native notice follows one that Windows never
+        // raises); a notice that does follow is not broadcast again.
+        if let Some(engine) = self.engine.as_ref() {
+            for event in engine.read().take_live_focus_events() {
+                let _ = self.event_tx.send(event);
+            }
+        }
     }
 
     /// A new subscriber: bring what the others were told up to date, subscribe, and return
@@ -2404,6 +2412,9 @@ pub(crate) fn split_window_target(
 
 #[cfg(test)]
 mod floating_height_parity_tests;
+
+#[cfg(test)]
+mod focus_converge_tests;
 
 #[cfg(test)]
 mod window_target_tests {

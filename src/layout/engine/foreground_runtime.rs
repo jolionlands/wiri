@@ -2,8 +2,85 @@
 //! path. No action snapshot enters the native reducer, and no retry clock exists.
 use super::*;
 use crate::backend::ForegroundStamp;
+use crate::ipc::messages::IpcEvent;
+
+/// A live-focus change `converge_live_focus` made that subscribers must still be told
+/// (the stream's `window_focus_changed` comes from the state diff; this is the legacy
+/// `window_focused` / `column_focused` pair the native notice would have produced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LiveFocusNotice {
+    pub(super) window: WindowId,
+    pub(super) location: Option<(usize, i32)>,
+}
 
 impl TilingEngine {
+    /// After wiri's own activation request succeeded for `window`, make the live engine
+    /// and IPC focus follow when a fresh native query says the window now is the
+    /// foreground window, instead of waiting for an EVENT_SYSTEM_FOREGROUND that Windows
+    /// does not always raise (it raised none for a successful `SetForegroundWindow` in
+    /// the aa6c884 h15 run, and a request for the window that already is foreground
+    /// never raises one). Call under the engine lock, right after the request returned.
+    ///
+    /// This is a native observation, not a synthetic one: it runs only when
+    /// `GetForegroundWindow` itself names the requested window, mirrors that fact through
+    /// the same `sync_os_foreground` path a native notice uses, and queues the same
+    /// broadcast. It never touches `foreground_observations` or the dwell history, so the
+    /// timeline still gets entries only from the hook FIFO; a late real notice for the
+    /// window ends the previous visit at its own native time. A refused request, or one
+    /// Windows accepted but did not carry out yet, moves nothing.
+    pub(super) fn converge_live_focus(&mut self, window: WindowId, backend: &BackendHandle) {
+        if self.os_foreground == Some(window) || !self.tiled_windows.contains_key(&window) {
+            return;
+        }
+        if backend.foreground_window() != window.as_isize() {
+            return;
+        }
+        let location = self.sync_os_foreground(window, backend);
+        if self.os_foreground != Some(window) {
+            // The open-focused policy took the focus back for another window.
+            return;
+        }
+        self.converged_broadcast = Some(window);
+        *self.live_focus_notice.lock() = Some(LiveFocusNotice { window, location });
+    }
+
+    /// The legacy broadcast for a live-focus change: `window_focused`, plus
+    /// `column_focused` when the window is tiled. `managed` is the managed window the
+    /// native notice resolved to (it names the workspace), which differs from `hwnd` for
+    /// an owned dialog.
+    pub fn live_focus_events(
+        &self,
+        hwnd: isize,
+        managed: Option<WindowId>,
+        location: Option<(usize, i32)>,
+    ) -> Vec<IpcEvent> {
+        let mut events = vec![IpcEvent::WindowFocused { window_hwnd: hwnd }];
+        if let Some((col_idx, ws_id)) = location {
+            let number = match managed.and_then(|w| self.locate_window(w)) {
+                Some((oid, _, _)) => self.workspace_number_on(oid, ws_id),
+                None => crate::layout::workspace_number(ws_id),
+            };
+            events.push(IpcEvent::ColumnFocused {
+                window_hwnd: hwnd,
+                column_index: col_idx,
+                workspace_id: number,
+            });
+        }
+        events
+    }
+
+    /// The broadcast `converge_live_focus` queued, for the IPC server to send once.
+    pub fn take_live_focus_events(&self) -> Vec<IpcEvent> {
+        match self.live_focus_notice.lock().take() {
+            Some(notice) => self.live_focus_events(
+                notice.window.as_isize(),
+                Some(notice.window),
+                notice.location,
+            ),
+            None => Vec::new(),
+        }
+    }
+
     /// Call once from the real startup foreground query, after initial management.
     /// `owner` is GA_ROOTOWNER (or `hwnd` when there is no different owner).
     pub fn seed_native_foreground(
@@ -76,6 +153,9 @@ impl TilingEngine {
         }
 
         let window = managed.unwrap_or_else(|| WindowId::new(hwnd));
+        // The window's live-focus broadcast was already made when wiri's own request
+        // converged on it: this notice still updates the state, but is not told twice.
+        let already_broadcast = self.converged_broadcast.take() == Some(window);
         let location = self.sync_os_foreground(window, backend);
         if self.os_foreground != Some(window) {
             // Existing open-focused/rule policy refused this foreground.
@@ -91,6 +171,9 @@ impl TilingEngine {
                 self.apply_all(backend);
                 return (false, None);
             }
+        }
+        if already_broadcast {
+            return (false, None);
         }
         (true, location)
     }
@@ -280,6 +363,110 @@ mod tests {
         assert!(observe(&mut engine, &backend, 101, 750, 2, true));
         assert!(engine.focus_previous_for_at(WindowId::new(101), 750, 800, &backend));
         assert_eq!(engine.monitors.focused().unwrap().focus_window, Some(a));
+    }
+
+    // ---- explicit focus converges on the native foreground (aa6c884 h15 evidence) ----------
+
+    use crate::backend::activation_attempt_test_support::{with_native_foreground, Activation};
+
+    #[test]
+    fn explicit_focus_of_the_window_that_already_is_native_foreground_converges() {
+        let (mut engine, backend) = fixture();
+        let (a, b) = (WindowId::new(100), WindowId::new(101));
+        assert_eq!(engine.os_foreground, Some(a));
+        let seen = (
+            engine.foreground_observations.current(),
+            engine.foreground_observations.last_stamp(),
+        );
+        // Windows already shows B (it needs no request and raises no notice), while the
+        // live focus still names A.
+        let (focused, attempts) = with_native_foreground(101, Activation::Refuse, || {
+            engine.focus_action_window(b, &backend)
+        });
+        assert!(focused);
+        assert!(attempts.is_empty(), "nothing to ask Windows for");
+        assert_eq!(engine.os_foreground, Some(b));
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(101));
+        assert_eq!(engine.monitors.focused().unwrap().focus_window, Some(b));
+        // The native timeline and the dwell history did not move.
+        assert_eq!(
+            (
+                engine.foreground_observations.current(),
+                engine.foreground_observations.last_stamp()
+            ),
+            seen
+        );
+        assert_eq!(seen.0, Some(a));
+        assert!(!engine.focus_previous_for_at(a, 0, 5000, &backend));
+        assert_eq!(engine.pending_previous, None);
+    }
+
+    #[test]
+    fn accepted_activation_without_a_native_notice_converges() {
+        let (mut engine, backend) = fixture();
+        let b = WindowId::new(101);
+        let (_, attempts) = with_native_foreground(100, Activation::SwitchWithoutNotice, || {
+            engine.focus_action_window(b, &backend)
+        });
+        assert_eq!(attempts, vec![101], "one request, then the query settles it");
+        assert_eq!(engine.os_foreground, Some(b));
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(101));
+        assert_eq!(
+            engine.foreground_observations.current(),
+            Some(WindowId::new(100))
+        );
+    }
+
+    #[test]
+    fn refused_activation_does_not_move_live_focus() {
+        let (mut engine, backend) = fixture();
+        let (a, b) = (WindowId::new(100), WindowId::new(101));
+        let (focused, attempts) = with_native_foreground(100, Activation::Refuse, || {
+            engine.focus_action_window(b, &backend)
+        });
+        assert!(focused, "the selection itself still moves");
+        assert!(!attempts.is_empty() && attempts.iter().all(|hwnd| *hwnd == 101));
+        assert_eq!(engine.os_foreground, Some(a));
+        assert_eq!(engine.ipc_snapshot().focused_window(), Some(100));
+        assert!(engine.take_live_focus_events().is_empty());
+    }
+
+    #[test]
+    fn deferred_acceptance_waits_for_the_native_notice() {
+        let (mut engine, backend) = fixture();
+        let (a, b) = (WindowId::new(100), WindowId::new(101));
+        let (_, attempts) = with_native_foreground(100, Activation::AcceptDeferred, || {
+            engine.focus_action_window(b, &backend)
+        });
+        assert!(!attempts.is_empty());
+        assert_eq!(engine.os_foreground, Some(a), "the query does not name B yet");
+        // The notice that follows is the ordinary path.
+        assert!(observe(&mut engine, &backend, 101, 1000, 1, true));
+        assert_eq!(engine.os_foreground, Some(b));
+    }
+
+    #[test]
+    fn a_native_notice_after_convergence_updates_state_and_history_but_is_not_told_twice() {
+        let (mut engine, backend) = fixture();
+        let (a, b) = (WindowId::new(100), WindowId::new(101));
+        with_native_foreground(100, Activation::SwitchWithoutNotice, || {
+            engine.focus_action_window(b, &backend)
+        });
+        let events = engine.take_live_focus_events();
+        assert!(matches!(
+            events.first(),
+            Some(IpcEvent::WindowFocused { window_hwnd: 101 })
+        ));
+        assert!(engine.take_live_focus_events().is_empty(), "delivered once");
+        // The real notice, whenever it comes, ends A's visit at its native time and is
+        // the same fact the engine already follows: not broadcast again.
+        assert!(!observe(&mut engine, &backend, 101, 1000, 1, true));
+        assert_eq!(engine.foreground_observations.current(), Some(b));
+        assert!(engine.focus_previous_for_at(b, 750, 1100, &backend));
+        assert_eq!(engine.monitors.focused().unwrap().focus_window, Some(a));
+        // A later current notice for another window and back is an ordinary change.
+        assert!(observe(&mut engine, &backend, 102, 2000, 2, true));
+        assert!(observe(&mut engine, &backend, 101, 3000, 3, true));
     }
 
     #[test]
