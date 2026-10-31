@@ -198,10 +198,13 @@ impl IpcServer {
         let unheard = self.sync_locked(&mut mirror);
         let receiver = self.event_tx.subscribe();
         let mut replay = state::replay(&mirror.last);
-        replay.extend(unheard);
         if let Some(config) = self.last_config.lock().clone() {
             replay.push(config);
         }
+        // niri's stream opens with the state replay ending in ConfigLoaded; notices that were
+        // queued while nobody listened follow it, so the first subscriber still hears them
+        // without changing that opening sequence (live gate h15_the_stream_starts_with_the_state).
+        replay.extend(unheard);
         (receiver, replay)
     }
 
