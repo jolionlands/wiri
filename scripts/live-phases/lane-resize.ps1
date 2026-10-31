@@ -34,16 +34,34 @@ using System.Windows.Forms;
 
 public static class H94SelfResize {
     [StructLayout(LayoutKind.Sequential)] public struct OuterRect { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] public struct NativePoint { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct MinMaxInfo {
+        public NativePoint Reserved, MaxSize, MaxPosition, MinTrack, MaxTrack;
+    }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out OuterRect r);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
 
     sealed class ProbeForm : Form {
         public readonly object Sync = new object();
         public int Writes;
+        public Action Ready;
+        protected override void OnShown(EventArgs e) {
+            base.OnShown(e);
+            if (Ready != null) Ready();
+        }
         protected override void WndProc(ref Message m) {
             // Every external placement, wiri's included, arrives as WM_WINDOWPOSCHANGED.
             if (m.Msg == 0x0047) { lock (Sync) { Writes = Writes + 1; } }
             base.WndProc(ref m);
+            if (m.Msg == 0x0024 && m.LParam != IntPtr.Zero) {
+                // After the default processing, which clamps an ordinary window to the virtual
+                // screen: an application that takes a size of its own raises its maximum
+                // tracking size, and the work-area gate needs a window wider than that.
+                MinMaxInfo info = (MinMaxInfo)Marshal.PtrToStructure(m.LParam, typeof(MinMaxInfo));
+                info.MaxTrack.X = 6000;
+                info.MaxTrack.Y = 6000;
+                Marshal.StructureToPtr(info, m.LParam, false);
+            }
         }
         public void ChooseSize(int width, int height) {
             // The window's own decision: from its own UI thread, like an application that
@@ -87,8 +105,10 @@ public static class H94SelfResize {
     public static IntPtr Open(string title) {
         Opening opening = new Opening();
         lock (Openings) Openings.Add(opening);
-        ProbeForm form = null;
         Thread thread = new Thread(delegate() {
+            // Nothing may escape this thread: an unhandled exception on any thread ends the
+            // whole harness process, and the fixtures belong to the harness.
+            ProbeForm form = null;
             try {
                 form = new ProbeForm();
                 form.Text = title;
@@ -97,24 +117,40 @@ public static class H94SelfResize {
                 form.Location = new Point(160, 140);
                 form.ClientSize = new System.Drawing.Size(420, 320);
                 form.MinimumSize = new System.Drawing.Size(0, 0);
+                // The largest tracking size the form can get. Windows still caps an ordinary
+                // window at the virtual screen plus its borders (1386 px here), so the gate
+                // that needs a window wider than the work area uses the width the window
+                // actually took and requires only that it exceed the work area.
+                form.MaximumSize = new System.Drawing.Size(6000, 6000);
                 form.ShowInTaskbar = true;
-                form.Shown += delegate {
-                    lock (opening.Sync) {
-                        opening.Handle = form.Handle;
-                        lock (Forms) Forms.Add(opening.Handle, form);
-                        opening.Ready = true;
-                        Monitor.PulseAll(opening.Sync);
+                ProbeForm owned = form;
+                form.Ready = delegate {
+                    try {
+                        lock (opening.Sync) {
+                            if (opening.Cancelled) return;
+                            opening.Handle = owned.Handle;
+                            lock (Forms) Forms.Add(opening.Handle, owned);
+                            opening.Ready = true;
+                            Monitor.PulseAll(opening.Sync);
+                        }
+                    } catch (Exception error) {
+                        lock (opening.Sync) { opening.Error = error; Monitor.PulseAll(opening.Sync); }
+                        try { owned.Close(); } catch (Exception) { }
                     }
                 };
-                lock (opening.Sync) { if (opening.Cancelled) { form.Close(); return; } }
+                lock (opening.Sync) { if (opening.Cancelled) return; }
                 Application.Run(form);
             } catch (Exception error) {
                 lock (opening.Sync) opening.Error = error;
             } finally {
-                if (form != null) {
-                    lock (Forms) Forms.Remove(form.Handle);
-                    form.Dispose();
-                }
+                try {
+                    if (form != null) {
+                        IntPtr handle = IntPtr.Zero;
+                        try { handle = form.Handle; } catch (Exception) { }
+                        if (handle != IntPtr.Zero) { lock (Forms) Forms.Remove(handle); }
+                        form.Dispose();
+                    }
+                } catch (Exception) { }
                 lock (opening.Sync) { opening.Finished = true; Monitor.PulseAll(opening.Sync); }
             }
         });
@@ -150,8 +186,10 @@ public static class H94SelfResize {
     }
 
     public static void Close(IntPtr h) {
-        ProbeForm form = Find(h);
-        if (!form.IsDisposed) form.BeginInvoke((MethodInvoker)delegate { form.Close(); });
+        try {
+            ProbeForm form = Find(h);
+            if (!form.IsDisposed) form.BeginInvoke((MethodInvoker)delegate { try { form.Close(); } catch (Exception) { } });
+        } catch (Exception) { }
     }
 
     public static void CloseAll() {
@@ -183,6 +221,15 @@ public static class H94SelfResize {
         } while ($clock.ElapsedMilliseconds -lt $timeoutMs)
         return $false
     }
+    # Written after every gate group, so a phase error still leaves the checks that ran.
+    function Save-H94Evidence {
+        try {
+            $h94Evidence['gates'] = [ordered]@{}
+            foreach ($gate in $h94Gates) { $h94Evidence.gates[$gate] = $summary[$gate] }
+            $h94Evidence['forms'] = @($h94Forms | ForEach-Object { $_.ToInt64() })
+            ($h94Evidence | ConvertTo-Json -Depth 10) | Set-Content -Encoding UTF8 (Join-Path $h94Dir 'evidence.json')
+        } catch { }
+    }
     # The window keeps `$width` for a whole settle period: the layout must not pull it back.
     function H94HoldsWidth([IntPtr]$h, [int]$width, [int]$holdMs = 1500) {
         $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -192,6 +239,38 @@ public static class H94SelfResize {
             Start-Sleep -Milliseconds 100
         }
         return $true
+    }
+    # Wait until the fixture has stopped receiving placements, so the window's next resize of
+    # itself cannot fall inside wiri's 250 ms "this was my own write" guard (which correctly
+    # refuses to read a placement it just made as the window's choice).
+    function H94Quiet([IntPtr]$h, [int]$quietMs = 500) {
+        $previous = @(-1)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($clock.ElapsedMilliseconds -lt ($quietMs + 3000)) {
+            $writes = [H94SelfResize]::Writes($h)
+            if ($writes -eq $previous[0]) { return $true }
+            $previous[0] = $writes
+            Start-Sleep -Milliseconds $quietMs
+        }
+        return $false
+    }
+    # The strip geometry of two fixtures as the IPC layout reports it: positions in the
+    # workspace view, so the difference and the gap between them do not depend on how far the
+    # camera has scrolled (niri keeps the neighbours' widths and moves them,
+    # scrolling.rs:1287-1305).
+    function H94Span([IntPtr]$a, [IntPtr]$b) {
+        $list = @(H94Windows)
+        $leftEntry = @($list | Where-Object { $_.id -eq $a.ToInt64() })
+        $rightEntry = @($list | Where-Object { $_.id -eq $b.ToInt64() })
+        if ($leftEntry.Count -ne 1 -or $rightEntry.Count -ne 1) { throw 'H94 fixture is not managed' }
+        $leftPos = [double]$leftEntry[0].layout.tile_pos_in_workspace_view[0]
+        $rightPos = [double]$rightEntry[0].layout.tile_pos_in_workspace_view[0]
+        [ordered]@{
+            span = $rightPos - $leftPos
+            gap = $rightPos - $leftPos - [double]$leftEntry[0].layout.tile_size[0]
+            left_size = [double]$leftEntry[0].layout.tile_size[0]
+            right_size = [double]$rightEntry[0].layout.tile_size[0]
+        }
     }
     function H94Open([string]$title) {
         $h = [H94SelfResize]::Open($title)
@@ -217,18 +296,22 @@ public static class H94SelfResize {
         try {
             $first = H94Open 'h94-self-one'
             $before = [H94SelfResize]::Outer($first)
-            [H94SelfResize]::ChooseSize($first, 700, 520)
-            $chosen = H94Wait { $o = [H94SelfResize]::Outer($first); $null -ne $o -and $o[2] -eq 700 } 5000
+            # Grow by 205 px on its own, whatever width the layout gave the column.
+            $chosenWidth = $before[2] + 205
+            $null = H94Quiet $first
+            [H94SelfResize]::ChooseSize($first, $chosenWidth, 520)
+            $chosen = H94Wait { $o = [H94SelfResize]::Outer($first); $null -ne $o -and $o[2] -eq $chosenWidth } 5000
             if (-not $chosen) { throw 'H94 the fixture did not take its own size' }
-            $kept = H94HoldsWidth $first 700 1800
+            $kept = H94HoldsWidth $first $chosenWidth 1800
             $outer = [H94SelfResize]::Outer($first)
             $h94Evidence.checks['keeps_its_width'] = [ordered]@{
-                before = $before; chosen = @(700, 520); outer = $outer; held = $kept
+                before = $before; chosen = @($chosenWidth, 520); outer = $outer; held = $kept
                 writes = [H94SelfResize]::Writes($first)
                 windows = @(H94Windows | Where-Object { $_.id -eq $first.ToInt64() })
             }
             $summary['h94_self_resize_window_keeps_its_width'] = [bool]$kept
         } catch { $h94Evidence.checks['keeps_its_width_error'] = ($_ | Out-String).Trim() }
+        Save-H94Evidence
 
         try {
             if ($null -eq $first) { throw 'H94 the first fixture is missing' }
@@ -239,62 +322,80 @@ public static class H94SelfResize {
             $pair = @($pair | Sort-Object { $_.rect[0] })
             $left = $pair[0]; $right = $pair[1]
             $rightBefore = $right.rect
-            # The left window grows by 180 px on its own.
-            [H94SelfResize]::ChooseSize($left.h, 880, 520)
-            $took = H94Wait { $o = [H94SelfResize]::Outer($left.h); $null -ne $o -and $o[2] -eq 880 } 5000
+            $spanBefore = H94Span $left.h $right.h
+            # The left window grows by 200 px on its own.
+            $grownWidth = $left.rect[2] + 200
+            $null = H94Quiet $left.h
+            [H94SelfResize]::ChooseSize($left.h, $grownWidth, 520)
+            $took = H94Wait { $o = [H94SelfResize]::Outer($left.h); $null -ne $o -and $o[2] -eq $grownWidth } 5000
             $moved = H94Wait {
-                $o = [H94SelfResize]::Outer($right.h)
-                $null -ne $o -and $o[0] -ge $rightBefore[0] + 100
-            } 6000
+                $span = H94Span $left.h $right.h
+                $span.span -ge $spanBefore.span + 150
+            } 6000 200
+            $spanAfter = H94Span $left.h $right.h
             $leftOuter = [H94SelfResize]::Outer($left.h)
             $rightOuter = [H94SelfResize]::Outer($right.h)
-            $noOverlap = $leftOuter[0] + $leftOuter[2] -le $rightOuter[0] + 2
             $h94Evidence.checks['grows_and_pushes'] = [ordered]@{
                 left = $left.h.ToInt64(); right = $right.h.ToInt64(); took = $took
                 left_outer = $leftOuter; right_before = $rightBefore; right_outer = $rightOuter
-                moved = $moved; no_overlap = $noOverlap
+                span_before = $spanBefore; span_after = $spanAfter; moved = $moved
             }
-            $summary['h94_self_resize_grows_and_pushes_the_neighbour'] = [bool]($took -and $moved -and $noOverlap)
+            $summary['h94_self_resize_grows_and_pushes_the_neighbour'] = [bool]($took -and $moved -and $spanAfter.gap -ge -2 -and $spanAfter.right_size -eq $spanBefore.right_size)
 
             # Shrinking itself below the column's own width moves the neighbour back.
-            [H94SelfResize]::ChooseSize($left.h, 420, 520)
-            $tookBack = H94Wait { $o = [H94SelfResize]::Outer($left.h); $null -ne $o -and $o[2] -eq 420 } 5000
+            $shrinkWidth = [Math]::Max(300, $left.rect[2] - 80)
+            $null = H94Quiet $left.h
+            [H94SelfResize]::ChooseSize($left.h, $shrinkWidth, 520)
+            $tookBack = H94Wait { $o = [H94SelfResize]::Outer($left.h); $null -ne $o -and $o[2] -eq $shrinkWidth } 5000
             $back = H94Wait {
-                $o = [H94SelfResize]::Outer($right.h)
-                $null -ne $o -and $o[0] -lt $rightOuter[0]
-            } 6000
+                $span = H94Span $left.h $right.h
+                $span.span -le $spanAfter.span - 60
+            } 6000 200
             $leftBack = [H94SelfResize]::Outer($left.h)
             $rightBack = [H94SelfResize]::Outer($right.h)
+            $spanBack = H94Span $left.h $right.h
             $h94Evidence.checks['shrink_moves_back'] = [ordered]@{
                 took = $tookBack; left_outer = $leftBack; right_before = $rightOuter; right_outer = $rightBack
-                moved_back = $back; no_overlap = ($leftBack[0] + $leftBack[2] -le $rightBack[0] + 2)
+                span_before = $spanAfter; span_after = $spanBack; moved_back = $back
             }
-            $summary['h94_self_resize_shrink_moves_the_neighbour_back'] = [bool]($tookBack -and $back)
+            $summary['h94_self_resize_shrink_moves_the_neighbour_back'] = [bool]($tookBack -and $back -and $spanBack.gap -ge -2)
         } catch { $h94Evidence.checks['neighbour_error'] = ($_ | Out-String).Trim() }
+        Save-H94Evidence
 
         try {
             if ($null -eq $first) { throw 'H94 the first fixture is missing' }
-            # Wider than the 1366 px work area: the window keeps its size, wiri does not crash
-            # and still answers, and the layout pushes the strip past the view.
+            # Wider than the work area: the strip has to scroll, and the window keeps the size
+            # it took (the layout must not pull it back to the view).
+            $workWidth = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Width
+            $null = H94Quiet $first
             [H94SelfResize]::ChooseSize($first, 1400, 520)
-            $took = H94Wait { $o = [H94SelfResize]::Outer($first); $null -ne $o -and $o[2] -eq 1400 } 5000
-            $held = H94HoldsWidth $first 1400 1500
+            $took = H94Wait {
+                $o = [H94SelfResize]::Outer($first)
+                $null -ne $o -and $o[2] -gt $workWidth
+            } 5000
+            $chosenOuter = [H94SelfResize]::Outer($first)
+            $held = $false
+            if ($null -ne $chosenOuter) { $held = H94HoldsWidth $first $chosenOuter[2] 1500 }
             $alive = $false
             try { $null = H94Command 'state' @('state', '--json'); $alive = $true } catch { $alive = $false }
             $h94Evidence.checks['past_work_area'] = [ordered]@{
                 took = $took; held = $held; daemon_answers = $alive
+                work_area_width = $workWidth; chosen = $chosenOuter
                 outer = [H94SelfResize]::Outer($first)
             }
             $summary['h94_self_resize_past_the_work_area'] = [bool]($took -and $held -and $alive)
         } catch { $h94Evidence.checks['past_work_area_error'] = ($_ | Out-String).Trim() }
+        Save-H94Evidence
 
         try {
             if ($null -eq $first) { throw 'H94 the first fixture is missing' }
             # Once the window has its size, wiri must not write the geometry again: no
             # SetWindowPos means no WM_WINDOWPOSCHANGED, and no oscillation over the period.
-            [H94SelfResize]::ChooseSize($first, 600, 520)
-            $null = H94Wait { $o = [H94SelfResize]::Outer($first); $null -ne $o -and $o[2] -eq 600 } 5000
-            $null = H94HoldsWidth $first 600 800
+            $settledWidth = [Math]::Max(320, $shrinkWidth - 60)
+            $null = H94Quiet $first
+            [H94SelfResize]::ChooseSize($first, $settledWidth, 520)
+            $null = H94Wait { $o = [H94SelfResize]::Outer($first); $null -ne $o -and $o[2] -eq $settledWidth } 5000
+            $null = H94HoldsWidth $first $settledWidth 1200
             [H94SelfResize]::ResetWrites($first)
             $start = [H94SelfResize]::Outer($first)
             $quiet = $true
@@ -311,6 +412,7 @@ public static class H94SelfResize {
             }
             $summary['h94_self_resize_settles_without_writes'] = [bool]$quiet
         } catch { $h94Evidence.checks['settles_error'] = ($_ | Out-String).Trim() }
+        Save-H94Evidence
 
         try {
             [H94SelfResize]::CloseAll()
@@ -326,10 +428,10 @@ public static class H94SelfResize {
             $h94Evidence.checks['cleanup'] = [ordered]@{ all_closed = $closed; still_managed = $listed }
             $summary['h94_cleanup'] = [bool]($closed -and $listed -eq 0)
         } catch { $h94Evidence.checks['cleanup_error'] = ($_ | Out-String).Trim() }
+        Save-H94Evidence
     } finally {
         try { [H94SelfResize]::CloseAll() } catch { }
         $null = H94Wait { [H94SelfResize]::AllClosed } 12000
-        $h94Evidence['forms'] = @($h94Forms | ForEach-Object { $_.ToInt64() })
-        ($h94Evidence | ConvertTo-Json -Depth 10) | Set-Content -Encoding UTF8 (Join-Path $h94Dir 'evidence.json')
+        Save-H94Evidence
     }
 }

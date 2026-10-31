@@ -18,7 +18,7 @@ impl TilingEngine {
     /// rectangle wiri's own SetWindowPos batch left there.  Returns true when the layout
     /// changed (and has been re-applied).
     pub fn note_window_self_resized(&mut self, id: WindowId, backend: &BackendHandle) -> bool {
-        let Some(observed) = Self::live_window_outer_rect(id) else {
+        let Some(observed) = Self::live_window_rect(id) else {
             return false;
         };
         if !self.adopt_self_resize(id, observed) {
@@ -31,9 +31,13 @@ impl TilingEngine {
     /// [`Self::note_window_self_resized`] with the window's live rectangle supplied: the
     /// decision and the layout change, so a pure test can drive it against fake windows.
     ///
-    /// `observed` is the window's outer rectangle (what `GetWindowRect` answers, the same
-    /// space as [`AppliedState::rect`]), because that is the rectangle wiri hands to
-    /// SetWindowPos and therefore the only one it can compare its own writes against.
+    /// `observed` is the window's **visible** frame (what `DwmGetWindowAttribute`
+    /// `DWMWA_EXTENDED_FRAME_BOUNDS` answers).  That is the space of
+    /// [`AppliedState::rect`]: `resolved_window_geometry` shrinks the tile by the border
+    /// inset and the backend adds the invisible DWM shadow margin on the way to
+    /// SetWindowPos, so the visible frame of the result is exactly the recorded rectangle.
+    /// Comparing anything else (a raw `GetWindowRect`) would see that margin on every window
+    /// and mistake wiri's own placement for the window's choice.
     pub(crate) fn adopt_self_resize(&mut self, id: WindowId, observed: Rect) -> bool {
         if self.applying_batch || self.frame_in_progress {
             // wiri's own batch or animation frame put the window there.
@@ -82,9 +86,10 @@ impl TilingEngine {
         let cfg = self
             .effective_config_for_workspace(output, workspace_id)
             .clone();
-        // The outer rectangle wiri applies is the tile shrunk by the border inset
+        // The visible frame wiri records is the tile shrunk by the border inset
         // (`resolved_window_geometry`), so the window's own size in tile space is the
-        // observed size plus that inset on both sides.
+        // observed size plus that inset on both sides - the same conversion
+        // `remember_column_width_spec` makes for a window that opens at its own size.
         let inset = self.rule_border_inset(id, &cfg);
         let tile_w = observed.size.w as i32 + 2 * inset;
         let tile_h = observed.size.h as i32 + 2 * inset;
@@ -148,35 +153,7 @@ impl TilingEngine {
         true
     }
 
-    /// The window's live outer rectangle: the same space as the rectangle wiri applies with
-    /// SetWindowPos, unlike the DWM visible frame that `EVENT_OBJECT_LOCATIONCHANGE`
-    /// reports.  `None` when the handle is gone or the window is minimised (its rectangle
-    /// then says nothing about the size it wants).
-    pub(crate) fn live_window_outer_rect(id: WindowId) -> Option<Rect> {
-        use windows::Win32::Foundation::{HWND, RECT};
-        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow};
-        let hwnd = HWND(id.as_isize() as *mut std::ffi::c_void);
-        // SAFETY: IsWindow and IsIconic only read the window's state, and GetWindowRect
-        // writes the rectangle into a local. A handle that went stale only makes IsWindow
-        // false, which returns first; nothing is dereferenced.
-        unsafe {
-            if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-                return None;
-            }
-            let mut rect = RECT::default();
-            if GetWindowRect(hwnd, &mut rect).is_err() {
-                return None;
-            }
-            Some(Rect::new(
-                rect.left,
-                rect.top,
-                (rect.right - rect.left).max(0) as u32,
-                (rect.bottom - rect.top).max(0) as u32,
-            ))
-        }
-    }
-
-    /// Whether two outer rectangles describe the same geometry.  One pixel of slack covers
+    /// Whether two visible rectangles describe the same geometry.  One pixel of slack covers
     /// a frame the system adjusted by a pixel; a real self-resize is never that small.
     fn same_window_rect(a: Rect, b: Rect) -> bool {
         (a.loc.x - b.loc.x).abs() <= 1

@@ -486,6 +486,57 @@ fn repeated_self_resize_never_oscillates() {
 }
 
 #[test]
+fn the_observed_rectangle_is_the_windows_visible_frame() {
+    // `resolved_window_geometry` shrinks the tile by the border inset, so the rectangle wiri
+    // records in `applied_state` is the *visible* frame of the window: the backend adds the
+    // invisible DWM shadow margin on the way to SetWindowPos.  Adopting a raw `GetWindowRect`
+    // would therefore see that margin on every window and mistake wiri's own placement for
+    // the window's choice.
+    let mut cfg = LayoutConfig {
+        outer_gaps: (0, 0, 0, 0),
+        column_gap: 0,
+        window_gap: 0,
+        border_width: 4,
+        column_width_mode: ColumnWidthMode::Proportional,
+        ..LayoutConfig::default()
+    };
+    cfg.effects.border.off = true;
+    cfg.effects.focus_ring.off = true;
+    cfg.effects.tab_indicator.off = true;
+    let mut engine = TilingEngine::new(cfg);
+    let output = OutputId::from_name("self-resize-visible-frame");
+    engine.register_monitor(
+        output,
+        Rect::new(0, 0, 1200, 900),
+        Rect::new(0, 0, 1200, 900),
+    );
+    let backend = BackendHandle::default_for_test();
+    let mut column = Column::new();
+    column.add_tile(crate::layout::Tile::new(WindowId::new(-9422)));
+    let monitor = engine.monitors.get_mut(&output).unwrap();
+    monitor.workspace_mut().unwrap().columns.push(column);
+    monitor.focus_column = Some(0);
+    monitor.focus_window = Some(WindowId::new(-9422));
+    apply(&mut engine, &backend);
+
+    let id = WindowId::new(-9422);
+    let tile = rect_of(&engine, output, id);
+    let applied = applied_rect(&engine, id);
+    assert_eq!(
+        applied.size.w,
+        tile.size.w - 8,
+        "the recorded rectangle is the tile less the border on both sides"
+    );
+    let chosen = observed(applied, applied.size.w + 300, applied.size.h);
+    assert!(engine.adopt_self_resize(id, chosen));
+    assert_eq!(
+        rect_of(&engine, output, id).size.w,
+        tile.size.w + 300,
+        "the window's visible width plus the border is the tile it keeps"
+    );
+}
+
+#[test]
 fn an_explicit_width_is_the_layouts_word_again() {
     let (mut engine, backend, output) = fixture(&[-9419]);
     let id = WindowId::new(-9419);
