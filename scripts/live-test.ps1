@@ -556,9 +556,11 @@ function NewTopLevel($before) { @([LT]::TopLevel() | Where-Object { $before -not
 # arrives while the tab is still tearing down is ignored). Returns how many windows it found.
 $terminalShellsStopped = 0
 $terminalWindowsLeftOpen = 0
+# Every terminal window a check of this run created and closed; the end of the run retries only these.
+$runTerminalWindows = New-Object System.Collections.Generic.List[long]
 function CloseNewTerminalWindows($snapshot, [int[]]$shellIds) {
     $wins = @(NewTopLevel $snapshot | Where-Object { [LT]::IsWindow($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') })
-    foreach ($h in $wins) { [LT]::Close($h) }
+    foreach ($h in $wins) { [void]$script:runTerminalWindows.Add([long]$h); [LT]::Close($h) }
     if ($wins.Count) { Start-Sleep -Milliseconds 500 }
     foreach ($id in @($shellIds)) {
         if (Get-Process -Id $id -ErrorAction SilentlyContinue) {
@@ -647,7 +649,7 @@ $ctlBytes = [IO.File]::ReadAllBytes($ctl)
 $ctlSubsystem = [BitConverter]::ToUInt16($ctlBytes, [BitConverter]::ToInt32($ctlBytes, 0x3C) + 24 + 68)
 
 $topBefore = [LT]::TopLevel()
-$topAtStart = $topBefore   # the end-of-run terminal sweep closes only windows this run created
+$topAtStart = $topBefore   # the end of the run reports terminal windows that appeared after this snapshot
 [FgLog]::Start()
 $w = Start-Wiri $log1 (Join-Path $D 'wiri.stdout.log')
 Start-Sleep -Seconds 4
@@ -3361,9 +3363,19 @@ if ($env:WIRI_LIVE_CI -eq '1') {
     })
 }
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-e-perf.ps1') } catch { LanePhaseError 'lane_e_perf' $_ } # p_* numeric information only; never pass/fail
-# Terminal windows this run created and any phase left behind: close them so the next run starts on a
-# clean desktop. Information only (a count), never a gate.
-$summary['terminal_windows_swept_at_end'] = CloseNewTerminalWindows $topAtStart @()
+# End of run: retry closing only terminal windows a check of this run created (the shared desktop may
+# also hold someone's own terminal, which must never be closed). Any other terminal window that appeared
+# during the run is only reported, so a phase that leaks one shows up here. Information only.
+$swept = 0
+foreach ($h in @($runTerminalWindows | Where-Object { [LT]::IsWindow([IntPtr]$_) })) {
+    for ($i = 0; $i -lt 15 -and [LT]::IsWindow([IntPtr]$h); $i++) { [LT]::Close([IntPtr]$h); Start-Sleep -Milliseconds 200 }
+    if ([LT]::IsWindow([IntPtr]$h)) { $terminalWindowsLeftOpen++ } else { $swept++ }
+}
+$untracked = @(NewTopLevel $topAtStart | Where-Object {
+    [LT]::IsWindow($_) -and ([LT]::Class($_) -match 'CASCADIA|ConsoleWindow') -and ($runTerminalWindows -notcontains [long]$_) })
+$summary['terminal_windows_swept_at_end'] = $swept
+$summary['terminal_windows_untracked_at_end'] = $untracked.Count
+$summary['terminal_windows_untracked_titles'] = @($untracked | ForEach-Object { [LT]::Title($_) })
 $summary['terminal_windows_left_open'] = $terminalWindowsLeftOpen
 # Foreground changes over the whole run. The harness never runs elevated, so an "Administrator:" window
 # taking the foreground is another program interfering with the run. Information only, never a gate.
