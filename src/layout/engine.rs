@@ -22,6 +22,7 @@ use super::strip::CenterFocusedColumn;
 use sizing::DrawMode;
 // The windows and workspaces as the IPC event stream describes them (niri's `Window` and `Workspace`).
 mod action_dispatch;
+mod by_id;
 mod focus_actions;
 mod foreground;
 mod foreground_runtime;
@@ -783,6 +784,8 @@ pub struct TilingEngine {
     /// notice that may still follow for the same window is not broadcast a second time.
     /// Cleared by any other live focus change.
     converged_broadcast: Option<WindowId>,
+    /// Set while a `*ById` action runs: nothing may hand the foreground to the engine focus.
+    activation_suppressed: bool,
     /// IPC focus history uses a monotonic daemon-local clock, never wall time.
     focus_timestamps: HashMap<WindowId, std::time::Duration>,
     focus_epoch: std::time::Instant,
@@ -939,6 +942,7 @@ impl TilingEngine {
             os_foreground: None,
             live_focus_notice: parking_lot::Mutex::new(None),
             converged_broadcast: None,
+            activation_suppressed: false,
             focus_timestamps: HashMap::new(),
             focus_epoch: std::time::Instant::now(),
             last_focus_stamp: std::time::Duration::ZERO,
@@ -3626,7 +3630,10 @@ impl TilingEngine {
         // Only the focused monitor's focus drives Win32 activation.  The attempt is
         // made once per focus target (success or not): retrying a refused request on
         // every layout pass is what used to flood the log and fight the foreground lock.
-        if activate_focus && Some(output_id) == self.monitors.focused_id() {
+        if activate_focus
+            && !self.activation_suppressed
+            && Some(output_id) == self.monitors.focused_id()
+        {
             let current_focus = self.monitors.get(&output_id).and_then(|m| m.focus_window);
             if let Some(wid) = current_focus {
                 if Some(wid) != self.last_activated {
@@ -3642,6 +3649,9 @@ impl TilingEngine {
     /// focus target, from the layout pass.  A refusal (foreground lock) is
     /// logged once here and never retried until the focus target changes again.
     fn activate_now(&mut self, wid: WindowId, backend: &BackendHandle) {
+        if self.activation_suppressed {
+            return;
+        }
         self.remember_action_focus(wid);
         self.last_activated = Some(wid);
         match backend.activate_window(wid.as_isize()) {
@@ -7478,26 +7488,6 @@ impl TilingEngine {
     /// The widest one (niri has the same limit).
     const MAX_COLUMN_PX: i32 = 100_000;
 
-    /// The focused column of `output` and what a size change needs to know about it:
-    /// its index and width, the width of the view, the gap between columns and the room
-    /// the borders take around a window.
-    fn focused_column_metrics(&self, output: OutputId) -> Option<(usize, i32, f64, i32, i32)> {
-        let monitor = self.monitors.get(&output)?;
-        let cfg = self.active_workspace_config(output);
-        let col_idx = monitor.focus_column?;
-        let view = Self::precise_tiling_area(monitor, cfg).width;
-        let workspace = monitor.workspace()?;
-        let column = workspace.columns.get(col_idx)?;
-        let current = column.resolved_width(Self::workspace_default_width(workspace, view, cfg));
-        Some((
-            col_idx,
-            current,
-            view,
-            cfg.column_gap,
-            2 * cfg.border_inset(),
-        ))
-    }
-
     fn physical_size_change(change: SizeChange, scale: f64) -> SizeChange {
         match change {
             SizeChange::SetFixed(px) => SizeChange::SetFixed((px as f64 * scale).round() as i32),
@@ -7641,12 +7631,40 @@ impl TilingEngine {
         let Some(output) = self.monitors.focused_id() else {
             return;
         };
-        let Some((col_idx, current, view, gap, _)) = self.focused_column_metrics(output) else {
+        let Some((workspace, col_idx)) = self
+            .monitors
+            .get(&output)
+            .and_then(|m| m.focus_column.map(|column| (m.active_workspace, column)))
+        else {
             return;
         };
-        let cfg = self.active_workspace_config(output).clone();
+        if self.apply_column_width_preset(output, workspace, col_idx, forwards) {
+            self.reveal_focused_column(output);
+            self.apply_layout_for_monitor(output, backend);
+        }
+    }
+
+    /// The next preset width for column `col_idx` of `workspace` on `output`, applied to
+    /// the column (no reveal, no layout). `false` when the column does not exist.
+    pub(super) fn apply_column_width_preset(
+        &mut self,
+        output: OutputId,
+        workspace: i32,
+        col_idx: usize,
+        forwards: bool,
+    ) -> bool {
+        let cfg = self.effective_config_for_workspace(output, workspace).clone();
+        let Some((current, view, gap)) = self.monitors.get(&output).and_then(|monitor| {
+            let view = Self::precise_tiling_area(monitor, &cfg).width;
+            let strip = monitor.workspaces.get(&workspace)?;
+            let column = strip.columns.get(col_idx)?;
+            let current = column.resolved_width(Self::workspace_default_width(strip, view, &cfg));
+            Some((current, view, cfg.column_gap))
+        }) else {
+            return false;
+        };
         let scale = self.monitors.get(&output).map_or(1.0, |m| m.scale_factor);
-        let presets = self.column_presets(output);
+        let presets = self.column_presets_for_workspace(output, workspace);
         let resolved: Vec<i32> = presets
             .iter()
             .map(|spec| match spec {
@@ -7659,11 +7677,11 @@ impl TilingEngine {
         let Some((maximized, remembered)) = self
             .monitors
             .get(&output)
-            .and_then(|m| m.workspace())
+            .and_then(|m| m.workspaces.get(&workspace))
             .and_then(|w| w.columns.get(col_idx))
             .map(|c| (c.maximized, c.preset_idx))
         else {
-            return;
+            return false;
         };
         // A maximized column counts as a column as wide as the view.
         let idx = if maximized {
@@ -7675,7 +7693,7 @@ impl TilingEngine {
         if let Some(column) = self
             .monitors
             .get_mut(&output)
-            .and_then(|m| m.workspace_mut())
+            .and_then(|m| m.workspaces.get_mut(&workspace))
             .and_then(|w| w.columns.get_mut(col_idx))
         {
             match presets[idx] {
@@ -7689,8 +7707,7 @@ impl TilingEngine {
             column.width = Some(width);
             column.preset_idx = Some(idx);
         }
-        self.reveal_focused_column(output);
-        self.apply_layout_for_monitor(output, backend);
+        true
     }
 
     /// Set the focused column's width to a fraction of the view (the older wiri

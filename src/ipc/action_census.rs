@@ -346,10 +346,6 @@ struct Row {
     note: &'static str,
 }
 
-/// The by-id forms that still go through "focus the window, then act": niri's `*ById`
-/// variants (niri:src/input/mod.rs:1110-1119,1728-1736,2111-2117,2213-2221) never change focus.
-const FOCUS_FIRST: &str = "by id (`--id` / `id`): wiri activates the named window first, niri's ById variant never changes focus; needs a focus-neutral engine path";
-
 fn pascal(name: &str) -> String {
     name.split('-')
         .map(|word| {
@@ -573,12 +569,8 @@ fn rows() -> Vec<Row> {
         unit("move-window-up", "MoveWindowUp -> engine.move_window_in_column(-1) (floating: float_move_by)"),
         unit("move-window-down-or-to-workspace-down", "MoveWindowDownOrToWorkspaceDown -> engine.move_window_or_to_workspace(true)"),
         unit("move-window-up-or-to-workspace-up", "MoveWindowUpOrToWorkspaceUp -> engine.move_window_or_to_workspace(false)"),
-        with_id("consume-or-expel-window-left", "ConsumeOrExpelWindowLeft -> engine.consume_or_expel_window_left")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
-        with_id("consume-or-expel-window-right", "ConsumeOrExpelWindowRight -> engine.consume_or_expel_window_right")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
+        with_id("consume-or-expel-window-left", "ConsumeOrExpelWindowLeft -> engine.consume_or_expel_window_left (by id: consume_or_expel_window_for, focus unchanged)"),
+        with_id("consume-or-expel-window-right", "ConsumeOrExpelWindowRight -> engine.consume_or_expel_window_right (by id: consume_or_expel_window_for, focus unchanged)"),
         unit("consume-window-into-column", "ConsumeWindowIntoColumn -> engine.consume_window_into_column"),
         unit("expel-window-from-column", "ExpelWindowFromColumn -> engine.expel_window_from_column"),
         unit("swap-window-right", "SwapWindowRight -> engine.swap_window_toward(true)"),
@@ -595,9 +587,7 @@ fn rows() -> Vec<Row> {
         unit("center-column", "CenterColumn -> engine.center_focused_column (floating: float_center)")
             .kind(Kind::Partial)
             .note("explicit-action evidence for variable-width edge columns and mixed outputs pending (matrix A)"),
-        with_id("center-window", "CenterWindow -> engine.center_focused_column / float_center")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
+        with_id("center-window", "CenterWindow -> engine.center_focused_column / float_center (by id: center_window_for, focus unchanged)"),
         unit("center-visible-columns", "CenterVisibleColumns -> engine.center_visible_columns"),
         unit("focus-workspace-down", "FocusWorkspaceNext -> engine.focus_workspace_relative(Next)"),
         unit("focus-workspace-up", "FocusWorkspacePrevious -> engine.focus_workspace_relative(Previous)"),
@@ -736,23 +726,17 @@ fn rows() -> Vec<Row> {
         );
     }
     rows.extend([
-        with_id("reset-window-height", "ResetWindowHeight -> engine.reset_window_height")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
+        with_id("reset-window-height", "ResetWindowHeight -> engine.reset_window_height (by id: reset_window_height_for, focus unchanged)"),
         unit("switch-preset-column-width", "ColumnWidthPresetCycle -> engine.switch_preset_column_width(true)"),
         unit("switch-preset-column-width-back", "ColumnWidthPresetCycleBack -> engine.switch_preset_column_width(false)"),
-        with_id("switch-preset-window-width", "WindowWidthPresetCycle -> engine.switch_preset_window_width(true)")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
-        with_id("switch-preset-window-width-back", "WindowWidthPresetCycleBack -> engine.switch_preset_window_width(false)")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
+        with_id("switch-preset-window-width", "WindowWidthPresetCycle -> engine.switch_preset_window_width(true) (by id: switch_preset_window_width_for, focus unchanged)"),
+        with_id("switch-preset-window-width-back", "WindowWidthPresetCycleBack -> engine.switch_preset_window_width(false) (by id: switch_preset_window_width_for, focus unchanged)"),
         with_id("switch-preset-window-height", "WindowHeightPresetCycle -> engine.switch_preset_window_height(true)")
             .kind(Kind::Partial)
-            .note("native mixed-DPI and some lifecycle routes still need physical evidence (matrix A); a tiled target by id is activated first (floating targets are not)"),
+            .note("native mixed-DPI and some lifecycle routes still need physical evidence (matrix A); by id (tiled or floating) the named window cycles without any focus change"),
         with_id("switch-preset-window-height-back", "WindowHeightPresetCycleBack -> engine.switch_preset_window_height(false)")
             .kind(Kind::Partial)
-            .note("same row as switch-preset-window-height (matrix A); a tiled target by id is activated first"),
+            .note("same row as switch-preset-window-height (matrix A); by id the named window cycles without any focus change"),
         unit("maximize-column", "MaximizeColumn -> engine.toggle_maximize_focused_column"),
         with_id("maximize-window-to-edges", "MaximizeWindowToEdges -> engine.toggle_maximize_window_to_edges_for"),
         a("set-column-width", "SetColumnWidth -> change_size(Width)")
@@ -795,15 +779,9 @@ fn rows() -> Vec<Row> {
         unit("debug-toggle-damage", "none")
             .na("compositor render debugging (damage overlay)"),
         unit("toggle-touchpad", "System(ToggleTouchpad) -> system_actions::toggle_touchpad"),
-        with_id("toggle-window-floating", "ToggleFloating -> engine.toggle_floating_for")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
-        with_id("move-window-to-floating", "MoveWindowToFloating -> engine.set_window_floating(true)")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
-        with_id("move-window-to-tiling", "MoveWindowToTiling -> engine.set_window_floating(false)")
-            .kind(Kind::Partial)
-            .note(FOCUS_FIRST),
+        with_id("toggle-window-floating", "ToggleFloating -> engine.toggle_floating_for (by id: toggle_floating_by_id, focus unchanged)"),
+        with_id("move-window-to-floating", "MoveWindowToFloating -> engine.set_window_floating(true) (by id: set_floating_by_id, focus unchanged)"),
+        with_id("move-window-to-tiling", "MoveWindowToTiling -> engine.set_window_floating(false) (by id: set_floating_by_id, focus unchanged)"),
         unit("focus-floating", "FocusFloating -> engine.focus_layer_action(Floating)"),
         unit("focus-tiling", "FocusTiling -> engine.focus_layer_action(Tiling)"),
         unit("switch-focus-between-floating-and-tiling", "SwitchFocusBetweenFloatingAndTiling -> engine.focus_layer_action(Switch)"),

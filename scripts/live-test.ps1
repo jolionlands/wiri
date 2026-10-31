@@ -3323,6 +3323,9 @@ try { . (Join-Path $PSScriptRoot 'live-phases\lane-a11y.ps1') } catch { LanePhas
 # test starts one private daemon whose own explicit hide/restore is the only cursor change,
 # and its `finally` reloads the user's cursor scheme unconditionally.
 try { . (Join-Path $PSScriptRoot 'live-phases\lane-last.ps1') } catch { LanePhaseError 'lane_last' $_ }
+# H92: the focus core. One focus-window request settles managed focus on the native foreground (no retry);
+# niri's *ById actions change the named window and never move native or managed focus.
+try { . (Join-Path $PSScriptRoot 'live-phases\lane-focus.ps1') } catch { LanePhaseError 'lane_focus' $_ }
 # Keep the normal desktop summary unchanged; only the explicit CI mode may omit a dependency gate.
 if ($env:WIRI_LIVE_CI -eq '1') {
     $summary['ci_skips'] = @(if ($null -eq $spawnWtWindow) {

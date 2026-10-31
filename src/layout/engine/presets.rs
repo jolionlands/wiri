@@ -256,8 +256,44 @@ impl TilingEngine {
             return;
         };
         let workspace = monitor.active_workspace;
+        self.switch_tiled_window_height_at(output, workspace, column_index, window, forwards, backend);
+    }
+
+    /// niri `switch-preset-window-height[-back]` for a named tile (`SwitchPresetWindowHeightById`,
+    /// niri:src/input/mod.rs:1704-1717): the tile's own column, on whatever workspace or output
+    /// it is, without selecting or activating anything. A floating window is cycled by
+    /// `float_cycle_height` instead.
+    pub fn switch_preset_window_height_for(
+        &mut self,
+        window: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        if self.floating_windows.contains(&window) {
+            self.float_cycle_height(window, forwards, backend);
+            return;
+        }
+        let Some((output, workspace, column_index)) = self.locate_window(window) else {
+            return;
+        };
+        self.switch_tiled_window_height_at(output, workspace, column_index, window, forwards, backend);
+    }
+
+    fn switch_tiled_window_height_at(
+        &mut self,
+        output: OutputId,
+        workspace: i32,
+        column_index: usize,
+        window: WindowId,
+        forwards: bool,
+        backend: &BackendHandle,
+    ) {
+        let Some(monitor) = self.monitors.get(&output) else {
+            return;
+        };
         let Some(column) = monitor
-            .workspace()
+            .workspaces
+            .get(&workspace)
             .and_then(|workspace| workspace.columns.get(column_index))
         else {
             return;
