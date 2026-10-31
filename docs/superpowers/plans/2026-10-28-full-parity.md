@@ -363,6 +363,15 @@ the older poller roadmap in PERF.md is historical.
   synchronous activation fallback; preserve generation and completion guarantees.
 - [ ] Measure ordinary animated frame spacing separately: the existing perf
   collector disables animations. Attribute runtime costs before optimization.
+  **Changed by Lane PACE:** the fixed 16 ms frame sleep is gone — the frame worker waits on
+  the desktop's presentation clock (`DCompositionWaitForCompositorClock`, then `DwmFlush`,
+  then a refresh-derived sleep; `src/animation/`), so animated spacing is the compositor's,
+  not `16 ms + work`, and a burst is the only time a wait exists. One `#[ignore]`
+  measurement test recorded median 16.663 / p95 16.703 / max 16.735 ms and 0.130 ms CPU per
+  frame on TRIDARIS (method and limits in [PERF.md](../../PERF.md#animation-clock-measurement-2026-10-30-lane-pace)).
+  Still open: the official collector still runs with animations off, the `h90_*` gates are
+  written but unrun, and the matrix row stays partial until a live cycle measures cadence
+  and idle CPU.
 
 ### Task 16: Hotkey-overlay selection and descriptions
 
