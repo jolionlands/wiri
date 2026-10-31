@@ -35,16 +35,17 @@
     $mpDaemon = $null
     $mpLog = Join-Path $mpDir 'pango.stderr'
     $mpCapture = Join-Path $mpDir 'pango.png'
-    # The fixture: the same words bold and plain, an entity plus a colour span, and one
-    # unknown tag (a markup error, so the whole title must paint literally).
+    # The fixture: the same word bold and plain, an entity plus a colour span on a word
+    # OCR reads reliably at the sheet's 13 px body size, and one unknown tag (a markup
+    # error, so the whole title must paint literally).
     $mpConfig = @'
 hotkey-overlay { skip-at-startup; hide-not-bound; }
 binds {
     extend-defaults false
-    Ctrl+Alt+F9 hotkey-overlay-title="<b>PangoBold</b>" { spawn "notepad.exe"; }
-    Ctrl+Alt+F10 hotkey-overlay-title="PangoBold" { spawn "calc.exe"; }
-    Ctrl+Alt+F11 hotkey-overlay-title=r##"<span foreground="#ff8800">PangoOrange</span> &amp; more"## { spawn "mspaint.exe"; }
-    Ctrl+Alt+F12 hotkey-overlay-title="<blinkish>PangoFallback" { spawn "write.exe"; }
+    Ctrl+Alt+F9 hotkey-overlay-title="<b>Bold</b>" { spawn "notepad.exe"; }
+    Ctrl+Alt+F10 hotkey-overlay-title="Bold" { spawn "calc.exe"; }
+    Ctrl+Alt+F11 hotkey-overlay-title=r##"<span foreground="#ff8800">Orange</span> and &amp; more"## { spawn "mspaint.exe"; }
+    Ctrl+Alt+F12 hotkey-overlay-title="<error> Fallback" { spawn "write.exe"; }
 }
 '@
     function MPNative() {
@@ -201,8 +202,10 @@ public static class LanePangoNative {
             try { $mpGraphics.CopyFromScreen($mpBounds[0], $mpBounds[1], 0, 0, $mpBitmap.Size); $mpBitmap.Save($mpCapture, [Drawing.Imaging.ImageFormat]::Png) }
             finally { $mpGraphics.Dispose() }
             $mpOcr = MPRead $mpCapture ([DateTime]::UtcNow.AddSeconds(20))
-            $mpBold = @(MPWords $mpOcr 'PangoBold')
-            $mpOrangeWord = @(MPWords $mpOcr 'PangoOrange') | Select-Object -First 1
+            # The sheet reads top to bottom: the `<b>` row is the first "Bold", the plain
+            # control row is the second.
+            $mpBold = @(MPWords $mpOcr 'Bold')
+            $mpOrangeWord = @(MPWords $mpOcr 'Orange') | Select-Object -First 1
             if ($mpBold.Count -ge 2) {
                 $mpBoldInk = MPInk $mpBitmap $mpBold[0]
                 $mpPlainInk = MPInk $mpBitmap $mpBold[$mpBold.Count - 1]
@@ -219,11 +222,11 @@ public static class LanePangoNative {
     # Group 1: the painted words and the entity.
     try {
         $mpText = $(if ($null -ne $mpOcr) { $mpOcr.text } else { '' })
-        $mpHasOrange = $mpText -match 'PangoOrange'
+        $mpHasOrange = $mpText -match 'Orange'
         $mpHasBold = ($mpBold.Count -ge 2)
         $mpHasMore = $mpText -match 'more'
         # The entity was decoded and the tags were not painted as text.
-        $mpNoEntity = ($mpText -notmatch 'amp;') -and ($mpText -notmatch '&amp')
+        $mpNoEntity = ($mpText -notmatch 'amp')
         $mpNoTagText = ($mpText -notmatch '<b>') -and ($mpText -notmatch '<span')
         MPGate 'h89_markup_title_text_and_entity_render' ($mpHasOrange -and $mpHasBold -and $mpHasMore -and $mpNoEntity -and $mpNoTagText) ([ordered]@{
                 text = $mpText; orange = $mpHasOrange; bold_rows = $mpBold.Count; more = $mpHasMore
@@ -242,7 +245,7 @@ public static class LanePangoNative {
     } catch {
         $mpDetails['colour-gate-error'] = ($_ | Out-String)
     }
-    # Group 3: the bold run has heavier strokes than the same words in regular weight.
+    # Group 3: the bold run has heavier strokes than the same word in regular weight.
     try {
         $mpHeavier = ($mpBoldInk -gt 0) -and ($mpPlainInk -gt 0) -and ($mpBoldInk -gt [int][Math]::Floor($mpPlainInk * 1.05))
         MPGate 'h89_markup_bold_run_has_more_ink' $mpHeavier ([ordered]@{
@@ -254,9 +257,9 @@ public static class LanePangoNative {
     # Group 4: invalid markup paints the whole original string, tags and all.
     try {
         $mpText = $(if ($null -ne $mpOcr) { $mpOcr.text } else { '' })
-        $mpFallback = ($mpText -match 'PangoFallback') -and ($mpText -match 'blinkish')
+        $mpFallback = ($mpText -match 'Fallback') -and ($mpText -match 'error')
         MPGate 'h89_invalid_markup_falls_back_to_the_whole_string' $mpFallback ([ordered]@{
-                text = $mpText; tag_text_visible = ($mpText -match 'blinkish'); title_visible = ($mpText -match 'PangoFallback')
+                text = $mpText; tag_text_visible = ($mpText -match 'error'); title_visible = ($mpText -match 'Fallback')
             })
     } catch {
         $mpDetails['fallback-gate-error'] = ($_ | Out-String)
@@ -264,7 +267,7 @@ public static class LanePangoNative {
     # Group 5: exactly one warning for the invalid title, logged at config load.
     try {
         $mpWarnings = DiagnosticCount $mpLog 'is not valid Pango markup'
-        $mpWarned = ($mpWarnings -eq 1) -and (@(LogLines $mpLog 'blinkish').Count -ge 1)
+        $mpWarned = ($mpWarnings -eq 1) -and (@(LogLines $mpLog "unknown tag 'error'").Count -ge 1)
         MPGate 'h89_invalid_markup_logs_one_warning_at_load' $mpWarned ([ordered]@{
                 warnings = $mpWarnings; lines = @(LogLines $mpLog 'is not valid Pango markup' | ForEach-Object { $_.Line })
             })
