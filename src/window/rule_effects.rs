@@ -5,7 +5,8 @@ use crate::config::{Effects, PaintStyle, RingStyle, ShadowStyle, TabIndicatorSty
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingOverride {
     pub off: Option<bool>,
-    pub width: Option<u32>,
+    /// Logical pixels (niri `FloatOrInt<0, 65535>`); fractional values are kept.
+    pub width: Option<f64>,
     pub active: Option<PaintStyle>,
     pub inactive: Option<PaintStyle>,
     pub urgent: Option<PaintStyle>,
@@ -29,20 +30,26 @@ impl RingOverride {
     pub fn apply(&self, target: &mut RingStyle) {
         apply_fields!(target, self, off, width, active, inactive, urgent);
     }
-    /// Honour layout-off unless explicitly enabled; enabling inherits its saved width.
-    pub fn inset(&self, base: &RingStyle, legacy_width: i32) -> i32 {
+    /// The border band in PHYSICAL pixels on an output of `scale`.
+    ///
+    /// Honour layout-off unless explicitly enabled; enabling inherits its saved width. The
+    /// rule's own logical width, and the saved width of an off layout border, are projected
+    /// through the output's scale exactly as niri does (tile.rs:244,252-257:
+    /// `round_logical_in_physical_max1` on the merged border config). `legacy_width` is the
+    /// layout's own band, already projected for the output.
+    pub fn inset(&self, base: &RingStyle, legacy_width: i32, scale: f64) -> i32 {
         if self.off.unwrap_or(base.off) {
             return 0;
         }
         self.width.map_or_else(
             || {
                 if base.off {
-                    base.width as i32
+                    crate::layout::metrics::ring_width_px(base.width, scale)
                 } else {
                     legacy_width.max(0)
                 }
             },
-            |w| w as i32,
+            |w| crate::layout::metrics::ring_width_px(w, scale),
         )
     }
 }
@@ -146,19 +153,19 @@ mod tests {
     #[test]
     fn an_empty_block_is_not_a_reset() {
         let mut base = Effects::default();
-        base.border.width = 11;
+        base.border.width = 11.0;
         assert_eq!(RuleEffects::default().apply_to(&base), base);
     }
     #[test]
     fn later_keys_merge_and_unset_keys_survive() {
         let mut first = RuleEffects::default();
-        first.border.width = Some(9);
+        first.border.width = Some(9.0);
         first.border.inactive = Some(PaintStyle::color("red"));
         let mut second = RuleEffects::default();
         second.border.active = Some(PaintStyle::color("lime"));
         first.merge(&second);
         let result = first.apply_to(&Effects::default());
-        assert_eq!(result.border.width, 9);
+        assert_eq!(result.border.width, 9.0);
         assert_eq!(result.border.inactive, PaintStyle::color("red"));
         assert_eq!(result.border.active, PaintStyle::color("lime"));
         assert_eq!(result.shadow, Effects::default().shadow);
@@ -167,28 +174,28 @@ mod tests {
     fn explicit_false_and_zero_override_previous_values() {
         let mut first = RuleEffects::default();
         first.border.off = Some(true);
-        first.border.width = Some(6);
+        first.border.width = Some(6.0);
         let mut second = RuleEffects::default();
         second.border.off = Some(false);
-        second.border.width = Some(0);
+        second.border.width = Some(0.0);
         first.merge(&second);
         let result = first.apply_to(&Effects::default());
         assert!(!result.border.off);
-        assert_eq!(result.border.width, 0);
+        assert_eq!(result.border.width, 0.0);
     }
     #[test]
     fn enabling_an_off_border_restores_its_width_and_width_alone_does_not_enable() {
         let mut base = RingStyle::border_default();
         base.off = true;
-        base.width = 7;
+        base.width = 7.0;
         let mut rule = RingOverride::default();
-        rule.width = Some(11);
-        assert_eq!(rule.inset(&base, 0), 0);
+        rule.width = Some(11.0);
+        assert_eq!(rule.inset(&base, 0, 1.0), 0);
         rule.width = None;
         rule.off = Some(false);
-        assert_eq!(rule.inset(&base, 0), 7);
-        rule.width = Some(11);
-        assert_eq!(rule.inset(&base, 0), 11);
+        assert_eq!(rule.inset(&base, 0, 1.0), 7);
+        rule.width = Some(11.0);
+        assert_eq!(rule.inset(&base, 0, 1.0), 11);
     }
     #[test]
     fn geometry_alone_does_not_clip_the_foreign_window() {

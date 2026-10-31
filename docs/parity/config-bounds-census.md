@@ -52,7 +52,7 @@ are named in the last column.
 | preset `fixed` | plain `i32`, no range | 1..=100000, **rounded** | whole 0..=u32::MAX, decimal rejected | same |
 | `default-column-width`/`default-window-height` `proportion` | `f64` | 0.0001..=10 | any finite | same |
 | `default-column-width`/`-height` `fixed` | `i32` | 0..=100000 whole | whole 0..=u32::MAX | same |
-| `border`/`focus-ring width` | `FloatOrInt<0, 65535>` (`appearance.rs:625-640`) | 0..=4096, rounded to u32 | 0..=65535 (stored rounded, see residuals) | `parity_bounds_shadow_tab_indicator_and_gradient_angle` |
+| `border`/`focus-ring width` | `FloatOrInt<0, 65535>` (`appearance.rs:625-640`) | 0..=4096, rounded to u32 | 0..=65535, kept fractional as `f64` logical pixels (rounded per output at use) | `parity_bounds_shadow_tab_indicator_and_gradient_angle` |
 | `shadow softness` | `FloatOrInt<0, 1024>` (`appearance.rs:647-660`) | 0..=4096 (too wide) | 0..=1024 | same |
 | `shadow spread` | `FloatOrInt<-1024, 1024>` | -4096..=4096 then **clamped to >= 0** | -1024..=1024, negative kept | same |
 | `shadow offset x=`/`y=` | `FloatOrInt<-65535, 65535>` | kept as f64 (legacy i32 mirror rounded) | unchanged | - |
@@ -126,8 +126,10 @@ them:
    argument (`xcursor-size`, `accel-speed`, `pinch-sensitivity`) are validated.
 3. **Negative fixed sizes.** niri's `PresetSize::Fixed(i32)` accepts a negative value; wiri's
    `SizeSpec::Fixed` is a `u32`, so `fixed -1` is an explicit error instead of a wrap.
-4. **Border and focus-ring width** are stored as whole device pixels (`RingStyle::width: u32`);
-   a fractional niri width is rounded once at decode. niri keeps `f64` and rounds at render.
+4. **Border and focus-ring width** are kept as fractional logical pixels (`RingStyle::width:
+   f64`, 2026-10-30) and rounded per output with niri's `round_logical_in_physical_max1`
+   (`layout::metrics::ring_width_px`). The older flat `border-width` / `focus-ring-width`
+   spellings stay integers.
 5. **`cooldown-ms`** is a `u32` in wiri, `u64` in niri; values above `u32::MAX` are refused.
 6. `Percent` options (`focus-follows-mouse max-scroll-amount`) are accepted by wiri's numeric
    reader without the mandatory `%`; niri requires the `%` suffix (`utils.rs:58-70`).

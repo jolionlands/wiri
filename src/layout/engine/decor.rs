@@ -62,6 +62,9 @@ pub(super) fn frame_specs(
     tiles: &[(WindowId, Rect, DrawMode)],
 ) -> Vec<DecorSpec> {
     let fx = &inputs.cfg.effects;
+    // The band is already physical (the view is projected per output); the ring and shadow
+    // metrics are logical and are projected here with the same output scale.
+    let scale = inputs.cfg.output_scale();
     let band = inputs.cfg.border_inset();
     let mut out = Vec::new();
     if inputs.lone_tile && inputs.cfg.smart_borders {
@@ -84,14 +87,14 @@ pub(super) fn frame_specs(
         } else {
             None
         };
-        let ring_width = fx.focus_ring.width as i32;
+        let ring_width = crate::layout::metrics::ring_width_px(fx.focus_ring.width, scale);
         let ring = if !fx.focus_ring.off && ring_width > 0 && is_active_window {
             paint_for(&fx.focus_ring, urgent, inputs.focus_monitor, inputs.accent)
         } else {
             None
         };
         let shadow = if fx.shadow.on {
-            shadow_of(&fx.shadow, focused)
+            shadow_of(&fx.shadow, focused, scale)
         } else {
             None
         };
@@ -117,7 +120,9 @@ pub(super) fn frame_specs(
     out
 }
 
-fn shadow_of(style: &crate::config::ShadowStyle, active: bool) -> Option<ShadowSpec> {
+/// The shadow of a window on an output of `scale`: softness, spread and offsets are logical
+/// in the configuration and physical in the spec (niri layout/shadow.rs:43-61).
+fn shadow_of(style: &crate::config::ShadowStyle, active: bool, scale: f64) -> Option<ShadowSpec> {
     let text = if active {
         &style.color
     } else {
@@ -128,11 +133,18 @@ fn shadow_of(style: &crate::config::ShadowStyle, active: bool) -> Option<ShadowS
     if !active && style.inactive_color.is_none() {
         color = color.faded(0.75);
     }
+    let metrics = crate::layout::metrics::project_shadow(
+        style.softness,
+        style.spread,
+        style.offset_x,
+        style.offset_y,
+        scale,
+    );
     Some(ShadowSpec {
-        softness: style.softness as f32,
-        spread: style.spread as f32,
-        offset_x: style.offset_x as f32,
-        offset_y: style.offset_y as f32,
+        softness: metrics.softness_px as f32,
+        spread: metrics.spread_px as f32,
+        offset_x: metrics.offset_x_px as f32,
+        offset_y: metrics.offset_y_px as f32,
         color,
         draw_behind_window: style.draw_behind_window,
     })

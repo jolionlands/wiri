@@ -194,13 +194,7 @@ impl TilingEngine {
                             .map(|tile| {
                                 let inset = self.rule_state.get(&tile.window_id).map_or(
                                     cfg.border_inset(),
-                                    |state| {
-                                        state
-                                            .resolved
-                                            .effects
-                                            .border
-                                            .inset(&cfg.effects.border, cfg.border_inset())
-                                    },
+                                    |state| cfg.border_inset_with(&state.resolved.effects.border),
                                 );
                                 Self::proportional_width(view, cfg, p, inset, min, max).tile_px
                             })
@@ -222,11 +216,7 @@ impl TilingEngine {
                             self.rule_state
                                 .get(&window)
                                 .map_or(cfg.border_inset(), |state| {
-                                    state
-                                        .resolved
-                                        .effects
-                                        .border
-                                        .inset(&cfg.effects.border, cfg.border_inset())
+                                    cfg.border_inset_with(&state.resolved.effects.border)
                                 })
                         });
                     column.width = Some(

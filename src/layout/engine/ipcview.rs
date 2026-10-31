@@ -844,8 +844,8 @@ mod tests {
 
     #[test]
     fn parity_ipc_layout_border_off_matches_native_allocation_at_fractional_scale() {
-        for border_width in [0, 7] {
-            for ring_width in [0, 9] {
+        for border_width in [0.0, 7.0] {
+            for ring_width in [0.0, 9.0] {
                 for ring_off in [false, true] {
                     let mut config = crate::config::Config::default();
                     config.layout.effects.border.off = true;
@@ -869,14 +869,14 @@ mod tests {
     fn parity_ipc_layout_enabled_border_uses_each_workspaces_own_inset() {
         let mut config = crate::config::Config::default();
         config.layout.effects.border.off = false;
-        config.layout.effects.border.width = 3;
-        config.layout.effects.focus_ring.width = 0;
+        config.layout.effects.border.width = 3.0;
+        config.layout.effects.focus_ring.width = 0.0;
         let mut override_layout = crate::config::LayoutConfigPartial::default();
         let mut border = crate::config::effects::RingStyle::border_default();
-        border.width = 6;
+        border.width = 6.0;
         override_layout.effects.border = Some(border);
         let mut ring = crate::config::effects::RingStyle::focus_ring_default();
-        ring.width = 11;
+        ring.width = 11.0;
         override_layout.effects.focus_ring = Some(ring);
         override_layout.outer_gaps = Some(23.0);
         let (engine, output, active, inactive) = geometry_fixture(config, Some(override_layout));
@@ -885,26 +885,29 @@ mod tests {
             engine.monitors.get(&output).unwrap().active_workspace,
             active
         );
-        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 3);
-        assert_snapshot_matches_calculated_native_allocation(&engine, output, inactive, 6);
+        // The widths are logical: niri's round_logical_in_physical_max1 at the fixture's
+        // 1.5 scale turns 3 into 4.5 -> 5 and 6 into 9 physical pixels.
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 5);
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, inactive, 9);
     }
 
     #[test]
     fn parity_ipc_layout_inactive_border_off_does_not_inherit_active_inset() {
         let mut config = crate::config::Config::default();
         config.layout.effects.border.off = false;
-        config.layout.effects.border.width = 5;
+        config.layout.effects.border.width = 5.0;
         let mut override_layout = crate::config::LayoutConfigPartial::default();
         let mut border = crate::config::effects::RingStyle::border_default();
         border.off = true;
-        border.width = 8;
+        border.width = 8.0;
         override_layout.effects.border = Some(border);
         let (engine, output, active, inactive) = geometry_fixture(config, Some(override_layout));
         assert_eq!(
             engine.monitors.get(&output).unwrap().active_workspace,
             active
         );
-        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 5);
+        // Logical 5 at the fixture's 1.5 scale is 7.5 -> 8 physical pixels.
+        assert_snapshot_matches_calculated_native_allocation(&engine, output, active, 8);
         assert_snapshot_matches_calculated_native_allocation(&engine, output, inactive, 0);
     }
 

@@ -31,6 +31,8 @@ mod ipcview;
 mod lane_l;
 pub use lane_l::FocusLayer;
 #[cfg(test)]
+mod decor_dpi_tests;
+#[cfg(test)]
 mod float_sizing_parity_tests;
 #[cfg(test)]
 mod floating_height_parity_tests;
@@ -515,6 +517,21 @@ impl LayoutConfig {
         self.border_width.max(0)
     }
 
+    /// The scale this view was projected at; a standalone (unprojected) engine config is 1.
+    pub fn output_scale(&self) -> f64 {
+        crate::layout::metrics::valid_scale(self.projection_scale.unwrap_or(1.0))
+    }
+
+    /// [`Self::border_inset`] of a window whose rules carry a `border {}` override, in the
+    /// physical pixels of the output this view belongs to.
+    pub fn border_inset_with(&self, rule: &crate::window::rule_effects::RingOverride) -> i32 {
+        rule.inset(
+            &self.effects.border,
+            self.border_inset(),
+            self.output_scale(),
+        )
+    }
+
     pub fn from_config(config: &crate::config::Config) -> Self {
         Self::from_config_at_scale(config, 1.0)
     }
@@ -539,10 +556,11 @@ impl LayoutConfig {
         // The border block says how much room every window leaves around itself: its width,
         // none when the border is off.
         lc.effects = config.layout.effects.clone();
+        // Logical to physical pixels for THIS output, niri's tile.rs:244,252-257.
         lc.border_width = if lc.effects.border.off {
             0
         } else {
-            lc.effects.border.width as i32
+            crate::layout::metrics::ring_width_px(lc.effects.border.width, scale)
         };
         if !config.layout.border_color.is_empty() {
             lc.border_color = config.layout.border_color.clone();
@@ -566,7 +584,7 @@ impl LayoutConfig {
         lc.focus_ring_width = if lc.effects.focus_ring.off {
             0
         } else {
-            lc.effects.focus_ring.width as i32
+            crate::layout::metrics::ring_width_px(lc.effects.focus_ring.width, scale)
         };
         if !config.layout.focus_ring_color.is_empty() {
             lc.focus_ring_color = config.layout.focus_ring_color.clone();
@@ -2184,12 +2202,7 @@ impl TilingEngine {
                 for column in workspace.columns.iter_mut() {
                     for tile in column.tiles.iter_mut() {
                         let border = states.get(&tile.window_id).map_or(border, |s| {
-                            2 * s
-                                .resolved
-                                .effects
-                                .border
-                                .inset(&cfg.effects.border, cfg.border_inset())
-                                as u32
+                            2 * cfg.border_inset_with(&s.resolved.effects.border) as u32
                         });
                         let window_min = known.get(&tile.window_id).copied().unwrap_or(0);
                         let rule = limits.get(&tile.window_id).copied().unwrap_or_default();

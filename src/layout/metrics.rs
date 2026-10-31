@@ -2,6 +2,12 @@
 //!
 //! niri e19df12 rounds nonzero gaps to at least one physical pixel, then keeps
 //! fractional strut extents through working-area and proportional-size resolution.
+//!
+//! The same file projects the appearance metrics (border width, focus-ring width and the
+//! shadow's softness, spread and offsets). Every one of them is configured, and carried by
+//! window rules, in LOGICAL pixels; the engine turns them into physical pixels once, for the
+//! output the window is on, so a window that moves to an output with another scale is
+//! decorated again with that output's pixels.
 
 use crate::config::{Edges, InsetValue, LayoutConfig};
 use crate::utils::{Point, Rect};
@@ -30,6 +36,72 @@ impl From<Rect> for PhysicalWorkArea {
             width: f64::from(rect.size.w),
             height: f64::from(rect.size.h),
         }
+    }
+}
+
+/// A usable output scale: a non-finite, zero or negative one is treated as 96 DPI.
+pub fn valid_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// A logical `border` or `focus-ring` width in whole physical pixels.
+///
+/// niri's `Tile::update_config` replaces the merged (layout plus window rule) width with
+/// `round_logical_in_physical_max1(scale, width)` (layout/tile.rs:244,252-257;
+/// utils/mod.rs:185-191): zero stays zero, any other width is at least one physical pixel,
+/// and the product with the scale is rounded to the nearest pixel (halves away from zero).
+/// Both the tile shrink of the border (tile.rs:818-840) and the ring's outward extent
+/// (focus_ring.rs:69-70) use that rounded width.
+pub fn ring_width_px(logical: f64, scale: f64) -> i32 {
+    // NaN and negative widths cannot be written in niri (range 0..=65535); treat them as off.
+    if logical.is_nan() || logical <= 0.0 {
+        return 0;
+    }
+    (logical * valid_scale(scale)).max(1.0).round() as i32
+}
+
+/// The shadow geometry of one tile in physical pixels, as niri's `Shadow` derives it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PhysicalShadow {
+    /// The CSS-style blur diameter: the gaussian's sigma is half of it. niri keeps sigma
+    /// unrounded and multiplies by the scale in the shader (shadow.rs:43-45,119).
+    pub softness_px: f64,
+    /// Signed spread. niri ceils its magnitude to a physical pixel (shadow.rs:50-53).
+    pub spread_px: f64,
+    /// Offsets, each ceiled to a physical pixel (shadow.rs:48-49).
+    pub offset_x_px: f64,
+    pub offset_y_px: f64,
+}
+
+/// Project the logical shadow metrics onto an output (niri layout/shadow.rs:43-61).
+///
+/// niri's `ceil` is `(logical * scale).ceil() / scale`, so in physical pixels the offsets
+/// are `ceil(offset * scale)` and the spread is `ceil(|spread| * scale)` with the sign of
+/// the configured spread; the softness is not rounded.
+pub fn project_shadow(
+    softness: f64,
+    spread: f64,
+    offset_x: f64,
+    offset_y: f64,
+    scale: f64,
+) -> PhysicalShadow {
+    let scale = valid_scale(scale);
+    let finite = |value: f64| if value.is_finite() { value } else { 0.0 };
+    let (softness, spread, offset_x, offset_y) = (
+        finite(softness).max(0.0),
+        finite(spread),
+        finite(offset_x),
+        finite(offset_y),
+    );
+    PhysicalShadow {
+        softness_px: softness * scale,
+        spread_px: (spread.abs() * scale).ceil().copysign(spread),
+        offset_x_px: (offset_x * scale).ceil(),
+        offset_y_px: (offset_y * scale).ceil(),
     }
 }
 

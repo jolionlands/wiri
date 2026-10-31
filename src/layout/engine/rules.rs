@@ -536,10 +536,7 @@ impl TilingEngine {
         let cfg = self
             .effective_config_for_workspace(output, workspace.unwrap_or(monitor.active_workspace));
         let view = Self::precise_tiling_area(monitor, cfg).width;
-        let border = 2 * rules
-            .effects
-            .border
-            .inset(&cfg.effects.border, cfg.border_inset());
+        let border = 2 * cfg.border_inset_with(&rules.effects.border);
         let px = match rules.default_column_width {
             Some(Some(spec)) => spec_px(spec, view, cfg.column_gap, border),
             // The empty block: the window picks its own width, that is the one it opened with.
@@ -563,10 +560,7 @@ impl TilingEngine {
             || self.active_workspace_config(output),
             |workspace| self.effective_config_for_workspace(output, workspace),
         );
-        let border = 2 * rules
-            .effects
-            .border
-            .inset(&cfg.effects.border, cfg.border_inset());
+        let border = 2 * cfg.border_inset_with(&rules.effects.border);
         let px = match rules.default_window_height {
             Some(Some(spec)) => spec_px(
                 spec,
