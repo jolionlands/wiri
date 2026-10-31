@@ -175,7 +175,7 @@ The key-press figure runs from the real `SendInput` call to the moved window's o
 
 These are in progress:
 
-- **Pannable overview.** The overview becomes niri's fixed-zoom view of the endless grid, which you can pan.
+- **Pannable overview in the full desktop run.** The overview is now niri's fixed-zoom view of the endless grid, which you can pan; its checks pass on the desktop and are being added to the full automated run.
 - **Multi-monitor and mixed-DPI checks** on real hardware.
 - **ARM64 performance numbers.**
 
