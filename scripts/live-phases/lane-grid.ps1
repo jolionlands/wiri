@@ -31,13 +31,15 @@ function H98Config([bool]$unified, [string]$binds) {
 
 # The visible (on-screen) columns of the active workspace: a parked column sits below the
 # monitor, so "inside the work area" is the observable that says which row is showing.
+# `Rc` reports L/T/R/B/W/H (the harness helper's fields); a plain `.X`/`.Y` read silently
+# yielded $null, which made every positional comparison below vacuously true.
 function H98Visible($forms, $work) {
     $visible = @()
     foreach ($form in $forms) {
         $rect = Rc $form
         if ($rect.W -le 0) { continue }
-        if (($rect.Y -lt ($work.Y + $work.H - 8)) -and ($rect.Y -ge ($work.Y - 8))) {
-            $visible += ,@($form, $rect)
+        if (($rect.T -lt ($work.Y + $work.H - 8)) -and ($rect.T -ge ($work.Y - 8))) {
+            $visible += [pscustomobject]@{ hwnd = $form; L = $rect.L; T = $rect.T; W = $rect.W; H = $rect.H }
         }
     }
     return $visible
@@ -48,6 +50,35 @@ function H98Work($ignored) {
     # parked column is moved below it by the layout.
     $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     return [pscustomobject]@{ X = $area.X; Y = $area.Y; W = $area.Width; H = $area.Height }
+}
+
+# Every fixture as the engine sees it (workspace, column, workspace-view position) next to its
+# screen rectangle: a failing geometric gate then shows which row the fixtures really are in.
+function H98Dump([string]$tag) {
+    $rows = @()
+    try {
+        $list = @(WinList ("h98-dump-" + $tag))
+        $workspaces = @((Ctl ("h98-dumpws-" + $tag) @('--json', 'workspaces') | ConvertFrom-Json).result.workspaces)
+        $entries = @()
+        foreach ($form in $h98Forms) {
+            $entry = @($list | Where-Object { [int64]$_.hwnd -eq [int64]$form }) | Select-Object -First 1
+            $rect = Rc $form
+            $entries += [ordered]@{
+                hwnd = [int64]$form
+                workspace = $(if ($null -ne $entry) { $entry.workspace } else { $null })
+                column = $(if ($null -ne $entry) { $entry.column } else { $null })
+                tile = $(if ($null -ne $entry) { $entry.tile } else { $null })
+                floating = $(if ($null -ne $entry) { $entry.floating } else { $null })
+                pos = $(if ($null -ne $entry) { @($entry.layout.tile_pos_in_workspace_view) } else { @() })
+                size = $(if ($null -ne $entry) { @($entry.layout.tile_size) } else { @() })
+                rect = @($rect.L, $rect.T, $rect.W, $rect.H)
+            }
+        }
+        $rows = [ordered]@{ stage = $tag; workspaces = $workspaces; fixtures = $entries }
+    } catch {
+        $rows = [ordered]@{ stage = $tag; error = ($_ | Out-String).Trim() }
+    }
+    ($rows | ConvertTo-Json -Depth 8) | Set-Content (Join-Path $D ("h98-dump-$tag.json"))
 }
 
 $h98Binds = @'
@@ -71,11 +102,107 @@ function H98Chord([int[]]$keys) {
     [LT]::Key(0x12, $true); [LT]::Key(0x11, $true)
 }
 
+# The unified grid hides and parks rows and columns, so a screen rectangle - or the published
+# view position - of a window on an inactive workspace, or of a column parked out of the view,
+# is stale.  The movement gates therefore read niri's own window state and rebuild the strip
+# themselves: a row's column starts are the running sum of its tiles' `tile_size`, which is the
+# space `src/layout/engine/unified_grid.rs` x-matches in (rule 3: a row change lands on the
+# column whose strip span holds the focus anchor; rule 4: the diagonal actions take the column
+# one right/left of it, clamped to the row).
+function H98State {
+    $windows = @((Ctl 'h98-windows' @('--json', 'windows') | ConvertFrom-Json).result.windows)
+    $workspaces = @((Ctl 'h98-workspaces' @('--json', 'workspaces') | ConvertFrom-Json).result.workspaces)
+    return [pscustomobject]@{ windows = $windows; workspaces = $workspaces }
+}
+function H98Of($state, $handle) {
+    return @($state.windows | Where-Object { [int64]$_.id -eq [int64]$handle }) | Select-Object -First 1
+}
+function H98RowOf($state, $window) {
+    if ($null -eq $window) { return -1 }
+    $workspace = @($state.workspaces | Where-Object { [int64]$_.id -eq [int64]$window.workspace_id }) | Select-Object -First 1
+    if ($null -eq $workspace) { return -1 }
+    return [int]$workspace.idx
+}
+# The window the engine acted on.  `is_focused` is niri's own focus flag; when the OS
+# foreground is held by another (non-wiri) window, wiri cannot activate the window and
+# reports no focused window at all, so the active row's remembered active window is the
+# fallback.
+function H98ActiveOf($state) {
+    $focused = @($state.windows | Where-Object { $_.is_focused -and ($h98Forms -contains [IntPtr][int64]$_.id) }) | Select-Object -First 1
+    if ($null -ne $focused) { return $focused }
+    $workspace = @($state.workspaces | Where-Object { $_.is_active }) | Select-Object -First 1
+    if ($null -eq $workspace -or $null -eq $workspace.active_window_id) { return $null }
+    return H98Of $state ([int64]$workspace.active_window_id)
+}
+function H98Column($window) {
+    if ($null -eq $window -or $null -eq $window.layout.pos_in_scrolling_layout) { return -1 }
+    return [int]$window.layout.pos_in_scrolling_layout[0]
+}
+# One entry per column of a row: its 1-based column number, strip start and tile width.
+function H98Strip($state, [int]$row) {
+    $strip = @()
+    $start = 0.0
+    $seen = 0
+    $windows = @($state.windows | Where-Object {
+        ($null -ne $_.layout.pos_in_scrolling_layout) -and ((H98RowOf $state $_) -eq $row)
+    } | Sort-Object { [int]$_.layout.pos_in_scrolling_layout[0] })
+    foreach ($window in $windows) {
+        $column = H98Column $window
+        if ($column -le $seen) { continue }
+        $width = [double]$window.layout.tile_size[0]
+        $strip += [pscustomobject]@{ Column = $column; Start = $start; Width = $width }
+        $start += $width
+        $seen = $column
+    }
+    return $strip
+}
+# The 0-based index of the row's column whose strip span holds `anchor`, nearest otherwise
+# (the engine's x_matched_column tie rule).
+function H98Matched($strip, [double]$anchor) {
+    $best = -1
+    $bestDistance = [double]::MaxValue
+    for ($i = 0; $i -lt $strip.Count; $i++) {
+        $start = $strip[$i].Start
+        $end = $strip[$i].Start + $strip[$i].Width
+        $distance = if ($anchor -lt $start) { $start - $anchor } elseif ($anchor -ge $end) { $anchor - $end } else { 0.0 }
+        if ($distance -lt $bestDistance) { $bestDistance = $distance; $best = $i }
+    }
+    return $best
+}
+# The strip x of the centre of a window's column.
+function H98Anchor($state, $window) {
+    $column = H98Column $window
+    foreach ($entry in (H98Strip $state (H98RowOf $state $window))) {
+        if ($entry.Column -eq $column) { return [double]($entry.Start + $entry.Width / 2) }
+    }
+    return $null
+}
+# The 1-based column a grid step lands on in `row`: the x-match moved by `offset` columns and
+# clamped to the row, exactly as the engine resolves it before anything moves.
+function H98ExpectedColumn($state, [int]$row, [double]$anchor, [int]$offset) {
+    $strip = @(H98Strip $state $row)
+    if ($strip.Count -eq 0) { return -1 }
+    $index = (H98Matched $strip $anchor) + $offset
+    if ($index -lt 0) { $index = 0 }
+    if ($index -gt ($strip.Count - 1)) { $index = $strip.Count - 1 }
+    return [int]$strip[$index].Column
+}
+# The window is on the monitor's view (its active row), not parked above or below it.
+function H98OnScreen($handle, $work) {
+    $rect = Rc $handle
+    return ($rect.W -gt 0) -and ($rect.T -ge ($work.Y - 8)) -and ($rect.T -lt ($work.Y + $work.H - 8))
+}
 $h98Forms = @()
 $h98Proc = $null
 try {
     try {
         $h98Proc = Start-WiriWithConfig (H98Config $true $h98Binds) (Join-Path $D 'wiri.stderr98.log')
+        # The desktop's own windows (this cycle's console and anything an earlier phase left
+        # open) are adopted into the first workspace, so the fixture rows start at workspace 2:
+        # a row the lane counts columns in holds only its own four forms, and a vertical move
+        # from a fixture row lands on another fixture row.
+        $null = Ctl 'h98-workspace' @('action', 'focus-workspace', '2')
+        Start-Sleep -Milliseconds 600
         # Three workspaces, four columns of varied widths each, on the unity grid.
         for ($rowIndex = 0; $rowIndex -lt 3; $rowIndex++) {
             if ($rowIndex -gt 0) {
@@ -89,103 +216,150 @@ try {
                 Start-Sleep -Milliseconds 120
             }
         }
-        $null = Ctl 'h98-home' @('action', 'focus-workspace', '1')
+        $null = Ctl 'h98-home' @('action', 'focus-workspace', '2')
         Start-Sleep -Milliseconds 500
         $h98Outputs = Ctl 'h98-outputs' @('list-monitors')
         $summary.h98_config_accepts_unified_grid = ($h98Outputs -match 'unified-grid: on')
         Set-Content (Join-Path $D 'h98-outputs.txt') ($h98Outputs | ConvertTo-Json -Depth 4 -Compress)
+        # Which fixture is which row/column, as the engine reports it: a failure then names the
+        # window it expected instead of a bare rectangle.
+        Set-Content (Join-Path $D 'h98-rows.txt') "$(($h98Forms | ForEach-Object { '{0}:{1}' -f $_.ToInt64(), (Rc $_).L }) -join ' ')"
 
+        H98Dump 'rows-built'
         $h98Work = H98Work $h98Outputs
-        # Row 1 (first workspace), third column: 520 px wide, centred near x = 8 + 320 + 8 + 260.
+        # Row 0 is workspace 2, row 1 workspace 3, row 2 workspace 4.  Each row's columns are
+        # 320, 520, 400, 620 px wide in that order.
+        $h98Top = @{ ws = 2; narrow = $h98Forms[0]; mid = $h98Forms[1]; wide = $h98Forms[2]; last = $h98Forms[3] }
+        $h98Row = @{ ws = 3; narrow = $h98Forms[4]; mid = $h98Forms[5]; wide = $h98Forms[6]; last = $h98Forms[7] }
+        $h98Low = @{ ws = 4; narrow = $h98Forms[8]; mid = $h98Forms[9]; wide = $h98Forms[10]; last = $h98Forms[11] }
+        # Mid row, second column: the 520 px anchor one row above another fixture row.
         $null = Ctl 'h98-col2' @('action', 'focus-column', '2')
         Start-Sleep -Milliseconds 300
-        $h98AnchorRect = Rc $h98Forms[1]
-        $h98AnchorCentre = $h98AnchorRect.X + [int]($h98AnchorRect.W / 2)
-        $h98AnchorRight = $h98AnchorRect.X + $h98AnchorRect.W
 
         # 1. Rule 3: moving one row down keeps x and lands on the column under the anchor.
+        $null = Ctl 'h98-home1' @('action', 'focus-workspace', '2')
+        Start-Sleep -Milliseconds 500
+        $null = Ctl 'h98-col2a' @('action', 'focus-column', '2')
+        Start-Sleep -Milliseconds 300
+        $h98State = H98State
+        $h98AnchorEntry = H98Of $h98State $h98Top.mid
+        $h98AnchorRow = H98RowOf $h98State $h98AnchorEntry
+        $h98AnchorX = H98Anchor $h98State $h98AnchorEntry
+        $h98Expected = H98ExpectedColumn $h98State ($h98AnchorRow + 1) $h98AnchorX 0
         $null = Ctl 'h98-down' @('action', 'focus-workspace-down')
         Start-Sleep -Milliseconds 700
-        $h98Visible = H98Visible $h98Forms $h98Work
-        $under = @($h98Visible | Where-Object {
-            ($h98AnchorCentre -ge $_.X) -and ($h98AnchorCentre -lt ($_.X + $_.W))
-        })
-        $summary.h98_vertical_move_keeps_x_and_picks_the_column_under_it = ($under.Count -eq 1) -and ($h98Visible.Count -ge 1)
-        Set-Content (Join-Path $D 'h98-vertical.txt') "anchor=$h98AnchorRect.X,$($h98AnchorRect.Y),$($h98AnchorRect.W) centre=$h98AnchorCentre visible=$(($h98Visible | ForEach-Object { "$($_.X),$($_.Y),$($_.W)" }) -join ' ')"
+        $h98State = H98State
+        $h98Active = H98ActiveOf $h98State
+        $h98RowIdx = H98RowOf $h98State $h98Active
+        $h98Under = ($null -ne $h98Active) -and ($h98Forms -contains [IntPtr][int64]$h98Active.id) -and
+            ($h98RowIdx -eq ($h98AnchorRow + 1)) -and
+            ((H98Column $h98Active) -eq $h98Expected) -and
+            (H98OnScreen ([IntPtr][int64]$h98Active.id) $h98Work)
+        $summary.h98_vertical_move_keeps_x_and_picks_the_column_under_it = $h98Under
+        Set-Content (Join-Path $D 'h98-vertical.txt') "anchor_row=$h98AnchorRow anchor_x=$h98AnchorX active=$($h98Active.id) row=$h98RowIdx column=$((H98Column $h98Active)) expected=$h98Expected under=$h98Under"
 
         # 2. An indexed workspace action lands on the x-matched column too.
-        $null = Ctl 'h98-ws1' @('action', 'focus-workspace', '1')
+        $null = Ctl 'h98-ws2' @('action', 'focus-workspace', '2')
         Start-Sleep -Milliseconds 500
-        $null = Ctl 'h98-ws3' @('action', 'focus-workspace', '3')
+        $null = Ctl 'h98-col2d' @('action', 'focus-column', '2')
+        Start-Sleep -Milliseconds 300
+        $h98State = H98State
+        $h98AnchorEntry = H98Of $h98State $h98Top.mid
+        $h98AnchorRow = H98RowOf $h98State $h98AnchorEntry
+        $h98AnchorX = H98Anchor $h98State $h98AnchorEntry
+        $h98Expected = H98ExpectedColumn $h98State 4 $h98AnchorX 0
+        $null = Ctl 'h98-ws4' @('action', 'focus-workspace', '4')
         Start-Sleep -Milliseconds 700
-        $h98Visible3 = H98Visible $h98Forms $h98Work
-        $under3 = @($h98Visible3 | Where-Object {
-            ($h98AnchorCentre -ge $_.X) -and ($h98AnchorCentre -lt ($_.X + $_.W))
-        })
-        $summary.h98_move_to_named_workspace_lands_on_the_x_matched_column = ($under3.Count -eq 1)
+        $h98State = H98State
+        $h98Active = H98ActiveOf $h98State
+        $h98RowIdx = H98RowOf $h98State $h98Active
+        $summary.h98_move_to_named_workspace_lands_on_the_x_matched_column =
+            ($null -ne $h98Active) -and ($h98Forms -contains [IntPtr][int64]$h98Active.id) -and
+            ($h98RowIdx -eq 4) -and ((H98Column $h98Active) -eq $h98Expected) -and
+            (H98OnScreen ([IntPtr][int64]$h98Active.id) $h98Work)
+        Set-Content (Join-Path $D 'h98-indexed.txt') "anchor_row=$h98AnchorRow anchor_x=$h98AnchorX row=$h98RowIdx column=$((H98Column $h98Active)) expected=$h98Expected"
 
         # 3. `focus-up-right`: one row up and one column right, as one motion.
-        $null = Ctl 'h98-home2' @('action', 'focus-workspace', '1')
+        $null = Ctl 'h98-home2' @('action', 'focus-workspace', '3')
         Start-Sleep -Milliseconds 500
         $null = Ctl 'h98-col2b' @('action', 'focus-column', '2')
         Start-Sleep -Milliseconds 300
-        $h98Before = Rc $h98Forms[1]
+        $h98State = H98State
+        $h98AnchorEntry = H98Of $h98State $h98Row.mid
+        $h98AnchorRow = H98RowOf $h98State $h98AnchorEntry
+        $h98AnchorX = H98Anchor $h98State $h98AnchorEntry
+        $h98Expected = H98ExpectedColumn $h98State ($h98AnchorRow - 1) $h98AnchorX 1
         $null = Ctl 'h98-upright' @('action', 'focus-up-right')
         Start-Sleep -Milliseconds 700
-        $h98VisibleAfter = H98Visible $h98Forms $h98Work
-        $h98Moved = @($h98VisibleAfter | Where-Object {
-            ($_.X -ge ($h98Before.X + $h98Before.W)) -and
-            ([math]::Abs($_.X - $h98Before.X) -gt 40)
-        })
-        $summary.h98_focus_up_right_lands_on_the_diagonal_target = ($h98Moved.Count -ge 1)
+        $h98State = H98State
+        $h98Active = H98ActiveOf $h98State
+        $h98RowIdx = H98RowOf $h98State $h98Active
+        $summary.h98_focus_up_right_lands_on_the_diagonal_target =
+            ($null -ne $h98Active) -and ($h98Forms -contains [IntPtr][int64]$h98Active.id) -and
+            ($h98RowIdx -eq ($h98AnchorRow - 1)) -and ((H98Column $h98Active) -eq $h98Expected) -and
+            (H98OnScreen ([IntPtr][int64]$h98Active.id) $h98Work)
 
         # 4. `focus-down-left`: one row down and one column left.
-        $null = Ctl 'h98-home3' @('action', 'focus-workspace', '1')
+        $null = Ctl 'h98-home3' @('action', 'focus-workspace', '3')
         Start-Sleep -Milliseconds 500
         $null = Ctl 'h98-col3' @('action', 'focus-column', '3')
         Start-Sleep -Milliseconds 300
-        $h98LeftBefore = Rc $h98Forms[2]
+        $h98State = H98State
+        $h98AnchorEntry = H98Of $h98State $h98Row.wide
+        $h98AnchorRow = H98RowOf $h98State $h98AnchorEntry
+        $h98AnchorX = H98Anchor $h98State $h98AnchorEntry
+        $h98Expected = H98ExpectedColumn $h98State ($h98AnchorRow + 1) $h98AnchorX -1
         $null = Ctl 'h98-downleft' @('action', 'focus-down-left')
         Start-Sleep -Milliseconds 700
-        $h98LeftVisible = H98Visible $h98Forms $h98Work
-        $h98LeftMoved = @($h98LeftVisible | Where-Object {
-            ($_.X -lt $h98LeftBefore.X) -and ($_.Y -ge ($h98LeftBefore.Y - 4))
-        })
-        $summary.h98_focus_down_left_lands_on_the_diagonal_target = ($h98LeftMoved.Count -ge 1)
+        $h98State = H98State
+        $h98Active = H98ActiveOf $h98State
+        $h98RowIdx = H98RowOf $h98State $h98Active
+        $summary.h98_focus_down_left_lands_on_the_diagonal_target =
+            ($null -ne $h98Active) -and ($h98Forms -contains [IntPtr][int64]$h98Active.id) -and
+            ($h98RowIdx -eq ($h98AnchorRow + 1)) -and ((H98Column $h98Active) -eq $h98Expected) -and
+            (H98OnScreen ([IntPtr][int64]$h98Active.id) $h98Work)
 
-        # 5. `move-window-up-right`: the window itself arrives in the row above.
-        $null = Ctl 'h98-home4' @('action', 'focus-workspace', '1')
+        # 5. `move-window-up-right`: the window itself arrives in the row above, one column
+        #    right of the column the x-matching rule picks under it.
+        $null = Ctl 'h98-home4' @('action', 'focus-workspace', '3')
         Start-Sleep -Milliseconds 500
         $null = Ctl 'h98-col1' @('action', 'focus-column', '1')
         Start-Sleep -Milliseconds 300
-        $h98Mover = $h98Forms[0]
-        $h98MoverBefore = Rc $h98Mover
+        $h98Mover = $h98Row.narrow
+        $h98State = H98State
+        $h98MoverRow = H98RowOf $h98State (H98Of $h98State $h98Mover)
+        $h98MoverX = H98Anchor $h98State (H98Of $h98State $h98Mover)
+        $h98Expected = H98ExpectedColumn $h98State ($h98MoverRow - 1) $h98MoverX 1
         $null = Ctl 'h98-moveupright' @('action', 'move-window-up-right')
         Start-Sleep -Milliseconds 800
-        $h98MoverAfter = Rc $h98Mover
-        # The moved window keeps focus, so it is the visible one of the row above and its x
-        # is one column right of where it was.
-        $h98MoverVisible = ($h98MoverAfter.Y -lt ($h98MoverBefore.Y - 4)) -or
-                           ([math]::Abs($h98MoverAfter.Y - $h98MoverBefore.Y) -le 4)
+        $h98State = H98State
+        $h98MoverAfter = H98Of $h98State $h98Mover
+        $h98RowIdx = H98RowOf $h98State $h98MoverAfter
         $summary.h98_move_window_up_right_moves_the_window_to_the_target_row =
-            $h98MoverVisible -and (($h98MoverAfter.W -lt $h98MoverBefore.W) -or ($h98MoverAfter.X -ne $h98MoverBefore.X))
-        Set-Content (Join-Path $D 'h98-move.txt') "before=$($h98MoverBefore.X),$($h98MoverBefore.Y),$($h98MoverBefore.W),$($h98MoverBefore.H) after=$($h98MoverAfter.X),$($h98MoverAfter.Y),$($h98MoverAfter.W),$($h98MoverAfter.H)"
+            ($null -ne $h98MoverAfter) -and ($h98RowIdx -eq ($h98MoverRow - 1)) -and
+            ((H98Column $h98MoverAfter) -eq $h98Expected) -and (H98OnScreen $h98Mover $h98Work)
+        Set-Content (Join-Path $D 'h98-move.txt') "from_row=$h98MoverRow x=$h98MoverX expected_col=$h98Expected row_now=$h98RowIdx col_now=$((H98Column $h98MoverAfter))"
 
         # 6. Rule 5: Mod+Up then Right with Up still held lands on the diagonal target.
-        $null = Ctl 'h98-home5' @('action', 'focus-workspace', '1')
+        $null = Ctl 'h98-home5' @('action', 'focus-workspace', '3')
         Start-Sleep -Milliseconds 500
         $null = Ctl 'h98-col2c' @('action', 'focus-column', '2')
         Start-Sleep -Milliseconds 300
-        $h98ChordBefore = Rc $h98Forms[1]
+        $h98State = H98State
+        $h98AnchorEntry = H98Of $h98State $h98Row.mid
+        $h98AnchorRow = H98RowOf $h98State $h98AnchorEntry
+        $h98AnchorX = H98Anchor $h98State $h98AnchorEntry
+        $h98Expected = H98ExpectedColumn $h98State ($h98AnchorRow - 1) $h98AnchorX 1
         H98Chord @(0x26, 0x27)
         Start-Sleep -Milliseconds 900
-        $h98ChordVisible = H98Visible $h98Forms $h98Work
-        $h98ChordTargets = @($h98ChordVisible | Where-Object {
-            ($_.X -ge ($h98ChordBefore.X + $h98ChordBefore.W)) -and
-            ([math]::Abs($_.X - $h98ChordBefore.X) -gt 40)
-        })
-        $summary.h98_two_arrows_together_land_on_the_diagonal_target = ($h98ChordTargets.Count -ge 1)
-        Set-Content (Join-Path $D 'h98-chord.txt') "before=$($h98ChordBefore.X),$($h98ChordBefore.Y),$($h98ChordBefore.W) visible=$(($h98ChordVisible | ForEach-Object { "$($_.X),$($_.Y),$($_.W)" }) -join ' ')"
+        $h98State = H98State
+        $h98Active = H98ActiveOf $h98State
+        $h98RowIdx = H98RowOf $h98State $h98Active
+        $summary.h98_two_arrows_together_land_on_the_diagonal_target =
+            ($null -ne $h98Active) -and ($h98Forms -contains [IntPtr][int64]$h98Active.id) -and
+            ($h98RowIdx -eq ($h98AnchorRow - 1)) -and ((H98Column $h98Active) -eq $h98Expected) -and
+            (H98OnScreen ([IntPtr][int64]$h98Active.id) $h98Work)
+        Set-Content (Join-Path $D 'h98-chord.txt') "from_row=$h98AnchorRow anchor_x=$h98AnchorX row_now=$h98RowIdx col_now=$((H98Column $h98Active)) expected=$h98Expected id=$($h98Active.id)"
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h98-unified-error.txt')
     } finally {
@@ -226,7 +400,7 @@ try {
         $h98bVisible = H98Visible $h98Forms $h98bWork
         $h98bNarrow = @($h98bVisible | Where-Object { [math]::Abs($_.W - 400) -le 6 })
         $summary.h98_without_the_flag_behaviour_is_niris = $h98bOff -and ($h98bNarrow.Count -ge 1)
-        Set-Content (Join-Path $D 'h98-off.txt') "off=$h98bOff anchor=$($h98bAnchor.X),$($h98bAnchor.W) visible=$(($h98bVisible | ForEach-Object { "$($_.X),$($_.W)" }) -join ' ')"
+        Set-Content (Join-Path $D 'h98-off.txt') "off=$h98bOff anchor=$($h98bAnchor.L),$($h98bAnchor.W) visible=$(($h98bVisible | ForEach-Object { "$($_.L),$($_.W)" }) -join ' ')"
     } catch {
         $_ | Out-String | Set-Content (Join-Path $D 'h98-off-error.txt')
     } finally {
