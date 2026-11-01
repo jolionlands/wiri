@@ -5,6 +5,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Diagnostics: refused hotkeys, inert options, watcher locks
+
+Found while auditing `v0.1.0` on an ARM64 laptop where two chords were already owned by another
+program. `wiri-ctl test-bindings` listed those chords as if Windows had accepted them, its
+"hotkey conflicts" heading printed no rows, and the only trace of the two `RegisterHotKey`
+failures was a `WARN` line in `wiri.log`.
+
+- `register_hotkeys` now records every refusal (id, chord, action, OS error) in a snapshot that
+  the `ListBindings` reply carries as `result.refused`; `test-bindings` prints a section naming
+  the chord, the action and the error, and says the keyboard hook still delivers it but that
+  there is no `WM_HOTKEY` fallback. Two CLI tests cover the section and both no-refusal shapes.
+- Options that parse, range-check and resolve but that nothing reads — `border-padding`/
+  `padding`, `focus-ring-gap`/`gap`, `split-ratio`, `auto-balance` and the bind property
+  `allow-when-locked` — now report a warning at their own line instead of taking effect
+  silently as nothing. Two decoder tests pin the wording and the reported position.
+- The config watcher no longer unwraps `std::sync::Mutex` locks: it uses `parking_lot::Mutex`
+  like the rest of the daemon, so a panic elsewhere can no longer turn every later config
+  reload into a lock-poisoning panic of its own.
+
 ### Lane PROMOTE — six parity rows to done on the official dab9a88 cycle
 
 The official tridaris cycle at `dab9a88` (run directory
