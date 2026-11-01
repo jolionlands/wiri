@@ -791,6 +791,20 @@ impl Decoder {
         );
     }
 
+    /// An option that parses, range-checks and resolves, and that nothing then
+    /// reads: the renderer or dispatcher never consults the value.  Saying so at
+    /// the line that sets it is the difference between "this setting is ignored"
+    /// and a silent no-op the user cannot diagnose.
+    fn not_applied(&mut self, node: &Node, why: &str) {
+        self.warn(
+            node.pos,
+            format!(
+                "'{}' is accepted but has no effect yet in wiri ({})",
+                node.name, why
+            ),
+        );
+    }
+
     fn unknown(&mut self, node: &Node, parent: &str, known: &[&str]) {
         let hint = suggestion(&norm(&node.name), known);
         let message = match hint {
@@ -2327,7 +2341,10 @@ impl Decoder {
                         p.effects.corner_radius = Some(r);
                     }
                 }
-                "border-padding" | "padding" => self.set_u32(child, 4096, &mut p.border_padding),
+                "border-padding" | "padding" => {
+                    self.set_u32(child, 4096, &mut p.border_padding);
+                    self.not_applied(child, "no layout or decoration path reads it");
+                }
                 "focus-ring-width" => {
                     self.set_u32(child, 4096, &mut p.focus_ring_width);
                     if let Some(w) = p.focus_ring_width {
@@ -2342,7 +2359,10 @@ impl Decoder {
                         focus_ring_style(p).active = PaintStyle::Color(c);
                     }
                 }
-                "focus-ring-gap" | "gap" => self.set_u32(child, 4096, &mut p.focus_ring_gap),
+                "focus-ring-gap" | "gap" => {
+                    self.set_u32(child, 4096, &mut p.focus_ring_gap);
+                    self.not_applied(child, "the ring is drawn flush with the border");
+                }
                 "focus-ring-inactive-color" | "inactive-color" => {
                     self.set_color(child, &mut p.focus_ring_inactive_color);
                     if let Some(c) = p.focus_ring_inactive_color.clone() {
@@ -2415,8 +2435,14 @@ impl Decoder {
                     }
                 }
                 "max-visible-columns" => self.set_u32(child, 1000, &mut p.max_visible_columns),
-                "split-ratio" => self.set_f64(child, 0.0, 1.0, &mut p.split_ratio),
-                "auto-balance" => self.set_flag(child, &mut p.auto_balance),
+                "split-ratio" => {
+                    self.set_f64(child, 0.0, 1.0, &mut p.split_ratio);
+                    self.not_applied(child, "no layout path reads it");
+                }
+                "auto-balance" => {
+                    self.set_flag(child, &mut p.auto_balance);
+                    self.not_applied(child, "no layout path reads it");
+                }
                 "strip-frame" => self.set_flag(child, &mut p.strip_frame),
                 "snap-on-drag" => self.set_flag(child, &mut p.snap_on_drag),
                 "snap-threshold-px" => self.set_u32(child, 4096, &mut p.snap_threshold_px),
@@ -2576,7 +2602,10 @@ impl Decoder {
                         p.effects.corner_radius = Some(r);
                     }
                 }
-                "padding" => self.set_u32(c, 4096, &mut p.border_padding),
+                "padding" => {
+                    self.set_u32(c, 4096, &mut p.border_padding);
+                    self.not_applied(c, "no layout or decoration path reads it");
+                }
                 "smart" => self.set_flag(c, &mut p.smart_borders),
                 _ => self.unknown(
                     c,
@@ -2635,7 +2664,10 @@ impl Decoder {
                 continue;
             }
             match norm(&c.name).as_str() {
-                "gap" => self.set_u32(c, 4096, &mut p.focus_ring_gap),
+                "gap" => {
+                    self.set_u32(c, 4096, &mut p.focus_ring_gap);
+                    self.not_applied(c, "the ring is drawn flush with the border");
+                }
                 _ => self.unknown(
                     c,
                     "'focus-ring'",
@@ -3502,6 +3534,14 @@ impl Decoder {
                     if let Some(v) = self.value_bool(node, &p.value) {
                         bind.allow_when_locked = v;
                     }
+                    self.warn(
+                        node.pos,
+                        format!(
+                            "bind {}: 'allow-when-locked' is accepted but has no effect yet \
+                             (wiri does not track a lock state to filter on)",
+                            node.name
+                        ),
+                    );
                 }
                 "allow-inhibiting" => {
                     if let Some(v) = self.value_bool(node, &p.value) {
@@ -3669,6 +3709,41 @@ mod tests {
             .filter(|i| i.severity == ValidationSeverity::Warning)
             .map(|i| i.to_string())
             .collect()
+    }
+
+    /// Options that are parsed, range-checked and resolved but that no renderer or
+    /// dispatcher reads must say so, at the line that sets them.  Without this a
+    /// user tunes `padding` or `split-ratio` and gets silence.
+    #[test]
+    fn inert_layout_options_are_reported_at_their_own_line() {
+        let d = load(
+            "layout {\n    split-ratio 0.6\n    auto-balance\n    border {\n        padding 4\n    }\n    focus-ring {\n        gap 2\n    }\n}\n",
+        );
+        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+        let w = warnings(&d).join("\n");
+        assert!(
+            w.contains("'split-ratio' is accepted but has no effect yet"),
+            "{w}"
+        );
+        assert!(
+            w.contains("'auto-balance' is accepted but has no effect yet"),
+            "{w}"
+        );
+        assert!(
+            w.contains("'padding' is accepted but has no effect yet"),
+            "{w}"
+        );
+        assert!(w.contains("'gap' is accepted but has no effect yet"), "{w}");
+        // The warning points at the option's own line, not at the file.
+        assert!(w.contains("2:5: warning:"), "{w}");
+    }
+
+    #[test]
+    fn allow_when_locked_parses_and_is_reported_as_inert() {
+        let d = load("binds {\n    Ctrl+Alt+Q allow-when-locked=true { quit; }\n}\n");
+        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+        let w = warnings(&d).join("\n");
+        assert!(w.contains("'allow-when-locked' is accepted"), "{w}");
     }
 
     /// The vocabulary the live completeness gates enumerate is exactly the two
@@ -4484,9 +4559,20 @@ overview { backdrop-color \"#000000\" }",
 
     #[test]
     fn wiri_layout_spellings_still_load() {
-        let cfg = clean(
+        let d = load(
             "layout {\n    gaps { inner 10; outer 6 }\n    borders { width 4; color \"#4d4d4d\"; color-focused \"#3381d9\"; color-urgent \"#cc3344\"; radius 8 }\n    focus-ring { width 3; color \"#3381d9\"; gap 6; inactive-color \"#404040\" }\n    shadows { enable true; opacity 0.75; offset-x 5; offset-y 5; blur 15; spread 5 }\n    column-width-mode \"proportional\"\n    max-visible-columns 4\n    column-width 700\n    scroll-step 300\n    hide-method hide\n    dim-unfocused 0.92\n    snap-on-drag false\n    snap-threshold-px 32\n    smart-borders true\n    reserve-top 30\n}\n",
         );
+        assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+        // `gap` is the one option in this block that nothing applies; it still
+        // parses, so the value below is asserted as before.
+        let warnings = warnings(&d).join("\n");
+        assert!(
+            warnings
+                .lines()
+                .all(|w| w.contains("'gap' is accepted but has no effect yet")),
+            "{warnings}"
+        );
+        let cfg = d.config;
         assert_eq!((cfg.layout.inner_gaps, cfg.layout.outer_gaps), (10.0, 6.0));
         assert_eq!(cfg.layout.border_width, 4);
         assert_eq!(cfg.layout.border_color, "#4d4d4d");
