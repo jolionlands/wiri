@@ -4564,13 +4564,19 @@ overview { backdrop-color \"#000000\" }",
         );
         assert!(errors(&d).is_empty(), "{:?}", errors(&d));
         // `gap` is the one option in this block that nothing applies; it still
-        // parses, so the value below is asserted as before.
-        let warnings = warnings(&d).join("\n");
+        // parses, so the value below is asserted as before.  Exactly one warning,
+        // at the `gap` token, so another option going dead cannot slip in here.
+        let warnings = warnings(&d);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
-            warnings
-                .lines()
-                .all(|w| w.contains("'gap' is accepted but has no effect yet")),
-            "{warnings}"
+            warnings[0].starts_with("4:44: warning:"),
+            "{:?}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("'gap' is accepted but has no effect yet"),
+            "{:?}",
+            warnings[0]
         );
         let cfg = d.config;
         assert_eq!((cfg.layout.inner_gaps, cfg.layout.outer_gaps), (10.0, 6.0));

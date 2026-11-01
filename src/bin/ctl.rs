@@ -1700,8 +1700,10 @@ fn print_bindings(resp: &serde_json::Value) {
             }
         }
         None => {
-            outln!("  Windows accepted every chord.  If one still does nothing, see");
-            outln!("  docs/TROUBLESHOOTING.md.");
+            // Absence of the field is not proof that Windows accepted everything:
+            // a daemon older than this CLI never reports refusals at all.
+            outln!("  The daemon reported no refused chords.  If one still does");
+            outln!("  nothing, see docs/TROUBLESHOOTING.md.");
         }
     }
 }
@@ -1735,13 +1737,16 @@ fn refused_binding_lines(resp: &serde_json::Value) -> Option<Vec<String>> {
             .unwrap_or("unknown error");
         lines.push(format!(
             "    {:<28}  {:<28}  {}",
-            truncate(chord, 28),
-            truncate(action, 28),
+            chord,
+            truncate(action, 40),
             error,
         ));
     }
     lines.push(String::new());
-    lines.push("  Another program owns that chord.  Close it, or rebind in config.kdl.".to_string());
+    lines.push(
+        "  Another program owns that chord, and may still act on it as well.  Close it,".to_string(),
+    );
+    lines.push("  or rebind in config.kdl.".to_string());
     Some(lines)
 }
 

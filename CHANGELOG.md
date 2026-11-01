@@ -19,7 +19,9 @@ failures was a `WARN` line in `wiri.log`.
 - Options that parse, range-check and resolve but that nothing reads — `border-padding`/
   `padding`, `focus-ring-gap`/`gap`, `split-ratio`, `auto-balance` and the bind property
   `allow-when-locked` — now report a warning at their own line instead of taking effect
-  silently as nothing. Two decoder tests pin the wording and the reported position.
+  silently as nothing. The warning travels the existing config-warning channel (the count in
+  the state reply and the daemon log, and the text from `wiri-ctl validate-config`), like the
+  "action not implemented yet" bind warning. Two decoder tests pin the wording and the position.
 - The config watcher no longer unwraps `std::sync::Mutex` locks: it uses `parking_lot::Mutex`
   like the rest of the daemon, so a panic elsewhere can no longer turn every later config
   reload into a lock-poisoning panic of its own.
