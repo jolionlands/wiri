@@ -5,11 +5,11 @@ use crate::config::types::Config;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -180,7 +180,7 @@ impl ConfigLoader {
                         return;
                     }
                     let hit = {
-                        let st = state.lock().unwrap();
+                        let st = state.lock();
                         event
                             .paths
                             .iter()
@@ -205,9 +205,9 @@ impl ConfigLoader {
                     watcher
                         .watch(&dir, RecursiveMode::NonRecursive)
                         .map_err(|e| ConfigError::WatchError(e.to_string()))?;
-                    self.state.lock().unwrap().dirs.insert(dir);
+                    self.state.lock().dirs.insert(dir);
                 }
-                *self.watcher.lock().unwrap() = Some(watcher);
+                *self.watcher.lock() = Some(watcher);
                 // The includes of the config as it stands are watched from the start.
                 let initial = load_quiet(&self.path);
                 watch_includes(&self.watcher, &self.state, &initial.includes);
@@ -285,7 +285,7 @@ impl ConfigLoader {
     }
 
     pub fn stop_watching(&mut self) {
-        *self.watcher.lock().unwrap() = None;
+        *self.watcher.lock() = None;
     }
 }
 
@@ -312,7 +312,7 @@ fn watch_includes(
         let dir = inc.parent().map(|p| p.to_path_buf());
         let mut new_dir: Option<PathBuf> = None;
         {
-            let mut st = state.lock().unwrap();
+            let mut st = state.lock();
             if let Some(name) = name {
                 st.names.insert(name);
             }
@@ -328,7 +328,7 @@ fn watch_includes(
             }
         }
         if let Some(dir) = new_dir {
-            if let Some(w) = watcher.lock().unwrap().as_mut() {
+            if let Some(w) = watcher.lock().as_mut() {
                 if let Err(e) = w.watch(&dir, RecursiveMode::NonRecursive) {
                     tracing::warn!("cannot watch {}: {}", dir.display(), e);
                 }
