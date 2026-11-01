@@ -1828,7 +1828,28 @@ impl IpcServer {
                         chord: format_chord(b.modifiers, b.vk_code),
                     })
                     .collect();
-                serde_json::json!({"success": true, "result": { "bindings": bindings }})
+                // Chords Windows refused.  They are still delivered by the
+                // keyboard hook, so they belong in the table above, but the
+                // reader has to be able to tell them apart from a chord that
+                // `RegisterHotKey` really accepted.
+                let refused: Vec<serde_json::Value> =
+                    crate::backend::message_loop::refused_bindings()
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "id": r.id,
+                                "chord": format_chord(r.modifiers, r.vk_code),
+                                "modifiers": r.modifiers,
+                                "vk_code": r.vk_code,
+                                "action": r.action,
+                                "error": r.error,
+                            })
+                        })
+                        .collect();
+                serde_json::json!({
+                    "success": true,
+                    "result": { "bindings": bindings, "refused": refused },
+                })
             }
             IpcMessage::MoveColumnToMonitor { direction } => {
                 info!("IPC: MoveColumnToMonitor direction={}", direction);

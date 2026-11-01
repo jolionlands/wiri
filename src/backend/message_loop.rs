@@ -415,12 +415,18 @@ fn is_overview_escape_binding(mods: u32, vk: u32, action: &Action) -> bool {
 
 /// Register a list of hotkeys with Windows, returning the IDs and the action map
 /// of the ones that Windows accepted.
+///
+/// Also returns a row for every chord Windows refused.  A refusal is not fatal:
+/// the low-level keyboard hook is the primary dispatch path, so the chord keeps
+/// working while the hook is active.  The rows exist so that diagnostics can say
+/// that, instead of implying the chord was registered.
 fn register_hotkeys(
     hwnd: HWND,
     hotkeys: &[(u32, u32, Action)],
-) -> (Vec<i32>, HashMap<i32, Action>) {
+) -> (Vec<i32>, HashMap<i32, Action>, Vec<RefusedBinding>) {
     let base_id = 32768i32;
     let mut registered_ids: Vec<i32> = Vec::new();
+    let mut refused: Vec<RefusedBinding> = Vec::new();
 
     for (i, (mods, vk, action)) in hotkeys.iter().enumerate() {
         let id = base_id + i as i32;
@@ -459,12 +465,20 @@ fn register_hotkeys(
                 "FAIL hotkey id={} mods=0x{:X} vk=0x{:02X} {:?} os_err={}",
                 id, mods, vk, action, err
             );
+            refused.push(RefusedBinding {
+                id,
+                modifiers: *mods,
+                vk_code: *vk,
+                action: format!("{:?}", action),
+                error: err.to_string(),
+            });
         }
     }
     info!(
-        "Hotkeys: {}/{} registered",
+        "Hotkeys: {}/{} registered, {} refused by Windows",
         registered_ids.len(),
-        hotkeys.len()
+        hotkeys.len(),
+        refused.len()
     );
 
     let action_map: HashMap<i32, Action> = hotkeys
@@ -474,7 +488,7 @@ fn register_hotkeys(
         .map(|(i, (_, _, action))| (base_id + i as i32, action.clone()))
         .collect();
 
-    (registered_ids, action_map)
+    (registered_ids, action_map, refused)
 }
 
 fn visible_binding_ids(
@@ -523,6 +537,44 @@ static HOTKEY_THREAD: Mutex<Option<HotkeyThreadState>> = Mutex::new(None);
 /// handler can return what the daemon really registered (vs what was in the
 /// config) — useful for diagnosing why a chord isn't firing.
 static REGISTERED_BINDINGS: Mutex<Vec<RegisteredBinding>> = Mutex::new(Vec::new());
+
+/// A chord the configuration asks for that `RegisterHotKey` refused, almost always
+/// because another program already owns it (Win32 error 1409,
+/// `ERROR_HOTKEY_ALREADY_REGISTERED`).  The low-level keyboard hook still delivers
+/// the chord while the hook is active, so the binding is not dead — but it has no
+/// `WM_HOTKEY` fallback, and a diagnostic must not present it as if Windows had
+/// accepted the registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedBinding {
+    /// Win32 hotkey id the failed `RegisterHotKey` used.
+    pub id: i32,
+    /// Win32 MOD_* bitmask (1=Alt, 2=Ctrl, 4=Shift, 8=Win).
+    pub modifiers: u32,
+    /// Win32 VK_* virtual key code.
+    pub vk_code: u32,
+    /// Action the chord would fire, Debug-formatted like `RegisteredBinding::action`.
+    pub action: String,
+    /// The OS error `RegisterHotKey` returned, e.g. "Hot key is already registered.
+    /// (os error 1409)".
+    pub error: String,
+}
+
+/// Chords `RegisterHotKey` refused in the most recent registration pass.  Empty
+/// on a machine where every chord registered.
+static REFUSED_BINDINGS: Mutex<Vec<RefusedBinding>> = Mutex::new(Vec::new());
+
+/// Replace the refused-chord snapshot.  Called by the hotkey thread after each
+/// registration pass, next to `update_current_bindings_snapshot`.
+pub fn update_refused_bindings(rows: Vec<RefusedBinding>) {
+    *REFUSED_BINDINGS.lock() = rows;
+}
+
+/// Chords `RegisterHotKey` refused in the last pass, for the `ListBindings` IPC
+/// response.  Empty when the hotkey thread has not started or every chord was
+/// accepted.
+pub fn refused_bindings() -> Vec<RefusedBinding> {
+    REFUSED_BINDINGS.lock().clone()
+}
 
 /// One registered hotkey binding, used by `MessageLoop::current_bindings`.
 #[derive(Debug, Clone)]
@@ -732,7 +784,8 @@ impl MessageLoop {
             keys.set_unified_grid_chord_ms(chord_ms);
         }
         keyboard::configure_latin_fallback();
-        let (mut registered_ids, _) = register_hotkeys(hwnd, &current_hotkeys);
+        let (mut registered_ids, _, refused) = register_hotkeys(hwnd, &current_hotkeys);
+        update_refused_bindings(refused);
         // Snapshot mirror for `current_bindings()` queries from IPC.
         update_current_bindings_snapshot(
             &current_hotkeys,
@@ -805,7 +858,8 @@ impl MessageLoop {
                         .lock()
                         .set_unified_grid_chord_ms(engine.read().unified_grid_chord_ms());
                     keyboard::configure_latin_fallback();
-                    let (new_ids, _) = register_hotkeys(hwnd, &new_hotkeys);
+                    let (new_ids, _, refused) = register_hotkeys(hwnd, &new_hotkeys);
+                    update_refused_bindings(refused);
                     registered_ids = new_ids;
                     update_current_bindings_snapshot(
                         &new_hotkeys,

@@ -1689,11 +1689,60 @@ fn print_bindings(resp: &serde_json::Value) {
 
     outln!();
     outln!(
-        "  {} binding{} registered.  See `docs/TROUBLESHOOTING.md` for known",
+        "  {} binding{} active.",
         bindings.len(),
         if bindings.len() == 1 { "" } else { "s" }
     );
-    outln!("  Windows hotkey conflicts that may swallow your chord.");
+    match refused_binding_lines(resp) {
+        Some(lines) => {
+            for line in lines {
+                outln!("{}", line);
+            }
+        }
+        None => {
+            outln!("  Windows accepted every chord.  If one still does nothing, see");
+            outln!("  docs/TROUBLESHOOTING.md.");
+        }
+    }
+}
+
+/// Rows for the "Windows refused these chords" section of `test-bindings`, or
+/// `None` when the daemon reported no refusals (the common case) or predates the
+/// `refused` field.
+///
+/// Kept separate from [`print_bindings`] so the parsing and wording are testable
+/// without capturing stdout.
+fn refused_binding_lines(resp: &serde_json::Value) -> Option<Vec<String>> {
+    let rows = resp.pointer("/result/refused").and_then(|r| r.as_array())?;
+    if rows.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "  {} chord{} Windows refused.  The wiri keyboard hook still delivers",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+        ),
+        "  them while it is active, but they have no WM_HOTKEY fallback:".to_string(),
+    ];
+    for row in rows {
+        let chord = row.get("chord").and_then(|v| v.as_str()).unwrap_or("?");
+        let action = row.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+        let error = row
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        lines.push(format!(
+            "    {:<28}  {:<28}  {}",
+            truncate(chord, 28),
+            truncate(action, 28),
+            error,
+        ));
+    }
+    lines.push(String::new());
+    lines.push("  Another program owns that chord.  Close it, or rebind in config.kdl.".to_string());
+    Some(lines)
 }
 
 /// Format the response to `GetBindings` (`wiri-ctl bindings`) as a
@@ -2033,10 +2082,46 @@ fn split_quoted_words(words: Vec<String>) -> (Vec<String>, Vec<bool>) {
 mod tests {
     use super::{
         fold_to_ascii, format_focus, format_query_result, raw_request_text, request_for,
-        schema_warning, split_quoted_words, Cli, Commands,
+        refused_binding_lines, schema_warning, split_quoted_words, Cli, Commands,
     };
     use clap::Parser;
     use wiri::ipc::IpcMessage;
+
+    #[test]
+    fn test_bindings_lists_chords_windows_refused() {
+        let resp = serde_json::json!({
+            "success": true,
+            "result": {
+                "bindings": [{
+                    "id": 32781, "chord": "Ctrl+Alt+Space", "modifiers": 3,
+                    "vk_code": 32, "action": "OverviewToggle"
+                }],
+                "refused": [{
+                    "id": 32781, "chord": "Ctrl+Alt+Space", "modifiers": 3,
+                    "vk_code": 32, "action": "OverviewToggle",
+                    "error": "Hot key is already registered. (os error 1409)"
+                }]
+            }
+        });
+        let text = refused_binding_lines(&resp)
+            .expect("a refusal section")
+            .join("\n");
+        assert!(text.contains("1 chord Windows refused"), "{text}");
+        assert!(text.contains("Ctrl+Alt+Space"), "{text}");
+        assert!(text.contains("OverviewToggle"), "{text}");
+        assert!(text.contains("os error 1409"), "{text}");
+    }
+
+    #[test]
+    fn test_bindings_without_refusals_prints_no_section() {
+        // A daemon that refused nothing, and a daemon old enough not to send the
+        // field at all, both render the plain table.
+        let none_refused =
+            serde_json::json!({"success": true, "result": {"bindings": [], "refused": []}});
+        assert!(refused_binding_lines(&none_refused).is_none());
+        let old_daemon = serde_json::json!({"success": true, "result": {"bindings": []}});
+        assert!(refused_binding_lines(&old_daemon).is_none());
+    }
 
     /// The request a command line sends to the daemon.
     fn request_of(args: &[&str]) -> IpcMessage {
