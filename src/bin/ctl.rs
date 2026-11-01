@@ -1728,6 +1728,14 @@ fn refused_binding_lines(resp: &serde_json::Value) -> Option<Vec<String>> {
         ),
         "  them while it is active, but they have no WM_HOTKEY fallback:".to_string(),
     ];
+    // 1409 is ERROR_HOTKEY_ALREADY_REGISTERED: another program owns the chord.
+    // Any other error (1459, a non-interactive window station, for one) is not
+    // that, and saying so would send the user hunting for the wrong culprit.
+    let all_already_registered = rows.iter().all(|row| {
+        row.get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e.contains("1409"))
+    });
     for row in rows {
         let chord = row.get("chord").and_then(|v| v.as_str()).unwrap_or("?");
         let action = row.get("action").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1743,10 +1751,16 @@ fn refused_binding_lines(resp: &serde_json::Value) -> Option<Vec<String>> {
         ));
     }
     lines.push(String::new());
-    lines.push(
-        "  Another program owns that chord, and may still act on it as well.  Close it,".to_string(),
-    );
-    lines.push("  or rebind in config.kdl.".to_string());
+    if all_already_registered {
+        lines.push(
+            "  Another program owns that chord, and may still act on it as well.  Close it,"
+                .to_string(),
+        );
+        lines.push("  or rebind in config.kdl.".to_string());
+    } else {
+        lines.push("  Windows refused it for the reason above.  (Error 1459 means wiri is".to_string());
+        lines.push("  running in a session without an interactive window station.)".to_string());
+    }
     Some(lines)
 }
 
@@ -2115,6 +2129,30 @@ mod tests {
         assert!(text.contains("Ctrl+Alt+Space"), "{text}");
         assert!(text.contains("OverviewToggle"), "{text}");
         assert!(text.contains("os error 1409"), "{text}");
+        assert!(text.contains("Another program owns that chord"), "{text}");
+    }
+
+    #[test]
+    fn test_bindings_does_not_blame_another_program_for_other_errors() {
+        // Seen for real on a non-interactive window station: every chord fails
+        // with 1459, and "another program owns it" would be the wrong advice.
+        let resp = serde_json::json!({
+            "success": true,
+            "result": {
+                "bindings": [],
+                "refused": [{
+                    "id": 32768, "chord": "Ctrl+Alt+F12", "modifiers": 3,
+                    "vk_code": 123, "action": "FocusWorkspace(2)",
+                    "error": "This operation requires an interactive window station. (os error 1459)"
+                }]
+            }
+        });
+        let text = refused_binding_lines(&resp)
+            .expect("a refusal section")
+            .join("\n");
+        assert!(text.contains("os error 1459"), "{text}");
+        assert!(!text.contains("Another program owns"), "{text}");
+        assert!(text.contains("Error 1459 means"), "{text}");
     }
 
     #[test]
