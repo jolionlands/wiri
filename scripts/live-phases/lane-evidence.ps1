@@ -313,7 +313,7 @@ layout {
 overview {
     zoom 0.5
     backdrop-color "#102030"
-    workspace-shadow { offset y=10; softness 0; spread 0; color "#ff0000"; }
+    workspace-shadow { offset y=24; softness 0; spread 0; color "#ff0000"; }
 }
 '@
         EvReload $h95ShadowOn 'shadow-on'
@@ -321,30 +321,29 @@ overview {
         Start-Sleep -Milliseconds 1500
         EvAction 'open-overview' @('toggle-overview')
         $h95Host = EvWaitOverview 500000
-        # The active workspace is centred at half height; the 50 px workspace gap is scaled to
-        # 25 px, so 2 px below the bottom edge is inside the offset-10 (scaled to 5 px) band and
-        # above the next workspace.
+        # At half zoom the shadow extends 12 px below the workspace. Skip the
+        # focused thumbnail's 4 px outline and sample the middle of that band.
         $h95X = [int]((EvProp $h95Host 'Workspace0X') + (EvProp $h95Host 'Workspace0W') / 2)
-        $h95Bottom = [int]((EvProp $h95Host 'Workspace0Y') + (EvProp $h95Host 'Workspace0H'))
+        $h95ShadowY = 7 + [int]((EvProp $h95Host 'Workspace0Y') + (EvProp $h95Host 'Workspace0H'))
         Start-Sleep -Milliseconds 700
-        $h95Red = EvPixel $h95X ($h95Bottom + 2)
+        $h95Red = EvPixel $h95X $h95ShadowY
         $h95OnPass = (EvNearColor $h95Red (EvRgb '#ff0000') 40)
-        $h95Details.observations.Add([ordered]@{ stage = 'shadow-on'; x = $h95X; y = ($h95Bottom + 2); rgb = $h95Red })
+        $h95Details.observations.Add([ordered]@{ stage = 'shadow-on'; x = $h95X; y = $h95ShadowY; rgb = $h95Red })
         # niri's `off`: the same point is the configured backdrop again.
-        $h95ShadowOff = $h95ShadowOn.Replace('workspace-shadow { offset y=10; softness 0; spread 0; color "#ff0000"; }', 'workspace-shadow { off; }')
+        $h95ShadowOff = $h95ShadowOn.Replace('workspace-shadow { offset y=24; softness 0; spread 0; color "#ff0000"; }', 'workspace-shadow { off; }')
         EvReload $h95ShadowOff 'shadow-off'
         $h95Host = EvWaitOverview 500000
         Start-Sleep -Milliseconds 700
         $h95BackdropPixels = @()
         for ($i = 0; $i -lt 30; $i++) {
-            $h95BackdropPixels = EvPixel $h95X ($h95Bottom + 2)
+            $h95BackdropPixels = EvPixel $h95X $h95ShadowY
             if (EvNearColor $h95BackdropPixels (EvRgb '#102030') 16) { break }
             Start-Sleep -Milliseconds 150
         }
         $h95OffPass = EvNearColor $h95BackdropPixels (EvRgb '#102030') 16
-        $h95Details.observations.Add([ordered]@{ stage = 'shadow-off'; x = $h95X; y = ($h95Bottom + 2); rgb = $h95BackdropPixels })
+        $h95Details.observations.Add([ordered]@{ stage = 'shadow-off'; x = $h95X; y = $h95ShadowY; rgb = $h95BackdropPixels })
         EvGate 'h95_overview_workspace_shadow_paints_and_off_removes_it' ($h95OnPass -and $h95OffPass) @{
-            on = $h95Red; off = $h95BackdropPixels; x = $h95X; y = ($h95Bottom + 2)
+            on = $h95Red; off = $h95BackdropPixels; x = $h95X; y = $h95ShadowY
         }
         Shot 'h95-overview-shadow'
         EvAction 'close-overview' @('close-overview')

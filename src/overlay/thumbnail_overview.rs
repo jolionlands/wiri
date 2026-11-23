@@ -300,6 +300,23 @@ fn thumbnail_geometry(
     ))
 }
 
+/// Place the caption above the card when the whole line fits between cards.
+/// DWM draws window previews over anything painted inside the card.
+fn workspace_caption(card: Rect, previous_bottom: i32, text_height: u32) -> Rect {
+    let above = card.loc.y - 5 - text_height as i32;
+    let top = if above >= previous_bottom.max(0) + 4 {
+        above
+    } else {
+        card.loc.y + 5
+    };
+    Rect::new(
+        card.loc.x + 6,
+        top,
+        card.size.w.saturating_sub(12),
+        text_height,
+    )
+}
+
 #[cfg(target_os = "windows")]
 mod win {
     use super::*;
@@ -318,8 +335,9 @@ mod win {
         DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
     };
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, SetBkMode,
-        SetTextColor, TextOutW, HDC, PAINTSTRUCT, TRANSPARENT,
+        BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetTextMetricsW,
+        InvalidateRect, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, HDC,
+        PAINTSTRUCT, TEXTMETRICW, TRANSPARENT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -690,14 +708,25 @@ mod win {
             let dc = BeginPaint(hwnd, &mut ps);
             appearance::paint(dc, self.bounds, &self.background);
             if let Some(context) = &self.scene.context {
+                let mut metrics = TEXTMETRICW::default();
+                let _ = GetTextMetricsW(dc, &mut metrics);
+                let mut previous_bottom = 0;
+                let _ = SetBkMode(dc, TRANSPARENT);
+                let _ = SetTextColor(dc, COLORREF(0x00df_d8d0));
                 for ws in &context.workspaces {
                     let r = local(ws.rect, self.bounds);
                     fill(dc, r, WORKSPACE);
                     ring(dc, r, if ws.active { HOVER } else { BACKDROP }, 1);
-                    let text: Vec<u16> = ws.label.encode_utf16().collect();
-                    let _ = SetBkMode(dc, TRANSPARENT);
-                    let _ = SetTextColor(dc, COLORREF(0x00df_d8d0));
-                    let _ = TextOutW(dc, r.loc.x + 6, r.loc.y + 5, &text);
+                    let caption =
+                        workspace_caption(r, previous_bottom, metrics.tmHeight.max(1) as u32);
+                    previous_bottom = r.bottom();
+                    let mut text: Vec<u16> = ws.label.encode_utf16().collect();
+                    let _ = DrawTextW(
+                        dc,
+                        &mut text,
+                        &mut native_rect(caption),
+                        DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
                 }
                 if let Some(id) = self.hovered.filter(|id| Some(*id) != context.focused) {
                     if let Some(rect) = self.scene.tiles.get(&id).and_then(|t| t.rect) {
@@ -1129,6 +1158,16 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn workspace_caption_clears_previews_and_stays_within_card_width() {
+        let card = Rect::new(60, 84, 280, 130);
+        let label = workspace_caption(card, 50, 16);
+        assert!(label.loc.y >= 54 && label.bottom() < card.loc.y);
+        assert!(label.loc.x >= card.loc.x && label.right() <= card.right());
+        assert_eq!(workspace_caption(card, 80, 16).loc.y, 89);
+        assert_eq!(workspace_caption(Rect::new(0, 1, 8, 12), 0, 16).size.w, 0);
+    }
+
     #[test]
     fn entire_thumbnail_has_uncropped_source() {
         assert_eq!(

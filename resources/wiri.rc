@@ -9,7 +9,7 @@
 
 1 ICON "wiri.ico"
 
-#define WIRI_VERSION 0,1,1
+#define WIRI_VERSION 0,1,2
 #define WIRI_NAME "wiri"
 #define WIRI_DESCRIPTION "A scrollable-tiling window manager for Windows"
 
@@ -28,12 +28,12 @@ VS_VERSION_INFO VERSIONINFO
             BEGIN
                 VALUE "CompanyName", "wiri developers"
                 VALUE "FileDescription", WIRI_DESCRIPTION
-                VALUE "FileVersion", "0.1.1"
+                VALUE "FileVersion", "0.1.2"
                 VALUE "InternalName", WIRI_NAME
                 VALUE "LegalCopyright", "Copyright (c) wiri developers"
                 VALUE "OriginalFilename", "wiri.exe"
                 VALUE "ProductName", WIRI_NAME
-                VALUE "ProductVersion", "0.1.1"
+                VALUE "ProductVersion", "0.1.2"
                 VALUE "Comments", "https://github.com/wiri-wm/wiri"
             END
         END
