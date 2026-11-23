@@ -29,7 +29,7 @@
 
 ## Status
 
-wiri's first release, [v0.1.0](https://github.com/jolionlands/wiri/releases/tag/v0.1.0), is out with prebuilt binaries for x86_64 and ARM64 Windows. The measurements below come from one x64 laptop, and multi-monitor, mixed-DPI and ARM64 testing on real hardware are still in progress.
+Download prebuilt binaries for x86_64 and ARM64 Windows from the [latest release](https://github.com/jolionlands/wiri/releases/latest). The measurements below come from one x64 laptop, and multi-monitor, mixed-DPI and ARM64 testing on real hardware are still in progress.
 
 ## Why wiri
 

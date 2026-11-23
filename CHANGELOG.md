@@ -5,6 +5,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-11-22
+
+The hotkey overlay now uses the scale of the focused monitor when the foreground application reports 96 DPI. The live harness checks the mixed-DPI fixture before changing display settings and records skips on other layouts.
+
 ### Lane MULTIMON — two displays, mixed DPI (H99)
 
 `scripts/live-phases/lane-multimon.ps1` adds the 25 `h99_*` gates of the two-display lane; it is
@@ -72,6 +76,8 @@ CLI case passed.
 Recount: **170 done / 39 partial / 17 N/A** (layout, 226 rows) and **144 done / 44 partial /
 71 N/A** (config, input and IPC, 259 rows) — **314 done / 83 partial / 88 N/A** across 485 rows,
 **314/397 applicable rows (79.1 %)**, up from 309/397 (77.8 %).
+
+## Development history included in v0.1.0
 
 ### Lane FIXRUN2 — the dba4606 run's remaining live-gate failures
 
@@ -1229,5 +1235,6 @@ Initial public release. See `docs/PROGRESS.md` for the full feature matrix.
 - A handful of anti-cheat shims dislike `WH_MOUSE_LL` — disable the mouse
   hook in those games
 
-[Unreleased]: https://github.com/jolionlands/wiri/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jolionlands/wiri/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jolionlands/wiri/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jolionlands/wiri/releases/tag/v0.1.0
