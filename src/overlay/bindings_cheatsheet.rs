@@ -230,8 +230,13 @@ fn focused_work_area() -> (Rect, f64) {
             let r = info.rcWork;
             let mut monitor_dpi: u32 = 0;
             let mut monitor_dpi_y: u32 = 0;
-            if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut monitor_dpi, &mut monitor_dpi_y)
-                .is_err()
+            if GetDpiForMonitor(
+                monitor,
+                MDT_EFFECTIVE_DPI,
+                &mut monitor_dpi,
+                &mut monitor_dpi_y,
+            )
+            .is_err()
             {
                 monitor_dpi = 0;
             }

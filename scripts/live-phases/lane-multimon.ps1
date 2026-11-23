@@ -410,6 +410,43 @@ public static class LaneMultimonNative {
         return "output r#`"$mmD2Name`"# {`r`n$body`r`n}`r`n"
     }
 
+    function MmVerifyRestore {
+        # ---- the final gate: the desktop is exactly as this lane found it ---------------------------
+        try {
+            if (@(MmMonitors | Where-Object { $_.Device -eq $mmD2Name }).Count -eq 0) {
+                $mmReport['restore-extend'] = [LaneMultimonNative]::Extend()
+                $null = MmWaitMonitor $mmD2Name $true 25
+            }
+            Start-Sleep -Milliseconds 1500
+            $endMon = MmMonitors
+            $endD1 = @($endMon | Where-Object { $_.Device -eq $mmD1Name }) | Select-Object -First 1
+            $endD2 = @($endMon | Where-Object { $_.Device -eq $mmD2Name }) | Select-Object -First 1
+            $endMode = MmMode $mmD2Name
+            $endD1Mode = MmMode $mmD1Name
+            $mmReport.observations.Add([ordered]@{ stage = 'restored'; monitors = @($endMon | ForEach-Object {
+                "$($_.Device) $($_.W)x$($_.H)@$($_.Dpi)dpi at $($_.L),$($_.T) primary=$($_.Primary)" });
+                d2_mode = $endMode; d1_mode = $endD1Mode })
+            MmGate 'h99_outputs_restored' (
+                ($null -ne $endD2) -and ($null -ne $endD1) -and
+                ($endMode.Count -ge 5) -and ($endMode[0] -eq 1920) -and ($endMode[1] -eq 1080) -and
+                ($endMode[2] -eq 1366) -and ($endMode[3] -eq 0) -and ($endMode[4] -eq 0) -and
+                ($endD2.L -eq 1366) -and ($endD2.T -eq 0) -and ($endD2.W -eq 1920) -and ($endD2.H -eq 1080) -and
+                ($endD2.Dpi -eq 120) -and (-not $endD2.Primary) -and
+                ($endD1.Primary) -and ($endD1.L -eq 0) -and ($endD1.T -eq 0) -and ($endD1.W -eq 1366) -and ($endD1.H -eq 768) -and
+                ($endD1.Dpi -eq 96) -and ($endD1Mode[0] -eq 1366) -and ($endD1Mode[1] -eq 768) -and ($endD1Mode[4] -eq 0) -and
+                ($endD1.WorkL -eq 0) -and ($endD1.WorkT -eq 0) -and ($endD1.WorkR -eq 1366) -and ($endD1.WorkB -eq 728)
+            ) ([ordered]@{
+                d2 = if ($null -ne $endD2) { "$($endD2.W)x$($endD2.H)@$($endD2.Dpi)dpi at $($endD2.L),$($endD2.T)" } else { 'missing' };
+                d2_mode = $endMode
+                d1 = if ($null -ne $endD1) { "$($endD1.W)x$($endD1.H)@$($endD1.Dpi)dpi at $($endD1.L),$($endD1.T) primary=$($endD1.Primary)" } else { 'missing' };
+                d1_mode = $endD1Mode })
+        } catch {
+            $_ | Out-String | Set-Content (Join-Path $mmDir 'restore-check-error.txt')
+            $mmReport['error-restore-check'] = ($_ | Out-String).Trim()
+            MmGate 'h99_outputs_restored' $false ([ordered]@{ error = ($_ | Out-String).Trim() })
+        }
+    }
+
     $mmProc = $null
     $mmForms = New-Object System.Collections.ArrayList
     $mmCursor = [Windows.Forms.Cursor]::Position
@@ -433,6 +470,17 @@ public static class LaneMultimonNative {
         $mmD1 = @($mmMon | Where-Object { $_.Primary }) | Select-Object -First 1
         $mmD2 = @($mmMon | Where-Object { -not $_.Primary }) | Select-Object -First 1
         if ($null -eq $mmD1 -or $null -eq $mmD2) { throw 'H99 needs exactly one primary and one secondary display' }
+        # The recovery commands below use the lab fixture's exact starting mode.
+        # Arm recovery only after read-only probes confirm that it matches.
+        $fixtureMatches = $mmMon.Count -eq 2 -and
+            $mmD1.L -eq 0 -and $mmD1.T -eq 0 -and $mmD1.W -eq 1366 -and $mmD1.H -eq 768 -and $mmD1.Dpi -eq 96 -and
+            $mmD2.L -eq 1366 -and $mmD2.T -eq 0 -and $mmD2.W -eq 1920 -and $mmD2.H -eq 1080 -and $mmD2.Dpi -eq 120 -and
+            ((MmMode $mmD1.Device | Select-Object -First 5) -join ',') -eq '1366,768,0,0,0' -and
+            ((MmMode $mmD2.Device | Select-Object -First 5) -join ',') -eq '1920,1080,1366,0,0'
+        if (-not $fixtureMatches) {
+            foreach ($gateName in $mmKeys) { MmSkip $gateName 'display layout differs from the mixed-DPI lab fixture' }
+            return
+        }
         $mmD1Name = $mmD1.Device
         $mmD2Name = $mmD2.Device
         $summary['h99_displays'] = @($mmMon | ForEach-Object { "$($_.Device) $($_.W)x$($_.H) $($_.Dpi)dpi at $($_.L),$($_.T)" })
@@ -1121,45 +1169,11 @@ public static class LaneMultimonNative {
             if ($null -ne $mmProc -and -not $mmProc.HasExited) { Stop-WiriGracefully $mmProc 'h99' }
         } catch { }
         try { [Windows.Forms.Cursor]::Position = $mmCursor } catch { }
-    }
-
-    # ---- the final gate: the desktop is exactly as this lane found it ---------------------------
-    try {
-        if ([string]::IsNullOrEmpty($mmD2Name)) { MmSave; return }
-        if (@(MmMonitors | Where-Object { $_.Device -eq $mmD2Name }).Count -eq 0) {
-            $mmReport['restore-extend'] = [LaneMultimonNative]::Extend()
-            $null = MmWaitMonitor $mmD2Name $true 25
+        try {
+            if ($mmD2Name) { MmVerifyRestore }
+        } finally {
+            if ($mmOldDpiContext -ne [IntPtr]::Zero) { $null = [LaneMultimonNative]::SetThreadDpiAwarenessContext($mmOldDpiContext) }
+            MmSave
         }
-        Start-Sleep -Milliseconds 1500
-        $endMon = MmMonitors
-        $endD1 = @($endMon | Where-Object { $_.Device -eq $mmD1Name }) | Select-Object -First 1
-        $endD2 = @($endMon | Where-Object { $_.Device -eq $mmD2Name }) | Select-Object -First 1
-        $endMode = MmMode $mmD2Name
-        $endD1Mode = MmMode $mmD1Name
-        $mmReport.observations.Add([ordered]@{ stage = 'restored'; monitors = @($endMon | ForEach-Object {
-            "$($_.Device) $($_.W)x$($_.H)@$($_.Dpi)dpi at $($_.L),$($_.T) primary=$($_.Primary)" });
-            d2_mode = $endMode; d1_mode = $endD1Mode })
-        MmGate 'h99_outputs_restored' (
-            ($null -ne $endD2) -and ($null -ne $endD1) -and
-            ($endMode.Count -ge 5) -and ($endMode[0] -eq 1920) -and ($endMode[1] -eq 1080) -and
-            ($endMode[2] -eq 1366) -and ($endMode[3] -eq 0) -and ($endMode[4] -eq 0) -and
-            ($endD2.L -eq 1366) -and ($endD2.T -eq 0) -and ($endD2.W -eq 1920) -and ($endD2.H -eq 1080) -and
-            ($endD2.Dpi -eq 120) -and (-not $endD2.Primary) -and
-            ($endD1.Primary) -and ($endD1.L -eq 0) -and ($endD1.T -eq 0) -and ($endD1.W -eq 1366) -and ($endD1.H -eq 768) -and
-            ($endD1.Dpi -eq 96) -and ($endD1Mode[0] -eq 1366) -and ($endD1Mode[1] -eq 768) -and ($endD1Mode[4] -eq 0) -and
-            ($endD1.WorkL -eq 0) -and ($endD1.WorkT -eq 0) -and ($endD1.WorkR -eq 1366) -and ($endD1.WorkB -eq 728)
-        ) ([ordered]@{
-            d2 = if ($null -ne $endD2) { "$($endD2.W)x$($endD2.H)@$($endD2.Dpi)dpi at $($endD2.L),$($endD2.T)" } else { 'missing' };
-            d2_mode = $endMode
-            d1 = if ($null -ne $endD1) { "$($endD1.W)x$($endD1.H)@$($endD1.Dpi)dpi at $($endD1.L),$($endD1.T) primary=$($endD1.Primary)" } else { 'missing' };
-            d1_mode = $endD1Mode })
-    } catch {
-        $_ | Out-String | Set-Content (Join-Path $mmDir 'restore-check-error.txt')
-        $mmReport['error-restore-check'] = ($_ | Out-String).Trim()
-        MmGate 'h99_outputs_restored' $false ([ordered]@{ error = ($_ | Out-String).Trim() })
-    } finally {
-        if ($mmOldDpiContext -ne [IntPtr]::Zero) { $null = [LaneMultimonNative]::SetThreadDpiAwarenessContext($mmOldDpiContext) }
-        $summary['h99_display_count'] = @(MmMonitors).Count
-        MmSave
     }
 }
