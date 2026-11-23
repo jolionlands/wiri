@@ -5,6 +5,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-11-22
+
+- Overview displays workspace names in the gap above previews when a full line fits. Long names are shortened to the card width.
+- Adjacent previews share a pixel boundary at fractional zoom levels, including while the workspace is panned.
+- Desktop checks now sample the workspace shadow beyond the focus outline and capture expected validation diagnostics in Windows PowerShell.
+
 ## [0.1.1] — 2026-11-22
 
 The hotkey overlay now uses the scale of the focused monitor when the foreground application reports 96 DPI. The live harness checks the mixed-DPI fixture before changing display settings and records skips on other layouts.
@@ -1235,6 +1241,7 @@ Initial public release. See `docs/PROGRESS.md` for the full feature matrix.
 - A handful of anti-cheat shims dislike `WH_MOUSE_LL` — disable the mouse
   hook in those games
 
-[Unreleased]: https://github.com/jolionlands/wiri/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/jolionlands/wiri/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/jolionlands/wiri/releases/tag/v0.1.2
 [0.1.1]: https://github.com/jolionlands/wiri/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jolionlands/wiri/releases/tag/v0.1.0

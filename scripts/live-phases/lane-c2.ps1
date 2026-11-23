@@ -13,8 +13,16 @@
         $c2Details[$name] = [ordered]@{ pass = $passed; observed = $observed }
     }
     function C2Validate([string]$label, [string[]]$cliArgs) {
-        $text = (& $wiri @cliArgs 2>&1 | Out-String)
-        $rc = $LASTEXITCODE
+        # Windows PowerShell surfaces redirected native stderr as ErrorRecord objects.
+        # Invalid configs are expected here. Capture the diagnostics and the real exit code.
+        $savedPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $text = (& $wiri @cliArgs 2>&1 | ForEach-Object { [string]$_ } | Out-String)
+            $rc = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedPreference
+        }
         [IO.File]::WriteAllText((Join-Path $c2Dir "$label.txt"), $text)
         return [pscustomobject]@{ rc = $rc; text = $text }
     }

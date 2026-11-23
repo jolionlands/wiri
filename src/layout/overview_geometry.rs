@@ -172,12 +172,20 @@ pub fn zoom_tile(tile: Rect, workspace: Rect, view: Rect, zoom: f64) -> Rect {
     } else {
         1.0
     };
-    Rect::new(
-        workspace.loc.x + round_logical((tile.loc.x - view.loc.x) as f64 * zoom),
-        workspace.loc.y + round_logical((tile.loc.y - view.loc.y) as f64 * zoom),
-        ((tile.size.w as f64 * zoom).round() as u32).max(1),
-        ((tile.size.h as f64 * zoom).round() as u32).max(1),
-    )
+    // Project both edges in the same coordinate system. Rounding the width
+    // independently can separate two tiles that shared an edge before zoom.
+    let project = |start: i32, length: u32, view_start: i32, workspace_start: i32| {
+        let offset = f64::from(start) - f64::from(view_start);
+        let first = (offset * zoom).round();
+        let last = ((offset + f64::from(length)) * zoom).round();
+        (
+            (f64::from(workspace_start) + first) as i32,
+            ((last - first) as u32).max(1),
+        )
+    };
+    let (x, width) = project(tile.loc.x, tile.size.w, view.loc.x, workspace.loc.x);
+    let (y, height) = project(tile.loc.y, tile.size.h, view.loc.y, workspace.loc.y);
+    Rect::new(x, y, width, height)
 }
 
 /// The visible part of a published thumbnail: the workspace crop first, so a
@@ -189,6 +197,25 @@ pub fn visible_tile(tile: Rect, workspace: Rect) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adjacent_tiles_share_pixel_edges_at_fractional_zoom() {
+        let view = Rect::new(-1500, 100, 1440, 900);
+        let workspace = Rect::new(-1000, 300, 720, 450);
+        for start in [-13, 1, 3] {
+            let tile = Rect::new(view.loc.x + start, view.loc.y + start, 13, 13);
+            let right = Rect::new(tile.right(), tile.loc.y, 15, 13);
+            let below = Rect::new(tile.loc.x, tile.bottom(), 13, 15);
+            for zoom in [0.3, 0.5, 0.75] {
+                let first = zoom_tile(tile, workspace, view, zoom);
+                assert_eq!(first.right(), zoom_tile(right, workspace, view, zoom).loc.x);
+                assert_eq!(
+                    first.bottom(),
+                    zoom_tile(below, workspace, view, zoom).loc.y
+                );
+            }
+        }
+    }
 
     fn view() -> Rect {
         Rect::new(0, 0, 1366, 768)
